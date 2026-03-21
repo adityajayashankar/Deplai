@@ -1,0 +1,63 @@
+# env files
+.env
+.env.local
+Agentic Layer/.env
+
+# dependencies
+Connector/node_modules
+Connector/.pnp
+Connector/.pnp.*
+Connector/.yarn/*
+!Connector/.yarn/patches
+!Connector/.yarn/plugins
+!Connector/.yarn/releases
+!Connector/.yarn/versions
+Connector/package-lock.json
+
+# testing
+Connector/coverage
+
+# next.js
+Connector/.next/
+Connector/out/
+
+# production
+Connector/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# vercel
+Connector/.vercel
+
+# typescript
+*.tsbuildinfo
+Connector/next-env.d.ts
+
+# runtime data (cloned repos & uploaded projects) — keep directory structure via .gitkeep
+Connector/tmp/repos/*
+!Connector/tmp/repos/.gitkeep
+Connector/tmp/local-projects/*
+!Connector/tmp/local-projects/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code
+.claude/
+
+*.json
+*.jsonl
+
+# KGagent data and config files — needed as Neo4j fallback and for agent config
+!KGagent/**/*.json
+!KGagent/**/*.jsonl

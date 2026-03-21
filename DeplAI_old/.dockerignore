@@ -1,0 +1,27 @@
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Python
+**/.venv/
+**/__pycache__/
+*.pyc
+*.egg-info
+pip-cache/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Other
+.DS_Store
+
+# Project-specific data to ignore
+terraform_rag_agent/data/repos/
+Test Data/

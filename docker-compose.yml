@@ -1,0 +1,38 @@
+version: "3.8"
+
+services:
+  agentic-layer:
+    build:
+      context: ./Agentic Layer
+      dockerfile: Dockerfile
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./.env
+    volumes:
+      # Docker socket — allows the container to manage other containers/volumes
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Local project uploads — needed for isdir checks inside the container
+      - ./Connector/tmp/local-projects:/local-projects:ro
+      # Mount source code live — code changes take effect on save without rebuild
+      - ./Agentic Layer:/app
+      # Legacy DeplAI_old assets used as fallback for Terraform RAG artifacts
+      - ./DeplAI_old:/app/DeplAI_old:ro
+      # KGagent — mounted alongside the agentic layer so graph.py can import it
+      - ./KGagent:/app/KGagent:ro
+    networks:
+      - deplai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  codebase_deplai:
+  security_reports:
+  LLM_Output:
+  grype_db_cache:
+
+networks:
+  deplai:
+    driver: bridge

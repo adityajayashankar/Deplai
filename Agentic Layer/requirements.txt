@@ -1,0 +1,40 @@
+fastapi>=0.115.0
+uvicorn>=0.34.0
+websockets>=14.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+docker>=7.0.0
+
+# HTTP clients
+httpx>=0.27.0
+requests>=2.32.0
+
+# AWS cost estimation
+boto3>=1.35.0
+
+# LangGraph + LangChain
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langchain-huggingface>=0.1.0
+langsmith>=0.2.0
+
+# KGagent LLM backends
+groq>=0.11.0
+openai>=1.40.0
+
+# KGagent knowledge graph + vector store
+neo4j>=5.0.0
+qdrant-client>=1.9.0
+sentence-transformers>=3.0.0
+
+# Terraform RAG agent
+chromadb>=0.5.0
+tqdm>=4.66.0
+
+# HuggingFace (kept for compatibility)
+huggingface-hub>=0.25.0
+
+# Claude
+anthropic>=0.56.0

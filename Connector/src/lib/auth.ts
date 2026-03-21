@@ -1,0 +1,113 @@
+import { getIronSession } from 'iron-session';
+import { cookies } from 'next/headers';
+import { NextResponse } from 'next/server';
+import { sessionOptions, SessionData } from './session';
+import { query } from './db';
+
+export async function getAuthenticatedUser() {
+  const cookieStore = await cookies();
+  const session = await getIronSession<SessionData>(cookieStore, sessionOptions);
+
+  if (!session.isLoggedIn || !session.user) {
+    return null;
+  }
+
+  return session.user;
+}
+
+export async function requireAuth(): Promise<
+  { user: SessionData['user'] & {}; error?: never } | { user?: never; error: NextResponse }
+> {
+  const user = await getAuthenticatedUser();
+  if (!user) {
+    return { error: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }) };
+  }
+  return { user };
+}
+
+export async function verifyLocalProjectAccess(
+  userId: string,
+  projectId: string
+): Promise<{ project: any; error?: never } | { project?: never; error: NextResponse }> {
+  const [project] = await query<any[]>(
+    `SELECT id, name, project_type, user_id
+     FROM projects
+     WHERE id = ?`,
+    [projectId]
+  );
+
+  if (!project) {
+    return { error: NextResponse.json({ error: 'Project not found' }, { status: 404 }) };
+  }
+  if (project.user_id !== userId) {
+    return { error: NextResponse.json({ error: 'Forbidden: You do not own this project' }, { status: 403 }) };
+  }
+  if (project.project_type !== 'local') {
+    return { error: NextResponse.json({ error: 'This endpoint is for local projects only' }, { status: 400 }) };
+  }
+  return { project };
+}
+
+/** Generic ownership check for any project type (local or github). */
+export async function verifyProjectOwnership(
+  userId: string,
+  projectId: string
+): Promise<{ project: any; error?: never } | { project?: never; error: NextResponse }> {
+  // Local projects are stored in the `projects` table
+  const [localProject] = await query<any[]>(
+    `SELECT id, name, project_type, user_id FROM projects WHERE id = ?`,
+    [projectId]
+  );
+  if (localProject) {
+    if (localProject.user_id !== userId) {
+      return { error: NextResponse.json({ error: 'Forbidden' }, { status: 403 }) };
+    }
+    return { project: localProject };
+  }
+
+  // GitHub repos are stored in `github_repositories` — ownership via installation
+  const [githubRepo] = await query<any[]>(
+    `SELECT r.id, r.full_name, i.user_id
+     FROM github_repositories r
+     JOIN github_installations i ON i.id = r.installation_id
+     WHERE r.id = ?`,
+    [projectId]
+  );
+  if (githubRepo) {
+    if (githubRepo.user_id !== userId) {
+      return { error: NextResponse.json({ error: 'Forbidden' }, { status: 403 }) };
+    }
+    return { project: githubRepo };
+  }
+
+  return { error: NextResponse.json({ error: 'Project not found' }, { status: 404 }) };
+}
+
+export async function verifyInstallationOwnership(
+  userId: string,
+  installationId: string
+): Promise<boolean> {
+  const [result] = await query<any[]>(
+    `SELECT id FROM github_installations 
+     WHERE id = ? AND user_id = ?`,
+    [installationId, userId]
+  );
+
+  return !!result;
+}
+
+export async function verifyRepositoryOwnership(
+  userId: string,
+  owner: string,
+  repo: string
+): Promise<{ installationId: string; suspended: boolean } | null> {
+  const [result] = await query<any[]>(
+    `SELECT r.installation_id, i.id as installation_uuid, i.suspended_at
+     FROM github_repositories r
+     JOIN github_installations i ON i.id = r.installation_id
+     WHERE r.full_name = ? AND i.user_id = ?`,
+    [`${owner}/${repo}`, userId]
+  );
+
+  return result ? { installationId: result.installation_uuid, suspended: !!result.suspended_at } : null;
+}

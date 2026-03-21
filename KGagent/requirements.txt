@@ -1,0 +1,13 @@
+# KG Agent minimal dependencies
+python-dotenv
+requests
+pydantic
+langgraph
+neo4j
+qdrant-client
+openai
+groq
+sentence-transformers
+langchain
+langchain-community
+langchain-huggingface
