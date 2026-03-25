@@ -1,8 +1,8 @@
 from typing import Type
-from pydantic import BaseModel, Field
+from pydantic.v1 import BaseModel, Field
 
 from .base import BaseTool
-from utils import get_rag_logger # Corrected absolute import for logger
+from utils.rag_logger import get_rag_logger
 
 logger = get_rag_logger(__name__)
 

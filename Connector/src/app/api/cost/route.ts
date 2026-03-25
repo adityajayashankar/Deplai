@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
+import { validateArchitectureJson } from '@/lib/architecture-contract';
 
 interface CostEstimateBody {
   architecture_json: Record<string, unknown>;
@@ -28,8 +29,14 @@ export async function POST(req: NextRequest) {
 
     const body = await req.json() as CostEstimateBody;
 
-    if (!body.architecture_json || typeof body.architecture_json !== 'object') {
-      return NextResponse.json({ error: 'architecture_json is required' }, { status: 400 });
+    const archValidation = validateArchitectureJson(body.architecture_json);
+    if (!archValidation.valid) {
+      return NextResponse.json(
+        {
+          error: `architecture_json contract validation failed: ${archValidation.errors.join('; ')}`,
+        },
+        { status: 400 },
+      );
     }
 
     // Optional project ownership check
@@ -39,6 +46,18 @@ export async function POST(req: NextRequest) {
     }
 
     const provider = String(body.provider || 'aws').trim().toLowerCase();
+    if (!['aws', 'azure', 'gcp'].includes(provider)) {
+      return NextResponse.json({ error: 'provider must be one of aws, azure, gcp' }, { status: 400 });
+    }
+
+    const awsAccessKey = body.aws_access_key_id?.trim();
+    const awsSecretKey = body.aws_secret_access_key?.trim();
+    if ((awsAccessKey && !awsSecretKey) || (!awsAccessKey && awsSecretKey)) {
+      return NextResponse.json(
+        { error: 'aws_access_key_id and aws_secret_access_key must be provided together' },
+        { status: 400 },
+      );
+    }
 
     const agenticRes = await fetch(`${AGENTIC_URL}/api/cost/estimate`, {
       method: 'POST',
@@ -47,10 +66,10 @@ export async function POST(req: NextRequest) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        architecture_json: body.architecture_json,
+        architecture_json: archValidation.normalized,
         provider,
-        aws_access_key_id: body.aws_access_key_id || null,
-        aws_secret_access_key: body.aws_secret_access_key || null,
+        aws_access_key_id: awsAccessKey || null,
+        aws_secret_access_key: awsSecretKey || null,
       }),
       signal: AbortSignal.timeout(60_000),
     });

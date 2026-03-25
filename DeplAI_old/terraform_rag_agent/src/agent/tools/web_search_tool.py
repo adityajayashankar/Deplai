@@ -11,10 +11,9 @@ except ImportError:
     TavilyClient = None # Allows the class to be defined, but tool will be non-functional
 
 from langchain_community.tools.tavily_search import TavilySearchResults
-from pydantic import BaseModel, Field
 
 from .base import BaseTool
-from utils import get_rag_logger # Corrected absolute import for logger
+from utils.rag_logger import get_rag_logger
 
 logger = get_rag_logger(__name__)
 

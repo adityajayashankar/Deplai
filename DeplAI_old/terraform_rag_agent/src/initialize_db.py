@@ -5,10 +5,10 @@ import os
 from dotenv import load_dotenv
 # Remove standard logging, import custom logger
 # import logging 
-from utils.rag_logger import setup_custom_logger # Import custom logger
+from utils.rag_logger import get_rag_logger
 
 # Initialize custom logger
-logger = setup_custom_logger(__name__)
+logger = get_rag_logger(__name__)
 
 def initialize_chromadb_utility():
     """Initializes a ChromaDB client and lists existing collections."""

@@ -1,9 +1,10 @@
 import { NextResponse } from 'next/server';
+import { requireEnv } from '@/lib/env';
 
 export async function GET() {
   const params = new URLSearchParams({
-    client_id: process.env.GITHUB_CLIENT_ID!,
-    redirect_uri: `${process.env.NEXT_PUBLIC_APP_URL}/api/auth/callback`,
+    client_id: requireEnv('GITHUB_CLIENT_ID'),
+    redirect_uri: `${requireEnv('NEXT_PUBLIC_APP_URL')}/api/auth/callback`,
     scope: 'user:email read:user read:org',
   });
 

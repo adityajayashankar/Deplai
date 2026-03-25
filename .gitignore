@@ -61,3 +61,6 @@ __pycache__/
 # KGagent data and config files — needed as Neo4j fallback and for agent config
 !KGagent/**/*.json
 !KGagent/**/*.jsonl
+
+#IDEA IDE
+.idea/

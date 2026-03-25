@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
+import { validateArchitectureJson } from '@/lib/architecture-contract';
 import { query } from '@/lib/db';
 import { githubService } from '@/lib/github';
 import { getLegacyRootRuntimeStatus, getLegacyTerraformRagStatus } from '@/lib/legacy-assets';
@@ -37,6 +38,16 @@ interface ProjectMetaRow {
   installation_uuid: string | null;
 }
 
+interface RepoPersistenceResult {
+  attempted: boolean;
+  success: boolean;
+  pr_url: string | null;
+  branch?: string | null;
+  reason?: string;
+  error?: string;
+  files_committed?: number;
+}
+
 const INDEX_HTML_CANDIDATES = [
   'index.html',
   'public/index.html',
@@ -45,9 +56,53 @@ const INDEX_HTML_CANDIDATES = [
   'build/index.html',
 ];
 
+const WEBSITE_ROOT_CANDIDATES = [
+  'dist',
+  'build',
+  'out',
+  'public',
+  'site',
+  'website',
+  'frontend/dist',
+  'frontend/build',
+  'frontend/public',
+  'web/dist',
+  'web/build',
+  'web/public',
+  'client/dist',
+  'client/build',
+  'client/public',
+  'app/dist',
+  'app/build',
+  'app/public',
+];
+
 interface WebsiteAsset {
   relativePath: string;
   contentBase64: string;
+}
+
+interface WebsiteAssetCollection {
+  assets: WebsiteAsset[];
+  selectedRoot: string;
+  totalBytes: number;
+  truncated: boolean;
+  skippedLargeFiles: number;
+}
+
+interface WebsiteEntrypointSelection {
+  relativePath: string | null;
+  html: string | null;
+  reason: string;
+}
+
+interface FrontendEntrypointDetection {
+  runtime: 'node' | 'python' | 'unknown';
+  framework: 'nextjs' | 'vite' | 'react' | 'vue' | 'svelte' | 'unknown';
+  entry_candidates: string[];
+  build_command: string | null;
+  has_build_output: boolean;
+  detected: boolean;
 }
 
 const SKIP_DIR_NAMES = new Set([
@@ -58,6 +113,10 @@ const SKIP_DIR_NAMES = new Set([
   '.pytest_cache',
   '.venv',
   'venv',
+  '.terraform',
+  '.cache',
+  'coverage',
+  'tmp',
 ]);
 
 const SKIP_FILE_NAMES = new Set([
@@ -69,12 +128,17 @@ const MAX_SITE_FILES = 2500;
 const MAX_SITE_FILE_BYTES = 8_000_000;
 const MAX_SITE_TOTAL_BYTES = 20_000_000;
 
-function defaultWebsiteHtml(projectName: string): string {
+function defaultWebsiteHtml(projectName: string, hintMessage?: string): string {
+  const safeHint = String(hintMessage || '').trim();
+  const hintBlock = safeHint
+    ? `<p style="margin-top: 1rem; color: #555;">${safeHint}</p>`
+    : '';
   return `<html>
   <head><title>DeplAI Deployment</title></head>
   <body style="font-family: Arial, sans-serif; padding: 2rem;">
     <h1>DeplAI deployment is live</h1>
     <p>Project: ${projectName}</p>
+    ${hintBlock}
   </body>
 </html>`;
 }
@@ -112,12 +176,86 @@ function shouldSkipSourceEntry(relativePath: string, isDirectory: boolean): bool
   return false;
 }
 
-function collectWebsiteAssets(rootPath: string): WebsiteAsset[] {
-  const assets: WebsiteAsset[] = [];
-  const pending: string[] = [''];
-  let totalBytes = 0;
+function pathExistsAsDirectory(rootPath: string, relPath: string): boolean {
+  const normalized = normalizeProjectPath(relPath);
+  const absolute = path.join(rootPath, ...normalized.split('/').filter(Boolean));
+  try {
+    return fs.statSync(absolute).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
-  while (pending.length > 0) {
+function pathExistsAsFile(rootPath: string, relPath: string): boolean {
+  const normalized = normalizeProjectPath(relPath);
+  const absolute = path.join(rootPath, ...normalized.split('/').filter(Boolean));
+  try {
+    return fs.statSync(absolute).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function hasHtmlAsset(assets: WebsiteAsset[]): boolean {
+  return assets.some((asset) => /\.(html?|xhtml)$/i.test(asset.relativePath));
+}
+
+function hasPreferredIndexAsset(assets: WebsiteAsset[]): boolean {
+  if (!assets.length) return false;
+  const byKey = new Set(
+    assets.map((asset) => normalizeWebsiteObjectKey(asset.relativePath).toLowerCase()),
+  );
+  return INDEX_HTML_CANDIDATES.some((candidate) => byKey.has(normalizeProjectPath(candidate).toLowerCase()));
+}
+
+function listWebsiteRootCandidates(rootPath: string): string[] {
+  const roots: string[] = [];
+  const seen = new Set<string>();
+
+  const add = (root: string) => {
+    const normalized = normalizeProjectPath(root);
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) return;
+    if (normalized && !pathExistsAsDirectory(rootPath, normalized)) return;
+    roots.push(normalized);
+    seen.add(key);
+  };
+
+  for (const root of WEBSITE_ROOT_CANDIDATES) {
+    add(root);
+  }
+
+  for (const htmlCandidate of INDEX_HTML_CANDIDATES) {
+    if (!pathExistsAsFile(rootPath, htmlCandidate)) continue;
+    const dir = normalizeProjectPath(path.posix.dirname(htmlCandidate));
+    add(dir === '.' ? '' : dir);
+  }
+
+  add('');
+  return roots;
+}
+
+function collectWebsiteAssetsForRoot(rootPath: string, sourceRoot: string): WebsiteAssetCollection {
+  const normalizedSource = normalizeProjectPath(sourceRoot);
+  const assets: WebsiteAsset[] = [];
+  const pending: string[] = [normalizedSource];
+  let totalBytes = 0;
+  let truncated = false;
+  let skippedLargeFiles = 0;
+
+  if (normalizedSource && !pathExistsAsDirectory(rootPath, normalizedSource)) {
+    return {
+      assets,
+      selectedRoot: normalizedSource,
+      totalBytes,
+      truncated,
+      skippedLargeFiles,
+    };
+  }
+
+  let stop = false;
+
+  while (pending.length > 0 && !stop) {
     const relativeDir = pending.pop() || '';
     const absoluteDir = path.join(rootPath, ...relativeDir.split('/').filter(Boolean));
 
@@ -146,31 +284,188 @@ function collectWebsiteAssets(rootPath: string): WebsiteAsset[] {
       const buffer = fs.readFileSync(filePath);
 
       if (buffer.length > MAX_SITE_FILE_BYTES) {
-        throw new Error(`Project asset exceeds ${MAX_SITE_FILE_BYTES} bytes: ${relativePath}`);
+        skippedLargeFiles += 1;
+        continue;
+      }
+
+      if (assets.length >= MAX_SITE_FILES) {
+        truncated = true;
+        stop = true;
+        break;
+      }
+
+      if (totalBytes + buffer.length > MAX_SITE_TOTAL_BYTES) {
+        truncated = true;
+        stop = true;
+        break;
       }
 
       totalBytes += buffer.length;
-      if (totalBytes > MAX_SITE_TOTAL_BYTES) {
-        throw new Error(`Project assets exceed ${MAX_SITE_TOTAL_BYTES} bytes; reduce bundle size before deployment.`);
-      }
 
       assets.push({
         relativePath,
         contentBase64: buffer.toString('base64'),
       });
-
-      if (assets.length > MAX_SITE_FILES) {
-        throw new Error(`Project has more than ${MAX_SITE_FILES} files; reduce bundle size before deployment.`);
-      }
     }
   }
 
   assets.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
-  return assets;
+  return {
+    assets,
+    selectedRoot: normalizedSource,
+    totalBytes,
+    truncated,
+    skippedLargeFiles,
+  };
 }
 
-function resolveIndexHtmlFromAssets(assets: WebsiteAsset[]): string | null {
-  if (!assets.length) return null;
+function collectWebsiteAssets(rootPath: string): WebsiteAssetCollection {
+  const empty: WebsiteAssetCollection = {
+    assets: [],
+    selectedRoot: '',
+    totalBytes: 0,
+    truncated: false,
+    skippedLargeFiles: 0,
+  };
+
+  const rootCandidates = listWebsiteRootCandidates(rootPath);
+  if (!rootCandidates.length) return empty;
+
+  const collected = rootCandidates.map((candidate) => collectWebsiteAssetsForRoot(rootPath, candidate));
+  const withPreferredIndex = collected.find((item) => hasPreferredIndexAsset(item.assets));
+  if (withPreferredIndex) return withPreferredIndex;
+
+  const withHtml = collected.find((item) => hasHtmlAsset(item.assets));
+  if (withHtml) return withHtml;
+
+  const withAssets = collected.find((item) => item.selectedRoot !== '' && item.assets.length > 0);
+  return withAssets || empty;
+}
+
+function parsePackageJson(rootPath: string): Record<string, unknown> | null {
+  const packageJsonPath = path.join(rootPath, 'package.json');
+  try {
+    if (!fs.existsSync(packageJsonPath)) return null;
+    const raw = fs.readFileSync(packageJsonPath, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function detectFrontendEntrypoint(rootPath: string): FrontendEntrypointDetection {
+  const packageJson = parsePackageJson(rootPath);
+  const deps = packageJson && typeof packageJson === 'object'
+    ? {
+      ...((packageJson.dependencies as Record<string, unknown>) || {}),
+      ...((packageJson.devDependencies as Record<string, unknown>) || {}),
+    }
+    : {};
+  const depKeys = new Set(Object.keys(deps).map((k) => String(k || '').toLowerCase()));
+  const scripts = packageJson && typeof packageJson === 'object'
+    ? ((packageJson.scripts as Record<string, unknown>) || {})
+    : {};
+  const buildCommand = typeof scripts.build === 'string'
+    ? String(scripts.build).trim()
+    : null;
+
+  let framework: FrontendEntrypointDetection['framework'] = 'unknown';
+  if (depKeys.has('next')) framework = 'nextjs';
+  else if (depKeys.has('vite')) framework = 'vite';
+  else if (depKeys.has('react')) framework = 'react';
+  else if (depKeys.has('vue')) framework = 'vue';
+  else if (depKeys.has('svelte')) framework = 'svelte';
+
+  const runtime: FrontendEntrypointDetection['runtime'] =
+    depKeys.size > 0 || packageJson ? 'node' : 'unknown';
+
+  const candidatePool: string[] = [];
+  if (framework === 'nextjs') {
+    candidatePool.push(
+      'src/app/page.tsx',
+      'src/app/page.jsx',
+      'app/page.tsx',
+      'app/page.jsx',
+      'pages/index.tsx',
+      'pages/index.jsx',
+      'pages/index.js',
+    );
+  } else if (framework === 'vite' || framework === 'react' || framework === 'vue' || framework === 'svelte') {
+    candidatePool.push(
+      'index.html',
+      'public/index.html',
+      'src/main.tsx',
+      'src/main.jsx',
+      'src/main.ts',
+      'src/main.js',
+      'src/index.tsx',
+      'src/index.jsx',
+      'src/index.ts',
+      'src/index.js',
+      'index.tsx',
+      'index.jsx',
+      'index.ts',
+      'index.js',
+    );
+  } else {
+    candidatePool.push(
+      'index.html',
+      'public/index.html',
+      'src/index.html',
+      'src/index.jsx',
+      'src/index.tsx',
+      'index.jsx',
+      'index.tsx',
+      'index.js',
+      'index.ts',
+    );
+  }
+
+  const foundCandidates = candidatePool
+    .filter((candidate) => pathExistsAsFile(rootPath, candidate))
+    .map((candidate) => normalizeProjectPath(candidate));
+
+  const hasBuildOutput = ['dist', 'build', 'out', '.next']
+    .some((dir) => pathExistsAsDirectory(rootPath, dir));
+
+  return {
+    runtime,
+    framework,
+    entry_candidates: foundCandidates,
+    build_command: buildCommand,
+    has_build_output: hasBuildOutput,
+    detected: foundCandidates.length > 0 || framework !== 'unknown',
+  };
+}
+
+function buildFrontendFallbackHint(projectName: string, detection: FrontendEntrypointDetection | null): string {
+  if (!detection || !detection.detected) return '';
+  const topCandidate = detection.entry_candidates[0] || '';
+  const buildHint = detection.build_command
+    ? `Run build command '${detection.build_command}' and upload the built assets (for example dist/build/out).`
+    : 'Build the frontend and upload compiled static assets (for example dist/build/out).';
+  if (topCandidate) {
+    return `Detected source entrypoint '${topCandidate}' for ${projectName}. ${buildHint}`;
+  }
+  return `Detected ${detection.framework} frontend source for ${projectName}. ${buildHint}`;
+}
+
+function decodeAssetContent(asset: WebsiteAsset | null | undefined): string {
+  if (!asset) return '';
+  return Buffer.from(asset.contentBase64, 'base64').toString('utf-8');
+}
+
+function resolvePrimaryWebsiteHtmlFromAssets(assets: WebsiteAsset[]): WebsiteEntrypointSelection {
+  if (!assets.length) {
+    return {
+      relativePath: null,
+      html: null,
+      reason: 'no assets were available',
+    };
+  }
+
   const lookup = new Map<string, WebsiteAsset>();
   for (const asset of assets) {
     lookup.set(normalizeWebsiteObjectKey(asset.relativePath), asset);
@@ -179,17 +474,88 @@ function resolveIndexHtmlFromAssets(assets: WebsiteAsset[]): string | null {
   for (const candidate of INDEX_HTML_CANDIDATES) {
     const hit = lookup.get(normalizeProjectPath(candidate));
     if (!hit) continue;
-    const decoded = Buffer.from(hit.contentBase64, 'base64').toString('utf-8');
-    if (decoded.trim()) return decoded;
+    const decoded = decodeAssetContent(hit);
+    if (decoded.trim()) {
+      return {
+        relativePath: hit.relativePath,
+        html: decoded,
+        reason: `matched preferred candidate (${candidate})`,
+      };
+    }
   }
 
-  return null;
+  let best: { asset: WebsiteAsset; score: number } | null = null;
+  for (const asset of assets) {
+    const normalized = normalizeWebsiteObjectKey(asset.relativePath).toLowerCase();
+    if (!/\.(html?|xhtml)$/.test(normalized)) continue;
+
+    const parts = normalized.split('/').filter(Boolean);
+    const leaf = String(parts[parts.length - 1] || '');
+    let score = 0.55;
+
+    if (leaf === 'index.html') score += 0.2;
+    if (parts.length === 1) score += 0.12;
+    if (normalized.includes('/dist/') || normalized.startsWith('dist/')) score += 0.08;
+    if (normalized.includes('/build/') || normalized.startsWith('build/')) score += 0.08;
+    if (/(home|main|app|default)\.html?$/.test(leaf)) score += 0.12;
+    if (normalized.includes('/templates/') || normalized.startsWith('templates/')) score -= 0.08;
+    if (normalized.includes('/views/') || normalized.startsWith('views/')) score -= 0.05;
+
+    if (!best || score > best.score) {
+      best = { asset, score };
+    }
+  }
+
+  const fallbackDecoded = decodeAssetContent(best?.asset);
+  if (best && fallbackDecoded.trim()) {
+    return {
+      relativePath: best.asset.relativePath,
+      html: fallbackDecoded,
+      reason: 'selected highest-scoring HTML candidate',
+    };
+  }
+
+  return {
+    relativePath: null,
+    html: null,
+    reason: 'no non-empty HTML file detected in collected assets',
+  };
 }
 
 async function resolveProjectSourceRoot(
   userId: string,
   projectId: string,
 ): Promise<string | null> {
+  const meta = await resolveProjectMeta(userId, projectId);
+  if (!meta) return null;
+
+  if (meta.project_type === 'github' && meta.repo_full_name && meta.installation_uuid) {
+    const [owner, repo] = meta.repo_full_name.split('/');
+    if (owner && repo) {
+      try {
+        const repoRoot = await githubService.ensureRepoFresh(meta.installation_uuid, owner, repo);
+        if (repoRoot && fs.existsSync(repoRoot) && fs.statSync(repoRoot).isDirectory()) {
+          return repoRoot;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  const localBase = path.join(process.cwd(), 'tmp', 'local-projects', userId, projectId);
+  if (fs.existsSync(localBase) && fs.statSync(localBase).isDirectory()) {
+    return localBase;
+  }
+
+  return null;
+}
+
+async function resolveProjectMeta(
+  userId: string,
+  projectId: string,
+): Promise<ProjectMetaRow | null> {
   let rows = await query<ProjectMetaRow[]>(
     `SELECT
       p.project_type,
@@ -217,31 +583,173 @@ async function resolveProjectSourceRoot(
       [projectId, userId],
     );
   }
+  return rows[0] || null;
+}
 
-  const meta = rows[0];
-  if (!meta) return null;
+function normalizeRepoWritePath(filePath: string): string {
+  const normalized = normalizeProjectPath(filePath || '');
+  if (!normalized || normalized.includes('..')) return '';
+  return normalized;
+}
 
-  if (meta.project_type === 'github' && meta.repo_full_name && meta.installation_uuid) {
-    const [owner, repo] = meta.repo_full_name.split('/');
-    if (owner && repo) {
+function isPersistableIacFile(file: GeneratedFile): boolean {
+  const safePath = normalizeRepoWritePath(file.path);
+  if (!safePath) return false;
+  if (safePath.startsWith('terraform/site/')) return false;
+  return safePath.startsWith('terraform/') || safePath.startsWith('ansible/') || safePath === 'README.md';
+}
+
+async function persistIacToRepoPr(
+  userId: string,
+  projectId: string,
+  projectName: string,
+  files: GeneratedFile[],
+): Promise<RepoPersistenceResult> {
+  const meta = await resolveProjectMeta(userId, projectId);
+  if (!meta) {
+    return { attempted: false, success: false, pr_url: null, reason: 'project_metadata_unavailable' };
+  }
+  if (meta.project_type !== 'github') {
+    return { attempted: false, success: false, pr_url: null, reason: 'local_project' };
+  }
+  if (!meta.repo_full_name || !meta.installation_uuid) {
+    return { attempted: false, success: false, pr_url: null, reason: 'missing_repo_metadata' };
+  }
+
+  const persistable = files.filter(isPersistableIacFile);
+  if (persistable.length === 0) {
+    return { attempted: false, success: false, pr_url: null, reason: 'no_persistable_iac_files' };
+  }
+
+  const [owner, repo] = meta.repo_full_name.split('/');
+  if (!owner || !repo) {
+    return { attempted: false, success: false, pr_url: null, reason: 'invalid_repo_name' };
+  }
+
+  try {
+    const octokit = await githubService.getInstallationClient(meta.installation_uuid);
+    const repoInfo = await octokit.repos.get({ owner, repo });
+    const baseBranch = String(repoInfo.data.default_branch || 'main');
+
+    const baseRef = await octokit.git.getRef({
+      owner,
+      repo,
+      ref: `heads/${baseBranch}`,
+    });
+
+    const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 12);
+    let branch = `deplai/iac-structure-${timestamp}`;
+    let branchCreated = false;
+    let attempt = 0;
+    while (!branchCreated && attempt < 4) {
+      const suffix = attempt === 0 ? '' : `-${attempt}`;
+      const candidate = `${branch}${suffix}`;
       try {
-        const repoRoot = await githubService.ensureRepoFresh(meta.installation_uuid, owner, repo);
-        if (repoRoot && fs.existsSync(repoRoot) && fs.statSync(repoRoot).isDirectory()) {
-          return repoRoot;
-        }
-      } catch {
-        return null;
+        await octokit.git.createRef({
+          owner,
+          repo,
+          ref: `refs/heads/${candidate}`,
+          sha: baseRef.data.object.sha,
+        });
+        branch = candidate;
+        branchCreated = true;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err || '');
+        if (!/Reference already exists/i.test(msg)) throw err;
+        attempt += 1;
       }
     }
-    return null;
-  }
+    if (!branchCreated) {
+      return {
+        attempted: true,
+        success: false,
+        pr_url: null,
+        reason: 'branch_creation_failed',
+        error: 'Could not allocate a unique branch name for IaC PR.',
+      };
+    }
 
-  const localBase = path.join(process.cwd(), 'tmp', 'local-projects', userId, projectId);
-  if (fs.existsSync(localBase) && fs.statSync(localBase).isDirectory()) {
-    return localBase;
-  }
+    let committed = 0;
+    for (const file of persistable) {
+      const safePath = normalizeRepoWritePath(file.path);
+      if (!safePath) continue;
 
-  return null;
+      let existingSha: string | undefined;
+      try {
+        const existing = await octokit.repos.getContent({
+          owner,
+          repo,
+          path: safePath,
+          ref: branch,
+        });
+        if (!Array.isArray(existing.data) && existing.data.type === 'file') {
+          existingSha = existing.data.sha;
+        }
+      } catch {
+        existingSha = undefined;
+      }
+
+      const contentBase64 = file.encoding === 'base64'
+        ? file.content
+        : Buffer.from(file.content, 'utf-8').toString('base64');
+
+      await octokit.repos.createOrUpdateFileContents({
+        owner,
+        repo,
+        path: safePath,
+        message: existingSha ? `chore(iac): update ${safePath}` : `feat(iac): add ${safePath}`,
+        content: contentBase64,
+        branch,
+        ...(existingSha ? { sha: existingSha } : {}),
+      });
+      committed += 1;
+    }
+
+    if (committed === 0) {
+      return {
+        attempted: true,
+        success: false,
+        pr_url: null,
+        branch,
+        reason: 'no_changes_to_commit',
+      };
+    }
+
+    const pr = await octokit.pulls.create({
+      owner,
+      repo,
+      base: baseBranch,
+      head: branch,
+      title: `feat(iac): structured Terraform bundle for ${projectName}`,
+      body: [
+        'This PR was generated by DeplAI pipeline IaC stage.',
+        '',
+        'Highlights:',
+        '- Structured Terraform layout (`providers.tf`, `backend.tf`, `main.tf`, `variables.tf`, `terraform.tfvars`, `outputs.tf`)',
+        '- Modularized resources (`modules/`)',
+        '- Environment overlays (`environments/dev`, `environments/prod`)',
+        '- Free-tier-eligible defaults with production-aware hardening baseline',
+      ].join('\n'),
+      maintainer_can_modify: true,
+    });
+
+    return {
+      attempted: true,
+      success: true,
+      pr_url: pr.data.html_url || null,
+      branch,
+      files_committed: committed,
+    };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to persist IaC as PR.';
+    return {
+      attempted: true,
+      success: false,
+      pr_url: null,
+      reason: 'persist_failed',
+      error: message,
+    };
+  }
 }
 
 function clampProvider(value: string | undefined): Provider {
@@ -374,13 +882,20 @@ function buildAwsBundle(
 ): GeneratedFile[] {
   const ec2HtmlBase64 = Buffer.from(siteIndexHtml, 'utf-8').toString('base64');
   const siteFiles = buildWebsiteSiteFiles(siteAssets, siteIndexHtml);
+  const safeProjectSlug = awsProjectSlug.replace(/"/g, '');
+  const tfContext = String(contextBlock || '').replace(/\r/g, '').trim() || 'No additional operator context was provided.';
 
-  const mainTf = `terraform {
+  const providersTf = `terraform {
   required_version = ">= 1.5.0"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
     }
     random = {
       source  = "hashicorp/random"
@@ -391,13 +906,298 @@ function buildAwsBundle(
 
 provider "aws" {
   region = var.aws_region
+
+  default_tags {
+    tags = local.common_tags
+  }
+}
+`;
+
+  const backendTf = `terraform {
+  backend "local" {
+    path = "deplai.tfstate"
+  }
+}
+`;
+
+  const mainTf = `locals {
+  common_tags = {
+    Project     = var.project_name
+    ManagedBy   = "deplai"
+    Environment = var.environment
+  }
 }
 
-resource "random_id" "suffix" {
-  byte_length = 4
+module "network" {
+  source = "./modules/network"
+
+  preferred_availability_zones = var.preferred_availability_zones
 }
 
-data "aws_vpc" "default" {
+module "security" {
+  source = "./modules/security"
+
+  project_name        = var.project_name
+  vpc_id              = module.network.vpc_id
+  ingress_cidr_blocks = var.ingress_cidr_blocks
+  tags                = local.common_tags
+}
+
+module "compute" {
+  source = "./modules/compute"
+
+  project_name                = var.project_name
+  enable_ec2                  = var.enable_ec2
+  instance_type               = var.instance_type
+  subnet_id                   = module.network.selected_subnet_id
+  vpc_security_group_ids      = [module.security.web_security_group_id]
+  existing_ec2_key_pair_name  = var.existing_ec2_key_pair_name
+  ec2_root_volume_size        = var.ec2_root_volume_size
+  bootstrap_index_html_base64 = var.bootstrap_index_html_base64
+  tags                        = local.common_tags
+}
+
+module "website" {
+  source = "./modules/website"
+
+  project_name              = var.project_name
+  site_asset_root           = "\${path.root}/site"
+  block_public_access       = var.website_block_public_access
+  force_destroy_site_bucket = var.force_destroy_site_bucket
+  tags                      = local.common_tags
+}
+
+module "observability" {
+  source = "./modules/observability"
+
+  project_name       = var.project_name
+  environment        = var.environment
+  log_retention_days = var.log_retention_days
+  enable_ec2         = var.enable_ec2
+  instance_id        = try(module.compute.instance_id, "")
+  tags               = local.common_tags
+}
+
+# Security context snapshot:
+# - Code findings: ${sec.totalCodeFindings}
+# - Supply findings: ${sec.totalSupplyFindings}
+# - Critical/high supply findings: ${sec.criticalOrHighSupply}
+# - High-impact CWEs: ${sec.highCwe.join(', ') || 'none'}
+`;
+
+  const varsTf = `variable "project_name" {
+  type        = string
+  description = "Project identifier used for resource naming."
+  default     = "${safeProjectSlug}"
+}
+
+variable "aws_region" {
+  type        = string
+  description = "AWS region where resources will be created."
+  default     = "eu-north-1"
+}
+
+variable "environment" {
+  type        = string
+  description = "Environment label for tagging and overlays."
+  default     = "dev"
+}
+
+variable "preferred_availability_zones" {
+  type        = list(string)
+  description = "Preferred AZ order for instance placement."
+  default     = ["eu-north-1a", "eu-north-1b", "eu-north-1c"]
+}
+
+variable "instance_type" {
+  type        = string
+  description = "EC2 instance type (kept free-tier eligible by default)."
+  default     = "t3.micro"
+}
+
+variable "enable_ec2" {
+  type        = bool
+  description = "Whether to provision EC2 compute."
+  default     = true
+}
+
+variable "existing_ec2_key_pair_name" {
+  type        = string
+  description = "Existing EC2 key pair name to attach. Leave empty to auto-generate one."
+  default     = ""
+}
+
+variable "ingress_cidr_blocks" {
+  type        = list(string)
+  description = "Inbound CIDR ranges for SSH/HTTP/HTTPS."
+  default     = ["0.0.0.0/0"]
+}
+
+variable "website_block_public_access" {
+  type        = bool
+  description = "Whether to enforce S3 Block Public Access for website bucket."
+  default     = ${websiteBlockPublicAccess ? 'true' : 'false'}
+}
+
+variable "force_destroy_site_bucket" {
+  type        = bool
+  description = "Allow destroy for non-production cleanups."
+  default     = true
+}
+
+variable "log_retention_days" {
+  type        = number
+  description = "CloudWatch log retention."
+  default     = 30
+}
+
+variable "ec2_root_volume_size" {
+  type        = number
+  description = "Root volume size in GiB."
+  default     = 8
+}
+
+variable "bootstrap_index_html_base64" {
+  type        = string
+  description = "Base64-encoded HTML used for EC2 bootstrap landing page."
+  default     = "${ec2HtmlBase64}"
+  sensitive   = true
+}
+
+variable "context_summary" {
+  type        = string
+  description = "Human context captured during Q/A and architecture stages."
+  default     = ""
+}
+`;
+
+  const terraformTfvars = `project_name = "${safeProjectSlug}"
+aws_region = "eu-north-1"
+environment = "dev"
+instance_type = "t3.micro"
+enable_ec2 = true
+preferred_availability_zones = ["eu-north-1a", "eu-north-1b", "eu-north-1c"]
+ingress_cidr_blocks = ["0.0.0.0/0"]
+existing_ec2_key_pair_name = ""
+website_block_public_access = ${websiteBlockPublicAccess ? 'true' : 'false'}
+force_destroy_site_bucket = true
+log_retention_days = 30
+ec2_root_volume_size = 8
+bootstrap_index_html_base64 = "${ec2HtmlBase64}"
+
+context_summary = <<-EOT
+${tfContext}
+EOT
+`;
+
+  const outputsTf = `output "security_logs_bucket" {
+  value       = module.website.security_logs_bucket
+  description = "S3 bucket for security and application logs."
+}
+
+output "app_log_group" {
+  value       = module.observability.log_group_name
+  description = "CloudWatch log group for runtime logs."
+}
+
+output "instance_public_ip" {
+  value       = module.compute.instance_public_ip
+  description = "Public IP of EC2 instance."
+}
+
+output "ec2_instance_id" {
+  value       = module.compute.instance_id
+  description = "EC2 instance id."
+}
+
+output "ec2_instance_type" {
+  value       = module.compute.instance_type
+  description = "EC2 instance type."
+}
+
+output "ec2_ami_id" {
+  value       = module.compute.ami_id
+  description = "AMI id used for EC2."
+}
+
+output "ec2_public_dns" {
+  value       = module.compute.public_dns
+  description = "EC2 public DNS."
+}
+
+output "ec2_availability_zone" {
+  value       = module.compute.availability_zone
+  description = "EC2 availability zone."
+}
+
+output "ec2_subnet_id" {
+  value       = module.compute.subnet_id
+  description = "Subnet id where EC2 is deployed."
+}
+
+output "ec2_vpc_security_group_ids" {
+  value       = module.compute.vpc_security_group_ids
+  description = "Security groups attached to EC2."
+}
+
+output "ec2_key_name" {
+  value       = module.compute.ec2_key_name
+  description = "Selected EC2 key pair name."
+}
+
+output "generated_ec2_private_key_pem" {
+  value       = module.compute.generated_private_key_pem
+  description = "Generated private key PEM when existing key name is not provided."
+  sensitive   = true
+}
+
+output "vpc_id" {
+  value       = module.network.vpc_id
+  description = "Target VPC id."
+}
+
+output "subnet_ids" {
+  value       = module.network.subnet_ids
+  description = "Candidate subnet ids in VPC."
+}
+
+output "selected_subnet_id" {
+  value       = module.network.selected_subnet_id
+  description = "Subnet selected for EC2 placement."
+}
+
+output "web_security_group_id" {
+  value       = module.security.web_security_group_id
+  description = "Security group used for web ingress."
+}
+
+output "instance_url" {
+  value       = module.compute.instance_url
+  description = "HTTP endpoint of EC2 instance."
+}
+
+output "website_bucket" {
+  value       = module.website.website_bucket
+  description = "S3 bucket hosting static site assets."
+}
+
+output "cloudfront_domain_name" {
+  value       = module.website.cloudfront_domain_name
+  description = "CloudFront domain name."
+}
+
+output "cloudfront_url" {
+  value       = module.website.cloudfront_url
+  description = "Public CloudFront URL."
+}
+
+output "s3_website_endpoint" {
+  value       = module.website.s3_website_endpoint
+  description = "S3 website endpoint."
+}
+`;
+
+  const moduleNetworkMainTf = `data "aws_vpc" "default" {
   default = true
 }
 
@@ -408,17 +1208,53 @@ data "aws_subnets" "default_in_vpc" {
   }
 }
 
-resource "aws_security_group" "web" {
+data "aws_subnet" "default_details" {
+  for_each = toset(data.aws_subnets.default_in_vpc.ids)
+  id       = each.value
+}
+
+locals {
+  preferred_subnet_ids = [
+    for subnet in data.aws_subnet.default_details :
+    subnet.id if contains(var.preferred_availability_zones, subnet.availability_zone)
+  ]
+
+  selected_subnet_id = length(local.preferred_subnet_ids) > 0
+    ? local.preferred_subnet_ids[0]
+    : (length(data.aws_subnets.default_in_vpc.ids) > 0 ? data.aws_subnets.default_in_vpc.ids[0] : "")
+}
+`;
+
+  const moduleNetworkVarsTf = `variable "preferred_availability_zones" {
+  type        = list(string)
+  description = "Preferred AZ order for subnet selection."
+}
+`;
+
+  const moduleNetworkOutputsTf = `output "vpc_id" {
+  value = data.aws_vpc.default.id
+}
+
+output "subnet_ids" {
+  value = data.aws_subnets.default_in_vpc.ids
+}
+
+output "selected_subnet_id" {
+  value = local.selected_subnet_id
+}
+`;
+
+  const moduleSecurityMainTf = `resource "aws_security_group" "web" {
   name_prefix = "\${var.project_name}-web-"
-  description = "Allow SSH and HTTP"
-  vpc_id      = data.aws_vpc.default.id
+  description = "Web and SSH ingress for application access"
+  vpc_id      = var.vpc_id
 
   ingress {
     description = "SSH"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = var.ingress_cidr_blocks
   }
 
   ingress {
@@ -426,7 +1262,15 @@ resource "aws_security_group" "web" {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = var.ingress_cidr_blocks
+  }
+
+  ingress {
+    description = "HTTPS"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = var.ingress_cidr_blocks
   }
 
   egress {
@@ -436,13 +1280,37 @@ resource "aws_security_group" "web" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = {
-    Project = var.project_name
-    Managed = "deplai"
-  }
+  tags = merge(var.tags, {
+    Name = "\${var.project_name}-web"
+  })
+}
+`;
+
+  const moduleSecurityVarsTf = `variable "project_name" {
+  type = string
 }
 
-data "aws_ami" "amazon_linux" {
+variable "vpc_id" {
+  type = string
+}
+
+variable "ingress_cidr_blocks" {
+  type        = list(string)
+  description = "Allowed ingress CIDR blocks."
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+`;
+
+  const moduleSecurityOutputsTf = `output "web_security_group_id" {
+  value = aws_security_group.web.id
+}
+`;
+
+  const moduleComputeMainTf = `data "aws_ami" "amazon_linux" {
   most_recent = true
   owners      = ["amazon"]
 
@@ -452,46 +1320,166 @@ data "aws_ami" "amazon_linux" {
   }
 }
 
+resource "random_id" "suffix" {
+  byte_length = 3
+}
+
+resource "tls_private_key" "ec2_ssh" {
+  count     = var.enable_ec2 && trimspace(var.existing_ec2_key_pair_name) == "" ? 1 : 0
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "aws_key_pair" "generated" {
+  count      = var.enable_ec2 && trimspace(var.existing_ec2_key_pair_name) == "" ? 1 : 0
+  key_name   = "\${var.project_name}-ssh-\${random_id.suffix.hex}"
+  public_key = tls_private_key.ec2_ssh[0].public_key_openssh
+
+  tags = merge(var.tags, {
+    Name = "\${var.project_name}-ssh"
+  })
+}
+
+locals {
+  selected_ec2_key_name = !var.enable_ec2
+    ? null
+    : (
+      trimspace(var.existing_ec2_key_pair_name) != ""
+      ? trimspace(var.existing_ec2_key_pair_name)
+      : try(aws_key_pair.generated[0].key_name, null)
+    )
+}
+
 resource "aws_instance" "app" {
-  count                       = var.enable_ec2 ? 1 : 0
+  count                       = var.enable_ec2 && trimspace(var.subnet_id) != "" ? 1 : 0
   ami                         = data.aws_ami.amazon_linux.id
   instance_type               = var.instance_type
-  subnet_id                   = tolist(data.aws_subnets.default_in_vpc.ids)[0]
-  vpc_security_group_ids      = [aws_security_group.web.id]
+  key_name                    = local.selected_ec2_key_name
+  subnet_id                   = var.subnet_id
+  vpc_security_group_ids      = var.vpc_security_group_ids
   associate_public_ip_address = true
 
   root_block_device {
-    volume_size           = 8
+    volume_size           = var.ec2_root_volume_size
     volume_type           = "gp3"
-    iops                  = 3000
-    encrypted             = false
+    encrypted             = true
     delete_on_termination = true
+  }
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
   }
 
   user_data = <<-EOT
     #!/bin/bash
-    set -eux
+    set -euxo pipefail
     dnf update -y
     dnf install -y nginx
     systemctl enable nginx
-    echo '${ec2HtmlBase64}' | base64 -d > /usr/share/nginx/html/index.html
+    echo '\${var.bootstrap_index_html_base64}' | base64 -d > /usr/share/nginx/html/index.html
     systemctl restart nginx
   EOT
 
-  tags = {
-    Name    = "\${var.project_name}-app"
-    Project = var.project_name
-    Managed = "deplai"
-  }
+  tags = merge(var.tags, {
+    Name = "\${var.project_name}-app"
+  })
+}
+`;
+
+  const moduleComputeVarsTf = `variable "project_name" {
+  type = string
+}
+
+variable "enable_ec2" {
+  type = bool
+}
+
+variable "instance_type" {
+  type = string
+}
+
+variable "subnet_id" {
+  type = string
+}
+
+variable "vpc_security_group_ids" {
+  type = list(string)
+}
+
+variable "existing_ec2_key_pair_name" {
+  type = string
+}
+
+variable "ec2_root_volume_size" {
+  type = number
+}
+
+variable "bootstrap_index_html_base64" {
+  type      = string
+  sensitive = true
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+`;
+
+  const moduleComputeOutputsTf = `output "instance_public_ip" {
+  value = try(aws_instance.app[0].public_ip, null)
+}
+
+output "instance_id" {
+  value = try(aws_instance.app[0].id, null)
+}
+
+output "instance_type" {
+  value = try(aws_instance.app[0].instance_type, null)
+}
+
+output "ami_id" {
+  value = try(aws_instance.app[0].ami, null)
+}
+
+output "public_dns" {
+  value = try(aws_instance.app[0].public_dns, null)
+}
+
+output "availability_zone" {
+  value = try(aws_instance.app[0].availability_zone, null)
+}
+
+output "subnet_id" {
+  value = try(aws_instance.app[0].subnet_id, null)
+}
+
+output "vpc_security_group_ids" {
+  value = try(aws_instance.app[0].vpc_security_group_ids, [])
+}
+
+output "ec2_key_name" {
+  value = local.selected_ec2_key_name
+}
+
+output "generated_private_key_pem" {
+  value     = try(tls_private_key.ec2_ssh[0].private_key_pem, null)
+  sensitive = true
+}
+
+output "instance_url" {
+  value = try("http://\${aws_instance.app[0].public_ip}", null)
+}
+`;
+
+  const moduleWebsiteMainTf = `resource "random_id" "suffix" {
+  byte_length = 4
 }
 
 resource "aws_s3_bucket" "security_logs" {
-  bucket = "\${var.project_name}-security-logs-\${random_id.suffix.hex}"
-
-  tags = {
-    Project = var.project_name
-    Managed = "deplai"
-  }
+  bucket        = "\${var.project_name}-security-logs-\${random_id.suffix.hex}"
+  force_destroy = true
+  tags          = var.tags
 }
 
 resource "aws_s3_bucket_public_access_block" "security_logs" {
@@ -503,11 +1491,16 @@ resource "aws_s3_bucket_public_access_block" "security_logs" {
 }
 
 resource "aws_s3_bucket" "website" {
-  bucket = "\${var.project_name}-site-\${random_id.suffix.hex}"
+  bucket        = "\${var.project_name}-site-\${random_id.suffix.hex}"
+  force_destroy = var.force_destroy_site_bucket
+  tags          = var.tags
+}
 
-  tags = {
-    Project = var.project_name
-    Managed = "deplai"
+resource "aws_s3_bucket_ownership_controls" "website" {
+  bucket = aws_s3_bucket.website.id
+
+  rule {
+    object_ownership = "BucketOwnerPreferred"
   }
 }
 
@@ -525,44 +1518,45 @@ resource "aws_s3_bucket_website_configuration" "website" {
 
 resource "aws_s3_bucket_public_access_block" "website" {
   bucket                  = aws_s3_bucket.website.id
-  block_public_acls       = ${websiteBlockPublicAccess ? 'true' : 'false'}
-  block_public_policy     = ${websiteBlockPublicAccess ? 'true' : 'false'}
-  ignore_public_acls      = ${websiteBlockPublicAccess ? 'true' : 'false'}
-  restrict_public_buckets = ${websiteBlockPublicAccess ? 'true' : 'false'}
+  block_public_acls       = var.block_public_access
+  block_public_policy     = var.block_public_access
+  ignore_public_acls      = var.block_public_access
+  restrict_public_buckets = var.block_public_access
 }
 
 locals {
   content_type_by_ext = {
-    html = "text/html"
-    htm  = "text/html"
-    css  = "text/css"
-    js   = "application/javascript"
-    mjs  = "application/javascript"
-    json = "application/json"
-    map  = "application/json"
-    txt  = "text/plain"
-    xml  = "application/xml"
-    svg  = "image/svg+xml"
-    png  = "image/png"
-    jpg  = "image/jpeg"
-    jpeg = "image/jpeg"
-    gif  = "image/gif"
-    webp = "image/webp"
-    ico  = "image/x-icon"
-    woff = "font/woff"
+    html  = "text/html"
+    htm   = "text/html"
+    css   = "text/css"
+    js    = "application/javascript"
+    mjs   = "application/javascript"
+    json  = "application/json"
+    map   = "application/json"
+    txt   = "text/plain"
+    xml   = "application/xml"
+    svg   = "image/svg+xml"
+    png   = "image/png"
+    jpg   = "image/jpeg"
+    jpeg  = "image/jpeg"
+    gif   = "image/gif"
+    webp  = "image/webp"
+    ico   = "image/x-icon"
+    woff  = "font/woff"
     woff2 = "font/woff2"
-    ttf  = "font/ttf"
-    eot  = "application/vnd.ms-fontobject"
-    otf  = "font/otf"
+    ttf   = "font/ttf"
+    eot   = "application/vnd.ms-fontobject"
+    otf   = "font/otf"
   }
 }
 
 resource "aws_s3_object" "website_assets" {
-  for_each = fileset("\${path.module}/site", "**")
-  bucket   = aws_s3_bucket.website.id
-  key      = each.value
-  source   = "\${path.module}/site/\${each.value}"
-  etag     = filemd5("\${path.module}/site/\${each.value}")
+  for_each = fileset(var.site_asset_root, "**")
+
+  bucket = aws_s3_bucket.website.id
+  key    = each.value
+  source = "\${var.site_asset_root}/\${each.value}"
+  etag   = filemd5("\${var.site_asset_root}/\${each.value}")
 
   content_type = lookup(
     local.content_type_by_ext,
@@ -573,7 +1567,7 @@ resource "aws_s3_object" "website_assets" {
 
 resource "aws_cloudfront_origin_access_control" "website" {
   name                              = "\${var.project_name}-oac-\${random_id.suffix.hex}"
-  description                       = "Origin access control for S3 website bucket"
+  description                       = "Origin access control for static website bucket"
   origin_access_control_origin_type = "s3"
   signing_behavior                  = "always"
   signing_protocol                  = "sigv4"
@@ -591,11 +1585,11 @@ resource "aws_cloudfront_distribution" "cdn" {
   }
 
   default_cache_behavior {
-    allowed_methods  = ["GET", "HEAD", "OPTIONS"]
-    cached_methods   = ["GET", "HEAD"]
-    target_origin_id = "s3-origin-\${aws_s3_bucket.website.id}"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "s3-origin-\${aws_s3_bucket.website.id}"
     viewer_protocol_policy = "redirect-to-https"
-    compress = true
+    compress               = true
 
     forwarded_values {
       query_string = false
@@ -622,10 +1616,12 @@ data "aws_iam_policy_document" "website_oac" {
   statement {
     actions   = ["s3:GetObject"]
     resources = ["\${aws_s3_bucket.website.arn}/*"]
+
     principals {
       type        = "Service"
       identifiers = ["cloudfront.amazonaws.com"]
     }
+
     condition {
       test     = "StringEquals"
       variable = "AWS:SourceArn"
@@ -638,138 +1634,131 @@ resource "aws_s3_bucket_policy" "website" {
   bucket = aws_s3_bucket.website.id
   policy = data.aws_iam_policy_document.website_oac.json
 }
-
-resource "aws_cloudwatch_log_group" "app" {
-  name              = "/deplai/\${var.project_name}-\${random_id.suffix.hex}"
-  retention_in_days = 30
-}
-
-# Security context summary:
-# - Code findings: ${sec.totalCodeFindings}
-# - Supply findings: ${sec.totalSupplyFindings} (critical/high: ${sec.criticalOrHighSupply})
-# - High-impact CWEs: ${sec.highCwe.join(', ') || 'none'}
-# - Next: add workload modules and IAM least-privilege policies.
 `;
 
-  const varsTf = `variable "project_name" {
-  type        = string
-  description = "Project identifier for resource naming."
-  default     = "${awsProjectSlug.replace(/"/g, '')}"
+  const moduleWebsiteVarsTf = `variable "project_name" {
+  type = string
 }
 
-variable "aws_region" {
-  type        = string
-  description = "AWS region for deployment."
-  default     = "ap-south-1"
+variable "site_asset_root" {
+  type = string
 }
 
-variable "instance_type" {
-  type        = string
-  description = "EC2 instance size for the deployed workload."
-  default     = "t3.micro"
+variable "block_public_access" {
+  type = bool
 }
 
-variable "enable_ec2" {
-  type        = bool
-  description = "Whether to create EC2 workload resources."
-  default     = true
+variable "force_destroy_site_bucket" {
+  type = bool
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
 }
 `;
 
-  const outputsTf = `output "security_logs_bucket" {
-  value       = aws_s3_bucket.security_logs.bucket
-  description = "Bucket for security and application logs."
-}
-
-output "app_log_group" {
-  value       = aws_cloudwatch_log_group.app.name
-  description = "CloudWatch log group for workloads."
-}
-
-output "instance_public_ip" {
-  value       = try(aws_instance.app[0].public_ip, null)
-  description = "Public IP for the deployed EC2 instance."
-}
-
-output "ec2_instance_id" {
-  value       = try(aws_instance.app[0].id, null)
-  description = "EC2 instance id."
-}
-
-output "ec2_instance_type" {
-  value       = try(aws_instance.app[0].instance_type, null)
-  description = "EC2 instance type."
-}
-
-output "ec2_ami_id" {
-  value       = try(aws_instance.app[0].ami, null)
-  description = "AMI id used for EC2."
-}
-
-output "ec2_public_dns" {
-  value       = try(aws_instance.app[0].public_dns, null)
-  description = "Public DNS name of EC2."
-}
-
-output "ec2_availability_zone" {
-  value       = try(aws_instance.app[0].availability_zone, null)
-  description = "Availability zone of EC2."
-}
-
-output "ec2_subnet_id" {
-  value       = try(aws_instance.app[0].subnet_id, null)
-  description = "Subnet id where EC2 is deployed."
-}
-
-output "ec2_vpc_security_group_ids" {
-  value       = try(aws_instance.app[0].vpc_security_group_ids, [])
-  description = "Security groups attached to EC2."
-}
-
-output "ec2_key_name" {
-  value       = try(aws_instance.app[0].key_name, null)
-  description = "EC2 key pair name if configured."
-}
-
-output "vpc_id" {
-  value       = data.aws_vpc.default.id
-  description = "Target VPC id."
-}
-
-output "subnet_ids" {
-  value       = data.aws_subnets.default_in_vpc.ids
-  description = "Candidate subnet ids in the VPC."
-}
-
-output "web_security_group_id" {
-  value       = aws_security_group.web.id
-  description = "Security group id for EC2 web ingress."
-}
-
-output "instance_url" {
-  value       = try("http://\${aws_instance.app[0].public_ip}", null)
-  description = "HTTP endpoint of the deployed instance."
+  const moduleWebsiteOutputsTf = `output "security_logs_bucket" {
+  value = aws_s3_bucket.security_logs.bucket
 }
 
 output "website_bucket" {
-  value       = aws_s3_bucket.website.bucket
-  description = "S3 bucket hosting static assets for CloudFront."
+  value = aws_s3_bucket.website.bucket
 }
 
 output "cloudfront_domain_name" {
-  value       = aws_cloudfront_distribution.cdn.domain_name
-  description = "CloudFront domain name."
+  value = aws_cloudfront_distribution.cdn.domain_name
 }
 
 output "cloudfront_url" {
-  value       = "https://\${aws_cloudfront_distribution.cdn.domain_name}"
-  description = "Public CloudFront URL."
+  value = "https://\${aws_cloudfront_distribution.cdn.domain_name}"
 }
 
 output "s3_website_endpoint" {
-  value       = aws_s3_bucket_website_configuration.website.website_endpoint
-  description = "S3 static website endpoint."
+  value = aws_s3_bucket_website_configuration.website.website_endpoint
 }
+`;
+
+  const moduleObservabilityMainTf = `resource "aws_cloudwatch_log_group" "app" {
+  name              = "/deplai/\${var.project_name}/\${var.environment}"
+  retention_in_days = var.log_retention_days
+  tags              = var.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "ec2_cpu_high" {
+  count = var.enable_ec2 && trimspace(var.instance_id) != "" ? 1 : 0
+
+  alarm_name          = "\${var.project_name}-\${var.environment}-ec2-cpu-high"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 80
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    InstanceId = var.instance_id
+  }
+
+  tags = var.tags
+}
+`;
+
+  const moduleObservabilityVarsTf = `variable "project_name" {
+  type = string
+}
+
+variable "environment" {
+  type = string
+}
+
+variable "log_retention_days" {
+  type = number
+}
+
+variable "enable_ec2" {
+  type = bool
+}
+
+variable "instance_id" {
+  type = string
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+`;
+
+  const moduleObservabilityOutputsTf = `output "log_group_name" {
+  value = aws_cloudwatch_log_group.app.name
+}
+
+output "cpu_alarm_name" {
+  value = try(aws_cloudwatch_metric_alarm.ec2_cpu_high[0].alarm_name, null)
+}
+`;
+
+  const envDevTfvars = `environment = "dev"
+instance_type = "t3.micro"
+enable_ec2 = true
+force_destroy_site_bucket = true
+log_retention_days = 14
+`;
+
+  const envProdTfvars = `environment = "prod"
+instance_type = "t3.micro"
+enable_ec2 = true
+force_destroy_site_bucket = false
+log_retention_days = 30
+`;
+
+  const envDevBackendHcl = `path = "deplai-dev.tfstate"
+`;
+
+  const envProdBackendHcl = `path = "deplai-prod.tfstate"
 `;
 
   const ansiblePlaybook = `---
@@ -795,6 +1784,23 @@ output "s3_website_endpoint" {
         state: enabled
         policy: deny
 
+    - name: Allow SSH through UFW
+      ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: Allow HTTP through UFW
+      ufw:
+        rule: allow
+        port: '80'
+        proto: tcp
+
+    - name: Allow HTTPS through UFW
+      ufw:
+        rule: allow
+        port: '443'
+        proto: tcp
+
   handlers:
     - name: restart ssh
       service:
@@ -811,32 +1817,83 @@ example-host ansible_host=127.0.0.1 ansible_user=ubuntu
 
 Generated by DeplAI pipeline Step 9.
 
-## Included
-- Terraform baseline for provider: AWS
-- Ansible hardening playbook
+## Terraform Structure
+- \`terraform/providers.tf\` -> provider + required providers
+- \`terraform/backend.tf\` -> state backend declaration
+- \`terraform/main.tf\` -> root module wiring
+- \`terraform/variables.tf\` -> input contract
+- \`terraform/terraform.tfvars\` -> baseline values
+- \`terraform/outputs.tf\` -> deployment outputs
+- \`terraform/modules/*\` -> reusable building blocks
+- \`terraform/environments/dev|prod\` -> environment overlays
+
+## Modules
+- \`modules/network\`: default VPC and subnet selection by preferred AZ
+- \`modules/security\`: web security group for SSH/HTTP/HTTPS
+- \`modules/compute\`: EC2 + key pair generation fallback
+- \`modules/website\`: S3 asset hosting + CloudFront OAC
+- \`modules/observability\`: CloudWatch log group + CPU alarm baseline
+
+## Free-tier + Production-aware defaults
+- Instance default: \`t3.micro\`
+- Root volume: encrypted \`gp3\` with \`8 GiB\`
+- CloudFront in front of S3 with OAC
+- IMDSv2 required on EC2
+- Environment overlays under \`environments/\`
 
 ## Context
 ${contextBlock}
 
 ## Commands
 \`\`\`bash
-terraform init
-terraform plan
-ansible-playbook -i ansible/inventory.ini ansible/playbooks/security-hardening.yml --syntax-check
+cd terraform
+terraform init -backend-config=environments/dev/backend.hcl
+terraform plan -var-file=terraform.tfvars -var-file=environments/dev/terraform.tfvars
 \`\`\`
+
+## Key Pair Handling
+If \`existing_ec2_key_pair_name\` is empty, Terraform generates a key pair and exposes \`generated_ec2_private_key_pem\`. Download the \`.pem\` or \`.ppk\` immediately from the DeplAI UI.
 `;
 
   return [
+    { path: 'terraform/providers.tf', content: providersTf },
+    { path: 'terraform/backend.tf', content: backendTf },
     { path: 'terraform/main.tf', content: mainTf },
     { path: 'terraform/variables.tf', content: varsTf },
+    { path: 'terraform/terraform.tfvars', content: terraformTfvars },
     { path: 'terraform/outputs.tf', content: outputsTf },
+
+    { path: 'terraform/modules/network/main.tf', content: moduleNetworkMainTf },
+    { path: 'terraform/modules/network/variables.tf', content: moduleNetworkVarsTf },
+    { path: 'terraform/modules/network/outputs.tf', content: moduleNetworkOutputsTf },
+
+    { path: 'terraform/modules/security/main.tf', content: moduleSecurityMainTf },
+    { path: 'terraform/modules/security/variables.tf', content: moduleSecurityVarsTf },
+    { path: 'terraform/modules/security/outputs.tf', content: moduleSecurityOutputsTf },
+
+    { path: 'terraform/modules/compute/main.tf', content: moduleComputeMainTf },
+    { path: 'terraform/modules/compute/variables.tf', content: moduleComputeVarsTf },
+    { path: 'terraform/modules/compute/outputs.tf', content: moduleComputeOutputsTf },
+
+    { path: 'terraform/modules/website/main.tf', content: moduleWebsiteMainTf },
+    { path: 'terraform/modules/website/variables.tf', content: moduleWebsiteVarsTf },
+    { path: 'terraform/modules/website/outputs.tf', content: moduleWebsiteOutputsTf },
+
+    { path: 'terraform/modules/observability/main.tf', content: moduleObservabilityMainTf },
+    { path: 'terraform/modules/observability/variables.tf', content: moduleObservabilityVarsTf },
+    { path: 'terraform/modules/observability/outputs.tf', content: moduleObservabilityOutputsTf },
+
+    { path: 'terraform/environments/dev/terraform.tfvars', content: envDevTfvars },
+    { path: 'terraform/environments/dev/backend.hcl', content: envDevBackendHcl },
+    { path: 'terraform/environments/prod/terraform.tfvars', content: envProdTfvars },
+    { path: 'terraform/environments/prod/backend.hcl', content: envProdBackendHcl },
+
     ...siteFiles,
     { path: 'ansible/inventory.ini', content: inventory },
     { path: 'ansible/playbooks/security-hardening.yml', content: ansiblePlaybook },
     { path: 'README.md', content: readme },
   ];
 }
-
 function buildAzureBundle(projectName: string, contextBlock: string, sec: ReturnType<typeof summarizeSecurity>): GeneratedFile[] {
   const mainTf = `terraform {
   required_version = ">= 1.5.0"
@@ -1042,8 +2099,18 @@ export async function POST(req: NextRequest) {
     const projectName = String(owned.project?.name || owned.project?.full_name || projectId).split('/').pop() || projectId;
     const qa = String(body.qa_summary || '').trim();
     const arch = String(body.architecture_context || '').trim();
+    const architectureValidation = body.architecture_json
+      ? validateArchitectureJson(body.architecture_json)
+      : null;
+    if (architectureValidation && !architectureValidation.valid) {
+      return NextResponse.json(
+        { error: `architecture_json contract validation failed: ${architectureValidation.errors.join('; ')}` },
+        { status: 400 },
+      );
+    }
     const hasArchitectureJson = Boolean(
-      body.architecture_json && Object.keys(body.architecture_json).length > 0,
+      architectureValidation?.valid && architectureValidation.normalized
+        && Object.keys(architectureValidation.normalized).length > 0,
     );
 
     // Hard gate: do not generate Terraform without any operator context.
@@ -1081,6 +2148,7 @@ export async function POST(req: NextRequest) {
       `High-impact CWE IDs: ${sec.highCwe.join(', ') || 'none'}`,
     ].filter(Boolean).join('\n');
 
+    const iacWarnings: string[] = [];
     const sourceRoot = provider === 'aws'
       ? await resolveProjectSourceRoot(String(user.id), projectId)
       : null;
@@ -1093,29 +2161,60 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
-    const websiteAssets = sourceRoot ? collectWebsiteAssets(sourceRoot) : [];
-    if (provider === 'aws' && websiteAssets.length === 0) {
-      return NextResponse.json(
-        {
-          error: 'Repository source was resolved but no deployable files were found for S3 website packaging.',
-          requires_repo_sync: true,
-        },
-        { status: 400 },
-      );
-    }
-    const resolvedIndexHtml = provider === 'aws' ? resolveIndexHtmlFromAssets(websiteAssets) : null;
-    if (provider === 'aws' && !String(resolvedIndexHtml || '').trim()) {
-      return NextResponse.json(
-        {
-          error: 'No deployable index.html found in repository (checked: index.html, public/index.html, src/index.html, dist/index.html, build/index.html).',
-          requires_repo_sync: true,
-        },
-        { status: 400 },
-      );
-    }
+
+    const websiteCollection = provider === 'aws' && sourceRoot
+      ? collectWebsiteAssets(sourceRoot)
+      : null;
+    const frontendDetection = provider === 'aws' && sourceRoot
+      ? detectFrontendEntrypoint(sourceRoot)
+      : null;
+    const websiteAssets = websiteCollection?.assets || [];
+    const websiteEntrypoint = provider === 'aws'
+      ? resolvePrimaryWebsiteHtmlFromAssets(websiteAssets)
+      : { relativePath: null, html: null, reason: 'provider is not aws' };
+    const fallbackHint = provider === 'aws'
+      ? buildFrontendFallbackHint(projectName, frontendDetection)
+      : '';
     const websiteIndexHtml = provider === 'aws'
-      ? String(resolvedIndexHtml || '').trim()
-      : ((resolvedIndexHtml || '').trim() || defaultWebsiteHtml(projectName));
+      ? (String(websiteEntrypoint.html || '').trim() || defaultWebsiteHtml(projectName, fallbackHint))
+      : defaultWebsiteHtml(projectName);
+
+    if (provider === 'aws') {
+      if (websiteCollection?.selectedRoot) {
+        iacWarnings.push(`Website assets were collected from '${websiteCollection.selectedRoot}'.`);
+      }
+      if ((websiteCollection?.assets.length || 0) === 0) {
+        iacWarnings.push('No deployable web asset directory was found; using a generated index.html fallback.');
+      }
+      if (frontendDetection?.detected) {
+        const firstCandidate = frontendDetection.entry_candidates[0];
+        if (firstCandidate) {
+          iacWarnings.push(`Detected frontend source entrypoint '${firstCandidate}' (${frontendDetection.framework}).`);
+        } else {
+          iacWarnings.push(`Detected frontend framework '${frontendDetection.framework}' without static HTML entrypoint.`);
+        }
+        if (!frontendDetection.has_build_output) {
+          const buildHint = frontendDetection.build_command
+            ? `Run '${frontendDetection.build_command}' before IaC generation so deployable static assets exist.`
+            : 'Run a frontend build before IaC generation so deployable static assets exist.';
+          iacWarnings.push(`Frontend build output was not found (dist/build/out). ${buildHint}`);
+        }
+      }
+      if (websiteCollection?.truncated) {
+        iacWarnings.push(
+          `Repository asset mirroring hit limits (${MAX_SITE_TOTAL_BYTES} bytes / ${MAX_SITE_FILES} files); deploying a trimmed website bundle.`,
+        );
+      }
+      if ((websiteCollection?.skippedLargeFiles || 0) > 0) {
+        iacWarnings.push(`Skipped ${websiteCollection?.skippedLargeFiles} file(s) larger than ${MAX_SITE_FILE_BYTES} bytes.`);
+      }
+      if (websiteEntrypoint.relativePath) {
+        iacWarnings.push(`Primary website entrypoint resolved to '${websiteEntrypoint.relativePath}' (${websiteEntrypoint.reason}).`);
+      } else {
+        iacWarnings.push(`No HTML entrypoint was detected (${websiteEntrypoint.reason}); using a generated index.html.`);
+      }
+    }
+
     const awsProjectSlug = toAwsProjectSlug(projectName);
     const websiteBlockPublicAccess = resolveWebsiteBlockPublicAccess(qa, arch);
 
@@ -1127,7 +2226,7 @@ export async function POST(req: NextRequest) {
           method: 'POST',
           headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            architecture_json: body.architecture_json,
+            architecture_json: architectureValidation?.normalized,
             provider,
             project_name: projectName,
             qa_summary: qa || null,
@@ -1141,6 +2240,7 @@ export async function POST(req: NextRequest) {
         };
 
         if (ragData.success && ragData.source === 'rag_agent' && Array.isArray(ragData.files)) {
+          const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, ragData.files);
           return NextResponse.json({
             success: true,
             provider,
@@ -1150,6 +2250,7 @@ export async function POST(req: NextRequest) {
             files: ragData.files,
             security_context: sec,
             source: 'rag_agent',
+            iac_repo_pr: iacRepoPr,
             legacy_assets: {
               terraform_rag: legacyTerraform,
               runtime_reference: legacyRuntime,
@@ -1176,16 +2277,38 @@ export async function POST(req: NextRequest) {
           websiteIndexHtml,
           websiteBlockPublicAccess,
         );
+    const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, files);
+    if (iacRepoPr.attempted && !iacRepoPr.success) {
+      const persistenceMsg = iacRepoPr.error || iacRepoPr.reason || 'IaC repo persistence failed.';
+      iacWarnings.push(`IaC PR persistence: ${persistenceMsg}`);
+    }
+
+    const summary = provider === 'aws' && iacWarnings.length > 0
+      ? `Generated ${files.length} IaC files for ${provider.toUpperCase()} with ${iacWarnings.length} packaging warning(s).`
+      : `Generated ${files.length} IaC files for ${provider.toUpperCase()}.`;
 
     return NextResponse.json({
       success: true,
       provider,
       project_id: projectId,
       project_name: projectName,
-      summary: `Generated ${files.length} IaC files for ${provider.toUpperCase()}.`,
+      summary,
       files,
       security_context: sec,
       source: 'template',
+      iac_repo_pr: iacRepoPr,
+      warnings: iacWarnings,
+      website_asset_stats: provider === 'aws'
+        ? {
+          selected_root: websiteCollection?.selectedRoot || '',
+          asset_count: websiteAssets.length,
+          total_bytes: websiteCollection?.totalBytes || 0,
+          truncated: Boolean(websiteCollection?.truncated),
+          skipped_large_files: websiteCollection?.skippedLargeFiles || 0,
+          entrypoint: websiteEntrypoint.relativePath,
+        }
+        : null,
+      frontend_entrypoint_detection: provider === 'aws' ? frontendDetection : null,
       legacy_assets: {
         terraform_rag: legacyTerraform,
         runtime_reference: legacyRuntime,
@@ -1196,3 +2319,4 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
+

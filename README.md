@@ -394,6 +394,35 @@ npm run dev
 
 Open `http://localhost:3000`.
 
+### 7. Detect Runtime + Entrypoint (optional)
+
+Use the detector on any unknown repository before IaC/deploy decisions:
+
+```bash
+python tools/detect_entry.py <path-to-repo>
+```
+
+JSON output mode:
+
+```bash
+python tools/detect_entry.py <path-to-repo> --json
+```
+
+The detector combines:
+- build/runtime config parsing (`package.json`, `pyproject.toml`, webpack/vite config),
+- framework conventions (Next.js/Vite/React/Flask/Django/common server layouts),
+- server route/template clues (`sendFile`, `express.static`, `render_template`, etc.),
+- confidence scoring with `requires_user_confirmation` when ambiguity remains.
+
+### 8. Autopilot Mode For Large Repositories
+
+In the Pipeline dashboard:
+- Enable **Autopilot mode** to auto-complete Q/A, policy gates, and deployment trigger.
+- Keep **Skip remediation loop** enabled for large repositories when deployment speed is the priority.
+- Provide runtime AWS credentials in the sidebar for Stage 10.
+
+Runtime deploy guardrails now enforce Free Tier EC2 candidates (`t3.micro`, `t2.micro`) by default for `runtime_apply`.
+
 ---
 
 ## Key API Endpoints

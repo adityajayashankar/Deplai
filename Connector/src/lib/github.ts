@@ -5,6 +5,7 @@ import { v4 as uuidv4 } from 'uuid';
 import simpleGit from 'simple-git';
 import fs from 'fs';
 import path from 'path';
+import { requireEnv } from './env';
 
 interface GitHubConfig {
   appId: string;
@@ -477,7 +478,7 @@ export class GitHubService {
 }
 
 export const githubService = new GitHubService({
-  appId: process.env.GITHUB_APP_ID!,
-  privateKey: process.env.GITHUB_PRIVATE_KEY!,
-  webhookSecret: process.env.GITHUB_WEBHOOK_SECRET!,
+  appId: requireEnv('GITHUB_APP_ID'),
+  privateKey: requireEnv('GITHUB_PRIVATE_KEY'),
+  webhookSecret: requireEnv('GITHUB_WEBHOOK_SECRET'),
 });

@@ -1,26 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
+import { validateArchitectureJson } from '@/lib/architecture-contract';
 import { resolveAwsIconName } from '@/lib/aws-icons';
-
-interface ArchitectureNode {
-  id?: string;
-  label?: string;
-  type?: string;
-}
-
-interface ArchitectureEdge {
-  from?: string;
-  to?: string;
-  label?: string;
-}
 
 interface DiagramBody {
   project_id?: string;
-  architecture_json?: {
-    title?: string;
-    nodes?: ArchitectureNode[];
-    edges?: ArchitectureEdge[];
-  };
+  architecture_json?: unknown;
 }
 
 interface DiagramNodePreview {
@@ -48,18 +33,17 @@ export async function POST(req: NextRequest) {
       if ('error' in owned) return owned.error;
     }
 
-    const architecture = body.architecture_json;
-    if (!architecture || typeof architecture !== 'object') {
-      return NextResponse.json({ error: 'architecture_json is required' }, { status: 400 });
+    const archValidation = validateArchitectureJson(body.architecture_json);
+    if (!archValidation.valid || !archValidation.normalized) {
+      return NextResponse.json(
+        { error: `architecture_json contract validation failed: ${archValidation.errors.join('; ')}` },
+        { status: 400 },
+      );
     }
-
-    const nodes = Array.isArray(architecture.nodes) ? architecture.nodes : [];
-    const edges = Array.isArray(architecture.edges) ? architecture.edges : [];
-    const title = String(architecture.title || 'Architecture Diagram').trim();
-
-    if (nodes.length === 0) {
-      return NextResponse.json({ error: 'architecture_json.nodes cannot be empty' }, { status: 400 });
-    }
+    const architecture = archValidation.normalized;
+    const nodes = architecture.nodes;
+    const edges = architecture.edges;
+    const title = architecture.title;
 
     const nodeLines: string[] = [];
     const nodePreview: DiagramNodePreview[] = [];

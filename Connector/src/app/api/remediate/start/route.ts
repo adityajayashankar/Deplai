@@ -21,6 +21,36 @@ interface GitHubRepoRow {
   suspended_at: string | null;
 }
 
+interface GitHubUserProfile {
+  id: number;
+  login: string;
+}
+
+async function validateGitHubTokenOwnership(githubToken: string, expectedLogin?: string | null): Promise<void> {
+  const response = await fetch('https://api.github.com/user', {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${githubToken}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    cache: 'no-store',
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!response.ok) {
+    throw new Error('Invalid GitHub token');
+  }
+
+  const profile = (await response.json()) as GitHubUserProfile;
+  if (!profile?.login) {
+    throw new Error('Invalid GitHub token profile');
+  }
+
+  if (expectedLogin && profile.login.toLowerCase() !== expectedLogin.toLowerCase()) {
+    throw new Error('GitHub token does not belong to authenticated user');
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const { user, error } = await requireAuth();
@@ -71,6 +101,8 @@ export async function POST(request: NextRequest) {
             { status: 400 },
           );
         }
+
+        await validateGitHubTokenOwnership(runtimeGithubToken, user.login);
 
         const token = runtimeGithubToken;
         const [owner, repo] = project.repo_full_name.split('/');
@@ -128,6 +160,8 @@ export async function POST(request: NextRequest) {
           { status: 400 }
         );
       }
+
+      await validateGitHubTokenOwnership(runtimeGithubToken, user.login);
 
       const token = runtimeGithubToken;
       const [owner, repo] = ghRepo.full_name.split('/');

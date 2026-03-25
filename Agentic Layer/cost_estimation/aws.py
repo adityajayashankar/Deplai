@@ -47,6 +47,31 @@ REGION_USAGE_TYPE_PREFIX = {
     "ap-southeast-1": "APS1",
     "us-east-1": "USE1",
     "us-west-2": "USW2",
+    "eu-north-1": "EUN1",
+    "eu-west-1": "EU",
+    "eu-west-2": "EUW2",
+    "eu-central-1": "EUC1",
+}
+
+EC2_HOURLY_FALLBACK = {
+    "t3.micro": 0.0124,
+    "t2.micro": 0.0116,
+    "t3.small": 0.0208,
+    "t3.medium": 0.0416,
+    "t3.large": 0.0832,
+}
+
+EBS_GB_MONTH_FALLBACK = {
+    "gp3": 0.08,
+    "gp2": 0.10,
+    "st1": 0.045,
+    "sc1": 0.025,
+}
+
+S3_GB_MONTH_FALLBACK = {
+    "General Purpose": 0.023,
+    "Infrequent Access": 0.0125,
+    "Archive": 0.004,
 }
 
 
@@ -98,10 +123,15 @@ def _ec2_estimate(client, node: dict) -> dict:
         {"Type": "TERM_MATCH", "Field": "termType", "Value": term_type},
         {"Type": "TERM_MATCH", "Field": "location", "Value": region},
     ]
-    resp = client.get_products(ServiceCode="AmazonEC2", Filters=ec2_filters, MaxResults=1)
+    resp = {"PriceList": []}
+    if client is not None:
+        resp = client.get_products(ServiceCode="AmazonEC2", Filters=ec2_filters, MaxResults=1)
+    fallback_pricing_used = False
     if not resp["PriceList"]:
-        return {"error": "No EC2 pricing found"}
-    hourly = _extract_monthly_price(resp["PriceList"][0])
+        hourly = float(EC2_HOURLY_FALLBACK.get(str(instance_type).lower(), EC2_HOURLY_FALLBACK["t3.micro"]))
+        fallback_pricing_used = True
+    else:
+        hourly = _extract_monthly_price(resp["PriceList"][0])
     monthly_compute = round(hourly * 730 * max(1, instance_count), 4)
 
     storage_filters = [
@@ -110,11 +140,17 @@ def _ec2_estimate(client, node: dict) -> dict:
         {"Type": "TERM_MATCH", "Field": "location", "Value": region},
         {"Type": "TERM_MATCH", "Field": "volumeApiName", "Value": volume_type},
     ]
-    sresp = client.get_products(ServiceCode="AmazonEC2", Filters=storage_filters, MaxResults=1)
+    sresp = {"PriceList": []}
+    if client is not None:
+        sresp = client.get_products(ServiceCode="AmazonEC2", Filters=storage_filters, MaxResults=1)
     monthly_storage = 0.0
     if sresp["PriceList"]:
         price_per_gb = _extract_monthly_price(sresp["PriceList"][0])
         monthly_storage = round(price_per_gb * storage_gb * max(1, instance_count), 4)
+    else:
+        fallback_pricing_used = True
+        fallback_gb_price = float(EBS_GB_MONTH_FALLBACK.get(str(volume_type).lower(), EBS_GB_MONTH_FALLBACK["gp3"]))
+        monthly_storage = round(fallback_gb_price * storage_gb * max(1, instance_count), 4)
 
     return {
         "service": "AmazonEC2",
@@ -122,10 +158,13 @@ def _ec2_estimate(client, node: dict) -> dict:
         "ec2_instance_monthly_usd": monthly_compute,
         "ec2_storage_monthly_usd": monthly_storage,
         "ec2_total_monthly_usd": round(monthly_compute + monthly_storage, 4),
+        "fallback_pricing_used": fallback_pricing_used,
     }
 
 
 def _rds_estimate(client, node: dict) -> dict:
+    if client is None:
+        return {"error": "RDS live pricing unavailable without AWS pricing credentials"}
     attrs = node.get("attributes", {})
     region_friendly = node.get("region", "Asia Pacific (Mumbai)")
     aws_region = REGION_CODE_MAP.get(region_friendly, "ap-south-1")
@@ -177,20 +216,30 @@ def _s3_estimate(client, node: dict) -> dict:
         {"Type": "TERM_MATCH", "Field": "storageClass", "Value": storage_class},
         {"Type": "TERM_MATCH", "Field": "usagetype", "Value": f"{usage_prefix}-TimedStorage-ByteHrs"},
     ]
-    resp = client.get_products(ServiceCode="AmazonS3", Filters=storage_filters, MaxResults=1)
+    resp = {"PriceList": []}
+    if client is not None:
+        resp = client.get_products(ServiceCode="AmazonS3", Filters=storage_filters, MaxResults=1)
     monthly_storage = 0.0
+    fallback_pricing_used = False
     if resp["PriceList"]:
         price_per_gb = _extract_monthly_price(resp["PriceList"][0])
+        monthly_storage = round(storage_gb * price_per_gb, 4)
+    else:
+        fallback_pricing_used = True
+        price_per_gb = float(S3_GB_MONTH_FALLBACK.get(storage_class, S3_GB_MONTH_FALLBACK["General Purpose"]))
         monthly_storage = round(storage_gb * price_per_gb, 4)
 
     return {
         "service": "AmazonS3",
         "s3_storage_monthly_usd": monthly_storage,
         "s3_total_monthly_usd": monthly_storage,
+        "fallback_pricing_used": fallback_pricing_used,
     }
 
 
 def _lambda_estimate(client, node: dict) -> dict:
+    if client is None:
+        return {"error": "Lambda live pricing unavailable without AWS pricing credentials"}
     attrs = node.get("attributes", {})
     region_friendly = node.get("region", "Asia Pacific (Mumbai)")
     aws_region = REGION_CODE_MAP.get(region_friendly, "ap-south-1")
@@ -236,13 +285,15 @@ def estimate_cost(architecture_json: dict, access_key: str = "", secret_key: str
     """
     _access_key = access_key or os.getenv("AWS_ACCESS_KEY_ID", "")
     _secret_key = secret_key or os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    used_fallback_only = False
     if not _access_key or not _secret_key:
-        return {"success": False, "error": "AWS credentials not provided"}
-
-    try:
-        client = _create_pricing_client(_access_key, _secret_key)
-    except Exception as exc:
-        return {"success": False, "error": f"Failed to create boto3 client: {exc}"}
+        client = None
+        used_fallback_only = True
+    else:
+        try:
+            client = _create_pricing_client(_access_key, _secret_key)
+        except Exception as exc:
+            return {"success": False, "error": f"Failed to create boto3 client: {exc}"}
 
     nodes = architecture_json.get("nodes", [])
     breakdown = []
@@ -281,4 +332,8 @@ def estimate_cost(architecture_json: dict, access_key: str = "", secret_key: str
         "currency": "USD",
         "breakdown": breakdown,
         "errors": errors,
+        "note": (
+            "AWS pricing credentials were not provided; using fallback heuristic rates for supported services."
+            if used_fallback_only else None
+        ),
     }

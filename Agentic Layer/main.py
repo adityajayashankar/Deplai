@@ -29,6 +29,7 @@ from result_parser import get_scan_results, get_scan_status, invalidate_cache
 from remediation import RemediationRunner
 from runner_base import RunnerBase
 from architecture_gen import generate_architecture
+from architecture_contract import ArchitectureContractError, parse_architecture_document
 from cost_estimation import estimate_cost
 
 logger = logging.getLogger(__name__)
@@ -480,17 +481,28 @@ async def architecture_generate(request: ArchitectureGenRequest):
     )
     if not result.get("success"):
         return ArchitectureGenResponse(success=False, error=result.get("error", "Unknown error"))
-    return ArchitectureGenResponse(success=True, architecture_json=result.get("architecture_json"))
+    try:
+        architecture_doc = parse_architecture_document(result.get("architecture_json"))
+    except ArchitectureContractError as exc:
+        return ArchitectureGenResponse(
+            success=False,
+            error=f"Generated architecture_json failed contract validation: {exc}",
+        )
+    provider = str(request.provider or "").strip().lower()
+    if provider in {"aws", "azure", "gcp"} and architecture_doc.provider is None:
+        architecture_doc = architecture_doc.model_copy(update={"provider": provider})
+    return ArchitectureGenResponse(success=True, architecture_json=architecture_doc)
 
 
 @app.post("/api/cost/estimate", response_model=CostEstimateResponse, dependencies=[Depends(verify_api_key)])
 async def cost_estimate(request: CostEstimateRequest):
     """Estimate monthly cloud infrastructure costs from an architecture JSON."""
+    architecture_json = request.architecture_json.to_wire_dict()
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(
         None,
         lambda: estimate_cost(
-            request.architecture_json,
+            architecture_json,
             provider=request.provider,
             access_key=request.aws_access_key_id or "",
             secret_key=request.aws_secret_access_key or "",
@@ -518,10 +530,11 @@ async def terraform_generate(request: TerraformGenRequest):
     from terraform_runner import generate_terraform
 
     loop = asyncio.get_running_loop()
+    architecture_json = request.architecture_json.to_wire_dict()
     rag_result = await loop.run_in_executor(
         None,
         lambda: generate_terraform(
-            architecture_json=request.architecture_json,
+            architecture_json=architecture_json,
             provider=request.provider,
             project_name=request.project_name,
             openai_api_key=request.openai_api_key or "",
@@ -562,7 +575,8 @@ async def terraform_apply(request: TerraformApplyRequest):
             provider=request.provider,
             aws_access_key_id=request.aws_access_key_id or "",
             aws_secret_access_key=request.aws_secret_access_key or "",
-            aws_region=request.aws_region or "ap-south-1",
+            aws_region=request.aws_region or "eu-north-1",
+            enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
         ),
     )
 

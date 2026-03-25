@@ -10,7 +10,7 @@ import {
   Terminal, DollarSign, Play, RotateCcw,
   Server, Lock, Send,
   MessageSquare, Wifi, Cpu, Layers, GitMerge,
-  FastForward, ArrowUpRight
+  FastForward, ArrowUpRight, Download
 } from 'lucide-react';
 
 type StageStatus = 'pending' | 'running' | 'paused' | 'success' | 'failed' | 'skipped';
@@ -65,6 +65,11 @@ interface DeploymentSummary {
   instancePublicIp: string | null;
   securityLogsBucket: string | null;
   websiteBucket: string | null;
+}
+
+interface GeneratedEc2SshKey {
+  keyName: string | null;
+  privateKeyPem: string;
 }
 
 interface DiagramNodePreview {
@@ -140,7 +145,7 @@ const QA_QUESTIONS = [
 
 function defaultAnswerForQuestion(question: string): string {
   const q = question.toLowerCase();
-  if (q.includes('region')) return 'ap-south-1, single-AZ is acceptable for now (AWS Free Tier mode).';
+  if (q.includes('region')) return 'eu-north-1 (Stockholm), prefer eu-north-1a and fallback to eu-north-1b/eu-north-1c.';
   if (q.includes('runtime stack') || q.includes('entrypoint')) return 'Python service, run with uvicorn using one process.';
   if (q.includes('build on the instance')) return 'Use minimal build steps, cache dependencies, keep build under 5 minutes.';
   if (q.includes('ec2 sizing')) return 'Use t3.micro baseline only (Free Tier safe).';
@@ -149,7 +154,7 @@ function defaultAnswerForQuestion(question: string): string {
   if (q.includes('storage footprint')) return 'Keep storage minimal: <=5GB website, <=5GB logs, and exactly 8GB EC2 root volume on gp3.';
   if (q.includes('background jobs')) return 'No separate workers required initially.';
   if (q.includes('ports/protocols')) return 'Expose only HTTP/HTTPS; keep all internal services private.';
-  if (q.includes('internet-facing') || q.includes('custom domain')) return 'Internet-facing via CloudFront, no custom domain yet.';
+  if (q.includes('internet-facing') || q.includes('custom domain')) return 'Internet-facing via EC2 public URL for phase 1; no custom domain yet.';
   if (q.includes('block public access')) return 'Keep Block Public Access ON.';
   if (q.includes('secret/config strategy')) return 'Use environment variables for now; migrate to SSM later.';
   if (q.includes('observability')) return 'Basic CloudWatch logs and essential alarms only, short retention.';
@@ -159,6 +164,46 @@ function defaultAnswerForQuestion(question: string): string {
 
 function buildDefaultQaSummary(): string {
   return QA_QUESTIONS.map((q) => `Q: ${q}\nA: ${defaultAnswerForQuestion(q)}`).join('\n\n');
+}
+
+const IAC_PREVIEW_MAX_CHARS = 14_000;
+const TEXT_FILE_EXTENSIONS = new Set([
+  'tf', 'tfvars', 'hcl', 'yaml', 'yml', 'ini', 'md', 'txt', 'sh', 'json', 'html', 'css', 'js', 'ts',
+]);
+
+function isLikelyTextFilePath(filePath: string): boolean {
+  const normalized = String(filePath || '').toLowerCase().trim();
+  if (!normalized) return false;
+  const parts = normalized.split('/');
+  const leaf = String(parts[parts.length - 1] || '');
+  const ext = leaf.includes('.') ? String(leaf.split('.').pop() || '') : '';
+  if (ext && TEXT_FILE_EXTENSIONS.has(ext)) return true;
+  // Most Terraform and Ansible outputs are text even without a known extension.
+  return normalized.startsWith('terraform/') || normalized.startsWith('ansible/');
+}
+
+function decodeGeneratedFileForPreview(file: GeneratedFile): string {
+  const raw = String(file.content || '');
+  let decoded = raw;
+
+  if (String(file.encoding || '').toLowerCase() === 'base64') {
+    if (!isLikelyTextFilePath(file.path)) {
+      return '[binary content omitted from preview]';
+    }
+    try {
+      const binary = atob(raw);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+    } catch {
+      return '[invalid base64 content]';
+    }
+  }
+
+  if (decoded.length <= IAC_PREVIEW_MAX_CHARS) return decoded;
+  return `${decoded.slice(0, IAC_PREVIEW_MAX_CHARS)}\n\n...preview truncated...`;
 }
 
 export default function App() {
@@ -183,12 +228,17 @@ export default function App() {
   const [generatedDiagram, setGeneratedDiagram] = useState<string | null>(null);
   const [generatedDiagramNodes, setGeneratedDiagramNodes] = useState<DiagramNodePreview[]>([]);
   const [deploymentSummary, setDeploymentSummary] = useState<DeploymentSummary | null>(null);
+  const [generatedEc2SshKey, setGeneratedEc2SshKey] = useState<GeneratedEc2SshKey | null>(null);
+  const [ppkDownloadInFlight, setPpkDownloadInFlight] = useState(false);
   const [deploying, setDeploying] = useState(false);
   const [budgetOverridden, setBudgetOverridden] = useState(false);
+  const [autopilotMode, setAutopilotMode] = useState(true);
   const [runtimeGithubToken, setRuntimeGithubToken] = useState('');
+  const [skipScanAndDeploy, setSkipScanAndDeploy] = useState(false);
+  const [skipRemediationLoop, setSkipRemediationLoop] = useState(true);
   const [awsAccessKeyId, setAwsAccessKeyId] = useState('');
   const [awsSecretAccessKey, setAwsSecretAccessKey] = useState('');
-  const [awsRegion, setAwsRegion] = useState('ap-south-1');
+  const [awsRegion, setAwsRegion] = useState('eu-north-1');
   const [isRunning, setIsRunning] = useState(false);
   const [pipelineState, setPipelineState] = useState<'idle' | 'running' | 'paused' | 'failed' | 'completed'>('idle');
   const [isManuallyPaused, setIsManuallyPaused] = useState(false);
@@ -198,6 +248,8 @@ export default function App() {
   const [loadingProjects, setLoadingProjects] = useState(true);
   const [pipelineRunId, setPipelineRunId] = useState(0);
   const [remediationPrUrl, setRemediationPrUrl] = useState<string | null>(null);
+  const [iacPrUrl, setIacPrUrl] = useState<string | null>(null);
+  const [selectedIacFilePath, setSelectedIacFilePath] = useState('');
 
   const [qaMessages, setQaMessages] = useState<{ role: 'agent' | 'user', text: string }[]>([
     { role: 'agent', text: QA_QUESTIONS[0] }
@@ -229,6 +281,35 @@ export default function App() {
     return selectedProject.name || selectedProject.id;
   }, [selectedProject]);
 
+  const sortedIacFiles = useMemo(
+    () => [...generatedIacFiles].sort((a, b) => a.path.localeCompare(b.path)),
+    [generatedIacFiles],
+  );
+
+  const iacStructureChecks = useMemo(() => {
+    const paths = new Set(sortedIacFiles.map((file) => String(file.path || '').toLowerCase()));
+    return {
+      providers: paths.has('terraform/providers.tf'),
+      main: paths.has('terraform/main.tf'),
+      variables: paths.has('terraform/variables.tf'),
+      tfvars: paths.has('terraform/terraform.tfvars'),
+      outputs: paths.has('terraform/outputs.tf'),
+      backend: paths.has('terraform/backend.tf'),
+      modules: Array.from(paths).some((p) => p.startsWith('terraform/modules/')),
+      environments: Array.from(paths).some((p) => p.startsWith('terraform/environments/')),
+    };
+  }, [sortedIacFiles]);
+
+  const selectedIacFile = useMemo(() => {
+    if (sortedIacFiles.length === 0) return null;
+    return sortedIacFiles.find((file) => file.path === selectedIacFilePath) || sortedIacFiles[0];
+  }, [selectedIacFilePath, sortedIacFiles]);
+
+  const selectedIacFilePreview = useMemo(
+    () => (selectedIacFile ? decodeGeneratedFileForPreview(selectedIacFile) : ''),
+    [selectedIacFile],
+  );
+
   const { state: scanState, messages: scanMessages } = getScanState(selectedProjectId || '');
   const { state: remediationState, messages: remediationMessages } = getRemediationState(selectedProjectId || '');
 
@@ -241,12 +322,6 @@ export default function App() {
     () => selectedProject?.type === 'github' && Boolean(remediationPrUrl),
     [selectedProject, remediationPrUrl],
   );
-
-  const monitorState = useMemo(() => {
-    if (remediationState !== 'idle') return remediationState;
-    if (scanState !== 'idle') return scanState;
-    return pipelineWsState;
-  }, [pipelineWsState, remediationState, scanState]);
 
   const emitPipelineEvent = useCallback((text: string) => {
     const ws = pipelineWsRef.current;
@@ -270,6 +345,113 @@ export default function App() {
     setLogs(prev => [...prev, { id: Math.random().toString(36).slice(2, 11), text }]);
     emitPipelineEvent(text);
   }, [emitPipelineEvent]);
+
+  const makeSshKeyFileStem = useCallback((): string => {
+    const rawBase = (generatedEc2SshKey?.keyName || `${selectedProjectName || 'deplai'}-ec2-key`).trim();
+    const normalized = rawBase
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-+/, '')
+      .replace(/-+$/, '')
+      .slice(0, 80);
+    return normalized || 'deplai-ec2-key';
+  }, [generatedEc2SshKey?.keyName, selectedProjectName]);
+
+  const downloadBlobFile = useCallback((filename: string, blob: Blob) => {
+    const url = window.URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.URL.revokeObjectURL(url);
+  }, []);
+
+  const handleDownloadEc2Pem = useCallback(() => {
+    const pem = generatedEc2SshKey?.privateKeyPem || '';
+    if (!pem.trim()) {
+      addLog('[ERROR] No generated EC2 private key is available for PEM download.');
+      return;
+    }
+
+    const filename = `${makeSshKeyFileStem()}.pem`;
+    const normalizedPem = pem.endsWith('\n') ? pem : `${pem}\n`;
+    downloadBlobFile(filename, new Blob([normalizedPem], { type: 'application/x-pem-file' }));
+    addLog(`[OUTPUT] Downloaded EC2 private key: ${filename}`);
+  }, [addLog, downloadBlobFile, generatedEc2SshKey?.privateKeyPem, makeSshKeyFileStem]);
+
+  const handleDownloadEc2Ppk = useCallback(async () => {
+    const pem = generatedEc2SshKey?.privateKeyPem || '';
+    if (!pem.trim()) {
+      addLog('[ERROR] No generated EC2 private key is available for PPK conversion.');
+      return;
+    }
+
+    if (ppkDownloadInFlight) return;
+    setPpkDownloadInFlight(true);
+
+    try {
+      const fallbackName = `${makeSshKeyFileStem()}.ppk`;
+      const res = await fetch('/api/pipeline/keypair/ppk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          private_key_pem: pem,
+          key_name: generatedEc2SshKey?.keyName || null,
+          project_name: selectedProjectName || null,
+        }),
+      });
+
+      const payload = await res.json().catch(() => ({})) as {
+        success?: boolean;
+        file_name?: string;
+        content_base64?: string;
+        error?: string;
+        hint?: string;
+      };
+
+      if (!res.ok || !payload.success || !payload.content_base64) {
+        const msg = String(payload.error || 'PPK conversion is unavailable in this runtime.');
+        const hint = String(payload.hint || '').trim();
+        addLog(`[WARN] ${msg}`);
+        if (hint) addLog(`[SYSTEM] ${hint}`);
+        addLog('[SYSTEM] Download the PEM key and convert to PPK using PuTTYgen if required.');
+        return;
+      }
+
+      const raw = window.atob(payload.content_base64);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i += 1) {
+        bytes[i] = raw.charCodeAt(i);
+      }
+
+      const filename = String(payload.file_name || fallbackName).trim() || fallbackName;
+      downloadBlobFile(filename, new Blob([bytes], { type: 'application/octet-stream' }));
+      addLog(`[OUTPUT] Downloaded EC2 private key: ${filename}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'PPK conversion request failed.';
+      addLog(`[WARN] ${message}`);
+      addLog('[SYSTEM] Download the PEM key and convert to PPK using PuTTYgen if required.');
+    } finally {
+      setPpkDownloadInFlight(false);
+    }
+  }, [
+    addLog,
+    downloadBlobFile,
+    generatedEc2SshKey?.keyName,
+    generatedEc2SshKey?.privateKeyPem,
+    makeSshKeyFileStem,
+    ppkDownloadInFlight,
+    selectedProjectName,
+  ]);
+
+  const monitorState = useMemo(() => {
+    if (remediationState !== 'idle') return remediationState;
+    if (scanState !== 'idle') return scanState;
+    return pipelineWsState;
+  }, [pipelineWsState, remediationState, scanState]);
 
   const markOpStarted = useCallback((key: string) => {
     stageOpsRef.current[key] = true;
@@ -421,11 +603,12 @@ export default function App() {
         provider: 'aws',
         project_name: selectedProjectName || project.id,
         qa_summary: trimmedSummary,
-        deployment_region: awsRegion.trim() || 'ap-south-1',
+        deployment_region: awsRegion.trim() || 'eu-north-1',
       }),
     });
     const architectureData = await architectureRes.json().catch(() => ({})) as {
       architecture_json?: Record<string, unknown>;
+      source?: string;
       error?: string;
     };
     if (!architectureRes.ok || !architectureData.architecture_json) {
@@ -437,6 +620,9 @@ export default function App() {
       ? ((generatedArchitecture as { nodes?: unknown[] }).nodes || []).length
       : 0;
     setArchitectureJson(generatedArchitecture);
+    if (String(architectureData.source || '') === 'deterministic_template') {
+      addLog('[SYSTEM] Using deterministic AWS architecture template (minimal baseline).');
+    }
     addLog(`[SYSTEM] Architecture JSON generated (${nodeCount} service node(s)).`);
 
     const diagramRes = await fetch('/api/pipeline/diagram', {
@@ -468,11 +654,16 @@ export default function App() {
         project_id: project.id,
         provider: 'aws',
         architecture_json: generatedArchitecture,
+        aws_access_key_id: awsAccessKeyId.trim() || undefined,
+        aws_secret_access_key: awsSecretAccessKey.trim() || undefined,
       }),
     });
     const costData = await costRes.json().catch(() => ({})) as {
       success?: boolean;
       total_monthly_usd?: number;
+      breakdown?: Array<{ service?: string; monthly_usd?: number }>;
+      errors?: string[];
+      note?: string | null;
       error?: string;
     };
     if (!costRes.ok || !costData.success) {
@@ -483,9 +674,31 @@ export default function App() {
     if (!Number.isFinite(totalMonthly)) {
       throw new Error('Cost estimation returned an invalid amount.');
     }
+    const breakdown = Array.isArray(costData.breakdown) ? costData.breakdown : [];
+    const pricingErrors = Array.isArray(costData.errors)
+      ? costData.errors.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    if (costData.note && String(costData.note).trim()) {
+      addLog(`[SYSTEM] Cost estimator note: ${String(costData.note).trim()}`);
+    }
+    if (pricingErrors.length > 0) {
+      addLog(`[WARN] Cost estimator warning: ${pricingErrors[0]}`);
+    }
+    if (totalMonthly <= 0 && breakdown.length === 0) {
+      throw new Error(
+        'Cost estimation returned $0.00 with no billable breakdown. Provide valid AWS pricing credentials and retry.',
+      );
+    }
     setCostEstimate(Number(totalMonthly.toFixed(2)));
     return Number(totalMonthly.toFixed(2));
-  }, [addLog, awsRegion, majorFindingsRemaining, selectedProjectName]);
+  }, [
+    addLog,
+    awsAccessKeyId,
+    awsRegion,
+    awsSecretAccessKey,
+    majorFindingsRemaining,
+    selectedProjectName,
+  ]);
 
   const runIacStage = useCallback(async (
     project: ProjectItem,
@@ -505,6 +718,32 @@ export default function App() {
     });
     const iacData = await iacRes.json().catch(() => ({})) as {
       files?: GeneratedFile[];
+      summary?: string;
+      warnings?: string[];
+      iac_repo_pr?: {
+        attempted?: boolean;
+        success?: boolean;
+        pr_url?: string | null;
+        reason?: string;
+        error?: string;
+        files_committed?: number;
+      } | null;
+      frontend_entrypoint_detection?: {
+        runtime?: string;
+        framework?: string;
+        entry_candidates?: string[];
+        build_command?: string | null;
+        has_build_output?: boolean;
+        detected?: boolean;
+      } | null;
+      website_asset_stats?: {
+        selected_root?: string;
+        asset_count?: number;
+        total_bytes?: number;
+        truncated?: boolean;
+        skipped_large_files?: number;
+        entrypoint?: string | null;
+      } | null;
       error?: string;
     };
     if (!iacRes.ok) {
@@ -514,9 +753,77 @@ export default function App() {
     if (files.length === 0) {
       throw new Error('IaC generation returned no files.');
     }
+    if (typeof iacData.summary === 'string' && iacData.summary.trim()) {
+      addLog(`[SYSTEM] ${iacData.summary.trim()}`);
+    }
+    const warnings = Array.isArray(iacData.warnings)
+      ? iacData.warnings.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    for (const warning of warnings) {
+      addLog(`[WARN] ${warning}`);
+    }
+    const iacRepoPr = iacData.iac_repo_pr;
+    if (iacRepoPr?.pr_url) {
+      setIacPrUrl(iacRepoPr.pr_url);
+      addLog(`[SYSTEM] IaC PR ready: ${iacRepoPr.pr_url}`);
+    } else if (iacRepoPr?.attempted && !iacRepoPr?.success) {
+      const reason = String(iacRepoPr.error || iacRepoPr.reason || 'unknown failure');
+      addLog(`[WARN] IaC PR persistence failed: ${reason}`);
+      setIacPrUrl(null);
+    } else if (iacRepoPr?.reason === 'local_project') {
+      addLog('[SYSTEM] IaC PR persistence skipped for local project.');
+      setIacPrUrl(null);
+    } else if (!iacRepoPr) {
+      setIacPrUrl(null);
+    }
+    const websiteStats = iacData.website_asset_stats;
+    if (websiteStats && typeof websiteStats === 'object') {
+      const count = Number(websiteStats.asset_count || 0);
+      const bytes = Number(websiteStats.total_bytes || 0);
+      const root = String(websiteStats.selected_root || '').trim() || '/';
+      addLog(`[SYSTEM] Website packaging stats: ${count} file(s), ${bytes} bytes mirrored from ${root}.`);
+    }
+    const entryDetection = iacData.frontend_entrypoint_detection;
+    if (entryDetection?.detected) {
+      const framework = String(entryDetection.framework || 'unknown');
+      const candidate = Array.isArray(entryDetection.entry_candidates) && entryDetection.entry_candidates.length > 0
+        ? String(entryDetection.entry_candidates[0] || '')
+        : '';
+      const buildOutput = entryDetection.has_build_output ? 'present' : 'missing';
+      addLog(`[SYSTEM] Frontend detection: framework=${framework}, entrypoint=${candidate || 'n/a'}, build_output=${buildOutput}.`);
+    }
     setGeneratedIacFiles(files);
     return files.length;
-  }, []);
+  }, [addLog]);
+
+  const applyMinimumCostDefaults = useCallback((source: 'user' | 'autopilot') => {
+    const summary = buildDefaultQaSummary();
+    setQaSummary(summary);
+    setQaStep(QA_QUESTIONS.length - 1);
+    setQaInput('');
+    setIsAgentTyping(false);
+    setQaMessages([
+      { role: 'agent', text: QA_QUESTIONS[0] },
+      {
+        role: 'user',
+        text: source === 'autopilot'
+          ? 'Autopilot: infer and apply free-tier defaults.'
+          : 'Use minimum-cost defaults.',
+      },
+      {
+        role: 'agent',
+        text: 'Minimum-cost defaults applied. Proceeding with low-cost architecture, cost estimation, and Terraform generation.',
+      },
+    ]);
+    if (source === 'autopilot') {
+      addLog('[SYSTEM] Autopilot applied inferred minimum-cost Q/A defaults for this repository.');
+    } else {
+      addLog('[USER] Applied minimum-cost default Q/A profile.');
+    }
+    setStageStatus(6, 'success', source === 'autopilot' ? 'Autopilot' : 'Defaults');
+    setIsManuallyPaused(false);
+    setPipelineState('running');
+  }, [addLog, setStageStatus]);
 
   const currentStage = useMemo(
     () => stages.find(stage => stage.status === 'running' || stage.status === 'pending') || null,
@@ -548,6 +855,25 @@ export default function App() {
       // Ignore storage write failures (quota/private mode).
     }
   }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (sortedIacFiles.length === 0) {
+      if (selectedIacFilePath) setSelectedIacFilePath('');
+      return;
+    }
+    if (selectedIacFilePath && sortedIacFiles.some((file) => file.path === selectedIacFilePath)) return;
+
+    const preferredOrder = [
+      'terraform/providers.tf',
+      'terraform/main.tf',
+      'terraform/variables.tf',
+      'terraform/terraform.tfvars',
+      'terraform/outputs.tf',
+      'terraform/backend.tf',
+    ];
+    const preferred = preferredOrder.find((path) => sortedIacFiles.some((file) => file.path === path));
+    setSelectedIacFilePath(preferred || sortedIacFiles[0].path);
+  }, [selectedIacFilePath, sortedIacFiles]);
 
   useEffect(() => {
     let cancelled = false;
@@ -707,6 +1033,17 @@ export default function App() {
       if (currentStage.id >= 7) {
         return;
       }
+      if (currentStage.id === 1 && skipScanAndDeploy) {
+        setStages(prev => prev.map(stage => {
+          if (stage.id >= 1 && stage.id <= 4.6) {
+            return { ...stage, status: 'skipped', duration: stage.id === 1 ? 'Bypass' : 'Bypass' };
+          }
+          return stage;
+        }));
+        setMajorFindingsRemaining(null);
+        addLog('[SYSTEM] Scan/remediation stages bypassed by run option. Jumping directly to Q/A and deployment planning.');
+        return;
+      }
       if (currentStage.id === 4.5 && !mergeGateRequired) {
         setStageStatus(4.5, 'skipped', 'N/A');
         addLog('[SYSTEM] Merge gate skipped: no remediation PR is required for this run.');
@@ -783,6 +1120,14 @@ export default function App() {
                 return stage;
               }));
               addLog('[SYSTEM] No major findings found. Skipping remediation loop and moving to Q/A.');
+            } else if (skipRemediationLoop) {
+              setStages(prev => prev.map(stage => {
+                if (stage.id >= 2 && stage.id <= 4.6) {
+                  return { ...stage, status: 'skipped', duration: 'Bypass' };
+                }
+                return stage;
+              }));
+              addLog('[SYSTEM] Remediation loop disabled for this run. Advancing to Q/A with current findings.');
             }
           } catch (error) {
             const message = error instanceof Error ? error.message : 'Failed to read scan results';
@@ -1003,6 +1348,14 @@ export default function App() {
     }
 
     if (currentStage.id === 6) {
+      if (autopilotMode) {
+        const autoQaKey = `${scopeKey}:autopilot_qa`;
+        if (!opStarted(autoQaKey)) {
+          markOpStarted(autoQaKey);
+          applyMinimumCostDefaults('autopilot');
+        }
+        return;
+      }
       setStageStatus(6, 'paused');
       setPipelineState('paused');
       addLog('[SYSTEM] Pipeline paused for operator Q/A context.');
@@ -1029,6 +1382,10 @@ export default function App() {
     remediationState,
     resolveRemediationPrUrl,
     runtimeGithubToken,
+    skipScanAndDeploy,
+    skipRemediationLoop,
+    autopilotMode,
+    applyMinimumCostDefaults,
     scanState,
     selectedProject,
     selectedProjectName,
@@ -1083,6 +1440,13 @@ export default function App() {
     }
 
     if (downstreamStage.id === 7.5) {
+      if (autopilotMode) {
+        if (opStarted(scopeKey)) return;
+        markOpStarted(scopeKey);
+        completeStage(7.5, 'Autopilot');
+        addLog('[SYSTEM] Autopilot approved architecture and cost gate.');
+        return;
+      }
       setStageStatus(7.5, 'paused');
       setPipelineState('paused');
       addLog('[SYSTEM] Manual gate: review diagram and cost estimate, then approve to continue.');
@@ -1109,6 +1473,16 @@ export default function App() {
     }
 
     if (downstreamStage.id === 9 && costEstimate > BUDGET_CAP) {
+      if (autopilotMode) {
+        if (opStarted(scopeKey)) return;
+        markOpStarted(scopeKey);
+        setBudgetOverridden(true);
+        completeStage(9, 'Auto override');
+        addLog(
+          `[SYSTEM] Autopilot budget override applied: estimate $${costEstimate.toFixed(2)} exceeds cap $${BUDGET_CAP.toFixed(2)}, continuing with free-tier EC2 enforcement.`,
+        );
+        return;
+      }
       setStageStatus(9, 'paused');
       setPipelineState('paused');
       addLog(`[POLICY VIOLATION] Cost estimate ($${costEstimate}) exceeds budget cap ($${BUDGET_CAP}). Awaiting override.`);
@@ -1124,15 +1498,25 @@ export default function App() {
     }
 
     if (downstreamStage.id === 10) {
-      if (opStarted(scopeKey)) return;
-      markOpStarted(scopeKey);
-
       // Keep deployment explicit: avoid a false "success" when no deploy credentials were provided.
       if (generatedIacFiles.length === 0) {
         failStage(10, 'Deployment blocked: no generated IaC files available.');
         return;
       }
 
+      if (autopilotMode) {
+        setStageStatus(10, 'paused');
+        setPipelineState('paused');
+        if (!awsAccessKeyId.trim() || !awsSecretAccessKey.trim()) {
+          addLog('[SYSTEM] Autopilot is waiting for AWS credentials before deployment.');
+        } else {
+          addLog('[SYSTEM] Autopilot deployment gate reached. Launching runtime apply with free-tier safeguards.');
+        }
+        return;
+      }
+
+      if (opStarted(scopeKey)) return;
+      markOpStarted(scopeKey);
       setStageStatus(10, 'paused');
       setPipelineState('paused');
       addLog('[SYSTEM] Deployment gate: click "Deploy to AWS" to apply generated Terraform and create EC2 + S3 + CloudFront.');
@@ -1147,11 +1531,14 @@ export default function App() {
     failStage,
     generatedIacFiles.length,
     isRunning,
+    awsAccessKeyId,
+    awsSecretAccessKey,
     markOpStarted,
     opStarted,
     pipelineRunId,
     pipelineState,
     qaSummary,
+    autopilotMode,
     runCostStage,
     runIacStage,
     selectedProject,
@@ -1171,6 +1558,14 @@ export default function App() {
 
     resetAll();
     stageOpsRef.current = {};
+    if (skipScanAndDeploy && !skipRemediationLoop) {
+      setSkipRemediationLoop(true);
+      addLog('[SYSTEM] Scan bypass implies remediation bypass. Enabling remediation skip for this run.');
+    }
+    if (autopilotMode && !skipRemediationLoop) {
+      setSkipRemediationLoop(true);
+      addLog('[SYSTEM] Autopilot enforces remediation bypass for faster large-repo deployment runs.');
+    }
     setStages(INITIAL_STAGES.map(stage => ({ ...stage, status: 'pending', duration: undefined })));
     setCycle(1);
     setMajorFindingsRemaining(null);
@@ -1178,15 +1573,19 @@ export default function App() {
     setQaSummary('');
     setArchitectureJson(null);
     setGeneratedIacFiles([]);
+    setSelectedIacFilePath('');
     setGeneratedDiagram(null);
     setGeneratedDiagramNodes([]);
     setDeploymentSummary(null);
+    setGeneratedEc2SshKey(null);
+    setPpkDownloadInFlight(false);
     setDeploying(false);
     setBudgetOverridden(false);
     setPipelineWsMessages([]);
     setQaStep(0);
     setQaMessages([{ role: 'agent', text: QA_QUESTIONS[0] }]);
     setRemediationPrUrl(null);
+    setIacPrUrl(null);
     setLogs([]);
     setPipelineRunId(prev => prev + 1);
     setIsManuallyPaused(false);
@@ -1195,6 +1594,15 @@ export default function App() {
     setActiveStageId(null);
     addLog(`[SYSTEM] Bound pipeline run to project ${selectedProjectName}.`);
     addLog(`[SYSTEM] Pipeline execution initiated for ${selectedProjectName}.`);
+    if (skipRemediationLoop) {
+      addLog('[SYSTEM] Run option enabled: remediation loop will be skipped after scan, even if major findings remain.');
+    }
+    if (skipScanAndDeploy) {
+      addLog('[SYSTEM] Run option enabled: scan and remediation stages will be skipped; pipeline will proceed directly to Q/A and deployment planning.');
+    }
+    if (autopilotMode) {
+      addLog('[SYSTEM] Autopilot mode enabled: Q/A, policy gates, and deployment trigger will run automatically when prerequisites are available.');
+    }
   };
 
   const pausePipeline = () => {
@@ -1225,6 +1633,8 @@ export default function App() {
     setGeneratedDiagram(null);
     setGeneratedDiagramNodes([]);
     setDeploymentSummary(null);
+    setGeneratedEc2SshKey(null);
+    setPpkDownloadInFlight(false);
     setDeploying(false);
     setBudgetOverridden(false);
     setPipelineWsMessages([]);
@@ -1341,7 +1751,8 @@ export default function App() {
           files: generatedIacFiles,
           aws_access_key_id: awsAccessKeyId.trim(),
           aws_secret_access_key: awsSecretAccessKey.trim(),
-          aws_region: awsRegion.trim() || 'ap-south-1',
+          aws_region: awsRegion.trim() || 'eu-north-1',
+          enforce_free_tier_ec2: true,
           estimated_monthly_usd: costEstimate,
           budget_limit_usd: BUDGET_CAP,
           budget_override: budgetOverridden,
@@ -1358,6 +1769,9 @@ export default function App() {
         const details = data.details || {};
         const detailTail =
           String(details.stderr_tail || details.stdout_tail || details.apply_log_tail || details.init_log_tail || '').trim();
+        const upstreamError = String(details.upstream_error || '').trim();
+        const deployHint = String(details.hint || '').trim();
+        const agenticOrigin = String(details.agentic_origin || '').trim();
         const selectedType = String(details.selected_instance_type || '').trim();
         const attemptedTypes = Array.isArray(details.attempted_instance_types)
           ? details.attempted_instance_types.map((v) => String(v)).filter(Boolean)
@@ -1382,6 +1796,15 @@ export default function App() {
         if (detailTail) {
           addLog(`[ERROR] Deploy detail: ${detailTail.slice(-380)}`);
         }
+        if (upstreamError) {
+          addLog(`[ERROR] Upstream transport detail: ${upstreamError.slice(-300)}`);
+        }
+        if (deployHint) {
+          addLog(`[SYSTEM] Deploy hint: ${deployHint}`);
+        }
+        if (agenticOrigin) {
+          addLog(`[SYSTEM] Agentic endpoint: ${agenticOrigin}`);
+        }
         throw new Error(String(data.error || 'Deployment request failed.'));
       }
 
@@ -1405,6 +1828,10 @@ export default function App() {
       const ec2Az = String(outputs.ec2_availability_zone || '').trim() || null;
       const ec2SubnetId = String(outputs.ec2_subnet_id || '').trim() || null;
       const ec2KeyName = String(outputs.ec2_key_name || '').trim() || null;
+      const generatedPrivateKeyPem =
+        typeof outputs.generated_ec2_private_key_pem === 'string'
+          ? String(outputs.generated_ec2_private_key_pem)
+          : null;
       const vpcId = String(outputs.vpc_id || '').trim() || null;
       const ec2SgIds = Array.isArray(outputs.ec2_vpc_security_group_ids)
         ? outputs.ec2_vpc_security_group_ids.map((v) => String(v)).filter(Boolean)
@@ -1421,6 +1848,18 @@ export default function App() {
         securityLogsBucket,
         websiteBucket,
       });
+      if (
+        generatedPrivateKeyPem &&
+        generatedPrivateKeyPem.includes('BEGIN') &&
+        generatedPrivateKeyPem.includes('PRIVATE KEY')
+      ) {
+        setGeneratedEc2SshKey({
+          keyName: ec2KeyName,
+          privateKeyPem: generatedPrivateKeyPem,
+        });
+      } else {
+        setGeneratedEc2SshKey(null);
+      }
 
       setStageStatus(10, 'success', 'Applied');
       setPipelineState('running');
@@ -1449,12 +1888,28 @@ export default function App() {
       } else {
         addLog('[OUTPUT] EC2 key pair name: not configured (SSM/alternate access expected).');
       }
+      if (
+        generatedPrivateKeyPem &&
+        generatedPrivateKeyPem.includes('BEGIN') &&
+        generatedPrivateKeyPem.includes('PRIVATE KEY')
+      ) {
+        addLog('[SYSTEM] Generated EC2 private key is available. Download .pem/.ppk now and store it securely.');
+      }
       if (Number.isFinite(websiteObjectCount)) addLog(`[OUTPUT] Website objects uploaded: ${websiteObjectCount}`);
       if (typeof websiteHasPolicy === 'boolean') addLog(`[OUTPUT] Website bucket policy attached: ${websiteHasPolicy ? 'yes' : 'no'}`);
       if (websiteBpaState) addLog(`[OUTPUT] Website bucket block public access: ${websiteBpaState}`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Deployment failed';
-      failStage(10, message);
+      const rawMessage = error instanceof Error ? error.message : 'Deployment failed';
+      const lowered = rawMessage.toLowerCase();
+      if (
+        lowered.includes('fetch failed') ||
+        lowered.includes('failed to fetch') ||
+        lowered.includes('network')
+      ) {
+        addLog('[WARN] Connector lost transport while waiting for Terraform apply response.');
+        addLog('[SYSTEM] Verify AGENTIC_LAYER_URL connectivity and check AWS console for in-flight resources before retry.');
+      }
+      failStage(10, rawMessage);
     } finally {
       window.clearInterval(heartbeat);
       setDeploying(false);
@@ -1466,10 +1921,44 @@ export default function App() {
     awsSecretAccessKey,
     budgetOverridden,
     costEstimate,
+    deploying,
     failStage,
     generatedIacFiles,
     selectedProject,
     setStageStatus,
+  ]);
+
+  useEffect(() => {
+    if (!autopilotMode) return;
+    if (!isRunning || pipelineState !== 'paused') return;
+
+    const stage10 = stages.find((stage) => stage.id === 10);
+    if (!stage10 || stage10.status !== 'paused') return;
+
+    if (generatedIacFiles.length === 0) return;
+    if (!awsAccessKeyId.trim() || !awsSecretAccessKey.trim()) return;
+    if (deploying) return;
+
+    const autoDeployKey = `${pipelineRunId}:${cycle}:10:autopilot_deploy`;
+    if (opStarted(autoDeployKey)) return;
+    markOpStarted(autoDeployKey);
+    addLog('[SYSTEM] Autopilot is triggering AWS deployment now (free-tier EC2 enforced).');
+    void handleDeployAws();
+  }, [
+    addLog,
+    autopilotMode,
+    awsAccessKeyId,
+    awsSecretAccessKey,
+    cycle,
+    deploying,
+    generatedIacFiles.length,
+    handleDeployAws,
+    isRunning,
+    markOpStarted,
+    opStarted,
+    pipelineRunId,
+    pipelineState,
+    stages,
   ]);
 
   const handleSkipStage = () => {
@@ -1520,23 +2009,7 @@ export default function App() {
   };
 
   const handleUseMinimumDefaults = () => {
-    const summary = buildDefaultQaSummary();
-    setQaSummary(summary);
-    setQaStep(QA_QUESTIONS.length - 1);
-    setQaInput('');
-    setIsAgentTyping(false);
-    setQaMessages([
-      { role: 'agent', text: QA_QUESTIONS[0] },
-      { role: 'user', text: 'Use minimum-cost defaults.' },
-      {
-        role: 'agent',
-        text: 'Minimum-cost defaults applied. Proceeding with low-cost architecture, cost estimation, and Terraform generation.',
-      },
-    ]);
-    addLog('[USER] Applied minimum-cost default Q/A profile.');
-    setStageStatus(6, 'success', 'Defaults');
-    setIsManuallyPaused(false);
-    setPipelineState('running');
+    applyMinimumCostDefaults('user');
   };
 
   const activeStage = useMemo(
@@ -1637,7 +2110,7 @@ export default function App() {
           <div className="p-5 border-b border-white/5 sticky top-0 bg-zinc-950/95 backdrop-blur z-20 space-y-3">
             <div className="flex justify-between items-center">
               <div>
-                <h2 className="text-[11px] font-bold text-zinc-400 uppercase tracking-[0.15em]">Pipeline Topology</h2>
+                <h2 className="text-[11px] font-bold text-zinc-400 uppercase tracking-[0.15em]">Pipeline Controls</h2>
                 <div className="text-[10px] text-zinc-500 mt-1 font-mono flex items-center">
                   <Layers className="w-3 h-3 mr-1" /> Run: x7f9-2a1b
                 </div>
@@ -1699,6 +2172,47 @@ export default function App() {
               <p className="text-[10px] text-zinc-500">
                 {selectedProject ? `Pipeline target: ${selectedProjectName}` : 'Choose a repository before starting.'}
               </p>
+              <div className="space-y-1.5 rounded-md border border-white/10 bg-zinc-900/40 p-2.5">
+                <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">
+                  Run Options
+                </div>
+                <label className="flex items-start gap-2 text-[11px] text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={autopilotMode}
+                    onChange={(e) => setAutopilotMode(e.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 rounded border-white/20 bg-zinc-950 text-cyan-400 focus:ring-cyan-500/40"
+                  />
+                  <span>Autopilot mode: auto-answer Q/A, auto-approve policy gates, and auto-trigger deployment when AWS credentials are present.</span>
+                </label>
+                <label className="flex items-start gap-2 text-[11px] text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={skipRemediationLoop}
+                    onChange={(e) => setSkipRemediationLoop(e.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 rounded border-white/20 bg-zinc-950 text-cyan-400 focus:ring-cyan-500/40"
+                  />
+                  <span>Skip remediation loop and continue to Q/A after scan (recommended for large repositories).</span>
+                </label>
+                <label className="flex items-start gap-2 text-[11px] text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={skipScanAndDeploy}
+                    onChange={(e) => setSkipScanAndDeploy(e.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 rounded border-white/20 bg-zinc-950 text-cyan-400 focus:ring-cyan-500/40"
+                  />
+                  <span>Skip scan and remediation entirely, then continue directly to Q/A, IaC generation, and deployment.</span>
+                </label>
+                <p className="text-[10px] text-zinc-500">
+                  Free-tier deployment guardrails are always enforced for runtime apply (EC2 micro family only).
+                </p>
+                <p className="text-[10px] text-zinc-500">
+                  When remediation bypass is enabled, stages 2 through 4.6 are skipped and deployment planning continues with current scan findings.
+                </p>
+                <p className="text-[10px] text-zinc-500">
+                  When scan bypass is enabled, stages 1 through 4.6 are skipped and no security findings are collected for this run.
+                </p>
+              </div>
               {selectedProject?.type === 'github' && (
                 <div className="space-y-1.5 rounded-md border border-white/10 bg-zinc-900/40 p-2.5">
                   <label htmlFor="runtime-github-token" className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold">
@@ -1710,11 +2224,13 @@ export default function App() {
                     autoComplete="off"
                     value={runtimeGithubToken}
                     onChange={(e) => setRuntimeGithubToken(e.target.value)}
-                    placeholder="Required for remediation PR creation"
+                    placeholder={skipRemediationLoop ? 'Optional when remediation is skipped' : 'Required for remediation PR creation'}
                     className="w-full bg-zinc-950 border border-white/10 rounded-md px-2.5 py-2 text-xs text-zinc-200 focus:outline-none focus:border-cyan-400/40"
                   />
                   <p className="text-[10px] text-zinc-500">
-                    Not persisted. Used only for this runtime remediation flow.
+                    {skipRemediationLoop
+                      ? 'Remediation is skipped for this run, so this token will not be used unless you disable the skip option.'
+                      : 'Not persisted. Used only for this runtime remediation flow.'}
                   </p>
                 </div>
               )}
@@ -1768,70 +2284,19 @@ export default function App() {
                       View PR <ArrowUpRight className="w-3 h-3" />
                     </a>
                   )}
+                  {iacPrUrl && (
+                    <a
+                      href={iacPrUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-[10px] px-2 py-1 rounded border border-sky-400/30 text-sky-200 bg-sky-500/10 hover:bg-sky-500/20 transition-colors inline-flex items-center gap-1"
+                    >
+                      View IaC PR <ArrowUpRight className="w-3 h-3" />
+                    </a>
+                  )}
                 </div>
               )}
             </div>
-          </div>
-
-          <div className="p-5 relative">
-            <div className="absolute left-[39px] top-10 bottom-10 w-[2px] bg-zinc-800/50 rounded-full" />
-
-            {stages.map((stage) => {
-              const isCycleNode = stage.id >= 1 && stage.id <= 4.6;
-              const showCycleHeader = stage.id === 1;
-              const showCycleFooter = stage.id === 4.6;
-              const isActive = activeStageId === stage.id;
-
-              const isCompleted = stage.status === 'success';
-              const isFailed = stage.status === 'failed';
-              const isSkipped = stage.status === 'skipped';
-
-              return (
-                <React.Fragment key={stage.id}>
-                  {showCycleHeader && (
-                    <div className="ml-12 mb-3 mt-4 px-3 py-2 bg-zinc-900/80 border border-white/5 rounded-md flex items-center justify-between text-[11px] font-semibold relative z-10 shadow-sm">
-                      <span className="text-zinc-400 uppercase tracking-wider flex items-center"><RotateCcw className="w-3 h-3 mr-1.5" /> Remediation Loop</span>
-                      <span className={`px-2 py-0.5 rounded-sm font-mono text-[10px] ${cycle === MAX_CYCLES ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20' : 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20'}`}>
-                        Attempt {cycle}/{MAX_CYCLES}
-                      </span>
-                    </div>
-                  )}
-
-                  <div
-                    className={`relative z-10 flex items-center p-2 rounded-lg cursor-pointer transition-all mb-1.5 ${isActive ? 'bg-zinc-900 border border-white/10 shadow-sm' : 'hover:bg-zinc-900/50 border border-transparent'} ${isCycleNode ? 'ml-6' : ''}`}
-                    onClick={() => setActiveStageId(stage.id)}
-                  >
-                    <div className={`flex items-center justify-center w-8 h-8 rounded-full bg-zinc-950 ring-4 ring-zinc-950 z-20 relative ${isActive ? 'shadow-[0_0_15px_rgba(34,211,238,0.2)]' : ''}`}>
-                      {renderStageIcon(stage.status, stage.isGate)}
-                      {isActive && <div className="absolute inset-0 border-2 border-cyan-500/30 rounded-full animate-ping" />}
-                    </div>
-
-                    <div className="ml-3.5 flex-1 min-w-0">
-                      <div className={`text-xs font-semibold truncate ${isActive ? 'text-zinc-100' : isCompleted ? 'text-zinc-300' : isFailed ? 'text-rose-400' : isSkipped ? 'text-zinc-600 line-through' : 'text-zinc-500'}`}>
-                        <span className="opacity-40 font-mono mr-1.5 font-medium">{stage.id}</span>
-                        {stage.label}
-                      </div>
-                      {stage.status === 'failed' && (
-                        <div className="text-[10px] text-rose-400 mt-0.5 font-medium flex items-center"><XCircle className="w-3 h-3 mr-1" /> Execution halted</div>
-                      )}
-                      {stage.status === 'paused' && (
-                        <div className="text-[10px] text-amber-400 mt-0.5 font-medium flex items-center"><AlertTriangle className="w-3 h-3 mr-1" /> Awaiting intervention</div>
-                      )}
-                    </div>
-
-                    {stage.duration && (
-                      <div className="text-[10px] text-zinc-600 font-mono bg-zinc-900/50 px-1.5 py-0.5 rounded">{stage.duration}</div>
-                    )}
-                  </div>
-
-                  {showCycleFooter && (
-                    <div className="ml-12 mb-5 mt-3 h-px bg-gradient-to-r from-zinc-800 to-transparent relative z-10 flex items-center">
-                      <span className="bg-zinc-950 pr-2 text-[9px] text-zinc-600 uppercase tracking-widest font-semibold">End Loop</span>
-                    </div>
-                  )}
-                </React.Fragment>
-              );
-            })}
           </div>
         </aside>
 
@@ -1863,7 +2328,7 @@ export default function App() {
                   className="px-4 py-2 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-300 text-xs font-semibold rounded-md flex items-center transition-colors shadow-sm"
                 >
                   <FastForward className="w-3.5 h-3.5 mr-2" />
-                  Skip Remediation → Q/A
+                  Skip Remediation â†’ Q/A
                 </button>
               )}
 
@@ -2088,6 +2553,92 @@ export default function App() {
 
             <div className="flex-1 relative bg-[#0c0c0e] min-h-0 shadow-inner">
               <div className="absolute inset-0 overflow-y-auto p-5 font-mono text-[11px] leading-[1.8] selection:bg-cyan-500/30 custom-scrollbar">
+                {generatedEc2SshKey?.privateKeyPem && (
+                  <div className="mb-4 rounded-lg border border-amber-400/30 bg-amber-500/10 px-4 py-3">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <div className="text-[10px] uppercase tracking-widest text-amber-200 font-semibold">
+                          EC2 SSH Private Key Ready
+                        </div>
+                        <div className="text-[11px] text-amber-100">
+                          Download and store this key now. It may not be recoverable later.
+                        </div>
+                        {generatedEc2SshKey.keyName && (
+                          <div className="text-[10px] text-amber-200/90">
+                            Key pair: <span className="font-semibold">{generatedEc2SshKey.keyName}</span>
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={handleDownloadEc2Pem}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-emerald-500/15 border border-emerald-400/40 text-emerald-200 hover:bg-emerald-500/25 transition-colors text-[11px] font-semibold"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          Download .pem
+                        </button>
+                        <button
+                          onClick={handleDownloadEc2Ppk}
+                          disabled={ppkDownloadInFlight}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-cyan-500/15 border border-cyan-400/40 text-cyan-200 hover:bg-cyan-500/25 transition-colors text-[11px] font-semibold disabled:opacity-60 disabled:cursor-not-allowed"
+                        >
+                          {ppkDownloadInFlight ? <Loader className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                          {ppkDownloadInFlight ? 'Building .ppk...' : 'Download .ppk'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {sortedIacFiles.length > 0 && (
+                  <div className="mb-4 rounded-lg border border-cyan-400/20 bg-cyan-500/5 p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-[10px] uppercase tracking-widest text-cyan-200 font-semibold">
+                          Generated IaC Bundle
+                        </div>
+                        <div className="text-[11px] text-cyan-100/90 mt-1">
+                          {sortedIacFiles.length} file(s) generated. Select a file to inspect actual Terraform output.
+                        </div>
+                      </div>
+                      <div className="text-[10px] text-cyan-100/80">
+                        Root checks: providers {iacStructureChecks.providers ? 'ok' : 'missing'} | main {iacStructureChecks.main ? 'ok' : 'missing'} | modules {iacStructureChecks.modules ? 'ok' : 'missing'} | envs {iacStructureChecks.environments ? 'ok' : 'missing'}
+                      </div>
+                    </div>
+
+                    <div className="mt-3 grid grid-cols-1 lg:grid-cols-3 gap-3">
+                      <div className="lg:col-span-1 rounded-md border border-white/10 bg-black/25 p-2">
+                        <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-2">
+                          Files
+                        </div>
+                        <div className="max-h-72 overflow-y-auto custom-scrollbar space-y-1">
+                          {sortedIacFiles.map((file) => (
+                            <button
+                              key={file.path}
+                              onClick={() => setSelectedIacFilePath(file.path)}
+                              className={`w-full text-left px-2 py-1.5 rounded text-[10px] transition-colors border ${
+                                selectedIacFile?.path === file.path
+                                  ? 'border-cyan-400/40 bg-cyan-500/15 text-cyan-100'
+                                  : 'border-transparent hover:border-white/10 hover:bg-zinc-900/60 text-zinc-300'
+                              }`}
+                              title={file.path}
+                            >
+                              {file.path}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="lg:col-span-2 rounded-md border border-white/10 bg-black/25 p-2">
+                        <div className="text-[10px] uppercase tracking-widest text-zinc-500 font-semibold mb-2">
+                          Preview {selectedIacFile?.path ? `| ${selectedIacFile.path}` : ''}
+                        </div>
+                        <pre className="text-[10px] leading-relaxed text-zinc-200 whitespace-pre-wrap break-words max-h-72 overflow-y-auto custom-scrollbar">
+                          {selectedIacFilePreview || 'No file selected.'}
+                        </pre>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 {logs.length === 0 && monitorMessages.length === 0 ? (
                   <div className="text-zinc-600 flex items-center justify-center h-full">
                     <div className="text-center">
@@ -2213,6 +2764,74 @@ export default function App() {
             </div>
           </div>
         </main>
+
+        <aside className="w-[320px] border-l border-white/5 bg-zinc-950 flex flex-col shrink-0 overflow-y-auto custom-scrollbar">
+          <div className="p-5 border-b border-white/5 sticky top-0 bg-zinc-950/95 backdrop-blur z-20">
+            <h2 className="text-[11px] font-bold text-zinc-400 uppercase tracking-[0.15em]">Pipeline Progress</h2>
+            <p className="text-[10px] text-zinc-500 mt-1">Stage progression is shown here.</p>
+          </div>
+
+          <div className="p-5 relative">
+            <div className="absolute left-[39px] top-10 bottom-10 w-[2px] bg-zinc-800/50 rounded-full" />
+
+            {stages.map((stage) => {
+              const isCycleNode = stage.id >= 1 && stage.id <= 4.6;
+              const showCycleHeader = stage.id === 1;
+              const showCycleFooter = stage.id === 4.6;
+              const isActive = activeStageId === stage.id;
+
+              const isCompleted = stage.status === 'success';
+              const isFailed = stage.status === 'failed';
+              const isSkipped = stage.status === 'skipped';
+
+              return (
+                <React.Fragment key={stage.id}>
+                  {showCycleHeader && (
+                    <div className="ml-12 mb-3 mt-4 px-3 py-2 bg-zinc-900/80 border border-white/5 rounded-md flex items-center justify-between text-[11px] font-semibold relative z-10 shadow-sm">
+                      <span className="text-zinc-400 uppercase tracking-wider flex items-center"><RotateCcw className="w-3 h-3 mr-1.5" /> Remediation Loop</span>
+                      <span className={`px-2 py-0.5 rounded-sm font-mono text-[10px] ${cycle === MAX_CYCLES ? 'bg-rose-500/10 text-rose-400 border border-rose-500/20' : 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20'}`}>
+                        Attempt {cycle}/{MAX_CYCLES}
+                      </span>
+                    </div>
+                  )}
+
+                  <div
+                    className={`relative z-10 flex items-center p-2 rounded-lg cursor-pointer transition-all mb-1.5 ${isActive ? 'bg-zinc-900 border border-white/10 shadow-sm' : 'hover:bg-zinc-900/50 border border-transparent'} ${isCycleNode ? 'ml-6' : ''}`}
+                    onClick={() => setActiveStageId(stage.id)}
+                  >
+                    <div className={`flex items-center justify-center w-8 h-8 rounded-full bg-zinc-950 ring-4 ring-zinc-950 z-20 relative ${isActive ? 'shadow-[0_0_15px_rgba(34,211,238,0.2)]' : ''}`}>
+                      {renderStageIcon(stage.status, stage.isGate)}
+                      {isActive && <div className="absolute inset-0 border-2 border-cyan-500/30 rounded-full animate-ping" />}
+                    </div>
+
+                    <div className="ml-3.5 flex-1 min-w-0">
+                      <div className={`text-xs font-semibold truncate ${isActive ? 'text-zinc-100' : isCompleted ? 'text-zinc-300' : isFailed ? 'text-rose-400' : isSkipped ? 'text-zinc-600 line-through' : 'text-zinc-500'}`}>
+                        <span className="opacity-40 font-mono mr-1.5 font-medium">{stage.id}</span>
+                        {stage.label}
+                      </div>
+                      {stage.status === 'failed' && (
+                        <div className="text-[10px] text-rose-400 mt-0.5 font-medium flex items-center"><XCircle className="w-3 h-3 mr-1" /> Execution halted</div>
+                      )}
+                      {stage.status === 'paused' && (
+                        <div className="text-[10px] text-amber-400 mt-0.5 font-medium flex items-center"><AlertTriangle className="w-3 h-3 mr-1" /> Awaiting intervention</div>
+                      )}
+                    </div>
+
+                    {stage.duration && (
+                      <div className="text-[10px] text-zinc-600 font-mono bg-zinc-900/50 px-1.5 py-0.5 rounded">{stage.duration}</div>
+                    )}
+                  </div>
+
+                  {showCycleFooter && (
+                    <div className="ml-12 mb-5 mt-3 h-px bg-gradient-to-r from-zinc-800 to-transparent relative z-10 flex items-center">
+                      <span className="bg-zinc-950 pr-2 text-[9px] text-zinc-600 uppercase tracking-widest font-semibold">End Loop</span>
+                    </div>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </div>
+        </aside>
       </div>
 
       <style dangerouslySetInnerHTML={{ __html: `

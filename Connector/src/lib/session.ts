@@ -1,4 +1,5 @@
 import { SessionOptions } from 'iron-session';
+import { requireEnv } from './env';
 
 export interface SessionData {
   user?: {
@@ -13,7 +14,7 @@ export interface SessionData {
 }
 
 export const sessionOptions: SessionOptions = {
-  password: process.env.SESSION_SECRET!,
+  password: requireEnv('SESSION_SECRET'),
   cookieName: 'deplai_session',
   cookieOptions: {
     secure: process.env.NODE_ENV === 'production',

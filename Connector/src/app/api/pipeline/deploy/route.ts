@@ -3,6 +3,10 @@ import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { readLegacyCicdTemplate } from '@/lib/legacy-assets';
 
+export const runtime = 'nodejs';
+export const maxDuration = 3600;
+export const dynamic = 'force-dynamic';
+
 type Provider = 'aws' | 'azure' | 'gcp';
 
 interface GeneratedFile {
@@ -23,9 +27,49 @@ interface DeployBody {
   aws_access_key_id?: string;
   aws_secret_access_key?: string;
   aws_region?: string;
+  enforce_free_tier_ec2?: boolean;
   estimated_monthly_usd?: number;
   budget_limit_usd?: number;
   budget_override?: boolean;
+}
+
+function resolveAgenticOrigin(): string {
+  try {
+    return new URL(AGENTIC_URL).origin;
+  } catch {
+    return AGENTIC_URL;
+  }
+}
+
+function classifyUpstreamError(err: unknown): { error: string; hint: string; upstreamError: string } {
+  const raw = err instanceof Error ? err.message : String(err || 'unknown upstream error');
+  const lowered = raw.toLowerCase();
+
+  if (lowered.includes('timeout')) {
+    return {
+      error: 'Deployment runtime timed out before Terraform apply completed.',
+      hint: 'The apply may still be in-flight. Check Connector logs and AWS console, then retry if nothing is active.',
+      upstreamError: raw,
+    };
+  }
+  if (
+    lowered.includes('fetch failed') ||
+    lowered.includes('econnrefused') ||
+    lowered.includes('enotfound') ||
+    lowered.includes('network')
+  ) {
+    return {
+      error: 'Connector could not reach the deployment runtime service.',
+      hint: 'Verify AGENTIC_LAYER_URL is reachable from the Connector runtime and that the Agentic Layer service is healthy.',
+      upstreamError: raw,
+    };
+  }
+
+  return {
+    error: 'Deployment runtime request failed before Terraform apply response was received.',
+    hint: 'Check Connector and Agentic Layer logs for transport/proxy/server timeout issues.',
+    upstreamError: raw,
+  };
 }
 
 function clampProvider(value: string | undefined): Provider {
@@ -238,7 +282,7 @@ ${credentialSteps[provider]}
 
 function buildWorkflowYaml(provider: Provider): { content: string; source: 'legacy_template' | 'generated' } {
   const tfVersion = '1.9.0';
-  const awsRegion = 'ap-south-1';
+  const awsRegion = 'eu-north-1';
   const legacy = readLegacyCicdTemplate(provider);
   if (legacy) {
     let content = legacy
@@ -344,7 +388,8 @@ export async function POST(req: NextRequest) {
 
       const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
       const awsSecretAccessKey = String(body.aws_secret_access_key || '').trim();
-      const awsRegion = String(body.aws_region || 'ap-south-1').trim() || 'ap-south-1';
+      const awsRegion = String(body.aws_region || 'eu-north-1').trim() || 'eu-north-1';
+      const enforceFreeTierEc2 = body.enforce_free_tier_ec2 !== false;
 
       if (!awsAccessKeyId || !awsSecretAccessKey) {
         return NextResponse.json(
@@ -355,25 +400,56 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const agenticRes = await fetch(`${AGENTIC_URL}/api/terraform/apply`, {
-        method: 'POST',
-        headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          project_name: projectName,
-          provider,
-          files: baseFiles,
-          aws_access_key_id: awsAccessKeyId,
-          aws_secret_access_key: awsSecretAccessKey,
-          aws_region: awsRegion,
-        }),
-        signal: AbortSignal.timeout(3_600_000),
-      });
-      const applyData = await agenticRes.json().catch(() => ({})) as Record<string, unknown>;
+      const applyRequest = {
+        project_name: projectName,
+        provider,
+        files: baseFiles,
+        aws_access_key_id: awsAccessKeyId,
+        aws_secret_access_key: awsSecretAccessKey,
+        aws_region: awsRegion,
+        enforce_free_tier_ec2: enforceFreeTierEc2,
+      };
+      let agenticRes: Response;
+      try {
+        agenticRes = await fetch(`${AGENTIC_URL}/api/terraform/apply`, {
+          method: 'POST',
+          headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify(applyRequest),
+          signal: AbortSignal.timeout(3_600_000),
+        });
+      } catch (upstreamErr) {
+        const classified = classifyUpstreamError(upstreamErr);
+        return NextResponse.json(
+          {
+            error: classified.error,
+            details: {
+              hint: classified.hint,
+              upstream_error: classified.upstreamError,
+              agentic_origin: resolveAgenticOrigin(),
+            },
+          },
+          { status: 502 },
+        );
+      }
+
+      const applyRaw = await agenticRes.text();
+      let applyData: Record<string, unknown> = {};
+      if (applyRaw.trim()) {
+        try {
+          applyData = JSON.parse(applyRaw) as Record<string, unknown>;
+        } catch {
+          applyData = { raw_response_tail: applyRaw.slice(-2000) };
+        }
+      }
       if (!agenticRes.ok || applyData.success !== true) {
         return NextResponse.json(
           {
             error: String(applyData.error || 'Runtime Terraform apply failed.'),
-            details: applyData.details ?? null,
+            details:
+              applyData.details ??
+              (applyData.raw_response_tail
+                ? { upstream_raw_response_tail: applyData.raw_response_tail }
+                : null),
             outputs: applyData.outputs ?? null,
           },
           { status: agenticRes.ok ? 500 : agenticRes.status },
@@ -508,7 +584,7 @@ export async function POST(req: NextRequest) {
     if (provider === 'aws') {
       const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
       const awsSecretAccessKey = String(body.aws_secret_access_key || '').trim();
-      const awsRegion = String(body.aws_region || 'ap-south-1').trim() || 'ap-south-1';
+      const awsRegion = String(body.aws_region || 'eu-north-1').trim() || 'eu-north-1';
 
       if (awsAccessKeyId && awsSecretAccessKey) {
         await upsertRepoVariable(owner, safeRepoName, githubPat, 'AWS_ACCESS_KEY_ID', awsAccessKeyId);
@@ -536,7 +612,17 @@ export async function POST(req: NextRequest) {
       blocked: false,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Deployment failed';
-    return NextResponse.json({ error: msg }, { status: 500 });
+    const classified = classifyUpstreamError(err);
+    return NextResponse.json(
+      {
+        error: classified.error,
+        details: {
+          hint: classified.hint,
+          upstream_error: classified.upstreamError,
+          agentic_origin: resolveAgenticOrigin(),
+        },
+      },
+      { status: 500 },
+    );
   }
 }

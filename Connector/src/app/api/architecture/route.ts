@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
+import { ArchitectureJson, validateArchitectureJson } from '@/lib/architecture-contract';
 
 interface ArchitectureBody {
   prompt: string;
@@ -164,7 +165,7 @@ function buildDeterministicAwsArchitecture(
   qaSummary: string,
   deploymentRegion: string,
   prompt: string,
-) {
+): ArchitectureJson {
   const region = awsRegionLabel(deploymentRegion);
   const blockPublicAccess = resolveWebsiteBlockPublicAccessFromQa(qaSummary);
   const freeTier = isFreeTierMode(qaSummary, prompt);
@@ -185,7 +186,12 @@ function buildDeterministicAwsArchitecture(
     : storage;
 
   return {
+    provider: 'aws',
+    schema_version: '1.0',
     title: `Deterministic AWS Deploy Plan for ${projectName}`,
+    metadata: {
+      source: 'deterministic_template',
+    },
     nodes: [
       {
         id: 'cloudFrontDistribution',
@@ -297,7 +303,7 @@ function buildDeterministicAwsArchitecture(
  */
 export async function POST(req: NextRequest) {
   try {
-    const { user, error } = await requireAuth();
+    const { error } = await requireAuth();
     if (error) return error;
 
     const body = await req.json() as ArchitectureBody;
@@ -312,10 +318,18 @@ export async function POST(req: NextRequest) {
       const projectName = normalizeProjectName(String(body.project_name || ''));
       const qaSummary = String(body.qa_summary || '');
       const deploymentRegion = String(body.deployment_region || 'ap-south-1');
+      const deterministicArchitecture = buildDeterministicAwsArchitecture(projectName, qaSummary, deploymentRegion, prompt);
+      const archValidation = validateArchitectureJson(deterministicArchitecture);
+      if (!archValidation.valid || !archValidation.normalized) {
+        return NextResponse.json(
+          { error: `Generated deterministic architecture failed validation: ${archValidation.errors.join('; ')}` },
+          { status: 500 },
+        );
+      }
       return NextResponse.json({
         success: true,
         provider,
-        architecture_json: buildDeterministicAwsArchitecture(projectName, qaSummary, deploymentRegion, prompt),
+        architecture_json: archValidation.normalized,
         source: 'deterministic_template',
       });
     }
@@ -344,11 +358,18 @@ export async function POST(req: NextRequest) {
         { status: agenticRes.ok ? 500 : agenticRes.status },
       );
     }
+    const archValidation = validateArchitectureJson(data.architecture_json);
+    if (!archValidation.valid || !archValidation.normalized) {
+      return NextResponse.json(
+        { error: `Generated architecture failed contract validation: ${archValidation.errors.join('; ')}` },
+        { status: 500 },
+      );
+    }
 
     return NextResponse.json({
       success: true,
       provider,
-      architecture_json: data.architecture_json,
+      architecture_json: archValidation.normalized,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Architecture generation error';
