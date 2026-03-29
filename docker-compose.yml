@@ -21,6 +21,7 @@ services:
       - ./DeplAI_old:/app/DeplAI_old:ro
       # KGagent — mounted alongside the agentic layer so graph.py can import it
       - ./KGagent:/app/KGagent:ro
+      - ./diagram_cost-estimation_agent:/app/diagram_cost-estimation_agent
     networks:
       - deplai
     extra_hosts:

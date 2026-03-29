@@ -1,7 +1,7 @@
 """
 Terraform generation runner.
-Wraps the terraform_rag_agent AgentOrchestrator for FastAPI consumption.
-Falls back gracefully if dependencies (chromadb, openai) are unavailable.
+Wraps the terraform agent AgentOrchestrator for FastAPI consumption.
+Uses OpenAI-compatible wiring with Groq defaults.
 """
 
 import json
@@ -117,21 +117,42 @@ def _initialize_agent(provider: str, openai_api_key: str):
     if web_search_tool:
         tools.append(web_search_tool)
 
-    # Make the per-request key available to the OpenAI client without
+    # Make the per-request key available to the OpenAI-compatible client without
     # mutating the process-global environment (concurrent requests could race).
     # AgentOrchestrator.__init__ reads os.getenv("OPENAI_API_KEY") once, so we
     # only set it when no key is already present to avoid clobbering another
     # request's key.
     prev_key = os.environ.get("OPENAI_API_KEY")
+    prev_base_url = os.environ.get("OPENAI_BASE_URL")
+    env_groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    key_looks_groq = bool(openai_api_key and openai_api_key.strip().startswith("gsk_"))
+    use_groq = bool(env_groq_key) or key_looks_groq
+
+    resolved_base_url = os.getenv("TERRAFORM_AGENT_OPENAI_BASE_URL", "").strip()
+    if not resolved_base_url:
+        resolved_base_url = os.getenv("GROQ_BASE_URL", "").strip() or "https://api.groq.com/openai/v1"
+
+    default_model = (
+        "llama-3.3-70b-versatile"
+        if use_groq
+        else "llama-3.3-70b-versatile"
+    )
+    resolved_model = os.getenv("TERRAFORM_AGENT_MODEL", default_model).strip() or default_model
     if openai_api_key and not prev_key:
         os.environ["OPENAI_API_KEY"] = openai_api_key
+    elif not prev_key and env_groq_key:
+        os.environ["OPENAI_API_KEY"] = env_groq_key
+    if not prev_base_url:
+        os.environ["OPENAI_BASE_URL"] = resolved_base_url
 
     try:
-        return AgentOrchestrator(tools=tools, llm_model_name="gpt-4o")
+        return AgentOrchestrator(tools=tools, llm_model_name=resolved_model)
     finally:
         # Restore original state if we set the key temporarily
         if openai_api_key and not prev_key:
             os.environ.pop("OPENAI_API_KEY", None)
+        if not prev_base_url:
+            os.environ.pop("OPENAI_BASE_URL", None)
 
 
 def _collect_output(output_path: str) -> dict[str, str]:
@@ -151,7 +172,7 @@ def generate_terraform(
     openai_api_key: str = "",
 ) -> Optional[dict]:
     """
-    Generate Terraform files from an architecture JSON using the RAG agent.
+    Generate Terraform files from an architecture JSON using the Terraform agent.
 
     Returns:
         {
@@ -162,14 +183,16 @@ def generate_terraform(
       or None if dependencies are unavailable (caller should fall back to templates).
     """
     if not _is_available():
-        logger.warning("terraform_runner: openai not available — RAG agent disabled")
-        return None
+        msg = "Terraform agent dependency missing: openai package is not installed."
+        logger.warning("terraform_runner: %s", msg)
+        return {"success": False, "error": msg}
 
     try:
         agent = _initialize_agent(provider, openai_api_key)
     except Exception as exc:
-        logger.warning("terraform_runner: could not initialize agent: %s", exc)
-        return None
+        msg = f"Terraform agent initialization failed: {exc}"
+        logger.warning("terraform_runner: %s", msg)
+        return {"success": False, "error": msg}
 
     query = (
         f"Generate a complete Terraform project for the following architecture. "
@@ -182,19 +205,21 @@ def generate_terraform(
     try:
         result = agent.run(query=query, project_name=project_name)
     except Exception as exc:
-        logger.error("terraform_runner: agent.run() failed: %s", exc)
-        return None
+        msg = f"Terraform agent execution failed: {exc}"
+        logger.error("terraform_runner: %s", msg)
+        return {"success": False, "error": msg}
 
     final_answer = result.get("final_answer", {})
     if final_answer.get("status") != "SUCCESS":
         msg = final_answer.get("message", "Agent returned non-SUCCESS status")
         logger.error("terraform_runner: %s", msg)
-        return None
+        return {"success": False, "error": str(msg)}
 
     output_path = final_answer.get("output_path", "")
     if not output_path or not os.path.isdir(output_path):
-        logger.error("terraform_runner: invalid output_path: %s", output_path)
-        return None
+        msg = f"Terraform agent produced invalid output path: {output_path}"
+        logger.error("terraform_runner: %s", msg)
+        return {"success": False, "error": msg}
 
     terraform_files = _collect_output(output_path)
 

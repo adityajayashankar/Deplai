@@ -191,3 +191,34 @@ class TerraformApplyResponse(BaseModel):
     cloudfront_url: Optional[str] = None
     details: Optional[dict] = None
     error: Optional[str] = None
+
+
+class AwsRuntimeDetailsRequest(BaseModel):
+    project_name: str = "deplai-project"
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_region: str = "eu-north-1"
+    instance_id: Optional[str] = None
+
+
+class AwsRuntimeDetailsResponse(BaseModel):
+    success: bool
+    details: Optional[dict] = None
+    error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Stage 7 approval payload (diagram + cost + budget gate)
+# ---------------------------------------------------------------------------
+
+class Stage7ApprovalRequest(BaseModel):
+    infra_plan: dict
+    budget_cap_usd: float = 100.0
+    pipeline_run_id: str = ""
+    environment: str = "dev"
+
+
+class Stage7ApprovalResponse(BaseModel):
+    success: bool
+    approval_payload: Optional[dict] = None
+    error: Optional[str] = None
