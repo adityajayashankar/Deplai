@@ -1,10 +1,9 @@
-import { NextRequest, NextResponse } from 'next/server';
+﻿import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { validateArchitectureJson } from '@/lib/architecture-contract';
 import { query } from '@/lib/db';
 import { githubService } from '@/lib/github';
-import { getLegacyRootRuntimeStatus, getLegacyTerraformRagStatus } from '@/lib/legacy-assets';
 import fs from 'fs';
 import path from 'path';
 
@@ -20,9 +19,9 @@ interface IacGenerateBody {
   provider?: Provider;
   qa_summary?: string;
   architecture_context?: string;
-  // Optional: full architecture JSON for RAG-based Terraform generation
+  // Required in LLM-only IaC mode: full architecture JSON
   architecture_json?: Record<string, unknown>;
-  // Optional: OpenAI key forwarded to the RAG agent
+  // Optional: OpenAI key forwarded to the IaC generator
   openai_api_key?: string;
 }
 
@@ -824,507 +823,270 @@ function buildWebsiteSiteFiles(siteAssets: WebsiteAsset[], siteIndexHtml: string
   }));
 }
 
-function resolveWebsiteBlockPublicAccess(qaSummary: string, architectureContext: string): boolean {
-  const qaText = String(qaSummary || '');
-  const text = `${qaText}\n${architectureContext}`.toLowerCase();
-  // Default secure posture with CloudFront OAC.
-  if (!text.trim()) return true;
-
-  // Prefer explicit Q/A parsing from stage-6 answers:
-  // Q: ...Block Public Access...
-  // A: yes/no/on/off
-  const qaPairs = qaText.split(/\n\s*\n/g);
-  for (const pair of qaPairs) {
-    const question = (pair.match(/Q:\s*(.+)/i)?.[1] || '').toLowerCase();
-    const answer = (pair.match(/A:\s*(.+)/i)?.[1] || '').toLowerCase();
-    if (!question || !answer) continue;
-    if (!question.includes('block public access')) continue;
-
-    if (
-      /\b(off|disable|disabled|no|false)\b/.test(answer) &&
-      !/\b(on)\b/.test(answer)
-    ) {
-      return false;
-    }
-    if (
-      /\b(on|enable|enabled|yes|true)\b/.test(answer) &&
-      !/\b(off)\b/.test(answer)
-    ) {
-      return true;
-    }
-  }
-
-  const explicitOff =
-    text.includes('block public access off') ||
-    text.includes('block public access: off') ||
-    text.includes('disable block public access') ||
-    text.includes('public access block off');
-  if (explicitOff) return false;
-
-  const explicitOn =
-    text.includes('block public access on') ||
-    text.includes('block public access: on') ||
-    text.includes('enable block public access') ||
-    text.includes('public access block on');
-  if (explicitOn) return true;
-
-  return true;
-}
-
-function buildAwsBundle(
+function buildAwsSixFileBundle(
   projectName: string,
-  awsProjectSlug: string,
+  safeProjectSlug: string,
   contextBlock: string,
   sec: ReturnType<typeof summarizeSecurity>,
-  siteAssets: WebsiteAsset[],
-  siteIndexHtml: string,
-  websiteBlockPublicAccess: boolean,
+  websiteIndexHtml: string,
 ): GeneratedFile[] {
-  const ec2HtmlBase64 = Buffer.from(siteIndexHtml, 'utf-8').toString('base64');
-  const siteFiles = buildWebsiteSiteFiles(siteAssets, siteIndexHtml);
-  const safeProjectSlug = awsProjectSlug.replace(/"/g, '');
-  const tfContext = String(contextBlock || '').replace(/\r/g, '').trim() || 'No additional operator context was provided.';
+  const safeContext = contextBlock.replace(/\r/g, '');
+  const ec2HtmlBase64 = Buffer.from(String(websiteIndexHtml || ''), 'utf-8').toString('base64');
 
   const providersTf = `terraform {
   required_version = ">= 1.5.0"
-
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-    tls = {
-      source  = "hashicorp/tls"
-      version = "~> 4.0"
+      version = "~> 5.54"
     }
     random = {
       source  = "hashicorp/random"
       version = "~> 3.6"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
     }
   }
 }
 
 provider "aws" {
   region = var.aws_region
-
-  default_tags {
-    tags = local.common_tags
-  }
 }
 `;
 
   const backendTf = `terraform {
-  backend "local" {
-    path = "deplai.tfstate"
-  }
+  backend "local" {}
 }
 `;
 
-  const mainTf = `locals {
-  common_tags = {
-    Project     = var.project_name
-    ManagedBy   = "deplai"
-    Environment = var.environment
-  }
-}
-
-module "network" {
-  source = "./modules/network"
-
-  preferred_availability_zones = var.preferred_availability_zones
-}
-
-module "security" {
-  source = "./modules/security"
-
-  project_name        = var.project_name
-  vpc_id              = module.network.vpc_id
-  ingress_cidr_blocks = var.ingress_cidr_blocks
-  tags                = local.common_tags
-}
-
-module "compute" {
-  source = "./modules/compute"
-
-  project_name                = var.project_name
-  enable_ec2                  = var.enable_ec2
-  instance_type               = var.instance_type
-  subnet_id                   = module.network.selected_subnet_id
-  vpc_security_group_ids      = [module.security.web_security_group_id]
-  existing_ec2_key_pair_name  = var.existing_ec2_key_pair_name
-  ec2_root_volume_size        = var.ec2_root_volume_size
-  bootstrap_index_html_base64 = var.bootstrap_index_html_base64
-  tags                        = local.common_tags
-}
-
-module "website" {
-  source = "./modules/website"
-
-  project_name              = var.project_name
-  site_asset_root           = "\${path.root}/site"
-  block_public_access       = var.website_block_public_access
-  force_destroy_site_bucket = var.force_destroy_site_bucket
-  tags                      = local.common_tags
-}
-
-module "observability" {
-  source = "./modules/observability"
-
-  project_name       = var.project_name
-  environment        = var.environment
-  log_retention_days = var.log_retention_days
-  enable_ec2         = var.enable_ec2
-  instance_id        = try(module.compute.instance_id, "")
-  tags               = local.common_tags
-}
-
-# Security context snapshot:
-# - Code findings: ${sec.totalCodeFindings}
-# - Supply findings: ${sec.totalSupplyFindings}
-# - Critical/high supply findings: ${sec.criticalOrHighSupply}
-# - High-impact CWEs: ${sec.highCwe.join(', ') || 'none'}
-`;
-
-  const varsTf = `variable "project_name" {
-  type        = string
-  description = "Project identifier used for resource naming."
-  default     = "${safeProjectSlug}"
+  const variablesTf = `variable "project_name" {
+  type    = string
+  default = "${safeProjectSlug}"
 }
 
 variable "aws_region" {
-  type        = string
-  description = "AWS region where resources will be created."
-  default     = "eu-north-1"
+  type    = string
+  default = "eu-north-1"
 }
 
 variable "environment" {
-  type        = string
-  description = "Environment label for tagging and overlays."
-  default     = "dev"
-}
-
-variable "preferred_availability_zones" {
-  type        = list(string)
-  description = "Preferred AZ order for instance placement."
-  default     = ["eu-north-1a", "eu-north-1b", "eu-north-1c"]
+  type    = string
+  default = "dev"
 }
 
 variable "instance_type" {
-  type        = string
-  description = "EC2 instance type (kept free-tier eligible by default)."
-  default     = "t3.micro"
+  type    = string
+  default = "t3.micro"
 }
 
 variable "enable_ec2" {
-  type        = bool
-  description = "Whether to provision EC2 compute."
-  default     = true
+  type    = bool
+  default = true
 }
 
 variable "existing_ec2_key_pair_name" {
-  type        = string
-  description = "Existing EC2 key pair name to attach. Leave empty to auto-generate one."
-  default     = ""
+  type    = string
+  default = ""
 }
 
 variable "ingress_cidr_blocks" {
-  type        = list(string)
-  description = "Inbound CIDR ranges for SSH/HTTP/HTTPS."
-  default     = ["0.0.0.0/0"]
+  type    = list(string)
+  default = ["0.0.0.0/0"]
 }
 
-variable "website_block_public_access" {
-  type        = bool
-  description = "Whether to enforce S3 Block Public Access for website bucket."
-  default     = ${websiteBlockPublicAccess ? 'true' : 'false'}
+variable "ssh_ingress_cidr_blocks" {
+  type    = list(string)
+  default = []
+}
+
+variable "preferred_availability_zones" {
+  type    = list(string)
+  default = ["eu-north-1a", "eu-north-1b", "eu-north-1c"]
+}
+
+variable "use_default_vpc" {
+  type    = bool
+  default = true
+}
+
+variable "vpc_cidr_block" {
+  type    = string
+  default = "10.42.0.0/16"
+}
+
+variable "public_subnet_cidr" {
+  type    = string
+  default = "10.42.1.0/24"
 }
 
 variable "force_destroy_site_bucket" {
-  type        = bool
-  description = "Allow destroy for non-production cleanups."
-  default     = true
-}
-
-variable "log_retention_days" {
-  type        = number
-  description = "CloudWatch log retention."
-  default     = 30
+  type    = bool
+  default = true
 }
 
 variable "ec2_root_volume_size" {
-  type        = number
-  description = "Root volume size in GiB."
-  default     = 8
+  type    = number
+  default = 8
 }
 
 variable "bootstrap_index_html_base64" {
-  type        = string
-  description = "Base64-encoded HTML used for EC2 bootstrap landing page."
-  default     = "${ec2HtmlBase64}"
-  sensitive   = true
+  type      = string
+  default   = "${ec2HtmlBase64}"
+  sensitive = true
 }
 
 variable "context_summary" {
-  type        = string
-  description = "Human context captured during Q/A and architecture stages."
-  default     = ""
+  type    = string
+  default = ""
 }
 `;
 
-  const terraformTfvars = `project_name = "${safeProjectSlug}"
+  const tfvars = `project_name = "${safeProjectSlug}"
 aws_region = "eu-north-1"
 environment = "dev"
 instance_type = "t3.micro"
 enable_ec2 = true
-preferred_availability_zones = ["eu-north-1a", "eu-north-1b", "eu-north-1c"]
-ingress_cidr_blocks = ["0.0.0.0/0"]
 existing_ec2_key_pair_name = ""
-website_block_public_access = ${websiteBlockPublicAccess ? 'true' : 'false'}
+ingress_cidr_blocks = ["0.0.0.0/0"]
+ssh_ingress_cidr_blocks = []
+preferred_availability_zones = ["eu-north-1a", "eu-north-1b", "eu-north-1c"]
+use_default_vpc = true
+vpc_cidr_block = "10.42.0.0/16"
+public_subnet_cidr = "10.42.1.0/24"
 force_destroy_site_bucket = true
-log_retention_days = 30
 ec2_root_volume_size = 8
 bootstrap_index_html_base64 = "${ec2HtmlBase64}"
-
 context_summary = <<-EOT
-${tfContext}
+${safeContext}
 EOT
 `;
 
-  const outputsTf = `output "security_logs_bucket" {
-  value       = module.website.security_logs_bucket
-  description = "S3 bucket for security and application logs."
-}
-
-output "app_log_group" {
-  value       = module.observability.log_group_name
-  description = "CloudWatch log group for runtime logs."
-}
-
-output "instance_public_ip" {
-  value       = module.compute.instance_public_ip
-  description = "Public IP of EC2 instance."
-}
-
-output "ec2_instance_id" {
-  value       = module.compute.instance_id
-  description = "EC2 instance id."
-}
-
-output "ec2_instance_type" {
-  value       = module.compute.instance_type
-  description = "EC2 instance type."
-}
-
-output "ec2_ami_id" {
-  value       = module.compute.ami_id
-  description = "AMI id used for EC2."
-}
-
-output "ec2_public_dns" {
-  value       = module.compute.public_dns
-  description = "EC2 public DNS."
-}
-
-output "ec2_availability_zone" {
-  value       = module.compute.availability_zone
-  description = "EC2 availability zone."
-}
-
-output "ec2_subnet_id" {
-  value       = module.compute.subnet_id
-  description = "Subnet id where EC2 is deployed."
-}
-
-output "ec2_vpc_security_group_ids" {
-  value       = module.compute.vpc_security_group_ids
-  description = "Security groups attached to EC2."
-}
-
-output "ec2_key_name" {
-  value       = module.compute.ec2_key_name
-  description = "Selected EC2 key pair name."
-}
-
-output "generated_ec2_private_key_pem" {
-  value       = module.compute.generated_private_key_pem
-  description = "Generated private key PEM when existing key name is not provided."
-  sensitive   = true
-}
-
-output "vpc_id" {
-  value       = module.network.vpc_id
-  description = "Target VPC id."
-}
-
-output "subnet_ids" {
-  value       = module.network.subnet_ids
-  description = "Candidate subnet ids in VPC."
-}
-
-output "selected_subnet_id" {
-  value       = module.network.selected_subnet_id
-  description = "Subnet selected for EC2 placement."
-}
-
-output "web_security_group_id" {
-  value       = module.security.web_security_group_id
-  description = "Security group used for web ingress."
-}
-
-output "instance_url" {
-  value       = module.compute.instance_url
-  description = "HTTP endpoint of EC2 instance."
-}
-
-output "website_bucket" {
-  value       = module.website.website_bucket
-  description = "S3 bucket hosting static site assets."
-}
-
-output "cloudfront_domain_name" {
-  value       = module.website.cloudfront_domain_name
-  description = "CloudFront domain name."
-}
-
-output "cloudfront_url" {
-  value       = module.website.cloudfront_url
-  description = "Public CloudFront URL."
-}
-
-output "s3_website_endpoint" {
-  value       = module.website.s3_website_endpoint
-  description = "S3 website endpoint."
-}
-`;
-
-  const moduleNetworkMainTf = `data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnets" "default_in_vpc" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
+  const mainTf = `locals {
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "deplai"
   }
 }
 
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+data "aws_vpc" "default" {
+  count   = var.use_default_vpc ? 1 : 0
+  default = true
+}
+
+data "aws_subnets" "default" {
+  count = var.use_default_vpc ? 1 : 0
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default[0].id]
+  }
+}
+
+locals {
+  preferred_azs = length(var.preferred_availability_zones) > 0 ? [for az in var.preferred_availability_zones : az if contains(data.aws_availability_zones.available.names, az)] : data.aws_availability_zones.available.names
+  selected_az   = length(local.preferred_azs) > 0 ? local.preferred_azs[0] : data.aws_availability_zones.available.names[0]
+  default_subnet_ids = try(data.aws_subnets.default[0].ids, [])
+}
+
 data "aws_subnet" "default_details" {
-  for_each = toset(data.aws_subnets.default_in_vpc.ids)
+  for_each = var.use_default_vpc ? toset(local.default_subnet_ids) : toset([])
   id       = each.value
 }
 
 locals {
-  preferred_subnet_ids = [
-    for subnet in data.aws_subnet.default_details :
-    subnet.id if contains(var.preferred_availability_zones, subnet.availability_zone)
-  ]
-
-  selected_subnet_id = length(local.preferred_subnet_ids) > 0
-    ? local.preferred_subnet_ids[0]
-    : (length(data.aws_subnets.default_in_vpc.ids) > 0 ? data.aws_subnets.default_in_vpc.ids[0] : "")
-}
-`;
-
-  const moduleNetworkVarsTf = `variable "preferred_availability_zones" {
-  type        = list(string)
-  description = "Preferred AZ order for subnet selection."
-}
-`;
-
-  const moduleNetworkOutputsTf = `output "vpc_id" {
-  value = data.aws_vpc.default.id
+  preferred_default_subnet_ids = [for s in values(data.aws_subnet.default_details) : s.id if contains(local.preferred_azs, s.availability_zone)]
+  selected_default_subnet_id   = length(local.preferred_default_subnet_ids) > 0 ? local.preferred_default_subnet_ids[0] : (length(local.default_subnet_ids) > 0 ? local.default_subnet_ids[0] : null)
 }
 
-output "subnet_ids" {
-  value = data.aws_subnets.default_in_vpc.ids
+resource "aws_vpc" "main" {
+  count                = var.use_default_vpc ? 0 : 1
+  cidr_block           = var.vpc_cidr_block
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags                 = merge(local.tags, { Name = "\${var.project_name}-vpc" })
 }
 
-output "selected_subnet_id" {
-  value = local.selected_subnet_id
+resource "aws_internet_gateway" "main" {
+  count  = var.use_default_vpc ? 0 : 1
+  vpc_id = aws_vpc.main[0].id
+  tags   = merge(local.tags, { Name = "\${var.project_name}-igw" })
 }
-`;
 
-  const moduleSecurityMainTf = `resource "aws_security_group" "web" {
+resource "aws_subnet" "public" {
+  count                   = var.use_default_vpc ? 0 : 1
+  vpc_id                  = aws_vpc.main[0].id
+  cidr_block              = var.public_subnet_cidr
+  availability_zone       = local.selected_az
+  map_public_ip_on_launch = true
+  tags                    = merge(local.tags, { Name = "\${var.project_name}-public-subnet" })
+}
+
+resource "aws_route_table" "public" {
+  count  = var.use_default_vpc ? 0 : 1
+  vpc_id = aws_vpc.main[0].id
+  tags   = merge(local.tags, { Name = "\${var.project_name}-public-rt" })
+}
+
+resource "aws_route" "internet_access" {
+  count                  = var.use_default_vpc ? 0 : 1
+  route_table_id         = aws_route_table.public[0].id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.main[0].id
+}
+
+resource "aws_route_table_association" "public" {
+  count          = var.use_default_vpc ? 0 : 1
+  subnet_id      = aws_subnet.public[0].id
+  route_table_id = aws_route_table.public[0].id
+}
+
+locals {
+  selected_vpc_id        = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
+  selected_instance_subnet_id = var.use_default_vpc ? local.selected_default_subnet_id : aws_subnet.public[0].id
+}
+
+resource "aws_security_group" "web" {
   name_prefix = "\${var.project_name}-web-"
-  description = "Web and SSH ingress for application access"
-  vpc_id      = var.vpc_id
+  description = "Web access for DeplAI deployment"
+  vpc_id      = local.selected_vpc_id
+  tags        = local.tags
 
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = var.ingress_cidr_blocks
+  dynamic "ingress" {
+    for_each = var.ssh_ingress_cidr_blocks
+    content {
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
   }
-
   ingress {
-    description = "HTTP"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = var.ingress_cidr_blocks
   }
-
   ingress {
-    description = "HTTPS"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
     cidr_blocks = var.ingress_cidr_blocks
   }
-
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
-  tags = merge(var.tags, {
-    Name = "\${var.project_name}-web"
-  })
-}
-`;
-
-  const moduleSecurityVarsTf = `variable "project_name" {
-  type = string
 }
 
-variable "vpc_id" {
-  type = string
-}
-
-variable "ingress_cidr_blocks" {
-  type        = list(string)
-  description = "Allowed ingress CIDR blocks."
-}
-
-variable "tags" {
-  type    = map(string)
-  default = {}
-}
-`;
-
-  const moduleSecurityOutputsTf = `output "web_security_group_id" {
-  value = aws_security_group.web.id
-}
-`;
-
-  const moduleComputeMainTf = `data "aws_ami" "amazon_linux" {
-  most_recent = true
-  owners      = ["amazon"]
-
-  filter {
-    name   = "name"
-    values = ["al2023-ami-2023.*-x86_64"]
-  }
-}
-
-resource "random_id" "suffix" {
-  byte_length = 3
-}
-
-resource "tls_private_key" "ec2_ssh" {
+resource "tls_private_key" "generated" {
   count     = var.enable_ec2 && trimspace(var.existing_ec2_key_pair_name) == "" ? 1 : 0
   algorithm = "RSA"
   rsa_bits  = 4096
@@ -1332,270 +1094,118 @@ resource "tls_private_key" "ec2_ssh" {
 
 resource "aws_key_pair" "generated" {
   count      = var.enable_ec2 && trimspace(var.existing_ec2_key_pair_name) == "" ? 1 : 0
-  key_name   = "\${var.project_name}-ssh-\${random_id.suffix.hex}"
-  public_key = tls_private_key.ec2_ssh[0].public_key_openssh
-
-  tags = merge(var.tags, {
-    Name = "\${var.project_name}-ssh"
-  })
+  key_name   = "\${var.project_name}-key"
+  public_key = tls_private_key.generated[0].public_key_openssh
 }
 
 locals {
-  selected_ec2_key_name = !var.enable_ec2
-    ? null
-    : (
-      trimspace(var.existing_ec2_key_pair_name) != ""
-      ? trimspace(var.existing_ec2_key_pair_name)
-      : try(aws_key_pair.generated[0].key_name, null)
-    )
+  selected_ec2_key_name = !var.enable_ec2 ? null : (
+    trimspace(var.existing_ec2_key_pair_name) != ""
+    ? trimspace(var.existing_ec2_key_pair_name)
+    : try(aws_key_pair.generated[0].key_name, null)
+  )
+}
+
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023*-x86_64"]
+  }
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
 }
 
 resource "aws_instance" "app" {
-  count                       = var.enable_ec2 && trimspace(var.subnet_id) != "" ? 1 : 0
-  ami                         = data.aws_ami.amazon_linux.id
+  count                       = var.enable_ec2 ? 1 : 0
+  ami                         = data.aws_ami.al2023.id
   instance_type               = var.instance_type
+  subnet_id                   = local.selected_instance_subnet_id
+  vpc_security_group_ids      = [aws_security_group.web.id]
   key_name                    = local.selected_ec2_key_name
-  subnet_id                   = var.subnet_id
-  vpc_security_group_ids      = var.vpc_security_group_ids
   associate_public_ip_address = true
-
-  root_block_device {
-    volume_size           = var.ec2_root_volume_size
-    volume_type           = "gp3"
-    encrypted             = true
-    delete_on_termination = true
-  }
+  tags                        = merge(local.tags, { Name = "\${var.project_name}-app" })
 
   metadata_options {
-    http_endpoint = "enabled"
-    http_tokens   = "required"
+    http_tokens = "required"
   }
 
-  user_data = <<-EOT
-    #!/bin/bash
-    set -euxo pipefail
-    dnf update -y
-    dnf install -y nginx
-    systemctl enable nginx
-    echo '\${var.bootstrap_index_html_base64}' | base64 -d > /usr/share/nginx/html/index.html
-    systemctl restart nginx
-  EOT
+  root_block_device {
+    volume_type = "gp3"
+    volume_size = var.ec2_root_volume_size
+    encrypted   = true
+  }
 
-  tags = merge(var.tags, {
-    Name = "\${var.project_name}-app"
-  })
-}
-`;
-
-  const moduleComputeVarsTf = `variable "project_name" {
-  type = string
+  user_data = <<-EOF
+              #!/bin/bash
+              cat > /usr/share/nginx/html/index.html <<'HTML'
+              \${base64decode(var.bootstrap_index_html_base64)}
+              HTML
+              EOF
 }
 
-variable "enable_ec2" {
-  type = bool
-}
-
-variable "instance_type" {
-  type = string
-}
-
-variable "subnet_id" {
-  type = string
-}
-
-variable "vpc_security_group_ids" {
-  type = list(string)
-}
-
-variable "existing_ec2_key_pair_name" {
-  type = string
-}
-
-variable "ec2_root_volume_size" {
-  type = number
-}
-
-variable "bootstrap_index_html_base64" {
-  type      = string
-  sensitive = true
-}
-
-variable "tags" {
-  type    = map(string)
-  default = {}
-}
-`;
-
-  const moduleComputeOutputsTf = `output "instance_public_ip" {
-  value = try(aws_instance.app[0].public_ip, null)
-}
-
-output "instance_id" {
-  value = try(aws_instance.app[0].id, null)
-}
-
-output "instance_type" {
-  value = try(aws_instance.app[0].instance_type, null)
-}
-
-output "ami_id" {
-  value = try(aws_instance.app[0].ami, null)
-}
-
-output "public_dns" {
-  value = try(aws_instance.app[0].public_dns, null)
-}
-
-output "availability_zone" {
-  value = try(aws_instance.app[0].availability_zone, null)
-}
-
-output "subnet_id" {
-  value = try(aws_instance.app[0].subnet_id, null)
-}
-
-output "vpc_security_group_ids" {
-  value = try(aws_instance.app[0].vpc_security_group_ids, [])
-}
-
-output "ec2_key_name" {
-  value = local.selected_ec2_key_name
-}
-
-output "generated_private_key_pem" {
-  value     = try(tls_private_key.ec2_ssh[0].private_key_pem, null)
-  sensitive = true
-}
-
-output "instance_url" {
-  value = try("http://\${aws_instance.app[0].public_ip}", null)
-}
-`;
-
-  const moduleWebsiteMainTf = `resource "random_id" "suffix" {
+resource "random_id" "bucket_suffix" {
   byte_length = 4
 }
 
-resource "aws_s3_bucket" "security_logs" {
-  bucket        = "\${var.project_name}-security-logs-\${random_id.suffix.hex}"
-  force_destroy = true
-  tags          = var.tags
+resource "aws_s3_bucket" "website" {
+  bucket        = "\${var.project_name}-site-\${random_id.bucket_suffix.hex}"
+  force_destroy = var.force_destroy_site_bucket
+  tags          = local.tags
 }
 
-resource "aws_s3_bucket_public_access_block" "security_logs" {
-  bucket                  = aws_s3_bucket.security_logs.id
+resource "aws_s3_bucket_public_access_block" "website" {
+  bucket                  = aws_s3_bucket.website.id
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
 }
 
-resource "aws_s3_bucket" "website" {
-  bucket        = "\${var.project_name}-site-\${random_id.suffix.hex}"
-  force_destroy = var.force_destroy_site_bucket
-  tags          = var.tags
-}
-
 resource "aws_s3_bucket_ownership_controls" "website" {
   bucket = aws_s3_bucket.website.id
-
-  rule {
-    object_ownership = "BucketOwnerPreferred"
-  }
+  rule { object_ownership = "BucketOwnerPreferred" }
 }
 
-resource "aws_s3_bucket_website_configuration" "website" {
-  bucket = aws_s3_bucket.website.id
-
-  index_document {
-    suffix = "index.html"
-  }
-
-  error_document {
-    key = "index.html"
-  }
+resource "aws_s3_object" "index" {
+  bucket       = aws_s3_bucket.website.id
+  key          = "index.html"
+  content      = base64decode(var.bootstrap_index_html_base64)
+  content_type = "text/html"
 }
 
-resource "aws_s3_bucket_public_access_block" "website" {
-  bucket                  = aws_s3_bucket.website.id
-  block_public_acls       = var.block_public_access
-  block_public_policy     = var.block_public_access
-  ignore_public_acls      = var.block_public_access
-  restrict_public_buckets = var.block_public_access
-}
-
-locals {
-  content_type_by_ext = {
-    html  = "text/html"
-    htm   = "text/html"
-    css   = "text/css"
-    js    = "application/javascript"
-    mjs   = "application/javascript"
-    json  = "application/json"
-    map   = "application/json"
-    txt   = "text/plain"
-    xml   = "application/xml"
-    svg   = "image/svg+xml"
-    png   = "image/png"
-    jpg   = "image/jpeg"
-    jpeg  = "image/jpeg"
-    gif   = "image/gif"
-    webp  = "image/webp"
-    ico   = "image/x-icon"
-    woff  = "font/woff"
-    woff2 = "font/woff2"
-    ttf   = "font/ttf"
-    eot   = "application/vnd.ms-fontobject"
-    otf   = "font/otf"
-  }
-}
-
-resource "aws_s3_object" "website_assets" {
-  for_each = fileset(var.site_asset_root, "**")
-
-  bucket = aws_s3_bucket.website.id
-  key    = each.value
-  source = "\${var.site_asset_root}/\${each.value}"
-  etag   = filemd5("\${var.site_asset_root}/\${each.value}")
-
-  content_type = lookup(
-    local.content_type_by_ext,
-    lower(element(reverse(split(".", each.value)), 0)),
-    "application/octet-stream",
-  )
-}
-
-resource "aws_cloudfront_origin_access_control" "website" {
-  name                              = "\${var.project_name}-oac-\${random_id.suffix.hex}"
-  description                       = "Origin access control for static website bucket"
+resource "aws_cloudfront_origin_access_control" "oac" {
+  name                              = "\${var.project_name}-oac-\${random_id.bucket_suffix.hex}"
+  description                       = "OAC for website bucket"
   origin_access_control_origin_type = "s3"
   signing_behavior                  = "always"
   signing_protocol                  = "sigv4"
 }
 
-resource "aws_cloudfront_distribution" "cdn" {
+resource "aws_cloudfront_distribution" "website" {
   enabled             = true
-  wait_for_deployment = false
   default_root_object = "index.html"
+  tags                = local.tags
 
   origin {
     domain_name              = aws_s3_bucket.website.bucket_regional_domain_name
-    origin_id                = "s3-origin-\${aws_s3_bucket.website.id}"
-    origin_access_control_id = aws_cloudfront_origin_access_control.website.id
+    origin_id                = "s3-website-origin"
+    origin_access_control_id = aws_cloudfront_origin_access_control.oac.id
   }
 
   default_cache_behavior {
-    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
-    cached_methods         = ["GET", "HEAD"]
-    target_origin_id       = "s3-origin-\${aws_s3_bucket.website.id}"
+    target_origin_id       = "s3-website-origin"
     viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
+    cached_methods         = ["GET", "HEAD", "OPTIONS"]
     compress               = true
 
     forwarded_values {
       query_string = false
-      cookies {
-        forward = "none"
-      }
+      cookies { forward = "none" }
     }
   }
 
@@ -1608,157 +1218,52 @@ resource "aws_cloudfront_distribution" "cdn" {
   viewer_certificate {
     cloudfront_default_certificate = true
   }
-
-  depends_on = [aws_s3_object.website_assets]
-}
-
-data "aws_iam_policy_document" "website_oac" {
-  statement {
-    actions   = ["s3:GetObject"]
-    resources = ["\${aws_s3_bucket.website.arn}/*"]
-
-    principals {
-      type        = "Service"
-      identifiers = ["cloudfront.amazonaws.com"]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "AWS:SourceArn"
-      values   = [aws_cloudfront_distribution.cdn.arn]
-    }
-  }
 }
 
 resource "aws_s3_bucket_policy" "website" {
   bucket = aws_s3_bucket.website.id
-  policy = data.aws_iam_policy_document.website_oac.json
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = { Service = "cloudfront.amazonaws.com" }
+      Action = ["s3:GetObject"]
+      Resource = ["\${aws_s3_bucket.website.arn}/*"]
+      Condition = {
+        StringEquals = {
+          "AWS:SourceArn" = aws_cloudfront_distribution.website.arn
+        }
+      }
+    }]
+  })
 }
 `;
 
-  const moduleWebsiteVarsTf = `variable "project_name" {
-  type = string
+  const outputsTf = `output "cloudfront_url" { value = "https://\${aws_cloudfront_distribution.website.domain_name}" }
+output "website_bucket_name" { value = aws_s3_bucket.website.id }
+output "ec2_instance_id" { value = try(aws_instance.app[0].id, null) }
+output "ec2_instance_arn" { value = try(aws_instance.app[0].arn, null) }
+output "ec2_instance_state" { value = try(aws_instance.app[0].instance_state, null) }
+output "ec2_instance_type" { value = var.instance_type }
+output "ec2_public_ip" { value = try(aws_instance.app[0].public_ip, null) }
+output "ec2_private_ip" { value = try(aws_instance.app[0].private_ip, null) }
+output "ec2_public_dns" { value = try(aws_instance.app[0].public_dns, null) }
+output "ec2_private_dns" { value = try(aws_instance.app[0].private_dns, null) }
+output "ec2_vpc_id" { value = local.selected_vpc_id }
+output "ec2_subnet_id" { value = local.selected_instance_subnet_id }
+output "ec2_key_name" { value = local.selected_ec2_key_name }
+output "generated_ec2_private_key_pem" {
+  value     = try(tls_private_key.generated[0].private_key_pem, null)
+  sensitive = true
 }
-
-variable "site_asset_root" {
-  type = string
-}
-
-variable "block_public_access" {
-  type = bool
-}
-
-variable "force_destroy_site_bucket" {
-  type = bool
-}
-
-variable "tags" {
-  type    = map(string)
-  default = {}
-}
-`;
-
-  const moduleWebsiteOutputsTf = `output "security_logs_bucket" {
-  value = aws_s3_bucket.security_logs.bucket
-}
-
-output "website_bucket" {
-  value = aws_s3_bucket.website.bucket
-}
-
-output "cloudfront_domain_name" {
-  value = aws_cloudfront_distribution.cdn.domain_name
-}
-
-output "cloudfront_url" {
-  value = "https://\${aws_cloudfront_distribution.cdn.domain_name}"
-}
-
-output "s3_website_endpoint" {
-  value = aws_s3_bucket_website_configuration.website.website_endpoint
-}
-`;
-
-  const moduleObservabilityMainTf = `resource "aws_cloudwatch_log_group" "app" {
-  name              = "/deplai/\${var.project_name}/\${var.environment}"
-  retention_in_days = var.log_retention_days
-  tags              = var.tags
-}
-
-resource "aws_cloudwatch_metric_alarm" "ec2_cpu_high" {
-  count = var.enable_ec2 && trimspace(var.instance_id) != "" ? 1 : 0
-
-  alarm_name          = "\${var.project_name}-\${var.environment}-ec2-cpu-high"
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 2
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = 300
-  statistic           = "Average"
-  threshold           = 80
-  treat_missing_data  = "notBreaching"
-
-  dimensions = {
-    InstanceId = var.instance_id
+output "security_summary" {
+  value = {
+    code_findings = ${sec.totalCodeFindings}
+    supply_findings = ${sec.totalSupplyFindings}
+    critical_or_high_supply = ${sec.criticalOrHighSupply}
+    high_cwe = "${sec.highCwe.join(', ') || 'none'}"
   }
-
-  tags = var.tags
 }
-`;
-
-  const moduleObservabilityVarsTf = `variable "project_name" {
-  type = string
-}
-
-variable "environment" {
-  type = string
-}
-
-variable "log_retention_days" {
-  type = number
-}
-
-variable "enable_ec2" {
-  type = bool
-}
-
-variable "instance_id" {
-  type = string
-}
-
-variable "tags" {
-  type    = map(string)
-  default = {}
-}
-`;
-
-  const moduleObservabilityOutputsTf = `output "log_group_name" {
-  value = aws_cloudwatch_log_group.app.name
-}
-
-output "cpu_alarm_name" {
-  value = try(aws_cloudwatch_metric_alarm.ec2_cpu_high[0].alarm_name, null)
-}
-`;
-
-  const envDevTfvars = `environment = "dev"
-instance_type = "t3.micro"
-enable_ec2 = true
-force_destroy_site_bucket = true
-log_retention_days = 14
-`;
-
-  const envProdTfvars = `environment = "prod"
-instance_type = "t3.micro"
-enable_ec2 = true
-force_destroy_site_bucket = false
-log_retention_days = 30
-`;
-
-  const envDevBackendHcl = `path = "deplai-dev.tfstate"
-`;
-
-  const envProdBackendHcl = `path = "deplai-prod.tfstate"
 `;
 
   const ansiblePlaybook = `---
@@ -1771,41 +1276,6 @@ log_retention_days = 30
         name: unattended-upgrades
         state: present
       when: ansible_os_family == "Debian"
-
-    - name: Disable root SSH login
-      lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?PermitRootLogin'
-        line: 'PermitRootLogin no'
-      notify: restart ssh
-
-    - name: Ensure UFW is enabled
-      ufw:
-        state: enabled
-        policy: deny
-
-    - name: Allow SSH through UFW
-      ufw:
-        rule: allow
-        name: OpenSSH
-
-    - name: Allow HTTP through UFW
-      ufw:
-        rule: allow
-        port: '80'
-        proto: tcp
-
-    - name: Allow HTTPS through UFW
-      ufw:
-        rule: allow
-        port: '443'
-        proto: tcp
-
-  handlers:
-    - name: restart ssh
-      service:
-        name: ssh
-        state: restarted
 `;
 
   const inventory = `[all]
@@ -1815,85 +1285,30 @@ example-host ansible_host=127.0.0.1 ansible_user=ubuntu
 
   const readme = `# IaC Bundle - ${projectName}
 
-Generated by DeplAI pipeline Step 9.
+Standard 6-file Terraform fallback bundle generated by DeplAI.
 
-## Terraform Structure
-- \`terraform/providers.tf\` -> provider + required providers
-- \`terraform/backend.tf\` -> state backend declaration
-- \`terraform/main.tf\` -> root module wiring
-- \`terraform/variables.tf\` -> input contract
-- \`terraform/terraform.tfvars\` -> baseline values
-- \`terraform/outputs.tf\` -> deployment outputs
-- \`terraform/modules/*\` -> reusable building blocks
-- \`terraform/environments/dev|prod\` -> environment overlays
-
-## Modules
-- \`modules/network\`: default VPC and subnet selection by preferred AZ
-- \`modules/security\`: web security group for SSH/HTTP/HTTPS
-- \`modules/compute\`: EC2 + key pair generation fallback
-- \`modules/website\`: S3 asset hosting + CloudFront OAC
-- \`modules/observability\`: CloudWatch log group + CPU alarm baseline
-
-## Free-tier + Production-aware defaults
-- Instance default: \`t3.micro\`
-- Root volume: encrypted \`gp3\` with \`8 GiB\`
-- CloudFront in front of S3 with OAC
-- IMDSv2 required on EC2
-- Environment overlays under \`environments/\`
-
-## Context
-${contextBlock}
-
-## Commands
-\`\`\`bash
-cd terraform
-terraform init -backend-config=environments/dev/backend.hcl
-terraform plan -var-file=terraform.tfvars -var-file=environments/dev/terraform.tfvars
-\`\`\`
-
-## Key Pair Handling
-If \`existing_ec2_key_pair_name\` is empty, Terraform generates a key pair and exposes \`generated_ec2_private_key_pem\`. Download the \`.pem\` or \`.ppk\` immediately from the DeplAI UI.
+Terraform files:
+- terraform/providers.tf
+- terraform/backend.tf
+- terraform/main.tf
+- terraform/variables.tf
+- terraform/terraform.tfvars
+- terraform/outputs.tf
 `;
 
   return [
     { path: 'terraform/providers.tf', content: providersTf },
     { path: 'terraform/backend.tf', content: backendTf },
     { path: 'terraform/main.tf', content: mainTf },
-    { path: 'terraform/variables.tf', content: varsTf },
-    { path: 'terraform/terraform.tfvars', content: terraformTfvars },
+    { path: 'terraform/variables.tf', content: variablesTf },
+    { path: 'terraform/terraform.tfvars', content: tfvars },
     { path: 'terraform/outputs.tf', content: outputsTf },
-
-    { path: 'terraform/modules/network/main.tf', content: moduleNetworkMainTf },
-    { path: 'terraform/modules/network/variables.tf', content: moduleNetworkVarsTf },
-    { path: 'terraform/modules/network/outputs.tf', content: moduleNetworkOutputsTf },
-
-    { path: 'terraform/modules/security/main.tf', content: moduleSecurityMainTf },
-    { path: 'terraform/modules/security/variables.tf', content: moduleSecurityVarsTf },
-    { path: 'terraform/modules/security/outputs.tf', content: moduleSecurityOutputsTf },
-
-    { path: 'terraform/modules/compute/main.tf', content: moduleComputeMainTf },
-    { path: 'terraform/modules/compute/variables.tf', content: moduleComputeVarsTf },
-    { path: 'terraform/modules/compute/outputs.tf', content: moduleComputeOutputsTf },
-
-    { path: 'terraform/modules/website/main.tf', content: moduleWebsiteMainTf },
-    { path: 'terraform/modules/website/variables.tf', content: moduleWebsiteVarsTf },
-    { path: 'terraform/modules/website/outputs.tf', content: moduleWebsiteOutputsTf },
-
-    { path: 'terraform/modules/observability/main.tf', content: moduleObservabilityMainTf },
-    { path: 'terraform/modules/observability/variables.tf', content: moduleObservabilityVarsTf },
-    { path: 'terraform/modules/observability/outputs.tf', content: moduleObservabilityOutputsTf },
-
-    { path: 'terraform/environments/dev/terraform.tfvars', content: envDevTfvars },
-    { path: 'terraform/environments/dev/backend.hcl', content: envDevBackendHcl },
-    { path: 'terraform/environments/prod/terraform.tfvars', content: envProdTfvars },
-    { path: 'terraform/environments/prod/backend.hcl', content: envProdBackendHcl },
-
-    ...siteFiles,
     { path: 'ansible/inventory.ini', content: inventory },
     { path: 'ansible/playbooks/security-hardening.yml', content: ansiblePlaybook },
     { path: 'README.md', content: readme },
   ];
 }
+
 function buildAzureBundle(projectName: string, contextBlock: string, sec: ReturnType<typeof summarizeSecurity>): GeneratedFile[] {
   const mainTf = `terraform {
   required_version = ">= 1.5.0"
@@ -2094,8 +1509,6 @@ export async function POST(req: NextRequest) {
     if ('error' in owned) return owned.error;
 
     const provider = clampProvider(body.provider);
-    const legacyTerraform = getLegacyTerraformRagStatus();
-    const legacyRuntime = getLegacyRootRuntimeStatus();
     const projectName = String(owned.project?.name || owned.project?.full_name || projectId).split('/').pop() || projectId;
     const qa = String(body.qa_summary || '').trim();
     const arch = String(body.architecture_context || '').trim();
@@ -2149,6 +1562,58 @@ export async function POST(req: NextRequest) {
     ].filter(Boolean).join('\n');
 
     const iacWarnings: string[] = [];
+    if (hasArchitectureJson) {
+      try {
+        const llmRes = await fetch(`${AGENTIC_URL}/api/terraform/generate`, {
+          method: 'POST',
+          headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            architecture_json: architectureValidation?.normalized,
+            provider,
+            project_name: projectName,
+            qa_summary: qa || null,
+            openai_api_key: body.openai_api_key || null,
+          }),
+          signal: AbortSignal.timeout(300_000),
+        });
+        const llmData = await llmRes.json() as {
+          success: boolean; source?: string; files?: GeneratedFile[];
+          readme?: string; error?: string;
+        };
+        const normalizedError = String(llmData.error || '')
+          .replace(/rag agent unavailable/ig, 'Terraform agent unavailable')
+          .replace(/terraform rag agent/ig, 'Terraform agent')
+          .replace(/use template fallback/ig, '')
+          .trim();
+        const normalizedSource = String(llmData.source || '')
+          .replace(/rag_agent/ig, 'terraform_agent')
+          .trim();
+
+        if (llmData.success && Array.isArray(llmData.files) && llmData.files.length > 0) {
+          const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, llmData.files);
+          return NextResponse.json({
+            success: true,
+            provider,
+            project_id: projectId,
+            project_name: projectName,
+            summary: `Generated ${llmData.files.length} IaC files via Terraform agent.`,
+            files: llmData.files,
+            security_context: sec,
+            source: normalizedSource || 'terraform_agent',
+            iac_repo_pr: iacRepoPr,
+          });
+        }
+
+        iacWarnings.push(
+          `Terraform agent failed (${normalizedError || 'no files returned'}). Falling back to standard template.`,
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Terraform agent request failed';
+        iacWarnings.push(`Terraform agent failed (${msg}). Falling back to standard template.`);
+      }
+    } else {
+      iacWarnings.push('architecture_json missing; falling back to standard template.');
+    }
     const sourceRoot = provider === 'aws'
       ? await resolveProjectSourceRoot(String(user.id), projectId)
       : null;
@@ -2216,66 +1681,18 @@ export async function POST(req: NextRequest) {
     }
 
     const awsProjectSlug = toAwsProjectSlug(projectName);
-    const websiteBlockPublicAccess = resolveWebsiteBlockPublicAccess(qa, arch);
-
-    // Keep AWS generation deterministic so runtime deploy always includes EC2+S3+CloudFront
-    // and repository file mirroring behavior remains consistent.
-    if (hasArchitectureJson && provider !== 'aws') {
-      try {
-        const ragRes = await fetch(`${AGENTIC_URL}/api/terraform/generate`, {
-          method: 'POST',
-          headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            architecture_json: architectureValidation?.normalized,
-            provider,
-            project_name: projectName,
-            qa_summary: qa || null,
-            openai_api_key: body.openai_api_key || null,
-          }),
-          signal: AbortSignal.timeout(300_000),
-        });
-        const ragData = await ragRes.json() as {
-          success: boolean; source?: string; files?: GeneratedFile[];
-          readme?: string; error?: string;
-        };
-
-        if (ragData.success && ragData.source === 'rag_agent' && Array.isArray(ragData.files)) {
-          const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, ragData.files);
-          return NextResponse.json({
-            success: true,
-            provider,
-            project_id: projectId,
-            project_name: projectName,
-            summary: `Generated ${ragData.files.length} IaC files via Terraform RAG agent.`,
-            files: ragData.files,
-            security_context: sec,
-            source: 'rag_agent',
-            iac_repo_pr: iacRepoPr,
-            legacy_assets: {
-              terraform_rag: legacyTerraform,
-              runtime_reference: legacyRuntime,
-            },
-          });
-        }
-        // source === 'unavailable' or other failure -> fall through to templates
-      } catch {
-        // RAG agent unreachable -> fall through
-      }
-    }
 
     // Template fallback
     const files = provider === 'azure'
       ? buildAzureBundle(projectName, contextBlock, sec)
       : provider === 'gcp'
         ? buildGcpBundle(projectName, contextBlock, sec)
-        : buildAwsBundle(
+        : buildAwsSixFileBundle(
           projectName,
           awsProjectSlug,
           contextBlock,
           sec,
-          websiteAssets,
           websiteIndexHtml,
-          websiteBlockPublicAccess,
         );
     const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, files);
     if (iacRepoPr.attempted && !iacRepoPr.success) {
@@ -2309,14 +1726,11 @@ export async function POST(req: NextRequest) {
         }
         : null,
       frontend_entrypoint_detection: provider === 'aws' ? frontendDetection : null,
-      legacy_assets: {
-        terraform_rag: legacyTerraform,
-        runtime_reference: legacyRuntime,
-      },
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Failed to generate IaC bundle';
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
+
 

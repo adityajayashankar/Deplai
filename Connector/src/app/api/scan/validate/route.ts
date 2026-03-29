@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAuth, verifyRepositoryOwnership } from '@/lib/auth';
+import { requireAuth, verifyProjectOwnership, verifyRepositoryOwnership } from '@/lib/auth';
 import { githubService } from '@/lib/github';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
+import { query } from '@/lib/db';
 
 interface ScanValidateBody {
   project_id?: string;
@@ -21,6 +22,23 @@ type ScanValidatePayload = {
   github_token?: string;
   repository_url?: string;
 };
+
+interface ProjectRow {
+  id: string;
+  project_type: 'local' | 'github';
+  user_id: string;
+  repo_full_name: string | null;
+  installation_uuid: string | null;
+  suspended_at: string | null;
+}
+
+interface GitHubRepoRow {
+  id: string;
+  full_name: string;
+  installation_uuid: string;
+  user_id: string | null;
+  suspended_at: string | null;
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -52,18 +70,81 @@ export async function POST(request: NextRequest) {
     if (resolvedProjectType === 'github') {
       const resolvedOwner = String(body.owner || '').trim();
       const resolvedRepo = String(body.repo || '').trim();
-      if (!resolvedOwner || !resolvedRepo) {
-        return NextResponse.json(
-          { error: 'owner and repo are required for GitHub scans' },
-          { status: 400 },
+
+      let repoFullName: string | null = null;
+      let installationUuid: string | null = null;
+      let suspended = false;
+
+      const projectRows = await query<ProjectRow[]>(
+        `SELECT
+          p.id,
+          p.project_type,
+          p.user_id,
+          gr.full_name AS repo_full_name,
+          gi.id AS installation_uuid,
+          gi.suspended_at
+        FROM projects p
+        LEFT JOIN github_repositories gr ON p.repository_id = gr.id
+        LEFT JOIN github_installations gi ON gr.installation_id = gi.id
+        WHERE p.id = ?`,
+        [resolvedProjectId],
+      );
+      const project = projectRows[0];
+
+      if (project) {
+        if (project.user_id !== user.id) {
+          return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+        }
+        if (project.project_type !== 'github') {
+          return NextResponse.json({ error: 'Selected project is not a GitHub repository' }, { status: 400 });
+        }
+        repoFullName = project.repo_full_name;
+        installationUuid = project.installation_uuid;
+        suspended = Boolean(project.suspended_at);
+      } else {
+        const ghRepoRows = await query<GitHubRepoRow[]>(
+          `SELECT
+            r.id,
+            r.full_name,
+            i.id AS installation_uuid,
+            i.user_id,
+            i.suspended_at
+          FROM github_repositories r
+          JOIN github_installations i ON i.id = r.installation_id
+          WHERE r.id = ?`,
+          [resolvedProjectId],
         );
+        const ghRepo = ghRepoRows[0];
+        if (ghRepo) {
+          // Installations can have NULL user_id on legacy rows; fallback to project ownership check.
+          if (ghRepo.user_id && ghRepo.user_id !== user.id) {
+            return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+          }
+          if (!ghRepo.user_id) {
+            const ownershipByProject = await verifyProjectOwnership(user.id, resolvedProjectId);
+            if ('error' in ownershipByProject) {
+              return NextResponse.json({ error: 'Repository not found or access denied' }, { status: 403 });
+            }
+          }
+          repoFullName = ghRepo.full_name;
+          installationUuid = ghRepo.installation_uuid;
+          suspended = Boolean(ghRepo.suspended_at);
+        }
       }
 
-      const ownership = await verifyRepositoryOwnership(user.id, resolvedOwner, resolvedRepo);
-      if (!ownership) {
+      if ((!repoFullName || !installationUuid) && resolvedOwner && resolvedRepo) {
+        const ownership = await verifyRepositoryOwnership(user.id, resolvedOwner, resolvedRepo);
+        if (ownership) {
+          repoFullName = `${resolvedOwner}/${resolvedRepo}`;
+          installationUuid = ownership.installationId;
+          suspended = ownership.suspended;
+        }
+      }
+
+      if (!repoFullName || !installationUuid) {
         return NextResponse.json({ error: 'Repository not found or access denied' }, { status: 403 });
       }
-      if (ownership.suspended) {
+      if (suspended) {
         return NextResponse.json(
           { error: 'GitHub App installation is suspended. Unsuspend before scanning.' },
           { status: 403 },
@@ -71,10 +152,9 @@ export async function POST(request: NextRequest) {
       }
 
       try {
-        // Always use installation metadata from the database.
-        const token = await githubService.getInstallationToken(ownership.installationId);
+        const token = await githubService.getInstallationToken(installationUuid);
         backendPayload.github_token = token;
-        backendPayload.repository_url = `https://github.com/${resolvedOwner}/${resolvedRepo}`;
+        backendPayload.repository_url = `https://github.com/${repoFullName}`;
       } catch (tokenError: unknown) {
         console.error('Failed to get GitHub token:', tokenError);
         return NextResponse.json(

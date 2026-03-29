@@ -75,7 +75,15 @@ export async function verifyProjectOwnership(
   );
   if (githubRepo) {
     if (githubRepo.user_id !== userId) {
-      return { error: NextResponse.json({ error: 'Forbidden' }, { status: 403 }) };
+      // Fallback path: legacy rows can have github_installations.user_id = NULL.
+      // In that case, trust ownership through a linked project record.
+      const [linkedProject] = await query<any[]>(
+        `SELECT id, user_id FROM projects WHERE repository_id = ? LIMIT 1`,
+        [projectId]
+      );
+      if (!linkedProject || linkedProject.user_id !== userId) {
+        return { error: NextResponse.json({ error: 'Forbidden' }, { status: 403 }) };
+      }
     }
     return { project: githubRepo };
   }
@@ -109,5 +117,21 @@ export async function verifyRepositoryOwnership(
     [`${owner}/${repo}`, userId]
   );
 
-  return result ? { installationId: result.installation_uuid, suspended: !!result.suspended_at } : null;
+  if (result) {
+    return { installationId: result.installation_uuid, suspended: !!result.suspended_at };
+  }
+
+  // Fallback path: installation rows may exist without user_id populated.
+  // Resolve ownership via any linked project owned by the user.
+  const [fallback] = await query<any[]>(
+    `SELECT r.installation_id, i.suspended_at
+     FROM github_repositories r
+     LEFT JOIN github_installations i ON i.id = r.installation_id
+     JOIN projects p ON p.repository_id = r.id
+     WHERE r.full_name = ? AND p.user_id = ?
+     LIMIT 1`,
+    [`${owner}/${repo}`, userId]
+  );
+  if (!fallback) return null;
+  return { installationId: String(fallback.installation_id), suspended: !!fallback.suspended_at };
 }

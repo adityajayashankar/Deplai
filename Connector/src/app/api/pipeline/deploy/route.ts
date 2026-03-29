@@ -194,7 +194,7 @@ function buildGeneratedWorkflowYaml(provider: Provider): string {
         with:
           aws-access-key-id: \${{ secrets.AWS_ACCESS_KEY_ID || vars.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: \${{ secrets.AWS_SECRET_ACCESS_KEY || vars.AWS_SECRET_ACCESS_KEY }}
-          aws-region: \${{ vars.AWS_REGION || 'ap-south-1' }}`,
+          aws-region: \${{ vars.AWS_REGION || 'eu-north-1' }}`,
     azure: `      - name: Azure Login
         uses: azure/login@v2
         with:
@@ -295,6 +295,87 @@ function buildWorkflowYaml(provider: Provider): { content: string; source: 'lega
   return { content: buildGeneratedWorkflowYaml(provider), source: 'generated' };
 }
 
+function extractOutputString(outputs: Record<string, unknown> | null | undefined, candidates: string[]): string | null {
+  if (!outputs || typeof outputs !== 'object') return null;
+
+  for (const key of candidates) {
+    const direct = outputs[key];
+    if (typeof direct === 'string' && direct.trim()) return direct;
+    if (direct && typeof direct === 'object' && 'value' in (direct as Record<string, unknown>)) {
+      const nested = (direct as Record<string, unknown>).value;
+      if (typeof nested === 'string' && nested.trim()) return nested;
+    }
+  }
+
+  const normalized = Object.keys(outputs).reduce<Record<string, unknown>>((acc, key) => {
+    acc[key.toLowerCase()] = outputs[key];
+    return acc;
+  }, {});
+
+  for (const key of candidates.map((candidate) => candidate.toLowerCase())) {
+    const candidateValue = normalized[key];
+    if (typeof candidateValue === 'string' && candidateValue.trim()) return candidateValue;
+    if (candidateValue && typeof candidateValue === 'object' && 'value' in (candidateValue as Record<string, unknown>)) {
+      const nested = (candidateValue as Record<string, unknown>).value;
+      if (typeof nested === 'string' && nested.trim()) return nested;
+    }
+  }
+
+  return null;
+}
+
+function extractStringFromRecord(record: Record<string, unknown> | null | undefined, candidates: string[]): string | null {
+  if (!record || typeof record !== 'object') return null;
+  const direct = extractOutputString(record, candidates);
+  if (direct) return direct;
+
+  for (const value of Object.values(record)) {
+    if (!value || typeof value !== 'object') continue;
+    const nested = extractOutputString(value as Record<string, unknown>, candidates);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function containsAwsInstanceResource(files: GeneratedFile[]): boolean {
+  return files.some((file) => {
+    const path = normalizePath(String(file.path || '')).toLowerCase();
+    if (!path.endsWith('.tf')) return false;
+    const content = String(file.content || '');
+    return /resource\s+"aws_instance"\s+"[^"]+"/i.test(content);
+  });
+}
+
+function detectStaleAwsTerraformBundle(files: GeneratedFile[]): string[] {
+  const tfFiles = files
+    .filter((file) => normalizePath(String(file.path || '')).toLowerCase().endsWith('.tf'))
+    .map((file) => String(file.content || ''));
+  if (tfFiles.length === 0) return ['No Terraform .tf files were provided in deploy payload.'];
+
+  const combined = tfFiles.join('\n');
+  const reasons: string[] = [];
+
+  const hasUseDefaultVpcVar = /variable\s+"use_default_vpc"\s*\{/i.test(combined);
+  const hasLegacyVpcCreate = /resource\s+"aws_vpc"\s+"main"\s*\{/i.test(combined);
+  const hasVpcConditionalCount = /resource\s+"aws_vpc"\s+"main"\s*\{[\s\S]*?count\s*=\s*var\.use_default_vpc\s*\?\s*0\s*:\s*1/i.test(combined);
+  if (hasLegacyVpcCreate && (!hasUseDefaultVpcVar || !hasVpcConditionalCount)) {
+    reasons.push('Terraform bundle still creates aws_vpc.main without default-VPC conditional mode.');
+  }
+
+  const hasLegacyOacName = /resource\s+"aws_cloudfront_origin_access_control"\s+"oac"\s*\{[\s\S]*?name\s*=\s*"\$\{var\.project_name\}-oac"/i.test(combined);
+  if (hasLegacyOacName) {
+    reasons.push('CloudFront OAC name is static and may collide on reruns.');
+  }
+
+  const hasExistingKeyPairVar = /variable\s+"existing_ec2_key_pair_name"\s*\{/i.test(combined);
+  const hasGeneratedKeyPair = /resource\s+"aws_key_pair"\s+"generated"\s*\{/i.test(combined);
+  if (hasGeneratedKeyPair && !hasExistingKeyPairVar) {
+    reasons.push('EC2 key pair reuse variable is missing; duplicate key-pair imports can fail.');
+  }
+
+  return reasons;
+}
+
 async function fetchFileSha(owner: string, repo: string, filePath: string, pat: string): Promise<string | null> {
   const readRes = await ghFetch(
     `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`,
@@ -386,15 +467,33 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
-      const awsSecretAccessKey = String(body.aws_secret_access_key || '').trim();
+      const staleReasons = detectStaleAwsTerraformBundle(baseFiles);
+      if (staleReasons.length > 0) {
+        return NextResponse.json(
+          {
+            error: 'Provided Terraform bundle is outdated for current AWS runtime safety constraints. Regenerate Stage 8 IaC and retry deploy.',
+            details: {
+              reasons: staleReasons,
+              required_actions: [
+                'Re-run Stage 8 (Generate terraform + ansible) to refresh files.',
+                'Ensure generated Terraform includes variable "use_default_vpc" and unique CloudFront OAC naming.',
+                'Retry deploy after refreshed bundle is loaded in UI state.',
+              ],
+            },
+          },
+          { status: 409 },
+        );
+      }
+
+      const awsAccessKeyId = String(body.aws_access_key_id || process.env.AWS_ACCESS_KEY_ID || '').trim();
+      const awsSecretAccessKey = String(body.aws_secret_access_key || process.env.AWS_SECRET_ACCESS_KEY || '').trim();
       const awsRegion = String(body.aws_region || 'eu-north-1').trim() || 'eu-north-1';
       const enforceFreeTierEc2 = body.enforce_free_tier_ec2 !== false;
 
       if (!awsAccessKeyId || !awsSecretAccessKey) {
         return NextResponse.json(
           {
-            error: 'AWS credentials are required for runtime deployment. Provide aws_access_key_id and aws_secret_access_key in this request.',
+            error: 'AWS credentials are required for runtime deployment. Provide aws_access_key_id/aws_secret_access_key or set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY on the server.',
           },
           { status: 400 },
         );
@@ -455,6 +554,31 @@ export async function POST(req: NextRequest) {
           { status: agenticRes.ok ? 500 : agenticRes.status },
         );
       }
+
+      const expectedEc2 = containsAwsInstanceResource(baseFiles);
+      const applyDetails = (applyData.details as Record<string, unknown> | null | undefined) ?? undefined;
+      const runtimeOutputs = (applyData.outputs as Record<string, unknown> | null | undefined) ?? undefined;
+      const ec2FallbackApplied = Boolean(applyDetails?.ec2_fallback_applied);
+      const ec2InstanceId = extractOutputString(runtimeOutputs, ['ec2_instance_id', 'instance_id']);
+
+      if (expectedEc2 && (ec2FallbackApplied || !ec2InstanceId)) {
+        return NextResponse.json(
+          {
+            error: ec2FallbackApplied
+              ? 'Deployment incomplete: EC2 provisioning was disabled by quota fallback, so required EC2 resources were not created.'
+              : 'Deployment incomplete: Terraform apply succeeded but no EC2 instance was provisioned.',
+            details: {
+              expected_ec2: true,
+              ec2_fallback_applied: ec2FallbackApplied,
+              ec2_instance_id: ec2InstanceId,
+              apply_details: applyDetails ?? null,
+            },
+            outputs: runtimeOutputs ?? null,
+          },
+          { status: 409 },
+        );
+      }
+
       return NextResponse.json({
         success: true,
         provider,
@@ -463,6 +587,22 @@ export async function POST(req: NextRequest) {
         cloudfront_url: applyData.cloudfront_url ?? null,
         outputs: applyData.outputs ?? {},
         details: applyData.details ?? null,
+        ec2_key_name: extractStringFromRecord(
+          {
+            ...(((applyData.outputs as Record<string, unknown> | undefined) ?? {})),
+            ...(((applyData.details as Record<string, unknown> | undefined) ?? {})),
+            ...applyData,
+          },
+          ['ec2_key_name', 'generated_ec2_key_name', 'key_name'],
+        ),
+        generated_ec2_private_key_pem: extractStringFromRecord(
+          {
+            ...(((applyData.outputs as Record<string, unknown> | undefined) ?? {})),
+            ...(((applyData.details as Record<string, unknown> | undefined) ?? {})),
+            ...applyData,
+          },
+          ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem'],
+        ),
       });
     }
 

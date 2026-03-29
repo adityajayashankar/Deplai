@@ -218,19 +218,6 @@ function buildDeterministicAwsArchitecture(
         },
       },
       {
-        id: 'securityLogsBucket',
-        type: 'AmazonS3',
-        label: 'Security Logs Bucket',
-        region,
-        attributes: {
-          storageGB: safeStorage.logs,
-          storageClass: 'Standard',
-          blockPublicAccess: true,
-          websiteHosting: false,
-          freeTierMode: freeTier,
-        },
-      },
-      {
         id: 'webAppServer',
         type: 'AmazonEC2',
         label: 'Web Server',
@@ -276,22 +263,12 @@ function buildDeterministicAwsArchitecture(
           outbound: ['all'],
         },
       },
-      {
-        id: 'cloudWatchLogGroup',
-        type: 'AmazonCloudWatch',
-        label: 'CloudWatch Log Group',
-        region,
-        attributes: {
-          retentionDays: 30,
-        },
-      },
     ],
     edges: [
       { from: 'cloudFrontDistribution', to: 'websiteBucket', label: 'origin (OAC)' },
       { from: 'defaultVpc', to: 'defaultSubnet' },
       { from: 'defaultSubnet', to: 'webAppServer' },
       { from: 'webSecurityGroup', to: 'webAppServer' },
-      { from: 'webAppServer', to: 'cloudWatchLogGroup', label: 'logs' },
     ],
   };
 }
