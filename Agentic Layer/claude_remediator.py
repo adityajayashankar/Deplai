@@ -584,7 +584,17 @@ def _collect_context_files(scan_data: dict[str, Any]) -> dict[str, str]:
         path for path in candidate_files if os.path.basename(path) in MANIFEST_FILES
     ]
 
-    selected = (vuln_paths + manifest_paths)[:MAX_CONTEXT_FILES]
+    # Prioritize dependency manifests so supply-chain remediation can edit them.
+    # If vulnerable code paths fill MAX_CONTEXT_FILES first, package manifests
+    # would otherwise be dropped and then rejected by the editable allowlist.
+    selected: list[str] = []
+    for path in manifest_paths + vuln_paths:
+        if path in selected:
+            continue
+        selected.append(path)
+        if len(selected) >= MAX_CONTEXT_FILES:
+            break
+
     contexts: dict[str, str] = {}
     for path in selected:
         content = _read_file(path)

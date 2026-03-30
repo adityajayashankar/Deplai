@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 # Add terraform_rag_agent src to path
 _AGENT_SRC = Path(__file__).parent / "terraform_rag_agent" / "src"
-_LEGACY_AGENT_SRC = Path(__file__).resolve().parents[1] / "DeplAI_old" / "terraform_rag_agent" / "src"
 
 
 def _activate_agent_src(agent_src: Path) -> None:
@@ -40,12 +39,10 @@ def _is_available() -> bool:
 def _initialize_agent(provider: str, openai_api_key: str):
     """
     Build an AgentOrchestrator for the given provider.
-    Mirrors the logic in DeplAI_old/workers/terraform_generator_worker.py.
     """
     agent_import_error: Optional[Exception] = None
     active_src: Optional[Path] = None
-    force_legacy = os.getenv("FORCE_LEGACY_TERRAFORM_RAG", "").strip().lower() in {"1", "true", "yes", "on"}
-    candidates = [_LEGACY_AGENT_SRC, _AGENT_SRC] if force_legacy else [_AGENT_SRC, _LEGACY_AGENT_SRC]
+    candidates = [_AGENT_SRC]
 
     for candidate in candidates:
         if not candidate.exists():
@@ -71,9 +68,6 @@ def _initialize_agent(provider: str, openai_api_key: str):
             raise agent_import_error
         raise RuntimeError("No terraform_rag_agent source path available.")
 
-    if active_src == _LEGACY_AGENT_SRC:
-        logger.info("terraform_runner: using legacy DeplAI_old terraform_rag_agent source at %s", active_src)
-
     collection_map = {
         "aws": "aws_provider_docs",
         "azure": "azure_provider_docs",
@@ -83,10 +77,6 @@ def _initialize_agent(provider: str, openai_api_key: str):
     collection_name = collection_map.get(provider.lower(), "aws_provider_docs")
 
     db_path = active_src.parent / "data" / "vector_db"
-    legacy_db_path = Path(__file__).resolve().parents[1] / "DeplAI_old" / "terraform_rag_agent" / "data" / "vector_db"
-    if not db_path.exists() and legacy_db_path.exists():
-        logger.info("terraform_runner: using legacy DeplAI_old vector DB at %s", legacy_db_path)
-        db_path = legacy_db_path
 
     hf_token = os.getenv("HUGGING_FACE_HUB_TOKEN", "")
     tavily_key = os.getenv("TAVILY_API_KEY", "")

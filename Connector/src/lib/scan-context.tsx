@@ -306,6 +306,29 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const reconcileScanStatusAfterSocketClose = useCallback(async (projectId: string) => {
+    try {
+      const res = await fetch(`/api/scan/status?project_id=${encodeURIComponent(projectId)}`, { cache: 'no-store' });
+      if (!res.ok) {
+        updateScanStatus(projectId, 'error');
+        return;
+      }
+      const payload = await res.json() as { status?: string };
+      const status = String(payload.status || 'not_initiated');
+      if (status === 'running') {
+        updateScanStatus(projectId, 'running');
+      } else if (status === 'found' || status === 'not_found') {
+        updateScanStatus(projectId, 'completed');
+      } else if (status === 'error') {
+        updateScanStatus(projectId, 'error');
+      } else {
+        updateScanStatus(projectId, 'idle');
+      }
+    } catch {
+      updateScanStatus(projectId, 'error');
+    }
+  }, [updateScanStatus]);
+
   const startScan = useCallback(async (projectId: string, projectName: string) => {
     const existingWs = wsRefs.current[projectId];
     if (existingWs && existingWs.readyState === WebSocket.OPEN) existingWs.close();
@@ -340,19 +363,14 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       updateScanStatus,
       (id) => updateScanStatus(id, 'error'),
       (id) => {
-        // If WS closes while scan is still running, mark as error so UI doesn't get stuck
-        setScanStates(prev => {
-          const cur = prev[id];
-          if (cur && cur.state === 'running') {
-            return { ...prev, [id]: { ...cur, state: 'error' } };
-          }
-          return prev;
-        });
+        // Reconcile with backend status to avoid false failures when the WS drops
+        // during server restarts/reloads while scan workers may still be running.
+        void reconcileScanStatusAfterSocketClose(id);
         delete wsRefs.current[id];
       },
       wsToken,
     );
-  }, [appendScanMessage, updateScanStatus]);
+  }, [appendScanMessage, reconcileScanStatusAfterSocketClose, updateScanStatus]);
 
   const getScanState = useCallback((projectId: string): ProjectScanState => {
     return scanStates[projectId] || { state: 'idle', messages: [], projectName: '' };

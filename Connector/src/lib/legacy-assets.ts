@@ -4,11 +4,12 @@ import path from 'path';
 export type Provider = 'aws' | 'azure' | 'gcp';
 
 const REPO_ROOT = path.resolve(process.cwd(), '..');
-const LEGACY_ROOT = path.join(REPO_ROOT, 'DeplAI_old');
-const LEGACY_AWS_ICONS_DIR = path.join(LEGACY_ROOT, 'AWS', 'pngs');
-const LEGACY_AWS_MAPS_FILE = path.join(LEGACY_ROOT, 'AWS', 'constants', 'maps.py');
-const LEGACY_CICD_DIR = path.join(LEGACY_ROOT, 'cicd_templates');
-const LEGACY_TERRAFORM_RAG_ROOT = path.join(LEGACY_ROOT, 'terraform_rag_agent');
+// Keep function names for compatibility, but resolve only current-repo paths.
+const LEGACY_ROOT = REPO_ROOT;
+const LEGACY_AWS_ICONS_DIR = path.join(REPO_ROOT, 'assets', 'aws-icons');
+const LEGACY_AWS_MAPS_FILE = path.join(REPO_ROOT, 'assets', 'aws-icons', 'maps.py');
+const LEGACY_CICD_DIR = path.join(REPO_ROOT, 'cicd_templates');
+const LEGACY_TERRAFORM_RAG_ROOT = path.join(REPO_ROOT, 'Agentic Layer', 'terraform_rag_agent');
 
 function safeReadFile(filePath: string): string | null {
   try {
@@ -74,11 +75,10 @@ export function getLegacyTerraformRagStatus() {
 
 export function getLegacyRootRuntimeStatus() {
   const requiredFiles = [
-    'main.py',
-    'streamlit_app.py',
+    path.join('Agentic Layer', 'main.py'),
     'docker-compose.yml',
     'README.md',
-    'requirements.txt',
+    path.join('Connector', 'package.json'),
   ];
   const present = requiredFiles.filter((f) => exists(path.join(LEGACY_ROOT, f)));
   return {

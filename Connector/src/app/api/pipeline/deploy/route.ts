@@ -500,6 +500,7 @@ export async function POST(req: NextRequest) {
       }
 
       const applyRequest = {
+        project_id: projectId,
         project_name: projectName,
         provider,
         files: baseFiles,

@@ -99,10 +99,12 @@ export async function POST(request: NextRequest) {
         per_page: 30,
       });
 
+      const projectPrefix = `deplai-remediation-${projectId.slice(0, 8)}-`;
       const match = response.data.find(pr => {
-        const title = String(pr.title || '').toLowerCase();
         const headRef = String(pr.head?.ref || '');
-        return title.includes('automated remediation fixes') || headRef.startsWith('deplai-remediation-');
+        // Only count PRs opened by remediation runs for this exact project id prefix.
+        // This avoids showing a stale "Create PR" success state after switching repos.
+        return headRef.startsWith(projectPrefix);
       });
 
       return NextResponse.json({

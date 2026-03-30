@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import boto3
+from typing import Any
 from pathlib import Path
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -27,7 +28,10 @@ from models import (
     Stage7ApprovalRequest, Stage7ApprovalResponse,
     TerraformGenRequest, TerraformGenResponse,
     TerraformApplyRequest, TerraformApplyResponse,
+    TerraformApplyStopRequest, TerraformApplyStopResponse,
+    TerraformApplyStatusRequest, TerraformApplyStatusResponse,
     AwsRuntimeDetailsRequest, AwsRuntimeDetailsResponse,
+    AwsDestroyRequest, AwsDestroyResponse,
 )
 from environment import EnvironmentInitializer
 from cleanup import cleanup_volumes, cleanup_project_reports
@@ -37,6 +41,7 @@ from runner_base import RunnerBase
 from architecture_gen import generate_architecture
 from architecture_contract import ArchitectureContractError, parse_architecture_document
 from cost_estimation import estimate_cost
+from utils import get_docker_client
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +122,8 @@ remediation_contexts: dict[str, RemediationRequest] = {}
 pipeline_subscribers: dict[str, set[WebSocket]] = {}
 pipeline_indices: dict[str, int] = {}
 pipeline_lock = asyncio.Lock()
+active_terraform_applies: dict[str, dict] = {}
+terraform_apply_results: dict[str, dict] = {}
 
 
 async def _broadcast_pipeline_event(project_id: str, msg_type: str, content: str) -> None:
@@ -289,13 +296,16 @@ async def _handle_websocket(
     except Exception:
         pass
     finally:
-        if project_id in active:
-            active[project_id].cancel()
-        active.pop(project_id, None)
-        # Clean up context if workflow never started (e.g. client disconnected
-        # before sending "start").  If run_workflow() ran, it already popped
-        # the context in its own finally block — this is a no-op in that case.
-        contexts.pop(project_id, None)
+        runner = active.get(project_id)
+        # Do NOT cancel active workflows on websocket disconnect.
+        # Users may navigate away/reload and return later; the backend run should continue.
+        if runner is None:
+            # Workflow never started; safe to cleanup context.
+            contexts.pop(project_id, None)
+        elif runner._task is not None and runner._task.done():
+            # Defensive cleanup if a completed runner is still present.
+            active.pop(project_id, None)
+            contexts.pop(project_id, None)
 
 
 @app.post("/api/scan/validate", response_model=ScanValidationResponse, dependencies=[Depends(verify_api_key)])
@@ -627,19 +637,38 @@ async def terraform_apply(request: TerraformApplyRequest):
     """Apply generated Terraform files to AWS using an ephemeral Docker volume."""
     from terraform_apply import apply_terraform_bundle
 
+    apply_key = (request.project_id or request.project_name or "").strip()
+    if not apply_key:
+        apply_key = request.project_name
+    apply_ctx = {"cancel_requested": False, "container_id": None}
+    active_terraform_applies[apply_key] = apply_ctx
+    terraform_apply_results[apply_key] = {"status": "running", "result": None}
+
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: apply_terraform_bundle(
-            files=[{"path": f.path, "content": f.content, "encoding": f.encoding} for f in request.files],
-            project_name=request.project_name,
-            provider=request.provider,
-            aws_access_key_id=request.aws_access_key_id or "",
-            aws_secret_access_key=request.aws_secret_access_key or "",
-            aws_region=request.aws_region or "eu-north-1",
-            enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
-        ),
-    )
+    result = None
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: apply_terraform_bundle(
+                files=[{"path": f.path, "content": f.content, "encoding": f.encoding} for f in request.files],
+                project_name=request.project_name,
+                provider=request.provider,
+                aws_access_key_id=request.aws_access_key_id or "",
+                aws_secret_access_key=request.aws_secret_access_key or "",
+                aws_region=request.aws_region or "eu-north-1",
+                enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
+                apply_context=apply_ctx,
+            ),
+        )
+    except Exception as exc:
+        result = {"success": False, "error": f"Terraform apply runtime error: {exc}"}
+    finally:
+        active_terraform_applies.pop(apply_key, None)
+        if result is not None:
+            terraform_apply_results[apply_key] = {
+                "status": "completed" if bool(result.get("success")) else "error",
+                "result": result,
+            }
 
     if not result.get("success"):
         return TerraformApplyResponse(
@@ -658,6 +687,70 @@ async def terraform_apply(request: TerraformApplyRequest):
         cloudfront_url=result.get("cloudfront_url"),
         details=result.get("details"),
     )
+
+
+@app.post("/api/terraform/apply/status", response_model=TerraformApplyStatusResponse, dependencies=[Depends(verify_api_key)])
+async def terraform_apply_status(request: TerraformApplyStatusRequest):
+    apply_key = (request.project_id or request.project_name or "").strip()
+    if not apply_key:
+        return TerraformApplyStatusResponse(success=False, error="project_id or project_name is required")
+
+    if apply_key in active_terraform_applies:
+        ctx = active_terraform_applies.get(apply_key) or {}
+        return TerraformApplyStatusResponse(
+            success=True,
+            status="running",
+            result={"container_id": ctx.get("container_id")},
+        )
+
+    cached = terraform_apply_results.get(apply_key)
+    if cached:
+        return TerraformApplyStatusResponse(
+            success=True,
+            status=str(cached.get("status") or "idle"),
+            result=cached.get("result"),
+        )
+
+    return TerraformApplyStatusResponse(success=True, status="idle", result=None)
+
+
+@app.post("/api/terraform/apply/stop", response_model=TerraformApplyStopResponse, dependencies=[Depends(verify_api_key)])
+async def terraform_apply_stop(request: TerraformApplyStopRequest):
+    """Stop an active runtime Terraform apply and terminate its active container."""
+    apply_key = (request.project_id or request.project_name or "").strip()
+    if not apply_key:
+        return TerraformApplyStopResponse(success=False, error="project_id or project_name is required")
+
+    ctx = active_terraform_applies.get(apply_key)
+    if not ctx:
+        return TerraformApplyStopResponse(success=False, message="No active deployment process found for this project.")
+
+    ctx["cancel_requested"] = True
+    container_id = str(ctx.get("container_id") or "").strip()
+    if not container_id:
+        return TerraformApplyStopResponse(success=True, message="Stop requested. Waiting for active Terraform command to start.")
+
+    def _kill_container() -> tuple[bool, str]:
+        try:
+            docker = get_docker_client()
+            container = docker.containers.get(container_id)
+            try:
+                container.kill()
+            except Exception:
+                pass
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+            return (True, f"Stopped deployment container {container_id[:12]}.")
+        except Exception as exc:
+            return (False, f"Failed to stop deployment container: {exc}")
+
+    loop = asyncio.get_running_loop()
+    ok, msg = await loop.run_in_executor(None, _kill_container)
+    if not ok:
+        return TerraformApplyStopResponse(success=False, error=msg)
+    return TerraformApplyStopResponse(success=True, message=msg)
 
 
 @app.post("/api/aws/runtime-details", response_model=AwsRuntimeDetailsResponse, dependencies=[Depends(verify_api_key)])
@@ -684,6 +777,23 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
             for i in r.get("Instances", [])
         ]
 
+        tagged_instances = []
+        if request.project_name:
+            try:
+                tagged_res = ec2.describe_instances(
+                    Filters=[
+                        {"Name": "tag:Project", "Values": [request.project_name]},
+                        {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
+                    ]
+                )
+                tagged_instances = [
+                    i
+                    for r in tagged_res.get("Reservations", [])
+                    for i in r.get("Instances", [])
+                ]
+            except Exception:
+                tagged_instances = []
+
         target_instance = None
         if request.instance_id:
             try:
@@ -697,6 +807,8 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
                     target_instance = by_id_instances[0]
             except Exception:
                 target_instance = None
+        if target_instance is None and tagged_instances:
+            target_instance = tagged_instances[0]
         if target_instance is None and running_instances:
             target_instance = running_instances[0]
 
@@ -772,6 +884,187 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
         )
     except Exception as exc:
         return AwsRuntimeDetailsResponse(success=False, error=str(exc))
+
+
+@app.post("/api/aws/destroy-runtime", response_model=AwsDestroyResponse, dependencies=[Depends(verify_api_key)])
+async def aws_destroy_runtime(request: AwsDestroyRequest):
+    """Best-effort runtime cleanup for DeplAI-managed AWS resources for a project."""
+    try:
+        session = boto3.session.Session(
+            aws_access_key_id=request.aws_access_key_id,
+            aws_secret_access_key=request.aws_secret_access_key,
+            region_name=request.aws_region,
+        )
+        ec2 = session.client("ec2", region_name=request.aws_region)
+        s3 = session.client("s3", region_name=request.aws_region)
+        cloudfront = session.client("cloudfront")
+
+        project_tag = str(request.project_name or "").strip()
+        if not project_tag:
+            return AwsDestroyResponse(success=False, error="project_name is required")
+
+        details: dict[str, Any] = {
+            "project_name": project_tag,
+            "region": request.aws_region,
+            "instances_terminated": [],
+            "security_groups_deleted": [],
+            "volumes_deleted": [],
+            "s3_buckets_deleted": [],
+            "cloudfront_deleted": [],
+            "cloudfront_pending_disable": [],
+            "errors": [],
+        }
+
+        # 1) Terminate tagged EC2 instances.
+        try:
+            reservations = ec2.describe_instances(
+                Filters=[
+                    {"Name": "tag:Project", "Values": [project_tag]},
+                    {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
+                ]
+            ).get("Reservations", [])
+            instance_ids = [
+                str(inst.get("InstanceId"))
+                for res in reservations
+                for inst in (res.get("Instances") or [])
+                if inst.get("InstanceId")
+            ]
+            if instance_ids:
+                ec2.terminate_instances(InstanceIds=instance_ids)
+                details["instances_terminated"] = instance_ids
+        except Exception as exc:
+            details["errors"].append(f"EC2 termination: {exc}")
+
+        # 2) Delete tagged/related key pair.
+        try:
+            key_name = f"{project_tag}-key"
+            try:
+                ec2.delete_key_pair(KeyName=key_name)
+            except Exception:
+                pass
+        except Exception as exc:
+            details["errors"].append(f"Key pair delete: {exc}")
+
+        # 3) Delete tagged EBS volumes (available only).
+        try:
+            volumes = ec2.describe_volumes(
+                Filters=[
+                    {"Name": "tag:Project", "Values": [project_tag]},
+                    {"Name": "status", "Values": ["available"]},
+                ]
+            ).get("Volumes", [])
+            for vol in volumes:
+                vid = str(vol.get("VolumeId") or "")
+                if not vid:
+                    continue
+                try:
+                    ec2.delete_volume(VolumeId=vid)
+                    details["volumes_deleted"].append(vid)
+                except Exception as exc:
+                    details["errors"].append(f"EBS {vid}: {exc}")
+        except Exception as exc:
+            details["errors"].append(f"EBS listing: {exc}")
+
+        # 4) Delete project S3 buckets (force delete objects first).
+        try:
+            buckets = s3.list_buckets().get("Buckets", []) or []
+            for bucket in buckets:
+                bname = str(bucket.get("Name") or "")
+                if not bname:
+                    continue
+                try:
+                    tagging = s3.get_bucket_tagging(Bucket=bname)
+                    tags = {str(t.get("Key")): str(t.get("Value")) for t in (tagging.get("TagSet") or []) if t.get("Key")}
+                    if tags.get("Project") != project_tag:
+                        continue
+                    paginator = s3.get_paginator("list_object_versions")
+                    for page in paginator.paginate(Bucket=bname):
+                        to_delete = []
+                        for item in (page.get("Versions") or []):
+                            to_delete.append({"Key": item["Key"], "VersionId": item["VersionId"]})
+                        for item in (page.get("DeleteMarkers") or []):
+                            to_delete.append({"Key": item["Key"], "VersionId": item["VersionId"]})
+                        if to_delete:
+                            s3.delete_objects(Bucket=bname, Delete={"Objects": to_delete, "Quiet": True})
+                    # For non-versioned leftovers:
+                    listed = s3.list_objects_v2(Bucket=bname)
+                    keys = [{"Key": o["Key"]} for o in (listed.get("Contents") or [])]
+                    if keys:
+                        s3.delete_objects(Bucket=bname, Delete={"Objects": keys, "Quiet": True})
+                    s3.delete_bucket(Bucket=bname)
+                    details["s3_buckets_deleted"].append(bname)
+                except Exception:
+                    continue
+        except Exception as exc:
+            details["errors"].append(f"S3 cleanup: {exc}")
+
+        # 5) Delete project CloudFront distributions by tags.
+        try:
+            marker = None
+            while True:
+                kwargs = {"Marker": marker} if marker else {}
+                resp = cloudfront.list_distributions(**kwargs)
+                dist_list = (resp.get("DistributionList") or {})
+                items = dist_list.get("Items") or []
+                for dist in items:
+                    dist_id = str(dist.get("Id") or "")
+                    arn = str(dist.get("ARN") or "")
+                    if not dist_id or not arn:
+                        continue
+                    try:
+                        tag_resp = cloudfront.list_tags_for_resource(Resource=arn)
+                        tags = {
+                            str(t.get("Key")): str(t.get("Value"))
+                            for t in (((tag_resp.get("Tags") or {}).get("Items")) or [])
+                            if t.get("Key")
+                        }
+                        if tags.get("Project") != project_tag:
+                            continue
+                        cfg_resp = cloudfront.get_distribution_config(Id=dist_id)
+                        etag = cfg_resp.get("ETag")
+                        cfg = cfg_resp.get("DistributionConfig") or {}
+                        enabled = bool(cfg.get("Enabled"))
+                        status = str((cloudfront.get_distribution(Id=dist_id).get("Distribution") or {}).get("Status") or "")
+                        if enabled:
+                            cfg["Enabled"] = False
+                            cloudfront.update_distribution(Id=dist_id, IfMatch=etag, DistributionConfig=cfg)
+                            details["cloudfront_pending_disable"].append(dist_id)
+                            continue
+                        if status.lower() != "deployed":
+                            details["cloudfront_pending_disable"].append(dist_id)
+                            continue
+                        del_etag = cloudfront.get_distribution_config(Id=dist_id).get("ETag")
+                        cloudfront.delete_distribution(Id=dist_id, IfMatch=del_etag)
+                        details["cloudfront_deleted"].append(dist_id)
+                    except Exception as exc:
+                        details["errors"].append(f"CloudFront {dist_id}: {exc}")
+
+                if not bool(dist_list.get("IsTruncated")):
+                    break
+                marker = dist_list.get("NextMarker")
+        except Exception as exc:
+            details["errors"].append(f"CloudFront cleanup: {exc}")
+
+        # 6) Delete tagged security groups (after EC2 termination attempts).
+        try:
+            sgs = ec2.describe_security_groups(
+                Filters=[{"Name": "tag:Project", "Values": [project_tag]}]
+            ).get("SecurityGroups", [])
+            for sg in sgs:
+                sgid = str(sg.get("GroupId") or "")
+                if not sgid:
+                    continue
+                try:
+                    ec2.delete_security_group(GroupId=sgid)
+                    details["security_groups_deleted"].append(sgid)
+                except Exception as exc:
+                    details["errors"].append(f"SG {sgid}: {exc}")
+        except Exception as exc:
+            details["errors"].append(f"SG listing: {exc}")
+
+        return AwsDestroyResponse(success=True, details=details)
+    except Exception as exc:
+        return AwsDestroyResponse(success=False, error=str(exc))
 
 
 @app.get("/health")

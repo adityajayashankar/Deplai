@@ -1010,7 +1010,7 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
             <p className="text-[11px] text-zinc-400 mb-4">{(allGatesPassed || overridden) ? 'Proceed to deploy with current policy and secret configuration.' : 'Resolve missing gates or override budget policy to continue.'}</p>
             {!within && !overridden && <Btn onClick={() => setOverridden(true)} variant="default" size="sm">Override budget policy</Btn>}
             <Btn onClick={onProceed} variant="primary" size="sm" disabled={!(terraformValidated && secretsConfigured && (within || overridden))}>
-              {(terraformValidated && secretsConfigured && (within || overridden)) ? 'Proceed to Deploy ?' : 'Add AWS secrets to continue'}
+              {(terraformValidated && secretsConfigured && (within || overridden)) ? 'Proceed to Deploy' : 'Add AWS secrets to continue'}
             </Btn>
           </div>
 
@@ -1040,6 +1040,13 @@ interface DeployApiResult {
   details?: Record<string, unknown> | null;
   ec2_key_name?: string | null;
   generated_ec2_private_key_pem?: string | null;
+  error?: string;
+}
+
+interface DeployStatusResponse {
+  success?: boolean;
+  status?: 'idle' | 'running' | 'completed' | 'error' | string;
+  result?: Record<string, unknown> | null;
   error?: string;
 }
 
@@ -1098,6 +1105,88 @@ interface AwsRuntimeLiveDetails {
 
 const DEPLOY_STATE_STORAGE_PREFIX = 'deplai.pipeline.deployState.';
 const DEPLOY_HISTORY_MAX = 20;
+type DeployStatus = 'idle' | 'running' | 'done' | 'error';
+type DeployLog = { text: string; ts: string; type: 'info' | 'success' | 'error' };
+
+interface ActiveDeployState {
+  status: DeployStatus;
+  progress: number;
+  logs: DeployLog[];
+  deployResult: DeployApiResult | null;
+  deploymentHistory: DeploymentHistoryEntry[];
+  updatedAt?: string;
+}
+
+interface ActiveDeployEntry {
+  state: ActiveDeployState;
+  listeners: Set<(state: ActiveDeployState) => void>;
+  inFlight: boolean;
+}
+
+const activeDeployments = new Map<string, ActiveDeployEntry>();
+
+function toDeployState(snapshot?: Partial<ActiveDeployState>): ActiveDeployState {
+  return {
+    status: (snapshot?.status === 'running' || snapshot?.status === 'done' || snapshot?.status === 'error') ? snapshot.status : 'idle',
+    progress: Number.isFinite(snapshot?.progress) ? Number(snapshot?.progress) : 0,
+    logs: Array.isArray(snapshot?.logs) ? snapshot.logs : [],
+    deployResult: (snapshot?.deployResult && typeof snapshot.deployResult === 'object') ? snapshot.deployResult : null,
+    deploymentHistory: Array.isArray(snapshot?.deploymentHistory) ? snapshot.deploymentHistory : [],
+    updatedAt: typeof snapshot?.updatedAt === 'string' ? snapshot.updatedAt : undefined,
+  };
+}
+
+function getOrCreateActiveDeployment(projectId: string, seed?: Partial<ActiveDeployState>): ActiveDeployEntry {
+  const existing = activeDeployments.get(projectId);
+  if (existing) return existing;
+  const created: ActiveDeployEntry = {
+    state: toDeployState(seed),
+    listeners: new Set(),
+    inFlight: false,
+  };
+  activeDeployments.set(projectId, created);
+  return created;
+}
+
+function emitActiveDeployment(projectId: string): void {
+  const entry = activeDeployments.get(projectId);
+  if (!entry) return;
+  for (const listener of entry.listeners) listener(entry.state);
+}
+
+function setActiveDeploymentState(projectId: string, next: ActiveDeployState): void {
+  const entry = getOrCreateActiveDeployment(projectId);
+  entry.state = next;
+  emitActiveDeployment(projectId);
+}
+
+function patchActiveDeploymentState(
+  projectId: string,
+  patch: Partial<ActiveDeployState> | ((prev: ActiveDeployState) => ActiveDeployState),
+): ActiveDeployState {
+  const entry = getOrCreateActiveDeployment(projectId);
+  const next = typeof patch === 'function'
+    ? patch(entry.state)
+    : { ...entry.state, ...patch };
+  entry.state = toDeployState({ ...next, updatedAt: new Date().toISOString() });
+  if (typeof window !== 'undefined') {
+    const snapshot: DeployStateSnapshot = {
+      status: entry.state.status,
+      progress: entry.state.progress,
+      logs: entry.state.logs,
+      deployResult: entry.state.deployResult,
+      deploymentHistory: entry.state.deploymentHistory,
+      updatedAt: new Date().toISOString(),
+    };
+    try {
+      localStorage.setItem(`${DEPLOY_STATE_STORAGE_PREFIX}${projectId}`, JSON.stringify(snapshot));
+    } catch {
+      // ignore storage errors
+    }
+  }
+  emitActiveDeployment(projectId);
+  return entry.state;
+}
 
 interface ResourceSummaryRow {
   label: string;
@@ -1305,14 +1394,17 @@ function toHistoryEntry(
 }
 
 export function DeployPage({ projectId, onDeploymentStateChange }: DeployPageProps) {
-  const [status, setStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
-  const [logs, setLogs] = useState<{ text: string; ts: string; type: 'info' | 'success' | 'error' }[]>([]);
+  const [status, setStatus] = useState<DeployStatus>('idle');
+  const [logs, setLogs] = useState<DeployLog[]>([]);
   const [progress, setProgress] = useState(0);
   const [deployResult, setDeployResult] = useState<DeployApiResult | null>(null);
   const [deploymentHistory, setDeploymentHistory] = useState<DeploymentHistoryEntry[]>([]);
   const [ppkLoading, setPpkLoading] = useState(false);
   const [runtimeDetailsLoading, setRuntimeDetailsLoading] = useState(false);
+  const [stopLoading, setStopLoading] = useState(false);
+  const [destroyLoading, setDestroyLoading] = useState(false);
   const [deployStateHydrated, setDeployStateHydrated] = useState(false);
+  const idleRecoveryRef = useRef<string | null>(null);
 
   const aws = useMemo(() => parseAwsFromSession(), []);
   const iacFiles = useMemo(() => parseIacFilesFromSession(), []);
@@ -1321,6 +1413,23 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
   const cost = useMemo(() => parseCostFromSession(), []);
 
   const hasAwsSecrets = Boolean(aws.aws_access_key_id.trim() && aws.aws_secret_access_key.trim());
+
+  useEffect(() => {
+    if (!projectId) return;
+    const entry = getOrCreateActiveDeployment(projectId);
+    const apply = (next: ActiveDeployState) => {
+      setStatus(next.status);
+      setProgress(next.progress);
+      setLogs(next.logs);
+      setDeployResult(next.deployResult);
+      setDeploymentHistory(next.deploymentHistory);
+    };
+    entry.listeners.add(apply);
+    apply(entry.state);
+    return () => {
+      entry.listeners.delete(apply);
+    };
+  }, [projectId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1368,6 +1477,14 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
       } else {
         setDeploymentHistory([]);
       }
+      setActiveDeploymentState(projectId, toDeployState({
+        status: saved.status as DeployStatus,
+        progress: Number(saved.progress || 0),
+        logs: Array.isArray(saved.logs) ? saved.logs as DeployLog[] : [],
+        deployResult: (saved.deployResult && typeof saved.deployResult === 'object') ? saved.deployResult as DeployApiResult : null,
+        deploymentHistory: Array.isArray(saved.deploymentHistory) ? saved.deploymentHistory as DeploymentHistoryEntry[] : [],
+        updatedAt: typeof saved.updatedAt === 'string' ? saved.updatedAt : undefined,
+      }));
     } catch {
       // ignore malformed persisted deploy state
     } finally {
@@ -1393,12 +1510,205 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
   }, [deployResult, deploymentHistory, deployStateHydrated, logs, progress, projectId, status]);
 
   useEffect(() => {
+    if (!projectId || !deployStateHydrated || !hasAwsSecrets) return;
+    if (status !== 'idle') return;
+    if (idleRecoveryRef.current === projectId) return;
+    idleRecoveryRef.current = projectId;
+
+    const recover = async () => {
+      try {
+        const res = await fetch('/api/pipeline/runtime-details', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: projectId,
+            aws_access_key_id: aws.aws_access_key_id,
+            aws_secret_access_key: aws.aws_secret_access_key,
+            aws_region: aws.aws_region,
+          }),
+        });
+        const data = await res.json().catch(() => ({})) as { success?: boolean; details?: AwsRuntimeLiveDetails };
+        const recoveredInstanceId = String(data.details?.instance?.instance_id || '');
+        if (!res.ok || data.success !== true || !recoveredInstanceId || recoveredInstanceId === 'n/a') return;
+
+        const recoveredResult: DeployApiResult = {
+          success: true,
+          details: {
+            live_runtime_details: data.details,
+          },
+        };
+        patchState((prev) => ({
+          ...prev,
+          status: 'done',
+          progress: 100,
+          deployResult: {
+            ...((prev.deployResult || {}) as DeployApiResult),
+            ...recoveredResult,
+            details: {
+              ...(((prev.deployResult?.details as Record<string, unknown> | null | undefined) || {})),
+              live_runtime_details: data.details,
+            },
+          },
+          deploymentHistory: [
+            toHistoryEntry(recoveredResult, 'done', aws.aws_region),
+            ...prev.deploymentHistory,
+          ].slice(0, DEPLOY_HISTORY_MAX),
+        }));
+        appendLog(`Recovered existing deployment for this project (${recoveredInstanceId}).`, 'success');
+      } catch {
+        // best-effort on page load
+      }
+    };
+
+    void recover();
+  }, [appendLog, aws.aws_access_key_id, aws.aws_region, aws.aws_secret_access_key, deployStateHydrated, hasAwsSecrets, projectId, status]);
+
+  useEffect(() => {
     onDeploymentStateChange?.(status);
   }, [onDeploymentStateChange, status]);
 
-  const appendLog = (text: string, type: 'info' | 'success' | 'error' = 'info') => {
-    setLogs((prev) => [...prev, { text, ts: new Date().toLocaleTimeString(), type }]);
+  const patchState = (patch: Partial<ActiveDeployState> | ((prev: ActiveDeployState) => ActiveDeployState)) => {
+    if (!projectId) return;
+    patchActiveDeploymentState(projectId, patch);
   };
+
+  const appendLog = (text: string, type: 'info' | 'success' | 'error' = 'info') => {
+    if (!projectId) return;
+    patchState((prev) => ({ ...prev, logs: [...prev.logs, { text, ts: new Date().toLocaleTimeString(), type }] }));
+  };
+
+  const reconcileDeploymentStatus = async (): Promise<void> => {
+    if (!projectId) return;
+    const res = await fetch('/api/pipeline/deploy/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: projectId }),
+    });
+    const data = await res.json().catch(() => ({})) as DeployStatusResponse;
+    if (!res.ok || data.success !== true) {
+      throw new Error(data.error || 'Failed to fetch deployment status.');
+    }
+
+    const statusValue = String(data.status || 'idle').toLowerCase();
+    const result = (data.result && typeof data.result === 'object')
+      ? (data.result as DeployApiResult)
+      : null;
+
+    if (statusValue === 'running') {
+      return;
+    }
+
+    if (statusValue === 'completed') {
+      if (result?.success) {
+        patchState((prev) => ({
+          ...prev,
+          status: 'done',
+          progress: 100,
+          deployResult: result,
+          deploymentHistory: [
+            toHistoryEntry(result, 'done', aws.aws_region),
+            ...prev.deploymentHistory,
+          ].slice(0, DEPLOY_HISTORY_MAX),
+        }));
+        appendLog('Recovered completed deployment state from backend runtime.', 'success');
+        if (hasAwsSecrets) {
+          try {
+            const detailsRes = await fetch('/api/pipeline/runtime-details', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                project_id: projectId,
+                aws_access_key_id: aws.aws_access_key_id,
+                aws_secret_access_key: aws.aws_secret_access_key,
+                aws_region: aws.aws_region,
+              }),
+            });
+            const detailsData = await detailsRes.json().catch(() => ({})) as { success?: boolean; details?: AwsRuntimeLiveDetails };
+            if (detailsRes.ok && detailsData.success === true && detailsData.details) {
+              patchState((prev) => ({
+                ...prev,
+                deployResult: {
+                  ...((prev.deployResult || {}) as DeployApiResult),
+                  details: {
+                    ...(((prev.deployResult?.details as Record<string, unknown> | null | undefined) || {})),
+                    live_runtime_details: detailsData.details,
+                  },
+                },
+              }));
+            }
+          } catch {
+            // Best-effort hydration only.
+          }
+        }
+        return;
+      }
+
+      const msg = result?.error || 'Deployment completed with errors.';
+      patchState((prev) => ({
+        ...prev,
+        status: 'error',
+        progress: 100,
+        deployResult: result,
+        deploymentHistory: result
+          ? [
+            toHistoryEntry(result, 'error', aws.aws_region),
+            ...prev.deploymentHistory,
+          ].slice(0, DEPLOY_HISTORY_MAX)
+          : prev.deploymentHistory,
+      }));
+      appendLog(msg, 'error');
+      return;
+    }
+
+    if (statusValue === 'error') {
+      const msg = result?.error || 'Deployment runtime returned an error.';
+      patchState((prev) => ({
+        ...prev,
+        status: 'error',
+        progress: 100,
+        deployResult: result || prev.deployResult,
+        deploymentHistory: result
+          ? [
+            toHistoryEntry(result, 'error', aws.aws_region),
+            ...prev.deploymentHistory,
+          ].slice(0, DEPLOY_HISTORY_MAX)
+          : prev.deploymentHistory,
+      }));
+      appendLog(msg, 'error');
+      return;
+    }
+
+    patchState({ status: 'error', progress: 100 });
+    appendLog('No active deployment process found. Marking stale UI run as stopped.', 'error');
+  };
+
+  useEffect(() => {
+    if (!projectId || status !== 'running') return;
+    const entry = getOrCreateActiveDeployment(projectId);
+    if (entry.inFlight) return;
+
+    let cancelled = false;
+    appendLog('Deployment state appears stale in UI. Verifying backend apply status...');
+
+    const runProbe = async () => {
+      if (cancelled) return;
+      try {
+        await reconcileDeploymentStatus();
+      } catch {
+        // keep current running state; next probe may recover
+      }
+    };
+
+    const timerId = window.setInterval(() => {
+      void runProbe();
+    }, 10_000);
+    void runProbe();
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timerId);
+    };
+  }, [appendLog, projectId, status]);
 
   const start = async () => {
     if (!projectId) {
@@ -1406,26 +1716,46 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
       setLogs([{ text: 'Select a project before deployment.', ts: new Date().toLocaleTimeString(), type: 'error' }]);
       return;
     }
+    const entry = getOrCreateActiveDeployment(projectId, {
+      status,
+      progress,
+      logs,
+      deployResult,
+      deploymentHistory,
+    });
+    if (entry.inFlight) {
+      appendLog('Deployment already running in background for this project.');
+      return;
+    }
+    entry.inFlight = true;
     if (!hasAwsSecrets) {
-      setStatus('error');
-      setLogs([{ text: 'AWS credentials missing. Configure secrets in GitOps first.', ts: new Date().toLocaleTimeString(), type: 'error' }]);
+      patchState({
+        status: 'error',
+        logs: [{ text: 'AWS credentials missing. Configure secrets in GitOps first.', ts: new Date().toLocaleTimeString(), type: 'error' }],
+      });
+      entry.inFlight = false;
       return;
     }
     if (iacFiles.length === 0) {
-      setStatus('error');
-      setLogs([{ text: 'No generated IaC files found. Generate Terraform first.', ts: new Date().toLocaleTimeString(), type: 'error' }]);
+      patchState({
+        status: 'error',
+        logs: [{ text: 'No generated IaC files found. Generate Terraform first.', ts: new Date().toLocaleTimeString(), type: 'error' }],
+      });
+      entry.inFlight = false;
       return;
     }
 
-    setStatus('running');
-    setDeployResult(null);
-    setLogs([]);
-    setProgress(5);
+    patchState({
+      status: 'running',
+      deployResult: null,
+      logs: [],
+      progress: 5,
+    });
     appendLog('Preparing runtime deploy payload...');
 
     let latestResult: DeployApiResult | null = null;
     try {
-      setProgress(20);
+      patchState({ progress: 20 });
       appendLog('Calling /api/pipeline/deploy for runtime apply...');
 
       const res = await fetch('/api/pipeline/deploy', {
@@ -1445,12 +1775,12 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
         }),
       });
 
-      setProgress(80);
+      patchState({ progress: 80 });
       const data = await res.json().catch(() => ({})) as DeployApiResult;
       latestResult = data;
 
       if (!res.ok || !data.success) {
-        setDeployResult(data || null);
+        patchState({ deployResult: data || null });
         const detailHint = data.details && typeof data.details === 'object' && 'hint' in data.details
           ? String((data.details as Record<string, unknown>).hint)
           : '';
@@ -1458,34 +1788,143 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
         throw new Error(detailHint ? `${msg} ${detailHint}` : msg);
       }
 
-      setDeployResult(data);
-      setProgress(100);
-      setStatus('done');
-      setDeploymentHistory((prev) => [
-        toHistoryEntry(data, 'done', aws.aws_region),
+      patchState((prev) => ({
         ...prev,
-      ].slice(0, DEPLOY_HISTORY_MAX));
+        deployResult: data,
+        progress: 100,
+        status: 'done',
+        deploymentHistory: [
+          toHistoryEntry(data, 'done', aws.aws_region),
+          ...prev.deploymentHistory,
+        ].slice(0, DEPLOY_HISTORY_MAX),
+      }));
       appendLog('Runtime Terraform apply completed successfully.', 'success');
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Deployment failed.';
-      setStatus('error');
-      setProgress(100);
+      patchState({ status: 'error', progress: 100 });
       if (latestResult) {
-        setDeploymentHistory((prev) => [
-          toHistoryEntry(latestResult, 'error', aws.aws_region),
+        patchState((prev) => ({
           ...prev,
-        ].slice(0, DEPLOY_HISTORY_MAX));
+          deploymentHistory: [
+            toHistoryEntry(latestResult, 'error', aws.aws_region),
+            ...prev.deploymentHistory,
+          ].slice(0, DEPLOY_HISTORY_MAX),
+        }));
       }
       appendLog(msg, 'error');
+    } finally {
+      entry.inFlight = false;
     }
   };
 
   const prepareFreshDeployment = () => {
-    setStatus('idle');
-    setProgress(0);
-    setLogs([]);
-    setDeployResult(null);
+    patchState({
+      status: 'idle',
+      progress: 0,
+      logs: [],
+      deployResult: null,
+    });
     appendLog('Ready for a fresh deployment run.', 'info');
+  };
+
+  const stopDeployment = async () => {
+    if (!projectId || stopLoading || status !== 'running') return;
+    setStopLoading(true);
+    try {
+      appendLog('Stop requested. Terminating deployment process...');
+      const res = await fetch('/api/pipeline/deploy/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: projectId }),
+      });
+      const data = await res.json().catch(() => ({})) as { success?: boolean; message?: string; error?: string };
+      if (!res.ok || data.success !== true) {
+        const backendMsg = String(data.error || data.message || '');
+        if (/no active deployment process found/i.test(backendMsg)) {
+          await reconcileDeploymentStatus();
+          appendLog('No active deployment process found on backend. UI state reconciled.', 'info');
+          return;
+        }
+        throw new Error(backendMsg || 'Failed to stop deployment process.');
+      }
+      getOrCreateActiveDeployment(projectId).inFlight = false;
+      patchState({ status: 'error', progress: 100 });
+      appendLog(data.message || 'Deployment process terminated.', 'success');
+    } catch (e) {
+      appendLog(e instanceof Error ? e.message : 'Failed to stop deployment process.', 'error');
+    } finally {
+      setStopLoading(false);
+    }
+  };
+
+  const destroyDeployment = async () => {
+    if (!projectId || destroyLoading) return;
+    if (status === 'running') {
+      appendLog('Stop deployment first, then run destroy.', 'error');
+      return;
+    }
+    if (!hasAwsSecrets) {
+      appendLog('AWS credentials are missing. Configure them first.', 'error');
+      return;
+    }
+    if (!window.confirm('Destroy AWS resources created for this project? This is irreversible.')) {
+      return;
+    }
+    setDestroyLoading(true);
+    try {
+      appendLog('Destroy requested. Cleaning up EC2, S3, CloudFront, security groups, and tagged volumes...');
+      const res = await fetch('/api/pipeline/deploy/destroy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: projectId,
+          aws_access_key_id: aws.aws_access_key_id,
+          aws_secret_access_key: aws.aws_secret_access_key,
+          aws_region: aws.aws_region,
+        }),
+      });
+      const data = await res.json().catch(() => ({})) as {
+        success?: boolean;
+        details?: {
+          instances_terminated?: string[];
+          s3_buckets_deleted?: string[];
+          cloudfront_deleted?: string[];
+          cloudfront_pending_disable?: string[];
+          security_groups_deleted?: string[];
+          volumes_deleted?: string[];
+          errors?: string[];
+        };
+        error?: string;
+      };
+      if (!res.ok || data.success !== true) {
+        throw new Error(data.error || 'Destroy failed.');
+      }
+      const d = data.details || {};
+      getOrCreateActiveDeployment(projectId).inFlight = false;
+      patchState((prev) => ({
+        ...prev,
+        status: 'idle',
+        progress: 0,
+        deployResult: null,
+      }));
+      appendLog(
+        `Destroy complete: ec2=${(d.instances_terminated || []).length}, s3=${(d.s3_buckets_deleted || []).length}, cloudfront=${(d.cloudfront_deleted || []).length}, sg=${(d.security_groups_deleted || []).length}, ebs=${(d.volumes_deleted || []).length}`,
+        'success',
+      );
+      if ((d.cloudfront_pending_disable || []).length > 0) {
+        appendLog(
+          `CloudFront pending disable/delete: ${(d.cloudfront_pending_disable || []).join(', ')}. Re-run destroy after distributions are disabled/deployed.`,
+          'info',
+        );
+      }
+      for (const err of (d.errors || []).slice(0, 5)) {
+        appendLog(`Destroy warning: ${err}`, 'error');
+      }
+    } catch (e) {
+      appendLog(e instanceof Error ? e.message : 'Destroy failed.', 'error');
+    } finally {
+      setDestroyLoading(false);
+    }
   };
 
   const runtimeOutputs = deployResult?.outputs;
@@ -1613,11 +2052,14 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
       if (!res.ok || data.success !== true || !data.details) {
         throw new Error(data.error || 'Failed to fetch runtime details.');
       }
-      setDeployResult((prev) => ({
-        ...(prev || {}),
-        details: {
-          ...((prev?.details as Record<string, unknown> | null | undefined) || {}),
-          live_runtime_details: data.details,
+      patchState((prev) => ({
+        ...prev,
+        deployResult: {
+          ...((prev.deployResult || {}) as DeployApiResult),
+          details: {
+            ...(((prev.deployResult?.details as Record<string, unknown> | null | undefined) || {})),
+            live_runtime_details: data.details,
+          },
         },
       }));
       appendLog('Live AWS runtime details updated.', 'success');
@@ -1672,6 +2114,16 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
                   <span className="text-sm font-semibold text-zinc-200">{status === 'done' ? 'Deployment complete' : status === 'error' ? 'Deployment failed' : 'Provisioning'}</span>
                 </div>
                 <div className="flex items-center gap-2">
+                  {status === 'running' && (
+                    <Btn variant="danger" size="sm" onClick={() => { void stopDeployment(); }} disabled={stopLoading}>
+                      {stopLoading ? 'Stopping...' : 'Stop Deployment'}
+                    </Btn>
+                  )}
+                  {status !== 'running' && (
+                    <Btn variant="danger" size="sm" onClick={() => { void destroyDeployment(); }} disabled={destroyLoading || !hasAwsSecrets}>
+                      {destroyLoading ? 'Destroying...' : 'Destroy Infrastructure'}
+                    </Btn>
+                  )}
                   {(status === 'done' || status === 'error') && (
                     <Btn variant="default" size="sm" onClick={prepareFreshDeployment}>Deploy New Instance</Btn>
                   )}
@@ -1710,13 +2162,18 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
               <div className="pt-3 border-t border-white/5">
                 <p className="text-[11px] text-zinc-500 mb-2">EC2 SSH Key Pair</p>
                 {generatedPem ? (
-                  <div className="flex items-center gap-2">
-                    <Btn variant="default" size="sm" onClick={onDownloadPem}>Download PEM</Btn>
-                    <Btn variant="default" size="sm" onClick={() => { void onDownloadPpk(); }} disabled={ppkLoading}>{ppkLoading ? 'Converting...' : 'Download PPK'}</Btn>
-                    <span className="text-[11px] text-zinc-500 font-mono">{keyName}</span>
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Btn variant="default" size="sm" onClick={onDownloadPem}>Download PEM</Btn>
+                      <Btn variant="default" size="sm" onClick={() => { void onDownloadPpk(); }} disabled={ppkLoading}>{ppkLoading ? 'Converting...' : 'Download PPK'}</Btn>
+                      <span className="text-[11px] text-zinc-500 font-mono">{keyName}</span>
+                    </div>
+                    <p className="text-[11px] text-amber-300">
+                      Private key material is generated one time. Download it now and keep it in a secure location.
+                    </p>
                   </div>
                 ) : (
-                  <p className="text-[11px] text-zinc-500">No generated private key found in deployment outputs. If an existing key pair was reused, private key download is not available.</p>
+                  <p className="text-[11px] text-zinc-500">No generated private key found in deployment outputs. This usually means an existing key pair was reused. AWS does not return private key material again; use the original PEM created at key generation time.</p>
                 )}
               </div>
               <div className="pt-3 border-t border-white/5">
@@ -1804,9 +2261,12 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
                     variant="default"
                     size="sm"
                     onClick={() => {
-                      setDeployResult(entry.deployResult);
-                      setStatus(entry.status);
-                      setProgress(100);
+                      patchState((prev) => ({
+                        ...prev,
+                        deployResult: entry.deployResult,
+                        status: entry.status,
+                        progress: 100,
+                      }));
                     }}
                   >
                     View

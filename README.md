@@ -257,8 +257,8 @@ cd "Agentic Layer/terraform_rag_agent"
 python src/indexer.py
 ```
 
-Legacy compatibility:
-- When present, `DeplAI_old/terraform_rag_agent/data/vector_db` is mounted and can be used as fallback vector DB for Terraform RAG retrieval.
+Vector DB path:
+- Terraform RAG uses `Agentic Layer/terraform_rag_agent/data/vector_db`.
 
 ### KGagent
 

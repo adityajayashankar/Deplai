@@ -39,7 +39,17 @@ export async function GET(
   }
 
   if (!content) {
-    return NextResponse.json({ error: 'Icon not found' }, { status: 404 });
+    const fallbackSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+      <rect x="2" y="2" width="60" height="60" rx="12" fill="#0f172a" stroke="#334155" stroke-width="2"/>
+      <path d="M18 40L28 24L36 34L44 24L46 40Z" fill="#06b6d4"/>
+      <circle cx="22" cy="18" r="3" fill="#22d3ee"/>
+    </svg>`;
+    return new NextResponse(fallbackSvg, {
+      headers: {
+        'Content-Type': 'image/svg+xml; charset=utf-8',
+        'Cache-Control': 'public, max-age=3600',
+      },
+    });
   }
 
   return new NextResponse(content, {
