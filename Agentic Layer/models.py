@@ -174,6 +174,7 @@ class TerraformApplyFile(BaseModel):
 
 
 class TerraformApplyRequest(BaseModel):
+    project_id: Optional[str] = None
     project_name: str = "deplai-project"
     provider: str = "aws"
     files: list[TerraformApplyFile]
@@ -193,6 +194,29 @@ class TerraformApplyResponse(BaseModel):
     error: Optional[str] = None
 
 
+class TerraformApplyStopRequest(BaseModel):
+    project_id: Optional[str] = None
+    project_name: Optional[str] = None
+
+
+class TerraformApplyStopResponse(BaseModel):
+    success: bool
+    message: Optional[str] = None
+    error: Optional[str] = None
+
+
+class TerraformApplyStatusRequest(BaseModel):
+    project_id: Optional[str] = None
+    project_name: Optional[str] = None
+
+
+class TerraformApplyStatusResponse(BaseModel):
+    success: bool
+    status: str = "idle"  # idle | running | completed | error
+    result: Optional[dict] = None
+    error: Optional[str] = None
+
+
 class AwsRuntimeDetailsRequest(BaseModel):
     project_name: str = "deplai-project"
     aws_access_key_id: str
@@ -202,6 +226,19 @@ class AwsRuntimeDetailsRequest(BaseModel):
 
 
 class AwsRuntimeDetailsResponse(BaseModel):
+    success: bool
+    details: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class AwsDestroyRequest(BaseModel):
+    project_name: str = "deplai-project"
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_region: str = "eu-north-1"
+
+
+class AwsDestroyResponse(BaseModel):
     success: bool
     details: Optional[dict] = None
     error: Optional[str] = None

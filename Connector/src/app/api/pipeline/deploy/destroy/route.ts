@@ -2,12 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 
-interface RuntimeDetailsBody {
+interface DestroyBody {
   project_id?: string;
   aws_access_key_id?: string;
   aws_secret_access_key?: string;
   aws_region?: string;
-  instance_id?: string;
 }
 
 export async function POST(req: NextRequest) {
@@ -15,30 +14,24 @@ export async function POST(req: NextRequest) {
     const { user, error } = await requireAuth();
     if (error) return error;
 
-    const body = await req.json() as RuntimeDetailsBody;
+    const body = await req.json().catch(() => ({})) as DestroyBody;
     const projectId = String(body.project_id || '').trim();
     if (!projectId) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
     }
-
     const owned = await verifyProjectOwnership(user.id, projectId);
     if ('error' in owned) return owned.error;
 
     const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
     const awsSecretAccessKey = String(body.aws_secret_access_key || '').trim();
-    const awsRegion = String(body.aws_region || 'eu-north-1').trim();
-    const instanceId = String(body.instance_id || '').trim();
-
+    const awsRegion = String(body.aws_region || 'eu-north-1').trim() || 'eu-north-1';
     if (!awsAccessKeyId || !awsSecretAccessKey) {
-      return NextResponse.json(
-        { error: 'AWS credentials are required to fetch runtime details.' },
-        { status: 400 },
-      );
+      return NextResponse.json({ error: 'AWS credentials are required.' }, { status: 400 });
     }
 
-    const projectName = String(owned.project?.name || owned.project?.full_name || projectId).trim();
+    const projectName = String(owned.project?.name || owned.project?.full_name || projectId).split('/').pop() || projectId;
 
-    const agenticRes = await fetch(`${AGENTIC_URL}/api/aws/runtime-details`, {
+    const res = await fetch(`${AGENTIC_URL}/api/aws/destroy-runtime`, {
       method: 'POST',
       headers: {
         ...agenticHeaders(),
@@ -49,30 +42,22 @@ export async function POST(req: NextRequest) {
         aws_access_key_id: awsAccessKeyId,
         aws_secret_access_key: awsSecretAccessKey,
         aws_region: awsRegion,
-        instance_id: instanceId || undefined,
       }),
-      signal: AbortSignal.timeout(60_000),
+      signal: AbortSignal.timeout(300_000),
     });
 
-    const data = await agenticRes.json().catch(() => ({})) as {
-      success?: boolean;
-      details?: Record<string, unknown>;
-      error?: string;
-    };
-
-    if (!agenticRes.ok || data.success !== true) {
+    const data = await res.json().catch(() => ({})) as { success?: boolean; details?: unknown; error?: string };
+    if (!res.ok || data.success !== true) {
       return NextResponse.json(
-        { error: String(data.error || 'Failed to fetch runtime AWS details.') },
-        { status: agenticRes.ok ? 500 : agenticRes.status },
+        { error: data.error || 'Destroy runtime request failed.' },
+        { status: res.ok ? 500 : res.status },
       );
     }
 
-    return NextResponse.json({
-      success: true,
-      details: data.details || null,
-    });
+    return NextResponse.json({ success: true, details: data.details || null });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Runtime details route failed';
+    const msg = err instanceof Error ? err.message : 'Destroy route failed';
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
+

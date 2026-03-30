@@ -35,16 +35,24 @@ class RunnerBase:
     async def _send_message(self, msg_type: str, content: str):
         self._message_index += 1
         message = ScanMessage.create(self._message_index, self._total_steps, msg_type, content)
-        await self.websocket.send_json({
-            "type": "message",
-            "data": message.model_dump(),
-        })
+        try:
+            await self.websocket.send_json({
+                "type": "message",
+                "data": message.model_dump(),
+            })
+        except Exception:
+            # Client may disconnect while a long-running workflow is in progress.
+            # Keep the runner alive; status can be recovered via REST polling.
+            pass
 
     async def _send_status(self, status: StreamStatus):
-        await self.websocket.send_json({
-            "type": "status",
-            "status": status.value,
-        })
+        try:
+            await self.websocket.send_json({
+                "type": "status",
+                "status": status.value,
+            })
+        except Exception:
+            pass
 
     async def _terminate(self, message: str) -> bool:
         await self._send_message("error", message)

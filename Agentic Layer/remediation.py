@@ -645,9 +645,14 @@ echo "PUSHED"
                                 f"Fallback remediation failed on batch {batch_index + 1}: {fb_result}",
                             )
                             if failed_batches >= REMEDIATION_MAX_FAILED_BATCHES:
-                                return await self._terminate(
-                                    "Too many consecutive remediation batch failures; stopping to prevent unsafe churn."
+                                await self._send_message(
+                                    "warning",
+                                    (
+                                        "Too many consecutive remediation batch failures in this cycle; "
+                                        "stopping further micro-batches and continuing pipeline with partial results."
+                                    ),
                                 )
+                                break
                             continue
                     except Exception as _fb_exc:
                         failed_batches += 1
@@ -656,9 +661,14 @@ echo "PUSHED"
                             f"Fallback remediation error on batch {batch_index + 1}: {_fb_exc}",
                         )
                         if failed_batches >= REMEDIATION_MAX_FAILED_BATCHES:
-                            return await self._terminate(
-                                "Too many consecutive remediation batch failures; stopping to prevent unsafe churn."
+                            await self._send_message(
+                                "warning",
+                                (
+                                    "Too many consecutive remediation batch failures in this cycle; "
+                                    "stopping further micro-batches and continuing pipeline with partial results."
+                                ),
                             )
+                            break
                         continue
 
                 summary = remediation_result.get("summary", "")

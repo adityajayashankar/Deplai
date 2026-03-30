@@ -17,6 +17,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from docker.errors import ContainerError
 
 from utils import decode_output, get_docker_client
@@ -112,6 +113,43 @@ def _run_terraform(volume_name: str, tf_root: str, args: list[str], env: dict[st
         remove=True,
     )
     return decode_output(output)
+
+
+def _run_terraform_with_tracking(
+    volume_name: str,
+    tf_root: str,
+    args: list[str],
+    env: dict[str, str],
+    apply_context: dict[str, Any] | None = None,
+) -> str:
+    if apply_context and apply_context.get("cancel_requested"):
+        raise RuntimeError("Terraform apply cancelled by user.")
+
+    docker = get_docker_client()
+    container = docker.containers.create(
+        TERRAFORM_IMAGE,
+        command=[f"-chdir={tf_root}", *args],
+        environment=env,
+        volumes={volume_name: {"bind": "/workspace", "mode": "rw"}},
+    )
+    if apply_context is not None:
+        apply_context["container_id"] = container.id
+
+    try:
+        container.start()
+        result = container.wait()
+        logs = decode_output(container.logs(stdout=True, stderr=True))
+        status_code = int((result or {}).get("StatusCode") or 1)
+        if status_code != 0:
+            raise RuntimeError(logs or f"terraform command failed (exit {status_code})")
+        return logs
+    finally:
+        if apply_context is not None:
+            apply_context["container_id"] = None
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
 
 
 def _tail(text: str, limit: int = 3000) -> str:
@@ -364,12 +402,14 @@ def _inspect_website_bucket(
     aws_secret_access_key: str,
     aws_region: str,
 ) -> dict[str, Any]:
+    # Keep post-apply bucket checks fast so UI isn't stuck after infra is already up.
+    s3_cfg = Config(connect_timeout=5, read_timeout=8, retries={"max_attempts": 2, "mode": "standard"})
     session = boto3.session.Session(
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key,
         region_name=aws_region,
     )
-    s3 = session.client("s3")
+    s3 = session.client("s3", config=s3_cfg)
 
     object_count = 0
     has_policy = False
@@ -430,6 +470,7 @@ def apply_terraform_bundle(
     aws_secret_access_key: str,
     aws_region: str,
     enforce_free_tier_ec2: bool = True,
+    apply_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if provider.lower() != "aws":
         return {"success": False, "error": "Runtime apply currently supports AWS only."}
@@ -461,12 +502,22 @@ def apply_terraform_bundle(
             "TF_IN_AUTOMATION": "1",
         }
 
-        init_log = _run_terraform(
+        init_log = _run_terraform_with_tracking(
             volume_name,
             tf_root,
             ["init", "-input=false", "-no-color"],
             env,
+            apply_context=apply_context,
         )
+        if apply_context and apply_context.get("cancel_requested"):
+            return {
+                "success": False,
+                "error": "Deployment stopped by user.",
+                "details": {
+                    "terraform_root": tf_root,
+                    "init_log_tail": _tail(init_log),
+                },
+            }
 
         tf_text = _collect_terraform_text(files)
         has_ec2_resource = _terraform_has_aws_instance(tf_text)
@@ -636,11 +687,21 @@ def apply_terraform_bundle(
             elif selected_instance_type:
                 attempted_instance_types.append(selected_instance_type)
                 apply_mode = "ec2_forced_small_instance"
-            apply_log = f"{apply_log}{_run_terraform(volume_name, tf_root, args, env)}"
-        except ContainerError as exc:
-            stderr = decode_output(getattr(exc, "stderr", b"") or b"")
-            stdout = decode_output(getattr(exc, "stdout", b"") or b"")
-            combined = f"{stderr}\n{stdout}".strip()
+            apply_log = f"{apply_log}{_run_terraform_with_tracking(volume_name, tf_root, args, env, apply_context=apply_context)}"
+        except Exception as exc:
+            if apply_context and apply_context.get("cancel_requested"):
+                return {
+                    "success": False,
+                    "error": "Deployment stopped by user.",
+                    "details": {
+                        "terraform_root": tf_root,
+                        "init_log_tail": _tail(init_log),
+                        "apply_log_tail": _tail(apply_log),
+                    },
+                }
+            combined = str(exc).strip()
+            stderr = combined
+            stdout = ""
 
             if "VpcLimitExceeded" in combined:
                 return {
@@ -678,7 +739,7 @@ def apply_terraform_bundle(
                         continue
                     attempted_instance_types.append(candidate)
                     try:
-                        retry_log = _run_terraform(
+                        retry_log = _run_terraform_with_tracking(
                             volume_name,
                             tf_root,
                             _build_apply_args(
@@ -687,6 +748,7 @@ def apply_terraform_bundle(
                                 force_default_vpc=True,
                             ),
                             env,
+                            apply_context=apply_context,
                         )
                         selected_instance_type = candidate
                         apply_mode = "ec2_quota_retry_smaller_type"
@@ -696,10 +758,8 @@ def apply_terraform_bundle(
                             f"[attempt-retry:{candidate}] apply retry log:\n{retry_log}"
                         )
                         break
-                    except ContainerError as retry_exc:
-                        retry_stderr = decode_output(getattr(retry_exc, "stderr", b"") or b"")
-                        retry_stdout = decode_output(getattr(retry_exc, "stdout", b"") or b"")
-                        retry_combined = f"{retry_stderr}\n{retry_stdout}".strip()
+                    except Exception as retry_exc:
+                        retry_combined = str(retry_exc).strip()
                         retry_errors.append(f"{candidate}: {_tail(retry_combined, 700)}")
                 else:
                     if allow_disable_fallback and has_enable_ec2_var:
@@ -709,7 +769,7 @@ def apply_terraform_bundle(
                             existing_key_name=existing_key_name_override,
                             force_default_vpc=True,
                         )
-                        retry_log = _run_terraform(volume_name, tf_root, retry_args, env)
+                        retry_log = _run_terraform_with_tracking(volume_name, tf_root, retry_args, env, apply_context=apply_context)
                         apply_log = (
                             "[attempt-1] EC2 apply failed across quota-safe instance candidates.\n"
                             f"{_tail(combined, 900)}\n\n"
@@ -748,7 +808,7 @@ def apply_terraform_bundle(
                         continue
                     attempted_az_orders.append([*az_order])
                     try:
-                        retry_log = _run_terraform(
+                        retry_log = _run_terraform_with_tracking(
                             volume_name,
                             tf_root,
                             _build_apply_args(
@@ -758,6 +818,7 @@ def apply_terraform_bundle(
                                 force_default_vpc=True,
                             ),
                             env,
+                            apply_context=apply_context,
                         )
                         selected_az_order = [*az_order]
                         quota_info["preferred_azs"] = selected_az_order
@@ -768,10 +829,8 @@ def apply_terraform_bundle(
                             f"[attempt-retry-az-order:{','.join(az_order)}] apply retry log:\n{retry_log}"
                         )
                         break
-                    except ContainerError as retry_exc:
-                        retry_stderr = decode_output(getattr(retry_exc, "stderr", b"") or b"")
-                        retry_stdout = decode_output(getattr(retry_exc, "stdout", b"") or b"")
-                        retry_combined = f"{retry_stderr}\n{retry_stdout}".strip()
+                    except Exception as retry_exc:
+                        retry_combined = str(retry_exc).strip()
                         capacity_retry_errors.append(
                             f"{','.join(az_order)}: {_tail(retry_combined, 700)}"
                         )
@@ -800,12 +859,23 @@ def apply_terraform_bundle(
             else:
                 raise
 
-        outputs_raw = _run_terraform(
+        outputs_raw = _run_terraform_with_tracking(
             volume_name,
             tf_root,
             ["output", "-json"],
             env,
+            apply_context=apply_context,
         )
+        if apply_context and apply_context.get("cancel_requested"):
+            return {
+                "success": False,
+                "error": "Deployment stopped by user.",
+                "details": {
+                    "terraform_root": tf_root,
+                    "init_log_tail": _tail(init_log),
+                    "apply_log_tail": _tail(apply_log),
+                },
+            }
         output_payload = json.loads(outputs_raw or "{}")
 
         outputs: dict[str, Any] = {}
@@ -817,11 +887,12 @@ def apply_terraform_bundle(
         ec2_state_resources: list[str] = []
         if has_ec2_resource and not ec2_fallback_applied:
             try:
-                state_list_raw = _run_terraform(
+                state_list_raw = _run_terraform_with_tracking(
                     volume_name,
                     tf_root,
                     ["state", "list"],
                     env,
+                    apply_context=apply_context,
                 )
                 for line in state_list_raw.splitlines():
                     row = line.strip()

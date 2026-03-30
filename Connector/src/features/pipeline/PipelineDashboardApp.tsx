@@ -87,6 +87,7 @@ export default function PipelineDashboardApp() {
   const [postMergeDone, setPostMergeDone] = useState<boolean>(false);
   const [rerunInProgress, setRerunInProgress] = useState<boolean>(false);
   const [deploySucceeded, setDeploySucceeded] = useState<boolean>(false);
+  const [deployRuntimeState, setDeployRuntimeState] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const [kgPhase, setKgPhase] = useState<'idle' | 'running' | 'completed' | 'skipped'>('idle');
   const [runOptions, setRunOptions] = useState<PipelineRunOptions>(() => {
     if (typeof window === 'undefined') {
@@ -577,22 +578,23 @@ export default function PipelineDashboardApp() {
 
     const scan = base.find((s) => s.key === 'scan');
     if (scan) {
-      if (scanRuntimeState === 'running' || runnerState === 'running') {
-        scan.status = 'running';
-        scan.duration = 'running';
-      } else if (scanRuntimeState === 'completed') {
-        scan.status = 'success';
-        scan.duration = 'completed';
-      } else if (scanRuntimeState === 'error') {
-        scan.status = 'active';
-        scan.duration = 'failed';
-      } else if (scanStatus === 'found') {
+      // Source-of-truth for terminal state is backend scan status.
+      if (scanStatus === 'found') {
         scan.status = 'success';
         scan.duration = 'completed';
       } else if (scanStatus === 'not_found') {
         scan.status = 'success';
         scan.duration = 'no findings';
       } else if (scanStatus === 'error') {
+        scan.status = 'active';
+        scan.duration = 'failed';
+      } else if (scanRuntimeState === 'running' || runnerState === 'running') {
+        scan.status = 'running';
+        scan.duration = 'running';
+      } else if (scanRuntimeState === 'completed') {
+        scan.status = 'success';
+        scan.duration = 'completed';
+      } else if (scanRuntimeState === 'error') {
         scan.status = 'active';
         scan.duration = 'failed';
       }
@@ -714,13 +716,16 @@ export default function PipelineDashboardApp() {
       if (deploySucceeded) {
         deploy.status = 'success';
         deploy.duration = 'completed';
+      } else if (deployRuntimeState === 'running') {
+        deploy.status = 'running';
+        deploy.duration = 'running';
       } else if (current === 'deploy') {
         deploy.status = 'active';
       }
     }
 
     return base;
-  }, [current, deploySucceeded, healthChecks, kgPhase, mergeConfirmed, neo4jConnected, noRemediationChanges, postMergeDone, prUrl, remediation.messages, remediation.state, scanRuntimeState, runnerState, scanStatus]);
+  }, [current, deployRuntimeState, deploySucceeded, healthChecks, kgPhase, mergeConfirmed, neo4jConnected, noRemediationChanges, postMergeDone, prUrl, remediation.messages, remediation.state, scanRuntimeState, runnerState, scanStatus]);
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
@@ -795,7 +800,7 @@ export default function PipelineDashboardApp() {
       case 'gitops':
         return <GitOpsPage onNavigate={setCurrent} projectId={selectedProjectId} scanStatus={scanStatus} />;
       case 'deploy':
-        return <DeployPage projectId={selectedProjectId} onDeploymentStateChange={(state) => setDeploySucceeded(state === 'done')} />;
+        return null;
       default:
         return (
           <OverviewPage
@@ -816,6 +821,15 @@ export default function PipelineDashboardApp() {
   };
 
   const runLabel = runnerState === 'running' ? 'Running Scan...' : 'Run Scan';
+  const deployPage = (
+    <DeployPage
+      projectId={selectedProjectId}
+      onDeploymentStateChange={(state) => {
+        setDeployRuntimeState(state);
+        setDeploySucceeded(state === 'done');
+      }}
+    />
+  );
 
   return (
     <div className="flex h-screen bg-[#09090b] text-zinc-300 overflow-hidden relative font-sans">
@@ -866,7 +880,14 @@ export default function PipelineDashboardApp() {
             </button>
           </div>
         </div>
-        <div className="flex-1 flex flex-col overflow-hidden">{renderPage()}</div>
+        <div className="flex-1 flex flex-col overflow-hidden">
+          {current === 'deploy' ? deployPage : renderPage()}
+          {current !== 'deploy' && deployRuntimeState === 'running' && (
+            <div className="hidden" aria-hidden>
+              {deployPage}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
