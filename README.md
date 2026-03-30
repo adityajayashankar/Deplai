@@ -394,6 +394,42 @@ npm run dev
 
 Open `http://localhost:3000`.
 
+### 7. Detect Runtime + Entrypoint (optional)
+
+Use the detector on any unknown repository before IaC/deploy decisions:
+
+```bash
+python tools/detect_entry.py <path-to-repo>
+```
+
+JSON output mode:
+
+```bash
+python tools/detect_entry.py <path-to-repo> --json
+```
+
+The detector combines:
+- build/runtime config parsing (`package.json`, `pyproject.toml`, webpack/vite config),
+- framework conventions (Next.js/Vite/React/Flask/Django/common server layouts),
+- server route/template clues (`sendFile`, `express.static`, `render_template`, etc.),
+- confidence scoring with `requires_user_confirmation` when ambiguity remains.
+
+### 8. Autopilot Mode For Large Repositories
+
+In the Pipeline dashboard:
+- Enable **Autopilot mode** to auto-complete Q/A, policy gates, and deployment trigger.
+- Keep **Skip remediation loop** enabled for large repositories when deployment speed is the priority.
+- Provide runtime AWS credentials in the sidebar for Stage 10.
+- Run-option normalization is enforced in UI state: **Skip scan implies Skip remediation**.
+- With Autopilot enabled, Q/A auto-fills defaults and advances to architecture.
+
+Runtime deploy guardrails now enforce Free Tier EC2 candidates (`t3.micro`, `t2.micro`) by default for `runtime_apply`.
+
+Deploy stage behavior:
+- Stage 10 deployment state persists per project across tab switches/reloads.
+- **Deploy New Instance** lets operators redeploy the same project without deleting previous deployment metadata.
+- **Previous Deployments** section shows historical deployment snapshots (status, instance id, URLs).
+
 ---
 
 ## Key API Endpoints
@@ -415,6 +451,8 @@ Open `http://localhost:3000`.
 | POST | `/api/pipeline/iac` | Generate Terraform (RAG→template) |
 | POST | `/api/pipeline/deploy` | Generate CI/CD workflow + push to GitHub + budget guard |
 | POST | `/api/repositories/refresh` | Refresh GitHub repository after merge |
+| DELETE | `/api/installations` | Disconnect GitHub installation(s) from current DeplAI user |
+| POST | `/api/auth/logout` | Logout current user session |
 
 ### Agentic Layer FastAPI (port 8000)
 
@@ -477,6 +515,8 @@ Users can choose their LLM backend at runtime from the dashboard settings. Suppo
 - Project ownership is verified on every scan/remediation/results endpoint
 - `project_id` accepts only `[a-zA-Z0-9_-]{1,80}` (shell injection prevention)
 - CORS origins are configurable via `CORS_ORIGINS` env var (not hardcoded)
+- IaC generation is gated on scan status (`running`/`not_initiated`/`error` are rejected before Terraform generation)
+- GitHub connector supports connect, disconnect (within DeplAI metadata), and logout controls in dashboard/pipeline UI
 
 ## Pipeline Contracts
 

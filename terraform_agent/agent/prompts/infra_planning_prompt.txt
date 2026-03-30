@@ -1,0 +1,18 @@
+﻿Given repository signals, map the application to concrete AWS infrastructure.
+Rules:
+1. Dockerfile strongly implies ECS Fargate for app compute unless explicit serverless signals exist.
+2. Presence of handler.py, lambda_handler, or serverless.yml implies Lambda.
+3. psycopg2 or sqlalchemy with postgres dialect implies RDS PostgreSQL.
+4. redis or celery implies ElastiCache Redis and separate worker service.
+5. If ambiguous, include "requires_clarification" with short reason.
+6. Never choose EC2 when ECS Fargate is appropriate.
+
+Return only valid JSON with this schema:
+{
+  "compute": "ecs_fargate|lambda|ec2|requires_clarification",
+  "services": ["api", "worker"],
+  "database": "rds_postgres|none|requires_clarification",
+  "cache": "elasticache_redis|none|requires_clarification",
+  "networking": "vpc_with_private_subnets|requires_clarification",
+  "state_backend": "s3_dynamodb"
+}

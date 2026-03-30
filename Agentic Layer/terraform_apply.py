@@ -25,6 +25,28 @@ TERRAFORM_IMAGE = "hashicorp/terraform:1.9.0"
 _EC2_STANDARD_FAMILY_PREFIXES = {"a", "c", "d", "h", "i", "m", "r", "t", "z"}
 _EC2_STANDARD_ONDEMAND_VCPU_QUOTA_CODE = "L-1216C47A"
 _SAFE_EC2_INSTANCE_ORDER = ["t3.micro", "t2.micro", "t3a.micro", "t3.small", "t2.small"]
+_DEFAULT_FREE_TIER_INSTANCE_ORDER = ["t3.micro", "t2.micro"]
+
+
+def _parse_instance_types(raw: str | None, fallback: list[str]) -> list[str]:
+    values = [str(v or "").strip().lower() for v in str(raw or "").split(",")]
+    normalized = [v for v in values if re.match(r"^[a-z0-9]+\.[a-z0-9]+$", v)]
+    if not normalized:
+        return [*fallback]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in normalized:
+        if value in seen:
+            continue
+        deduped.append(value)
+        seen.add(value)
+    return deduped
+
+
+_FREE_TIER_EC2_INSTANCE_ORDER = _parse_instance_types(
+    os.getenv("DEPLAI_FREE_TIER_EC2_TYPES"),
+    _DEFAULT_FREE_TIER_INSTANCE_ORDER,
+)
 
 
 def _normalize_rel_path(path: str) -> str:
@@ -124,6 +146,29 @@ def _is_vcpu_quota_error(text: str) -> bool:
     return "VcpuLimitExceeded" in (text or "")
 
 
+def _is_capacity_error(text: str) -> bool:
+    value = (text or "").lower()
+    return (
+        "insufficientinstancecapacity" in value
+        or "not supported in your requested availability zone" in value
+        or ("insufficient capacity" in value and "availability zone" in value)
+    )
+
+
+def _rotated_az_orders(preferred_azs: list[str]) -> list[list[str]]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for az in preferred_azs:
+        value = str(az or "").strip().lower()
+        if not value or value in seen:
+            continue
+        normalized.append(value)
+        seen.add(value)
+    if len(normalized) <= 1:
+        return []
+    return [normalized[idx:] + normalized[:idx] for idx in range(1, len(normalized))]
+
+
 def _missing_enable_ec2_var(text: str) -> bool:
     value = text or ""
     return (
@@ -156,6 +201,23 @@ def _terraform_has_variable(tf_text: str, variable_name: str) -> bool:
     return re.search(pattern, tf_text or "", flags=re.IGNORECASE) is not None
 
 
+def _ec2_key_pair_exists(ec2_client: Any, key_name: str) -> bool:
+    try:
+        ec2_client.describe_key_pairs(KeyNames=[key_name])
+        return True
+    except Exception as exc:
+        message = str(exc or "")
+        if "InvalidKeyPair.NotFound" in message or "not found" in message.lower():
+            return False
+        return False
+
+
+def _project_slug_for_key(project_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9-]+", "-", str(project_name or "").strip().lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug[:40] or "deplai-project"
+
+
 def _terraform_has_aws_instance(tf_text: str) -> bool:
     return re.search(r'resource\s+"aws_instance"\s+"[^"]+"', tf_text or "", flags=re.IGNORECASE) is not None
 
@@ -174,6 +236,29 @@ def _terraform_default_instance_type(tf_text: str) -> str | None:
         return None
     value = str(default_match.group(1) or "").strip().lower()
     return value or None
+
+
+def _terraform_literal_instance_types(tf_text: str) -> list[str]:
+    values = [
+        str(match.group(1) or "").strip().lower()
+        for match in re.finditer(r'instance_type\s*=\s*"([^"]+)"', tf_text or "", flags=re.IGNORECASE)
+    ]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value or value in seen:
+            continue
+        deduped.append(value)
+        seen.add(value)
+    return deduped
+
+
+def _preferred_azs_for_region(aws_region: str, max_count: int = 3) -> list[str]:
+    region = str(aws_region or "").strip().lower()
+    if not re.match(r"^[a-z]{2}-[a-z0-9-]+-\d+$", region):
+        return []
+    suffixes = ["a", "b", "c", "d", "e", "f"]
+    return [f"{region}{suffix}" for suffix in suffixes[: max(1, min(max_count, len(suffixes)))]]
 
 
 def _get_instance_vcpus(ec2_client: Any, instance_type: str) -> int | None:
@@ -257,15 +342,16 @@ def _count_running_standard_vcpus(ec2_client: Any) -> int | None:
         return None
 
 
-def _ordered_instance_candidates(preferred: str | None) -> list[str]:
+def _ordered_instance_candidates(preferred: str | None, enforce_free_tier: bool) -> list[str]:
     seen: set[str] = set()
     ordered: list[str] = []
+    base_order = _FREE_TIER_EC2_INSTANCE_ORDER if enforce_free_tier else _SAFE_EC2_INSTANCE_ORDER
     if preferred:
         p = preferred.strip().lower()
-        if p:
+        if p and (not enforce_free_tier or p in set(base_order)):
             ordered.append(p)
             seen.add(p)
-    for value in _SAFE_EC2_INSTANCE_ORDER:
+    for value in base_order:
         if value not in seen:
             ordered.append(value)
             seen.add(value)
@@ -343,6 +429,7 @@ def apply_terraform_bundle(
     aws_access_key_id: str,
     aws_secret_access_key: str,
     aws_region: str,
+    enforce_free_tier_ec2: bool = True,
 ) -> dict[str, Any]:
     if provider.lower() != "aws":
         return {"success": False, "error": "Runtime apply currently supports AWS only."}
@@ -385,21 +472,58 @@ def apply_terraform_bundle(
         has_ec2_resource = _terraform_has_aws_instance(tf_text)
         has_instance_type_var = _terraform_has_variable(tf_text, "instance_type")
         has_enable_ec2_var = _terraform_has_variable(tf_text, "enable_ec2")
+        has_aws_region_var = _terraform_has_variable(tf_text, "aws_region")
+        has_preferred_azs_var = _terraform_has_variable(tf_text, "preferred_availability_zones")
+        has_existing_key_name_var = _terraform_has_variable(tf_text, "existing_ec2_key_pair_name")
+        has_use_default_vpc_var = _terraform_has_variable(tf_text, "use_default_vpc")
+        preferred_azs = _preferred_azs_for_region(aws_region)
+        selected_az_order = [*preferred_azs]
+        attempted_az_orders: list[list[str]] = [[*preferred_azs]] if preferred_azs else []
+        enforce_free_tier = bool(enforce_free_tier_ec2)
+        allowed_instance_types = _FREE_TIER_EC2_INSTANCE_ORDER if enforce_free_tier else _SAFE_EC2_INSTANCE_ORDER
+        allowed_instance_type_set = set(allowed_instance_types)
 
         ec2_fallback_applied = False
+        precheck_disable_ec2 = False
         apply_mode = "default"
         selected_instance_type: str | None = None
         quota_info: dict[str, Any] = {}
         attempted_instance_types: list[str] = []
         apply_args_base = ["apply", "-auto-approve", "-input=false", "-no-color", "-parallelism=20"]
+        allow_disable_fallback = str(
+            os.getenv("DEPLAI_ALLOW_EC2_DISABLE_FALLBACK", "1")
+        ).strip().lower() in {"1", "true", "yes"}
         requested_instance_type = (
             os.getenv("DEPLAI_EC2_INSTANCE_TYPE", "").strip().lower()
             or _terraform_default_instance_type(tf_text)
             or "t3.micro"
         )
-        instance_candidates = _ordered_instance_candidates(requested_instance_type)
+        existing_key_name_override: str | None = None
+        instance_candidates = _ordered_instance_candidates(
+            requested_instance_type,
+            enforce_free_tier=enforce_free_tier,
+        )
         if not (has_ec2_resource and has_instance_type_var):
             instance_candidates = []
+
+        if has_ec2_resource and enforce_free_tier and not has_instance_type_var:
+            literal_types = _terraform_literal_instance_types(tf_text)
+            disallowed = [itype for itype in literal_types if itype not in allowed_instance_type_set]
+            if disallowed:
+                return {
+                    "success": False,
+                    "error": (
+                        "Terraform defines non-free-tier EC2 instance types and cannot be overridden "
+                        "because variable \"instance_type\" is missing."
+                    ),
+                    "details": {
+                        "terraform_root": tf_root,
+                        "enforce_free_tier_ec2": enforce_free_tier,
+                        "allowed_instance_types": allowed_instance_types,
+                        "disallowed_literal_instance_types": disallowed,
+                        "init_log_tail": _tail(init_log),
+                    },
+                }
 
         if has_ec2_resource and has_instance_type_var:
             session = boto3.session.Session(
@@ -408,11 +532,18 @@ def apply_terraform_bundle(
                 region_name=aws_region,
             )
             ec2 = session.client("ec2", region_name=aws_region)
+            if has_existing_key_name_var:
+                key_candidate = f"{_project_slug_for_key(project_name)}-key"
+                if _ec2_key_pair_exists(ec2, key_candidate):
+                    existing_key_name_override = key_candidate
             quota_limit = _get_standard_vcpu_quota(session, aws_region)
             used_vcpus = _count_running_standard_vcpus(ec2)
             quota_info["requested_instance_type"] = requested_instance_type
             quota_info["quota_limit_vcpus"] = quota_limit
             quota_info["used_vcpus"] = used_vcpus
+            quota_info["enforce_free_tier_ec2"] = enforce_free_tier
+            quota_info["allowed_instance_types"] = allowed_instance_types
+            quota_info["preferred_azs"] = selected_az_order
 
             if quota_limit is not None and used_vcpus is not None:
                 headroom_vcpus = float(quota_limit) - float(used_vcpus)
@@ -425,42 +556,119 @@ def apply_terraform_bundle(
                     if headroom_vcpus >= float(vcpus):
                         viable.append((itype, vcpus))
                 if not viable:
-                    return {
-                        "success": False,
-                        "error": (
-                            f"EC2 quota precheck failed in {aws_region}: standard-family vCPU "
-                            f"headroom is {max(0.0, headroom_vcpus):.1f}, not enough for smallest "
-                            "safe instance candidate. Stop/terminate running EC2 instances in this "
-                            "region or request a quota increase, then retry."
-                        ),
-                        "details": {
-                            "terraform_root": tf_root,
-                            "quota_info": quota_info,
-                            "init_log_tail": _tail(init_log),
-                        },
-                    }
-                selected_instance_type = viable[0][0]
+                    quota_is_zero = float(quota_limit or 0.0) <= 0.0
+                    used_is_zero = float(used_vcpus or 0.0) <= 0.0
+                    if allow_disable_fallback and has_enable_ec2_var:
+                        ec2_fallback_applied = True
+                        precheck_disable_ec2 = True
+                        apply_mode = "ec2_disabled_quota_precheck_fallback"
+                        quota_info["quota_diagnosis"] = (
+                            "zero_account_quota" if quota_is_zero and used_is_zero else "insufficient_headroom"
+                        )
+                        quota_info["precheck_disable_ec2"] = True
+                    else:
+                        if quota_is_zero and used_is_zero:
+                            friendly = (
+                                f"EC2 quota precheck failed in {aws_region}: account has 0.0 standard-family "
+                                "On-Demand vCPU quota in this region. This is an account quota baseline issue "
+                                "(not active instances). Request a quota increase for "
+                                "'Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances' "
+                                "or use a region where this quota is available."
+                            )
+                        else:
+                            friendly = (
+                                f"EC2 quota precheck failed in {aws_region}: standard-family vCPU "
+                                f"headroom is {max(0.0, headroom_vcpus):.1f}, not enough for smallest "
+                                "safe instance candidate. Stop/terminate running EC2 instances in this "
+                                "region or request a quota increase, then retry."
+                            )
+                        return {
+                            "success": False,
+                            "error": friendly,
+                            "details": {
+                                "terraform_root": tf_root,
+                                "quota_info": quota_info,
+                                "quota_diagnosis": "zero_account_quota" if quota_is_zero and used_is_zero else "insufficient_headroom",
+                                "init_log_tail": _tail(init_log),
+                            },
+                        }
+                if viable:
+                    selected_instance_type = viable[0][0]
             else:
                 selected_instance_type = instance_candidates[0] if instance_candidates else None
 
-        def _build_apply_args(instance_type_override: str | None) -> list[str]:
+        def _build_apply_args(
+            instance_type_override: str | None,
+            disable_ec2: bool = False,
+            preferred_azs_override: list[str] | None = None,
+            existing_key_name: str | None = None,
+            force_default_vpc: bool = False,
+        ) -> list[str]:
             args = [*apply_args_base]
             if has_enable_ec2_var and has_ec2_resource:
-                args.append("-var=enable_ec2=true")
+                args.append(f"-var=enable_ec2={'false' if disable_ec2 else 'true'}")
+            if has_aws_region_var:
+                args.append(f"-var=aws_region={aws_region}")
+            az_order = preferred_azs_override if preferred_azs_override is not None else preferred_azs
+            if has_preferred_azs_var and az_order:
+                args.append(f"-var=preferred_availability_zones={json.dumps(az_order)}")
+            if force_default_vpc and has_use_default_vpc_var:
+                args.append("-var=use_default_vpc=true")
+            if existing_key_name and has_existing_key_name_var:
+                args.append(f"-var=existing_ec2_key_pair_name={existing_key_name}")
             if instance_type_override:
                 args.append(f"-var=instance_type={instance_type_override}")
             return args
 
         try:
-            args = _build_apply_args(selected_instance_type)
-            if selected_instance_type:
+            args = _build_apply_args(
+                selected_instance_type,
+                disable_ec2=precheck_disable_ec2,
+                preferred_azs_override=selected_az_order,
+                existing_key_name=existing_key_name_override,
+                force_default_vpc=True,
+            )
+            if precheck_disable_ec2:
+                apply_log = (
+                    f"[precheck] EC2 quota/headroom unavailable in {aws_region}; "
+                    "proceeding with enable_ec2=false fallback.\n"
+                )
+            elif selected_instance_type:
                 attempted_instance_types.append(selected_instance_type)
                 apply_mode = "ec2_forced_small_instance"
-            apply_log = _run_terraform(volume_name, tf_root, args, env)
+            apply_log = f"{apply_log}{_run_terraform(volume_name, tf_root, args, env)}"
         except ContainerError as exc:
             stderr = decode_output(getattr(exc, "stderr", b"") or b"")
             stdout = decode_output(getattr(exc, "stdout", b"") or b"")
             combined = f"{stderr}\n{stdout}".strip()
+
+            if "VpcLimitExceeded" in combined:
+                return {
+                    "success": False,
+                    "error": (
+                        "AWS VPC quota exceeded and the provided Terraform bundle still creates a new VPC. "
+                        "Regenerate IaC with default-VPC mode (latest Stage 8 template) and retry, or clean up unused VPCs."
+                    ),
+                    "details": {
+                        "terraform_root": tf_root,
+                        "init_log_tail": _tail(init_log),
+                        "apply_log_tail": _tail(combined, 1800),
+                    },
+                }
+
+            if "OriginAccessControlAlreadyExists" in combined:
+                return {
+                    "success": False,
+                    "error": (
+                        "CloudFront Origin Access Control name conflict detected in Terraform bundle. "
+                        "Regenerate IaC with unique OAC naming (latest Stage 8 template) and retry."
+                    ),
+                    "details": {
+                        "terraform_root": tf_root,
+                        "init_log_tail": _tail(init_log),
+                        "apply_log_tail": _tail(combined, 1800),
+                    },
+                }
 
             if _is_vcpu_quota_error(combined) and has_ec2_resource and has_instance_type_var:
                 retry_errors: list[str] = [_tail(combined, 1200)]
@@ -473,7 +681,11 @@ def apply_terraform_bundle(
                         retry_log = _run_terraform(
                             volume_name,
                             tf_root,
-                            _build_apply_args(candidate),
+                            _build_apply_args(
+                                candidate,
+                                existing_key_name=existing_key_name_override,
+                                force_default_vpc=True,
+                            ),
                             env,
                         )
                         selected_instance_type = candidate
@@ -490,11 +702,13 @@ def apply_terraform_bundle(
                         retry_combined = f"{retry_stderr}\n{retry_stdout}".strip()
                         retry_errors.append(f"{candidate}: {_tail(retry_combined, 700)}")
                 else:
-                    allow_disable_fallback = str(
-                        os.getenv("DEPLAI_ALLOW_EC2_DISABLE_FALLBACK", "0")
-                    ).strip().lower() in {"1", "true", "yes"}
                     if allow_disable_fallback and has_enable_ec2_var:
-                        retry_args = [*apply_args_base, "-var=enable_ec2=false"]
+                        retry_args = _build_apply_args(
+                            None,
+                            disable_ec2=True,
+                            existing_key_name=existing_key_name_override,
+                            force_default_vpc=True,
+                        )
                         retry_log = _run_terraform(volume_name, tf_root, retry_args, env)
                         apply_log = (
                             "[attempt-1] EC2 apply failed across quota-safe instance candidates.\n"
@@ -516,13 +730,73 @@ def apply_terraform_bundle(
                                 "terraform_root": tf_root,
                                 "selected_instance_type": selected_instance_type,
                                 "attempted_instance_types": attempted_instance_types,
+                                "attempted_preferred_az_orders": attempted_az_orders,
                                 "quota_info": quota_info,
                                 "stderr_tail": _tail(stderr),
                                 "stdout_tail": _tail(stdout),
                                 "retry_errors": retry_errors[-5:],
                                 "init_log_tail": _tail(init_log),
+                                "enforce_free_tier_ec2": enforce_free_tier,
+                                "allowed_instance_types": allowed_instance_types,
                             },
                         }
+            elif _is_capacity_error(combined) and has_ec2_resource and has_preferred_azs_var and preferred_azs:
+                retry_log = ""
+                capacity_retry_errors: list[str] = [_tail(combined, 1200)]
+                for az_order in _rotated_az_orders(preferred_azs):
+                    if az_order in attempted_az_orders:
+                        continue
+                    attempted_az_orders.append([*az_order])
+                    try:
+                        retry_log = _run_terraform(
+                            volume_name,
+                            tf_root,
+                            _build_apply_args(
+                                selected_instance_type,
+                                preferred_azs_override=az_order,
+                                existing_key_name=existing_key_name_override,
+                                force_default_vpc=True,
+                            ),
+                            env,
+                        )
+                        selected_az_order = [*az_order]
+                        quota_info["preferred_azs"] = selected_az_order
+                        apply_mode = "ec2_capacity_retry_az_rotation"
+                        apply_log = (
+                            "[attempt-1] apply failed with AZ capacity constraints.\n"
+                            f"{_tail(combined, 900)}\n\n"
+                            f"[attempt-retry-az-order:{','.join(az_order)}] apply retry log:\n{retry_log}"
+                        )
+                        break
+                    except ContainerError as retry_exc:
+                        retry_stderr = decode_output(getattr(retry_exc, "stderr", b"") or b"")
+                        retry_stdout = decode_output(getattr(retry_exc, "stdout", b"") or b"")
+                        retry_combined = f"{retry_stderr}\n{retry_stdout}".strip()
+                        capacity_retry_errors.append(
+                            f"{','.join(az_order)}: {_tail(retry_combined, 700)}"
+                        )
+                else:
+                    return {
+                        "success": False,
+                        "error": (
+                            "EC2 creation failed due to insufficient capacity across preferred "
+                            "availability zones. Retry shortly, choose another region, or pick "
+                            "a different instance type."
+                        ),
+                        "details": {
+                            "terraform_root": tf_root,
+                            "selected_instance_type": selected_instance_type,
+                            "attempted_instance_types": attempted_instance_types,
+                            "attempted_preferred_az_orders": attempted_az_orders,
+                            "quota_info": quota_info,
+                            "stderr_tail": _tail(stderr),
+                            "stdout_tail": _tail(stdout),
+                            "capacity_retry_errors": capacity_retry_errors[-5:],
+                            "init_log_tail": _tail(init_log),
+                            "enforce_free_tier_ec2": enforce_free_tier,
+                            "allowed_instance_types": allowed_instance_types,
+                        },
+                    }
             else:
                 raise
 
@@ -566,6 +840,7 @@ def apply_terraform_bundle(
                         "terraform_root": tf_root,
                         "selected_instance_type": selected_instance_type,
                         "attempted_instance_types": attempted_instance_types,
+                        "attempted_preferred_az_orders": attempted_az_orders,
                         "quota_info": quota_info,
                         "init_log_tail": _tail(init_log),
                         "apply_log_tail": _tail(apply_log),
@@ -629,7 +904,10 @@ def apply_terraform_bundle(
                 "ec2_fallback_applied": ec2_fallback_applied,
                 "selected_instance_type": selected_instance_type,
                 "attempted_instance_types": attempted_instance_types,
+                "attempted_preferred_az_orders": attempted_az_orders,
                 "quota_info": quota_info,
+                "enforce_free_tier_ec2": enforce_free_tier,
+                "allowed_instance_types": allowed_instance_types,
                 "ec2_state_resources": ec2_state_resources,
                 "terraform_root": tf_root,
                 "init_log_tail": _tail(init_log),

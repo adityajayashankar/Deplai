@@ -1,0 +1,18 @@
+﻿Generate modular Terraform as a JSON object where keys are relative file paths and values are file content.
+Mandatory constraints:
+- Modules: modules/vpc, modules/compute, modules/database, modules/cache
+- Environment separation: environments/dev/main.tf and environments/prod/main.tf
+- Remote state in backend.tf with S3 bucket + DynamoDB locking
+- No hardcoded secrets; use AWS Secrets Manager or SSM Parameter Store references
+- Declare all variables in variables.tf
+- Define outputs in outputs.tf
+- Include cost-awareness comments for expensive resources
+- Keep networking private by default
+
+Return JSON shape:
+{
+  "terraform_files": {
+    "terraform/providers.tf": "...",
+    "terraform/backend.tf": "..."
+  }
+}

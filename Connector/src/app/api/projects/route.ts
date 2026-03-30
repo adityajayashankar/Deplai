@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
 import { query } from '@/lib/db';
+import { githubService } from '@/lib/github';
 
 type DbError = {
   code?: string;
@@ -34,7 +35,7 @@ type GithubRepoRow = {
   last_synced_at: Date | string | null;
   created_at: Date | string;
   installation_id: string;
-  account_login: string;
+  account_login: string | null;
 };
 
 function isSchemaError(error: unknown): boolean {
@@ -127,6 +128,7 @@ export async function GET() {
 
     let githubRepos: GithubRepoRow[] = [];
     try {
+      // Primary ownership path: installation explicitly linked to this user.
       githubRepos = await query<GithubRepoRow[]>(
         `SELECT 
           r.id,
@@ -144,13 +146,37 @@ export async function GET() {
          ORDER BY r.full_name ASC`,
         [user.id]
       );
-    } catch (githubError: unknown) {
-      const dbGithubError = githubError as DbError;
-      // Backward-compatible fallback for older schemas that do not include `user_hidden`.
-      if (dbGithubError?.code === 'ER_BAD_FIELD_ERROR') {
+
+      // Fallback ownership path: legacy rows can miss github_installations.user_id.
+      // In that case, include repos linked to projects owned by this user.
+      if (githubRepos.length === 0) {
+        githubRepos = await query<GithubRepoRow[]>(
+          `SELECT DISTINCT
+            r.id,
+            r.full_name,
+            r.default_branch,
+            r.is_private,
+            r.languages,
+            r.last_synced_at,
+            r.created_at,
+            i.id as installation_id,
+            i.account_login
+           FROM github_repositories r
+           JOIN github_installations i ON i.id = r.installation_id
+           LEFT JOIN projects p ON p.repository_id = r.id
+           WHERE (i.user_id = ? OR p.user_id = ?) AND r.user_hidden = false
+           ORDER BY r.full_name ASC`,
+          [user.id, user.id]
+        );
+      }
+
+      // If still empty, attempt a one-time installation sync (helps when webhook
+      // delivery lagged and repository rows were not yet created).
+      if (githubRepos.length === 0) {
         try {
+          await githubService.syncInstallations(user.id);
           githubRepos = await query<GithubRepoRow[]>(
-            `SELECT 
+            `SELECT DISTINCT
               r.id,
               r.full_name,
               r.default_branch,
@@ -162,9 +188,37 @@ export async function GET() {
               i.account_login
              FROM github_repositories r
              JOIN github_installations i ON i.id = r.installation_id
-             WHERE i.user_id = ?
+             LEFT JOIN projects p ON p.repository_id = r.id
+             WHERE (i.user_id = ? OR p.user_id = ?) AND r.user_hidden = false
              ORDER BY r.full_name ASC`,
-            [user.id]
+            [user.id, user.id]
+          );
+        } catch (syncErr) {
+          console.warn('GitHub installation sync in /api/projects failed:', syncErr);
+        }
+      }
+    } catch (githubError: unknown) {
+      const dbGithubError = githubError as DbError;
+      // Backward-compatible fallback for older schemas that do not include `user_hidden`.
+      if (dbGithubError?.code === 'ER_BAD_FIELD_ERROR') {
+        try {
+          githubRepos = await query<GithubRepoRow[]>(
+            `SELECT DISTINCT
+              r.id,
+              r.full_name,
+              r.default_branch,
+              r.is_private,
+              r.languages,
+              r.last_synced_at,
+              r.created_at,
+              i.id as installation_id,
+              i.account_login
+             FROM github_repositories r
+             JOIN github_installations i ON i.id = r.installation_id
+             LEFT JOIN projects p ON p.repository_id = r.id
+             WHERE (i.user_id = ? OR p.user_id = ?)
+             ORDER BY r.full_name ASC`,
+            [user.id, user.id]
           );
         } catch (fallbackError: unknown) {
           const dbFallbackError = fallbackError as DbError;
@@ -207,7 +261,7 @@ export async function GET() {
         owner,
         repo: repoName,
         type: 'github',
-        source: repo.account_login,
+        source: repo.account_login || owner || 'GitHub',
         branch: repo.default_branch,
         access: repo.is_private ? 'Private' : 'Public',
         languages: parseLanguages(repo.languages),

@@ -2,10 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { query } from '@/lib/db';
 import { verifyWebhookSignature } from '@/lib/crypto';
 import { v4 as uuidv4 } from 'uuid';
+import { requireEnv } from '@/lib/env';
 
 export async function POST(request: NextRequest) {
   try {
-    const signature = request.headers.get('x-hub-signature-256');
+    const signature = request.headers.get('x-hub-signature-256')?.trim();
     const event = request.headers.get('x-github-event');
     
     if (!signature || !event) {
@@ -20,7 +21,7 @@ export async function POST(request: NextRequest) {
     const isValid = verifyWebhookSignature(
       body,
       signature,
-      process.env.GITHUB_WEBHOOK_SECRET!
+      requireEnv('GITHUB_WEBHOOK_SECRET')
     );
 
     if (!isValid) {

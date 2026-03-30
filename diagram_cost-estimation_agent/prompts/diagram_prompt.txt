@@ -1,0 +1,18 @@
+Given an infra_plan JSON, produce only additional diagram objects for resource types not handled by deterministic logic.
+
+Output JSON schema:
+{
+  "nodes": [
+    {"id": "STRING", "label": "STRING", "type": "STRING", "color": "STRING", "existing": false}
+  ],
+  "edges": [
+    {"from_node": "STRING", "to_node": "STRING", "style": "solid|dashed"}
+  ]
+}
+
+Rules:
+1) Use only resources explicitly present in input.
+2) Do not duplicate any existing node IDs.
+3) Return empty arrays if nothing should be added.
+4) Keep style deterministic and conservative.
+

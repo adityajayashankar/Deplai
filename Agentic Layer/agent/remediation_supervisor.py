@@ -57,14 +57,23 @@ except Exception:
         _tool_search_code = None  # type: ignore[assignment]
 
 # ── Configuration ──────────────────────────────────────────────────────────────
+def _env_int_positive(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 AGENT_DELAY_SECONDS = float(os.getenv("REMEDIATION_AGENT_DELAY_SECONDS", "3"))
 AGENT_NODE_TIMEOUT_SECONDS = float(os.getenv("REMEDIATION_AGENT_NODE_TIMEOUT_SECONDS", "180"))
 MAX_ROUNDS = 3  # Max Proposer→Critic negotiation rounds (2 = two full attempts)
-SUPERVISOR_MAX_FILES = int(os.getenv("REMEDIATION_SUPERVISOR_MAX_FILES", "8"))
-SUPERVISOR_MAX_FILE_CHARS = int(os.getenv("REMEDIATION_SUPERVISOR_MAX_FILE_CHARS", "2200"))
-SUPERVISOR_MAX_CONTEXT_CHARS = int(os.getenv("REMEDIATION_SUPERVISOR_MAX_CONTEXT_CHARS", "12000"))
-SUPERVISOR_MAX_FINDINGS = int(os.getenv("REMEDIATION_SUPERVISOR_MAX_FINDINGS", "16"))
-SUPERVISOR_MAX_PROMPT_CHARS = int(os.getenv("REMEDIATION_SUPERVISOR_MAX_PROMPT_CHARS", "22000"))
+SUPERVISOR_MAX_FILES = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_FILES", 8)
+SUPERVISOR_MAX_FILE_CHARS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_FILE_CHARS", 2200)
+SUPERVISOR_MAX_CONTEXT_CHARS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_CONTEXT_CHARS", 12000)
+SUPERVISOR_MAX_FINDINGS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_FINDINGS", 16)
+SUPERVISOR_MAX_PROMPT_CHARS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_PROMPT_CHARS", 22000)
 
 
 # ── Shared state ───────────────────────────────────────────────────────────────

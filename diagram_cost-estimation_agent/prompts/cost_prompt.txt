@@ -1,0 +1,11 @@
+Given a resource type and AWS region not in the static pricing table, return:
+{
+  "monthly_usd": 0.0,
+  "notes": "short basis for estimate"
+}
+
+Constraints:
+1) Be conservative and round up where uncertain.
+2) Mention pricing basis (for example on-demand hourly rate x 730h).
+3) Output only valid JSON.
+

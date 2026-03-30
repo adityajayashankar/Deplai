@@ -204,6 +204,39 @@ function ProjectsPageContent() {
     );
   };
 
+  const handleDisconnectGitHub = async () => {
+    if (!installations.length) {
+      showPopup({ type: 'warning', message: 'No GitHub installations are connected.' });
+      return;
+    }
+    const confirmed = window.confirm(
+      'Disconnect GitHub from DeplAI? This removes linked GitHub installations and repositories from this workspace UI.',
+    );
+    if (!confirmed) return;
+
+    try {
+      const response = await fetch('/api/installations', { method: 'DELETE' });
+      const data = await response.json().catch(() => ({})) as { error?: string; disconnected?: number };
+      if (!response.ok) throw new Error(data.error || 'Failed to disconnect GitHub.');
+      showPopup({
+        type: 'success',
+        message: `Disconnected ${Number(data.disconnected || 0)} installation(s).`,
+      });
+      await refreshProjects(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to disconnect GitHub.';
+      showPopup({ type: 'error', message });
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } finally {
+      router.push('/');
+    }
+  };
+
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
       <header className="h-14 border-b border-white/5 bg-zinc-950/80 backdrop-blur-md px-5 flex items-center justify-between sticky top-0 z-30">
@@ -229,6 +262,15 @@ function ProjectsPageContent() {
         </div>
 
         <div className="flex items-center gap-3">
+          {installations.length > 0 && (
+            <button
+              onClick={handleDisconnectGitHub}
+              className="hidden sm:inline-flex items-center text-amber-200 bg-amber-500/15 hover:bg-amber-500/25 px-3 py-1.5 rounded-md border border-amber-400/30 text-xs font-semibold tracking-wide transition-colors shadow-sm"
+              title="Disconnect GitHub App installations from DeplAI"
+            >
+              Disconnect GitHub
+            </button>
+          )}
           <a
             href="https://github.com/apps/deplai-gitapp-aj/installations/new"
             target="_blank"
@@ -260,6 +302,13 @@ function ProjectsPageContent() {
               <span className="text-xs font-medium text-zinc-200">{user.name || user.login}</span>
             </a>
           )}
+          <button
+            onClick={handleLogout}
+            className="inline-flex items-center text-zinc-300 bg-white/5 hover:bg-white/10 px-3 py-1.5 rounded-md border border-white/10 text-xs font-semibold tracking-wide transition-colors"
+            title="Logout"
+          >
+            Logout
+          </button>
         </div>
       </header>
 

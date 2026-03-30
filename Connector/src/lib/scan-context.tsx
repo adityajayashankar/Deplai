@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useState, useRef, useCallback, useMemo, useEffect } from 'react';
 
-const WS_BASE_URL = process.env.NEXT_PUBLIC_AGENTIC_WS_URL || 'ws://localhost:8000';
+const WS_BASE_URL = (process.env.NEXT_PUBLIC_AGENTIC_WS_URL || '').trim();
 const SCAN_CONTEXT_STORAGE_KEY = 'deplai.scan-context.v1';
 const MAX_PROJECT_ENTRIES = 40;
 const MAX_MESSAGES_PER_PROJECT = 500;
@@ -86,7 +86,54 @@ async function fetchWsToken(projectId: string): Promise<string> {
   }
 }
 
+let resolvedWsBaseCache: string | null = null;
+let wsBaseFetchInFlight: Promise<string> | null = null;
+
+function normalizeWsBase(input: string): string {
+  return input.replace(/\/+$/, '');
+}
+
+function browserWsFallbackBase(): string {
+  if (typeof window === 'undefined') return 'ws://localhost:8000';
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}`;
+}
+
+async function resolveWsBaseUrl(): Promise<string> {
+  if (resolvedWsBaseCache) return resolvedWsBaseCache;
+  if (WS_BASE_URL) {
+    resolvedWsBaseCache = normalizeWsBase(WS_BASE_URL);
+    return resolvedWsBaseCache;
+  }
+  if (wsBaseFetchInFlight) return wsBaseFetchInFlight;
+
+  wsBaseFetchInFlight = (async () => {
+    try {
+      const res = await fetch('/api/pipeline/ws-config', { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json() as { ws_base?: string };
+        const fromServer = String(data.ws_base || '').trim();
+        if (fromServer) {
+          resolvedWsBaseCache = normalizeWsBase(fromServer);
+          return resolvedWsBaseCache;
+        }
+      }
+    } catch {
+      // ignore and fallback
+    }
+    resolvedWsBaseCache = normalizeWsBase(browserWsFallbackBase());
+    return resolvedWsBaseCache;
+  })();
+
+  try {
+    return await wsBaseFetchInFlight;
+  } finally {
+    wsBaseFetchInFlight = null;
+  }
+}
+
 function connectWebSocket(
+  wsBaseUrl: string,
   path: string,
   projectId: string,
   onMessage: (projectId: string, msg: ScanMessage) => void,
@@ -95,7 +142,7 @@ function connectWebSocket(
   onClose: (projectId: string) => void,
   wsToken: string,
 ): WebSocket {
-  const base = `${WS_BASE_URL}${path}/${projectId}`;
+  const base = `${normalizeWsBase(wsBaseUrl)}${path}/${projectId}`;
   const ws = new WebSocket(wsToken ? `${base}?token=${encodeURIComponent(wsToken)}` : base);
 
   ws.onopen = () => {
@@ -284,8 +331,10 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       return next;
     });
 
+    const wsBaseUrl = await resolveWsBaseUrl();
     const wsToken = await fetchWsToken(projectId);
     wsRefs.current[projectId] = connectWebSocket(
+      wsBaseUrl,
       '/ws/scan', projectId,
       appendScanMessage,
       updateScanStatus,
@@ -373,8 +422,10 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
+    const wsBaseUrl = await resolveWsBaseUrl();
     const wsToken = await fetchWsToken(projectId);
     remWsRefs.current[projectId] = connectWebSocket(
+      wsBaseUrl,
       '/ws/remediate', projectId,
       appendRemediationMessage,
       updateRemediationStatus,

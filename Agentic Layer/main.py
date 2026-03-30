@@ -5,7 +5,11 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
+import sys
 import time
+import boto3
+from pathlib import Path
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -20,8 +24,10 @@ from models import (
     RemediationRequest, RemediationResponse,
     ArchitectureGenRequest, ArchitectureGenResponse,
     CostEstimateRequest, CostEstimateResponse,
+    Stage7ApprovalRequest, Stage7ApprovalResponse,
     TerraformGenRequest, TerraformGenResponse,
     TerraformApplyRequest, TerraformApplyResponse,
+    AwsRuntimeDetailsRequest, AwsRuntimeDetailsResponse,
 )
 from environment import EnvironmentInitializer
 from cleanup import cleanup_volumes, cleanup_project_reports
@@ -29,6 +35,7 @@ from result_parser import get_scan_results, get_scan_status, invalidate_cache
 from remediation import RemediationRunner
 from runner_base import RunnerBase
 from architecture_gen import generate_architecture
+from architecture_contract import ArchitectureContractError, parse_architecture_document
 from cost_estimation import estimate_cost
 
 logger = logging.getLogger(__name__)
@@ -480,17 +487,28 @@ async def architecture_generate(request: ArchitectureGenRequest):
     )
     if not result.get("success"):
         return ArchitectureGenResponse(success=False, error=result.get("error", "Unknown error"))
-    return ArchitectureGenResponse(success=True, architecture_json=result.get("architecture_json"))
+    try:
+        architecture_doc = parse_architecture_document(result.get("architecture_json"))
+    except ArchitectureContractError as exc:
+        return ArchitectureGenResponse(
+            success=False,
+            error=f"Generated architecture_json failed contract validation: {exc}",
+        )
+    provider = str(request.provider or "").strip().lower()
+    if provider in {"aws", "azure", "gcp"} and architecture_doc.provider is None:
+        architecture_doc = architecture_doc.model_copy(update={"provider": provider})
+    return ArchitectureGenResponse(success=True, architecture_json=architecture_doc)
 
 
 @app.post("/api/cost/estimate", response_model=CostEstimateResponse, dependencies=[Depends(verify_api_key)])
 async def cost_estimate(request: CostEstimateRequest):
     """Estimate monthly cloud infrastructure costs from an architecture JSON."""
+    architecture_json = request.architecture_json.to_wire_dict()
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(
         None,
         lambda: estimate_cost(
-            request.architecture_json,
+            architecture_json,
             provider=request.provider,
             access_key=request.aws_access_key_id or "",
             secret_key=request.aws_secret_access_key or "",
@@ -509,41 +527,97 @@ async def cost_estimate(request: CostEstimateRequest):
     )
 
 
+@app.post("/api/stage7/approval", response_model=Stage7ApprovalResponse, dependencies=[Depends(verify_api_key)])
+async def stage7_approval(request: Stage7ApprovalRequest):
+    """Run Stage 7 diagram+cost+budget agent and return approval payload."""
+    agent_dir = Path("/app/diagram_cost-estimation_agent")
+    runner = agent_dir / "run_stage7.py"
+    if not runner.exists():
+        logger.error("Stage7 agent runner missing at path: %s", runner)
+        return Stage7ApprovalResponse(
+            success=False,
+            error="Stage7 agent runner not found. Ensure diagram_cost-estimation_agent is mounted.",
+        )
+
+    payload = {
+        "infra_plan": request.infra_plan,
+        "budget_cap_usd": request.budget_cap_usd,
+        "pipeline_run_id": request.pipeline_run_id,
+        "environment": request.environment,
+    }
+    loop = asyncio.get_running_loop()
+
+    def _invoke() -> dict:
+        proc = subprocess.run(
+            [sys.executable, str(runner)],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            cwd=str(agent_dir),
+            check=False,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            tail_err = (proc.stderr or "").strip()[-1500:]
+            raise RuntimeError(f"Stage7 agent failed: {tail_err or 'unknown subprocess error'}")
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            raise RuntimeError("Stage7 agent returned empty output")
+        return json.loads(raw)
+
+    try:
+        approval_payload = await loop.run_in_executor(None, _invoke)
+    except Exception as exc:
+        logger.exception("Stage7 approval generation failed")
+        return Stage7ApprovalResponse(success=False, error=str(exc))
+
+    return Stage7ApprovalResponse(success=True, approval_payload=approval_payload)
+
+
 @app.post("/api/terraform/generate", response_model=TerraformGenResponse, dependencies=[Depends(verify_api_key)])
 async def terraform_generate(request: TerraformGenRequest):
     """
     Generate Terraform + Ansible IaC files from an architecture JSON.
-    Attempts the RAG-agent pipeline first; falls back to security-aware templates.
+    Uses the Terraform agent to generate IaC files.
     """
     from terraform_runner import generate_terraform
 
     loop = asyncio.get_running_loop()
-    rag_result = await loop.run_in_executor(
+    architecture_json = request.architecture_json.to_wire_dict()
+    llm_api_key = (
+        request.openai_api_key
+        or os.getenv("GROQ_API_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+    )
+    agent_result = await loop.run_in_executor(
         None,
         lambda: generate_terraform(
-            architecture_json=request.architecture_json,
+            architecture_json=architecture_json,
             provider=request.provider,
             project_name=request.project_name,
-            openai_api_key=request.openai_api_key or "",
+            openai_api_key=llm_api_key,
         ),
     )
 
-    if rag_result and rag_result.get("success"):
+    if agent_result and agent_result.get("success"):
         return TerraformGenResponse(
             success=True,
             provider=request.provider,
             project_name=request.project_name,
-            files=rag_result.get("files"),
-            readme=rag_result.get("readme"),
-            source="rag_agent",
+            files=agent_result.get("files"),
+            readme=agent_result.get("readme"),
+            source="terraform_agent",
         )
 
-    # RAG agent unavailable or failed — return indicator so Connector falls back
+    # Terraform agent unavailable or failed.
+    error_message = "Terraform agent unavailable."
+    if isinstance(agent_result, dict):
+        error_message = str(agent_result.get("error") or error_message)
     return TerraformGenResponse(
         success=False,
         provider=request.provider,
         project_name=request.project_name,
-        error="RAG agent unavailable — use template fallback",
+        error=error_message,
         source="unavailable",
     )
 
@@ -562,7 +636,8 @@ async def terraform_apply(request: TerraformApplyRequest):
             provider=request.provider,
             aws_access_key_id=request.aws_access_key_id or "",
             aws_secret_access_key=request.aws_secret_access_key or "",
-            aws_region=request.aws_region or "ap-south-1",
+            aws_region=request.aws_region or "eu-north-1",
+            enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
         ),
     )
 
@@ -585,6 +660,178 @@ async def terraform_apply(request: TerraformApplyRequest):
     )
 
 
+@app.post("/api/aws/runtime-details", response_model=AwsRuntimeDetailsResponse, dependencies=[Depends(verify_api_key)])
+async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
+    try:
+        session = boto3.session.Session(
+            aws_access_key_id=request.aws_access_key_id,
+            aws_secret_access_key=request.aws_secret_access_key,
+            region_name=request.aws_region,
+        )
+        ec2 = session.client("ec2", region_name=request.aws_region)
+        s3 = session.client("s3", region_name=request.aws_region)
+        cloudfront = session.client("cloudfront")
+        sts = session.client("sts", region_name=request.aws_region)
+
+        account_id = str(sts.get_caller_identity().get("Account", ""))
+
+        running_res = ec2.describe_instances(
+            Filters=[{"Name": "instance-state-name", "Values": ["running"]}]
+        )
+        running_instances = [
+            i
+            for r in running_res.get("Reservations", [])
+            for i in r.get("Instances", [])
+        ]
+
+        target_instance = None
+        if request.instance_id:
+            try:
+                by_id = ec2.describe_instances(InstanceIds=[request.instance_id])
+                by_id_instances = [
+                    i
+                    for r in by_id.get("Reservations", [])
+                    for i in r.get("Instances", [])
+                ]
+                if by_id_instances:
+                    target_instance = by_id_instances[0]
+            except Exception:
+                target_instance = None
+        if target_instance is None and running_instances:
+            target_instance = running_instances[0]
+
+        vpcs = ec2.describe_vpcs().get("Vpcs", []) or []
+        subnets = ec2.describe_subnets().get("Subnets", []) or []
+        igws = ec2.describe_internet_gateways().get("InternetGateways", []) or []
+        route_tables = ec2.describe_route_tables().get("RouteTables", []) or []
+        security_groups = ec2.describe_security_groups().get("SecurityGroups", []) or []
+        key_pairs = ec2.describe_key_pairs().get("KeyPairs", []) or []
+        nat_gateways_raw = ec2.describe_nat_gateways().get("NatGateways", []) or []
+        nat_gateways = [n for n in nat_gateways_raw if str(n.get("State", "")).lower() not in {"deleted", "deleting"}]
+        all_instances_res = ec2.describe_instances()
+        all_instances = [
+            i
+            for r in all_instances_res.get("Reservations", [])
+            for i in r.get("Instances", [])
+        ]
+
+        s3_bucket_count = len((s3.list_buckets().get("Buckets", []) or []))
+        cf_quantity = int(((cloudfront.list_distributions().get("DistributionList") or {}).get("Quantity")) or 0)
+
+        instance = {
+            "instance_id": "n/a",
+            "public_ipv4_address": "n/a",
+            "private_ipv4_address": "n/a",
+            "instance_state": "n/a",
+            "instance_type": "n/a",
+            "public_dns": "n/a",
+            "private_dns": "n/a",
+            "vpc_id": "n/a",
+            "subnet_id": "n/a",
+            "instance_arn": "n/a",
+        }
+        if target_instance:
+            iid = str(target_instance.get("InstanceId") or "")
+            instance = {
+                "instance_id": iid or "n/a",
+                "public_ipv4_address": str(target_instance.get("PublicIpAddress") or "n/a"),
+                "private_ipv4_address": str(target_instance.get("PrivateIpAddress") or "n/a"),
+                "instance_state": str((target_instance.get("State") or {}).get("Name") or "n/a"),
+                "instance_type": str(target_instance.get("InstanceType") or "n/a"),
+                "public_dns": str(target_instance.get("PublicDnsName") or "n/a"),
+                "private_dns": str(target_instance.get("PrivateDnsName") or "n/a"),
+                "vpc_id": str(target_instance.get("VpcId") or "n/a"),
+                "subnet_id": str(target_instance.get("SubnetId") or "n/a"),
+                "instance_arn": (
+                    f"arn:aws:ec2:{request.aws_region}:{account_id}:instance/{iid}"
+                    if iid and account_id
+                    else "n/a"
+                ),
+            }
+
+        return AwsRuntimeDetailsResponse(
+            success=True,
+            details={
+                "region": request.aws_region,
+                "account_id": account_id or None,
+                "instance": instance,
+                "resource_counts": {
+                    "ec2_instances_total": len(all_instances),
+                    "ec2_instances_running": len(running_instances),
+                    "vpcs": len(vpcs),
+                    "subnets": len(subnets),
+                    "nat_gateways": len(nat_gateways),
+                    "internet_gateways": len(igws),
+                    "route_tables": len(route_tables),
+                    "security_groups": len(security_groups),
+                    "key_pairs": len(key_pairs),
+                    "s3_buckets": s3_bucket_count,
+                    "cloudfront_distributions": cf_quantity,
+                },
+            },
+        )
+    except Exception as exc:
+        return AwsRuntimeDetailsResponse(success=False, error=str(exc))
+
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    checks: list[dict] = []
+
+    # Docker engine availability (required for scan/remediation/runtime-apply paths)
+    try:
+        import docker  # type: ignore
+
+        docker_client = docker.from_env()
+        docker_client.ping()
+        checks.append({
+            "name": "docker_engine",
+            "state": "healthy",
+            "detail": "Docker daemon reachable",
+        })
+    except Exception as exc:
+        checks.append({
+            "name": "docker_engine",
+            "state": "down",
+            "detail": str(exc),
+        })
+
+    # Neo4j availability (optional for remediation flow; KG can be skipped)
+    neo4j_uri = os.environ.get("NEO4J_URI", "").strip()
+    neo4j_user = os.environ.get("NEO4J_USER", "").strip()
+    neo4j_password = os.environ.get("NEO4J_PASSWORD", "").strip()
+    if not neo4j_uri:
+        checks.append({
+            "name": "neo4j",
+            "state": "down",
+            "detail": "NEO4J_URI is not configured",
+        })
+    else:
+        try:
+            from neo4j import GraphDatabase  # type: ignore
+
+            driver = GraphDatabase.driver(
+                neo4j_uri,
+                auth=(neo4j_user, neo4j_password),
+                connection_timeout=3,
+            )
+            try:
+                driver.verify_connectivity()
+            finally:
+                driver.close()
+            checks.append({
+                "name": "neo4j",
+                "state": "healthy",
+                "detail": f"Connected to {neo4j_uri}",
+            })
+        except Exception as exc:
+            checks.append({
+                "name": "neo4j",
+                "state": "down",
+                "detail": str(exc),
+            })
+
+    has_down = any(c.get("state") == "down" for c in checks)
+    has_degraded = any(c.get("state") == "degraded" for c in checks)
+    status = "down" if has_down else ("degraded" if has_degraded else "healthy")
+    return {"status": status, "checks": checks}

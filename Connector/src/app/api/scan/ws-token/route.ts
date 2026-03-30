@@ -1,19 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { createHmac } from 'crypto';
+import { requireEnv } from '@/lib/env';
 
-// WS_TOKEN_SECRET is a server-side-only secret used to sign short-lived WebSocket
-// tokens. It MUST NOT be the same as DEPLAI_SERVICE_KEY — keep it separate.
-// Falls back to DEPLAI_SERVICE_KEY only so existing single-env deployments still work.
-const WS_TOKEN_SECRET = process.env.WS_TOKEN_SECRET || process.env.DEPLAI_SERVICE_KEY || '';
+// WS_TOKEN_SECRET is a server-side-only secret used to sign short-lived WebSocket tokens.
+// It must be explicitly configured and never default to an empty or unrelated secret.
+const WS_TOKEN_SECRET = requireEnv('WS_TOKEN_SECRET');
 
 export async function GET(request: NextRequest) {
   const { error, user } = await requireAuth();
   if (error) return error;
-
-  if (!WS_TOKEN_SECRET) {
-    return NextResponse.json({ error: 'Server misconfigured' }, { status: 500 });
-  }
 
   // project_id is required — tokens are scoped per project so they cannot be
   // replayed against a different project's WebSocket endpoint.

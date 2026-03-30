@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
 import { AGENTIC_URL } from '@/lib/agentic';
-import { getLegacyRootRuntimeStatus, getLegacyTerraformRagStatus } from '@/lib/legacy-assets';
 
 type HealthState = 'healthy' | 'degraded' | 'down';
 
@@ -11,7 +10,14 @@ interface HealthCheck {
   detail: string;
 }
 
-async function checkAgenticHealth(): Promise<HealthCheck> {
+interface AgenticHealthPayload {
+  status?: string;
+  checks?: Array<{ name?: string; state?: string; detail?: string }>;
+}
+
+const OPTIONAL_UPSTREAM_CHECKS = new Set(['neo4j']);
+
+async function checkAgenticHealth(): Promise<{ check: HealthCheck; upstreamChecks: HealthCheck[]; reachable: boolean }> {
   try {
     const res = await fetch(`${AGENTIC_URL}/health`, {
       method: 'GET',
@@ -20,20 +26,56 @@ async function checkAgenticHealth(): Promise<HealthCheck> {
     });
     if (!res.ok) {
       return {
-        name: 'agentic_layer',
-        state: 'down',
-        detail: `Health endpoint returned ${res.status}`,
+        check: {
+          name: 'agentic_layer',
+          state: 'down',
+          detail: `Health endpoint returned ${res.status}`,
+        },
+        upstreamChecks: [],
+        reachable: false,
       };
     }
-    const data = await res.json().catch(() => ({})) as { status?: string };
+    const data = await res.json().catch(() => ({})) as AgenticHealthPayload;
+    const upstreamChecks = Array.isArray(data.checks)
+      ? data.checks
+        .filter((check) => check?.name && !String(check.name).startsWith('legacy_'))
+        .map((check) => {
+          const name = String(check.name);
+          const normalizedState: HealthState = (check.state === 'healthy' || check.state === 'degraded' || check.state === 'down')
+            ? check.state
+            : 'degraded';
+          const state: HealthState = normalizedState === 'down' && OPTIONAL_UPSTREAM_CHECKS.has(name)
+            ? 'degraded'
+            : normalizedState;
+          return {
+            name,
+            state,
+            detail: String(check.detail || ''),
+          };
+        })
+      : [];
+    const hasAnyHealthyUpstream = upstreamChecks.some((check) => check.state === 'healthy');
+    const mappedState: HealthState = data.status === 'healthy'
+      ? 'healthy'
+      : data.status === 'down'
+        ? (hasAnyHealthyUpstream ? 'degraded' : 'down')
+        : 'degraded';
     return {
-      name: 'agentic_layer',
-      state: data.status === 'healthy' ? 'healthy' : 'degraded',
-      detail: data.status === 'healthy' ? 'Connected' : 'Unexpected health payload',
+      check: {
+        name: 'agentic_layer',
+        state: mappedState,
+        detail: mappedState === 'healthy' ? 'Connected' : mappedState === 'degraded' ? 'Reachable with dependency issues' : 'Agentic layer unavailable',
+      },
+      upstreamChecks,
+      reachable: true,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'unreachable';
-    return { name: 'agentic_layer', state: 'down', detail: msg };
+    return {
+      check: { name: 'agentic_layer', state: 'down', detail: msg },
+      upstreamChecks: [],
+      reachable: false,
+    };
   }
 }
 
@@ -42,38 +84,43 @@ export async function GET() {
   if (error) return error;
 
   const checks: HealthCheck[] = [];
-  const agentic = await checkAgenticHealth();
-  checks.push(agentic);
+  const agenticHealth = await checkAgenticHealth();
+  checks.push(agenticHealth.check, ...agenticHealth.upstreamChecks);
 
-  const agenticUp = agentic.state === 'healthy';
-  const legacyTerraform = getLegacyTerraformRagStatus();
-  const legacyRuntime = getLegacyRootRuntimeStatus();
+  const upstreamState = (name: string): HealthState | undefined =>
+    checks.find((c) => c.name === name)?.state;
+  const agenticAvailable = agenticHealth.reachable;
+  const dockerUp = checks.find(c => c.name === 'docker_engine')?.state === 'healthy';
+  const neo4jUp = upstreamState('neo4j') === 'healthy';
+  const architectureEngineUp = upstreamState('architecture') !== 'down';
+  const costEngineUp = upstreamState('cost') !== 'down';
+  const terraformEngineUp = upstreamState('terraform') !== 'down';
+  const diagramEngineUp = architectureEngineUp;
   const serviceChecks: HealthCheck[] = [
-    { name: 'scan', state: agenticUp ? 'healthy' : 'down', detail: agenticUp ? 'Ready' : 'Agentic layer unavailable' },
-    { name: 'remediation', state: agenticUp ? 'healthy' : 'down', detail: agenticUp ? 'Ready' : 'Agentic layer unavailable' },
-    { name: 'architecture', state: agenticUp ? 'healthy' : 'down', detail: agenticUp ? 'Ready' : 'Agentic layer unavailable' },
-    { name: 'diagram', state: agenticUp ? 'healthy' : 'down', detail: agenticUp ? 'Ready' : 'Architecture JSON renderer offline' },
-    { name: 'cost', state: agenticUp ? 'healthy' : 'down', detail: agenticUp ? 'Ready' : 'Agentic layer unavailable' },
+    {
+      name: 'scan',
+      state: agenticAvailable && dockerUp ? 'healthy' : 'down',
+      detail: agenticAvailable && dockerUp ? 'Ready' : !agenticAvailable ? 'Agentic layer unavailable' : 'Docker engine unavailable',
+    },
+    {
+      name: 'remediation',
+      state: agenticAvailable && dockerUp ? 'healthy' : 'down',
+      detail: agenticAvailable && dockerUp ? (neo4jUp ? 'Ready' : 'Ready (KG will be skipped - Neo4j offline)') : !agenticAvailable ? 'Agentic layer unavailable' : 'Docker engine unavailable',
+    },
+    {
+      name: 'kg_agent',
+      state: neo4jUp ? 'healthy' : 'degraded',
+      detail: neo4jUp ? 'Neo4j connected' : 'Neo4j offline - remediation will continue without KG enrichment',
+    },
+    { name: 'architecture', state: agenticAvailable && architectureEngineUp ? 'healthy' : 'down', detail: agenticAvailable && architectureEngineUp ? 'Ready' : 'Agentic layer unavailable' },
+    { name: 'diagram', state: agenticAvailable && diagramEngineUp ? 'healthy' : 'down', detail: agenticAvailable && diagramEngineUp ? 'Ready' : 'Architecture JSON renderer offline' },
+    { name: 'cost', state: agenticAvailable && costEngineUp ? 'healthy' : 'down', detail: agenticAvailable && costEngineUp ? 'Ready' : 'Agentic layer unavailable' },
     {
       name: 'terraform',
-      state: agenticUp ? 'healthy' : 'degraded',
-      detail: agenticUp
-        ? 'RAG agent (with DeplAI_old vector DB fallback) + template fallback available'
-        : 'RAG agent unavailable; Connector template fallback still available',
-    },
-    {
-      name: 'legacy_terraform_rag_assets',
-      state: legacyTerraform.available ? 'healthy' : 'degraded',
-      detail: legacyTerraform.available
-        ? `Legacy Terraform RAG assets detected (orchestrator=${legacyTerraform.has_orchestrator}, vector_db=${legacyTerraform.has_vector_db})`
-        : 'Legacy Terraform RAG assets missing; only current module available',
-    },
-    {
-      name: 'legacy_runtime_reference_pack',
-      state: legacyRuntime.available ? 'healthy' : 'degraded',
-      detail: legacyRuntime.available
-        ? `Legacy runtime files available (${legacyRuntime.present_count}/${legacyRuntime.required_count}) for migration/reference`
-        : 'Legacy runtime root files unavailable',
+      state: agenticAvailable && terraformEngineUp ? 'healthy' : 'degraded',
+      detail: agenticAvailable && terraformEngineUp
+        ? 'LLM IaC generator reachable'
+        : 'LLM IaC generator unavailable',
     },
     {
       name: 'gitops_deploy',
@@ -93,8 +140,9 @@ export async function GET() {
 
   checks.push(...serviceChecks);
 
-  const hasDown = checks.some(c => c.state === 'down');
-  const hasDegraded = checks.some(c => c.state === 'degraded');
+  const overallDrivers = [agenticHealth.check, ...serviceChecks];
+  const hasDown = overallDrivers.some(c => c.state === 'down');
+  const hasDegraded = overallDrivers.some(c => c.state === 'degraded');
   const overall: HealthState = hasDown ? 'down' : hasDegraded ? 'degraded' : 'healthy';
 
   return NextResponse.json({

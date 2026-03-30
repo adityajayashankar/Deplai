@@ -3,6 +3,10 @@ import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { readLegacyCicdTemplate } from '@/lib/legacy-assets';
 
+export const runtime = 'nodejs';
+export const maxDuration = 3600;
+export const dynamic = 'force-dynamic';
+
 type Provider = 'aws' | 'azure' | 'gcp';
 
 interface GeneratedFile {
@@ -23,9 +27,49 @@ interface DeployBody {
   aws_access_key_id?: string;
   aws_secret_access_key?: string;
   aws_region?: string;
+  enforce_free_tier_ec2?: boolean;
   estimated_monthly_usd?: number;
   budget_limit_usd?: number;
   budget_override?: boolean;
+}
+
+function resolveAgenticOrigin(): string {
+  try {
+    return new URL(AGENTIC_URL).origin;
+  } catch {
+    return AGENTIC_URL;
+  }
+}
+
+function classifyUpstreamError(err: unknown): { error: string; hint: string; upstreamError: string } {
+  const raw = err instanceof Error ? err.message : String(err || 'unknown upstream error');
+  const lowered = raw.toLowerCase();
+
+  if (lowered.includes('timeout')) {
+    return {
+      error: 'Deployment runtime timed out before Terraform apply completed.',
+      hint: 'The apply may still be in-flight. Check Connector logs and AWS console, then retry if nothing is active.',
+      upstreamError: raw,
+    };
+  }
+  if (
+    lowered.includes('fetch failed') ||
+    lowered.includes('econnrefused') ||
+    lowered.includes('enotfound') ||
+    lowered.includes('network')
+  ) {
+    return {
+      error: 'Connector could not reach the deployment runtime service.',
+      hint: 'Verify AGENTIC_LAYER_URL is reachable from the Connector runtime and that the Agentic Layer service is healthy.',
+      upstreamError: raw,
+    };
+  }
+
+  return {
+    error: 'Deployment runtime request failed before Terraform apply response was received.',
+    hint: 'Check Connector and Agentic Layer logs for transport/proxy/server timeout issues.',
+    upstreamError: raw,
+  };
 }
 
 function clampProvider(value: string | undefined): Provider {
@@ -150,7 +194,7 @@ function buildGeneratedWorkflowYaml(provider: Provider): string {
         with:
           aws-access-key-id: \${{ secrets.AWS_ACCESS_KEY_ID || vars.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: \${{ secrets.AWS_SECRET_ACCESS_KEY || vars.AWS_SECRET_ACCESS_KEY }}
-          aws-region: \${{ vars.AWS_REGION || 'ap-south-1' }}`,
+          aws-region: \${{ vars.AWS_REGION || 'eu-north-1' }}`,
     azure: `      - name: Azure Login
         uses: azure/login@v2
         with:
@@ -238,7 +282,7 @@ ${credentialSteps[provider]}
 
 function buildWorkflowYaml(provider: Provider): { content: string; source: 'legacy_template' | 'generated' } {
   const tfVersion = '1.9.0';
-  const awsRegion = 'ap-south-1';
+  const awsRegion = 'eu-north-1';
   const legacy = readLegacyCicdTemplate(provider);
   if (legacy) {
     let content = legacy
@@ -249,6 +293,87 @@ function buildWorkflowYaml(provider: Provider): { content: string; source: 'lega
     return { content, source: 'legacy_template' };
   }
   return { content: buildGeneratedWorkflowYaml(provider), source: 'generated' };
+}
+
+function extractOutputString(outputs: Record<string, unknown> | null | undefined, candidates: string[]): string | null {
+  if (!outputs || typeof outputs !== 'object') return null;
+
+  for (const key of candidates) {
+    const direct = outputs[key];
+    if (typeof direct === 'string' && direct.trim()) return direct;
+    if (direct && typeof direct === 'object' && 'value' in (direct as Record<string, unknown>)) {
+      const nested = (direct as Record<string, unknown>).value;
+      if (typeof nested === 'string' && nested.trim()) return nested;
+    }
+  }
+
+  const normalized = Object.keys(outputs).reduce<Record<string, unknown>>((acc, key) => {
+    acc[key.toLowerCase()] = outputs[key];
+    return acc;
+  }, {});
+
+  for (const key of candidates.map((candidate) => candidate.toLowerCase())) {
+    const candidateValue = normalized[key];
+    if (typeof candidateValue === 'string' && candidateValue.trim()) return candidateValue;
+    if (candidateValue && typeof candidateValue === 'object' && 'value' in (candidateValue as Record<string, unknown>)) {
+      const nested = (candidateValue as Record<string, unknown>).value;
+      if (typeof nested === 'string' && nested.trim()) return nested;
+    }
+  }
+
+  return null;
+}
+
+function extractStringFromRecord(record: Record<string, unknown> | null | undefined, candidates: string[]): string | null {
+  if (!record || typeof record !== 'object') return null;
+  const direct = extractOutputString(record, candidates);
+  if (direct) return direct;
+
+  for (const value of Object.values(record)) {
+    if (!value || typeof value !== 'object') continue;
+    const nested = extractOutputString(value as Record<string, unknown>, candidates);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function containsAwsInstanceResource(files: GeneratedFile[]): boolean {
+  return files.some((file) => {
+    const path = normalizePath(String(file.path || '')).toLowerCase();
+    if (!path.endsWith('.tf')) return false;
+    const content = String(file.content || '');
+    return /resource\s+"aws_instance"\s+"[^"]+"/i.test(content);
+  });
+}
+
+function detectStaleAwsTerraformBundle(files: GeneratedFile[]): string[] {
+  const tfFiles = files
+    .filter((file) => normalizePath(String(file.path || '')).toLowerCase().endsWith('.tf'))
+    .map((file) => String(file.content || ''));
+  if (tfFiles.length === 0) return ['No Terraform .tf files were provided in deploy payload.'];
+
+  const combined = tfFiles.join('\n');
+  const reasons: string[] = [];
+
+  const hasUseDefaultVpcVar = /variable\s+"use_default_vpc"\s*\{/i.test(combined);
+  const hasLegacyVpcCreate = /resource\s+"aws_vpc"\s+"main"\s*\{/i.test(combined);
+  const hasVpcConditionalCount = /resource\s+"aws_vpc"\s+"main"\s*\{[\s\S]*?count\s*=\s*var\.use_default_vpc\s*\?\s*0\s*:\s*1/i.test(combined);
+  if (hasLegacyVpcCreate && (!hasUseDefaultVpcVar || !hasVpcConditionalCount)) {
+    reasons.push('Terraform bundle still creates aws_vpc.main without default-VPC conditional mode.');
+  }
+
+  const hasLegacyOacName = /resource\s+"aws_cloudfront_origin_access_control"\s+"oac"\s*\{[\s\S]*?name\s*=\s*"\$\{var\.project_name\}-oac"/i.test(combined);
+  if (hasLegacyOacName) {
+    reasons.push('CloudFront OAC name is static and may collide on reruns.');
+  }
+
+  const hasExistingKeyPairVar = /variable\s+"existing_ec2_key_pair_name"\s*\{/i.test(combined);
+  const hasGeneratedKeyPair = /resource\s+"aws_key_pair"\s+"generated"\s*\{/i.test(combined);
+  if (hasGeneratedKeyPair && !hasExistingKeyPairVar) {
+    reasons.push('EC2 key pair reuse variable is missing; duplicate key-pair imports can fail.');
+  }
+
+  return reasons;
 }
 
 async function fetchFileSha(owner: string, repo: string, filePath: string, pat: string): Promise<string | null> {
@@ -342,43 +467,118 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
-      const awsSecretAccessKey = String(body.aws_secret_access_key || '').trim();
-      const awsRegion = String(body.aws_region || 'ap-south-1').trim() || 'ap-south-1';
+      const staleReasons = detectStaleAwsTerraformBundle(baseFiles);
+      if (staleReasons.length > 0) {
+        return NextResponse.json(
+          {
+            error: 'Provided Terraform bundle is outdated for current AWS runtime safety constraints. Regenerate Stage 8 IaC and retry deploy.',
+            details: {
+              reasons: staleReasons,
+              required_actions: [
+                'Re-run Stage 8 (Generate terraform + ansible) to refresh files.',
+                'Ensure generated Terraform includes variable "use_default_vpc" and unique CloudFront OAC naming.',
+                'Retry deploy after refreshed bundle is loaded in UI state.',
+              ],
+            },
+          },
+          { status: 409 },
+        );
+      }
+
+      const awsAccessKeyId = String(body.aws_access_key_id || process.env.AWS_ACCESS_KEY_ID || '').trim();
+      const awsSecretAccessKey = String(body.aws_secret_access_key || process.env.AWS_SECRET_ACCESS_KEY || '').trim();
+      const awsRegion = String(body.aws_region || 'eu-north-1').trim() || 'eu-north-1';
+      const enforceFreeTierEc2 = body.enforce_free_tier_ec2 !== false;
 
       if (!awsAccessKeyId || !awsSecretAccessKey) {
         return NextResponse.json(
           {
-            error: 'AWS credentials are required for runtime deployment. Provide aws_access_key_id and aws_secret_access_key in this request.',
+            error: 'AWS credentials are required for runtime deployment. Provide aws_access_key_id/aws_secret_access_key or set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY on the server.',
           },
           { status: 400 },
         );
       }
 
-      const agenticRes = await fetch(`${AGENTIC_URL}/api/terraform/apply`, {
-        method: 'POST',
-        headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          project_name: projectName,
-          provider,
-          files: baseFiles,
-          aws_access_key_id: awsAccessKeyId,
-          aws_secret_access_key: awsSecretAccessKey,
-          aws_region: awsRegion,
-        }),
-        signal: AbortSignal.timeout(3_600_000),
-      });
-      const applyData = await agenticRes.json().catch(() => ({})) as Record<string, unknown>;
+      const applyRequest = {
+        project_name: projectName,
+        provider,
+        files: baseFiles,
+        aws_access_key_id: awsAccessKeyId,
+        aws_secret_access_key: awsSecretAccessKey,
+        aws_region: awsRegion,
+        enforce_free_tier_ec2: enforceFreeTierEc2,
+      };
+      let agenticRes: Response;
+      try {
+        agenticRes = await fetch(`${AGENTIC_URL}/api/terraform/apply`, {
+          method: 'POST',
+          headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
+          body: JSON.stringify(applyRequest),
+          signal: AbortSignal.timeout(3_600_000),
+        });
+      } catch (upstreamErr) {
+        const classified = classifyUpstreamError(upstreamErr);
+        return NextResponse.json(
+          {
+            error: classified.error,
+            details: {
+              hint: classified.hint,
+              upstream_error: classified.upstreamError,
+              agentic_origin: resolveAgenticOrigin(),
+            },
+          },
+          { status: 502 },
+        );
+      }
+
+      const applyRaw = await agenticRes.text();
+      let applyData: Record<string, unknown> = {};
+      if (applyRaw.trim()) {
+        try {
+          applyData = JSON.parse(applyRaw) as Record<string, unknown>;
+        } catch {
+          applyData = { raw_response_tail: applyRaw.slice(-2000) };
+        }
+      }
       if (!agenticRes.ok || applyData.success !== true) {
         return NextResponse.json(
           {
             error: String(applyData.error || 'Runtime Terraform apply failed.'),
-            details: applyData.details ?? null,
+            details:
+              applyData.details ??
+              (applyData.raw_response_tail
+                ? { upstream_raw_response_tail: applyData.raw_response_tail }
+                : null),
             outputs: applyData.outputs ?? null,
           },
           { status: agenticRes.ok ? 500 : agenticRes.status },
         );
       }
+
+      const expectedEc2 = containsAwsInstanceResource(baseFiles);
+      const applyDetails = (applyData.details as Record<string, unknown> | null | undefined) ?? undefined;
+      const runtimeOutputs = (applyData.outputs as Record<string, unknown> | null | undefined) ?? undefined;
+      const ec2FallbackApplied = Boolean(applyDetails?.ec2_fallback_applied);
+      const ec2InstanceId = extractOutputString(runtimeOutputs, ['ec2_instance_id', 'instance_id']);
+
+      if (expectedEc2 && (ec2FallbackApplied || !ec2InstanceId)) {
+        return NextResponse.json(
+          {
+            error: ec2FallbackApplied
+              ? 'Deployment incomplete: EC2 provisioning was disabled by quota fallback, so required EC2 resources were not created.'
+              : 'Deployment incomplete: Terraform apply succeeded but no EC2 instance was provisioned.',
+            details: {
+              expected_ec2: true,
+              ec2_fallback_applied: ec2FallbackApplied,
+              ec2_instance_id: ec2InstanceId,
+              apply_details: applyDetails ?? null,
+            },
+            outputs: runtimeOutputs ?? null,
+          },
+          { status: 409 },
+        );
+      }
+
       return NextResponse.json({
         success: true,
         provider,
@@ -387,6 +587,22 @@ export async function POST(req: NextRequest) {
         cloudfront_url: applyData.cloudfront_url ?? null,
         outputs: applyData.outputs ?? {},
         details: applyData.details ?? null,
+        ec2_key_name: extractStringFromRecord(
+          {
+            ...(((applyData.outputs as Record<string, unknown> | undefined) ?? {})),
+            ...(((applyData.details as Record<string, unknown> | undefined) ?? {})),
+            ...applyData,
+          },
+          ['ec2_key_name', 'generated_ec2_key_name', 'key_name'],
+        ),
+        generated_ec2_private_key_pem: extractStringFromRecord(
+          {
+            ...(((applyData.outputs as Record<string, unknown> | undefined) ?? {})),
+            ...(((applyData.details as Record<string, unknown> | undefined) ?? {})),
+            ...applyData,
+          },
+          ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem'],
+        ),
       });
     }
 
@@ -508,7 +724,7 @@ export async function POST(req: NextRequest) {
     if (provider === 'aws') {
       const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
       const awsSecretAccessKey = String(body.aws_secret_access_key || '').trim();
-      const awsRegion = String(body.aws_region || 'ap-south-1').trim() || 'ap-south-1';
+      const awsRegion = String(body.aws_region || 'eu-north-1').trim() || 'eu-north-1';
 
       if (awsAccessKeyId && awsSecretAccessKey) {
         await upsertRepoVariable(owner, safeRepoName, githubPat, 'AWS_ACCESS_KEY_ID', awsAccessKeyId);
@@ -536,7 +752,17 @@ export async function POST(req: NextRequest) {
       blocked: false,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Deployment failed';
-    return NextResponse.json({ error: msg }, { status: 500 });
+    const classified = classifyUpstreamError(err);
+    return NextResponse.json(
+      {
+        error: classified.error,
+        details: {
+          hint: classified.hint,
+          upstream_error: classified.upstreamError,
+          agentic_origin: resolveAgenticOrigin(),
+        },
+      },
+      { status: 500 },
+    );
   }
 }

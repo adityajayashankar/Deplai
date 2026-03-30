@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 _AWS_SYSTEM_PROMPT = """You are an AWS architecture expert. Generate a detailed AWS architecture in JSON format based on the user's prompt.
 The JSON should be structured with a 'title', 'nodes', and 'edges'.
+Always include "provider": "aws" and "schema_version": "1.0" at the top level.
+Every edge must use "from" and "to" fields that reference valid node ids.
 For the `type` field in each node, use specific AWS service names compatible with the Python `diagrams` library AND for cost estimation (e.g., `AmazonEC2`, `AmazonRDS`, `AmazonS3`, `AmazonVPC`, `AmazonSubnet`, `ELB`, `AutoScaling`, `AmazonCloudFront`, `AWSLambda`, `AWSIAM`).
 Ensure the attributes for each node contain enough detail for cost estimation. For example, EC2 needs `instanceType`, `operatingSystem`, `tenancy`, `termType`, and `storageGB`. S3 needs `storageGB`, `storageClass`, `numPUTRequests`, etc.
 The entire output must be a single valid JSON object.
@@ -76,6 +78,8 @@ Provide only the JSON object as the response."""
 
 _AZURE_SYSTEM_PROMPT = """You are an Azure architecture expert. Generate a detailed Azure architecture in JSON format based on the user's prompt.
 The JSON should be structured with a 'title', 'nodes', and 'edges'.
+Always include "provider": "azure" and "schema_version": "1.0" at the top level.
+Every edge must use "from" and "to" fields that reference valid node ids.
 For the `type` field in each node, use specific Azure service names that can be mapped for cost estimation.
 Ensure the attributes for each node contain enough detail for cost estimation. For example, VMs need `vmSize`, `operatingSystem`, `hoursPerMonth`, and `numberOfInstances`. Storage needs `storageGB`, `accessTier`, `redundancy`, etc.
 The entire output must be a single valid JSON object.
@@ -119,6 +123,8 @@ Provide only the JSON object as the response."""
 
 _GCP_SYSTEM_PROMPT = """You are a Google Cloud Platform (GCP) architecture expert. Generate a detailed GCP architecture in JSON format based on the user's prompt.
 The JSON should be structured with a 'title', 'nodes', and 'edges'.
+Always include "provider": "gcp" and "schema_version": "1.0" at the top level.
+Every edge must use "from" and "to" fields that reference valid node ids.
 For the `type` field in each node, use specific GCP service names (e.g., 'GCE', 'GCS', 'CloudSQL', 'CloudFunctions', 'VPC').
 Ensure attributes provide details for cost estimation, like `instanceType` for compute and `storageClass` for storage.
 The entire output must be a single valid JSON object.

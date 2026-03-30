@@ -11,6 +11,13 @@ interface ProjectRow {
   installation_uuid: string | null;
 }
 
+interface GitHubRepoRow {
+  id: string;
+  full_name: string;
+  installation_uuid: string;
+  user_id: string;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const { user, error } = await requireAuth();
@@ -22,7 +29,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
     }
 
-    const rows = await query<ProjectRow[]>(
+    const projectRows = await query<ProjectRow[]>(
       `SELECT
         p.id,
         p.project_type,
@@ -35,48 +42,86 @@ export async function POST(request: NextRequest) {
       WHERE p.id = ?`,
       [projectId],
     );
-    const project = rows[0];
+    const project = projectRows[0];
 
-    if (!project) {
-      return NextResponse.json({ error: 'Project not found' }, { status: 404 });
+    let repoFullName: string | null = null;
+    let installationUuid: string | null = null;
+
+    if (project) {
+      if (project.user_id !== user.id) {
+        return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+      }
+      if (project.project_type !== 'github') {
+        return NextResponse.json({ success: true, pr_url: null, reason: 'local_project' });
+      }
+      repoFullName = project.repo_full_name;
+      installationUuid = project.installation_uuid;
+    } else {
+      const ghRepoRows = await query<GitHubRepoRow[]>(
+        `SELECT
+          r.id,
+          r.full_name,
+          i.id AS installation_uuid,
+          i.user_id
+        FROM github_repositories r
+        JOIN github_installations i ON i.id = r.installation_id
+        WHERE r.id = ?`,
+        [projectId],
+      );
+      const ghRepo = ghRepoRows[0];
+      if (!ghRepo) {
+        return NextResponse.json({ success: true, pr_url: null, reason: 'project_not_found' });
+      }
+      if (ghRepo.user_id !== user.id) {
+        return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+      }
+      repoFullName = ghRepo.full_name;
+      installationUuid = ghRepo.installation_uuid;
     }
-    if (project.user_id !== user.id) {
-      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
-    }
-    if (project.project_type !== 'github') {
-      return NextResponse.json({ success: true, pr_url: null, reason: 'local_project' });
-    }
-    if (!project.repo_full_name || !project.installation_uuid) {
+
+    if (!repoFullName || !installationUuid) {
       return NextResponse.json({ success: true, pr_url: null, reason: 'missing_repo_metadata' });
     }
 
-    const [owner, repo] = project.repo_full_name.split('/');
+    const [owner, repo] = repoFullName.split('/');
     if (!owner || !repo) {
       return NextResponse.json({ success: true, pr_url: null, reason: 'invalid_repo_name' });
     }
 
-    const octokit = await githubService.getInstallationClient(project.installation_uuid);
-    const response = await octokit.pulls.list({
-      owner,
-      repo,
-      state: 'open',
-      sort: 'created',
-      direction: 'desc',
-      per_page: 30,
-    });
+    try {
+      const octokit = await githubService.getInstallationClient(installationUuid);
+      const response = await octokit.pulls.list({
+        owner,
+        repo,
+        state: 'open',
+        sort: 'created',
+        direction: 'desc',
+        per_page: 30,
+      });
 
-    const match = response.data.find(pr => {
-      const title = String(pr.title || '').toLowerCase();
-      const headRef = String(pr.head?.ref || '');
-      return title.includes('automated remediation fixes') || headRef.startsWith('deplai-remediation-');
-    });
+      const match = response.data.find(pr => {
+        const title = String(pr.title || '').toLowerCase();
+        const headRef = String(pr.head?.ref || '');
+        return title.includes('automated remediation fixes') || headRef.startsWith('deplai-remediation-');
+      });
 
-    return NextResponse.json({
-      success: true,
-      pr_url: match?.html_url || null,
-      pr_number: match?.number || null,
-      total_open_prs: response.data.length,
-    });
+      return NextResponse.json({
+        success: true,
+        pr_url: match?.html_url || null,
+        pr_number: match?.number || null,
+        total_open_prs: response.data.length,
+      });
+    } catch (githubErr: unknown) {
+      const message = githubErr instanceof Error ? githubErr.message : 'GitHub PR lookup failed';
+      return NextResponse.json({
+        success: true,
+        pr_url: null,
+        pr_number: null,
+        total_open_prs: 0,
+        reason: 'github_lookup_failed',
+        detail: message,
+      });
+    }
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Failed to resolve remediation PR';
     return NextResponse.json({ error: message }, { status: 500 });

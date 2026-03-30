@@ -3,6 +3,7 @@ from enum import Enum
 from datetime import datetime, timezone
 from pydantic import BaseModel, field_validator
 from typing import Literal, Optional
+from architecture_contract import ArchitectureDocument
 
 # Allowlist for project_id — alphanumeric, hyphens, underscores only, 1-80 chars.
 # This prevents shell metacharacters from reaching Docker exec commands.
@@ -114,7 +115,7 @@ class ArchitectureGenRequest(BaseModel):
 
 class ArchitectureGenResponse(BaseModel):
     success: bool
-    architecture_json: Optional[dict] = None
+    architecture_json: Optional[ArchitectureDocument] = None
     error: Optional[str] = None
 
 
@@ -123,7 +124,7 @@ class ArchitectureGenResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class CostEstimateRequest(BaseModel):
-    architecture_json: dict
+    architecture_json: ArchitectureDocument
     provider: str = "aws"
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
@@ -145,7 +146,7 @@ class CostEstimateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class TerraformGenRequest(BaseModel):
-    architecture_json: dict
+    architecture_json: ArchitectureDocument
     provider: str = "aws"
     project_name: str = "deplai-project"
     qa_summary: Optional[str] = None
@@ -179,6 +180,7 @@ class TerraformApplyRequest(BaseModel):
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
     aws_region: Optional[str] = None
+    enforce_free_tier_ec2: Optional[bool] = True
 
 
 class TerraformApplyResponse(BaseModel):
@@ -188,4 +190,35 @@ class TerraformApplyResponse(BaseModel):
     outputs: Optional[dict] = None
     cloudfront_url: Optional[str] = None
     details: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class AwsRuntimeDetailsRequest(BaseModel):
+    project_name: str = "deplai-project"
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_region: str = "eu-north-1"
+    instance_id: Optional[str] = None
+
+
+class AwsRuntimeDetailsResponse(BaseModel):
+    success: bool
+    details: Optional[dict] = None
+    error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Stage 7 approval payload (diagram + cost + budget gate)
+# ---------------------------------------------------------------------------
+
+class Stage7ApprovalRequest(BaseModel):
+    infra_plan: dict
+    budget_cap_usd: float = 100.0
+    pipeline_run_id: str = ""
+    environment: str = "dev"
+
+
+class Stage7ApprovalResponse(BaseModel):
+    success: bool
+    approval_payload: Optional[dict] = None
     error: Optional[str] = None

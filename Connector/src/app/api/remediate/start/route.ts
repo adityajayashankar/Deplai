@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { query } from '@/lib/db';
+import { githubService } from '@/lib/github';
 
 interface ProjectRow {
   id: string;
@@ -21,6 +22,36 @@ interface GitHubRepoRow {
   suspended_at: string | null;
 }
 
+interface GitHubUserProfile {
+  id: number;
+  login: string;
+}
+
+async function validateGitHubTokenOwnership(githubToken: string, expectedLogin?: string | null): Promise<void> {
+  const response = await fetch('https://api.github.com/user', {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${githubToken}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    cache: 'no-store',
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!response.ok) {
+    throw new Error('Invalid GitHub token');
+  }
+
+  const profile = (await response.json()) as GitHubUserProfile;
+  if (!profile?.login) {
+    throw new Error('Invalid GitHub token profile');
+  }
+
+  if (expectedLogin && profile.login.toLowerCase() !== expectedLogin.toLowerCase()) {
+    throw new Error('GitHub token does not belong to authenticated user');
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const { user, error } = await requireAuth();
@@ -32,6 +63,7 @@ export async function POST(request: NextRequest) {
         ? github_token.trim()
         : null;
     const scope = remediation_scope === 'major' ? 'major' : 'all';
+    let usedInstallationToken = false;
 
     if (!project_id) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
@@ -65,14 +97,11 @@ export async function POST(request: NextRequest) {
         if (!project.repo_full_name || !project.installation_uuid) {
           return NextResponse.json({ error: 'GitHub project metadata is incomplete' }, { status: 400 });
         }
-        if (!runtimeGithubToken) {
-          return NextResponse.json(
-            { error: 'github_token is required for GitHub remediation and PR creation.' },
-            { status: 400 },
-          );
+        const token = runtimeGithubToken || await githubService.getInstallationToken(project.installation_uuid);
+        usedInstallationToken = !runtimeGithubToken;
+        if (runtimeGithubToken) {
+          await validateGitHubTokenOwnership(runtimeGithubToken, user.login);
         }
-
-        const token = runtimeGithubToken;
         const [owner, repo] = project.repo_full_name.split('/');
 
         backendPayload = {
@@ -122,14 +151,11 @@ export async function POST(request: NextRequest) {
       if (ghRepo.user_id !== user.id) {
         return NextResponse.json({ error: 'Forbidden: You do not own this repository' }, { status: 403 });
       }
-      if (!runtimeGithubToken) {
-        return NextResponse.json(
-          { error: 'github_token is required for GitHub remediation and PR creation.' },
-          { status: 400 }
-        );
+      const token = runtimeGithubToken || await githubService.getInstallationToken(ghRepo.installation_uuid);
+      usedInstallationToken = !runtimeGithubToken;
+      if (runtimeGithubToken) {
+        await validateGitHubTokenOwnership(runtimeGithubToken, user.login);
       }
-
-      const token = runtimeGithubToken;
       const [owner, repo] = ghRepo.full_name.split('/');
 
       backendPayload = {
@@ -160,7 +186,10 @@ export async function POST(request: NextRequest) {
     }
 
     const data = await response.json();
-    return NextResponse.json(data);
+    return NextResponse.json({
+      ...data,
+      auth_mode: usedInstallationToken ? 'installation_token' : 'user_token',
+    });
   } catch (error: unknown) {
     console.error('Remediation start error:', error);
     const message = error instanceof Error ? error.message : 'Failed to start remediation';
