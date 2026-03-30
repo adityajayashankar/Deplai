@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { COST_BREAKDOWN } from './data';
 import type { Message } from './types';
 import { Btn, colorize, FileNode, Header, Tag } from './ui';
@@ -9,13 +9,14 @@ export interface AwsCredentialsConfig {
   aws_region: string;
 }
 
-export function QAPage({ onNavigate }: { onNavigate: (v: string) => void }) {
+export function QAPage({ onNavigate, autopilot = false }: { onNavigate: (v: string) => void; autopilot?: boolean }) {
   const [messages, setMessages] = useState<Message[]>([{ role: 'agent', text: 'What AWS region should this deploy to, and do you need multi-AZ resilience?' }]);
   const [step, setStep] = useState<number>(0);
   const [input, setInput] = useState<string>('');
   const [answers, setAnswers] = useState<string[]>([]);
   const [done, setDone] = useState<boolean>(false);
   const [typing, setTyping] = useState<boolean>(false);
+  const [autopilotApplied, setAutopilotApplied] = useState<boolean>(false);
   const chatRef = useRef<HTMLDivElement>(null);
   const questions = [
     'What AWS region should this deploy to, and do you need multi-AZ resilience?',
@@ -113,7 +114,7 @@ export function QAPage({ onNavigate }: { onNavigate: (v: string) => void }) {
     }, 900);
   };
 
-  const useDefaults = () => {
+  const applyDefaults = () => {
     const msgs: Message[] = [];
     questions.forEach((q, i) => {
       msgs.push({ role: 'agent', text: q });
@@ -127,9 +128,19 @@ export function QAPage({ onNavigate }: { onNavigate: (v: string) => void }) {
     setStep(questions.length);
   };
 
+  useEffect(() => {
+    if (!autopilot || done || autopilotApplied) return;
+    const timerId = window.setTimeout(() => {
+      setAutopilotApplied(true);
+      applyDefaults();
+      window.setTimeout(() => onNavigate('arch'), 500);
+    }, 120);
+    return () => window.clearTimeout(timerId);
+  }, [applyDefaults, autopilot, autopilotApplied, done, onNavigate]);
+
   return (
     <div className="flex-1 flex flex-col min-h-0 fade-in">
-      <Header title="Q/A Context Gathering" subtitle="The DeplAI Agent collects architecture requirements before generating infrastructure." badge={{ text: 'Awaiting operator input', cls: 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20' }} actions={<><Btn onClick={useDefaults} size="sm" variant="default" disabled={done}>Use minimum defaults</Btn><Tag color="indigo">Stage 6 - GATE</Tag></>} />
+      <Header title="Q/A Context Gathering" subtitle="The DeplAI Agent collects architecture requirements before generating infrastructure." badge={{ text: 'Awaiting operator input', cls: 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20' }} actions={<><Btn onClick={applyDefaults} size="sm" variant="default" disabled={done}>Use minimum defaults</Btn><Tag color="indigo">Stage 6 - GATE</Tag></>} />
       <div className="flex-1 min-h-0 flex flex-col overflow-hidden p-7">
         <div ref={chatRef} className="flex-1 min-h-0 overflow-y-auto space-y-4 mb-4 custom-scrollbar pr-2">
           {messages.map((m, i) => (
@@ -1037,7 +1048,18 @@ interface DeployStateSnapshot {
   progress: number;
   logs: Array<{ text: string; ts: string; type: 'info' | 'success' | 'error' }>;
   deployResult: DeployApiResult | null;
+  deploymentHistory: DeploymentHistoryEntry[];
   updatedAt: string;
+}
+
+interface DeploymentHistoryEntry {
+  id: string;
+  createdAt: string;
+  status: 'done' | 'error';
+  region: string;
+  cloudfrontUrl: string;
+  instanceId: string;
+  deployResult: DeployApiResult | null;
 }
 
 interface AwsRuntimeLiveInstance {
@@ -1075,6 +1097,7 @@ interface AwsRuntimeLiveDetails {
 }
 
 const DEPLOY_STATE_STORAGE_PREFIX = 'deplai.pipeline.deployState.';
+const DEPLOY_HISTORY_MAX = 20;
 
 interface ResourceSummaryRow {
   label: string;
@@ -1253,13 +1276,43 @@ function downloadTextFile(fileName: string, content: string): void {
   URL.revokeObjectURL(url);
 }
 
+function toHistoryEntry(
+  result: DeployApiResult | null,
+  status: 'done' | 'error',
+  region: string,
+): DeploymentHistoryEntry {
+  const outputs = result?.outputs;
+  const details = result?.details;
+  const live = details && typeof details === 'object'
+    ? (details as { live_runtime_details?: { instance?: { instance_id?: string } } }).live_runtime_details
+    : null;
+  const instanceId = String(
+    live?.instance?.instance_id
+    || pickOutput(outputs, ['ec2_instance_id', 'instance_id'])
+    || 'n/a',
+  );
+  const cloudfrontUrl = String(result?.cloudfront_url || pickOutput(outputs, ['cloudfront_url', 'cloudfront_domain_name']) || 'n/a');
+
+  return {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    createdAt: new Date().toISOString(),
+    status,
+    region: region || 'eu-north-1',
+    cloudfrontUrl,
+    instanceId,
+    deployResult: result,
+  };
+}
+
 export function DeployPage({ projectId, onDeploymentStateChange }: DeployPageProps) {
   const [status, setStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const [logs, setLogs] = useState<{ text: string; ts: string; type: 'info' | 'success' | 'error' }[]>([]);
   const [progress, setProgress] = useState(0);
   const [deployResult, setDeployResult] = useState<DeployApiResult | null>(null);
+  const [deploymentHistory, setDeploymentHistory] = useState<DeploymentHistoryEntry[]>([]);
   const [ppkLoading, setPpkLoading] = useState(false);
   const [runtimeDetailsLoading, setRuntimeDetailsLoading] = useState(false);
+  const [deployStateHydrated, setDeployStateHydrated] = useState(false);
 
   const aws = useMemo(() => parseAwsFromSession(), []);
   const iacFiles = useMemo(() => parseIacFilesFromSession(), []);
@@ -1271,11 +1324,14 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
+    setDeployStateHydrated(false);
     if (!projectId) {
       setStatus('idle');
       setProgress(0);
       setLogs([]);
       setDeployResult(null);
+      setDeploymentHistory([]);
+      setDeployStateHydrated(true);
       return;
     }
     try {
@@ -1294,18 +1350,39 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
       if (saved.deployResult && typeof saved.deployResult === 'object') {
         setDeployResult(saved.deployResult as DeployApiResult);
       }
+      if (Array.isArray(saved.deploymentHistory)) {
+        setDeploymentHistory(
+          saved.deploymentHistory
+            .filter((row) => row && typeof row.id === 'string' && typeof row.createdAt === 'string')
+            .map((row) => ({
+              id: String(row.id),
+              createdAt: String(row.createdAt),
+              status: row.status === 'error' ? 'error' : 'done',
+              region: String(row.region || 'eu-north-1'),
+              cloudfrontUrl: String(row.cloudfrontUrl || 'n/a'),
+              instanceId: String(row.instanceId || 'n/a'),
+              deployResult: (row.deployResult && typeof row.deployResult === 'object') ? row.deployResult as DeployApiResult : null,
+            }))
+            .slice(0, DEPLOY_HISTORY_MAX),
+        );
+      } else {
+        setDeploymentHistory([]);
+      }
     } catch {
       // ignore malformed persisted deploy state
+    } finally {
+      setDeployStateHydrated(true);
     }
   }, [projectId]);
 
   useEffect(() => {
-    if (typeof window === 'undefined' || !projectId) return;
+    if (typeof window === 'undefined' || !projectId || !deployStateHydrated) return;
     const snapshot: DeployStateSnapshot = {
       status,
       progress,
       logs,
       deployResult,
+      deploymentHistory,
       updatedAt: new Date().toISOString(),
     };
     try {
@@ -1313,7 +1390,7 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
     } catch {
       // ignore storage errors
     }
-  }, [deployResult, logs, progress, projectId, status]);
+  }, [deployResult, deploymentHistory, deployStateHydrated, logs, progress, projectId, status]);
 
   useEffect(() => {
     onDeploymentStateChange?.(status);
@@ -1346,6 +1423,7 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
     setProgress(5);
     appendLog('Preparing runtime deploy payload...');
 
+    let latestResult: DeployApiResult | null = null;
     try {
       setProgress(20);
       appendLog('Calling /api/pipeline/deploy for runtime apply...');
@@ -1369,8 +1447,10 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
 
       setProgress(80);
       const data = await res.json().catch(() => ({})) as DeployApiResult;
+      latestResult = data;
 
       if (!res.ok || !data.success) {
+        setDeployResult(data || null);
         const detailHint = data.details && typeof data.details === 'object' && 'hint' in data.details
           ? String((data.details as Record<string, unknown>).hint)
           : '';
@@ -1381,13 +1461,31 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
       setDeployResult(data);
       setProgress(100);
       setStatus('done');
+      setDeploymentHistory((prev) => [
+        toHistoryEntry(data, 'done', aws.aws_region),
+        ...prev,
+      ].slice(0, DEPLOY_HISTORY_MAX));
       appendLog('Runtime Terraform apply completed successfully.', 'success');
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Deployment failed.';
       setStatus('error');
       setProgress(100);
+      if (latestResult) {
+        setDeploymentHistory((prev) => [
+          toHistoryEntry(latestResult, 'error', aws.aws_region),
+          ...prev,
+        ].slice(0, DEPLOY_HISTORY_MAX));
+      }
       appendLog(msg, 'error');
     }
+  };
+
+  const prepareFreshDeployment = () => {
+    setStatus('idle');
+    setProgress(0);
+    setLogs([]);
+    setDeployResult(null);
+    appendLog('Ready for a fresh deployment run.', 'info');
   };
 
   const runtimeOutputs = deployResult?.outputs;
@@ -1573,7 +1671,12 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
                   {status === 'error' && <svg className="w-4 h-4 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg>}
                   <span className="text-sm font-semibold text-zinc-200">{status === 'done' ? 'Deployment complete' : status === 'error' ? 'Deployment failed' : 'Provisioning'}</span>
                 </div>
-                <span className="text-sm font-bold font-mono text-cyan-400">{progress}%</span>
+                <div className="flex items-center gap-2">
+                  {(status === 'done' || status === 'error') && (
+                    <Btn variant="default" size="sm" onClick={prepareFreshDeployment}>Deploy New Instance</Btn>
+                  )}
+                  <span className="text-sm font-bold font-mono text-cyan-400">{progress}%</span>
+                </div>
               </div>
               <div className="h-1.5 bg-zinc-800"><div className="h-full bg-gradient-to-r from-cyan-500 to-indigo-500 transition-all duration-500" style={{ width: `${progress}%` }} /></div>
               <div className="p-4 max-h-72 overflow-y-auto space-y-2 bg-zinc-950/70 custom-scrollbar">
@@ -1677,9 +1780,45 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
               </div>
             ))}
           </div>
+
+          <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4">
+            <div className="flex items-center justify-between mb-3">
+              <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold">Previous Deployments</p>
+              <Tag color="zinc">{deploymentHistory.length}</Tag>
+            </div>
+            {deploymentHistory.length === 0 && (
+              <p className="text-[11px] text-zinc-500">No deployment history yet for this project.</p>
+            )}
+            {deploymentHistory.map((entry) => (
+              <div key={entry.id} className="py-2.5 border-b border-white/4 last:border-0">
+                <div className="flex items-center justify-between gap-2">
+                  <span className={`text-[10px] font-semibold ${entry.status === 'done' ? 'text-emerald-400' : 'text-amber-400'}`}>
+                    {entry.status === 'done' ? 'SUCCESS' : 'FAILED'}
+                  </span>
+                  <span className="text-[10px] text-zinc-600 font-mono">{new Date(entry.createdAt).toLocaleString()}</span>
+                </div>
+                <p className="text-[11px] text-zinc-300 mt-1 font-mono">EC2: {entry.instanceId || 'n/a'}</p>
+                <p className="text-[11px] text-zinc-500 font-mono truncate">CF: {entry.cloudfrontUrl || 'n/a'}</p>
+                <div className="mt-2">
+                  <Btn
+                    variant="default"
+                    size="sm"
+                    onClick={() => {
+                      setDeployResult(entry.deployResult);
+                      setStatus(entry.status);
+                      setProgress(100);
+                    }}
+                  >
+                    View
+                  </Btn>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
     </div>
   );
 }
+
 

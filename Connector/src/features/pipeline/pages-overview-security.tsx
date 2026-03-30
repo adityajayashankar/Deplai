@@ -104,7 +104,7 @@ export function OverviewPage({
               <p className="text-sm font-semibold text-zinc-200">Runtime Stream</p>
               <div className="flex items-center gap-2"><span className={`w-2 h-2 rounded-full ${scanRuntimeState === 'running' || remediationRuntimeState === 'running' ? 'bg-cyan-500 pulse-dot' : 'bg-emerald-500'}`} /><span className="text-[10px] font-mono text-zinc-500 tracking-wider">ws://agentic-layer</span></div>
             </div>
-            <div className="p-4 bg-[#0a0a0c] font-mono text-[11px] flex-1 overflow-y-auto space-y-1.5 shadow-inner min-h-[300px] custom-scrollbar">
+            <div className="p-4 bg-[#0a0a0c] font-mono text-[11px] flex-1 overflow-y-auto space-y-1.5 shadow-inner min-h-75 custom-scrollbar">
               <div className="text-zinc-500">Connecting to pipeline services via WebSocket...</div>
               <div className={healthOverall === 'down' ? 'text-red-400' : 'text-emerald-400'}>Health: {healthOverall || 'unknown'}</div>
               <div className="text-cyan-400 mt-2">[scan] status={scanStatus || 'not_initiated'}</div>
@@ -166,7 +166,7 @@ export function PreflightPage({ checks = [] }: { checks?: PreflightCheckItem[] }
         <div className="grid grid-cols-2 gap-3">
           {items.map((c, i) => (
             <div key={i} className="bg-zinc-900 border border-white/5 rounded-xl p-4 flex items-start gap-3 hover:border-white/10 transition-colors">
-              <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 ${c.state === 'healthy' ? 'bg-emerald-500/10 border border-emerald-500/20' : c.state === 'degraded' ? 'bg-amber-500/10 border border-amber-500/20' : 'bg-red-500/10 border border-red-500/20'}`}>
+              <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 mt-0.5 ${c.state === 'healthy' ? 'bg-emerald-500/10 border border-emerald-500/20' : c.state === 'degraded' ? 'bg-amber-500/10 border border-amber-500/20' : 'bg-red-500/10 border border-red-500/20'}`}>
                 {c.state === 'healthy' && <svg className="w-4 h-4 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>}
                 {c.state === 'degraded' && <svg className="w-4 h-4 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /></svg>}
                 {c.state === 'down' && <svg className="w-4 h-4 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg>}
@@ -174,7 +174,7 @@ export function PreflightPage({ checks = [] }: { checks?: PreflightCheckItem[] }
               <div className="flex-1 min-w-0">
                 <div className="flex items-center justify-between gap-2">
                   <p className="text-sm font-medium text-zinc-200">{c.name}</p>
-                  <span className={`text-[10px] font-mono flex-shrink-0 ${c.state === 'healthy' ? 'text-emerald-400' : c.state === 'degraded' ? 'text-amber-400' : 'text-red-400'}`}>{c.state}</span>
+                  <span className={`text-[10px] font-mono shrink-0 ${c.state === 'healthy' ? 'text-emerald-400' : c.state === 'degraded' ? 'text-amber-400' : 'text-red-400'}`}>{c.state}</span>
                 </div>
                 <p className="text-[11px] text-zinc-500 mt-0.5">{c.detail}</p>
               </div>
@@ -250,9 +250,9 @@ export function ScanPage({ scanResults, scanStatus }: ScanPageProps) {
               {sastFindings.map((f, i) => (
                 <div key={i} className="border-b border-white/4 last:border-0">
                   <div onClick={() => setExpandedRow(expandedRow === i ? null : i)} className="flex items-center gap-4 px-5 py-3.5 cursor-pointer hover:bg-white/3 transition-colors group">
-                    <svg className={`w-4 h-4 text-zinc-600 flex-shrink-0 transition-transform ${expandedRow === i ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
+                    <svg className={`w-4 h-4 text-zinc-600 shrink-0 transition-transform ${expandedRow === i ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
                     <SeverityBadge s={f.severity} />
-                    <span className="text-[11px] font-mono text-zinc-500 w-24 flex-shrink-0">{f.id}</span>
+                    <span className="text-[11px] font-mono text-zinc-500 w-24 shrink-0">{f.id}</span>
                     <span className="text-sm font-medium text-zinc-200 flex-1">{f.title}</span>
                     <span className="text-[11px] font-mono text-zinc-500">{f.file}:{f.line}</span>
                     <span className="text-[11px] bg-zinc-800 text-zinc-400 px-2 py-0.5 rounded font-mono">{f.count} hit{f.count > 1 ? 's' : ''}</span>

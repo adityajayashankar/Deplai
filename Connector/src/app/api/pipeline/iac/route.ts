@@ -577,9 +577,10 @@ async function resolveProjectMeta(
         gi.id AS installation_uuid
       FROM github_repositories gr
       JOIN github_installations gi ON gr.installation_id = gi.id
-      WHERE gr.id = ? AND gi.user_id = ?
+      LEFT JOIN projects p ON p.repository_id = gr.id
+      WHERE gr.id = ? AND (gi.user_id = ? OR p.user_id = ?)
       LIMIT 1`,
-      [projectId, userId],
+      [projectId, userId, userId],
     );
   }
   return rows[0] || null;
@@ -1538,6 +1539,46 @@ export async function POST(req: NextRequest) {
     }
 
     let scanData: ScanResultsData = {};
+    let scanStatus = 'not_initiated';
+    try {
+      const scanStatusRes = await fetch(`${AGENTIC_URL}/api/scan/status/${projectId}`, {
+        headers: agenticHeaders(),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (scanStatusRes.ok) {
+        const payload = await scanStatusRes.json() as { status?: string };
+        scanStatus = String(payload.status || 'not_initiated');
+      }
+    } catch {
+      // Do not hard-fail IaC if status probe fails due to transient connectivity.
+      scanStatus = 'unknown';
+    }
+
+    if (scanStatus === 'running') {
+      return NextResponse.json(
+        { error: 'Scan is still running for this project. Wait for completion before generating Terraform.' },
+        { status: 409 },
+      );
+    }
+    if (scanStatus === 'not_initiated') {
+      return NextResponse.json(
+        {
+          error: 'No scan results found for this project. Run a scan first, then generate Terraform.',
+          requires_scan: true,
+        },
+        { status: 400 },
+      );
+    }
+    if (scanStatus === 'error') {
+      return NextResponse.json(
+        {
+          error: 'Latest scan ended with an error. Re-run scan successfully before generating Terraform.',
+          requires_scan: true,
+        },
+        { status: 400 },
+      );
+    }
+
     try {
       const scanRes = await fetch(`${AGENTIC_URL}/api/scan/results/${projectId}`, {
         headers: agenticHeaders(),

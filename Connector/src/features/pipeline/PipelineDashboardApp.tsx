@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { STAGES } from './data';
 import { ArchPage, DeployPage, GitOpsPage, IaCPage, QAPage } from './pages-delivery';
 import { OverviewPage, PreflightPage, ScanPage } from './pages-overview-security';
@@ -60,6 +61,7 @@ function readSavedCostEstimate(): { totalMonthlyUsd: number | null; budgetCapUsd
 }
 
 export default function PipelineDashboardApp() {
+  const router = useRouter();
   const { startScan, startRemediation, approveRemediationRescan, getRemediationState, getScanState } = useScan();
 
   const validStageKeys = useMemo(() => new Set(['overview', ...STAGES.map((s) => s.key)]), []);
@@ -103,6 +105,12 @@ export default function PipelineDashboardApp() {
       return { autopilot: true, skipRemediation: false, skipScan: false };
     }
   });
+  const normalizedRunOptions = useMemo<PipelineRunOptions>(() => ({
+    autopilot: Boolean(runOptions.autopilot),
+    skipScan: Boolean(runOptions.skipScan),
+    // Skip scan implies skip remediation (there is no scan output to remediate).
+    skipRemediation: Boolean(runOptions.skipScan || runOptions.skipRemediation),
+  }), [runOptions.autopilot, runOptions.skipRemediation, runOptions.skipScan]);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) || null,
@@ -221,11 +229,11 @@ export default function PipelineDashboardApp() {
   useEffect(() => {
     if (typeof window === 'undefined') return;
     try {
-      localStorage.setItem(RUN_OPTIONS_STORAGE_KEY, JSON.stringify(runOptions));
+      localStorage.setItem(RUN_OPTIONS_STORAGE_KEY, JSON.stringify(normalizedRunOptions));
     } catch {
       // ignore storage failures
     }
-  }, [runOptions]);
+  }, [normalizedRunOptions]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -413,6 +421,7 @@ export default function PipelineDashboardApp() {
       if (finalScan === 'found') {
         if (skipRemediation) {
           setKgPhase('idle');
+          setPostMergeDone(true);
           setCurrent('qa');
           return finalScan;
         }
@@ -429,6 +438,7 @@ export default function PipelineDashboardApp() {
       }
       if (finalScan === 'not_found') {
         setKgPhase('idle');
+        setPostMergeDone(true);
         setCurrent('qa');
       }
     }
@@ -450,20 +460,44 @@ export default function PipelineDashboardApp() {
       const healthRes = await fetch('/api/pipeline/health', { cache: 'no-store' });
       if (!healthRes.ok) throw new Error('Preflight check failed.');
 
-      if (runOptions.skipScan) {
+      if (normalizedRunOptions.skipScan) {
+        setPostMergeDone(true);
+        setKgPhase('skipped');
         setCurrent('qa');
         setRunnerState('idle');
         return;
       }
 
-      await runScanFlow(true, runOptions.skipRemediation);
+      await runScanFlow(true, normalizedRunOptions.skipRemediation);
       setRunnerState('idle');
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Pipeline run failed.';
       setRunnerError(message);
       setRunnerState('error');
     }
-  }, [runOptions.skipRemediation, runOptions.skipScan, runScanFlow, selectedProject]);
+  }, [normalizedRunOptions.skipRemediation, normalizedRunOptions.skipScan, runScanFlow, selectedProject]);
+
+  const onDisconnectGitHub = useCallback(async () => {
+    if (githubAccounts.length === 0) return;
+    if (!window.confirm('Disconnect GitHub from DeplAI for this account?')) return;
+    try {
+      const res = await fetch('/api/installations', { method: 'DELETE' });
+      const data = await res.json().catch(() => ({})) as { error?: string };
+      if (!res.ok) throw new Error(data.error || 'Failed to disconnect GitHub');
+      await loadProjects();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to disconnect GitHub';
+      setRunnerError(msg);
+    }
+  }, [githubAccounts.length, loadProjects]);
+
+  const onLogout = useCallback(async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } finally {
+      router.push('/');
+    }
+  }, [router]);
 
   const onStartRemediation = useCallback(async () => {
     if (!selectedProjectId) return;
@@ -567,7 +601,9 @@ export default function PipelineDashboardApp() {
     const kg = base.find((s) => s.key === 'kg');
     const hasKgEvent = remediation.messages.some((m) => m.type === 'kg_result');
     if (kg) {
-      if (kgPhase === 'running') {
+      if (!scanInitiated) {
+        kg.status = 'pending';
+      } else if (kgPhase === 'running') {
         kg.status = 'running';
         kg.duration = 'analyzing';
       } else if (kgPhase === 'completed') {
@@ -590,51 +626,55 @@ export default function PipelineDashboardApp() {
 
     const remediate = base.find((s) => s.key === 'remediate');
     if (remediate) {
-      if (scanStatus === 'not_found') {
+      if (!scanInitiated) {
+        remediate.status = 'pending';
+      } else if (scanStatus === 'not_found') {
         remediate.status = 'success';
         remediate.duration = 'skipped (no findings)';
+      } else {
+        if (remediation.state === 'running') remediate.status = 'running';
+        if (remediation.state === 'waiting_approval') remediate.status = 'active';
+        if (remediation.state === 'completed') remediate.status = 'success';
+        if (remediation.state === 'error') remediate.status = 'active';
       }
-      if (remediation.state === 'running') remediate.status = 'running';
-      if (remediation.state === 'waiting_approval') remediate.status = 'active';
-      if (remediation.state === 'completed') remediate.status = 'success';
-      if (remediation.state === 'error') remediate.status = 'active';
     }
 
     const pr = base.find((s) => s.key === 'pr');
     if (pr) {
-      if (scanStatus === 'not_found') {
+      if (!scanInitiated) {
+        pr.status = 'pending';
+      } else if (scanStatus === 'not_found') {
         pr.status = 'success';
         pr.duration = 'skipped (no findings)';
-      }
-      else if (prUrl) pr.status = 'success';
+      } else if (prUrl) pr.status = 'success';
       else if (noRemediationChanges) {
         pr.status = 'success';
         pr.duration = 'skipped (no changes)';
-      }
-      else if (remediation.state === 'waiting_approval') pr.status = 'active';
+      } else if (remediation.state === 'waiting_approval') pr.status = 'active';
     }
 
     const merge = base.find((s) => s.key === 'merge');
     if (merge) {
-      if (scanStatus === 'not_found') {
+      if (!scanInitiated) {
+        merge.status = 'pending';
+      } else if (scanStatus === 'not_found') {
         merge.status = 'success';
         merge.duration = 'skipped (no findings)';
-      }
-      else if (mergeConfirmed) merge.status = 'success';
+      } else if (mergeConfirmed) merge.status = 'success';
       else if (noRemediationChanges) {
         merge.status = 'success';
         merge.duration = 'skipped (no PR)';
-      }
-      else if (prUrl) merge.status = 'active';
+      } else if (prUrl) merge.status = 'active';
     }
 
     const postmerge = base.find((s) => s.key === 'postmerge');
     if (postmerge) {
-      if (scanStatus === 'not_found') {
+      if (!scanInitiated) {
+        postmerge.status = 'pending';
+      } else if (scanStatus === 'not_found') {
         postmerge.status = 'success';
         postmerge.duration = 'skipped (no findings)';
-      }
-      else if (postMergeDone) postmerge.status = 'success';
+      } else if (postMergeDone) postmerge.status = 'success';
       else if (mergeConfirmed || noRemediationChanges) postmerge.status = 'active';
     }
 
@@ -746,7 +786,7 @@ export default function PipelineDashboardApp() {
       case 'postmerge':
         return <PostMergePage onSkip={onSkipPostMerge} onRerunScan={onRerunPostMergeScan} rerunInProgress={rerunInProgress} />;
       case 'qa':
-        return <QAPage onNavigate={setCurrent} />;
+        return <QAPage onNavigate={setCurrent} autopilot={normalizedRunOptions.autopilot} />;
       case 'arch':
       case 'approve':
         return <ArchPage onNavigate={setCurrent} projectId={selectedProjectId} projectName={selectedProject?.name} />;
@@ -780,8 +820,21 @@ export default function PipelineDashboardApp() {
   return (
     <div className="flex h-screen bg-[#09090b] text-zinc-300 overflow-hidden relative font-sans">
       <GlobalStyles />
-      {showOptions && <RunOptionsModal onClose={() => setShowOptions(false)} options={runOptions} onChange={setRunOptions} />}
-      <Sidebar current={current} setCurrent={setCurrent} stages={stages} githubAccounts={githubAccounts} />
+      {showOptions && (
+        <RunOptionsModal
+          onClose={() => setShowOptions(false)}
+          options={normalizedRunOptions}
+          onChange={(next) => {
+            const safeNext: PipelineRunOptions = {
+              autopilot: Boolean(next.autopilot),
+              skipScan: Boolean(next.skipScan),
+              skipRemediation: Boolean(next.skipScan || next.skipRemediation),
+            };
+            setRunOptions(safeNext);
+          }}
+        />
+      )}
+      <Sidebar current={current} setCurrent={setCurrent} stages={stages} githubAccounts={githubAccounts} onDisconnectGitHub={onDisconnectGitHub} />
       <div className="flex-1 flex flex-col overflow-hidden min-w-0 bg-[#09090b]">
         <div className="h-11 bg-[#09090b]/80 border-b border-white/5 flex items-center px-5 gap-3 flex-shrink-0 backdrop-blur">
           <div className="flex items-center gap-1.5 text-[11px] text-zinc-600">
@@ -804,6 +857,12 @@ export default function PipelineDashboardApp() {
             >
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
               {runLabel}
+            </button>
+            <button
+              onClick={onLogout}
+              className="flex items-center gap-1.5 px-3 py-1 bg-zinc-900 hover:bg-zinc-800 border border-white/10 rounded-md text-[11px] font-medium text-zinc-300 transition-colors"
+            >
+              Logout
             </button>
           </div>
         </div>

@@ -157,6 +157,9 @@ sequenceDiagram
 - Cache invalidation before UI re-fetches results
 - Empty scanner report guardrails to avoid false-clean outcomes
 - Human-in-the-loop checkpoint before post-fix persistence + re-scan
+- Run-option normalization in pipeline UI (`skip_scan` implies `skip_remediation`)
+- Autopilot Q/A path can auto-apply defaults and advance to architecture generation
+- IaC generation in Connector is scan-state-gated before Terraform generation
 
 ## 5. Data Boundaries
 
@@ -170,4 +173,13 @@ sequenceDiagram
 - GitHub remediation uses either runtime token or installation token
 - Runtime LLM API keys are sent for remediation execution and should be handled as secrets
 - Do not commit real credentials to repo files
+
+## 7. Connector Session and GitHub Link Lifecycle
+
+- Session logout is handled by `POST /api/auth/logout` (session cookie invalidation).
+- GitHub disconnect is handled by `DELETE /api/installations`:
+  - single installation disconnect via `installation_id`
+  - full user disconnect when no installation id is provided
+- Disconnect removes DeplAI metadata links (`github_installations`, `github_repositories`) but does not uninstall the GitHub App at GitHub.
+- Deploy stage UI maintains per-project deployment history snapshots and supports new-instance redeploy without deleting old snapshots.
 

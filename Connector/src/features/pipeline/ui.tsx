@@ -189,6 +189,7 @@ interface SidebarProps {
   stages: Stage[];
   githubAccounts?: string[];
   githubInstallUrl?: string;
+  onDisconnectGitHub?: () => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -197,6 +198,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   stages,
   githubAccounts = [],
   githubInstallUrl = 'https://github.com/apps/deplai-gitapp-aj/installations/new',
+  onDisconnectGitHub,
 }) => {
   const loopStages = stages.filter((s) => s.group === 'loop');
   const preStages = stages.filter((s) => s.id === 0);
@@ -267,10 +269,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <p className={`text-[11px] truncate ${githubConnected ? 'text-zinc-300' : 'text-zinc-500'}`}>{githubLabel}</p>
             <p className={`text-[10px] ${githubConnected ? 'text-emerald-400' : 'text-amber-400'}`}>{githubConnected ? 'GitHub connected' : 'GitHub connector required'}</p>
           </div>
-          {!githubConnected && (
+          {!githubConnected ? (
             <a href={githubInstallUrl} target="_blank" rel="noreferrer" className="text-[10px] px-2 py-1 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/25">
               Connect
             </a>
+          ) : (
+            <button
+              onClick={onDisconnectGitHub}
+              className="text-[10px] px-2 py-1 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 hover:bg-amber-500/25"
+              title="Disconnect GitHub installations from DeplAI"
+            >
+              Disconnect
+            </button>
           )}
         </div>
       </div>
