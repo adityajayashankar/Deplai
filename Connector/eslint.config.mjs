@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Connector working directories containing imported third-party repos.
+    "tmp/**",
   ]),
 ]);
 

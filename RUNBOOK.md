@@ -108,6 +108,18 @@ curl http://localhost:3000/api/pipeline/health
 
 Requires authenticated session.
 
+## Python syntax validation
+
+From repo root:
+
+```powershell
+python -m compileall "Agentic Layer" KGagent terraform_agent diagram_cost-estimation_agent
+```
+
+Behavior:
+
+- Compiles all Python packages in-place to catch syntax-level errors early.
+
 ## 5. Stage Operations
 
 ## Stage 1: Scan

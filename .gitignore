@@ -57,6 +57,7 @@ __pycache__/
 
 *.json
 *.jsonl
+*.mjs
 
 # KGagent data and config files — needed as Neo4j fallback and for agent config
 !KGagent/**/*.json

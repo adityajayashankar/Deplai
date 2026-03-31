@@ -1,15 +1,26 @@
 # DeplAI Architecture
 
-This document describes the current runtime architecture in this repository.
+This document describes the active runtime architecture in this repository. It is intentionally implementation-first: the goal is to explain the system that actually runs today, not an older target-state design.
 
-## 1. Runtime Topology
+## System Overview
+
+DeplAI is a staged DevSecOps control plane built around three runtime layers:
+
+- `Connector`: the user-facing Next.js application and backend-for-frontend layer
+- `Agentic Layer`: the FastAPI orchestration service for scan, remediation, architecture, cost, and deploy actions
+- Supporting analysis modules: `KGagent` and `diagram_cost-estimation_agent`
+
+The platform accepts a GitHub repository or local project, runs security analysis, guides remediation through human approval, generates architecture and delivery artifacts, applies policy checks, and then deploys through GitOps or AWS runtime apply.
+
+## Runtime Topology
 
 ```mermaid
 flowchart LR
-    U[Browser] --> C[Connector Next.js]
+    U[User Browser] --> C[Connector<br/>Next.js UI + BFF]
     C --> DB[(MySQL)]
-    C -->|X-API-Key REST| A[Agentic Layer FastAPI]
-    C -->|WS token + WS| A
+    C --> G[GitHub API]
+    C -->|REST + X-API-Key| A[Agentic Layer<br/>FastAPI]
+    C -->|WS token + WebSocket| A
 
     A --> D[(Docker Engine)]
     D --> V1[(codebase_deplai)]
@@ -17,124 +28,341 @@ flowchart LR
     D --> V3[(LLM_Output)]
     D --> V4[(grype_db_cache)]
 
-    A --> K[KGagent module import]
-    K --> N[(Neo4j)]
-    K --> Q[(Qdrant)]
+    A --> KG[KGagent<br/>in-process import]
+    KG --> N[(Neo4j)]
+    KG --> Q[(Qdrant)]
 
-    A --> S7[diagram_cost-estimation_agent subprocess]
-    C --> G[GitHub API]
+    A --> S7[diagram_cost-estimation_agent<br/>subprocess]
     A --> G
 ```
 
-## 2. Component Responsibilities
+## Architectural Flow
 
-## Connector (`Connector/`)
+```mermaid
+flowchart TB
+    subgraph USER[User Interaction]
+        UI[DeplAI Dashboard]
+    end
 
-- User auth/session, project ownership checks, GitHub integration.
-- BFF routes for scan/remediation/pipeline APIs.
-- Pipeline UI orchestration and stage state persistence.
-- WebSocket token minting (`/api/scan/ws-token`) with HMAC signature.
+    subgraph STEP0[Stage 0: Preflight]
+        PF[Pipeline readiness checks]
+    end
 
-## Agentic Layer (`Agentic Layer/`)
+    subgraph STEP1[Stage 1: Scan]
+        SC[Load repository or local project]
+        SAST[Bearer SAST]
+        SCA[Syft and Grype SCA]
+    end
 
-- Scan orchestration (`EnvironmentInitializer`).
-- Remediation orchestration (`RemediationRunner`).
-- Architecture/cost APIs.
-- Stage 7 subprocess invocation.
-- Terraform generation and runtime apply APIs.
-- AWS runtime details and destroy APIs.
+    subgraph STEP2[Stage 2: KG Analysis]
+        KG2[KG analysis]
+        KGN[(Neo4j)]
+        KGQ[(Qdrant)]
+    end
 
-## Stage 7 Agent (`diagram_cost-estimation_agent/`)
+    subgraph STEP3[Stage 3: Remediation]
+        RS[Remediation runner]
+        RP[Plan]
+        RPR[Propose]
+        RC[Critique]
+        RSY[Synthesize]
+    end
 
-- Builds diagram model from `infra_plan`.
-- Estimates cost from static AWS pricing table first.
-- Uses Groq fallback for unknown resource types.
-- Computes budget gate `PASS | WARN | FAIL`.
-- Returns approval payload used by Stage 7.5 UI gate.
+    subgraph STEP4[Stage 4: Pull Request]
+        PR[Push branch]
+        OPR[Open PR]
+    end
 
-## KGagent (`KGagent/`)
+    subgraph STEP45[Stage 4.5: Merge Gate]
+        MG[Manual merge approval]
+    end
 
-- Imported by remediation path through `run_analysis_agent`.
-- Provides CVE/CWE context from graph/vector data.
-- Remediation continues even when KG dependencies are unavailable.
+    subgraph STEP46[Stage 4.6: Post-Merge]
+        PM[Refresh and continue]
+    end
 
-## 3. Security and Auth Boundaries
+    subgraph STEP6[Stage 6: QA Context]
+        QA[Capture infra and delivery answers]
+    end
 
-- Connector -> Agentic REST is protected with `X-API-Key` (`DEPLAI_SERVICE_KEY`).
-- WebSocket connections use short-lived HMAC token bound to:
-  - `sub` (user id)
-  - `project_id`
-  - `exp` timestamp
-- Backend verifies token signature, expiry, project scope, and `sub`/context match.
-- Project ownership is checked in Connector before forwarding requests.
+    subgraph STEP7[Stage 7: Architecture and Cost]
+        AG[Architecture generation]
+        DG[Diagram generation]
+        CE[Cost estimation]
+    end
 
-## 4. Data Boundaries
+    subgraph STEP75[Stage 7.5: Approval]
+        AP[Approve architecture and cost]
+    end
 
-## Persistent metadata
+    subgraph STEP8[Stage 8: IaC]
+        TF[Terraform generation]
+        TEMP[Template fallback]
+    end
 
-- MySQL tables in `Connector/database.sql`:
-  - `users`
-  - `github_installations`
-  - `github_repositories`
-  - `projects`
-  - `chat_sessions`
-  - `chat_messages`
+    subgraph STEP9[Stage 9: Policy]
+        PG[Budget and delivery policy gate]
+    end
 
-## Runtime execution data
+    subgraph STEP10[Stage 10: Deploy]
+        GD[GitOps push]
+        AWSDEP[AWS runtime apply]
+        PD[Runtime details and outputs]
+    end
 
-- Docker volumes:
-  - `codebase_deplai` (repo working copy per project id)
-  - `security_reports` (Bearer/Syft/Grype JSON output)
-  - `LLM_Output` (remediation summary)
-  - `grype_db_cache` (scanner cache)
+    UI --> PF
+    PF --> SC
+    SC --> SAST
+    SC --> SCA
+    SAST --> KG2
+    SCA --> KG2
+    KG2 --> KGN
+    KG2 --> KGQ
+    KG2 --> RS
+    RS --> RP
+    RP --> RPR
+    RPR --> RC
+    RC -->|reject| RP
+    RC -->|accept| RSY
+    RSY --> PR
+    PR --> OPR
+    OPR --> MG
+    MG --> PM
+    PM --> QA
+    QA --> AG
+    AG --> DG
+    DG --> CE
+    CE --> AP
+    AP --> TF
+    TF --> TEMP
+    TF --> PG
+    PG --> GD
+    PG --> AWSDEP
+    AWSDEP --> PD
+```
 
-## 5. Stage Flow Mapping
+## Core Components
 
-Pipeline stages surfaced in UI:
+### Connector
 
-- `0` preflight (non-blocking health overview)
+`Connector/` is the control plane entry point and BFF.
+
+Responsibilities:
+
+- user authentication and session handling
+- project ownership and authorization checks
+- GitHub OAuth, GitHub App, repository sync, and PR/deploy integration
+- pipeline stage orchestration in the dashboard
+- WebSocket token minting for scan and remediation streams
+- policy checks and request shaping before calling the backend
+
+Important characteristics:
+
+- persists project and chat metadata in MySQL
+- exposes pipeline routes under `Connector/src/app/api`
+- holds local project uploads under `Connector/tmp/local-projects`
+- drives most later pipeline stages over HTTP rather than queue workers
+
+### Agentic Layer
+
+`Agentic Layer/` is the orchestration runtime.
+
+Responsibilities:
+
+- scan validation and scan execution orchestration
+- remediation execution and cycle management
+- architecture generation and cost estimation APIs
+- Stage 7 subprocess invocation
+- Terraform generation handoff
+- Terraform runtime apply, stop, status, destroy, and runtime details
+- health and readiness reporting
+
+Important runtime state in memory:
+
+- active scan runners
+- active remediation runners
+- pipeline websocket subscribers
+- active Terraform apply contexts
+- cached apply results
+
+Important characteristics:
+
+- protected by `DEPLAI_SERVICE_KEY`
+- verifies HMAC-bound WebSocket tokens using `WS_TOKEN_SECRET`
+- uses Docker to manage working volumes and scanner execution
+
+### KGagent
+
+`KGagent/` is not a required standalone service in the active path. It is imported by the remediation flow inside the backend.
+
+Responsibilities:
+
+- enrich remediation with graph-backed CVE and CWE context
+- query Neo4j and optional vector retrieval dependencies
+- tolerate dependency unavailability without hard-failing the full remediation flow
+
+### Stage 7 Agent
+
+`diagram_cost-estimation_agent/` is executed by the backend as a subprocess during approval-pack generation.
+
+Responsibilities:
+
+- transform infra planning data into diagram output
+- estimate cost across cloud providers
+- produce approval payloads for the Stage 7.5 gate
+- feed the downstream IaC and deployment stages with structured artifact data
+
+## Stage Mapping
+
+The active stage order surfaced in the UI is defined in `Connector/src/features/pipeline/data.ts`.
+
+Stages:
+
+- `0` preflight
 - `1` scan
 - `2` KG analysis
 - `3` remediation
 - `4` remediation PR
-- `4.5` merge confirmation gate
-- `4.6` post-merge action gate
-- `6` QA context gate
-- `7` architecture + cost
+- `4.5` merge gate
+- `4.6` post-merge actions
+- `6` QA context gathering
+- `7` architecture and cost
 - `7.5` approval gate
 - `8` IaC generation
-- `9` policy gate (budget/secrets/critical findings)
+- `9` GitOps and policy gate
 - `10` deploy
 
-Backend remediation loop cap:
+Operational note:
 
-- Max 2 remediation cycles (`MAX_REMEDIATION_CYCLES = 2`).
+- remediation is hard-capped at `MAX_REMEDIATION_CYCLES = 2`
 
-## 6. IaC and Deploy Path
+## Data Architecture
 
-- Backend `/api/terraform/generate` calls `terraform_runner.py`.
-- `terraform_runner.py` is intentionally non-RAG in this repository and returns unavailable so Connector can use template fallback.
-- Connector `/api/pipeline/iac`:
-  - validates architecture contract,
-  - blocks if scan state is invalid,
-  - tries backend generator,
-  - falls back to template bundle when needed,
-  - can open IaC PR for GitHub projects.
-- Connector `/api/pipeline/deploy`:
-  - enforces budget guardrail,
-  - `runtime_apply=true` -> backend runtime Terraform apply (AWS only),
-  - `runtime_apply=false` -> GitOps repo+workflow push.
+### Persistent metadata
 
-## 7. Health Model
+MySQL is used by Connector for durable application metadata, including:
 
-- Agentic `/health` currently checks:
-  - Docker daemon
-  - Neo4j connectivity
-- Connector `/api/pipeline/health` composes this into service-level checks:
-  - `scan`, `remediation`, `kg_agent`, `architecture`, `diagram`, `cost`, `terraform`, `gitops_deploy`, `runtime_deploy`.
+- users
+- GitHub installations
+- GitHub repositories
+- projects
+- chat sessions
+- chat messages
 
-## 8. Current Architectural Notes
+### Runtime execution state
 
-- `terraform_agent/` (top-level) exists but is not the active runtime generation path.
-- KG server process is not required for baseline flow; KG logic is imported in-process.
-- Delivery UI currently drives AWS-specific architecture/IaC/deploy behavior.
+The backend uses Docker-managed volumes for execution artifacts:
+
+- `codebase_deplai`: working copy of the project under analysis
+- `security_reports`: scanner outputs from Bearer, Syft, and Grype
+- `LLM_Output`: remediation summaries and related artifacts
+- `grype_db_cache`: vulnerability database cache
+
+### Client-side transient state
+
+Not every pipeline artifact is server-persisted yet. Some stage data is still carried in UI state or browser storage, especially around QA answers, architecture outputs, cost outputs, and deployment continuation.
+
+## Security Boundaries
+
+### Connector to backend
+
+- REST calls from Connector to Agentic Layer use `X-API-Key`
+- the shared secret is `DEPLAI_SERVICE_KEY`
+
+### WebSocket control
+
+- Connector signs short-lived WebSocket tokens with `WS_TOKEN_SECRET`
+- tokens are bound to `sub`, `project_id`, and expiry
+- Agentic Layer verifies signature, expiry, project binding, and user context match
+
+### Project authorization
+
+- Connector performs project ownership checks before forwarding scan, remediation, or delivery actions
+- backend trust is scoped around the authenticated and prevalidated request coming from Connector
+
+### Deployment controls
+
+- budget guardrails are enforced before deployment proceeds
+- runtime deploy control plane includes status, stop, destroy, and runtime details endpoints
+- GitOps repository updates are performed through GitHub API calls from Connector
+
+## Deployment Architecture
+
+There are two deployment modes in the current system.
+
+### GitOps mode
+
+Triggered when `runtime_apply=false`.
+
+Behavior:
+
+- Connector writes generated IaC and workflow assets into a GitHub repository
+- repository variables and workflow files are configured
+- deployment execution is delegated to GitHub Actions or repository workflow logic
+
+### Runtime apply mode
+
+Triggered when `runtime_apply=true`.
+
+Behavior:
+
+- Connector forwards the apply request to Agentic Layer
+- Agentic Layer executes Terraform apply for AWS-focused deployments
+- apply state is tracked in memory and exposed through status and stop endpoints
+- post-deploy details are returned through runtime detail routes
+
+## Health Model
+
+### Backend health
+
+`/health` in Agentic Layer currently checks at least:
+
+- Docker daemon availability
+- Neo4j connectivity
+
+### Connector health composition
+
+`/api/pipeline/health` in Connector turns backend and local checks into a service-level readiness model, including:
+
+- scan
+- remediation
+- KG agent
+- architecture
+- diagram
+- cost
+- terraform
+- GitOps deploy
+- runtime deploy
+
+## Active Versus Legacy Paths
+
+This repository contains code that is not the primary runtime path.
+
+Active path:
+
+- Connector BFF routes
+- Agentic Layer orchestration
+- in-process KG analysis
+- Stage 7 subprocess execution
+- Connector-managed IaC fallback and deployment orchestration
+
+Legacy or non-primary path:
+
+- top-level `terraform_agent/` as a standalone generator runtime
+- older queue and worker style documentation
+- Terraform RAG-based generation path
+
+## Current Constraints
+
+- `docker-compose.yml` starts `agentic-layer` only
+- MySQL, Neo4j, and Qdrant are not provisioned by the compose file
+- runtime deployment is AWS-only
+- delivery UX remains AWS-first
+- not all workflow artifacts are yet persisted as a single canonical run object
+- Terraform generation can intentionally fall back to static templates
+
+## Related Documents
+
+- operational guide: `RUNBOOK.md`
+- platform overview: `README.md`
+- architecture contract notes: `ARCHITECTURE_CONTRACTS.md`

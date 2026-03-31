@@ -149,19 +149,43 @@ async function upsertRepoVariable(owner: string, repo: string, pat: string, name
   const trimmed = String(value || '').trim();
   if (!trimmed) return;
 
-  await ghFetch(
+  const updateRes = await ghFetch(
     `https://api.github.com/repos/${owner}/${repo}/actions/variables/${encodeURIComponent(name)}`,
     pat,
     'PATCH',
     { name, value: trimmed },
   );
 
-  await ghFetch(
+  if (updateRes.ok) return;
+  if (updateRes.status !== 404) {
+    const reason = String(updateRes.data?.message || 'unknown GitHub API error');
+    throw new Error(`Failed to update variable "${name}" (${updateRes.status}): ${reason}`);
+  }
+
+  const createRes = await ghFetch(
     `https://api.github.com/repos/${owner}/${repo}/actions/variables`,
     pat,
     'POST',
     { name, value: trimmed },
   );
+
+  if (createRes.ok) return;
+
+  // Handle race: variable may have been created between PATCH and POST.
+  if (createRes.status === 409) {
+    const retryUpdateRes = await ghFetch(
+      `https://api.github.com/repos/${owner}/${repo}/actions/variables/${encodeURIComponent(name)}`,
+      pat,
+      'PATCH',
+      { name, value: trimmed },
+    );
+    if (retryUpdateRes.ok) return;
+    const reason = String(retryUpdateRes.data?.message || 'unknown GitHub API error');
+    throw new Error(`Failed to update variable "${name}" after conflict (${retryUpdateRes.status}): ${reason}`);
+  }
+
+  const reason = String(createRes.data?.message || 'unknown GitHub API error');
+  throw new Error(`Failed to create variable "${name}" (${createRes.status}): ${reason}`);
 }
 
 async function ghFetch(url: string, pat: string, method: string, body?: unknown) {
