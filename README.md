@@ -1,77 +1,277 @@
 # DeplAI
 
-DeplAI is an agentic DevSecOps pipeline that takes a local upload or GitHub repo, scans it, remediates vulnerabilities with human approval, then moves through architecture, cost, IaC generation, budget policy, and deployment.
+DeplAI is an agentic DevSecOps platform that takes a GitHub repository or local upload, runs security analysis, drives a human-reviewed remediation loop, generates architecture and cost outputs, produces infrastructure artifacts, enforces delivery policy, and then deploys through either GitOps or direct runtime apply.
 
-## What Runs Today
+The active system in this repository is a Next.js control plane (`Connector`) backed by a FastAPI orchestration layer (`Agentic Layer`). Knowledge graph enrichment (`KGagent`) and diagram/cost generation (`diagram_cost-estimation_agent`) are integrated into that path. The top-level `terraform_agent/` directory is present, but it is not the primary runtime path today.
 
-- Frontend/BFF: `Connector` (Next.js 16)
-- Backend orchestrator: `Agentic Layer` (FastAPI)
-- Stage 7 agent: `diagram_cost-estimation_agent` (invoked by FastAPI as a subprocess)
-- KG analysis: `KGagent` is imported by `Agentic Layer` during remediation (not a separate HTTP service in this pipeline path)
-- Runtime deploy: AWS only (`/api/terraform/apply`)
+## Executive Summary
 
-`docker-compose.yml` currently starts only `agentic-layer`.
+- Frontend and BFF: `Connector` using Next.js 16
+- Backend orchestrator: `Agentic Layer` using FastAPI
+- Stage 7 diagram and cost execution: `diagram_cost-estimation_agent`
+- Remediation context enrichment: `KGagent` imported in-process by the backend
+- Runtime deployment path: AWS-focused and backed by `/api/terraform/apply`
+- Containerized local startup: `docker-compose.yml` currently starts only `agentic-layer`
+
+## What The Platform Does
+
+DeplAI is structured as a guided delivery pipeline rather than a single scanner or generator. The current implementation combines:
+
+- Preflight health and readiness checks
+- Source code ingestion for GitHub or local projects
+- Security scanning using Bearer plus Syft and Grype
+- Knowledge graph assisted vulnerability analysis
+- Multi-step remediation orchestration with human approval
+- Pull request creation and merge gating
+- Post-merge validation and re-scan loop
+- Architecture generation and cost estimation
+- Terraform bundle generation with template fallback
+- Budget and policy gating before deployment
+- AWS runtime apply and post-deploy runtime detail retrieval
+
+## Runtime Architecture
+
+```mermaid
+flowchart LR
+    U[User Browser] --> C[Connector<br/>Next.js UI + BFF]
+    C --> DB[(MySQL)]
+    C -->|REST + X-API-Key| A[Agentic Layer<br/>FastAPI]
+    C -->|WS token + WebSocket| A
+    C --> G[GitHub API]
+
+    A --> D[(Docker Engine)]
+    D --> V1[(codebase_deplai)]
+    D --> V2[(security_reports)]
+    D --> V3[(LLM_Output)]
+    D --> V4[(grype_db_cache)]
+
+    A --> KG[KGagent<br/>in-process import]
+    KG --> N[(Neo4j)]
+    KG --> Q[(Qdrant)]
+
+    A --> S7[diagram_cost-estimation_agent<br/>subprocess]
+    A --> G
+```
+
+## End-To-End Pipeline
+
+The pipeline surfaced in `Connector/src/features/pipeline/data.ts` is the implementation baseline for the UI and BFF routes.
+
+```mermaid
+flowchart TB
+    subgraph USER[User Interaction]
+        UI[DeplAI Dashboard]
+    end
+
+    subgraph STEP0[Stage 0: Preflight]
+        PF[Pipeline readiness checks]
+    end
+
+    subgraph STEP1[Stage 1: Scan]
+        SC[Ingest repository or local project]
+        SAST[Run Bearer SAST]
+        SCA[Run Syft and Grype SCA]
+    end
+
+    subgraph STEP2[Stage 2: KG Analysis]
+        KG[KG Agent analysis]
+        KGN[(Neo4j)]
+        KGQ[(Qdrant)]
+    end
+
+    subgraph STEP3[Stage 3: Remediation]
+        RS[Remediation supervisor]
+        RP[Plan remediation]
+        RPr[Propose code changes]
+        RC[Critique and validate]
+        RSy[Synthesize approved change set]
+    end
+
+    subgraph STEP4[Stage 4: Pull Request]
+        PR[Push remediation branch]
+        OPR[Open GitHub pull request]
+    end
+
+    subgraph STEP45[Stage 4.5: Merge Gate]
+        MG[Manual approval and merge]
+    end
+
+    subgraph STEP46[Stage 4.6: Post-Merge]
+        PM[Refresh code and prepare next pass]
+    end
+
+    subgraph STEP6[Stage 6: QA Context]
+        QA[Capture deployment and architecture answers]
+    end
+
+    subgraph STEP7[Stage 7: Architecture and Cost]
+        AG[Architecture generation]
+        DG[Diagram generation]
+        CE[Cost estimation]
+        AWS[AWS pricing sources]
+        AZ[Azure pricing path]
+        GCP[GCP pricing path]
+    end
+
+    subgraph STEP75[Stage 7.5: Approval Gate]
+        AP[Approve architecture and cost]
+    end
+
+    subgraph STEP8[Stage 8: IaC]
+        TF[Terraform generation]
+        AN[Ansible bundle support]
+        TEMP[Static template fallback]
+    end
+
+    subgraph STEP9[Stage 9: Policy Gate]
+        PG[Budget and delivery policy checks]
+    end
+
+    subgraph STEP10[Stage 10: Deploy]
+        GD[GitOps repository push]
+        AWSDEP[AWS runtime apply]
+        PD[Return runtime details and deployment outputs]
+    end
+
+    UI --> PF
+    PF --> SC
+    SC --> SAST
+    SC --> SCA
+    SAST --> KG
+    SCA --> KG
+
+    KG --> KGN
+    KG --> KGQ
+    KG --> RS
+
+    RS --> RP
+    RP --> RPr
+    RPr --> RC
+    RC -->|reject| RP
+    RC -->|accept| RSy
+
+    RSy --> PR
+    PR --> OPR
+    OPR --> MG
+    MG --> PM
+    PM --> QA
+
+    QA --> AG
+    AG --> DG
+    DG --> CE
+    CE --> AWS
+    CE --> AZ
+    CE --> GCP
+    CE --> AP
+
+    AP --> TF
+    TF --> AN
+    TF --> TEMP
+    TF --> PG
+
+    PG --> GD
+    PG --> AWSDEP
+    AWSDEP --> PD
+
+    classDef step fill:#e1f5fe,stroke:#01579b,stroke-width:2px
+    classDef agent fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef data fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+
+    class STEP0,STEP1,STEP2,STEP3,STEP4,STEP45,STEP46,STEP6,STEP7,STEP75,STEP8,STEP9,STEP10 step
+    class KG,RS,RP,RPr,RC,RSy,AG,CE,TF,AN agent
+    class KGN,KGQ,TEMP data
+```
+
+## Current Delivery Scope
+
+The repository is broader than the currently active production path. The active behavior today is:
+
+- Scan and remediation are orchestrated through FastAPI and streamed over WebSockets
+- KG analysis is integrated in-process and does not require a separate KG HTTP service
+- Architecture and cost are generated from the Connector plus backend stage 7 path
+- Stage 8 can call the backend Terraform path, but Connector has an explicit template fallback
+- Runtime deploy is AWS-only
+- GitOps deployment writes repository files and GitHub Actions workflow assets when `runtime_apply=false`
+
+Important implementation notes:
+
+- Remediation cycles are capped at `2` in the backend
+- `skipScan` implies `skipRemediation`
+- Delivery UI is AWS-centric even though some architecture and cost generation paths support other providers
+- The old Terraform RAG path has been removed from the runtime flow
 
 ## Repository Layout
 
 ```text
 DeplAI/
-|- Connector/                      Next.js app, auth, dashboard, BFF routes
-|- Agentic Layer/                  FastAPI scan/remediate/architecture/cost/terraform/runtime APIs
-|- diagram_cost-estimation_agent/  Stage 7 diagram+cost+budget agent
-|- KGagent/                        LangGraph KG analysis module used during remediation
-|- terraform_agent/                Legacy/standalone terraform agent project (not active path)
-|- ARCHITECTURE.md
-|- RUNBOOK.md
-|- FLOW_MIGRATION_NOTES.md
+|- Connector/                      Next.js dashboard, BFF routes, GitHub integration, session/auth
+|- Agentic Layer/                  FastAPI orchestration for scan, remediation, architecture, cost, terraform, deploy
+|- diagram_cost-estimation_agent/  Stage 7 subprocess for diagram, pricing, and approval payload
+|- KGagent/                        Knowledge graph analysis used during remediation
+|- terraform_agent/                Legacy standalone terraform agent, not the active runtime path
+|- ARCHITECTURE.md                 Runtime architecture details
+|- RUNBOOK.md                      Operational startup and troubleshooting guide
 ```
 
-## Implemented Pipeline Flow
+## Security And Control Boundaries
 
-UI stages in `Connector/src/features/pipeline/data.ts`:
+- Connector to Agentic Layer REST calls are protected with `DEPLAI_SERVICE_KEY`
+- Scan and remediation streams use short-lived HMAC WebSocket tokens
+- Connector enforces project ownership before forwarding pipeline actions
+- Deployment path enforces budget guardrails before GitOps push or runtime apply
+- Runtime deploy control includes status, stop, destroy, and runtime detail endpoints
 
-1. Stage 0 `preflight`
-2. Stage 1 `scan`
-3. Stage 2 `kg`
-4. Stage 3 `remediate`
-5. Stage 4 `pr`
-6. Stage 4.5 `merge`
-7. Stage 4.6 `postmerge`
-8. Stage 6 `qa`
-9. Stage 7 `arch` (diagram + cost generation)
-10. Stage 7.5 `approve`
-11. Stage 8 `iac`
-12. Stage 9 `gitops` (budget + policy gate)
-13. Stage 10 `deploy`
+## Primary APIs
 
-Notes:
+Connector BFF routes:
 
-- Remediation loop is hard-capped at 2 cycles in backend (`MAX_REMEDIATION_CYCLES = 2`).
-- WebSocket streams are used for scan/remediation; later stages use HTTP.
-- `skipScan` implies `skipRemediation`.
-- Autopilot auto-fills QA defaults and auto-advances to architecture.
+- `POST /api/scan/validate`
+- `GET /api/scan/status`
+- `GET /api/scan/results`
+- `GET /api/scan/ws-token`
+- `POST /api/remediate/start`
+- `POST /api/architecture`
+- `POST /api/cost`
+- `GET /api/pipeline/health`
+- `POST /api/pipeline/diagram`
+- `POST /api/pipeline/stage7`
+- `POST /api/pipeline/iac`
+- `POST /api/pipeline/deploy`
+- `POST /api/pipeline/deploy/status`
+- `POST /api/pipeline/deploy/stop`
+- `POST /api/pipeline/deploy/destroy`
+- `POST /api/pipeline/runtime-details`
 
-## Key Behaviors
+Agentic Layer routes:
 
-- AWS architecture generation in `/api/architecture` is deterministic template-driven from QA context.
-- Non-AWS architecture generation proxies to backend LLM route.
-- `/api/pipeline/iac` hard-gates on scan status (`running`, `not_initiated`, `error` are blocked).
-- `/api/pipeline/iac` tries backend terraform generator first, then falls back to built-in templates.
-- `/api/pipeline/deploy` enforces budget guardrail before runtime apply or GitOps push.
-- Runtime apply (`runtime_apply=true`) is AWS-only and executes Terraform in ephemeral Docker containers.
+- `POST /api/scan/validate`
+- `WS /ws/scan/{project_id}`
+- `GET /api/scan/status/{project_id}`
+- `GET /api/scan/results/{project_id}`
+- `POST /api/remediate/validate`
+- `WS /ws/remediate/{project_id}`
+- `WS /ws/pipeline/{project_id}`
+- `POST /api/architecture/generate`
+- `POST /api/cost/estimate`
+- `POST /api/stage7/approval`
+- `POST /api/terraform/generate`
+- `POST /api/terraform/apply`
+- `POST /api/terraform/apply/status`
+- `POST /api/terraform/apply/stop`
+- `POST /api/aws/runtime-details`
+- `POST /api/aws/destroy-runtime`
 
-## Quick Start
-
-## 1) Prerequisites
+## Prerequisites
 
 - Node.js 20+
-- Python 3.12+
+- Python 3.13+
 - Docker Desktop
 - MySQL 8+
+- GitHub OAuth App and GitHub App credentials for repository-backed workflows
 
-## 2) Configure `.env` at repo root
+## Environment Configuration
 
-Minimum required:
+Minimum required values in repo-root `.env`:
 
 ```bash
 NEXT_PUBLIC_APP_URL=http://localhost:3000
@@ -94,7 +294,7 @@ GITHUB_PRIVATE_KEY=<pem-with-\n>
 GITHUB_WEBHOOK_SECRET=<webhook-secret>
 ```
 
-Common optional keys:
+Common optional values:
 
 ```bash
 GROQ_API_KEY=
@@ -110,25 +310,27 @@ NEO4J_USER=neo4j
 NEO4J_PASSWORD=
 ```
 
-## 3) Initialize database
+## Local Startup
+
+Initialize the MySQL schema:
 
 ```bash
 mysql -u root -p < Connector/database.sql
 ```
 
-## 4) Start backend
+Start the backend:
 
 ```bash
 docker compose up -d --build agentic-layer
 ```
 
-Health:
+Check backend health:
 
 ```bash
 curl http://localhost:8000/health
 ```
 
-## 5) Start frontend
+Start the frontend:
 
 ```bash
 cd Connector
@@ -136,58 +338,25 @@ npm install
 npm run dev
 ```
 
-Open: `http://localhost:3000`
+Open `http://localhost:3000`.
 
-## API Surfaces
+Validate Python modules from repo root:
 
-Connector BFF (examples):
+```powershell
+python -m compileall "Agentic Layer" KGagent terraform_agent diagram_cost-estimation_agent
+```
 
-- `POST /api/scan/validate`
-- `GET /api/scan/status?project_id=...`
-- `GET /api/scan/results?project_id=...`
-- `GET /api/scan/ws-token?project_id=...`
-- `POST /api/remediate/start`
-- `POST /api/architecture`
-- `POST /api/cost`
-- `GET /api/pipeline/health`
-- `POST /api/pipeline/diagram`
-- `POST /api/pipeline/stage7`
-- `POST /api/pipeline/iac`
-- `POST /api/pipeline/deploy`
-- `POST /api/pipeline/deploy/status`
-- `POST /api/pipeline/deploy/stop`
-- `POST /api/pipeline/deploy/destroy`
-- `POST /api/pipeline/runtime-details`
+## Known Constraints
 
-Agentic Layer (examples):
+- `docker-compose.yml` does not start MySQL, Neo4j, or Qdrant for you
+- Runtime deployment is AWS-only
+- Delivery-stage UX is AWS-first
+- Top-level `terraform_agent/` is not the primary runtime generator
+- Terraform generation can intentionally fall back to static templates
+- KG enrichment can degrade gracefully if Neo4j or Qdrant are unavailable
 
-- `POST /api/scan/validate`
-- `WS /ws/scan/{project_id}`
-- `GET /api/scan/status/{project_id}`
-- `GET /api/scan/results/{project_id}`
-- `POST /api/remediate/validate`
-- `WS /ws/remediate/{project_id}`
-- `WS /ws/pipeline/{project_id}`
-- `POST /api/architecture/generate`
-- `POST /api/cost/estimate`
-- `POST /api/stage7/approval`
-- `POST /api/terraform/generate`
-- `POST /api/terraform/apply`
-- `POST /api/terraform/apply/status`
-- `POST /api/terraform/apply/stop`
-- `POST /api/aws/runtime-details`
-- `POST /api/aws/destroy-runtime`
+## Additional Documentation
 
-## Known Limits
-
-- Pipeline UI is currently AWS-centric for delivery stages.
-- Runtime deploy path is AWS only.
-- Terraform RAG module has been removed; IaC generation now relies on Connector template fallback when backend generator is unavailable.
-- KG enrichment is optional; remediation can proceed without Neo4j availability.
-
-## Documentation
-
-- Architecture: `ARCHITECTURE.md`
-- Operations: `RUNBOOK.md`
-- Flow migration notes: `FLOW_MIGRATION_NOTES.md`
-- Architecture contract: `ARCHITECTURE_CONTRACTS.md`
+- Architecture detail: `ARCHITECTURE.md`
+- Operations and troubleshooting: `RUNBOOK.md`
+- Architecture contract notes: `ARCHITECTURE_CONTRACTS.md`
