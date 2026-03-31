@@ -1,185 +1,140 @@
 # DeplAI Architecture
 
-This document describes runtime architecture, orchestration, and agent interactions.
+This document describes the current runtime architecture in this repository.
 
-## 1. System Architecture
+## 1. Runtime Topology
 
 ```mermaid
 flowchart LR
-    U[User Browser] --> C[Connector Next.js]
-    C -->|REST| DB[(MySQL)]
-    C -->|REST + X-API-Key| A[Agentic Layer FastAPI]
-    C -->|WebSocket| A
+    U[Browser] --> C[Connector Next.js]
+    C --> DB[(MySQL)]
+    C -->|X-API-Key REST| A[Agentic Layer FastAPI]
+    C -->|WS token + WS| A
 
-    A -->|Docker SDK| D[(Docker Engine)]
+    A --> D[(Docker Engine)]
     D --> V1[(codebase_deplai)]
     D --> V2[(security_reports)]
     D --> V3[(LLM_Output)]
     D --> V4[(grype_db_cache)]
 
-    A -->|KG analysis import| K[KGagent LangGraph]
+    A --> K[KGagent module import]
     K --> N[(Neo4j)]
     K --> Q[(Qdrant)]
-    K --> E[External Intel APIs]
 
-    A --> G[GitHub API]
-    C --> G
+    A --> S7[diagram_cost-estimation_agent subprocess]
+    C --> G[GitHub API]
+    A --> G
 ```
 
-## 2. Scan Orchestration
+## 2. Component Responsibilities
 
-`EnvironmentInitializer` is the scan orchestrator in `Agentic Layer/environment.py`.
+## Connector (`Connector/`)
 
-Responsibilities:
-- validate Docker availability
-- ensure Docker volumes exist
-- clear stale codebase and stale project report files
-- ingest source (GitHub clone or local project copy)
-- run scanners:
-  - Bearer for SAST
-  - Syft + Grype for SCA
-- stream progress over websocket to Connector
+- User auth/session, project ownership checks, GitHub integration.
+- BFF routes for scan/remediation/pipeline APIs.
+- Pipeline UI orchestration and stage state persistence.
+- WebSocket token minting (`/api/scan/ws-token`) with HMAC signature.
 
-```mermaid
-sequenceDiagram
-    participant UI as Connector UI
-    participant BFF as Connector API
-    participant AG as Agentic Layer
-    participant ENV as EnvironmentInitializer
-    participant DO as Docker Engine
-    participant SR as security_reports volume
+## Agentic Layer (`Agentic Layer/`)
 
-    UI->>BFF: POST /api/scan/validate
-    BFF->>AG: POST /api/scan/validate
-    AG-->>BFF: validation ok
-    UI->>AG: WS /ws/scan/{project_id} + start
-    AG->>ENV: run()
-    ENV->>DO: ensure volumes + cleanup stale data
-    ENV->>DO: ingest source into codebase_deplai
-    par SAST branch
-      ENV->>DO: run bearer/bearer
-      DO->>SR: write *_Bearer.json
-    and SCA branch
-      ENV->>DO: run anchore/syft
-      DO->>SR: write *_sbom.json
-      ENV->>DO: run anchore/grype
-      DO->>SR: write *_Grype.json
-    end
-    ENV-->>AG: success/failure
-    AG-->>UI: websocket status updates
-    UI->>BFF: GET /api/scan/status + /api/scan/results
-    BFF->>AG: fetch status/results
-```
+- Scan orchestration (`EnvironmentInitializer`).
+- Remediation orchestration (`RemediationRunner`).
+- Architecture/cost APIs.
+- Stage 7 subprocess invocation.
+- Terraform generation and runtime apply APIs.
+- AWS runtime details and destroy APIs.
 
-## 3. Remediation Orchestration
+## Stage 7 Agent (`diagram_cost-estimation_agent/`)
 
-`RemediationRunner` is the remediation orchestrator in `Agentic Layer/remediation.py`.
+- Builds diagram model from `infra_plan`.
+- Estimates cost from static AWS pricing table first.
+- Uses Groq fallback for unknown resource types.
+- Computes budget gate `PASS | WARN | FAIL`.
+- Returns approval payload used by Stage 7.5 UI gate.
 
-Responsibilities:
-- ingest parsed scan results
-- run KG intelligence analysis (`run_analysis_agent`)
-- call remediation LLM and apply file edits in `codebase_deplai`
-- emit changed files to UI
-- enforce human approval gate before persistence
-- persist to local codebase or GitHub (branch + PR)
-- invalidate cache and run post-fix re-scan
+## KGagent (`KGagent/`)
 
-```mermaid
-flowchart TD
-    A[RemediationRunner start] --> B[Load scan results]
-    B --> C[Run KG analysis agent]
-    C --> D[Run LLM remediator]
-    D --> E[Apply file edits in codebase volume]
-    E --> F[Send changed files to UI]
-    F --> G{Human approval?}
-    G -- No --> G
-    G -- Yes --> H{Project type}
-    H -- local --> I[Copy files to local project path]
-    H -- github --> J[Commit + push branch + create PR]
-    I --> K[Invalidate result cache]
-    J --> K
-    K --> L[Run Bearer + Syft + Grype re-scan]
-    L --> M[Emit completed/error]
-```
+- Imported by remediation path through `run_analysis_agent`.
+- Provides CVE/CWE context from graph/vector data.
+- Remediation continues even when KG dependencies are unavailable.
 
-## 4. Agent Orchestration and Interaction Model
+## 3. Security and Auth Boundaries
 
-There are two major agent loops in this system:
+- Connector -> Agentic REST is protected with `X-API-Key` (`DEPLAI_SERVICE_KEY`).
+- WebSocket connections use short-lived HMAC token bound to:
+  - `sub` (user id)
+  - `project_id`
+  - `exp` timestamp
+- Backend verifies token signature, expiry, project scope, and `sub`/context match.
+- Project ownership is checked in Connector before forwarding requests.
 
-1. **Pipeline Orchestrators (workflow control)**
-- `EnvironmentInitializer` (scan pipeline)
-- `RemediationRunner` (remediation pipeline)
+## 4. Data Boundaries
 
-2. **Knowledge/Reasoning Agents (security intelligence + fix generation)**
-- `KGagent` LangGraph planner/tool loop
-- LLM remediator (`run_claude_remediation` with provider abstraction)
+## Persistent metadata
 
-### 4.1 Agent Interaction Diagram
+- MySQL tables in `Connector/database.sql`:
+  - `users`
+  - `github_installations`
+  - `github_repositories`
+  - `projects`
+  - `chat_sessions`
+  - `chat_messages`
 
-```mermaid
-sequenceDiagram
-    participant RR as RemediationRunner
-    participant AGG as run_analysis_agent
-    participant LG as KG LangGraph Agent
-    participant TOOLS as KG Tools
-    participant GDB as Neo4j/Qdrant
-    participant LLM as Remediation LLM
-    participant REPO as codebase_deplai
-    participant GH as GitHub API
-    participant UI as Connector UI
+## Runtime execution data
 
-    RR->>AGG: run_analysis_agent(project_id, scan_data)
-    AGG->>LG: agent_query(...)
-    LG->>TOOLS: select and execute tool actions
-    TOOLS->>GDB: graph/vector retrieval + evidence
-    GDB-->>TOOLS: direct + inferred correlations
-    TOOLS-->>LG: structured evidence payload
-    LG-->>AGG: contract JSON (confidence, hitl, actions)
-    AGG-->>RR: business/vuln summary + context
+- Docker volumes:
+  - `codebase_deplai` (repo working copy per project id)
+  - `security_reports` (Bearer/Syft/Grype JSON output)
+  - `LLM_Output` (remediation summary)
+  - `grype_db_cache` (scanner cache)
 
-    RR->>LLM: remediation prompt(scan findings + KG context + file contexts)
-    LLM-->>RR: JSON changeset
-    RR->>REPO: apply file updates
-    RR-->>UI: changed_files + waiting_approval
-    UI-->>RR: approve_rescan
+## 5. Stage Flow Mapping
 
-    alt github project
-      RR->>GH: push branch + open PR
-    else local project
-      RR->>REPO: persist to local-projects source path
-    end
-```
+Pipeline stages surfaced in UI:
 
-### 4.2 Orchestration Guarantees
+- `0` preflight (non-blocking health overview)
+- `1` scan
+- `2` KG analysis
+- `3` remediation
+- `4` remediation PR
+- `4.5` merge confirmation gate
+- `4.6` post-merge action gate
+- `6` QA context gate
+- `7` architecture + cost
+- `7.5` approval gate
+- `8` IaC generation
+- `9` policy gate (budget/secrets/critical findings)
+- `10` deploy
 
-- Shared scan/remediation websocket protocol (`start`, `approve_rescan`)
-- Explicit terminal statuses (`completed`, `error`, `waiting_approval`)
-- Cache invalidation before UI re-fetches results
-- Empty scanner report guardrails to avoid false-clean outcomes
-- Human-in-the-loop checkpoint before post-fix persistence + re-scan
-- Run-option normalization in pipeline UI (`skip_scan` implies `skip_remediation`)
-- Autopilot Q/A path can auto-apply defaults and advance to architecture generation
-- IaC generation in Connector is scan-state-gated before Terraform generation
+Backend remediation loop cap:
 
-## 5. Data Boundaries
+- Max 2 remediation cycles (`MAX_REMEDIATION_CYCLES = 2`).
 
-- **Metadata boundary**: MySQL (`users`, `github_installations`, `github_repositories`, `projects`)
-- **Transient execution boundary**: Docker volumes (`codebase_deplai`, `security_reports`, `LLM_Output`, `grype_db_cache`)
-- **External boundary**: GitHub APIs, optional LLM providers, optional Neo4j/Qdrant infra
+## 6. IaC and Deploy Path
 
-## 6. Security Posture Notes
+- Backend `/api/terraform/generate` calls `terraform_runner.py`.
+- `terraform_runner.py` is intentionally non-RAG in this repository and returns unavailable so Connector can use template fallback.
+- Connector `/api/pipeline/iac`:
+  - validates architecture contract,
+  - blocks if scan state is invalid,
+  - tries backend generator,
+  - falls back to template bundle when needed,
+  - can open IaC PR for GitHub projects.
+- Connector `/api/pipeline/deploy`:
+  - enforces budget guardrail,
+  - `runtime_apply=true` -> backend runtime Terraform apply (AWS only),
+  - `runtime_apply=false` -> GitOps repo+workflow push.
 
-- `DEPLAI_SERVICE_KEY` secures Connector -> Agentic REST calls and websocket tokening
-- GitHub remediation uses either runtime token or installation token
-- Runtime LLM API keys are sent for remediation execution and should be handled as secrets
-- Do not commit real credentials to repo files
+## 7. Health Model
 
-## 7. Connector Session and GitHub Link Lifecycle
+- Agentic `/health` currently checks:
+  - Docker daemon
+  - Neo4j connectivity
+- Connector `/api/pipeline/health` composes this into service-level checks:
+  - `scan`, `remediation`, `kg_agent`, `architecture`, `diagram`, `cost`, `terraform`, `gitops_deploy`, `runtime_deploy`.
 
-- Session logout is handled by `POST /api/auth/logout` (session cookie invalidation).
-- GitHub disconnect is handled by `DELETE /api/installations`:
-  - single installation disconnect via `installation_id`
-  - full user disconnect when no installation id is provided
-- Disconnect removes DeplAI metadata links (`github_installations`, `github_repositories`) but does not uninstall the GitHub App at GitHub.
-- Deploy stage UI maintains per-project deployment history snapshots and supports new-instance redeploy without deleting old snapshots.
+## 8. Current Architectural Notes
 
+- `terraform_agent/` (top-level) exists but is not the active runtime generation path.
+- KG server process is not required for baseline flow; KG logic is imported in-process.
+- Delivery UI currently drives AWS-specific architecture/IaC/deploy behavior.

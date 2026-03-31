@@ -29,12 +29,8 @@ neo4j>=5.0.0
 qdrant-client>=1.9.0
 sentence-transformers>=3.0.0
 
-# Terraform RAG agent
-chromadb>=0.5.0
+# Utility
 tqdm>=4.66.0
-
-# HuggingFace (kept for compatibility)
-huggingface-hub>=0.25.0
 
 # Claude
 anthropic>=0.56.0

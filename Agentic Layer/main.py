@@ -587,8 +587,9 @@ async def stage7_approval(request: Stage7ApprovalRequest):
 @app.post("/api/terraform/generate", response_model=TerraformGenResponse, dependencies=[Depends(verify_api_key)])
 async def terraform_generate(request: TerraformGenRequest):
     """
-    Generate Terraform + Ansible IaC files from an architecture JSON.
-    Uses the Terraform agent to generate IaC files.
+    Generate Terraform IaC files from an architecture JSON.
+    In this repository build, terraform_runner returns unavailable and
+    callers should use template fallback generation.
     """
     from terraform_runner import generate_terraform
 
