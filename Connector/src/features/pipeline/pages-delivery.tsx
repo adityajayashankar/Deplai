@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { COST_BREAKDOWN } from './data';
 import type { Message } from './types';
 import { Btn, colorize, FileNode, Header, Tag } from './ui';
@@ -1413,6 +1413,14 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
   const cost = useMemo(() => parseCostFromSession(), []);
 
   const hasAwsSecrets = Boolean(aws.aws_access_key_id.trim() && aws.aws_secret_access_key.trim());
+  const patchState = useCallback((patch: Partial<ActiveDeployState> | ((prev: ActiveDeployState) => ActiveDeployState)) => {
+    if (!projectId) return;
+    patchActiveDeploymentState(projectId, patch);
+  }, [projectId]);
+
+  const appendLog = useCallback((text: string, type: 'info' | 'success' | 'error' = 'info') => {
+    patchState((prev) => ({ ...prev, logs: [...prev.logs, { text, ts: new Date().toLocaleTimeString(), type }] }));
+  }, [patchState]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -1561,21 +1569,11 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
     };
 
     void recover();
-  }, [appendLog, aws.aws_access_key_id, aws.aws_region, aws.aws_secret_access_key, deployStateHydrated, hasAwsSecrets, projectId, status]);
+  }, [appendLog, aws.aws_access_key_id, aws.aws_region, aws.aws_secret_access_key, deployStateHydrated, hasAwsSecrets, patchState, projectId, status]);
 
   useEffect(() => {
     onDeploymentStateChange?.(status);
   }, [onDeploymentStateChange, status]);
-
-  const patchState = (patch: Partial<ActiveDeployState> | ((prev: ActiveDeployState) => ActiveDeployState)) => {
-    if (!projectId) return;
-    patchActiveDeploymentState(projectId, patch);
-  };
-
-  const appendLog = (text: string, type: 'info' | 'success' | 'error' = 'info') => {
-    if (!projectId) return;
-    patchState((prev) => ({ ...prev, logs: [...prev.logs, { text, ts: new Date().toLocaleTimeString(), type }] }));
-  };
 
   const reconcileDeploymentStatus = async (): Promise<void> => {
     if (!projectId) return;
