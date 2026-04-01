@@ -98,6 +98,22 @@ const UI_MAP: Record<
     }),
   },
 
+  plan_deployment: {
+    pending: (_o, _ctx) => ({ events: [], route_push: null, cards: [], buttons: [] }),
+    success: (o, _ctx) => ({
+      events: [{ type: 'navigate', payload: { path: '/dashboard/pipeline', project_id: o.result?.project_id } }],
+      route_push: '/dashboard/pipeline',
+      cards: [],
+      buttons: [],
+    }),
+    failure: (o, _ctx) => ({
+      events: [{ type: 'deployment_planning_failed', payload: { error: o.error } }],
+      route_push: null,
+      cards: [{ type: 'error', data: { message: o.error ?? 'Deployment planning failed' } }],
+      buttons: [],
+    }),
+  },
+
   create_github_repo: {
     pending: (_o, _ctx) => ({ events: [], route_push: null, cards: [], buttons: [] }),
     success: (o, _ctx) => ({

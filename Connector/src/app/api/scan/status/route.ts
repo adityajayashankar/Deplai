@@ -8,6 +8,11 @@ function isBackendConnectivityError(error: unknown): boolean {
   return code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EHOSTUNREACH' || code === 'ETIMEDOUT';
 }
 
+function isBackendTimeoutError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error || '').toLowerCase();
+  return (error instanceof Error && error.name === 'TimeoutError') || message.includes('aborted due to timeout') || message.includes('timed out');
+}
+
 export async function GET(request: NextRequest) {
   try {
     const { error, user } = await requireAuth();
@@ -31,7 +36,7 @@ export async function GET(request: NextRequest) {
 
     const response = await fetch(`${AGENTIC_URL}/api/scan/status/${projectId}`, {
       headers: agenticHeaders(),
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(5_000),
     });
 
     if (!response.ok) {
@@ -48,14 +53,21 @@ export async function GET(request: NextRequest) {
     const data = await response.json();
     return NextResponse.json(data);
   } catch (error: unknown) {
+    if (isBackendTimeoutError(error)) {
+      return NextResponse.json({
+        status: 'error',
+        backend: 'agentic',
+        detail: `Agentic Layer timed out at ${AGENTIC_URL}. The backend is likely paused or hung.`,
+      }, { status: 504 });
+    }
     if (isBackendConnectivityError(error)) {
       return NextResponse.json({
         status: 'error',
         backend: 'agentic',
         detail: `Agentic Layer is unreachable at ${AGENTIC_URL}`,
-      });
+      }, { status: 502 });
     }
     console.error('Scan status error:', error);
-    return NextResponse.json({ status: 'error', detail: 'Unexpected scan status error' });
+    return NextResponse.json({ status: 'error', detail: 'Unexpected scan status error' }, { status: 500 });
   }
 }

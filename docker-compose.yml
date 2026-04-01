@@ -5,18 +5,23 @@ services:
     build:
       context: ./Agentic Layer
       dockerfile: Dockerfile
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    command: uvicorn main:app --reload --reload-dir /app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
     env_file:
       - ./.env
+    environment:
+      DEPLAI_LOCAL_PROJECTS_ROOT: /local-projects
+      DEPLAI_GITHUB_REPOS_ROOT: /repos
     volumes:
       # Docker socket — allows the container to manage other containers/volumes
       - /var/run/docker.sock:/var/run/docker.sock
       # Local project uploads — needed for isdir checks inside the container
       - ./Connector/tmp/local-projects:/local-projects:ro
+      - ./Connector/tmp/repos:/repos:ro
       # Mount source code live — code changes take effect on save without rebuild
       - ./Agentic Layer:/app
+      - ./terraform_agent:/app/terraform_agent
       # KGagent — mounted alongside the agentic layer so graph.py can import it
       - ./KGagent:/app/KGagent:ro
       - ./diagram_cost-estimation_agent:/app/diagram_cost-estimation_agent

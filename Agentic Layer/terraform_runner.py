@@ -1,13 +1,22 @@
-"""Terraform generation runner.
-
-RAG-based terraform generation has been removed from this repository.
-This module intentionally returns an unavailable response so callers can
-use their existing template fallback path.
-"""
+"""Terraform generation runner backed by the authoritative terraform_agent package."""
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import Any
+
+
+def _ensure_agent_import_path() -> None:
+    candidates = [
+        Path(__file__).resolve().parents[1],
+        Path("/app"),
+    ]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        if str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
 
 
 def generate_terraform(
@@ -15,11 +24,16 @@ def generate_terraform(
     provider: str = "aws",
     project_name: str = "deplai-project",
     openai_api_key: str = "",
+    **kwargs: Any,
 ) -> dict[str, Any]:
-    _ = architecture_json, provider, project_name, openai_api_key
-    return {
-        "success": False,
-        "error": "Terraform RAG generator has been removed from this deployment.",
-        "source": "unavailable",
-    }
+    _ensure_agent_import_path()
+    from terraform_agent.agent.engine import generate_terraform_run
 
+    payload = {
+        "architecture_json": architecture_json,
+        "provider": provider,
+        "project_name": project_name,
+        "llm_api_key": openai_api_key,
+        **kwargs,
+    }
+    return generate_terraform_run(payload)

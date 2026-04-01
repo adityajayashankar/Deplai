@@ -29,7 +29,7 @@ interface LLMConfig {
 const MAX_REACT_ITERATIONS = 6;
 
 // Tools that must be executed client-side (require browser, PAT, navigation, etc.)
-const CLIENT_TOOLS = new Set(['run_scan', 'navigate_to_results', 'start_remediation', 'create_github_repo', 'ask_for_github_pat', 'generate_architecture', 'estimate_cost']);
+const CLIENT_TOOLS = new Set(['run_scan', 'navigate_to_results', 'start_remediation', 'plan_deployment', 'create_github_repo', 'ask_for_github_pat', 'generate_architecture', 'estimate_cost']);
 
 interface ApiMessage {
   role: string;
@@ -47,9 +47,8 @@ interface ParsedStep {
   toolCall: { name: string; params: Record<string, unknown> } | null;
 }
 
-const SCAN_INTENT_RE = /\b(scan|security scan|audit|sast|sca|scan my repo|run scan|full audit)\b/i;
-const REMEDIATION_INTENT_RE = /\b(remediate|remediation|auto[-\s]?remediate|auto[-\s]?fix|fix (?:vulns?|vulnerabilities|findings|issues)|patch (?:vulns?|vulnerabilities|issues))\b/i;
 const REPORT_NAV_INTENT_RE = /\b(open|view|show|take me to|go to|navigate to)\b[\s\S]{0,40}\b(report|results|findings|security analysis|dashboard)\b/i;
+const DEPLOYMENT_INTENT_RE = /\b(deploy|deployment|terraform|iac|infrastructure|infra|provision|architecture review|review wizard|plan deployment)\b/i;
 
 function inferScanTypeFromText(text: string): 'all' | 'sast' | 'sca' {
   const t = (text || '').toLowerCase();
@@ -221,6 +220,39 @@ function inferNavigateToResultsFallback(
   };
 }
 
+function inferPlanDeploymentFallback(
+  history: ApiMessage[],
+  projects: ConnectedProject[],
+): { message: string; toolCall: { name: string; params: Record<string, unknown> } } | null {
+  const latestUser = [...history].reverse().find(m => m.role === 'user');
+  if (!latestUser) return null;
+
+  const latestUserText = (latestUser.content || '').trim();
+  const recentUserText = [...history]
+    .filter(m => m.role === 'user')
+    .slice(-6)
+    .map(m => m.content)
+    .join('\n');
+
+  if (!DEPLOYMENT_INTENT_RE.test(`${latestUserText}\n${recentUserText}`)) {
+    return null;
+  }
+
+  const project = resolveProjectFromConversation(latestUserText, history, projects);
+  if (!project) return null;
+
+  return {
+    message: `Opening deployment planning for **${project.name}** now.`,
+    toolCall: {
+      name: 'plan_deployment',
+      params: {
+        project_id: project.id,
+        project_name: project.name,
+      },
+    },
+  };
+}
+
 // ── System prompt ──────────────────────────────────────────────────────────────
 
 interface ConnectedProject {
@@ -252,6 +284,7 @@ CONNECTED PROJECTS:
 ${list}
 
 TOOLS:
+â€¢ plan_deployment â€” params: {project_id, project_name} â€” launch repository analysis and open the deployment planning wizard for a project
 • run_scan — params: {project_id, project_name, scan_type:"all"|"sast"|"sca"}
 • navigate_to_results — params: {project_id, project_name} — MUST use for any "show report/results/findings" request — never reply with plain text
 • get_scan_report_context — params: {project_id, project_name} — MUST use before summarizing report/finding output
@@ -277,6 +310,7 @@ RULES:
 - Before creating a repo, clearly ask for a GitHub token with permissions:
   - Classic PAT: repo
   - Fine-grained token: Contents (read/write), Pages (read/write), Metadata (read-only)
+- For repository deployment requests that should go through the delivery pipeline, use plan_deployment instead of generate_architecture.
 - After start_remediation, stop — UI shows progress card.
 - For architecture design requests ("design an architecture", "what services should I use", "plan my infra"), use generate_architecture.
 - After generate_architecture succeeds, offer to estimate costs using estimate_cost.
@@ -1275,6 +1309,20 @@ export async function POST(req: NextRequest) {
           observations: [
             ...result.observations,
             'Fallback tool resolver triggered: inferred navigate_to_results from user selection.',
+          ],
+        };
+      }
+    }
+    if (!result.toolCall && !llmAskedQuestion) {
+      const inferred = inferPlanDeploymentFallback(messages, projects);
+      if (inferred) {
+        result = {
+          ...result,
+          message: result.message?.trim() ? result.message : inferred.message,
+          toolCall: inferred.toolCall,
+          observations: [
+            ...result.observations,
+            'Fallback tool resolver triggered: inferred plan_deployment from deployment intent.',
           ],
         };
       }

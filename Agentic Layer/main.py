@@ -40,7 +40,19 @@ from remediation import RemediationRunner
 from runner_base import RunnerBase
 from architecture_gen import generate_architecture
 from architecture_contract import ArchitectureContractError, parse_architecture_document
+from architecture_decision import complete_architecture_review, start_architecture_review
 from cost_estimation import estimate_cost
+from deployment_planning_contract import (
+    ArchitectureReviewCompleteRequest,
+    ArchitectureReviewCompleteResponse,
+    ArchitectureReviewStartRequest,
+    ArchitectureReviewStartResponse,
+    RepositoryAnalysisRequest,
+    RepositoryAnalysisResponse,
+)
+from claude_deployment_pipeline import generate_terraform_bundle
+from repository_analysis import run_repository_analysis
+from stage7_bridge import run_stage7_approval_payload
 from utils import get_docker_client
 
 logger = logging.getLogger(__name__)
@@ -485,6 +497,87 @@ async def websocket_pipeline(websocket: WebSocket, project_id: str):
                     pipeline_indices.pop(project_id, None)
 
 
+@app.post("/api/repository-analysis/run", response_model=RepositoryAnalysisResponse, dependencies=[Depends(verify_api_key)])
+async def repository_analysis_run(request: RepositoryAnalysisRequest):
+    loop = asyncio.get_running_loop()
+    workspace = str(request.workspace or request.project_name or request.project_id).strip()
+    try:
+        context_json, context_md, runtime_paths = await loop.run_in_executor(
+            None,
+            lambda: run_repository_analysis(
+                project_id=request.project_id,
+                project_name=request.project_name,
+                project_type=request.project_type,
+                workspace=workspace,
+                user_id=request.user_id,
+                repo_full_name=request.repo_full_name,
+            ),
+        )
+    except Exception as exc:
+        logger.exception("Repository analysis failed")
+        return RepositoryAnalysisResponse(success=False, error=str(exc), workspace=workspace)
+
+    return RepositoryAnalysisResponse(
+        success=True,
+        workspace=workspace,
+        context_json=context_json,
+        context_md=context_md,
+        runtime_paths=runtime_paths,
+    )
+
+
+@app.post("/api/architecture/review/start", response_model=ArchitectureReviewStartResponse, dependencies=[Depends(verify_api_key)])
+async def architecture_review_start(request: ArchitectureReviewStartRequest):
+    loop = asyncio.get_running_loop()
+    try:
+        review = await loop.run_in_executor(
+            None,
+            lambda: start_architecture_review(
+                project_id=request.project_id,
+                project_name=request.project_name,
+                project_type=request.project_type,
+                workspace=request.workspace,
+                user_id=request.user_id,
+                repo_full_name=request.repo_full_name,
+                environment=request.environment,
+            ),
+        )
+    except Exception as exc:
+        logger.exception("Architecture review start failed")
+        return ArchitectureReviewStartResponse(success=False, workspace=request.workspace, error=str(exc))
+    return ArchitectureReviewStartResponse(success=True, workspace=request.workspace, review=review)
+
+
+@app.post("/api/architecture/review/complete", response_model=ArchitectureReviewCompleteResponse, dependencies=[Depends(verify_api_key)])
+async def architecture_review_complete(request: ArchitectureReviewCompleteRequest):
+    loop = asyncio.get_running_loop()
+    try:
+        answers_json, deployment_profile, architecture_view, approval_payload, runtime_paths = await loop.run_in_executor(
+            None,
+            lambda: complete_architecture_review(
+                project_id=request.project_id,
+                project_name=request.project_name,
+                project_type=request.project_type,
+                workspace=request.workspace,
+                answers=request.answers,
+                user_id=request.user_id,
+                repo_full_name=request.repo_full_name,
+            ),
+        )
+    except Exception as exc:
+        logger.exception("Architecture review completion failed")
+        return ArchitectureReviewCompleteResponse(success=False, workspace=request.workspace, error=str(exc))
+    return ArchitectureReviewCompleteResponse(
+        success=True,
+        workspace=request.workspace,
+        answers_json=answers_json,
+        deployment_profile=deployment_profile,
+        architecture_view=architecture_view,
+        approval_payload=approval_payload,
+        runtime_paths=runtime_paths,
+    )
+
+
 @app.post("/api/architecture/generate", response_model=ArchitectureGenResponse, dependencies=[Depends(verify_api_key)])
 async def architecture_generate(request: ArchitectureGenRequest):
     """Generate architecture JSON from a natural language prompt."""
@@ -540,43 +633,18 @@ async def cost_estimate(request: CostEstimateRequest):
 @app.post("/api/stage7/approval", response_model=Stage7ApprovalResponse, dependencies=[Depends(verify_api_key)])
 async def stage7_approval(request: Stage7ApprovalRequest):
     """Run Stage 7 diagram+cost+budget agent and return approval payload."""
-    agent_dir = Path("/app/diagram_cost-estimation_agent")
-    runner = agent_dir / "run_stage7.py"
-    if not runner.exists():
-        logger.error("Stage7 agent runner missing at path: %s", runner)
-        return Stage7ApprovalResponse(
-            success=False,
-            error="Stage7 agent runner not found. Ensure diagram_cost-estimation_agent is mounted.",
-        )
-
-    payload = {
-        "infra_plan": request.infra_plan,
-        "budget_cap_usd": request.budget_cap_usd,
-        "pipeline_run_id": request.pipeline_run_id,
-        "environment": request.environment,
-    }
     loop = asyncio.get_running_loop()
 
-    def _invoke() -> dict:
-        proc = subprocess.run(
-            [sys.executable, str(runner)],
-            input=json.dumps(payload),
-            text=True,
-            capture_output=True,
-            cwd=str(agent_dir),
-            check=False,
-            timeout=60,
-        )
-        if proc.returncode != 0:
-            tail_err = (proc.stderr or "").strip()[-1500:]
-            raise RuntimeError(f"Stage7 agent failed: {tail_err or 'unknown subprocess error'}")
-        raw = (proc.stdout or "").strip()
-        if not raw:
-            raise RuntimeError("Stage7 agent returned empty output")
-        return json.loads(raw)
-
     try:
-        approval_payload = await loop.run_in_executor(None, _invoke)
+        approval_payload = await loop.run_in_executor(
+            None,
+            lambda: run_stage7_approval_payload(
+                infra_plan=request.infra_plan,
+                budget_cap_usd=request.budget_cap_usd,
+                pipeline_run_id=request.pipeline_run_id,
+                environment=request.environment,
+            ),
+        )
     except Exception as exc:
         logger.exception("Stage7 approval generation failed")
         return Stage7ApprovalResponse(success=False, error=str(exc))
@@ -586,27 +654,18 @@ async def stage7_approval(request: Stage7ApprovalRequest):
 
 @app.post("/api/terraform/generate", response_model=TerraformGenResponse, dependencies=[Depends(verify_api_key)])
 async def terraform_generate(request: TerraformGenRequest):
-    """
-    Generate Terraform IaC files from an architecture JSON.
-    In this repository build, terraform_runner returns unavailable and
-    callers should use template fallback generation.
-    """
-    from terraform_runner import generate_terraform
-
+    """Generate Terraform IaC files from a Claude-derived deployment profile."""
     loop = asyncio.get_running_loop()
-    architecture_json = request.architecture_json.to_wire_dict()
-    llm_api_key = (
-        request.openai_api_key
-        or os.getenv("GROQ_API_KEY", "").strip()
-        or os.getenv("OPENAI_API_KEY", "").strip()
-    )
+    architecture_json = dict(request.architecture_json or {})
     agent_result = await loop.run_in_executor(
         None,
-        lambda: generate_terraform(
+        lambda: generate_terraform_bundle(
             architecture_json=architecture_json,
-            provider=request.provider,
             project_name=request.project_name,
-            openai_api_key=llm_api_key,
+            workspace=request.workspace,
+            aws_region=request.aws_region,
+            qa_summary=request.qa_summary or "",
+            website_index_html=request.website_index_html or "",
         ),
     )
 
@@ -615,12 +674,19 @@ async def terraform_generate(request: TerraformGenRequest):
             success=True,
             provider=request.provider,
             project_name=request.project_name,
+            run_id=agent_result.get("run_id"),
+            workspace=agent_result.get("workspace"),
+            provider_version=agent_result.get("provider_version"),
+            state_bucket=agent_result.get("state_bucket"),
+            lock_table=agent_result.get("lock_table"),
+            manifest=agent_result.get("manifest"),
+            dag_order=agent_result.get("dag_order"),
+            warnings=agent_result.get("warnings"),
             files=agent_result.get("files"),
             readme=agent_result.get("readme"),
-            source="terraform_agent",
+            source=str(agent_result.get("source") or "terraform_agent"),
         )
 
-    # Terraform agent unavailable or failed.
     error_message = "Terraform agent unavailable."
     if isinstance(agent_result, dict):
         error_message = str(agent_result.get("error") or error_message)
@@ -628,39 +694,80 @@ async def terraform_generate(request: TerraformGenRequest):
         success=False,
         provider=request.provider,
         project_name=request.project_name,
+        run_id=agent_result.get("run_id") if isinstance(agent_result, dict) else None,
+        workspace=agent_result.get("workspace") if isinstance(agent_result, dict) else None,
+        provider_version=agent_result.get("provider_version") if isinstance(agent_result, dict) else None,
+        state_bucket=agent_result.get("state_bucket") if isinstance(agent_result, dict) else None,
+        lock_table=agent_result.get("lock_table") if isinstance(agent_result, dict) else None,
+        manifest=agent_result.get("manifest") if isinstance(agent_result, dict) else None,
+        dag_order=agent_result.get("dag_order") if isinstance(agent_result, dict) else None,
+        warnings=agent_result.get("warnings") if isinstance(agent_result, dict) else None,
         error=error_message,
-        source="unavailable",
+        source=str(agent_result.get("source") or "unavailable") if isinstance(agent_result, dict) else "unavailable",
+        details=agent_result.get("details") if isinstance(agent_result, dict) else None,
     )
 
 
 @app.post("/api/terraform/apply", response_model=TerraformApplyResponse, dependencies=[Depends(verify_api_key)])
 async def terraform_apply(request: TerraformApplyRequest):
     """Apply generated Terraform files to AWS using an ephemeral Docker volume."""
-    from terraform_apply import apply_terraform_bundle
+    from terraform_apply import apply_saved_terraform_run, apply_terraform_bundle
 
     apply_key = (request.project_id or request.project_name or "").strip()
     if not apply_key:
         apply_key = request.project_name
-    apply_ctx = {"cancel_requested": False, "container_id": None}
+    loop = asyncio.get_running_loop()
+
+    def emit_apply_event(msg_type: str, content: str) -> None:
+        project_id = str(request.project_id or "").strip()
+        if not project_id:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _broadcast_pipeline_event(project_id, msg_type, content),
+                loop,
+            )
+        except Exception:
+            pass
+
+    apply_ctx = {"cancel_requested": False, "container_id": None, "emit": emit_apply_event}
     active_terraform_applies[apply_key] = apply_ctx
     terraform_apply_results[apply_key] = {"status": "running", "result": None}
 
-    loop = asyncio.get_running_loop()
     result = None
     try:
-        result = await loop.run_in_executor(
-            None,
-            lambda: apply_terraform_bundle(
-                files=[{"path": f.path, "content": f.content, "encoding": f.encoding} for f in request.files],
-                project_name=request.project_name,
-                provider=request.provider,
-                aws_access_key_id=request.aws_access_key_id or "",
-                aws_secret_access_key=request.aws_secret_access_key or "",
-                aws_region=request.aws_region or "eu-north-1",
-                enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
-                apply_context=apply_ctx,
-            ),
-        )
+        emit_apply_event("info", "Terraform runtime apply started.")
+        if request.run_id and request.workspace:
+            emit_apply_event("info", f"Reusing saved Terraform workspace '{request.workspace}'.")
+            result = await loop.run_in_executor(
+                None,
+                lambda: apply_saved_terraform_run(
+                    run_id=request.run_id or "",
+                    workspace=request.workspace or "",
+                    project_name=request.project_name,
+                    provider=request.provider,
+                    state_bucket=request.state_bucket or "",
+                    aws_access_key_id=request.aws_access_key_id or "",
+                    aws_secret_access_key=request.aws_secret_access_key or "",
+                    aws_region=request.aws_region or "eu-north-1",
+                    apply_context=apply_ctx,
+                ),
+            )
+        else:
+            emit_apply_event("info", "Applying generated Terraform bundle.")
+            result = await loop.run_in_executor(
+                None,
+                lambda: apply_terraform_bundle(
+                    files=[{"path": f.path, "content": f.content, "encoding": f.encoding} for f in request.files],
+                    project_name=request.project_name,
+                    provider=request.provider,
+                    aws_access_key_id=request.aws_access_key_id or "",
+                    aws_secret_access_key=request.aws_secret_access_key or "",
+                    aws_region=request.aws_region or "eu-north-1",
+                    enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
+                    apply_context=apply_ctx,
+                ),
+            )
     except Exception as exc:
         result = {"success": False, "error": f"Terraform apply runtime error: {exc}"}
     finally:
@@ -670,6 +777,10 @@ async def terraform_apply(request: TerraformApplyRequest):
                 "status": "completed" if bool(result.get("success")) else "error",
                 "result": result,
             }
+        if result and result.get("success"):
+            emit_apply_event("success", "Terraform runtime apply completed successfully.")
+        elif result:
+            emit_apply_event("error", str(result.get("error") or "Terraform runtime apply failed."))
 
     if not result.get("success"):
         return TerraformApplyResponse(

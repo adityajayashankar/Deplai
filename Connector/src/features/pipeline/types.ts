@@ -5,6 +5,7 @@ export interface Stage {
   key: string;
   label: string;
   group?: 'loop' | null;
+  track?: 'shared' | 'security' | 'deployment';
   status: 'success' | 'active' | 'running' | 'pending';
   duration?: string;
   gate?: boolean;

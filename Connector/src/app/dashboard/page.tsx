@@ -1,5 +1,5 @@
-﻿import PipelineDashboardApp from '@/features/pipeline/PipelineDashboardApp';
+import DashboardHomeApp from '@/features/dashboard/DashboardHomeApp';
 
 export default function DashboardPage() {
-  return <PipelineDashboardApp />;
+  return <DashboardHomeApp />;
 }

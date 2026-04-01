@@ -1380,6 +1380,55 @@ export default function AgentChat({
         break;
       }
 
+      case 'plan_deployment': {
+        const { project_id, project_name } = toolCall.params as { project_id: string; project_name?: string };
+        const resolvedProjectName = project_name || projects.find((project) => project.id === project_id)?.name || project_id;
+        addActivity({ type: 'tool_start', icon: '🏗️', label: `Preparing deployment planning for "${resolvedProjectName}"…` });
+        setCurrentStep(`Analyzing "${resolvedProjectName}" for deployment planning…`);
+        try {
+          const res = await fetch('/api/repository-analysis/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ project_id, workspace: resolvedProjectName }),
+          });
+          const data = await res.json().catch(() => ({})) as {
+            success?: boolean;
+            context_json?: Record<string, unknown>;
+            context_md?: string;
+            error?: string;
+          };
+          if (!res.ok || !data.success || !data.context_json) {
+            throw new Error(data.error || 'Repository analysis failed.');
+          }
+          if (typeof window !== 'undefined') {
+            localStorage.setItem('deplai.pipeline.selectedProjectId', project_id);
+            localStorage.setItem(`deplai.pipeline.currentStage.${project_id}`, 'arch');
+            sessionStorage.setItem('deplai.pipeline.planningProjectId', project_id);
+            sessionStorage.setItem('deplai.pipeline.repoContext', JSON.stringify(data.context_json));
+            sessionStorage.setItem('deplai.pipeline.repoContextMd', JSON.stringify(String(data.context_md || '')));
+            sessionStorage.setItem('deplai.pipeline.qaContext', JSON.stringify({
+              qa_summary: String(data.context_json.summary || ''),
+              deployment_region: 'eu-north-1',
+            }));
+          }
+          addActivity({ type: 'tool_done', icon: '✅', label: `Deployment planning ready for "${resolvedProjectName}"` });
+          addDisplay({
+            role: 'assistant',
+            content:
+              `Repository analysis is ready for **${resolvedProjectName}**.\n` +
+              `Opening the shared deployment review wizard now.`,
+          });
+          setBusy(false);
+          router.push('/dashboard/pipeline');
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : 'Failed to start deployment planning.';
+          addActivity({ type: 'error', icon: '❌', label: `Deployment planning error: ${msg}` });
+          addDisplay({ role: 'assistant', content: `Deployment planning failed for **${resolvedProjectName}**: ${msg}` });
+          setBusy(false);
+        }
+        break;
+      }
+
       case 'generate_code': {
         const files = generatedFiles ?? [];
         if (files.length > 0) {
