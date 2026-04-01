@@ -13,6 +13,26 @@ interface CostEstimateBody {
   project_id?: string;
 }
 
+function classifyAgenticRouteError(err: unknown, action: string): { message: string; status: number } {
+  const raw = err instanceof Error ? err.message : String(err || 'unknown upstream error');
+  const lowered = raw.toLowerCase();
+  if (
+    lowered.includes('fetch failed') ||
+    lowered.includes('econnrefused') ||
+    lowered.includes('enotfound') ||
+    lowered.includes('network')
+  ) {
+    return {
+      message: `Agentic Layer is unavailable while trying to ${action}. Start the service at ${AGENTIC_URL} and retry.`,
+      status: 502,
+    };
+  }
+  return {
+    message: raw || `${action} failed.`,
+    status: 500,
+  };
+}
+
 /**
  * POST /api/cost
  * Estimate monthly cloud costs from an architecture JSON.
@@ -93,7 +113,7 @@ export async function POST(req: NextRequest) {
       errors: data.errors || [],
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Cost estimation error';
-    return NextResponse.json({ error: msg }, { status: 500 });
+    const classified = classifyAgenticRouteError(err, 'estimate infrastructure cost');
+    return NextResponse.json({ error: classified.message }, { status: classified.status });
   }
 }

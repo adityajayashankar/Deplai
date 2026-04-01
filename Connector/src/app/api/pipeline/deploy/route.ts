@@ -20,6 +20,10 @@ interface DeployBody {
   provider?: Provider;
   github_pat?: string;
   runtime_apply?: boolean;
+  run_id?: string;
+  workspace?: string;
+  state_bucket?: string;
+  lock_table?: string;
   repo_name?: string;
   description?: string;
   is_private?: boolean;
@@ -361,6 +365,174 @@ function extractStringFromRecord(record: Record<string, unknown> | null | undefi
   return null;
 }
 
+function normalizeScalar(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+async function fetchAwsRuntimeDetails(params: {
+  projectName: string;
+  awsAccessKeyId: string;
+  awsSecretAccessKey: string;
+  awsRegion: string;
+  instanceId?: string | null;
+}): Promise<Record<string, unknown> | null> {
+  const response = await fetch(`${AGENTIC_URL}/api/aws/runtime-details`, {
+    method: 'POST',
+    headers: {
+      ...agenticHeaders(),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      project_name: params.projectName,
+      aws_access_key_id: params.awsAccessKeyId,
+      aws_secret_access_key: params.awsSecretAccessKey,
+      aws_region: params.awsRegion,
+      instance_id: params.instanceId || undefined,
+    }),
+    signal: AbortSignal.timeout(60_000),
+  });
+
+  const payload = await response.json().catch(() => ({})) as {
+    success?: boolean;
+    details?: Record<string, unknown>;
+  };
+  if (!response.ok || payload.success !== true || !payload.details) {
+    return null;
+  }
+  return payload.details;
+}
+
+type EndpointCheck = {
+  label: 'cloudfront' | 'instance';
+  url: string;
+  ok: boolean;
+  status: number | null;
+  detail: string;
+};
+
+async function probeEndpoint(label: 'cloudfront' | 'instance', rawUrl: string): Promise<EndpointCheck> {
+  const url = String(rawUrl || '').trim();
+  if (!url) {
+    return { label, url: '', ok: false, status: null, detail: 'No endpoint provided.' };
+  }
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      cache: 'no-store',
+      signal: AbortSignal.timeout(8_000),
+    });
+    const text = await response.text().catch(() => '');
+    return {
+      label,
+      url,
+      ok: response.ok,
+      status: response.status,
+      detail: text.replace(/\s+/g, ' ').trim().slice(0, 160) || `HTTP ${response.status}`,
+    };
+  } catch (error) {
+    return {
+      label,
+      url,
+      ok: false,
+      status: null,
+      detail: error instanceof Error ? error.message : 'Request failed',
+    };
+  }
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForRuntimeVerification(params: {
+  cloudfrontUrl?: string | null;
+  publicIp?: string | null;
+  timeoutMs?: number;
+  intervalMs?: number;
+}): Promise<{ checks: EndpointCheck[]; verified: boolean }> {
+  const timeoutMs = Math.max(15_000, Number(params.timeoutMs || 180_000));
+  const intervalMs = Math.max(5_000, Number(params.intervalMs || 10_000));
+  const startedAt = Date.now();
+  let checks: EndpointCheck[] = [];
+
+  while (Date.now() - startedAt < timeoutMs) {
+    checks = await Promise.all([
+      probeEndpoint('cloudfront', String(params.cloudfrontUrl || '')),
+      probeEndpoint('instance', params.publicIp ? `http://${String(params.publicIp).trim()}` : ''),
+    ]);
+    if (checks.some((check) => check.ok)) {
+      return { checks, verified: true };
+    }
+    await sleep(intervalMs);
+  }
+
+  return { checks, verified: false };
+}
+
+function normalizeDeploymentRuntime(payload: {
+  cloudfrontUrl?: string | null;
+  outputs?: Record<string, unknown> | null;
+  details?: Record<string, unknown> | null;
+  runtimeDetails?: Record<string, unknown> | null;
+}): {
+  keypair: Record<string, string | null>;
+  ec2: Record<string, string | null>;
+  network: Record<string, string | null>;
+  cdn: Record<string, string | null>;
+} {
+  const outputs = payload.outputs || {};
+  const details = payload.details || {};
+  const runtime = payload.runtimeDetails || {};
+  const liveInstance = (runtime.instance && typeof runtime.instance === 'object')
+    ? runtime.instance as Record<string, unknown>
+    : null;
+
+  const keyName = extractStringFromRecord(
+    {
+      ...outputs,
+      ...details,
+    },
+    ['ec2_key_name', 'generated_ec2_key_name', 'key_name'],
+  );
+  const privateKeyPem = extractStringFromRecord(
+    {
+      ...outputs,
+      ...details,
+    },
+    ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem'],
+  );
+  const cloudfrontUrl = normalizeScalar(payload.cloudfrontUrl)
+    || extractOutputString(outputs, ['cloudfront_url'])
+    || extractOutputString(outputs, ['cloudfront_domain_name']);
+
+  return {
+    keypair: {
+      key_name: keyName,
+      private_key_pem: privateKeyPem,
+    },
+    ec2: {
+      instance_id: normalizeScalar(liveInstance?.instance_id) || extractOutputString(outputs, ['ec2_instance_id', 'instance_id']),
+      state: normalizeScalar(liveInstance?.instance_state) || extractOutputString(outputs, ['ec2_instance_state', 'instance_state']),
+      type: normalizeScalar(liveInstance?.instance_type) || extractOutputString(outputs, ['ec2_instance_type', 'instance_type']),
+      public_ip: normalizeScalar(liveInstance?.public_ipv4_address) || extractOutputString(outputs, ['ec2_public_ip', 'public_ip', 'instance_public_ip']),
+      private_ip: normalizeScalar(liveInstance?.private_ipv4_address) || extractOutputString(outputs, ['ec2_private_ip', 'private_ip', 'instance_private_ip']),
+      public_dns: normalizeScalar(liveInstance?.public_dns) || extractOutputString(outputs, ['ec2_public_dns', 'instance_public_dns', 'public_dns']),
+      private_dns: normalizeScalar(liveInstance?.private_dns) || extractOutputString(outputs, ['ec2_private_dns', 'private_dns', 'instance_private_dns']),
+      instance_arn: normalizeScalar(liveInstance?.instance_arn) || extractOutputString(outputs, ['ec2_instance_arn', 'instance_arn']),
+    },
+    network: {
+      vpc_id: normalizeScalar(liveInstance?.vpc_id) || extractOutputString(outputs, ['ec2_vpc_id', 'vpc_id']),
+      subnet_id: normalizeScalar(liveInstance?.subnet_id) || extractOutputString(outputs, ['ec2_subnet_id', 'subnet_id']),
+    },
+    cdn: {
+      cloudfront_url: cloudfrontUrl ? (cloudfrontUrl.startsWith('http') ? cloudfrontUrl : `https://${cloudfrontUrl}`) : null,
+    },
+  };
+}
+
 function containsAwsInstanceResource(files: GeneratedFile[]): boolean {
   return files.some((file) => {
     const path = normalizePath(String(file.path || '')).toLowerCase();
@@ -452,14 +624,17 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const runtimeMode = body.runtime_apply === true;
+    const runId = String(body.run_id || '').trim();
+    const workspace = String(body.workspace || '').trim();
+    const hasRunReference = runtimeMode && Boolean(runId && workspace);
     const baseFiles = Array.isArray(body.files) ? body.files : [];
-    if (baseFiles.length === 0) {
+    if (baseFiles.length === 0 && !hasRunReference) {
       return NextResponse.json(
         { error: 'No generated IaC files provided. Generate Terraform/Ansible first.' },
         { status: 400 },
       );
     }
-    const runtimeMode = body.runtime_apply === true;
     const MAX_FILES = runtimeMode ? 3000 : 120;
     const MAX_FILE_BYTES = runtimeMode ? 8_000_000 : 700_000;
     const MAX_TOTAL_BYTES = runtimeMode ? 35_000_000 : 8_000_000;
@@ -491,7 +666,7 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const staleReasons = detectStaleAwsTerraformBundle(baseFiles);
+      const staleReasons = hasRunReference ? [] : detectStaleAwsTerraformBundle(baseFiles);
       if (staleReasons.length > 0) {
         return NextResponse.json(
           {
@@ -509,24 +684,19 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const awsAccessKeyId = String(body.aws_access_key_id || process.env.AWS_ACCESS_KEY_ID || '').trim();
-      const awsSecretAccessKey = String(body.aws_secret_access_key || process.env.AWS_SECRET_ACCESS_KEY || '').trim();
+      const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
+      const awsSecretAccessKey = String(body.aws_secret_access_key || '').trim();
       const awsRegion = String(body.aws_region || 'eu-north-1').trim() || 'eu-north-1';
       const enforceFreeTierEc2 = body.enforce_free_tier_ec2 !== false;
-
-      if (!awsAccessKeyId || !awsSecretAccessKey) {
-        return NextResponse.json(
-          {
-            error: 'AWS credentials are required for runtime deployment. Provide aws_access_key_id/aws_secret_access_key or set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY on the server.',
-          },
-          { status: 400 },
-        );
-      }
 
       const applyRequest = {
         project_id: projectId,
         project_name: projectName,
         provider,
+        run_id: runId || undefined,
+        workspace: workspace || undefined,
+        state_bucket: String(body.state_bucket || '').trim() || undefined,
+        lock_table: String(body.lock_table || '').trim() || undefined,
         files: baseFiles,
         aws_access_key_id: awsAccessKeyId,
         aws_secret_access_key: awsSecretAccessKey,
@@ -604,30 +774,64 @@ export async function POST(req: NextRequest) {
         );
       }
 
+      const runtimeOutputPayload = (applyData.outputs as Record<string, unknown> | null | undefined) ?? null;
+      const runtimeDetails = awsAccessKeyId && awsSecretAccessKey
+        ? await fetchAwsRuntimeDetails({
+          projectName,
+          awsAccessKeyId,
+          awsSecretAccessKey,
+          awsRegion,
+          instanceId: extractOutputString(runtimeOutputPayload, ['ec2_instance_id', 'instance_id']),
+        }).catch(() => null)
+        : null;
+      const mergedDetails = {
+        ...(((applyData.details as Record<string, unknown> | undefined) || {})),
+        ...(runtimeDetails ? { live_runtime_details: runtimeDetails } : {}),
+      };
+      const normalizedRuntime = normalizeDeploymentRuntime({
+        cloudfrontUrl: typeof applyData.cloudfront_url === 'string' ? applyData.cloudfront_url : null,
+        outputs: runtimeOutputPayload,
+        details: mergedDetails,
+        runtimeDetails,
+      });
+      const verification = await waitForRuntimeVerification({
+        cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
+        publicIp: normalizedRuntime.ec2.public_ip,
+      });
+      if (!verification.verified) {
+        return NextResponse.json(
+          {
+            error: 'Deployment provisioned infrastructure but no live endpoint became reachable after apply.',
+            details: {
+              verification_checks: verification.checks,
+              live_runtime_details: runtimeDetails,
+              apply_details: mergedDetails,
+            },
+            outputs: runtimeOutputPayload ?? {},
+          },
+          { status: 409 },
+        );
+      }
+
       return NextResponse.json({
         success: true,
         provider,
         project_id: projectId,
         mode: 'runtime_apply',
-        cloudfront_url: applyData.cloudfront_url ?? null,
-        outputs: applyData.outputs ?? {},
-        details: applyData.details ?? null,
-        ec2_key_name: extractStringFromRecord(
-          {
-            ...(((applyData.outputs as Record<string, unknown> | undefined) ?? {})),
-            ...(((applyData.details as Record<string, unknown> | undefined) ?? {})),
-            ...applyData,
-          },
-          ['ec2_key_name', 'generated_ec2_key_name', 'key_name'],
-        ),
-        generated_ec2_private_key_pem: extractStringFromRecord(
-          {
-            ...(((applyData.outputs as Record<string, unknown> | undefined) ?? {})),
-            ...(((applyData.details as Record<string, unknown> | undefined) ?? {})),
-            ...applyData,
-          },
-          ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem'],
-        ),
+        cloudfront_url: normalizedRuntime.cdn.cloudfront_url,
+        outputs: runtimeOutputPayload ?? {},
+        raw_outputs: runtimeOutputPayload ?? {},
+        details: mergedDetails,
+        sensitive_output_arns:
+          (applyData.details as Record<string, unknown> | undefined)?.sensitive_output_arns ?? null,
+        ec2_key_name: normalizedRuntime.keypair.key_name,
+        generated_ec2_private_key_pem: normalizedRuntime.keypair.private_key_pem,
+        keypair: normalizedRuntime.keypair,
+        ec2: normalizedRuntime.ec2,
+        network: normalizedRuntime.network,
+        cdn: normalizedRuntime.cdn,
+        deployment_verified: true,
+        verification_checks: verification.checks,
       });
     }
 

@@ -11,9 +11,10 @@ import io
 import json
 import os
 import re
+import sys
 import tarfile
 import uuid
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import boto3
@@ -27,6 +28,18 @@ _EC2_STANDARD_FAMILY_PREFIXES = {"a", "c", "d", "h", "i", "m", "r", "t", "z"}
 _EC2_STANDARD_ONDEMAND_VCPU_QUOTA_CODE = "L-1216C47A"
 _SAFE_EC2_INSTANCE_ORDER = ["t3.micro", "t2.micro", "t3a.micro", "t3.small", "t2.small"]
 _DEFAULT_FREE_TIER_INSTANCE_ORDER = ["t3.micro", "t2.micro"]
+
+
+def _ensure_agent_import_path() -> None:
+    candidates = [
+        Path(__file__).resolve().parents[1],
+        Path("/app"),
+    ]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        if str(candidate) not in sys.path:
+            sys.path.insert(0, str(candidate))
 
 
 def _parse_instance_types(raw: str | None, fallback: list[str]) -> list[str]:
@@ -59,6 +72,18 @@ def _normalize_rel_path(path: str) -> str:
     if ".." in PurePosixPath(normalized).parts:
         raise ValueError("Parent directory traversal is not allowed")
     return normalized
+
+
+def _emit_progress(apply_context: dict[str, Any] | None, msg_type: str, content: str) -> None:
+    if not apply_context:
+        return
+    emitter = apply_context.get("emit")
+    if not callable(emitter):
+        return
+    try:
+        emitter(str(msg_type or "info"), str(content or "").strip())
+    except Exception:
+        pass
 
 
 def _decode_file_payload(item: dict[str, Any], rel_path: str) -> bytes:
@@ -125,6 +150,9 @@ def _run_terraform_with_tracking(
     if apply_context and apply_context.get("cancel_requested"):
         raise RuntimeError("Terraform apply cancelled by user.")
 
+    primary = str(args[0] if args else "terraform").strip() or "terraform"
+    _emit_progress(apply_context, "info", f"Running terraform {primary}...")
+
     docker = get_docker_client()
     container = docker.containers.create(
         TERRAFORM_IMAGE,
@@ -141,7 +169,9 @@ def _run_terraform_with_tracking(
         logs = decode_output(container.logs(stdout=True, stderr=True))
         status_code = int((result or {}).get("StatusCode") or 1)
         if status_code != 0:
+            _emit_progress(apply_context, "error", f"terraform {primary} failed.")
             raise RuntimeError(logs or f"terraform command failed (exit {status_code})")
+        _emit_progress(apply_context, "success", f"terraform {primary} completed.")
         return logs
     finally:
         if apply_context is not None:
@@ -476,9 +506,11 @@ def apply_terraform_bundle(
         return {"success": False, "error": "Runtime apply currently supports AWS only."}
 
     if not files:
+        _emit_progress(apply_context, "error", "Terraform apply aborted: no files were provided.")
         return {"success": False, "error": "No files were provided for Terraform apply."}
 
     if not aws_access_key_id or not aws_secret_access_key:
+        _emit_progress(apply_context, "error", "Terraform apply aborted: AWS credentials are missing.")
         return {"success": False, "error": "AWS credentials are required for runtime Terraform apply."}
 
     docker = get_docker_client()
@@ -491,6 +523,7 @@ def apply_terraform_bundle(
     try:
         normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
         _write_files_to_volume(volume_name, files)
+        _emit_progress(apply_context, "info", "Terraform files staged into runtime workspace.")
 
         has_terraform_dir = any(path == "terraform" or path.startswith("terraform/") for path in normalized_paths)
         tf_root = "/workspace/terraform" if has_terraform_dir else "/workspace"
@@ -510,6 +543,7 @@ def apply_terraform_bundle(
             apply_context=apply_context,
         )
         if apply_context and apply_context.get("cancel_requested"):
+            _emit_progress(apply_context, "error", "Terraform apply cancelled during init.")
             return {
                 "success": False,
                 "error": "Deployment stopped by user.",
@@ -680,6 +714,7 @@ def apply_terraform_bundle(
                 force_default_vpc=True,
             )
             if precheck_disable_ec2:
+                _emit_progress(apply_context, "info", "EC2 quota unavailable. Applying fallback with enable_ec2=false.")
                 apply_log = (
                     f"[precheck] EC2 quota/headroom unavailable in {aws_region}; "
                     "proceeding with enable_ec2=false fallback.\n"
@@ -690,6 +725,7 @@ def apply_terraform_bundle(
             apply_log = f"{apply_log}{_run_terraform_with_tracking(volume_name, tf_root, args, env, apply_context=apply_context)}"
         except Exception as exc:
             if apply_context and apply_context.get("cancel_requested"):
+                _emit_progress(apply_context, "error", "Terraform apply cancelled during apply.")
                 return {
                     "success": False,
                     "error": "Deployment stopped by user.",
@@ -739,6 +775,7 @@ def apply_terraform_bundle(
                         continue
                     attempted_instance_types.append(candidate)
                     try:
+                        _emit_progress(apply_context, "info", f"Retrying terraform apply with instance type {candidate}.")
                         retry_log = _run_terraform_with_tracking(
                             volume_name,
                             tf_root,
@@ -763,6 +800,7 @@ def apply_terraform_bundle(
                         retry_errors.append(f"{candidate}: {_tail(retry_combined, 700)}")
                 else:
                     if allow_disable_fallback and has_enable_ec2_var:
+                        _emit_progress(apply_context, "info", "Quota retry exhausted. Applying final fallback with EC2 disabled.")
                         retry_args = _build_apply_args(
                             None,
                             disable_ec2=True,
@@ -867,6 +905,7 @@ def apply_terraform_bundle(
             apply_context=apply_context,
         )
         if apply_context and apply_context.get("cancel_requested"):
+            _emit_progress(apply_context, "error", "Terraform apply cancelled while reading outputs.")
             return {
                 "success": False,
                 "error": "Deployment stopped by user.",
@@ -886,6 +925,7 @@ def apply_terraform_bundle(
 
         ec2_state_resources: list[str] = []
         if has_ec2_resource and not ec2_fallback_applied:
+            _emit_progress(apply_context, "info", "Validating EC2 resources in Terraform state.")
             try:
                 state_list_raw = _run_terraform_with_tracking(
                     volume_name,
@@ -927,6 +967,7 @@ def apply_terraform_bundle(
         website_inspection: dict[str, Any] | None = None
         website_bucket = outputs.get("website_bucket")
         if isinstance(website_bucket, str) and website_bucket.strip():
+            _emit_progress(apply_context, "info", f"Inspecting deployed website bucket {website_bucket.strip()}.")
             website_inspection = _inspect_website_bucket(
                 bucket_name=website_bucket.strip(),
                 aws_access_key_id=aws_access_key_id,
@@ -988,6 +1029,7 @@ def apply_terraform_bundle(
         }
 
     except ContainerError as exc:
+        _emit_progress(apply_context, "error", "Terraform container failed during runtime apply.")
         stderr = decode_output(getattr(exc, "stderr", b"") or b"")
         stdout = decode_output(getattr(exc, "stdout", b"") or b"")
         combined = f"{stderr}\n{stdout}".strip()
@@ -1003,6 +1045,7 @@ def apply_terraform_bundle(
             },
         }
     except Exception as exc:
+        _emit_progress(apply_context, "error", f"Terraform runtime apply failed: {exc}")
         return {
             "success": False,
             "error": f"Terraform runtime apply failed: {str(exc)}",
@@ -1016,3 +1059,33 @@ def apply_terraform_bundle(
             volume.remove(force=True)
         except Exception:
             pass
+
+
+def apply_saved_terraform_run(
+    *,
+    run_id: str,
+    workspace: str,
+    project_name: str,
+    provider: str,
+    state_bucket: str,
+    aws_access_key_id: str,
+    aws_secret_access_key: str,
+    aws_region: str,
+    apply_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    _ensure_agent_import_path()
+    from terraform_agent.agent.engine import apply_terraform_run
+
+    return apply_terraform_run(
+        {
+            "run_id": run_id,
+            "workspace": workspace,
+            "project_name": project_name,
+            "provider": provider,
+            "state_bucket": state_bucket,
+            "aws_access_key_id": aws_access_key_id,
+            "aws_secret_access_key": aws_secret_access_key,
+            "aws_region": aws_region,
+        },
+        apply_context=apply_context,
+    )

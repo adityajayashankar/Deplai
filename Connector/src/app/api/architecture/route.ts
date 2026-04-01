@@ -291,7 +291,9 @@ export async function POST(req: NextRequest) {
 
     const provider = String(body.provider || 'aws').trim().toLowerCase();
 
-    if (provider === 'aws') {
+    const explicitLlmRequested = Boolean(body.llm_provider || body.llm_api_key || body.llm_model);
+
+    if (provider === 'aws' && !explicitLlmRequested) {
       const projectName = normalizeProjectName(String(body.project_name || ''));
       const qaSummary = String(body.qa_summary || '');
       const deploymentRegion = String(body.deployment_region || 'ap-south-1');

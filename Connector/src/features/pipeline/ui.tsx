@@ -49,14 +49,14 @@ export const SeverityBadge: React.FC<{ s: string }> = ({ s }) => {
 export const StageIcon: React.FC<{ status: string; gate?: boolean }> = ({ status, gate }) => {
   if (status === 'success') {
     return (
-      <svg className="w-4 h-4 text-emerald-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <svg className="w-4 h-4 text-emerald-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
       </svg>
     );
   }
   if (status === 'active') {
     return (
-      <svg className="w-4 h-4 text-amber-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <svg className="w-4 h-4 text-amber-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
       </svg>
     );
@@ -190,6 +190,7 @@ interface SidebarProps {
   githubAccounts?: string[];
   githubInstallUrl?: string;
   onDisconnectGitHub?: () => void;
+  onBackToDashboard?: () => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -199,10 +200,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   githubAccounts = [],
   githubInstallUrl = 'https://github.com/apps/deplai-gitapp-aj/installations/new',
   onDisconnectGitHub,
+  onBackToDashboard,
 }) => {
-  const loopStages = stages.filter((s) => s.group === 'loop');
-  const preStages = stages.filter((s) => s.id === 0);
-  const postStages = stages.filter((s) => s.group !== 'loop' && s.id !== 0);
+  const sharedStages = stages.filter((s) => s.track === 'shared' || s.id === 0);
+  const securityStages = stages.filter((s) => s.track === 'security');
+  const deploymentStages = stages.filter((s) => s.track === 'deployment');
   const successCount = stages.filter((s) => s.status === 'success').length;
   const pct = Math.round((successCount / stages.length) * 100);
   const githubConnected = githubAccounts.length > 0;
@@ -211,7 +213,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   return (
     <aside className="w-72 flex-shrink-0 bg-[#09090b] border-r border-white/5 flex flex-col overflow-hidden">
       <div className="px-4 py-4 border-b border-white/5">
-        <div className="flex items-center gap-2.5 mb-4">
+        <button onClick={onBackToDashboard} className="mb-4 flex items-center gap-2.5 text-left hover:opacity-90 transition-opacity">
           <div className="w-7 h-7 rounded-lg bg-cyan-500/15 border border-cyan-500/25 flex items-center justify-center">
             <svg viewBox="0 0 28 28" className="w-4 h-4" fill="none">
               <polygon points="14,2 25,8 25,20 14,26 3,20 3,8" stroke="#06b6d4" strokeWidth="1.5" />
@@ -222,7 +224,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <p className="text-sm font-semibold text-zinc-100 leading-none">DeplAI</p>
             <p className="text-[10px] text-zinc-500 mt-0.5">Enterprise Pipeline</p>
           </div>
-        </div>
+        </button>
+        <button
+          onClick={onBackToDashboard}
+          className="mb-3 inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-zinc-900 px-2.5 py-1.5 text-[11px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800"
+        >
+          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+          Back to Dashboard
+        </button>
         <div className="bg-zinc-900 rounded-lg p-3 border border-white/5">
           <div className="flex justify-between items-center mb-2">
             <span className="text-[11px] text-zinc-400 font-medium">Pipeline progress</span>
@@ -238,21 +247,25 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
       </div>
       <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5 custom-scrollbar">
-        {preStages.map((s) => <StageRow key={s.key} stage={s} active={current === s.key} onClick={() => setCurrent(s.key)} />)}
-        <div className="mx-2 my-2">
+        {sharedStages.map((s) => <StageRow key={s.key} stage={s} active={current === s.key} onClick={() => setCurrent(s.key)} />)}
+        <div className="mx-2 my-3">
           <div className="flex items-center gap-2 mb-1.5">
-            <span className="text-[9px] uppercase tracking-widest text-zinc-600 font-semibold flex-shrink-0">Remediation Loop ×2</span>
+            <span className="text-[9px] uppercase tracking-widest text-zinc-600 font-semibold flex-shrink-0">Security Track</span>
             <div className="flex-1 h-px bg-zinc-800" />
           </div>
           <div className="ml-3 space-y-0.5 border-l border-zinc-800 pl-3">
-            {loopStages.map((s) => <StageRow key={s.key} stage={s} active={current === s.key} onClick={() => setCurrent(s.key)} />)}
-          </div>
-          <div className="flex items-center gap-2 mt-1.5">
-            <div className="flex-1 h-px bg-zinc-800" />
-            <span className="text-[9px] uppercase tracking-widest text-zinc-600 font-semibold flex-shrink-0">End Loop</span>
+            {securityStages.map((s) => <StageRow key={s.key} stage={s} active={current === s.key} onClick={() => setCurrent(s.key)} />)}
           </div>
         </div>
-        {postStages.map((s) => <StageRow key={s.key} stage={s} active={current === s.key} onClick={() => setCurrent(s.key)} />)}
+        <div className="mx-2 my-3">
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className="text-[9px] uppercase tracking-widest text-zinc-600 font-semibold flex-shrink-0">Deployment Track</span>
+            <div className="flex-1 h-px bg-zinc-800" />
+          </div>
+          <div className="ml-3 space-y-0.5 border-l border-zinc-800 pl-3">
+            {deploymentStages.map((s) => <StageRow key={s.key} stage={s} active={current === s.key} onClick={() => setCurrent(s.key)} />)}
+          </div>
+        </div>
       </nav>
       <div className="px-3 py-3 border-t border-white/5">
         <div className="flex items-center gap-2">

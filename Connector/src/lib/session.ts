@@ -10,6 +10,8 @@ export interface SessionData {
     name: string;
     avatarUrl: string;
   };
+  oauthState?: string;
+  oauthStateExpiresAt?: number;
   isLoggedIn: boolean;
 }
 

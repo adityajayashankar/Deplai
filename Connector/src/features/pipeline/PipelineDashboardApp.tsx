@@ -559,7 +559,12 @@ export default function PipelineDashboardApp() {
   }, [current, scanStatus]);
 
   const stages = useMemo((): Stage[] => {
-    const base = STAGES.map((s) => ({ ...s, status: 'pending' as Stage['status'], duration: undefined }));
+    const base: Stage[] = STAGES.map((s) => ({ ...s, status: 'pending', duration: undefined }));
+    const deploymentStages = new Set(['qa', 'arch', 'approve', 'iac', 'gitops', 'deploy']);
+    const deploymentFlowStarted = deploymentStages.has(current)
+      || Boolean(costEstimate.totalMonthlyUsd)
+      || deployRuntimeState !== 'idle'
+      || deploySucceeded;
 
     const preflight = base.find((s) => s.key === 'preflight');
     const scanInitiated = scanStatus !== 'not_initiated'
@@ -681,9 +686,9 @@ export default function PipelineDashboardApp() {
     }
 
     const qa = base.find((s) => s.key === 'qa');
-    if (qa && postMergeDone) {
+    if (qa && (postMergeDone || deploymentFlowStarted)) {
       if (current === 'qa') qa.status = 'active';
-      else if (['arch', 'approve', 'iac', 'gitops', 'deploy'].includes(current)) qa.status = 'success';
+      else if (deploymentStages.has(current)) qa.status = 'success';
       else qa.status = 'pending';
     }
 
@@ -725,7 +730,7 @@ export default function PipelineDashboardApp() {
     }
 
     return base;
-  }, [current, deployRuntimeState, deploySucceeded, healthChecks, kgPhase, mergeConfirmed, neo4jConnected, noRemediationChanges, postMergeDone, prUrl, remediation.messages, remediation.state, scanRuntimeState, runnerState, scanStatus]);
+  }, [costEstimate.totalMonthlyUsd, current, deployRuntimeState, deploySucceeded, healthChecks, kgPhase, mergeConfirmed, neo4jConnected, noRemediationChanges, postMergeDone, prUrl, remediation.messages, remediation.state, scanRuntimeState, runnerState, scanStatus]);
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
@@ -791,7 +796,7 @@ export default function PipelineDashboardApp() {
       case 'postmerge':
         return <PostMergePage onSkip={onSkipPostMerge} onRerunScan={onRerunPostMergeScan} rerunInProgress={rerunInProgress} />;
       case 'qa':
-        return <QAPage onNavigate={setCurrent} autopilot={normalizedRunOptions.autopilot} />;
+        return <QAPage onNavigate={setCurrent} autopilot={normalizedRunOptions.autopilot} projectId={selectedProjectId} projectName={selectedProject?.name} />;
       case 'arch':
       case 'approve':
         return <ArchPage onNavigate={setCurrent} projectId={selectedProjectId} projectName={selectedProject?.name} />;
@@ -848,17 +853,31 @@ export default function PipelineDashboardApp() {
           }}
         />
       )}
-      <Sidebar current={current} setCurrent={setCurrent} stages={stages} githubAccounts={githubAccounts} onDisconnectGitHub={onDisconnectGitHub} />
+      <Sidebar
+        current={current}
+        setCurrent={setCurrent}
+        stages={stages}
+        githubAccounts={githubAccounts}
+        onDisconnectGitHub={onDisconnectGitHub}
+        onBackToDashboard={() => router.push('/dashboard')}
+      />
       <div className="flex-1 flex flex-col overflow-hidden min-w-0 bg-[#09090b]">
-        <div className="h-11 bg-[#09090b]/80 border-b border-white/5 flex items-center px-5 gap-3 flex-shrink-0 backdrop-blur">
+        <div className="h-11 bg-[#09090b]/80 border-b border-white/5 flex items-center px-5 gap-3 shrink-0 backdrop-blur">
           <div className="flex items-center gap-1.5 text-[11px] text-zinc-600">
-            <span className="text-zinc-500 hover:text-zinc-300 cursor-pointer" onClick={() => setCurrent('overview')}>Pipeline</span>
+            <span className="text-zinc-500 hover:text-zinc-300 cursor-pointer" onClick={() => router.push('/dashboard')}>Dashboard</span>
             <span>/</span>
-            <span className="text-zinc-300 capitalize">{current === 'overview' ? 'Dashboard' : stages.find((s) => s.key === current)?.label || current}</span>
+            <span className="text-zinc-300 capitalize">{current === 'overview' ? 'Pipeline' : stages.find((s) => s.key === current)?.label || current}</span>
             {runnerError && <span className="text-[11px] text-red-400 ml-3">{runnerError}</span>}
           </div>
           <div className="flex-1" />
           <div className="flex items-center gap-2">
+            <button
+              onClick={() => router.push('/dashboard')}
+              className="flex items-center gap-1.5 px-3 py-1 bg-zinc-900 hover:bg-zinc-800 border border-white/10 rounded-md text-[11px] font-medium text-zinc-300 transition-colors"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+              Dashboard
+            </button>
             <ProjectSelector projects={projects} selectedProjectId={selectedProjectId} onSelect={setSelectedProjectId} />
             <button onClick={() => setShowOptions(true)} className="flex items-center gap-1.5 px-3 py-1 bg-zinc-900 hover:bg-zinc-800 border border-white/10 rounded-md text-[11px] font-medium text-zinc-300 transition-colors">
               <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>

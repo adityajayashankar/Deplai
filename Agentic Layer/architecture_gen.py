@@ -9,6 +9,7 @@ import logging
 import os
 import httpx
 from typing import Optional
+from anthropic import AsyncAnthropic
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,7 @@ _GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 _DEFAULT_OPENROUTER_MODEL = "mistralai/mistral-7b-instruct"
+_DEFAULT_CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-7-sonnet-latest")
 
 
 async def _call_llm_json(system: str, user: str, provider: str = "", api_key: str = "", model: str = "") -> dict:
@@ -200,7 +202,17 @@ async def _call_llm_json(system: str, user: str, provider: str = "", api_key: st
         except Exception as exc:
             logger.warning("User-provider %s failed in arch gen: %s", provider, exc)
 
-    # 2. Groq
+    # 2. Claude SDK
+    claude_key = os.getenv("ANTHROPIC_API_KEY", "").strip() or os.getenv("CLAUDE_API_KEY", "").strip()
+    if claude_key:
+        try:
+            result = await _call_anthropic(messages, claude_key, model or _DEFAULT_CLAUDE_MODEL)
+            if result:
+                return result
+        except Exception as exc:
+            logger.warning("Claude fallback failed in arch gen: %s", exc)
+
+    # 3. Groq
     groq_key = os.getenv("GROQ_API_KEY", "")
     if groq_key:
         try:
@@ -210,7 +222,7 @@ async def _call_llm_json(system: str, user: str, provider: str = "", api_key: st
         except Exception as exc:
             logger.warning("Groq fallback failed in arch gen: %s", exc)
 
-    # 3. OpenRouter
+    # 4. OpenRouter
     or_key = os.getenv("OPENROUTER_API_KEY", "")
     if or_key:
         try:
@@ -230,12 +242,11 @@ async def _openai_compatible(messages: list, provider: str, api_key: str, model:
         "groq": (_GROQ_URL, model or _DEFAULT_GROQ_MODEL),
         "openrouter": (_OPENROUTER_URL, model or _DEFAULT_OPENROUTER_MODEL),
         "openai": ("https://api.openai.com/v1/chat/completions", model or "gpt-4o-mini"),
-        "claude": ("https://api.anthropic.com/v1/messages", model or "claude-3-5-haiku-20241022"),
+        "claude": ("https://api.anthropic.com/v1/messages", model or _DEFAULT_CLAUDE_MODEL),
     }
 
     if provider_lower == "claude":
-        # Anthropic API format is different
-        return await _call_anthropic(messages, api_key, model or "claude-3-5-haiku-20241022")
+        return await _call_anthropic(messages, api_key, model or _DEFAULT_CLAUDE_MODEL)
 
     base_url, resolved_model = url_map.get(provider_lower, (_OPENROUTER_URL, model or _DEFAULT_OPENROUTER_MODEL))
 
@@ -263,25 +274,21 @@ async def _openai_compatible(messages: list, provider: str, api_key: str, model:
 async def _call_anthropic(messages: list, api_key: str, model: str) -> Optional[dict]:
     system_msgs = [m["content"] for m in messages if m["role"] == "system"]
     user_msgs = [m for m in messages if m["role"] != "system"]
-    payload = {
-        "model": model,
-        "max_tokens": 4096,
-        "system": "\n\n".join(system_msgs),
-        "messages": user_msgs,
-    }
-    async with httpx.AsyncClient(timeout=90) as client:
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    text = data["content"][0]["text"]
+    client = AsyncAnthropic(api_key=api_key, timeout=90.0)
+    response = await client.messages.create(
+        model=model,
+        max_tokens=4096,
+        system="\n\n".join(system_msgs),
+        messages=user_msgs,
+    )
+    text_parts: list[str] = []
+    for block in response.content:
+        block_text = getattr(block, "text", None)
+        if isinstance(block_text, str) and block_text.strip():
+            text_parts.append(block_text)
+    text = "\n".join(text_parts).strip()
+    if not text:
+        raise ValueError("Claude SDK returned no text content for architecture generation.")
     # Anthropic doesn't have json_object mode — extract JSON via brace-depth
     # matching (the greedy regex r"\{.*\}" could capture garbage if the LLM
     # includes braces in explanation text).

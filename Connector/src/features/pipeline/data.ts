@@ -1,19 +1,19 @@
 ﻿import type { ArchNode, CostItem, ScaFinding, SastFinding, Severity, Stage } from './types';
 
 export const STAGES: Stage[] = [
-  { id: 0, key: 'preflight', label: 'Preflight checks', group: null, status: 'success', duration: '1.8s' },
-  { id: 1, key: 'scan', label: 'run_scan (SAST/SCA)', group: 'loop', status: 'success', duration: '4m 32s' },
-  { id: 2, key: 'kg', label: 'KG Agent analysis', group: 'loop', status: 'success', duration: '22s' },
-  { id: 3, key: 'remediate', label: 'Remediate vulnerabilities', group: 'loop', status: 'success', duration: '2m 14s' },
-  { id: 4, key: 'pr', label: 'Create PR', group: 'loop', status: 'success', duration: '4s' },
-  { id: 4.5, key: 'merge', label: 'Merge gate', group: 'loop', status: 'active', gate: true },
-  { id: 4.6, key: 'postmerge', label: 'Post-merge actions', group: 'loop', status: 'pending' },
-  { id: 6, key: 'qa', label: 'Q/A context gathering', status: 'pending', gate: true },
-  { id: 7, key: 'arch', label: 'Generate diagram + estimate_cost', status: 'pending' },
-  { id: 7.5, key: 'approve', label: 'Approve architecture + cost', status: 'pending', gate: true },
-  { id: 8, key: 'iac', label: 'Generate terraform (+ansible)', status: 'pending' },
-  { id: 9, key: 'gitops', label: 'GitOps (budget check)', status: 'pending', gate: true },
-  { id: 10, key: 'deploy', label: 'Deploy on AWS', status: 'pending', gate: true },
+  { id: 0, key: 'preflight', label: 'Preflight checks', group: null, track: 'shared', status: 'success', duration: '1.8s' },
+  { id: 1, key: 'scan', label: 'run_scan (SAST/SCA)', group: 'loop', track: 'security', status: 'success', duration: '4m 32s' },
+  { id: 2, key: 'kg', label: 'KG Agent analysis', group: 'loop', track: 'security', status: 'success', duration: '22s' },
+  { id: 3, key: 'remediate', label: 'Remediate vulnerabilities', group: 'loop', track: 'security', status: 'success', duration: '2m 14s' },
+  { id: 4, key: 'pr', label: 'Create PR', group: 'loop', track: 'security', status: 'success', duration: '4s' },
+  { id: 4.5, key: 'merge', label: 'Merge gate', group: 'loop', track: 'security', status: 'active', gate: true },
+  { id: 4.6, key: 'postmerge', label: 'Post-merge actions', group: 'loop', track: 'security', status: 'pending' },
+  { id: 6, key: 'qa', label: 'Q/A context gathering', track: 'deployment', status: 'pending', gate: true },
+  { id: 7, key: 'arch', label: 'Generate diagram + estimate_cost', track: 'deployment', status: 'pending' },
+  { id: 7.5, key: 'approve', label: 'Approve architecture + cost', track: 'deployment', status: 'pending', gate: true },
+  { id: 8, key: 'iac', label: 'Generate terraform (+ansible)', track: 'deployment', status: 'pending' },
+  { id: 9, key: 'gitops', label: 'GitOps (budget check)', track: 'deployment', status: 'pending', gate: true },
+  { id: 10, key: 'deploy', label: 'Deploy on AWS', track: 'deployment', status: 'pending', gate: true },
 ];
 
 export const SAST_FINDINGS: SastFinding[] = [

@@ -1,0 +1,870 @@
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+import * as THREE from 'three';
+import { 
+  Check, Lock, Send, Server, AlertCircle, ChevronRight, ChevronDown, RefreshCw, 
+  Plus, Zap, Upload, Github, Trash2, FileText, Play, ArrowRight, Rocket, GitBranch, 
+  CheckCircle2, XCircle, KeyRound, ShieldCheck, CircleDashed, LayoutGrid, Globe, 
+  Database, Cloud, FileCode2, FolderOpen, FileJson, Bot, User, Activity, Download, 
+  ExternalLink, Shield, Copy, Terminal, MoreVertical, Search, List, Grid, 
+  Settings, LogOut, Code, Network, Cpu, AlertTriangle, Fingerprint, Box, CpuIcon
+} from 'lucide-react';
+
+// ==========================================
+// TEXT TYPE COMPONENT
+// ==========================================
+
+interface TextTypeProps {
+  className?: string;
+  showCursor?: boolean;
+  hideCursorWhileTyping?: boolean;
+  cursorCharacter?: string | React.ReactNode;
+  cursorBlinkDuration?: number;
+  cursorClassName?: string;
+  text: string | string[];
+  as?: React.ElementType;
+  typingSpeed?: number;
+  initialDelay?: number;
+  pauseDuration?: number;
+  deletingSpeed?: number;
+  loop?: boolean;
+  textColors?: string[];
+  variableSpeed?: { min: number; max: number };
+  onSentenceComplete?: (sentence: string, index: number) => void;
+  startOnVisible?: boolean;
+  reverseMode?: boolean;
+}
+
+const TextType = ({
+  text, as: Component = 'div', typingSpeed = 50, initialDelay = 0, pauseDuration = 2000,
+  deletingSpeed = 30, loop = false, className = '', showCursor = true, hideCursorWhileTyping = false,
+  cursorCharacter = '|', cursorClassName = '', textColors = [], variableSpeed, onSentenceComplete,
+  startOnVisible = false, reverseMode = false, ...props
+}: TextTypeProps & React.HTMLAttributes<HTMLElement>) => {
+  const [displayedText, setDisplayedText] = useState('');
+  const [currentCharIndex, setCurrentCharIndex] = useState(0);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [currentTextIndex, setCurrentTextIndex] = useState(0);
+  const [isVisible, setIsVisible] = useState(!startOnVisible);
+  const cursorRef = useRef<HTMLSpanElement>(null);
+  const containerRef = useRef<HTMLElement>(null);
+
+  const textArray = useMemo(() => (Array.isArray(text) ? text : [text]), [text]);
+
+  const getRandomSpeed = useCallback(() => {
+    if (!variableSpeed) return typingSpeed;
+    const { min, max } = variableSpeed;
+    return Math.random() * (max - min) + min;
+  }, [variableSpeed, typingSpeed]);
+
+  useEffect(() => {
+    if (!startOnVisible || !containerRef.current) return;
+    const observer = new IntersectionObserver(entries => {
+      entries.forEach(entry => { if (entry.isIntersecting) setIsVisible(true); });
+    }, { threshold: 0.1 });
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, [startOnVisible]);
+
+  useEffect(() => {
+    if (!isVisible) return;
+    let timeout: ReturnType<typeof setTimeout>;
+    const currentText = textArray[currentTextIndex];
+    const processedText = reverseMode ? currentText.split('').reverse().join('') : currentText;
+
+    const executeTypingAnimation = () => {
+      if (isDeleting) {
+        if (displayedText === '') {
+          setIsDeleting(false);
+          if (currentTextIndex === textArray.length - 1 && !loop) return;
+          if (onSentenceComplete) onSentenceComplete(textArray[currentTextIndex], currentTextIndex);
+          setCurrentTextIndex(prev => (prev + 1) % textArray.length);
+          setCurrentCharIndex(0);
+          timeout = setTimeout(() => {}, pauseDuration);
+        } else {
+          timeout = setTimeout(() => setDisplayedText(prev => prev.slice(0, -1)), deletingSpeed);
+        }
+      } else {
+        if (currentCharIndex < processedText.length) {
+          timeout = setTimeout(() => {
+            setDisplayedText(prev => prev + processedText[currentCharIndex]);
+            setCurrentCharIndex(prev => prev + 1);
+          }, variableSpeed ? getRandomSpeed() : typingSpeed);
+        } else if (textArray.length >= 1) {
+          if (!loop && currentTextIndex === textArray.length - 1) return;
+          timeout = setTimeout(() => setIsDeleting(true), pauseDuration);
+        }
+      }
+    };
+
+    if (currentCharIndex === 0 && !isDeleting && displayedText === '') timeout = setTimeout(executeTypingAnimation, initialDelay);
+    else executeTypingAnimation();
+
+    return () => clearTimeout(timeout);
+  }, [currentCharIndex, displayedText, isDeleting, typingSpeed, deletingSpeed, pauseDuration, textArray, currentTextIndex, loop, initialDelay, isVisible, reverseMode, variableSpeed, onSentenceComplete, getRandomSpeed]);
+
+  const shouldHideCursor = hideCursorWhileTyping && (currentCharIndex < textArray[currentTextIndex].length || isDeleting);
+  const renderStyledText = () => displayedText.split('').map((char, i) => (<span key={i} className={char === '_' ? 'text-indigo-500' : ''}>{char}</span>));
+
+  return React.createElement(
+    Component,
+    { ref: containerRef, className: `inline-block whitespace-pre-wrap tracking-tight ${className}`, ...props },
+    <span className="inline" style={{ color: textColors.length ? textColors[currentTextIndex % textColors.length] : 'inherit' }}>{renderStyledText()}</span>,
+    showCursor && <span ref={cursorRef} className={`ml-[1px] inline-block opacity-100 ${shouldHideCursor ? 'hidden' : ''} ${cursorClassName}`}>{cursorCharacter}</span>
+  );
+};
+
+
+// ==========================================
+// BORDER GLOW UTILITIES & COMPONENT
+// ==========================================
+
+function parseHSL(hslStr: string): { h: number; s: number; l: number } {
+  const match = hslStr.match(/([\d.]+)\s*([\d.]+)%?\s*([\d.]+)%?/);
+  if (!match) return { h: 40, s: 80, l: 80 };
+  return { h: parseFloat(match[1]), s: parseFloat(match[2]), l: parseFloat(match[3]) };
+}
+
+function buildBoxShadow(glowColor: string, intensity: number): string {
+  const { h, s, l } = parseHSL(glowColor);
+  const base = `${h}deg ${s}% ${l}%`;
+  const layers: [number, number, number, number, boolean][] = [
+    [0, 0, 0, 1, 100, true], [0, 0, 1, 0, 60, true], [0, 0, 3, 0, 50, true],
+    [0, 0, 6, 0, 40, true], [0, 0, 15, 0, 30, true], [0, 0, 25, 2, 20, true],
+    [0, 0, 50, 2, 10, true],
+    [0, 0, 1, 0, 60, false], [0, 0, 3, 0, 50, false], [0, 0, 6, 0, 40, false],
+    [0, 0, 15, 0, 30, false], [0, 0, 25, 2, 20, false], [0, 0, 50, 2, 10, false],
+  ];
+  return layers.map(([x, y, blur, spread, alpha, inset]) => {
+    const a = Math.min(alpha * intensity, 100);
+    return `${inset ? 'inset ' : ''}${x}px ${y}px ${blur}px ${spread}px hsl(${base} / ${a}%)`;
+  }).join(', ');
+}
+
+function easeOutCubic(x: number) { return 1 - Math.pow(1 - x, 3); }
+function easeInCubic(x: number) { return x * x * x; }
+
+function animateValue({ start = 0, end = 100, duration = 1000, delay = 0, ease = easeOutCubic, onUpdate, onEnd }: any) {
+  const t0 = performance.now() + delay;
+  function tick() {
+    const elapsed = performance.now() - t0;
+    const t = Math.min(elapsed / duration, 1);
+    onUpdate(start + (end - start) * ease(t));
+    if (t < 1) requestAnimationFrame(tick);
+    else if (onEnd) onEnd();
+  }
+  setTimeout(() => requestAnimationFrame(tick), delay);
+}
+
+const GRADIENT_POSITIONS = ['80% 55%', '69% 34%', '8% 6%', '41% 38%', '86% 85%', '82% 18%', '51% 4%'];
+const COLOR_MAP = [0, 1, 2, 0, 1, 2, 1];
+
+function buildMeshGradients(colors: string[]): string[] {
+  const gradients: string[] = [];
+  for (let i = 0; i < 7; i++) {
+    const c = colors[Math.min(COLOR_MAP[i], colors.length - 1)];
+    gradients.push(`radial-gradient(at ${GRADIENT_POSITIONS[i]}, ${c} 0px, transparent 50%)`);
+  }
+  gradients.push(`linear-gradient(${colors[0]} 0 100%)`);
+  return gradients;
+}
+
+interface BorderGlowProps {
+  children?: React.ReactNode;
+  className?: string;
+  edgeSensitivity?: number;
+  glowColor?: string;
+  backgroundColor?: string;
+  borderRadius?: number;
+  glowRadius?: number;
+  glowIntensity?: number;
+  coneSpread?: number;
+  animated?: boolean;
+  colors?: string[];
+  fillOpacity?: number;
+}
+
+const BorderGlow: React.FC<BorderGlowProps> = ({
+  children, className = '', edgeSensitivity = 30, glowColor = '40 80 80', backgroundColor = '#000000',
+  borderRadius = 12, glowRadius = 30, glowIntensity = 0.3, coneSpread = 25, animated = false,
+  colors = ['#3f3f46', '#18181b', '#000000'], fillOpacity = 0.5,
+}) => {
+  const cardRef = useRef<HTMLDivElement>(null);
+  const [isHovered, setIsHovered] = useState(false);
+  const [cursorAngle, setCursorAngle] = useState(45);
+  const [edgeProximity, setEdgeProximity] = useState(0);
+  const [sweepActive, setSweepActive] = useState(false);
+
+  const getCenterOfElement = useCallback((el: HTMLElement) => {
+    const { width, height } = el.getBoundingClientRect();
+    return [width / 2, height / 2];
+  }, []);
+
+  const getEdgeProximity = useCallback((el: HTMLElement, x: number, y: number) => {
+    const [cx, cy] = getCenterOfElement(el);
+    const dx = x - cx;
+    const dy = y - cy;
+    let kx = Infinity, ky = Infinity;
+    if (dx !== 0) kx = cx / Math.abs(dx);
+    if (dy !== 0) ky = cy / Math.abs(dy);
+    return Math.min(Math.max(1 / Math.min(kx, ky), 0), 1);
+  }, [getCenterOfElement]);
+
+  const getCursorAngle = useCallback((el: HTMLElement, x: number, y: number) => {
+    const [cx, cy] = getCenterOfElement(el);
+    const dx = x - cx;
+    const dy = y - cy;
+    if (dx === 0 && dy === 0) return 0;
+    let degrees = Math.atan2(dy, dx) * (180 / Math.PI) + 90;
+    if (degrees < 0) degrees += 360;
+    return degrees;
+  }, [getCenterOfElement]);
+
+  const handlePointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const card = cardRef.current;
+    if (!card) return;
+    const rect = card.getBoundingClientRect();
+    setEdgeProximity(getEdgeProximity(card, e.clientX - rect.left, e.clientY - rect.top));
+    setCursorAngle(getCursorAngle(card, e.clientX - rect.left, e.clientY - rect.top));
+  }, [getEdgeProximity, getCursorAngle]);
+
+  useEffect(() => {
+    if (!animated) return;
+    const angleStart = 110, angleEnd = 465;
+    setSweepActive(true);
+    setCursorAngle(angleStart);
+    animateValue({ duration: 500, onUpdate: (v: number) => setEdgeProximity(v / 100) });
+    animateValue({ ease: easeInCubic, duration: 1500, end: 50, onUpdate: (v: number) => setCursorAngle((angleEnd - angleStart) * (v / 100) + angleStart) });
+    animateValue({ ease: easeOutCubic, delay: 1500, duration: 2250, start: 50, end: 100, onUpdate: (v: number) => setCursorAngle((angleEnd - angleStart) * (v / 100) + angleStart) });
+    animateValue({ ease: easeInCubic, delay: 2500, duration: 1500, start: 100, end: 0, onUpdate: (v: number) => setEdgeProximity(v / 100), onEnd: () => setSweepActive(false) });
+  }, [animated]);
+
+  const isVisible = isHovered || sweepActive;
+  const borderOpacity = isVisible ? Math.max(0, (edgeProximity * 100 - (edgeSensitivity + 20)) / (100 - (edgeSensitivity + 20))) : 0;
+  const glowOpacity = isVisible ? Math.max(0, (edgeProximity * 100 - edgeSensitivity) / (100 - edgeSensitivity)) : 0;
+  const meshGradients = buildMeshGradients(colors);
+  const borderBg = meshGradients.map(g => `${g} border-box`);
+  const fillBg = meshGradients.map(g => `${g} padding-box`);
+  const angleDeg = `${cursorAngle.toFixed(3)}deg`;
+
+  return (
+    <div
+      ref={cardRef} onPointerMove={handlePointerMove} onPointerEnter={() => setIsHovered(true)} onPointerLeave={() => setIsHovered(false)}
+      className={`relative grid isolate ${className}`}
+      style={{ background: backgroundColor, borderRadius: `${borderRadius}px`, transform: 'translate3d(0, 0, 0.01px)' }}
+    >
+      <div className="absolute inset-0 rounded-[inherit] -z-[1]"
+        style={{
+          border: '1px solid transparent',
+          background: [`linear-gradient(${backgroundColor} 0 100%) padding-box`, 'linear-gradient(rgb(255 255 255 / 0%) 0% 100%) border-box', ...borderBg].join(', '),
+          opacity: borderOpacity,
+          maskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
+          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        }}
+      />
+      <div className="absolute inset-0 rounded-[inherit] -z-[1]"
+        style={{
+          border: '1px solid transparent', background: fillBg.join(', '),
+          maskImage: ['linear-gradient(to bottom, black, black)', 'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)', 'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)', `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`].join(', '),
+          WebkitMaskImage: ['linear-gradient(to bottom, black, black)', 'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)', 'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)', `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`].join(', '),
+          maskComposite: 'subtract, add, add, add, add, add', WebkitMaskComposite: 'source-out, source-over, source-over, source-over, source-over, source-over',
+          opacity: borderOpacity * fillOpacity, mixBlendMode: 'soft-light',
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        } as React.CSSProperties}
+      />
+      <span className="absolute pointer-events-none z-[1] rounded-[inherit]"
+        style={{
+          inset: `${-glowRadius}px`,
+          maskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
+          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
+          opacity: glowOpacity, mixBlendMode: 'plus-lighter',
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        } as React.CSSProperties}
+      >
+        <span className="absolute rounded-[inherit]" style={{ inset: `${glowRadius}px`, boxShadow: buildBoxShadow(glowColor, glowIntensity) }} />
+      </span>
+      <div className="flex flex-col relative h-full w-full z-[1]">{children}</div>
+    </div>
+  );
+};
+
+// ==========================================
+// PIXELBLAST COMPONENT
+// ==========================================
+
+const VERTEX_SRC = `void main() { gl_Position = vec4(position, 1.0); }`;
+const FRAGMENT_SRC = `
+precision highp float;
+uniform vec3 uColor; uniform vec2 uResolution; uniform float uTime; uniform float uPixelSize; uniform float uPixelJitter; uniform float uEdgeFade; uniform float uNoiseAmount;
+out vec4 fragColor;
+float hash11(float n){ return fract(sin(n)*43758.5453); }
+void main(){
+  vec2 fragCoord = gl_FragCoord.xy - uResolution * .5;
+  float h = fract(sin(dot(floor(fragCoord / uPixelSize), vec2(127.1, 311.7))) * 43758.5453);
+  float M = 1.0 + (h - 0.5) * uPixelJitter;
+  if (uEdgeFade > 0.0) {
+    vec2 norm = gl_FragCoord.xy / uResolution;
+    float edge = min(min(norm.x, norm.y), min(1.0 - norm.x, 1.0 - norm.y));
+    M *= smoothstep(0.0, uEdgeFade, edge);
+  }
+  vec3 color = uColor;
+  if (uNoiseAmount > 0.0) color += (hash11(dot(gl_FragCoord.xy, vec2(12.98, 78.23)) + uTime) - 0.5) * uNoiseAmount;
+  fragColor = vec4(color, M * 0.1);
+}
+`;
+
+const PixelBlast: React.FC<any> = ({ pixelSize = 3, color = '#3f3f46', className, style, antialias = true, pixelSizeJitter = 0.5, edgeFade = 0.5, noiseAmount = 0.05 }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const renderer = new THREE.WebGLRenderer({ canvas: document.createElement('canvas'), antialias, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    container.appendChild(renderer.domElement);
+    const uniforms = {
+      uResolution: { value: new THREE.Vector2(0, 0) }, uTime: { value: 0 }, uColor: { value: new THREE.Color(color) },
+      uPixelSize: { value: pixelSize }, uPixelJitter: { value: pixelSizeJitter }, uEdgeFade: { value: edgeFade }, uNoiseAmount: { value: noiseAmount }
+    };
+    const scene = new THREE.Scene();
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const material = new THREE.ShaderMaterial({ vertexShader: VERTEX_SRC, fragmentShader: FRAGMENT_SRC, uniforms, transparent: true, glslVersion: THREE.GLSL3 });
+    scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material));
+    const clock = new THREE.Clock();
+    const setSize = () => { renderer.setSize(container.clientWidth || 1, container.clientHeight || 1, false); uniforms.uResolution.value.set(renderer.domElement.width, renderer.domElement.height); };
+    setSize();
+    const ro = new ResizeObserver(setSize); ro.observe(container);
+    let rafId = 0;
+    const animate = () => { uniforms.uTime.value = clock.getElapsedTime(); renderer.render(scene, camera); rafId = requestAnimationFrame(animate); };
+    rafId = requestAnimationFrame(animate);
+    return () => { ro.disconnect(); cancelAnimationFrame(rafId); renderer.dispose(); if (renderer.domElement.parentElement === container) container.removeChild(renderer.domElement); };
+  }, []); 
+  return <div ref={containerRef} className={`w-full h-full relative overflow-hidden ${className ?? ''}`} style={style} />;
+};
+
+// ==========================================
+// MAIN APP COMPONENT & DATA
+// ==========================================
+
+type PipelineStageId = 'analysis' | 'qa' | 'architecture' | 'approval' | 'terraform' | 'aws_config' | 'deploy' | 'outputs';
+
+const SIDEBAR_STAGES = [
+  { id: 'analysis', label: 'Repository Analysis', details: 'Codebase Scan' },
+  { id: 'qa', label: 'Questions', details: 'Interactive Q&A' },
+  { id: 'architecture', label: 'Architecture', details: 'Diagram + Cost' },
+  { id: 'approval', label: 'Approval', details: 'Sign-off' },
+  { id: 'terraform', label: 'Terraform', details: 'IaC Generation' },
+  { id: 'aws_config', label: 'AWS Config', details: 'GitOps & Secrets' },
+  { id: 'deploy', label: 'Deploy', details: 'Execution' },
+  { id: 'outputs', label: 'Outputs', details: 'Credentials & URLs' },
+];
+
+const MOCK_REPOS = [
+  { id: 1, name: 'core-payment-gateway', source: 'Github', currentBranch: 'main', time: 'Scanned 4d ago', status: 'Ready for Deploy', visibility: 'PRIVATE' },
+];
+
+export default function DeploymentPipeline() {
+  const [activeStage, setActiveStage] = useState<PipelineStageId>('analysis');
+  const [selectedRepo, setSelectedRepo] = useState<any>(MOCK_REPOS[0]);
+  
+  // States for various pipeline steps
+  const [isAnalyzing, setIsAnalyzing] = useState(true);
+  const [chatInput, setChatInput] = useState('');
+  const [messages, setMessages] = useState([{ sender: 'agent', text: "I've analyzed the repository. To finalize the deployment plan, do you require a multi-AZ redundancy setup for the database?", timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
+  const [isTyping, setIsTyping] = useState(false);
+  const [awsKey, setAwsKey] = useState('AKIAXXXXXXXXXXXXXXXX');
+  const [awsSecret, setAwsSecret] = useState('');
+  const [deployLogs, setDeployLogs] = useState<string[]>([]);
+  const [deployActive, setDeployActive] = useState(false);
+  const [deployFinished, setDeployFinished] = useState(false);
+  const [approved, setApproved] = useState(false);
+  
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const logEndRef = useRef<HTMLDivElement>(null);
+  const deployIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Initial Analysis Simulation
+  useEffect(() => {
+    if (activeStage === 'analysis' && isAnalyzing) {
+      const timer = setTimeout(() => setIsAnalyzing(false), 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [activeStage, isAnalyzing]);
+
+  useEffect(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), [messages, isTyping]);
+  useEffect(() => logEndRef.current?.scrollIntoView({ behavior: 'smooth' }), [deployLogs]);
+
+  // Clean up any stray intervals
+  useEffect(() => {
+    return () => {
+      if (deployIntervalRef.current) clearInterval(deployIntervalRef.current);
+    };
+  }, []);
+
+  const handleSendMessage = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim()) return;
+    setMessages(prev => [...prev, { sender: 'user', text: chatInput, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
+    setChatInput('');
+    setIsTyping(true);
+    setTimeout(() => {
+      setIsTyping(false);
+      setMessages(prev => [...prev, { sender: 'agent', text: "Noted. Single-AZ configuration selected. The context gathering is complete. You can proceed to view the Architecture & Cost estimate.", timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
+    }, 1200);
+  };
+
+  const startDeploy = () => {
+    if (deployIntervalRef.current) clearInterval(deployIntervalRef.current);
+    setActiveStage('deploy');
+    setDeployActive(true);
+    setDeployFinished(false);
+    setDeployLogs([]); 
+    
+    const logs = [
+      "[info] Initializing provider 'aws' version 5.0.0...",
+      "[info] Creating AWS VPC (vpc-08219ae)...",
+      "[info] Provisioning public subnets in eu-north-1a...",
+      "[info] Security groups created successfully.",
+      "[info] launching t3.micro instance (i-0x7291)...",
+      "[info] Attaching Elastic IP...",
+      "[info] Running Ansible playbooks for hardening...",
+      "[info] Generating SSH credentials...",
+      "[success] Deployment complete."
+    ];
+    
+    let i = 0;
+    deployIntervalRef.current = setInterval(() => {
+      if (i < logs.length) {
+        const nextLog = logs[i];
+        setDeployLogs(prev => [...prev, nextLog]);
+        i++;
+      } else {
+        if (deployIntervalRef.current) clearInterval(deployIntervalRef.current);
+        setDeployActive(false);
+        setDeployFinished(true);
+      }
+    }, 800);
+  };
+
+  const getStageStatus = (stageId: string) => {
+    const stageOrder = SIDEBAR_STAGES.map(s => s.id);
+    const currentIndex = stageOrder.indexOf(activeStage);
+    const thisIndex = stageOrder.indexOf(stageId);
+    if (thisIndex < currentIndex) return 'completed';
+    if (thisIndex === currentIndex) return 'active';
+    return 'locked';
+  };
+
+  const getProgressPercentage = () => {
+    const stageOrder = SIDEBAR_STAGES.map(s => s.id);
+    let currentIndex = stageOrder.indexOf(activeStage);
+    if (activeStage === 'deploy' && deployFinished) return 100;
+    return Math.round(((currentIndex + 1) / SIDEBAR_STAGES.length) * 100);
+  };
+
+  // ==========================================
+  // RENDERERS
+  // ==========================================
+
+  const renderAnalysisView = () => (
+    <div className="flex-1 overflow-y-auto p-8 custom-scrollbar relative z-10 w-full max-w-5xl mx-auto space-y-6 animate-fade-in">
+      <div>
+        <h1 className="text-2xl font-semibold text-zinc-100 mb-1">Repository Analysis</h1>
+        <p className="text-sm text-zinc-400">Scanning codebase to infer runtime and deployment requirements.</p>
+      </div>
+
+      {isAnalyzing ? (
+        <div className="flex flex-col items-center justify-center h-64 border border-[#1A1A1A] border-dashed rounded-lg bg-[#050505]">
+          <RefreshCw className="w-6 h-6 text-zinc-400 animate-spin mb-4" />
+          <p className="text-zinc-300 text-sm font-medium">Analyzing repository context...</p>
+        </div>
+      ) : (
+        <div className="space-y-6 animate-fade-in">
+          <div className="grid grid-cols-3 gap-6">
+            <BorderGlow backgroundColor="#050505" colors={['#27272a', '#050505']} glowColor="200 10 30" borderRadius={8} className="p-6 border border-[#1A1A1A]">
+               <CpuIcon className="w-5 h-5 text-zinc-400 mb-4" />
+               <h3 className="text-[10px] font-semibold text-zinc-500 tracking-widest uppercase mb-1">RUNTIME</h3>
+               <p className="text-lg font-medium text-zinc-100">Node.js 18.x</p>
+            </BorderGlow>
+            <BorderGlow backgroundColor="#050505" colors={['#27272a', '#050505']} glowColor="200 10 30" borderRadius={8} className="p-6 border border-[#1A1A1A]">
+               <Code className="w-5 h-5 text-zinc-400 mb-4" />
+               <h3 className="text-[10px] font-semibold text-zinc-500 tracking-widest uppercase mb-1">FRAMEWORK</h3>
+               <p className="text-lg font-medium text-zinc-100">Express / React</p>
+            </BorderGlow>
+            <BorderGlow backgroundColor="#050505" colors={['#27272a', '#050505']} glowColor="200 10 30" borderRadius={8} className="p-6 border border-[#1A1A1A]">
+               <Network className="w-5 h-5 text-zinc-400 mb-4" />
+               <h3 className="text-[10px] font-semibold text-zinc-500 tracking-widest uppercase mb-1">EXPOSED PORTS</h3>
+               <p className="text-lg font-medium text-zinc-100">3000, 8080</p>
+            </BorderGlow>
+          </div>
+
+          <BorderGlow backgroundColor="#050505" colors={['#3f3f46', '#050505']} glowColor="40 50 30" borderRadius={8} className="p-6 border border-[#1A1A1A]">
+             <h3 className="text-sm font-medium text-zinc-300 flex items-center gap-2 mb-4"><AlertTriangle className="w-4 h-4 text-amber-500" /> Low Confidence Detections</h3>
+             <ul className="space-y-3 text-sm text-zinc-400">
+               <li className="flex items-center gap-3"><div className="w-1.5 h-1.5 rounded-full bg-amber-500"></div> Found `pg` package, assuming PostgreSQL requirement.</li>
+               <li className="flex items-center gap-3"><div className="w-1.5 h-1.5 rounded-full bg-amber-500"></div> No clear caching layer detected. May need Redis.</li>
+             </ul>
+          </BorderGlow>
+
+          <div className="flex justify-end pt-4">
+             <button onClick={() => setActiveStage('qa')} className="px-6 py-2.5 bg-zinc-100 text-black text-sm font-semibold rounded-md flex items-center gap-2 hover:bg-white transition-colors">
+               Continue to Questions <ArrowRight className="w-4 h-4" />
+             </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  const renderQaView = () => (
+    <div className="flex-1 flex flex-col overflow-hidden max-w-4xl mx-auto w-full relative z-10 px-4 animate-fade-in">
+      <div className="py-6 border-b border-[#1A1A1A]">
+         <h1 className="text-2xl font-semibold text-zinc-100 mb-1">Deployment Questions</h1>
+         <p className="text-sm text-zinc-400">Resolving architectural ambiguity based on codebase scan.</p>
+      </div>
+      <div className="flex-1 overflow-y-auto py-6 space-y-6 custom-scrollbar px-2">
+        {messages.map((msg, i) => (
+          <div key={i} className={`flex gap-4 ${msg.sender === 'user' ? 'flex-row-reverse' : ''}`}>
+            <div className={`w-8 h-8 rounded-md shrink-0 flex items-center justify-center ${msg.sender === 'agent' ? 'bg-[#111111] border border-[#262626]' : 'bg-[#1A1A1A]'}`}>
+              {msg.sender === 'agent' ? <Bot className="w-4 h-4 text-zinc-300" /> : <User className="w-4 h-4 text-zinc-400" />}
+            </div>
+            <div className={`max-w-[80%] flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}>
+              <div className="flex items-baseline gap-2 mb-1 px-1">
+                <span className="text-xs font-medium text-zinc-500">{msg.sender === 'agent' ? 'DepLAI Agent' : 'You'}</span>
+              </div>
+              <div className={`p-4 text-[13px] leading-relaxed ${msg.sender === 'agent' ? 'bg-[#050505] border border-[#1A1A1A] text-zinc-300 rounded-lg rounded-tl-sm' : 'bg-[#111111] border border-[#262626] text-zinc-200 rounded-lg rounded-tr-sm'}`}>
+                {msg.text}
+              </div>
+            </div>
+          </div>
+        ))}
+        {isTyping && <div className="text-zinc-500 text-xs px-12 font-mono animate-pulse">Generating response...</div>}
+        <div ref={chatEndRef} />
+      </div>
+      <div className="py-4 bg-[#000000]">
+        <form onSubmit={handleSendMessage} className="flex gap-2">
+          <input type="text" value={chatInput} onChange={e => setChatInput(e.target.value)} placeholder="Type your requirement..." className="flex-1 bg-[#050505] border border-[#262626] rounded-md px-4 py-2.5 text-sm text-zinc-200 focus:outline-none focus:border-indigo-500/50 transition-colors" />
+          <button type="submit" disabled={!chatInput.trim()} className="px-6 rounded-md bg-zinc-100 text-black font-semibold hover:bg-white disabled:opacity-50 disabled:cursor-not-allowed transition-all"><Send className="w-4 h-4" /></button>
+        </form>
+        {messages.length > 2 && !isTyping && (
+          <div className="flex justify-end mt-4 animate-fade-in">
+             <button onClick={() => setActiveStage('architecture')} className="px-5 py-2 text-sm font-semibold bg-indigo-600 text-white rounded-md hover:bg-indigo-500 transition-colors flex items-center gap-2">
+               Generate Architecture <ArrowRight className="w-4 h-4" />
+             </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  const renderArchitectureView = () => (
+    <div className="flex-1 overflow-y-auto p-8 custom-scrollbar relative z-10 w-full max-w-5xl mx-auto space-y-6 animate-fade-in">
+      <div className="flex items-center justify-between mb-2">
+        <div>
+          <h1 className="text-2xl font-semibold text-zinc-100 mb-1">Architecture & Cost Estimate</h1>
+          <p className="text-sm text-zinc-400">Proposed topology for AWS (eu-north-1).</p>
+        </div>
+      </div>
+      <div className="grid grid-cols-3 gap-6">
+        <div className="col-span-2">
+          <BorderGlow backgroundColor="#050505" colors={['#27272a', '#050505']} glowIntensity={0.2} borderRadius={8} className="h-[400px] border border-[#1A1A1A] relative overflow-hidden flex items-center justify-center">
+             <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:30px_30px]"></div>
+             <div className="relative w-full max-w-md h-64 z-10">
+               <svg className="absolute inset-0 w-full h-full opacity-30"><path d="M 80 50 L 220 50 M 280 50 L 420 50 M 250 80 L 250 180" stroke="#71717A" strokeWidth="1.5" strokeDasharray="4 4" fill="none" /></svg>
+               <div className="absolute top-[20px] left-[0px] p-3 bg-[#0A0A0A] border border-[#262626] rounded-md text-center w-28">
+                 <Globe className="w-4 h-4 text-zinc-300 mx-auto mb-1" /><div className="text-[10px] font-bold text-zinc-400">CLOUDFRONT</div>
+               </div>
+               <div className="absolute top-[20px] left-[200px] p-3 bg-[#0A0A0A] border border-[#262626] rounded-md text-center w-28">
+                 <Database className="w-4 h-4 text-zinc-300 mx-auto mb-1" /><div className="text-[10px] font-bold text-zinc-400">RDS (POSTGRES)</div>
+               </div>
+               <div className="absolute top-[20px] left-[400px] p-3 bg-[#0A0A0A] border border-[#262626] rounded-md text-center w-28">
+                 <Server className="w-4 h-4 text-zinc-300 mx-auto mb-1" /><div className="text-[10px] font-bold text-zinc-400">EC2 (ASG)</div>
+               </div>
+             </div>
+             <div className="absolute bottom-4 text-[10px] text-zinc-600 uppercase tracking-widest font-mono">Topology / v1.0</div>
+          </BorderGlow>
+        </div>
+        <div className="flex flex-col gap-6">
+          <BorderGlow backgroundColor="#050505" colors={['#27272a', '#050505']} glowIntensity={0.2} borderRadius={8} className="p-6 border border-[#1A1A1A]">
+             <h3 className="text-[10px] font-bold text-zinc-500 tracking-widest uppercase mb-4">MONTHLY ESTIMATE</h3>
+             <div className="text-3xl font-semibold text-zinc-100 mb-1">$85.20</div>
+             <p className="text-xs text-zinc-500 mb-6">USD / month runtime</p>
+             <div className="space-y-3 border-t border-[#1A1A1A] pt-4">
+               {['RDS Database', 'EC2 Compute', 'Networking'].map(s => (
+                 <div key={s} className="flex justify-between text-xs"><span className="text-zinc-400">{s}</span><span className="text-zinc-300 font-mono">~$28.40</span></div>
+               ))}
+             </div>
+          </BorderGlow>
+          <div className="mt-auto">
+             <button onClick={() => setActiveStage('approval')} className="w-full py-3 rounded-md bg-zinc-100 text-black font-semibold text-sm hover:bg-white transition-colors">Review & Approve</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderApprovalView = () => (
+    <div className="flex-1 overflow-y-auto p-8 custom-scrollbar relative z-10 w-full max-w-3xl mx-auto space-y-6 animate-fade-in">
+       <div className="mb-8 mt-4 border-b border-[#1A1A1A] pb-6">
+          <h1 className="text-2xl font-semibold text-zinc-100 mb-2">Sign-off</h1>
+          <p className="text-sm text-zinc-400">Review deployment contract before generating infrastructure code.</p>
+       </div>
+
+       <div className="bg-[#050505] border border-[#1A1A1A] rounded-lg p-6">
+         <div className="grid grid-cols-2 gap-6 text-sm mb-6">
+            <div><span className="block text-[10px] font-bold text-zinc-500 uppercase mb-1">Target Region</span><span className="text-zinc-200">AWS eu-north-1</span></div>
+            <div><span className="block text-[10px] font-bold text-zinc-500 uppercase mb-1">Environment</span><span className="text-zinc-200">Production</span></div>
+            <div><span className="block text-[10px] font-bold text-zinc-500 uppercase mb-1">Compute</span><span className="text-zinc-200">EC2 t3.micro (Auto-scaling)</span></div>
+            <div><span className="block text-[10px] font-bold text-zinc-500 uppercase mb-1">Est. Monthly Cost</span><span className="text-zinc-200 font-mono">$85.20</span></div>
+         </div>
+
+         <div className="bg-[#000000] p-4 rounded-md border border-[#1A1A1A] mb-6">
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" checked={approved} onChange={e => setApproved(e.target.checked)} className="mt-1 w-4 h-4 rounded border-[#4B5563] text-indigo-600 focus:ring-indigo-600 bg-[#111111]" />
+              <span className="text-sm text-zinc-400 leading-relaxed">
+                I approve the architectural design and estimated runtime costs. Proceed with generating Terraform configurations.
+              </span>
+            </label>
+         </div>
+
+         <button 
+           disabled={!approved} 
+           onClick={() => setActiveStage('terraform')} 
+           className="w-full py-3 rounded-md bg-indigo-600 text-white font-semibold text-sm hover:bg-indigo-500 disabled:opacity-50 disabled:bg-[#111111] disabled:text-zinc-500 transition-colors"
+         >
+           Approve & Generate IaC
+         </button>
+       </div>
+    </div>
+  );
+
+  const renderTerraformView = () => (
+    <div className="flex-1 flex flex-col gap-6 p-8 relative z-10 w-full max-w-6xl mx-auto overflow-hidden animate-fade-in">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold text-zinc-100 mb-1">Terraform Output</h1>
+          <p className="text-sm text-zinc-400">Code generated from approved architecture.</p>
+        </div>
+        <button onClick={() => setActiveStage('aws_config')} className="px-5 py-2 rounded-md bg-zinc-100 text-black font-semibold text-sm hover:bg-white transition-colors">Continue to Config</button>
+      </div>
+
+      <div className="flex-1 flex gap-6 overflow-hidden">
+        <div className="w-64 shrink-0 h-full bg-[#050505] border border-[#1A1A1A] rounded-lg flex flex-col">
+           <div className="p-3 border-b border-[#1A1A1A] bg-[#000000] text-[10px] font-bold text-zinc-500 uppercase tracking-widest">FILES</div>
+           <div className="flex-1 p-3 overflow-y-auto custom-scrollbar text-sm space-y-1 text-zinc-400">
+             <div className="flex items-center gap-2 py-1"><FolderOpen className="w-4 h-4 text-zinc-500" /> terraform/</div>
+             <div className="ml-4 flex items-center gap-2 text-zinc-200 bg-[#111111] px-2 py-1 rounded cursor-pointer"><FileJson className="w-4 h-4" /> main.tf</div>
+             <div className="ml-4 flex items-center gap-2 px-2 py-1 cursor-pointer hover:text-zinc-200"><FileJson className="w-4 h-4" /> variables.tf</div>
+             <div className="ml-4 flex items-center gap-2 px-2 py-1 cursor-pointer hover:text-zinc-200"><FileJson className="w-4 h-4" /> outputs.tf</div>
+           </div>
+        </div>
+        
+        <div className="flex-1 h-full bg-[#050505] border border-[#1A1A1A] rounded-lg flex flex-col">
+          <div className="px-4 py-2.5 border-b border-[#1A1A1A] bg-[#000000] flex items-center justify-between font-mono text-[11px] text-zinc-400">
+            <span>terraform/main.tf</span><span className="text-emerald-500 font-semibold">VALIDATED</span>
+          </div>
+          <div className="flex-1 p-5 overflow-y-auto custom-scrollbar font-mono text-[13px] leading-relaxed text-zinc-300">
+            <span className="text-indigo-400">resource</span> "aws_vpc" "main" {"{"}<br/>
+            <span className="pl-4">cidr_block = <span className="text-emerald-400">"10.0.0.0/16"</span></span><br/>
+            <span className="pl-4">enable_dns_hostnames = <span className="text-amber-400">true</span></span><br/>
+            {"}"}<br/><br/>
+            <span className="text-indigo-400">resource</span> "aws_subnet" "public" {"{"}<br/>
+            <span className="pl-4">vpc_id = aws_vpc.main.id</span><br/>
+            <span className="pl-4">cidr_block = <span className="text-emerald-400">"10.0.1.0/24"</span></span><br/>
+            {"}"}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderAwsConfigView = () => (
+    <div className="flex-1 overflow-y-auto p-8 custom-scrollbar relative z-10 w-full max-w-4xl mx-auto space-y-6 animate-fade-in">
+      <div className="border-b border-[#1A1A1A] pb-6 mb-6 mt-4">
+        <h1 className="text-2xl font-semibold text-zinc-100 mb-2">AWS Configuration</h1>
+        <p className="text-sm text-zinc-400">Provide deploy-time credentials.</p>
+      </div>
+
+      <div className="bg-[#050505] border border-[#1A1A1A] rounded-lg p-6 space-y-6">
+        <div className="space-y-4">
+          <div>
+            <label className="block text-[10px] font-bold text-zinc-500 uppercase mb-2">AWS_ACCESS_KEY_ID</label>
+            <input type="text" value={awsKey} onChange={e => setAwsKey(e.target.value)} className="w-full bg-[#000000] border border-[#262626] rounded-md px-4 py-2.5 text-sm text-zinc-200 font-mono focus:border-indigo-500/50 focus:outline-none transition-colors" />
+          </div>
+          <div>
+            <label className="block text-[10px] font-bold text-zinc-500 uppercase mb-2">AWS_SECRET_ACCESS_KEY</label>
+            <input type="password" value={awsSecret} onChange={e => setAwsSecret(e.target.value)} placeholder="Required" className="w-full bg-[#000000] border border-[#262626] rounded-md px-4 py-2.5 text-sm text-zinc-200 font-mono focus:border-indigo-500/50 focus:outline-none transition-colors" />
+          </div>
+        </div>
+        
+        <div className="pt-4 border-t border-[#1A1A1A]">
+           {awsSecret ? (
+             <button onClick={startDeploy} className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-md transition-colors flex items-center justify-center gap-2"><Rocket className="w-4 h-4" /> Start Deployment</button>
+           ) : (
+             <button disabled className="w-full py-3 bg-[#111111] text-zinc-500 font-semibold rounded-md cursor-not-allowed">Awaiting Credentials</button>
+           )}
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderDeployView = () => (
+    <div className="flex-1 overflow-y-auto p-8 custom-scrollbar relative z-10 w-full max-w-5xl mx-auto space-y-6 animate-fade-in">
+      <div className="flex items-center justify-between mb-2">
+        <h1 className="text-2xl font-semibold text-zinc-100">{deployActive ? 'Deploying...' : 'Deployment Complete'}</h1>
+        {deployActive && <span className="flex h-2 w-2 relative"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span><span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span></span>}
+      </div>
+
+      <div className="bg-[#050505] border border-[#1A1A1A] rounded-lg flex flex-col h-[500px] overflow-hidden">
+        <div className="px-4 py-2.5 border-b border-[#1A1A1A] bg-[#000000] flex items-center gap-2 text-xs font-mono text-zinc-500">
+          <Terminal className="w-4 h-4 text-zinc-400" /> STDOUT
+        </div>
+        <div className="flex-1 p-6 font-mono text-[13px] overflow-y-auto custom-scrollbar bg-[#000000]">
+          {deployLogs.map((log, i) => {
+            if (log == null) return null;
+            const logText = String(log);
+            return (
+              <div key={i} className="flex gap-4 mb-1 animate-fade-in">
+                <span className="text-zinc-600 shrink-0">{(i+1).toString().padStart(2, '0')}</span>
+                <span className={logText.includes('[success]') ? 'text-emerald-400 font-medium' : 'text-zinc-300'}>{logText}</span>
+              </div>
+            );
+          })}
+          {deployActive && <div className="text-zinc-600 mt-2 animate-pulse">_</div>}
+          <div ref={logEndRef} />
+        </div>
+      </div>
+
+      {deployFinished && (
+        <div className="flex justify-end animate-fade-in pt-4">
+          <button onClick={() => setActiveStage('outputs')} className="px-6 py-2.5 bg-zinc-100 text-black font-semibold rounded-md hover:bg-white transition-colors flex items-center gap-2">
+            View Outputs <ArrowRight className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
+  const renderOutputsView = () => (
+    <div className="flex-1 overflow-y-auto p-8 custom-scrollbar relative z-10 w-full max-w-5xl mx-auto space-y-6 animate-fade-in">
+      <div className="mb-8 border-b border-[#1A1A1A] pb-6 mt-4">
+        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-[11px] font-bold uppercase mb-4 border border-emerald-500/20">
+          <CheckCircle2 className="w-3.5 h-3.5" /> Deployed
+        </div>
+        <h1 className="text-2xl font-semibold text-zinc-100 mb-2">Live Infrastructure</h1>
+        <p className="text-sm text-zinc-400">Access details and endpoints.</p>
+      </div>
+
+      <div className="grid grid-cols-2 gap-6">
+        <div className="bg-[#050505] border border-[#1A1A1A] rounded-lg p-6">
+          <h3 className="text-[10px] font-bold text-zinc-500 uppercase mb-6 flex items-center gap-2"><KeyRound className="w-4 h-4" /> Security</h3>
+          <div className="space-y-4">
+             <div className="p-4 bg-[#000000] border border-[#262626] rounded-md">
+               <p className="text-xs text-zinc-400 mb-3">SSH Key Pair</p>
+               <button className="w-full py-2 bg-[#111111] hover:bg-[#1A1A1A] text-zinc-200 border border-[#262626] text-[12px] font-medium rounded-md transition-colors flex items-center justify-center gap-2"><Download className="w-4 h-4" /> Download .PEM</button>
+             </div>
+             <div>
+               <p className="text-xs text-zinc-400 mb-1">Connect</p>
+               <div className="p-3 bg-[#000000] border border-[#262626] rounded-md font-mono text-[11px] text-zinc-300 flex justify-between">
+                 <span>ssh -i "key.pem" ec2-user@13.51.244.101</span>
+               </div>
+             </div>
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-6">
+          <div className="bg-[#050505] border border-[#1A1A1A] rounded-lg p-6">
+             <h3 className="text-[10px] font-bold text-zinc-500 uppercase mb-4 flex items-center gap-2"><Globe className="w-4 h-4" /> Endpoints</h3>
+             <div className="space-y-4">
+               <div>
+                 <p className="text-[10px] text-zinc-500 mb-1 uppercase font-bold">Public IPv4</p>
+                 <span className="text-sm font-mono text-zinc-200">13.51.244.101</span>
+               </div>
+             </div>
+          </div>
+
+          <div className="bg-[#050505] border border-[#1A1A1A] rounded-lg p-6 flex-1">
+             <h3 className="text-[10px] font-bold text-zinc-500 uppercase mb-4 flex items-center gap-2"><Cpu className="w-4 h-4" /> Compute</h3>
+             <div className="space-y-3 text-sm">
+               <div className="flex justify-between border-b border-[#1A1A1A] pb-2"><span className="text-zinc-400">Instance ID</span><span className="text-zinc-200 font-mono">i-0x7291be82</span></div>
+               <div className="flex justify-between border-b border-[#1A1A1A] pb-2"><span className="text-zinc-400">Type</span><span className="text-zinc-200">t3.micro</span></div>
+               <div className="flex justify-between pt-1"><span className="text-zinc-400">State</span><span className="text-emerald-400 font-medium">running</span></div>
+             </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="relative flex h-screen bg-[#000000] text-zinc-300 font-sans selection:bg-indigo-500/30 overflow-hidden">
+      <div className="absolute inset-0 z-0 opacity-20 pointer-events-none">
+        <PixelBlast variant="diamond" color="#3f3f46" pixelSize={4} patternScale={2} patternDensity={0.6} speed={0.1} noiseAmount={0.03} transparent={true} />
+      </div>
+
+      {/* --- SIDEBAR --- */}
+      <aside className="relative z-20 w-[260px] border-r border-[#1A1A1A] bg-[#050505] flex flex-col shrink-0 h-full">
+        <div className="h-16 flex items-center px-6 border-b border-[#1A1A1A]">
+          <div className="flex items-center gap-3">
+            <div className="w-6 h-6 rounded bg-[#111111] border border-[#262626] flex items-center justify-center text-white font-bold text-xs">N</div>
+            <span className="text-white font-semibold text-sm tracking-wide">DepLAI</span>
+          </div>
+        </div>
+        
+        <div className="flex-1 overflow-y-auto custom-scrollbar py-6 space-y-1 px-3">
+          {SIDEBAR_STAGES.map((stage, idx) => {
+            const status = getStageStatus(stage.id);
+            const isActive = status === 'active';
+            const isCompleted = status === 'completed';
+            const isLocked = status === 'locked';
+
+            return (
+              <div 
+                key={stage.id} 
+                onClick={() => !isLocked && setActiveStage(stage.id as PipelineStageId)}
+                className={`px-3 py-2 rounded-md flex items-center gap-3 transition-colors ${isLocked ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'} ${isActive ? 'bg-[#111111] text-zinc-100' : 'hover:bg-[#0A0A0A] text-zinc-400'}`}
+              >
+                <div className="shrink-0 flex items-center justify-center">
+                  {isCompleted ? <CheckCircle2 className="w-4 h-4 text-emerald-500" /> : isActive ? <CircleDashed className="w-4 h-4 text-indigo-500 animate-spin" /> : <div className="w-4 h-4 rounded-full border border-zinc-700"></div>}
+                </div>
+                <span className="text-[13px] font-medium">{stage.label}</span>
+              </div>
+            );
+          })}
+        </div>
+      </aside>
+
+      {/* --- MAIN CONTENT --- */}
+      <div className="flex-1 flex flex-col h-full overflow-hidden bg-transparent">
+        <header className="h-16 flex items-center justify-between px-8 border-b border-[#1A1A1A] bg-[#050505]/90 backdrop-blur-md relative z-20">
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-zinc-500 font-medium">{SIDEBAR_STAGES.find(s => s.id === activeStage)?.label}</span>
+          </div>
+          {selectedRepo && (
+             <div className="flex items-center gap-3">
+               <span className="text-xs text-zinc-400 bg-[#111111] px-3 py-1.5 rounded-md border border-[#262626] font-mono">{selectedRepo.name}</span>
+               <button onClick={() => alert("Exiting Deployment Track")} className="text-xs font-semibold text-zinc-400 hover:text-white transition-colors">Exit</button>
+             </div>
+          )}
+        </header>
+
+        {activeStage === 'analysis' && renderAnalysisView()}
+        {activeStage === 'qa' && renderQaView()}
+        {activeStage === 'architecture' && renderArchitectureView()}
+        {activeStage === 'approval' && renderApprovalView()}
+        {activeStage === 'terraform' && renderTerraformView()}
+        {activeStage === 'aws_config' && renderAwsConfigView()}
+        {activeStage === 'deploy' && renderDeployView()}
+        {activeStage === 'outputs' && renderOutputsView()}
+      </div>
+      
+      <style dangerouslySetInnerHTML={{__html: `
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #262626; border-radius: 10px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background-color: #3f3f46; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-fade-in { animation: fadeIn 0.3s ease-out forwards; }
+      `}} />
+    </div>
+  );
+}

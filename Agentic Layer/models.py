@@ -1,8 +1,8 @@
 import re
 from enum import Enum
 from datetime import datetime, timezone
-from pydantic import BaseModel, field_validator
-from typing import Literal, Optional
+from pydantic import BaseModel, Field, field_validator
+from typing import Any, Literal, Optional
 from architecture_contract import ArchitectureDocument
 
 # Allowlist for project_id — alphanumeric, hyphens, underscores only, 1-80 chars.
@@ -146,20 +146,40 @@ class CostEstimateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class TerraformGenRequest(BaseModel):
-    architecture_json: ArchitectureDocument
+    architecture_json: dict[str, Any]
     provider: str = "aws"
     project_name: str = "deplai-project"
+    workspace: str = "default"
+    state_bucket: str = ""
+    lock_table: str = ""
+    aws_region: str = "eu-north-1"
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
     qa_summary: Optional[str] = None
     openai_api_key: Optional[str] = None
+    refresh_docs: Optional[bool] = False
+    llm_provider: Optional[str] = None
+    llm_api_key: Optional[str] = None
+    llm_model: Optional[str] = None
+    website_index_html: Optional[str] = None
 
 
 class TerraformGenResponse(BaseModel):
     success: bool
     provider: str = ""
     project_name: str = ""
+    run_id: Optional[str] = None
+    workspace: Optional[str] = None
+    provider_version: Optional[str] = None
+    state_bucket: Optional[str] = None
+    lock_table: Optional[str] = None
+    manifest: Optional[list] = None
+    dag_order: Optional[list[str]] = None
+    warnings: Optional[list[str]] = None
     files: Optional[list] = None
     readme: Optional[str] = None
     source: Optional[str] = None
+    details: Optional[dict] = None
     error: Optional[str] = None
 
 
@@ -177,7 +197,11 @@ class TerraformApplyRequest(BaseModel):
     project_id: Optional[str] = None
     project_name: str = "deplai-project"
     provider: str = "aws"
-    files: list[TerraformApplyFile]
+    run_id: Optional[str] = None
+    workspace: Optional[str] = None
+    state_bucket: Optional[str] = None
+    lock_table: Optional[str] = None
+    files: list[TerraformApplyFile] = Field(default_factory=list)
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
     aws_region: Optional[str] = None

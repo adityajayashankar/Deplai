@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { timingSafeEqual } from 'crypto';
 import { getIronSession } from 'iron-session';
 import { cookies } from 'next/headers';
 import { sessionOptions, SessionData } from '@/lib/session';
@@ -45,13 +46,34 @@ function fetchGitHub(endpoint: string, accessToken: string) {
   });
 }
 
+function safeStateMatches(expected: string, actual: string): boolean {
+  const expectedBuf = Buffer.from(expected);
+  const actualBuf = Buffer.from(actual);
+  if (expectedBuf.length !== actualBuf.length) return false;
+  return timingSafeEqual(expectedBuf, actualBuf);
+}
+
 export async function GET(request: NextRequest) {
   try {
+    const cookieStore = await cookies();
+    const session = await getIronSession<SessionData>(cookieStore, sessionOptions);
     const { searchParams } = new URL(request.url);
     const code = searchParams.get('code');
+    const returnedState = String(searchParams.get('state') || '').trim();
+
+    const expectedState = String(session.oauthState || '').trim();
+    const stateExpiresAt = Number(session.oauthStateExpiresAt || 0);
+
+    session.oauthState = undefined;
+    session.oauthStateExpiresAt = undefined;
 
     if (!code) {
+      await session.save();
       return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=no_code`);
+    }
+    if (!expectedState || !returnedState || !stateExpiresAt || Date.now() > stateExpiresAt || !safeStateMatches(expectedState, returnedState)) {
+      await session.save();
+      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=auth_failed`);
     }
 
     const tokenResponse = await fetch('https://github.com/login/oauth/access_token', {
@@ -64,31 +86,48 @@ export async function GET(request: NextRequest) {
         client_id: process.env.GITHUB_CLIENT_ID,
         client_secret: process.env.GITHUB_CLIENT_SECRET,
         code,
+        state: returnedState,
       }),
     });
 
     const tokenData = await tokenResponse.json() as { access_token?: string; error?: string };
 
-    if (tokenData.error) {
+    if (!tokenResponse.ok || tokenData.error) {
+      await session.save();
       return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=token_error`);
     }
 
     const accessToken = tokenData.access_token;
     if (!accessToken) {
+      await session.save();
       return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=token_missing`);
     }
 
-    const [githubUser, emails] = await Promise.all([
-      fetchGitHub('/user', accessToken).then(r => r.json() as Promise<GitHubUser>),
-      fetchGitHub('/user/emails', accessToken).then(r => r.json() as Promise<GitHubEmail[]>),
+    const [githubUserResponse, emailsResponse] = await Promise.all([
+      fetchGitHub('/user', accessToken),
+      fetchGitHub('/user/emails', accessToken),
     ]);
+
+    if (!githubUserResponse.ok || !emailsResponse.ok) {
+      await session.save();
+      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=auth_failed`);
+    }
+
+    const githubUser = await githubUserResponse.json() as GitHubUser;
+    const emails = await emailsResponse.json() as GitHubEmail[];
+
+    if (!githubUser?.id || !githubUser?.login) {
+      await session.save();
+      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=auth_failed`);
+    }
 
     const primaryEmail = emails.find((e) => e.primary)?.email || emails[0]?.email;
     if (!primaryEmail) {
+      await session.save();
       return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=no_email`);
     }
 
-    let [user] = await query<any[]>(
+    let [user] = await query<Array<{ id: string }>>(
       'SELECT id FROM users WHERE email = ?',
       [primaryEmail]
     );
@@ -102,8 +141,6 @@ export async function GET(request: NextRequest) {
       user = { id: userId };
     }
 
-    const cookieStore = await cookies();
-    const session = await getIronSession<SessionData>(cookieStore, sessionOptions);
     session.user = {
       id: user.id,
       githubId: githubUser.id,

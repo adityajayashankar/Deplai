@@ -1,9 +1,9 @@
 ﻿import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
-import { validateArchitectureJson } from '@/lib/architecture-contract';
-import { query } from '@/lib/db';
+import { validateTerraformArchitectureInput } from '@/lib/deployment-planning-contract';
 import { githubService } from '@/lib/github';
+import { resolveProjectMeta as resolveSharedProjectMeta, resolveProjectSourceRoot as resolveSharedProjectSourceRoot } from '@/lib/project-meta';
 import fs from 'fs';
 import path from 'path';
 
@@ -23,6 +23,16 @@ interface IacGenerateBody {
   architecture_json?: Record<string, unknown>;
   // Optional: OpenAI key forwarded to the IaC generator
   openai_api_key?: string;
+  aws_access_key_id?: string;
+  aws_secret_access_key?: string;
+  aws_region?: string;
+  workspace?: string;
+  state_bucket?: string;
+  lock_table?: string;
+  refresh_docs?: boolean;
+  llm_provider?: string;
+  llm_api_key?: string;
+  llm_model?: string;
 }
 
 interface GeneratedFile {
@@ -45,6 +55,26 @@ interface RepoPersistenceResult {
   reason?: string;
   error?: string;
   files_committed?: number;
+}
+
+function classifyAgenticRouteError(err: unknown, action: string): { message: string; status: number } {
+  const raw = err instanceof Error ? err.message : String(err || 'unknown upstream error');
+  const lowered = raw.toLowerCase();
+  if (
+    lowered.includes('fetch failed') ||
+    lowered.includes('econnrefused') ||
+    lowered.includes('enotfound') ||
+    lowered.includes('network')
+  ) {
+    return {
+      message: `Agentic Layer is unavailable while trying to ${action}. Start the service at ${AGENTIC_URL} and retry.`,
+      status: 502,
+    };
+  }
+  return {
+    message: raw || `${action} failed.`,
+    status: 500,
+  };
 }
 
 const INDEX_HTML_CANDIDATES = [
@@ -525,65 +555,14 @@ async function resolveProjectSourceRoot(
   userId: string,
   projectId: string,
 ): Promise<string | null> {
-  const meta = await resolveProjectMeta(userId, projectId);
-  if (!meta) return null;
-
-  if (meta.project_type === 'github' && meta.repo_full_name && meta.installation_uuid) {
-    const [owner, repo] = meta.repo_full_name.split('/');
-    if (owner && repo) {
-      try {
-        const repoRoot = await githubService.ensureRepoFresh(meta.installation_uuid, owner, repo);
-        if (repoRoot && fs.existsSync(repoRoot) && fs.statSync(repoRoot).isDirectory()) {
-          return repoRoot;
-        }
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-
-  const localBase = path.join(process.cwd(), 'tmp', 'local-projects', userId, projectId);
-  if (fs.existsSync(localBase) && fs.statSync(localBase).isDirectory()) {
-    return localBase;
-  }
-
-  return null;
+  return resolveSharedProjectSourceRoot(userId, projectId);
 }
 
 async function resolveProjectMeta(
   userId: string,
   projectId: string,
 ): Promise<ProjectMetaRow | null> {
-  let rows = await query<ProjectMetaRow[]>(
-    `SELECT
-      p.project_type,
-      gr.full_name AS repo_full_name,
-      gi.id AS installation_uuid
-    FROM projects p
-    LEFT JOIN github_repositories gr ON p.repository_id = gr.id
-    LEFT JOIN github_installations gi ON gr.installation_id = gi.id
-    WHERE p.id = ?`,
-    [projectId],
-  );
-
-  // For GitHub selections, the dashboard project id is usually github_repositories.id,
-  // not projects.id. Fall back to resolving metadata directly from github_repositories.
-  if (!rows[0]) {
-    rows = await query<ProjectMetaRow[]>(
-      `SELECT
-        'github' AS project_type,
-        gr.full_name AS repo_full_name,
-        gi.id AS installation_uuid
-      FROM github_repositories gr
-      JOIN github_installations gi ON gr.installation_id = gi.id
-      LEFT JOIN projects p ON p.repository_id = gr.id
-      WHERE gr.id = ? AND (gi.user_id = ? OR p.user_id = ?)
-      LIMIT 1`,
-      [projectId, userId, userId],
-    );
-  }
-  return rows[0] || null;
+  return resolveSharedProjectMeta(userId, projectId) as Promise<ProjectMetaRow | null>;
 }
 
 function normalizeRepoWritePath(filePath: string): string {
@@ -1142,9 +1121,14 @@ resource "aws_instance" "app" {
 
   user_data = <<-EOF
               #!/bin/bash
+              set -euxo pipefail
+              dnf install -y nginx
+              mkdir -p /usr/share/nginx/html
               cat > /usr/share/nginx/html/index.html <<'HTML'
               \${base64decode(var.bootstrap_index_html_base64)}
               HTML
+              systemctl enable nginx
+              systemctl restart nginx
               EOF
 }
 
@@ -1514,7 +1498,7 @@ export async function POST(req: NextRequest) {
     const qa = String(body.qa_summary || '').trim();
     const arch = String(body.architecture_context || '').trim();
     const architectureValidation = body.architecture_json
-      ? validateArchitectureJson(body.architecture_json)
+      ? validateTerraformArchitectureInput(body.architecture_json)
       : null;
     if (architectureValidation && !architectureValidation.valid) {
       return NextResponse.json(
@@ -1540,6 +1524,7 @@ export async function POST(req: NextRequest) {
 
     let scanData: ScanResultsData = {};
     let scanStatus = 'not_initiated';
+    const scanContextWarnings: string[] = [];
     try {
       const scanStatusRes = await fetch(`${AGENTIC_URL}/api/scan/status/${projectId}`, {
         headers: agenticHeaders(),
@@ -1555,41 +1540,29 @@ export async function POST(req: NextRequest) {
     }
 
     if (scanStatus === 'running') {
-      return NextResponse.json(
-        { error: 'Scan is still running for this project. Wait for completion before generating Terraform.' },
-        { status: 409 },
-      );
-    }
-    if (scanStatus === 'not_initiated') {
-      return NextResponse.json(
-        {
-          error: 'No scan results found for this project. Run a scan first, then generate Terraform.',
-          requires_scan: true,
-        },
-        { status: 400 },
-      );
-    }
-    if (scanStatus === 'error') {
-      return NextResponse.json(
-        {
-          error: 'Latest scan ended with an error. Re-run scan successfully before generating Terraform.',
-          requires_scan: true,
-        },
-        { status: 400 },
-      );
-    }
-
-    try {
-      const scanRes = await fetch(`${AGENTIC_URL}/api/scan/results/${projectId}`, {
-        headers: agenticHeaders(),
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (scanRes.ok) {
-        const payload = await scanRes.json() as { data?: ScanResultsData };
-        scanData = payload.data || {};
+      scanContextWarnings.push('Security scan is still running; generating Terraform without attached security context.');
+    } else if (scanStatus === 'not_initiated') {
+      scanContextWarnings.push('No security scan found for this project; generating Terraform without attached security context.');
+    } else if (scanStatus === 'error') {
+      scanContextWarnings.push('Latest security scan ended with an error; proceeding without attached security context.');
+    } else if (scanStatus === 'unknown') {
+      scanContextWarnings.push('Security scan status could not be determined; proceeding without attached security context.');
+    } else {
+      try {
+        const scanRes = await fetch(`${AGENTIC_URL}/api/scan/results/${projectId}`, {
+          headers: agenticHeaders(),
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (scanRes.ok) {
+          const payload = await scanRes.json() as { data?: ScanResultsData };
+          scanData = payload.data || {};
+        } else {
+          scanContextWarnings.push('Security scan exists but its results could not be loaded; proceeding without attached security context.');
+        }
+      } catch {
+        scanData = {};
+        scanContextWarnings.push('Security scan results fetch failed; proceeding without attached security context.');
       }
-    } catch {
-      scanData = {};
     }
 
     const sec = summarizeSecurity(scanData);
@@ -1603,58 +1576,6 @@ export async function POST(req: NextRequest) {
     ].filter(Boolean).join('\n');
 
     const iacWarnings: string[] = [];
-    if (hasArchitectureJson) {
-      try {
-        const llmRes = await fetch(`${AGENTIC_URL}/api/terraform/generate`, {
-          method: 'POST',
-          headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            architecture_json: architectureValidation?.normalized,
-            provider,
-            project_name: projectName,
-            qa_summary: qa || null,
-            openai_api_key: body.openai_api_key || null,
-          }),
-          signal: AbortSignal.timeout(300_000),
-        });
-        const llmData = await llmRes.json() as {
-          success: boolean; source?: string; files?: GeneratedFile[];
-          readme?: string; error?: string;
-        };
-        const normalizedError = String(llmData.error || '')
-          .replace(/rag agent unavailable/ig, 'Terraform agent unavailable')
-          .replace(/terraform rag agent/ig, 'Terraform agent')
-          .replace(/use template fallback/ig, '')
-          .trim();
-        const normalizedSource = String(llmData.source || '')
-          .replace(/rag_agent/ig, 'terraform_agent')
-          .trim();
-
-        if (llmData.success && Array.isArray(llmData.files) && llmData.files.length > 0) {
-          const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, llmData.files);
-          return NextResponse.json({
-            success: true,
-            provider,
-            project_id: projectId,
-            project_name: projectName,
-            summary: `Generated ${llmData.files.length} IaC files via Terraform agent.`,
-            files: llmData.files,
-            security_context: sec,
-            source: normalizedSource || 'terraform_agent',
-            iac_repo_pr: iacRepoPr,
-          });
-        }
-
-        iacWarnings.push(
-          `Terraform agent failed (${normalizedError || 'no files returned'}). Falling back to standard template.`,
-        );
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Terraform agent request failed';
-        iacWarnings.push(`Terraform agent failed (${msg}). Falling back to standard template.`);
-      }
-    } else {
-      iacWarnings.push('architecture_json missing; falling back to standard template.');
-    }
     const sourceRoot = provider === 'aws'
       ? await resolveProjectSourceRoot(String(user.id), projectId)
       : null;
@@ -1721,28 +1642,73 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const awsProjectSlug = toAwsProjectSlug(projectName);
+    if (provider === 'aws') {
+      if (!hasArchitectureJson) {
+        return NextResponse.json(
+          { error: 'AWS Terraform generation requires architecture_json.' },
+          { status: 400 },
+        );
+      }
 
-    // Template fallback
+      const safeProjectSlug = toAwsProjectSlug(projectName);
+      const files = [
+        ...buildAwsSixFileBundle(projectName, safeProjectSlug, contextBlock, sec, websiteIndexHtml),
+        ...buildWebsiteSiteFiles(websiteAssets, websiteIndexHtml),
+      ];
+      const allWarnings = [
+        ...scanContextWarnings,
+        ...iacWarnings,
+        'Generated Terraform bundle locally from repository analysis, interactive Q&A context, and the selected AWS region.',
+        'Terraform files use a local backend by default. AWS credentials are only needed later for apply/deploy.',
+      ];
+      const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, files);
+      if (iacRepoPr.attempted && !iacRepoPr.success) {
+        const persistenceMsg = iacRepoPr.error || iacRepoPr.reason || 'IaC repo persistence failed.';
+        allWarnings.push(`IaC PR persistence: ${persistenceMsg}`);
+      }
+
+      return NextResponse.json({
+        success: true,
+        provider,
+        project_id: projectId,
+        project_name: projectName,
+        summary: `Generated ${files.length} Terraform files from repository analysis and operator context.`,
+        files,
+        security_context: sec,
+        source: 'connector_aws_bundle',
+        run_id: null,
+        workspace: null,
+        provider_version: null,
+        state_bucket: null,
+        lock_table: null,
+        manifest: [],
+        dag_order: [],
+        iac_repo_pr: iacRepoPr,
+        warnings: allWarnings,
+        website_asset_stats: {
+          selected_root: websiteCollection?.selectedRoot || '',
+          asset_count: websiteAssets.length,
+          total_bytes: websiteCollection?.totalBytes || 0,
+          truncated: Boolean(websiteCollection?.truncated),
+          skipped_large_files: websiteCollection?.skippedLargeFiles || 0,
+          entrypoint: websiteEntrypoint.relativePath,
+        },
+        frontend_entrypoint_detection: frontendDetection,
+      });
+    }
+
     const files = provider === 'azure'
       ? buildAzureBundle(projectName, contextBlock, sec)
-      : provider === 'gcp'
-        ? buildGcpBundle(projectName, contextBlock, sec)
-        : buildAwsSixFileBundle(
-          projectName,
-          awsProjectSlug,
-          contextBlock,
-          sec,
-          websiteIndexHtml,
-        );
+      : buildGcpBundle(projectName, contextBlock, sec);
     const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, files);
     if (iacRepoPr.attempted && !iacRepoPr.success) {
       const persistenceMsg = iacRepoPr.error || iacRepoPr.reason || 'IaC repo persistence failed.';
       iacWarnings.push(`IaC PR persistence: ${persistenceMsg}`);
     }
 
-    const summary = provider === 'aws' && iacWarnings.length > 0
-      ? `Generated ${files.length} IaC files for ${provider.toUpperCase()} with ${iacWarnings.length} packaging warning(s).`
+    const combinedWarnings = [...scanContextWarnings, ...iacWarnings];
+    const summary = combinedWarnings.length > 0
+      ? `Generated ${files.length} IaC files for ${provider.toUpperCase()} with ${combinedWarnings.length} warning(s).`
       : `Generated ${files.length} IaC files for ${provider.toUpperCase()}.`;
 
     return NextResponse.json({
@@ -1755,22 +1721,13 @@ export async function POST(req: NextRequest) {
       security_context: sec,
       source: 'template',
       iac_repo_pr: iacRepoPr,
-      warnings: iacWarnings,
-      website_asset_stats: provider === 'aws'
-        ? {
-          selected_root: websiteCollection?.selectedRoot || '',
-          asset_count: websiteAssets.length,
-          total_bytes: websiteCollection?.totalBytes || 0,
-          truncated: Boolean(websiteCollection?.truncated),
-          skipped_large_files: websiteCollection?.skippedLargeFiles || 0,
-          entrypoint: websiteEntrypoint.relativePath,
-        }
-        : null,
-      frontend_entrypoint_detection: provider === 'aws' ? frontendDetection : null,
+      warnings: combinedWarnings,
+      website_asset_stats: null,
+      frontend_entrypoint_detection: null,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Failed to generate IaC bundle';
-    return NextResponse.json({ error: msg }, { status: 500 });
+    const classified = classifyAgenticRouteError(err, 'generate Terraform and Ansible files');
+    return NextResponse.json({ error: classified.message }, { status: classified.status });
   }
 }
 

@@ -36,6 +36,14 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition> = {
     security_sensitive_params: ['github_token'],
     risk_level: 'high',
   },
+  plan_deployment: {
+    name: 'plan_deployment',
+    description: 'Launch the repository analyzer and open the deployment planning wizard for a project.',
+    required_params: ['project_id', 'project_name'],
+    optional_params: [],
+    security_sensitive_params: [],
+    risk_level: 'low',
+  },
   create_github_repo: {
     name: 'create_github_repo',
     description: 'Create a new GitHub repository and push generated files to it.',

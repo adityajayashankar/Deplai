@@ -1,0 +1,1713 @@
+'use client';
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { ArrowRight, Bot, CheckCircle2, ChevronRight, CircleDashed, Download, ExternalLink, RefreshCw, Rocket, Send, Server, Terminal, User } from 'lucide-react';
+import { buildDeploymentWorkspace } from '@/lib/deployment-planning-contract';
+import {
+  APPROVAL_PAYLOAD_KEY,
+  ARCHITECTURE_VIEW_KEY,
+  COST_ESTIMATE_KEY,
+  CURRENT_STAGE_STORAGE_PREFIX,
+  DEPLOYMENT_PROFILE_KEY,
+  DEPLOY_HISTORY_MAX,
+  IAC_FILES_KEY,
+  IAC_RUN_KEY,
+  PLANNING_PROJECT_KEY,
+  QA_CONTEXT_KEY,
+  REPO_CONTEXT_MD_KEY,
+  REVIEW_ANSWERS_KEY,
+  REVIEW_PAYLOAD_KEY,
+  SELECTED_PROJECT_STORAGE_KEY,
+  clearPlanningState,
+  downloadTextFile,
+  extractDeploymentSummary,
+  loadDeploySnapshot,
+  loadDeployUiStage,
+  persistDeploySnapshot,
+  readIacFilesFromSession,
+  readSavedAws,
+  readSavedIacRun,
+  readStoredJson,
+  saveDeployUiStage,
+  toHistoryEntry,
+  type ArchitectureReviewPayload,
+  type AwsSessionConfig,
+  type DeployApiResult,
+  type DeployStateSnapshot,
+  type GeneratedIacFile,
+  type ProjectRecord,
+  type RepositoryContextJson,
+  writeSavedAws,
+  writeStoredJson,
+} from './state';
+
+type PipelineStageId = 'analysis' | 'qa' | 'architecture' | 'approval' | 'terraform' | 'aws_config' | 'deploy' | 'outputs';
+
+type QaMessage = { sender: 'agent' | 'user'; text: string; questionId?: string; timestamp: string };
+
+const SIDEBAR_STAGES: Array<{ id: PipelineStageId; label: string; details: string }> = [
+  { id: 'analysis', label: 'Repository Analysis', details: 'Codebase Scan' },
+  { id: 'qa', label: 'Questions', details: 'Interactive Q&A' },
+  { id: 'architecture', label: 'Architecture', details: 'Diagram + Cost' },
+  { id: 'approval', label: 'Approval', details: 'Sign-off' },
+  { id: 'terraform', label: 'Terraform', details: 'IaC Generation' },
+  { id: 'aws_config', label: 'AWS Config', details: 'GitOps & Secrets' },
+  { id: 'deploy', label: 'Deploy', details: 'Execution' },
+  { id: 'outputs', label: 'Outputs', details: 'Credentials & URLs' },
+];
+
+function timestampLabel(date = new Date()) {
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function buildQaTranscript(review: ArchitectureReviewPayload | null, answers: Record<string, string>) {
+  if (!review) return { messages: [] as QaMessage[], unansweredIndex: 0 };
+  const messages: QaMessage[] = [];
+  let unansweredIndex = review.questions.length;
+  review.questions.forEach((question, index) => {
+    messages.push({ sender: 'agent', text: question.question, questionId: question.id, timestamp: timestampLabel() });
+    const answer = answers[question.id];
+    if (answer?.trim()) {
+      const label = question.options?.find((option) => option.value === answer)?.label || answer;
+      messages.push({ sender: 'user', text: label, questionId: question.id, timestamp: timestampLabel() });
+    } else if (unansweredIndex === review.questions.length) {
+      unansweredIndex = index;
+    }
+  });
+  if (unansweredIndex === review.questions.length && review.questions.length > 0) unansweredIndex = review.questions.length - 1;
+  return { messages, unansweredIndex };
+}
+
+function readCostEstimate() {
+  const raw = readStoredJson<{ total_monthly_usd?: number; budget_cap_usd?: number }>(COST_ESTIMATE_KEY);
+  return { total: Number(raw?.total_monthly_usd || 0), cap: Number(raw?.budget_cap_usd || 100) };
+}
+
+type RuntimeArchNode = {
+  id: string;
+  label: string;
+  type: string;
+};
+
+type RuntimeArchEdge = {
+  from: string;
+  to: string;
+  label?: string;
+};
+
+type RuntimeCostItem = {
+  service: string;
+  type: string;
+  monthly: number;
+  note: string;
+};
+
+type ApprovalPayload = {
+  diagram?: {
+    nodes?: Array<Record<string, unknown>>;
+    edges?: Array<Record<string, unknown>>;
+    region?: string;
+  };
+  cost_estimate?: {
+    line_items?: unknown;
+    total_monthly_usd?: number;
+  };
+  budget_gate?: {
+    cap_usd?: number;
+  };
+};
+
+type PipelineSocketState = 'idle' | 'connecting' | 'connected' | 'error';
+
+type DeployStatusResponse = {
+  success?: boolean;
+  status?: string;
+  result?: unknown;
+  error?: string;
+};
+
+type EndpointVerificationCheck = {
+  label: string;
+  url: string;
+  ok: boolean;
+  status: number | null;
+  detail: string;
+};
+
+type OutputBannerState = {
+  tone: 'success' | 'warning' | 'error';
+  label: string;
+  title: string;
+  description: string;
+};
+
+type AwsRuntimeLiveInstance = {
+  instance_id?: string;
+  public_ipv4_address?: string;
+  private_ipv4_address?: string;
+  instance_state?: string;
+  instance_type?: string;
+  public_dns?: string;
+  private_dns?: string;
+  vpc_id?: string;
+  subnet_id?: string;
+  instance_arn?: string;
+};
+
+type AwsRuntimeLiveCounts = {
+  ec2_instances_total?: number;
+  ec2_instances_running?: number;
+  vpcs?: number;
+  subnets?: number;
+  nat_gateways?: number;
+  internet_gateways?: number;
+  route_tables?: number;
+  security_groups?: number;
+  key_pairs?: number;
+  s3_buckets?: number;
+  cloudfront_distributions?: number;
+};
+
+type AwsRuntimeLiveDetails = {
+  region?: string;
+  account_id?: string;
+  instance?: AwsRuntimeLiveInstance;
+  resource_counts?: AwsRuntimeLiveCounts;
+};
+
+type DeployStatus = DeployStateSnapshot['status'];
+type DeployLog = DeployStateSnapshot['logs'][number];
+
+type ActiveDeployState = {
+  status: DeployStatus;
+  progress: number;
+  logs: DeployLog[];
+  deployResult: DeployApiResult | null;
+  deploymentHistory: DeployStateSnapshot['deploymentHistory'];
+  updatedAt?: string;
+};
+
+type ActiveDeployEntry = {
+  state: ActiveDeployState;
+  listeners: Set<(state: ActiveDeployState) => void>;
+  inFlight: boolean;
+};
+
+const activeDeployments = new Map<string, ActiveDeployEntry>();
+
+function toDeployState(snapshot?: Partial<ActiveDeployState>): ActiveDeployState {
+  return {
+    status: snapshot?.status === 'running' || snapshot?.status === 'done' || snapshot?.status === 'error' ? snapshot.status : 'idle',
+    progress: Number.isFinite(snapshot?.progress) ? Number(snapshot?.progress) : 0,
+    logs: Array.isArray(snapshot?.logs) ? snapshot.logs : [],
+    deployResult: snapshot?.deployResult && typeof snapshot.deployResult === 'object' ? snapshot.deployResult : null,
+    deploymentHistory: Array.isArray(snapshot?.deploymentHistory) ? snapshot.deploymentHistory : [],
+    updatedAt: typeof snapshot?.updatedAt === 'string' ? snapshot.updatedAt : undefined,
+  };
+}
+
+function getOrCreateActiveDeployment(projectId: string, seed?: Partial<ActiveDeployState>): ActiveDeployEntry {
+  const existing = activeDeployments.get(projectId);
+  if (existing) return existing;
+  const created: ActiveDeployEntry = {
+    state: toDeployState(seed),
+    listeners: new Set(),
+    inFlight: false,
+  };
+  activeDeployments.set(projectId, created);
+  return created;
+}
+
+function emitActiveDeployment(projectId: string): void {
+  const entry = activeDeployments.get(projectId);
+  if (!entry) return;
+  for (const listener of entry.listeners) listener(entry.state);
+}
+
+function persistActiveDeploymentState(projectId: string, state: ActiveDeployState): void {
+  if (typeof window === 'undefined') return;
+  persistDeploySnapshot(projectId, {
+    status: state.status,
+    progress: state.progress,
+    logs: state.logs,
+    deployResult: state.deployResult,
+    deploymentHistory: state.deploymentHistory,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+function setActiveDeploymentState(projectId: string, next: ActiveDeployState): void {
+  const entry = getOrCreateActiveDeployment(projectId);
+  entry.state = toDeployState(next);
+  persistActiveDeploymentState(projectId, entry.state);
+  emitActiveDeployment(projectId);
+}
+
+function patchActiveDeploymentState(
+  projectId: string,
+  patch: Partial<ActiveDeployState> | ((prev: ActiveDeployState) => ActiveDeployState),
+): ActiveDeployState {
+  const entry = getOrCreateActiveDeployment(projectId);
+  const next = typeof patch === 'function'
+    ? patch(entry.state)
+    : { ...entry.state, ...patch };
+  entry.state = toDeployState({ ...next, updatedAt: new Date().toISOString() });
+  persistActiveDeploymentState(projectId, entry.state);
+  emitActiveDeployment(projectId);
+  return entry.state;
+}
+
+function extractLiveRuntimeDetails(result: DeployApiResult | null): AwsRuntimeLiveDetails | null {
+  const details = result?.details;
+  if (!details || typeof details !== 'object') return null;
+  const live = (details as { live_runtime_details?: AwsRuntimeLiveDetails }).live_runtime_details;
+  return live && typeof live === 'object' ? live : null;
+}
+
+function mergeDeployResultWithRuntimeDetails(
+  result: DeployApiResult | null,
+  details: AwsRuntimeLiveDetails,
+): DeployApiResult {
+  return {
+    ...((result || {}) as DeployApiResult),
+    details: {
+      ...(((result?.details as Record<string, unknown> | null | undefined) || {})),
+      live_runtime_details: details,
+    },
+  };
+}
+
+function getLiveRuntimeInstanceId(result: DeployApiResult | null): string {
+  const liveDetails = extractLiveRuntimeDetails(result);
+  return String(liveDetails?.instance?.instance_id || '').trim();
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function readStringValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function readBooleanValue(value: unknown, fallback = false): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function readRecordArray(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value)
+    ? value.filter((item) => !!item && typeof item === 'object' && !Array.isArray(item)).map((item) => item as Record<string, unknown>)
+    : [];
+}
+
+function deriveArchitectureFromDeploymentProfile(profile: Record<string, unknown> | null): { nodes: RuntimeArchNode[]; edges: RuntimeArchEdge[] } {
+  const root = asObject(profile);
+  if (!root) return { nodes: [], edges: [] };
+  const compute = asObject(root.compute);
+  const networking = asObject(root.networking);
+  const dataLayer = readRecordArray(root.data_layer);
+  const services = readRecordArray(compute?.services);
+  const strategy = readStringValue(compute?.strategy);
+  const hasLoadBalancer = !!networking?.load_balancer && typeof networking.load_balancer === 'object';
+  const nodes: RuntimeArchNode[] = [];
+  const edges: RuntimeArchEdge[] = [];
+  const addNode = (id: string, type: string, label: string) => {
+    if (!nodes.some((node) => node.id === id)) nodes.push({ id, type, label });
+  };
+  const addEdge = (from: string, to: string, label?: string) => {
+    if (!edges.some((edge) => edge.from === from && edge.to === to && edge.label === label)) {
+      edges.push({ from, to, label });
+    }
+  };
+
+  if (strategy === 's3_cloudfront') {
+    addNode('websiteBucket', 'AmazonS3', 'Website Bucket');
+    addNode('cloudFrontDistribution', 'AmazonCloudFront', 'CloudFront Distribution');
+    addEdge('cloudFrontDistribution', 'websiteBucket', 'origin');
+  } else {
+    addNode('applicationVpc', 'AmazonVPC', 'Application VPC');
+    if (strategy === 'ec2') {
+      addNode('websiteBucket', 'AmazonS3', 'Website Bucket');
+      addNode('cloudFrontDistribution', 'AmazonCloudFront', 'CloudFront Distribution');
+      addNode('appSecurityGroup', 'AmazonVPC', 'App Security Group');
+      addEdge('cloudFrontDistribution', 'websiteBucket', 'origin');
+      addEdge('applicationVpc', 'appSecurityGroup', 'security');
+    } else if (hasLoadBalancer) {
+      const lbConfig = asObject(networking?.load_balancer);
+      addNode('applicationAlb', 'ELB', readBooleanValue(lbConfig?.public, true) ? 'Public Application Load Balancer' : 'Application Load Balancer');
+      addEdge('applicationAlb', 'applicationVpc', 'ingress');
+    }
+
+    if (strategy === 'ecs_fargate') {
+      addNode('ecsCluster', 'AmazonECS', 'ECS Cluster');
+      services.forEach((service, index) => {
+        const baseId = readStringValue(service.id) || `service-${index + 1}`;
+        const label = readStringValue(service.id).toUpperCase() || `SERVICE ${index + 1}`;
+        const port = Number(service.port || 0);
+        const serviceNodeId = `${baseId}Service`;
+        addNode(serviceNodeId, 'AmazonECS', label);
+        addEdge('ecsCluster', serviceNodeId, 'task');
+        if (hasLoadBalancer && port > 0) addEdge('applicationAlb', serviceNodeId, String(port));
+      });
+    } else {
+      services.forEach((service, index) => {
+        const baseId = readStringValue(service.id) || `service-${index + 1}`;
+        const label = readStringValue(service.id).toUpperCase() || `SERVICE ${index + 1}`;
+        const port = Number(service.port || 80) || 80;
+        const serviceNodeId = `${baseId}Instance`;
+        addNode(serviceNodeId, 'AmazonEC2', label);
+        if (strategy === 'ec2') {
+          addEdge('applicationVpc', serviceNodeId, 'subnet');
+          addEdge('appSecurityGroup', serviceNodeId, String(port));
+        } else if (hasLoadBalancer) {
+          addEdge('applicationAlb', serviceNodeId, String(port));
+        }
+      });
+    }
+  }
+
+  dataLayer.forEach((item) => {
+    const itemType = readStringValue(item.type);
+    if (itemType === 'postgresql') {
+      addNode('primaryDatabase', 'AmazonRDS', 'Primary PostgreSQL');
+      services.forEach((service, index) => {
+        const baseId = readStringValue(service.id) || `service-${index + 1}`;
+        addEdge(strategy === 'ecs_fargate' ? `${baseId}Service` : `${baseId}Instance`, 'primaryDatabase');
+      });
+    } else if (itemType === 'redis') {
+      addNode('cacheCluster', 'AmazonElastiCache', 'Redis Cache');
+      services.forEach((service, index) => {
+        const baseId = readStringValue(service.id) || `service-${index + 1}`;
+        addEdge(strategy === 'ecs_fargate' ? `${baseId}Service` : `${baseId}Instance`, 'cacheCluster');
+      });
+    }
+  });
+
+  return { nodes, edges };
+}
+
+function architectureViewLooksStale(view: Record<string, unknown> | null, profile: Record<string, unknown> | null): boolean {
+  const root = asObject(profile);
+  if (!root || !Array.isArray(view?.nodes)) return false;
+  const compute = asObject(root.compute);
+  const strategy = readStringValue(compute?.strategy);
+  if (strategy !== 'ec2') return false;
+  const nodeIds = view.nodes
+    .map((node) => (node && typeof node === 'object' ? readStringValue((node as Record<string, unknown>).id) : ''))
+    .filter(Boolean);
+  const hasAlb = nodeIds.includes('applicationAlb');
+  const hasCloudFront = nodeIds.includes('cloudFrontDistribution');
+  const hasBucket = nodeIds.includes('websiteBucket');
+  return hasAlb && (!hasCloudFront || !hasBucket);
+}
+
+function normalizeCostBreakdown(raw: unknown): RuntimeCostItem[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => {
+      const row = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+      return {
+        service: String(row.service || row.name || 'Service'),
+        type: String(row.type || row.category || 'General'),
+        monthly: Number(row.monthly_usd || row.monthly_cost_usd || row.monthly || 0),
+        note: String(row.note || row.description || ''),
+      };
+    })
+    .filter((item) => item.service.trim().length > 0);
+}
+
+function normalizeVerificationChecks(raw: unknown): EndpointVerificationCheck[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => {
+      const entry = item && typeof item === 'object' ? item as Record<string, unknown> : null;
+      if (!entry) return null;
+      return {
+        label: String(entry.label || 'endpoint'),
+        url: String(entry.url || ''),
+        ok: Boolean(entry.ok),
+        status: typeof entry.status === 'number' ? entry.status : null,
+        detail: String(entry.detail || ''),
+      } satisfies EndpointVerificationCheck;
+    })
+    .filter((item): item is EndpointVerificationCheck => item !== null);
+}
+
+function pickNodeColor(type: string): string {
+  const value = String(type || '').toLowerCase();
+  if (value.includes('cloudfront')) return '#06b6d4';
+  if (value.includes('ec2') || value.includes('compute')) return '#22c55e';
+  if (value.includes('rds') || value.includes('database') || value.includes('postgres')) return '#f59e0b';
+  if (value.includes('s3') || value.includes('bucket') || value.includes('storage')) return '#f97316';
+  if (value.includes('security')) return '#94a3b8';
+  if (value.includes('vpc') || value.includes('subnet') || value.includes('network')) return '#64748b';
+  return '#a1a1aa';
+}
+
+function labelForAnswer(
+  review: ArchitectureReviewPayload | null,
+  questionId: string,
+  value: string,
+): string {
+  const question = review?.questions.find((entry) => entry.id === questionId);
+  return question?.options?.find((option) => option.value === value)?.label || value;
+}
+
+function buildQaSummary(
+  review: ArchitectureReviewPayload | null,
+  answers: Record<string, string>,
+  repoContext: RepositoryContextJson | null,
+  repoContextMd: string,
+): string {
+  const blocks: string[] = [];
+  const summary = String(repoContext?.summary || '').trim();
+  if (summary) {
+    blocks.push(`Repository summary:\n${summary}`);
+  }
+  const runtime = String(repoContext?.language?.runtime || '').trim();
+  const frameworks = Array.isArray(repoContext?.frameworks)
+    ? repoContext.frameworks.map((item) => String(item.name || '')).filter(Boolean)
+    : [];
+  const dataStores = Array.isArray(repoContext?.data_stores)
+    ? repoContext.data_stores.map((item) => String(item.type || '')).filter(Boolean)
+    : [];
+  const processes = Array.isArray(repoContext?.processes)
+    ? repoContext.processes.map((item) => `${String(item.type || 'process')}: ${String(item.command || item.source || '').trim()}`).filter(Boolean)
+    : [];
+  const requiredSecrets = Array.isArray(repoContext?.environment_variables?.required_secrets)
+    ? (repoContext.environment_variables?.required_secrets as unknown[]).map((item) => String(item || '')).filter(Boolean)
+    : [];
+  const buildCommand = String(repoContext?.build?.build_command || '').trim();
+  const startCommand = String(repoContext?.build?.start_command || '').trim();
+  const healthPath = String(repoContext?.health?.endpoint || '').trim();
+  const detailLines = [
+    runtime ? `Runtime: ${runtime}` : '',
+    frameworks.length > 0 ? `Frameworks: ${frameworks.join(', ')}` : '',
+    dataStores.length > 0 ? `Data stores: ${dataStores.join(', ')}` : '',
+    buildCommand ? `Build command: ${buildCommand}` : '',
+    startCommand ? `Start command: ${startCommand}` : '',
+    healthPath ? `Health endpoint: ${healthPath}` : '',
+    processes.length > 0 ? `Processes: ${processes.join(' | ')}` : '',
+    requiredSecrets.length > 0 ? `Required secrets: ${requiredSecrets.join(', ')}` : '',
+  ].filter(Boolean);
+  if (detailLines.length > 0) {
+    blocks.push(`Repository analysis details:\n${detailLines.join('\n')}`);
+  }
+  const markdown = String(repoContextMd || '').trim();
+  if (markdown) {
+    blocks.push(`Repository analysis markdown:\n${markdown}`);
+  }
+  if (review) {
+    review.questions.forEach((question) => {
+      const answer = String(answers[question.id] || '').trim();
+      if (!answer) return;
+      blocks.push(`Q: ${question.question}\nA: ${labelForAnswer(review, question.id, answer)}`);
+    });
+  }
+  return blocks.join('\n\n').trim();
+}
+
+export default function DeploymentTrackApp() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const logEndRef = useRef<HTMLDivElement>(null);
+  const pipelineSocketRef = useRef<WebSocket | null>(null);
+  const deployRequestRef = useRef<string | null>(null);
+  const idleRecoveryRef = useRef<string | null>(null);
+  const analysisRequestRef = useRef<string | null>(null);
+  const reviewRequestRef = useRef<string | null>(null);
+  const [projects, setProjects] = useState<ProjectRecord[]>([]);
+  const [activeStage, setActiveStage] = useState<PipelineStageId>('analysis');
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [repoContext, setRepoContext] = useState<RepositoryContextJson | null>(() => readStoredJson<RepositoryContextJson>('deplai.pipeline.repoContext'));
+  const [repoContextMd, setRepoContextMd] = useState<string>(() => readStoredJson<string>(REPO_CONTEXT_MD_KEY) || '');
+  const [review, setReview] = useState<ArchitectureReviewPayload | null>(() => readStoredJson<ArchitectureReviewPayload>(REVIEW_PAYLOAD_KEY));
+  const [answers, setAnswers] = useState<Record<string, string>>(() => readStoredJson<Record<string, string>>(REVIEW_ANSWERS_KEY) || {});
+  const [messages, setMessages] = useState<QaMessage[]>([]);
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [chatInput, setChatInput] = useState('');
+  const [deploymentProfile, setDeploymentProfile] = useState<Record<string, unknown> | null>(() => readStoredJson<Record<string, unknown>>(DEPLOYMENT_PROFILE_KEY));
+  const [architectureView, setArchitectureView] = useState<Record<string, unknown> | null>(() => readStoredJson<Record<string, unknown>>(ARCHITECTURE_VIEW_KEY));
+  const [approvalPayload, setApprovalPayload] = useState<ApprovalPayload | null>(() => readStoredJson<ApprovalPayload>(APPROVAL_PAYLOAD_KEY));
+  const [approved, setApproved] = useState(false);
+  const [iacFiles, setIacFiles] = useState<GeneratedIacFile[]>(() => readIacFilesFromSession());
+  const [selectedFile, setSelectedFile] = useState<string>(() => readIacFilesFromSession()[0]?.path || '');
+  const [aws, setAws] = useState<AwsSessionConfig>(() => readSavedAws());
+  const [deployStatus, setDeployStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const [deployProgress, setDeployProgress] = useState(0);
+  const [deployLogs, setDeployLogs] = useState<Array<{ text: string; ts: string; type: 'info' | 'success' | 'error' }>>([]);
+  const [deployResult, setDeployResult] = useState<DeployApiResult | null>(null);
+  const [deploymentHistory, setDeploymentHistory] = useState<DeployStateSnapshot['deploymentHistory']>([]);
+  const [deploySocketState, setDeploySocketState] = useState<PipelineSocketState>('idle');
+  const [stopLoading, setStopLoading] = useState(false);
+  const [destroyLoading, setDestroyLoading] = useState(false);
+  const [verifyLoading, setVerifyLoading] = useState(false);
+  const [endpointChecks, setEndpointChecks] = useState<EndpointVerificationCheck[]>([]);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const selectedProject = useMemo(() => projects.find((project) => project.id === selectedProjectId) || null, [projects, selectedProjectId]);
+  const expectedWorkspace = useMemo(() => (
+    selectedProject ? buildDeploymentWorkspace(selectedProject.id, selectedProject.name) : ''
+  ), [selectedProject]);
+  const qaState = useMemo(() => buildQaTranscript(review, answers), [answers, review]);
+  const currentQuestion = review?.questions?.[currentQuestionIndex] || null;
+  const allQuestionsAnswered = Boolean(review && review.questions.every((question) => String(answers[question.id] || '').trim()));
+  const hasAwsSecrets = Boolean(aws.aws_access_key_id.trim() && aws.aws_secret_access_key.trim());
+  const costEstimate = readCostEstimate();
+  const patchState = useCallback((patch: Partial<ActiveDeployState> | ((prev: ActiveDeployState) => ActiveDeployState)) => {
+    if (!selectedProjectId) return;
+    patchActiveDeploymentState(selectedProjectId, patch);
+  }, [selectedProjectId]);
+  const appendLog = useCallback((text: string, type: 'info' | 'success' | 'error' = 'info') => {
+    patchState((prev) => {
+      const last = prev.logs[prev.logs.length - 1];
+      if (last && last.text === text && last.type === type) {
+        return prev;
+      }
+      return {
+        ...prev,
+        logs: [...prev.logs, { text, ts: timestampLabel(), type }],
+      };
+    });
+  }, [patchState]);
+  const pushDeploymentHistory = useCallback((result: DeployApiResult | null, status: 'done' | 'error') => {
+    if (!result) return;
+    patchState((prev) => {
+      const nextEntry = toHistoryEntry(result, status, aws.aws_region);
+      const previous = prev.deploymentHistory[0];
+      if (
+        previous &&
+        previous.status === nextEntry.status &&
+        previous.instanceId === nextEntry.instanceId &&
+        previous.cloudfrontUrl === nextEntry.cloudfrontUrl
+      ) {
+        return prev;
+      }
+      return {
+        ...prev,
+        deploymentHistory: [nextEntry, ...prev.deploymentHistory].slice(0, DEPLOY_HISTORY_MAX),
+      };
+    });
+  }, [aws.aws_region, patchState]);
+  const mergeRuntimeDetailsIntoResult = useCallback((details: AwsRuntimeLiveDetails) => {
+    patchState((prev) => ({
+      ...prev,
+      deployResult: mergeDeployResultWithRuntimeDetails(prev.deployResult, details),
+    }));
+  }, [patchState]);
+  const deploySummary = useMemo(() => extractDeploymentSummary(deployResult), [deployResult]);
+  const liveRuntimeDetails = useMemo(() => extractLiveRuntimeDetails(deployResult), [deployResult]);
+  const hasLiveRuntimeDetails = useMemo(
+    () => Boolean(liveRuntimeDetails && getLiveRuntimeInstanceId(deployResult) && getLiveRuntimeInstanceId(deployResult) !== 'n/a'),
+    [deployResult, liveRuntimeDetails],
+  );
+  const persistedEndpointChecks = useMemo(() => normalizeVerificationChecks(deployResult?.verification_checks), [deployResult?.verification_checks]);
+  const effectiveEndpointChecks = endpointChecks.length > 0 ? endpointChecks : persistedEndpointChecks;
+  const verificationFailed = useMemo(
+    () => effectiveEndpointChecks.some((check) => !check.ok) || deployResult?.deployment_verified === false,
+    [deployResult?.deployment_verified, effectiveEndpointChecks],
+  );
+  const verificationPassed = useMemo(() => {
+    if (effectiveEndpointChecks.length > 0) {
+      return effectiveEndpointChecks.every((check) => check.ok);
+    }
+    return deployResult?.deployment_verified === true;
+  }, [deployResult?.deployment_verified, effectiveEndpointChecks]);
+  const backendErrorMessage = useMemo(() => {
+    const direct = String(deployResult?.error || '').trim();
+    if (direct) return direct;
+    if (verificationFailed) {
+      return 'Deployment verification failed or runtime data is incomplete.';
+    }
+    if (deployStatus === 'error') {
+      return 'The backend reported a deployment error.';
+    }
+    return '';
+  }, [deployResult?.error, deployStatus, verificationFailed]);
+  const hasEndpointTargets = useMemo(
+    () => deploySummary.cloudfrontUrl !== 'n/a' || deploySummary.publicIp !== 'n/a',
+    [deploySummary.cloudfrontUrl, deploySummary.publicIp],
+  );
+  const outputBanner = useMemo<OutputBannerState>(() => {
+    if (deployStatus === 'running') {
+      return {
+        tone: 'warning',
+        label: 'Deployment Running',
+        title: 'Deployment In Progress',
+        description: 'The backend runtime is still applying infrastructure. Outputs will hydrate when the current repo reaches a terminal state.',
+      };
+    }
+    if (deployStatus === 'error' || backendErrorMessage) {
+      return {
+        tone: 'error',
+        label: 'Error',
+        title: 'Deployment Error',
+        description: backendErrorMessage || 'The deployment did not complete successfully. Review the runtime error and verification details below.',
+      };
+    }
+    if (!deployResult) {
+      return {
+        tone: 'warning',
+        label: 'No Deployment Data',
+        title: 'Infrastructure Outputs',
+        description: 'No deployment snapshot is bound to this repo yet. Run deploy or reconcile backend status to hydrate outputs.',
+      };
+    }
+    if (verificationFailed) {
+      return {
+        tone: 'error',
+        label: 'Verification Failed',
+        title: 'Infrastructure Outputs',
+        description: 'The backend returned outputs, but verification failed or the runtime data is incomplete for this repo.',
+      };
+    }
+    if (!deployResult.success) {
+      return {
+        tone: 'warning',
+        label: 'Pending Runtime Confirmation',
+        title: 'Infrastructure Outputs',
+        description: 'The deploy track has a partial payload, but the backend has not confirmed a successful terminal runtime state yet.',
+      };
+    }
+    if (!hasLiveRuntimeDetails) {
+      return {
+        tone: 'warning',
+        label: 'Missing Runtime Data',
+        title: 'Infrastructure Outputs',
+        description: 'The deployment payload exists, but live runtime details are missing. Fetch runtime details before treating this deploy as healthy.',
+      };
+    }
+    if (verificationPassed) {
+      return {
+        tone: 'success',
+        label: 'Live',
+        title: 'Infrastructure Outputs',
+        description: 'The backend confirmed a successful terminal state and the current repo has live runtime data.',
+      };
+    }
+    return {
+      tone: 'warning',
+      label: 'Pending Verification',
+      title: 'Infrastructure Outputs',
+      description: 'The backend confirmed infrastructure, but live endpoint verification has not been recorded for this repo yet.',
+    };
+  }, [backendErrorMessage, deployResult, deployStatus, hasLiveRuntimeDetails, verificationFailed, verificationPassed]);
+  const outputBannerClassName = useMemo(() => {
+    if (outputBanner.tone === 'success') return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400';
+    if (outputBanner.tone === 'error') return 'border-red-500/20 bg-red-500/10 text-red-300';
+    return 'border-amber-500/20 bg-amber-500/10 text-amber-300';
+  }, [outputBanner.tone]);
+  const savedRun = readSavedIacRun();
+  const activeIacFilePath = selectedFile || iacFiles[0]?.path || '';
+  const shouldConnectPipelineSocket = Boolean(selectedProject && (activeStage === 'deploy' || activeStage === 'outputs' || deployStatus === 'running'));
+  const canFetchRuntimeDetails = Boolean(selectedProject && hasAwsSecrets);
+  const canVerifyLiveEndpoints = Boolean(
+    selectedProject &&
+    deployStatus !== 'running' &&
+    deployResult?.success &&
+    hasLiveRuntimeDetails &&
+    hasEndpointTargets &&
+    !backendErrorMessage,
+  );
+  const canOpenCloudfront = Boolean(hasLiveRuntimeDetails && deploySummary.cloudfrontUrl !== 'n/a');
+  const qaSummary = useMemo(() => buildQaSummary(review, answers, repoContext, repoContextMd), [answers, repoContext, repoContextMd, review]);
+  const analysisFrameworkNames = useMemo(() => (
+    Array.isArray(repoContext?.frameworks)
+      ? repoContext.frameworks.map((item) => String(item.name || '')).filter(Boolean)
+      : []
+  ), [repoContext?.frameworks]);
+  const analysisDataStoreNames = useMemo(() => (
+    Array.isArray(repoContext?.data_stores)
+      ? repoContext.data_stores.map((item) => String(item.type || '')).filter(Boolean)
+      : []
+  ), [repoContext?.data_stores]);
+  const analysisProcessLines = useMemo(() => (
+    Array.isArray(repoContext?.processes)
+      ? repoContext.processes.map((item) => `${String(item.type || 'process')}: ${String(item.command || item.source || '').trim()}`).filter(Boolean)
+      : []
+  ), [repoContext?.processes]);
+  const analysisSecretNames = useMemo(() => (
+    Array.isArray(repoContext?.environment_variables?.required_secrets)
+      ? (repoContext.environment_variables?.required_secrets as unknown[]).map((item) => String(item || '')).filter(Boolean)
+      : []
+  ), [repoContext?.environment_variables?.required_secrets]);
+  const analysisConfigNames = useMemo(() => (
+    Array.isArray(repoContext?.environment_variables?.config_values)
+      ? (repoContext.environment_variables?.config_values as unknown[]).map((item) => String(item || '')).filter(Boolean)
+      : []
+  ), [repoContext?.environment_variables?.config_values]);
+  const analysisFlagLines = useMemo(() => (
+    [
+      ...(Array.isArray(repoContext?.conflicts) ? repoContext.conflicts.map((item) => String(item.reason || '').trim()) : []),
+      ...(Array.isArray(repoContext?.low_confidence_items) ? repoContext.low_confidence_items.map((item) => String(item.reason || '').trim()) : []),
+    ].filter(Boolean)
+  ), [repoContext?.conflicts, repoContext?.low_confidence_items]);
+  const derivedArchitecture = useMemo(() => deriveArchitectureFromDeploymentProfile(deploymentProfile), [deploymentProfile]);
+  const shouldUseDerivedArchitecture = useMemo(
+    () => architectureViewLooksStale(architectureView, deploymentProfile) || (!Array.isArray(architectureView?.nodes) && derivedArchitecture.nodes.length > 0),
+    [architectureView, deploymentProfile, derivedArchitecture.nodes.length],
+  );
+  const architectureNodes = useMemo<RuntimeArchNode[]>(() => {
+    if (shouldUseDerivedArchitecture) {
+      return derivedArchitecture.nodes;
+    }
+    if (Array.isArray(architectureView?.nodes)) {
+      return architectureView.nodes.map((node, index) => {
+        const entry = node && typeof node === 'object' ? node as Record<string, unknown> : {};
+        return {
+          id: String(entry.id || `node_${index + 1}`),
+          label: String(entry.label || entry.type || `Node ${index + 1}`),
+          type: String(entry.type || ''),
+        };
+      });
+    }
+    if (Array.isArray(approvalPayload?.diagram?.nodes)) {
+      return approvalPayload.diagram.nodes.map((node, index) => ({
+        id: String(node.id || `node_${index + 1}`),
+        label: String(node.label || node.type || `Node ${index + 1}`),
+        type: String(node.type || ''),
+      }));
+    }
+    return [];
+  }, [approvalPayload, architectureView, derivedArchitecture.nodes, shouldUseDerivedArchitecture]);
+  const architectureEdges = useMemo<RuntimeArchEdge[]>(() => {
+    if (shouldUseDerivedArchitecture) {
+      return derivedArchitecture.edges;
+    }
+    if (Array.isArray(architectureView?.edges)) {
+      return architectureView.edges.map((edge) => {
+        const entry = edge && typeof edge === 'object' ? edge as Record<string, unknown> : {};
+        return {
+          from: String(entry.from || ''),
+          to: String(entry.to || ''),
+          label: String(entry.label || ''),
+        };
+      });
+    }
+    if (Array.isArray(approvalPayload?.diagram?.edges)) {
+      return approvalPayload.diagram.edges.map((edge) => ({
+        from: String(edge.from || ''),
+        to: String(edge.to || ''),
+        label: String(edge.label || edge.style || ''),
+      }));
+    }
+    return [];
+  }, [approvalPayload, architectureView, derivedArchitecture.edges, shouldUseDerivedArchitecture]);
+  const architectureCostRows = useMemo(() => normalizeCostBreakdown(approvalPayload?.cost_estimate?.line_items), [approvalPayload]);
+  const architectureRegion = String(approvalPayload?.diagram?.region || aws.aws_region || 'eu-north-1');
+  const architectureLayout = useMemo(() => {
+    const columns = 3;
+    return architectureNodes.map((node, index) => {
+      const col = index % columns;
+      const row = Math.floor(index / columns);
+      return {
+        ...node,
+        x: 140 + col * 210,
+        y: 56 + row * 96,
+        color: pickNodeColor(node.type),
+      };
+    });
+  }, [architectureNodes]);
+  const architectureNodePositions = useMemo(() => {
+    const map = new Map<string, { x: number; y: number }>();
+    architectureLayout.forEach((node) => {
+      map.set(node.id, { x: node.x, y: node.y });
+    });
+    return map;
+  }, [architectureLayout]);
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [deployLogs]);
+
+  useEffect(() => {
+    writeSavedAws(aws);
+  }, [aws]);
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    writeStoredJson(REVIEW_ANSWERS_KEY, answers);
+  }, [answers, selectedProjectId]);
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    const entry = getOrCreateActiveDeployment(selectedProjectId);
+    const apply = (next: ActiveDeployState) => {
+      setDeployStatus(next.status);
+      setDeployProgress(next.progress);
+      setDeployLogs(next.logs);
+      setDeployResult(next.deployResult);
+      setDeploymentHistory(next.deploymentHistory);
+    };
+    entry.listeners.add(apply);
+    apply(entry.state);
+    return () => {
+      entry.listeners.delete(apply);
+    };
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    writeStoredJson(QA_CONTEXT_KEY, {
+      qa_summary: qaSummary,
+      deployment_region: aws.aws_region || 'eu-north-1',
+    });
+  }, [aws.aws_region, qaSummary, selectedProjectId]);
+
+  useEffect(() => {
+    setMessages(qaState.messages);
+    setCurrentQuestionIndex(qaState.unansweredIndex);
+    const next = review?.questions?.[qaState.unansweredIndex];
+    if (next) setChatInput(String(answers[next.id] || ''));
+  }, [answers, qaState.messages, qaState.unansweredIndex, review]);
+
+  useEffect(() => {
+    fetch('/api/projects', { cache: 'no-store' })
+      .then((response) => response.json())
+      .then((data: { projects?: ProjectRecord[] }) => setProjects(Array.isArray(data.projects) ? data.projects : []))
+      .catch(() => setProjects([]));
+  }, []);
+
+  useEffect(() => {
+    const queryProjectId = searchParams.get('projectId');
+    const entry = searchParams.get('entry');
+    const nextProjectId = queryProjectId || null;
+    if (!nextProjectId) {
+      idleRecoveryRef.current = null;
+      setSelectedProjectId(null);
+      setActiveStage('analysis');
+      setDeployStatus('idle');
+      setDeployProgress(0);
+      setDeployLogs([]);
+      setDeployResult(null);
+      setDeploymentHistory([]);
+      setEndpointChecks([]);
+      setError(null);
+      return;
+    }
+    const previousPlanningProjectId = sessionStorage.getItem(PLANNING_PROJECT_KEY);
+    const freshLaunch = entry === 'card' || entry === 'selector';
+    const projectChanged = !previousPlanningProjectId || previousPlanningProjectId !== nextProjectId;
+    if (freshLaunch || projectChanged) {
+      clearPlanningState();
+      idleRecoveryRef.current = null;
+      analysisRequestRef.current = null;
+      reviewRequestRef.current = null;
+      setAnalysisLoading(false);
+      setReviewLoading(false);
+      setRepoContext(null);
+      setRepoContextMd('');
+      setReview(null);
+      setAnswers({});
+      setMessages([]);
+      setCurrentQuestionIndex(0);
+      setChatInput('');
+      setDeploymentProfile(null);
+      setArchitectureView(null);
+      setApprovalPayload(null);
+      setIacFiles([]);
+      setSelectedFile('');
+      setApproved(false);
+      setDeployStatus('idle');
+      setDeployProgress(0);
+      setDeployLogs([]);
+      setDeployResult(null);
+      setDeploymentHistory([]);
+      setEndpointChecks([]);
+      setError(null);
+    }
+    setSelectedProjectId(nextProjectId);
+    localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, nextProjectId);
+    sessionStorage.setItem(PLANNING_PROJECT_KEY, nextProjectId);
+    setActiveStage(freshLaunch ? 'analysis' : ((loadDeployUiStage(nextProjectId) as PipelineStageId | null) || 'analysis'));
+    const snapshot = loadDeploySnapshot(nextProjectId);
+    const existing = activeDeployments.get(nextProjectId);
+    const nextState = existing?.state || toDeployState(snapshot || undefined);
+    setActiveDeploymentState(nextProjectId, nextState);
+    setEndpointChecks([]);
+  }, [searchParams]);
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    persistDeploySnapshot(selectedProjectId, {
+      status: deployStatus,
+      progress: deployProgress,
+      logs: deployLogs,
+      deployResult,
+      deploymentHistory,
+      updatedAt: new Date().toISOString(),
+    });
+  }, [deployLogs, deployProgress, deployResult, deployStatus, deploymentHistory, selectedProjectId]);
+
+  useEffect(() => {
+    if (!selectedProject || !hasAwsSecrets) return;
+    if (deployStatus !== 'idle') return;
+    if (idleRecoveryRef.current === selectedProject.id) return;
+    if (deployResult?.details && typeof deployResult.details === 'object' && 'live_runtime_details' in (deployResult.details as Record<string, unknown>)) return;
+
+    idleRecoveryRef.current = selectedProject.id;
+    let cancelled = false;
+
+    const recover = async () => {
+      try {
+        const response = await fetch('/api/pipeline/runtime-details', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: selectedProject.id,
+            aws_access_key_id: aws.aws_access_key_id,
+            aws_secret_access_key: aws.aws_secret_access_key,
+            aws_region: aws.aws_region,
+          }),
+        });
+        const data = await response.json().catch(() => ({})) as { success?: boolean; details?: Record<string, unknown>; error?: string };
+        const recoveredInstanceId = String((data.details as { instance?: { instance_id?: string } } | undefined)?.instance?.instance_id || '').trim();
+        if (cancelled || !response.ok || data.success !== true || !data.details || !recoveredInstanceId || recoveredInstanceId === 'n/a') return;
+
+        const recoveredResult: DeployApiResult = {
+          success: true,
+          details: {
+            live_runtime_details: data.details,
+          },
+        };
+        patchState((prev) => ({
+          ...prev,
+          status: 'done',
+          progress: 100,
+          deployResult: mergeDeployResultWithRuntimeDetails(prev.deployResult || recoveredResult, data.details as AwsRuntimeLiveDetails),
+        }));
+        pushDeploymentHistory(recoveredResult, 'done');
+        appendLog(`Recovered existing deployment for this project (${recoveredInstanceId}).`, 'success');
+      } catch {
+        // best-effort recovery only
+      }
+    };
+
+    void recover();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [appendLog, aws.aws_access_key_id, aws.aws_region, aws.aws_secret_access_key, deployResult?.details, deployStatus, hasAwsSecrets, patchState, pushDeploymentHistory, selectedProject]);
+
+  useEffect(() => {
+    if (!selectedProject || !shouldConnectPipelineSocket) {
+      pipelineSocketRef.current?.close();
+      pipelineSocketRef.current = null;
+      setDeploySocketState('idle');
+      return;
+    }
+
+    let disposed = false;
+    let socket: WebSocket | null = null;
+
+    const connect = async () => {
+      try {
+        setDeploySocketState('connecting');
+        const [wsConfigRes, tokenRes] = await Promise.all([
+          fetch('/api/pipeline/ws-config', { cache: 'no-store' }),
+          fetch(`/api/scan/ws-token?project_id=${encodeURIComponent(selectedProject.id)}`, { cache: 'no-store' }),
+        ]);
+        const wsConfig = await wsConfigRes.json().catch(() => ({})) as { success?: boolean; ws_base?: string; error?: string };
+        const tokenData = await tokenRes.json().catch(() => ({})) as { token?: string; error?: string };
+        if (!wsConfigRes.ok || !wsConfig.success || !wsConfig.ws_base) {
+          throw new Error(wsConfig.error || 'Failed to resolve pipeline websocket base.');
+        }
+        if (!tokenRes.ok || !tokenData.token) {
+          throw new Error(tokenData.error || 'Failed to issue pipeline websocket token.');
+        }
+        if (disposed) return;
+
+        const wsUrl = `${wsConfig.ws_base.replace(/\/$/, '')}/ws/pipeline/${encodeURIComponent(selectedProject.id)}?token=${encodeURIComponent(tokenData.token)}`;
+        socket = new WebSocket(wsUrl);
+        pipelineSocketRef.current = socket;
+
+        socket.onopen = () => {
+          if (disposed) return;
+          setDeploySocketState('connected');
+          socket?.send(JSON.stringify({ action: 'start' }));
+        };
+
+        socket.onmessage = (event) => {
+          if (disposed) return;
+          try {
+            const payload = JSON.parse(String(event.data || '')) as {
+              type?: string;
+              data?: { type?: 'info' | 'success' | 'error'; content?: string };
+            };
+            if (payload.type !== 'message' || !payload.data?.content) return;
+            appendLog(payload.data.content, payload.data.type || 'info');
+          } catch {
+            // ignore malformed websocket payloads
+          }
+        };
+
+        socket.onerror = () => {
+          if (disposed) return;
+          setDeploySocketState('error');
+        };
+
+        socket.onclose = () => {
+          if (disposed) return;
+          setDeploySocketState('error');
+        };
+      } catch (reason) {
+        if (disposed) return;
+        setDeploySocketState('error');
+        appendLog(reason instanceof Error ? reason.message : 'Failed to connect to live pipeline websocket.', 'error');
+      }
+    };
+
+    void connect();
+
+    return () => {
+      disposed = true;
+      socket?.close();
+      if (pipelineSocketRef.current === socket) {
+        pipelineSocketRef.current = null;
+      }
+    };
+  }, [appendLog, selectedProject, shouldConnectPipelineSocket]);
+
+  const setAndPersistStage = useCallback((stage: PipelineStageId) => {
+    if (!selectedProjectId) {
+      setActiveStage('analysis');
+      return;
+    }
+    setActiveStage(stage);
+    if (selectedProjectId) {
+      saveDeployUiStage(selectedProjectId, stage);
+      localStorage.setItem(`${CURRENT_STAGE_STORAGE_PREFIX}${selectedProjectId}`, stage);
+    }
+  }, [selectedProjectId]);
+
+  const runAnalysis = useCallback(async () => {
+    if (!selectedProject) return;
+    const workspace = buildDeploymentWorkspace(selectedProject.id, selectedProject.name);
+    if (analysisRequestRef.current === workspace) return;
+    analysisRequestRef.current = workspace;
+    setAnalysisLoading(true);
+    setError(null);
+    try {
+      const response = await fetch('/api/repository-analysis/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: selectedProject.id, workspace }),
+      });
+      const data = await response.json().catch(() => ({})) as { success?: boolean; context_json?: RepositoryContextJson; context_md?: string; error?: string };
+      if (!response.ok || !data.success || !data.context_json) {
+        throw new Error(data.error || 'Repository analysis failed.');
+      }
+      const contextMd = String(data.context_md || '');
+      setRepoContext(data.context_json);
+      setRepoContextMd(contextMd);
+      writeStoredJson('deplai.pipeline.repoContext', data.context_json);
+      writeStoredJson(REPO_CONTEXT_MD_KEY, contextMd);
+      writeStoredJson(QA_CONTEXT_KEY, { qa_summary: String(data.context_json.summary || '') });
+    } finally {
+      setAnalysisLoading(false);
+      if (analysisRequestRef.current === workspace) {
+        analysisRequestRef.current = null;
+      }
+    }
+  }, [selectedProject]);
+
+  useEffect(() => {
+    if (activeStage !== 'analysis' || !selectedProject) return;
+    if (repoContext && repoContext.workspace === expectedWorkspace) return;
+    void runAnalysis().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Repository analysis failed.'));
+  }, [activeStage, expectedWorkspace, repoContext, runAnalysis, selectedProject]);
+
+  const loadReview = useCallback(async () => {
+    if (!selectedProject) return;
+    const workspace = repoContext?.workspace || buildDeploymentWorkspace(selectedProject.id, selectedProject.name);
+    if (reviewRequestRef.current === workspace) return;
+    reviewRequestRef.current = workspace;
+    setReviewLoading(true);
+    setError(null);
+    try {
+      const response = await fetch('/api/architecture/review/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: selectedProject.id, workspace }),
+      });
+      const data = await response.json().catch(() => ({})) as { success?: boolean; review?: ArchitectureReviewPayload; error?: string };
+      if (!response.ok || !data.success || !data.review) {
+        throw new Error(data.error || 'Failed to start architecture review.');
+      }
+      setReview(data.review);
+      const initialAnswers = Object.keys(answers).length > 0 ? answers : {};
+      setAnswers(initialAnswers);
+      writeStoredJson(REVIEW_PAYLOAD_KEY, data.review);
+      writeStoredJson(REVIEW_ANSWERS_KEY, initialAnswers);
+    } finally {
+      setReviewLoading(false);
+      if (reviewRequestRef.current === workspace) {
+        reviewRequestRef.current = null;
+      }
+    }
+  }, [answers, repoContext?.workspace, selectedProject]);
+
+  useEffect(() => {
+    if (activeStage !== 'qa' || !selectedProject) return;
+    if (!repoContext || repoContext.workspace !== expectedWorkspace) {
+      setAndPersistStage('analysis');
+      return;
+    }
+    if (review && review.context_json.workspace === expectedWorkspace && review.questions.length > 0) return;
+    void loadReview().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to start architecture review.'));
+  }, [activeStage, expectedWorkspace, loadReview, repoContext, review, selectedProject, setAndPersistStage]);
+
+  const submitAnswer = useCallback((value: string) => {
+    if (!currentQuestion) return;
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    setAnswers((prev) => ({ ...prev, [currentQuestion.id]: trimmed }));
+    setChatInput('');
+  }, [currentQuestion]);
+
+  const generatePlan = useCallback(async () => {
+    if (!selectedProject || !review) return;
+    setError(null);
+    const response = await fetch('/api/architecture/review/complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: selectedProject.id, workspace: review.context_json.workspace || buildDeploymentWorkspace(selectedProject.id, selectedProject.name), answers }),
+    });
+    const data = await response.json().catch(() => ({})) as {
+      success?: boolean;
+      deployment_profile?: Record<string, unknown>;
+      architecture_view?: Record<string, unknown>;
+      approval_payload?: Record<string, unknown>;
+      error?: string;
+    };
+    if (!response.ok || !data.success || !data.deployment_profile || !data.architecture_view) {
+      throw new Error(data.error || 'Failed to generate deployment profile.');
+    }
+    setDeploymentProfile(data.deployment_profile);
+    setArchitectureView(data.architecture_view);
+    setApprovalPayload(data.approval_payload || null);
+    writeStoredJson(DEPLOYMENT_PROFILE_KEY, data.deployment_profile);
+    writeStoredJson(ARCHITECTURE_VIEW_KEY, data.architecture_view);
+    writeStoredJson(APPROVAL_PAYLOAD_KEY, data.approval_payload || {});
+    writeStoredJson(COST_ESTIMATE_KEY, {
+      total_monthly_usd: Number((data.approval_payload?.cost_estimate as { total_monthly_usd?: number } | undefined)?.total_monthly_usd || 0),
+      budget_cap_usd: Number((data.approval_payload?.budget_gate as { cap_usd?: number } | undefined)?.cap_usd || 100),
+    });
+    setAndPersistStage('architecture');
+  }, [answers, review, selectedProject, setAndPersistStage]);
+
+  const generateTerraform = useCallback(async () => {
+    if (!selectedProject) return;
+    setError(null);
+    const response = await fetch('/api/pipeline/iac', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project_id: selectedProject.id,
+        provider: 'aws',
+        qa_summary: qaSummary,
+        architecture_context: qaSummary || String(repoContext?.summary || ''),
+        architecture_json: deploymentProfile || architectureView || undefined,
+        aws_region: aws.aws_region.trim() || 'eu-north-1',
+      }),
+    });
+    const data = await response.json().catch(() => ({})) as { success?: boolean; files?: GeneratedIacFile[]; summary?: string; warnings?: string[]; run_id?: string; workspace?: string; provider_version?: string; state_bucket?: string; lock_table?: string; error?: string };
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'IaC generation failed.');
+    }
+    const files = Array.isArray(data.files) ? data.files : [];
+    setIacFiles(files);
+    if (files[0]?.path) setSelectedFile(files[0].path);
+    sessionStorage.setItem(IAC_FILES_KEY, JSON.stringify(files));
+    if (data.run_id && data.workspace) {
+      sessionStorage.setItem(IAC_RUN_KEY, JSON.stringify({ run_id: data.run_id, workspace: data.workspace, provider_version: data.provider_version || '', state_bucket: data.state_bucket || '', lock_table: data.lock_table || '' }));
+    } else {
+      sessionStorage.removeItem(IAC_RUN_KEY);
+    }
+  }, [architectureView, aws.aws_region, deploymentProfile, qaSummary, repoContext?.summary, selectedProject]);
+
+  const hydrateTerminalDeployResult = useCallback(async (baseResult: DeployApiResult | null) => {
+    if (!baseResult?.success || String(baseResult.error || '').trim()) {
+      throw new Error(String(baseResult?.error || 'Deployment runtime returned an error.'));
+    }
+    const existingInstanceId = getLiveRuntimeInstanceId(baseResult);
+    if (existingInstanceId && existingInstanceId !== 'n/a') {
+      return baseResult;
+    }
+    if (!selectedProject || !hasAwsSecrets) {
+      throw new Error('Deployment completed, but live runtime details are missing for this repo.');
+    }
+
+    const response = await fetch('/api/pipeline/runtime-details', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project_id: selectedProject.id,
+        aws_access_key_id: aws.aws_access_key_id,
+        aws_secret_access_key: aws.aws_secret_access_key,
+        aws_region: aws.aws_region,
+        instance_id: extractDeploymentSummary(baseResult).instanceId !== 'n/a' ? extractDeploymentSummary(baseResult).instanceId : undefined,
+      }),
+    });
+    const data = await response.json().catch(() => ({})) as { success?: boolean; details?: AwsRuntimeLiveDetails; error?: string };
+    const hydratedInstanceId = String(data.details?.instance?.instance_id || '').trim();
+    if (!response.ok || data.success !== true || !data.details || !hydratedInstanceId || hydratedInstanceId === 'n/a') {
+      throw new Error(data.error || 'Deployment completed, but live runtime details could not be verified.');
+    }
+    return mergeDeployResultWithRuntimeDetails(baseResult, data.details);
+  }, [aws.aws_access_key_id, aws.aws_region, aws.aws_secret_access_key, hasAwsSecrets, selectedProject]);
+
+  const reconcileDeploymentStatus = useCallback(async () => {
+    if (!selectedProject) return;
+    const response = await fetch('/api/pipeline/deploy/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: selectedProject.id, project_name: selectedProject.name }),
+    });
+    const data = await response.json().catch(() => ({})) as DeployStatusResponse;
+    if (!response.ok || data.success !== true) {
+      throw new Error(data.error || 'Failed to fetch deployment status.');
+    }
+
+    const runtimeStatus = String(data.status || 'idle').toLowerCase();
+    const runtimeResult = data.result && typeof data.result === 'object'
+      ? data.result as DeployApiResult
+      : null;
+
+    if (runtimeStatus === 'running') {
+      patchState((prev) => ({
+        ...prev,
+        status: 'running',
+        progress: Math.max(prev.progress, 55),
+        deployResult: runtimeResult || prev.deployResult,
+      }));
+      return;
+    }
+
+    if (runtimeStatus === 'completed' && runtimeResult?.success) {
+      try {
+        const hydratedResult = await hydrateTerminalDeployResult(runtimeResult);
+        const hydratedChecks = normalizeVerificationChecks(hydratedResult.verification_checks);
+        if (hydratedResult.deployment_verified === false || hydratedChecks.some((check) => !check.ok)) {
+          throw new Error(hydratedResult.error || 'Deployment verification failed for the current repo.');
+        }
+        patchState((prev) => ({
+          ...prev,
+          status: 'done',
+          progress: 100,
+          deployResult: hydratedResult,
+        }));
+        getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
+        pushDeploymentHistory(hydratedResult, 'done');
+        appendLog('Recovered completed deployment state from backend runtime.', 'success');
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : 'Deployment completed, but runtime verification failed.';
+        const errorResult: DeployApiResult = {
+          ...((runtimeResult || {}) as DeployApiResult),
+          success: false,
+          error: runtimeResult?.error || message,
+        };
+        patchState((prev) => ({
+          ...prev,
+          status: 'error',
+          progress: 100,
+          deployResult: errorResult,
+        }));
+        getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
+        pushDeploymentHistory(errorResult, 'error');
+        appendLog(message, 'error');
+      }
+      return;
+    }
+
+    if (runtimeStatus === 'completed' || runtimeStatus === 'error') {
+      const message = runtimeResult?.error || 'Deployment runtime returned an error.';
+      patchState((prev) => ({
+        ...prev,
+        status: 'error',
+        progress: 100,
+        deployResult: runtimeResult || prev.deployResult || { success: false, error: message },
+      }));
+      getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
+      pushDeploymentHistory(runtimeResult, 'error');
+      appendLog(message, 'error');
+      return;
+    }
+
+    patchState((prev) => ({
+      ...prev,
+      status: 'error',
+      progress: 100,
+      deployResult: prev.deployResult || { success: false, error: 'No active deployment process found.' },
+    }));
+    getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
+    appendLog('No active deployment process found. Marking stale UI run as stopped.', 'error');
+  }, [appendLog, hydrateTerminalDeployResult, patchState, pushDeploymentHistory, selectedProject]);
+
+  const startDeploy = useCallback(async () => {
+    if (!selectedProject) return;
+    const activeDeployment = getOrCreateActiveDeployment(selectedProject.id, {
+      status: deployStatus,
+      progress: deployProgress,
+      logs: deployLogs,
+      deployResult,
+      deploymentHistory,
+    });
+    if (deployRequestRef.current === selectedProject.id || activeDeployment.inFlight) {
+      appendLog('Deployment already running in background for this project.');
+      return;
+    }
+    activeDeployment.inFlight = true;
+    if (!hasAwsSecrets) {
+      setError('AWS credentials are required before deployment.');
+      patchState({
+        status: 'error',
+        progress: 100,
+        deployResult: { success: false, error: 'AWS credentials are required before deployment.' },
+      });
+      appendLog('AWS credentials are missing. Configure them first.', 'error');
+      activeDeployment.inFlight = false;
+      return;
+    }
+    if (!savedRun && iacFiles.length === 0) {
+      setError('No generated Terraform bundle found. Generate Terraform first.');
+      patchState({
+        status: 'error',
+        progress: 100,
+        deployResult: { success: false, error: 'No generated Terraform bundle found. Generate Terraform first.' },
+      });
+      appendLog('No generated IaC files found. Generate Terraform first.', 'error');
+      activeDeployment.inFlight = false;
+      return;
+    }
+    deployRequestRef.current = selectedProject.id;
+    setError(null);
+    patchState({
+      status: 'running',
+      progress: 5,
+      logs: [],
+      deployResult: null,
+    });
+    setEndpointChecks([]);
+    appendLog('Preparing runtime deploy payload...');
+    try {
+      patchState({ progress: 20 });
+      appendLog('Calling /api/pipeline/deploy for runtime apply...');
+      const response = await fetch('/api/pipeline/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: selectedProject.id,
+          provider: 'aws',
+          runtime_apply: true,
+          run_id: savedRun?.run_id,
+          workspace: savedRun?.workspace,
+          state_bucket: savedRun?.state_bucket,
+          lock_table: savedRun?.lock_table,
+          files: savedRun ? [] : iacFiles,
+          aws_access_key_id: aws.aws_access_key_id,
+          aws_secret_access_key: aws.aws_secret_access_key,
+          aws_region: aws.aws_region,
+          estimated_monthly_usd: costEstimate.total,
+          budget_limit_usd: costEstimate.cap,
+          budget_override: false,
+        }),
+      });
+      const data = await response.json().catch(() => ({})) as DeployApiResult;
+      if (!response.ok || !data.success) {
+        const message = data.error || 'Deployment failed.';
+        patchState((prev) => ({
+          ...prev,
+          status: 'error',
+          progress: 100,
+          deployResult: data || { success: false, error: message },
+        }));
+        pushDeploymentHistory(data || null, 'error');
+        appendLog(message, 'error');
+        setError(message);
+        return;
+      }
+      patchState((prev) => ({
+        ...prev,
+        status: 'running',
+        progress: Math.max(prev.progress, 80),
+        deployResult: data,
+      }));
+      appendLog('Runtime apply request returned. Waiting for backend runtime to reach a terminal state...');
+      try {
+        await reconcileDeploymentStatus();
+      } catch {
+        patchState((prev) => ({
+          ...prev,
+          status: 'running',
+          progress: Math.max(prev.progress, 90),
+          deployResult: data,
+        }));
+        appendLog('Backend confirmation is still pending. Use Reconcile Backend Status if this state persists.', 'info');
+      }
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : 'Deployment failed.';
+      patchState((prev) => ({
+        ...prev,
+        status: 'error',
+        progress: 100,
+        deployResult: prev.deployResult || { success: false, error: message },
+      }));
+      appendLog(message, 'error');
+      setError(message);
+    } finally {
+      if (deployRequestRef.current === selectedProject.id) {
+        deployRequestRef.current = null;
+      }
+      activeDeployment.inFlight = false;
+    }
+  }, [appendLog, aws.aws_access_key_id, aws.aws_region, aws.aws_secret_access_key, costEstimate.cap, costEstimate.total, deployLogs, deployProgress, deployResult, deployStatus, deploymentHistory, hasAwsSecrets, iacFiles, patchState, pushDeploymentHistory, reconcileDeploymentStatus, savedRun, selectedProject]);
+
+  const stopDeployment = useCallback(async () => {
+    if (!selectedProject || stopLoading || deployStatus !== 'running') return;
+    setStopLoading(true);
+    try {
+      appendLog('Stop requested. Terminating deployment process...');
+      const response = await fetch('/api/pipeline/deploy/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: selectedProject.id, project_name: selectedProject.name }),
+      });
+      const data = await response.json().catch(() => ({})) as { success?: boolean; message?: string; error?: string };
+      if (!response.ok || data.success !== true) {
+        const backendMessage = String(data.error || data.message || '');
+        if (/no active deployment process found/i.test(backendMessage)) {
+          await reconcileDeploymentStatus();
+          appendLog('No active deployment process found on backend. UI state reconciled.', 'info');
+          return;
+        }
+        throw new Error(backendMessage || 'Failed to stop deployment process.');
+      }
+      deployRequestRef.current = null;
+      getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
+      const stopMessage = data.message || 'Deployment process terminated.';
+      patchState((prev) => ({
+        ...prev,
+        status: 'error',
+        progress: 100,
+        deployResult: {
+          ...((prev.deployResult || {}) as DeployApiResult),
+          success: false,
+          error: stopMessage,
+        },
+      }));
+      appendLog(stopMessage, 'success');
+    } catch (reason) {
+      appendLog(reason instanceof Error ? reason.message : 'Failed to stop deployment process.', 'error');
+    } finally {
+      setStopLoading(false);
+    }
+  }, [appendLog, deployStatus, patchState, reconcileDeploymentStatus, selectedProject, stopLoading]);
+
+  const fetchRuntimeDetails = useCallback(async () => {
+    if (!selectedProject || !hasAwsSecrets) return;
+    const response = await fetch('/api/pipeline/runtime-details', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project_id: selectedProject.id,
+        aws_access_key_id: aws.aws_access_key_id,
+        aws_secret_access_key: aws.aws_secret_access_key,
+        aws_region: aws.aws_region,
+        instance_id: deploySummary.instanceId !== 'n/a' ? deploySummary.instanceId : undefined,
+      }),
+    });
+    const data = await response.json().catch(() => ({})) as { success?: boolean; details?: AwsRuntimeLiveDetails; error?: string };
+    if (!response.ok || !data.success || !data.details) {
+      throw new Error(data.error || 'Failed to fetch runtime details.');
+    }
+    mergeRuntimeDetailsIntoResult(data.details);
+    appendLog('Live AWS runtime details updated.', 'success');
+  }, [appendLog, aws.aws_access_key_id, aws.aws_region, aws.aws_secret_access_key, deploySummary.instanceId, hasAwsSecrets, mergeRuntimeDetailsIntoResult, selectedProject]);
+
+  const verifyLiveEndpoints = useCallback(async () => {
+    setVerifyLoading(true);
+    try {
+      const response = await fetch('/api/pipeline/deploy/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cloudfront_url: deploySummary.cloudfrontUrl !== 'n/a' ? deploySummary.cloudfrontUrl : '',
+          public_ip: deploySummary.publicIp !== 'n/a' ? deploySummary.publicIp : '',
+        }),
+      });
+      const data = await response.json().catch(() => ({})) as {
+        success?: boolean;
+        checks?: EndpointVerificationCheck[];
+        error?: string;
+      };
+      if (!response.ok || data.success !== true) {
+        throw new Error(data.error || 'Endpoint verification failed.');
+      }
+      const checks = Array.isArray(data.checks) ? data.checks : [];
+      const verified = checks.length > 0 && checks.every((check) => check.ok);
+      setEndpointChecks(checks);
+      patchState((prev) => ({
+        ...prev,
+        deployResult: {
+          ...((prev.deployResult || { success: deployStatus === 'done' }) as DeployApiResult),
+          deployment_verified: verified,
+          verification_checks: checks,
+        },
+      }));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Endpoint verification failed.');
+    } finally {
+      setVerifyLoading(false);
+    }
+  }, [deployStatus, deploySummary.cloudfrontUrl, deploySummary.publicIp, patchState]);
+
+  const downloadPpk = useCallback(async () => {
+    if (!deploySummary.generatedPem) return;
+    const response = await fetch('/api/pipeline/keypair/ppk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ private_key_pem: deploySummary.generatedPem, key_name: deploySummary.keyName, project_name: selectedProject?.name }),
+    });
+    const data = await response.json().catch(() => ({})) as { success?: boolean; file_name?: string; content_base64?: string; error?: string; hint?: string };
+    if (!response.ok || !data.success || !data.content_base64) {
+      throw new Error(data.hint ? `${data.error || 'PPK conversion failed.'} ${data.hint}` : (data.error || 'PPK conversion failed.'));
+    }
+    const bytes = Uint8Array.from(atob(data.content_base64), (char) => char.charCodeAt(0));
+    const blob = new Blob([bytes], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = data.file_name || `${deploySummary.keyName}.ppk`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }, [deploySummary.generatedPem, deploySummary.keyName, selectedProject?.name]);
+
+  const destroyDeployment = useCallback(async () => {
+    if (!selectedProject || destroyLoading) return;
+    if (deployStatus === 'running') {
+      appendLog('Stop deployment first, then run destroy.', 'error');
+      return;
+    }
+    if (!hasAwsSecrets) {
+      appendLog('AWS credentials are missing. Configure them first.', 'error');
+      return;
+    }
+    setDestroyLoading(true);
+    try {
+      const response = await fetch('/api/pipeline/deploy/destroy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: selectedProject.id,
+          aws_access_key_id: aws.aws_access_key_id,
+          aws_secret_access_key: aws.aws_secret_access_key,
+          aws_region: aws.aws_region,
+        }),
+      });
+      const data = await response.json().catch(() => ({})) as {
+        success?: boolean;
+        details?: {
+          instances_terminated?: string[];
+          s3_buckets_deleted?: string[];
+          cloudfront_deleted?: string[];
+          cloudfront_pending_disable?: string[];
+          security_groups_deleted?: string[];
+          volumes_deleted?: string[];
+          errors?: string[];
+        };
+        error?: string;
+      };
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || 'Destroy failed.');
+      }
+      deployRequestRef.current = null;
+      getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
+      patchState((prev) => ({
+        ...prev,
+        status: 'idle',
+        progress: 0,
+        deployResult: null,
+      }));
+      setEndpointChecks([]);
+      const details = data.details || {};
+      appendLog(
+        `Destroy complete: ec2=${(details.instances_terminated || []).length}, s3=${(details.s3_buckets_deleted || []).length}, cloudfront=${(details.cloudfront_deleted || []).length}, sg=${(details.security_groups_deleted || []).length}, ebs=${(details.volumes_deleted || []).length}`,
+        'success',
+      );
+      if ((details.cloudfront_pending_disable || []).length > 0) {
+        appendLog(
+          `CloudFront pending disable/delete: ${(details.cloudfront_pending_disable || []).join(', ')}. Re-run destroy after distributions are disabled/deployed.`,
+          'info',
+        );
+      }
+      for (const warning of (details.errors || []).slice(0, 5)) {
+        appendLog(`Destroy warning: ${warning}`, 'error');
+      }
+    } finally {
+      setDestroyLoading(false);
+    }
+  }, [appendLog, aws.aws_access_key_id, aws.aws_region, aws.aws_secret_access_key, deployStatus, destroyLoading, hasAwsSecrets, patchState, selectedProject]);
+
+  useEffect(() => {
+    if (!selectedProject || deployStatus !== 'running') return;
+    const activeDeployment = getOrCreateActiveDeployment(selectedProject.id);
+    if (activeDeployment.inFlight) return;
+    let cancelled = false;
+
+    const probe = async () => {
+      if (cancelled) return;
+      try {
+        await reconcileDeploymentStatus();
+      } catch {
+        // best-effort reconciliation while backend apply is in flight
+      }
+    };
+
+    const timerId = window.setInterval(() => {
+      void probe();
+    }, 10_000);
+
+    void probe();
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timerId);
+    };
+  }, [deployProgress, deployStatus, reconcileDeploymentStatus, selectedProject]);
+
+  return (
+    <div className="flex h-screen overflow-hidden bg-black font-sans text-zinc-300">
+      <aside className="flex h-full w-[260px] shrink-0 flex-col border-r border-[#1A1A1A] bg-[#050505]">
+        <div className="flex h-16 items-center border-b border-[#1A1A1A] px-6"><div className="flex items-center gap-3"><div className="flex h-6 w-6 items-center justify-center rounded border border-[#262626] bg-[#111111] text-xs font-bold text-white">N</div><span className="text-sm font-semibold tracking-wide text-white">DepLAI</span></div></div>
+        <div className="custom-scrollbar flex-1 space-y-1 overflow-y-auto px-3 py-6">
+          {SIDEBAR_STAGES.map((stage) => <button key={stage.id} onClick={() => setAndPersistStage(stage.id)} className={`flex w-full items-center gap-3 rounded-md px-3 py-2 text-left ${activeStage === stage.id ? 'bg-[#111111] text-zinc-100' : 'text-zinc-400 hover:bg-[#0A0A0A]'}`}><div className="flex shrink-0 items-center justify-center">{activeStage === stage.id ? <CircleDashed className="h-4 w-4 animate-spin text-indigo-500" /> : <div className="h-4 w-4 rounded-full border border-zinc-700" />}</div><div><div className="text-[13px] font-medium">{stage.label}</div><div className="text-[10px] uppercase tracking-widest text-zinc-600">{stage.details}</div></div></button>)}
+        </div>
+      </aside>
+      <div className="flex h-full flex-1 flex-col overflow-hidden">
+        <header className="flex h-16 items-center justify-between border-b border-[#1A1A1A] bg-[#050505] px-8">
+          <div className="flex items-center gap-2 text-sm"><button onClick={() => router.push('/dashboard')} className="font-medium text-zinc-500 hover:text-white">Dashboard</button><ChevronRight className="h-4 w-4 text-zinc-700" /><span className="font-medium text-zinc-100">{SIDEBAR_STAGES.find((stage) => stage.id === activeStage)?.label}</span></div>
+          {selectedProject && <div className="flex items-center gap-3"><span className="rounded-md border border-[#262626] bg-[#111111] px-3 py-1.5 font-mono text-xs text-zinc-400">{selectedProject.name}</span><button onClick={() => router.push('/dashboard')} className="text-xs font-semibold text-zinc-400 hover:text-white">Exit</button></div>}
+        </header>
+        <div className="custom-scrollbar flex-1 overflow-y-auto p-8">
+          {error && <div className="mx-auto mb-6 max-w-5xl rounded-md border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">{error}</div>}
+          {activeStage === 'analysis' && <div className="mx-auto max-w-5xl space-y-6">{selectedProject ? <><div><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Repository Analysis</h1><p className="text-sm text-zinc-400">{analysisLoading ? 'Scanning codebase and waiting for Agentic Layer.' : 'Scanning codebase to infer runtime and deployment requirements.'}</p></div><div className="grid grid-cols-3 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Runtime</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : String(repoContext?.language?.runtime || 'Unknown')}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Frameworks</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : analysisFrameworkNames.join(' / ') || 'None detected'}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Data Stores</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : analysisDataStoreNames.join(', ') || 'None detected'}</div></div></div>{!analysisLoading && repoContext && <div className="grid grid-cols-2 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Scanner Summary</div><div className="space-y-2 text-sm text-zinc-300"><div>{String(repoContext.summary || 'No summary generated yet.')}</div><div className="text-zinc-500">Workspace: <span className="font-mono text-zinc-300">{repoContext.workspace}</span></div><div className="text-zinc-500">Build: <span className="font-mono text-zinc-300">{String(repoContext.build?.build_command || 'not detected')}</span></div><div className="text-zinc-500">Start: <span className="font-mono text-zinc-300">{String(repoContext.build?.start_command || 'not detected')}</span></div><div className="text-zinc-500">Health: <span className="font-mono text-zinc-300">{String(repoContext.health?.endpoint || 'not detected')}</span></div></div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Terraform Context</div><pre className="max-h-[220px] overflow-y-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-400">{qaSummary || 'Repository context will appear here after the scanner completes.'}</pre></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Processes & Config</div><div className="space-y-2 text-sm text-zinc-300">{analysisProcessLines.length > 0 ? analysisProcessLines.map((line) => <div key={line}>{line}</div>) : <div className="text-zinc-500">No explicit processes detected.</div>}{analysisConfigNames.length > 0 && <div className="pt-3 text-zinc-500">Config values: <span className="text-zinc-300">{analysisConfigNames.join(', ')}</span></div>}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Secrets & Flags</div><div className="space-y-2 text-sm text-zinc-300">{analysisSecretNames.length > 0 ? <div>Required secrets: {analysisSecretNames.join(', ')}</div> : <div className="text-zinc-500">No required secrets detected.</div>}{analysisFlagLines.length > 0 ? analysisFlagLines.map((line) => <div key={line} className="text-amber-300">{line}</div>) : <div className="text-zinc-500">No major flags raised by the scanner.</div>}{repoContext.readme_notes && <div className="text-zinc-400">{String(repoContext.readme_notes)}</div>}</div></div></div>}{!analysisLoading && repoContextMd && <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Scanner Markdown</div><pre className="max-h-[320px] overflow-y-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-400">{repoContextMd}</pre></div>}<div className="flex justify-end"><button onClick={() => setAndPersistStage('qa')} disabled={analysisLoading || !repoContext || repoContext.workspace !== expectedWorkspace} className="flex items-center gap-2 rounded-md bg-zinc-100 px-6 py-2.5 text-sm font-semibold text-black hover:bg-white disabled:cursor-not-allowed disabled:bg-[#111111] disabled:text-zinc-500">{analysisLoading ? 'Scanning Repository...' : 'Continue to Questions'} <ArrowRight className="h-4 w-4" /></button></div></> : <div className="rounded-xl border border-[#1A1A1A] bg-[#050505] p-8"><h1 className="mb-2 text-2xl font-semibold text-zinc-100">Choose a Repository from the Dashboard</h1><p className="max-w-2xl text-sm leading-relaxed text-zinc-400">Deployment Track only runs against a specific repository. Start from a repo card on the dashboard so the AWS deployment flow is bound to the correct project.</p><div className="mt-6"><button onClick={() => router.push('/dashboard')} className="rounded-md bg-zinc-100 px-5 py-2.5 text-sm font-semibold text-black hover:bg-white">Back to Dashboard</button></div></div>}</div>}
+          {activeStage === 'qa' && <div className="mx-auto max-w-4xl"><div className="border-b border-[#1A1A1A] py-6"><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Deployment Questions</h1><p className="text-sm text-zinc-400">{reviewLoading ? 'Preparing deployment questions from repository analysis.' : 'Resolving architectural ambiguity based on codebase scan.'}</p></div><div className="custom-scrollbar max-h-[480px] space-y-6 overflow-y-auto px-2 py-6">{messages.map((message, index) => <div key={`${message.questionId || index}-${message.sender}`} className={`flex gap-4 ${message.sender === 'user' ? 'flex-row-reverse' : ''}`}><div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md ${message.sender === 'agent' ? 'border border-[#262626] bg-[#111111]' : 'bg-[#1A1A1A]'}`}>{message.sender === 'agent' ? <Bot className="h-4 w-4 text-zinc-300" /> : <User className="h-4 w-4 text-zinc-400" />}</div><div className={`rounded-lg p-4 text-[13px] leading-relaxed ${message.sender === 'agent' ? 'rounded-tl-sm border border-[#1A1A1A] bg-[#050505] text-zinc-300' : 'rounded-tr-sm border border-[#262626] bg-[#111111] text-zinc-200'}`}>{message.text}</div></div>)}{reviewLoading && <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-4 text-sm text-zinc-400">Waiting for Agentic Layer to generate deployment questions...</div>}</div><div className="bg-black py-4">{currentQuestion?.options && <div className="mb-3 flex flex-wrap gap-2">{currentQuestion.options.map((option) => <button key={option.value} onClick={() => submitAnswer(option.value)} className="rounded-md border border-[#262626] bg-[#050505] px-3 py-2 text-xs font-medium text-zinc-300 hover:border-[#3f3f46]">{option.label}</button>)}</div>}<form onSubmit={(event) => { event.preventDefault(); submitAnswer(chatInput); }} className="flex gap-2"><input value={chatInput} onChange={(event) => setChatInput(event.target.value)} disabled={!currentQuestion} className="flex-1 rounded-md border border-[#262626] bg-[#050505] px-4 py-2.5 text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none disabled:opacity-50" /><button type="submit" disabled={!chatInput.trim() || !currentQuestion} className="rounded-md bg-zinc-100 px-6 font-semibold text-black hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"><Send className="h-4 w-4" /></button></form>{allQuestionsAnswered && <div className="mt-4 flex justify-end"><button onClick={() => void generatePlan().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to generate deployment profile.'))} className="flex items-center gap-2 rounded-md bg-indigo-600 px-5 py-2 text-sm font-semibold text-white hover:bg-indigo-500">Generate Architecture <ArrowRight className="h-4 w-4" /></button></div>}</div></div>}
+          {activeStage === 'architecture' && <div className="mx-auto max-w-6xl space-y-6"><div><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Architecture & Cost Estimate</h1><p className="text-sm text-zinc-400">Generated topology for AWS ({architectureRegion}) from repository analysis and deployment Q&A.</p></div><div className="grid grid-cols-3 gap-6"><div className="col-span-2 overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="flex items-center justify-between border-b border-[#1A1A1A] px-5 py-4"><div><div className="text-sm font-semibold text-zinc-100">Generated Architecture Graph</div><div className="text-xs text-zinc-500">{architectureNodes.length} nodes / {architectureEdges.length} edges</div></div></div><div className="p-5">{architectureLayout.length > 0 ? <svg viewBox="0 0 700 400" className="w-full rounded-lg bg-black"><defs><marker id="deploy-track-arrow" markerWidth="8" markerHeight="6" refX="6" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#3f3f46" /></marker></defs>{architectureEdges.map((edge, index) => { const from = architectureNodePositions.get(edge.from); const to = architectureNodePositions.get(edge.to); if (!from || !to) return null; return <line key={`${edge.from}-${edge.to}-${index}`} x1={from.x} y1={from.y} x2={to.x} y2={to.y} stroke="#3f3f46" strokeWidth="1.5" strokeDasharray="5,3" markerEnd="url(#deploy-track-arrow)" />; })}{architectureLayout.map((node) => <g key={node.id} transform={`translate(${node.x - 60},${node.y - 22})`}><rect width="120" height="44" rx="8" fill={`${node.color}18`} stroke={node.color} strokeWidth="1" strokeOpacity=".65" /><text x="60" y="17" textAnchor="middle" fill={node.color} fontSize="9" fontFamily="monospace" fontWeight="600">{node.id.toUpperCase()}</text><text x="60" y="31" textAnchor="middle" fill="#a1a1aa" fontSize="10" fontFamily="-apple-system,sans-serif">{node.label || node.type}</text></g>)}<text x="350" y="392" textAnchor="middle" fill="#52525b" fontSize="10" fontFamily="-apple-system,sans-serif">Rendered from architecture review output</text></svg> : <div className="rounded-lg border border-dashed border-[#262626] bg-black px-6 py-16 text-center text-sm text-zinc-500">Architecture output is not available yet. Complete Q&A generation to populate the graph.</div>}</div></div><div className="space-y-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Monthly Estimate</div><div className="text-3xl font-semibold text-zinc-100">${costEstimate.total.toFixed(2)}</div><div className="mt-2 text-xs text-zinc-500">Budget cap: ${costEstimate.cap.toFixed(2)}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Q&A Context</div><div className="text-xs leading-relaxed text-zinc-400">{qaSummary ? <pre className="whitespace-pre-wrap font-sans text-xs leading-relaxed text-zinc-400">{qaSummary}</pre> : 'Waiting for deployment answers.'}</div></div><button onClick={() => setAndPersistStage('approval')} className="w-full rounded-md bg-zinc-100 py-3 text-sm font-semibold text-black hover:bg-white">Review & Approve</button></div></div>{architectureCostRows.length > 0 && <div className="overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="border-b border-[#1A1A1A] px-5 py-4 text-sm font-semibold text-zinc-100">Cost Breakdown</div><table className="w-full text-sm"><thead><tr className="border-b border-[#1A1A1A] text-left text-[11px] uppercase tracking-widest text-zinc-500"><th className="px-5 py-3">Service</th><th className="px-5 py-3">Type</th><th className="px-5 py-3">Monthly</th><th className="px-5 py-3">Notes</th></tr></thead><tbody>{architectureCostRows.map((row, index) => <tr key={`${row.service}-${index}`} className="border-b border-[#111111] last:border-0"><td className="px-5 py-3 text-zinc-200">{row.service}</td><td className="px-5 py-3 text-zinc-400">{row.type}</td><td className="px-5 py-3 font-mono text-zinc-200">${row.monthly.toFixed(2)}</td><td className="px-5 py-3 text-zinc-500">{row.note || '-'}</td></tr>)}<tr className="bg-black/60"><td className="px-5 py-3 font-semibold text-zinc-100">Total</td><td className="px-5 py-3" /><td className="px-5 py-3 font-mono font-semibold text-zinc-100">${costEstimate.total.toFixed(2)}</td><td className="px-5 py-3" /></tr></tbody></table></div>}</div>}
+          {activeStage === 'approval' && <div className="mx-auto max-w-3xl space-y-6"><div className="mt-4 mb-8 border-b border-[#1A1A1A] pb-6"><h1 className="mb-2 text-2xl font-semibold text-zinc-100">Sign-off</h1><p className="text-sm text-zinc-400">Review deployment contract before generating infrastructure code.</p></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-6 rounded-md border border-[#1A1A1A] bg-black p-4"><label className="flex items-start gap-3"><input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)} className="mt-1 h-4 w-4 rounded border-[#4B5563] bg-[#111111] text-indigo-600" /><span className="text-sm leading-relaxed text-zinc-400">I approve the architectural design and estimated runtime costs. Proceed with generating Terraform configurations.</span></label></div><button disabled={!approved} onClick={() => { setAndPersistStage('terraform'); void generateTerraform().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'IaC generation failed.')); }} className="w-full rounded-md bg-indigo-600 py-3 text-sm font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500">Approve & Generate IaC</button></div></div>}
+          {activeStage === 'terraform' && <div className="mx-auto flex max-w-6xl flex-col gap-6"><div className="flex items-center justify-between"><div><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Terraform Output</h1><p className="text-sm text-zinc-400">Code generated by the Terraform agent from the approved architecture.</p></div><button onClick={() => setAndPersistStage('aws_config')} disabled={iacFiles.length === 0} className="rounded-md bg-zinc-100 px-5 py-2 text-sm font-semibold text-black hover:bg-white disabled:bg-[#111111] disabled:text-zinc-500">Continue to Config</button></div><div className="grid grid-cols-3 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5"><div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Terraform Agent</div><div className="text-sm text-zinc-200">{savedRun?.run_id ? 'Connected to saved run' : 'Using generated file bundle'}</div><div className="mt-3 space-y-2 text-xs text-zinc-500"><div>Run ID: <span className="font-mono text-zinc-300">{savedRun?.run_id || 'pending'}</span></div><div>Workspace: <span className="font-mono text-zinc-300">{savedRun?.workspace || 'local session'}</span></div><div>Files: <span className="font-mono text-zinc-300">{iacFiles.length}</span></div></div></div><div className="col-span-2 flex gap-6"><div className="custom-scrollbar h-[520px] w-64 shrink-0 overflow-y-auto rounded-lg border border-[#1A1A1A] bg-[#050505] p-3 text-sm">{iacFiles.map((file) => <button key={file.path} onClick={() => setSelectedFile(file.path)} className={`mb-2 block w-full rounded px-2 py-1 text-left ${activeIacFilePath === file.path ? 'bg-[#111111] text-zinc-200' : 'text-zinc-300 hover:bg-[#111111]'}`}>{file.path}</button>)}</div><div className="flex h-[520px] flex-1 flex-col rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="border-b border-[#1A1A1A] bg-black px-4 py-2.5 font-mono text-[11px] text-zinc-400">{activeIacFilePath || 'Generated files'}</div><div className="custom-scrollbar flex-1 overflow-y-auto p-5 font-mono text-[13px] leading-relaxed text-zinc-300"><pre className="whitespace-pre-wrap">{(iacFiles.find((file) => file.path === activeIacFilePath) || iacFiles[0])?.content || 'Generate Terraform to view files.'}</pre></div></div></div></div></div>}
+          {activeStage === 'aws_config' && <div className="mx-auto max-w-5xl space-y-6"><div className="mt-4 mb-6 border-b border-[#1A1A1A] pb-6"><h1 className="mb-2 text-2xl font-semibold text-zinc-100">AWS Configuration</h1><p className="text-sm text-zinc-400">Provide deploy-time credentials and confirm the Terraform runtime inputs.</p></div><div className="grid grid-cols-3 gap-6"><div className="col-span-2 space-y-6 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="space-y-4"><input value={aws.aws_access_key_id} onChange={(event) => setAws((prev) => ({ ...prev, aws_access_key_id: event.target.value }))} placeholder="AWS_ACCESS_KEY_ID" className="w-full rounded-md border border-[#262626] bg-black px-4 py-2.5 font-mono text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none" /><input type="password" value={aws.aws_secret_access_key} onChange={(event) => setAws((prev) => ({ ...prev, aws_secret_access_key: event.target.value }))} placeholder="AWS_SECRET_ACCESS_KEY" className="w-full rounded-md border border-[#262626] bg-black px-4 py-2.5 font-mono text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none" /><input value={aws.aws_region} onChange={(event) => setAws((prev) => ({ ...prev, aws_region: event.target.value }))} placeholder="AWS_REGION" className="w-full rounded-md border border-[#262626] bg-black px-4 py-2.5 font-mono text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none" /></div><button onClick={() => setAndPersistStage('deploy')} disabled={!hasAwsSecrets || (!savedRun && iacFiles.length === 0)} className="flex w-full items-center justify-center gap-2 rounded-md bg-indigo-600 py-3 font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500"><Rocket className="h-4 w-4" /> Continue to Deploy</button></div><div className="space-y-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div><div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Runtime Inputs</div><div className="mt-3 space-y-2 text-xs text-zinc-400"><div>Terraform source: <span className="font-mono text-zinc-200">{savedRun?.run_id ? 'saved run' : 'session files'}</span></div><div>Workspace: <span className="font-mono text-zinc-200">{savedRun?.workspace || 'local session'}</span></div><div>Estimated monthly cost: <span className="font-mono text-zinc-200">${costEstimate.total.toFixed(2)}</span></div><div>Budget cap: <span className="font-mono text-zinc-200">${costEstimate.cap.toFixed(2)}</span></div></div></div><div className={`rounded-md border px-3 py-2 text-xs ${hasAwsSecrets ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300' : 'border-amber-500/20 bg-amber-500/10 text-amber-300'}`}>{hasAwsSecrets ? 'AWS credentials ready for runtime apply.' : 'Enter AWS credentials to unlock deployment.'}</div></div></div></div>}
+          {activeStage === 'deploy' && <div className="mx-auto max-w-5xl space-y-6"><div className="mb-2 flex items-center justify-between"><div><h1 className="text-2xl font-semibold text-zinc-100">{deployStatus === 'done' ? 'Deployment Complete' : deployStatus === 'running' ? 'Deployment In Progress' : deployStatus === 'error' ? 'Deployment Failed' : 'Ready to Deploy'}</h1><p className="mt-1 text-sm text-zinc-400">Live deployment console backed by pipeline WebSocket events and backend status reconciliation.</p></div><div className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-widest ${deploySocketState === 'connected' ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : deploySocketState === 'connecting' ? 'border-cyan-500/20 bg-cyan-500/10 text-cyan-400' : deploySocketState === 'error' ? 'border-amber-500/20 bg-amber-500/10 text-amber-400' : 'border-zinc-700 bg-[#111111] text-zinc-500'}`}>WS {deploySocketState}</div></div><div className="grid grid-cols-3 gap-6"><div className="col-span-2 flex h-[500px] flex-col overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="flex items-center justify-between border-b border-[#1A1A1A] bg-black px-4 py-2.5 font-mono text-xs text-zinc-500"><div className="flex items-center gap-2"><Terminal className="h-4 w-4 text-zinc-400" /> STDOUT</div><div>{deployLogs.length} events</div></div><div className="custom-scrollbar flex-1 overflow-y-auto bg-black p-6 font-mono text-[13px]">{deployLogs.map((log, index) => <div key={`${log.ts}-${index}`} className="mb-1 flex gap-4"><span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span><span className={log.type === 'success' ? 'font-medium text-emerald-400' : log.type === 'error' ? 'text-red-400' : 'text-zinc-300'}>{log.text}</span></div>)}<div ref={logEndRef} /></div></div><div className="space-y-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div><div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Execution</div><div className="mt-3 text-3xl font-semibold text-zinc-100">{deployProgress}%</div><div className="mt-2 h-2 overflow-hidden rounded-full bg-[#111111]"><div className={`h-full rounded-full ${deployStatus === 'done' ? 'bg-emerald-500' : deployStatus === 'error' ? 'bg-red-500' : 'bg-indigo-500'}`} style={{ width: `${deployProgress}%` }} /></div><div className="mt-3 text-xs text-zinc-500">Status: <span className="font-mono text-zinc-300">{deployStatus}</span></div></div><div className="space-y-3"><button onClick={() => void startDeploy()} disabled={deployStatus === 'running'} className="flex w-full items-center justify-center gap-2 rounded-md bg-indigo-600 px-6 py-2.5 font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500"><Rocket className="h-4 w-4" /> {deployStatus === 'done' ? 'Re-run Deploy' : 'Start Deploy'}</button><button onClick={() => void stopDeployment()} disabled={deployStatus !== 'running' || stopLoading} className="w-full rounded-md border border-red-500/20 bg-red-500/10 px-6 py-2.5 font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">{stopLoading ? 'Stopping...' : 'Stop Deployment'}</button><button onClick={() => void reconcileDeploymentStatus().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to reconcile deployment status.'))} className="w-full rounded-md border border-[#262626] bg-[#111111] px-6 py-2.5 font-semibold text-zinc-300 hover:bg-[#181818]">Reconcile Backend Status</button>{deployStatus !== 'running' && deployResult && <button onClick={() => setAndPersistStage('outputs')} className="flex w-full items-center justify-center gap-2 rounded-md bg-zinc-100 px-6 py-2.5 font-semibold text-black hover:bg-white">{deployStatus === 'error' ? 'View Results' : 'View Outputs'} <ArrowRight className="h-4 w-4" /></button>}</div></div></div></div>}
+          {activeStage === 'outputs' && <div className="mx-auto max-w-5xl space-y-6"><div className="mt-4 mb-8 border-b border-[#1A1A1A] pb-6"><div className={`mb-4 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-bold uppercase ${outputBannerClassName}`}><CheckCircle2 className="h-3.5 w-3.5" /> {outputBanner.label}</div><h1 className="mb-2 text-2xl font-semibold text-zinc-100">{outputBanner.title}</h1><p className="text-sm text-zinc-400">{outputBanner.description}</p>{backendErrorMessage && <div className="mt-4 rounded-md border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">{backendErrorMessage}</div>}{!backendErrorMessage && !hasLiveRuntimeDetails && deployResult?.success && <div className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-200">Live runtime details are missing for this repo. Fetch the latest runtime details to hydrate outputs before treating this deploy as successful.</div>}</div><div className="grid grid-cols-2 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-6 text-[10px] font-bold uppercase text-zinc-500">Security</div><div className="flex gap-2"><button onClick={() => deploySummary.generatedPem && downloadTextFile(`${deploySummary.keyName}.pem`, deploySummary.generatedPem.endsWith('\n') ? deploySummary.generatedPem : `${deploySummary.generatedPem}\n`)} disabled={!deploySummary.generatedPem} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-[#262626] bg-[#111111] py-2 text-[12px] font-medium text-zinc-200 hover:bg-[#1A1A1A] disabled:cursor-not-allowed disabled:text-zinc-500"><Download className="h-4 w-4" /> Download .PEM</button><button onClick={() => void downloadPpk().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'PPK conversion failed.'))} disabled={!deploySummary.generatedPem} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-[#262626] bg-[#111111] py-2 text-[12px] font-medium text-zinc-200 hover:bg-[#1A1A1A] disabled:cursor-not-allowed disabled:text-zinc-500"><Download className="h-4 w-4" /> Download .PPK</button></div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-4 text-[10px] font-bold uppercase text-zinc-500">Endpoints</div><div className="space-y-3 text-sm"><div className="flex justify-between"><span className="text-zinc-400">Public IP</span><span className="font-mono text-zinc-200">{deploySummary.publicIp}</span></div><div className="flex justify-between"><span className="text-zinc-400">Instance</span><span className="font-mono text-zinc-200">{deploySummary.instanceId}</span></div><div className="flex justify-between"><span className="text-zinc-400">CloudFront</span><div className="flex items-center gap-2"><span className="font-mono text-zinc-200">{deploySummary.cloudfrontUrl}</span>{canOpenCloudfront && <button onClick={() => window.open(deploySummary.cloudfrontUrl.startsWith('http') ? deploySummary.cloudfrontUrl : `https://${deploySummary.cloudfrontUrl}`, '_blank', 'noopener,noreferrer')} className="text-zinc-500 hover:text-zinc-200"><ExternalLink className="h-4 w-4" /></button>}</div></div><div className="flex justify-between"><span className="text-zinc-400">Verification</span><span className={`font-medium ${outputBanner.tone === 'success' ? 'text-emerald-400' : outputBanner.tone === 'error' ? 'text-red-300' : 'text-amber-300'}`}>{outputBanner.label}</span></div></div></div></div><div className="flex gap-3"><button onClick={() => void fetchRuntimeDetails().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to fetch runtime details.'))} disabled={!canFetchRuntimeDetails} className="flex items-center gap-2 rounded-md border border-[#262626] bg-[#111111] px-4 py-2 text-sm font-semibold text-zinc-300 hover:bg-[#181818] disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><RefreshCw className="h-4 w-4" /> Fetch Latest Runtime Details</button><button onClick={() => void verifyLiveEndpoints()} disabled={verifyLoading || !canVerifyLiveEndpoints} className="flex items-center gap-2 rounded-md border border-cyan-500/20 bg-cyan-500/10 px-4 py-2 text-sm font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><ExternalLink className="h-4 w-4" /> {verifyLoading ? 'Verifying...' : 'Verify Live Endpoints'}</button><button onClick={() => void destroyDeployment().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Destroy failed.'))} disabled={destroyLoading || !hasAwsSecrets} className="flex items-center gap-2 rounded-md border border-red-500/20 bg-red-500/10 px-4 py-2 text-sm font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><Server className="h-4 w-4" /> {destroyLoading ? 'Destroying...' : 'Destroy Infrastructure'}</button></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><h3 className="mb-4 text-sm font-semibold text-zinc-200">Endpoint Verification</h3>{effectiveEndpointChecks.length > 0 ? <div className="space-y-3">{effectiveEndpointChecks.map((check) => <div key={`${check.label}-${check.url || 'empty'}`} className="rounded-md border border-[#1A1A1A] bg-black p-4"><div className="flex items-center justify-between"><div><div className="text-sm font-medium text-zinc-200">{check.label}</div><div className="mt-1 font-mono text-[11px] text-zinc-500">{check.url || 'n/a'}</div></div><span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${check.ok ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-300'}`}>{check.ok ? `HTTP ${check.status ?? 200}` : (check.status ? `HTTP ${check.status}` : 'Unreachable')}</span></div><div className="mt-3 text-xs leading-relaxed text-zinc-400">{check.detail}</div></div>)}</div> : <div className="rounded-md border border-dashed border-[#262626] bg-black px-4 py-6 text-sm text-zinc-500">{canVerifyLiveEndpoints ? 'No live verification has been recorded yet. Run `Verify Live Endpoints` to test the deployed URLs.' : 'Verification is unavailable until the current repo has a successful deploy payload and live runtime details.'}</div>}</div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><h3 className="mb-4 text-sm font-semibold text-zinc-200">Deployment History</h3><div className="space-y-3">{deploymentHistory.map((entry) => <div key={entry.id} className="rounded-md border border-[#1A1A1A] bg-black p-4"><div className="flex items-center justify-between"><div><p className="text-sm font-medium text-zinc-200">{new Date(entry.createdAt).toLocaleString()}</p><p className="mt-1 font-mono text-[11px] text-zinc-400">EC2: {entry.instanceId}</p></div><span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${entry.status === 'done' ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-400'}`}>{entry.status === 'done' ? 'Success' : 'Error'}</span></div></div>)}</div></div></div>}
+        </div>
+      </div>
+      <style dangerouslySetInnerHTML={{ __html: `.custom-scrollbar::-webkit-scrollbar{width:6px}.custom-scrollbar::-webkit-scrollbar-track{background:transparent}.custom-scrollbar::-webkit-scrollbar-thumb{background-color:#262626;border-radius:10px}.custom-scrollbar::-webkit-scrollbar-thumb:hover{background-color:#3f3f46}` }} />
+    </div>
+  );
+}

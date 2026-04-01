@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { COST_BREAKDOWN } from './data';
-import type { Message } from './types';
 import { Btn, colorize, FileNode, Header, Tag } from './ui';
+import { buildDeploymentWorkspace } from '@/lib/deployment-planning-contract';
 
 export interface AwsCredentialsConfig {
   aws_access_key_id: string;
@@ -9,149 +9,301 @@ export interface AwsCredentialsConfig {
   aws_region: string;
 }
 
-export function QAPage({ onNavigate, autopilot = false }: { onNavigate: (v: string) => void; autopilot?: boolean }) {
-  const [messages, setMessages] = useState<Message[]>([{ role: 'agent', text: 'What AWS region should this deploy to, and do you need multi-AZ resilience?' }]);
-  const [step, setStep] = useState<number>(0);
-  const [input, setInput] = useState<string>('');
-  const [answers, setAnswers] = useState<string[]>([]);
-  const [done, setDone] = useState<boolean>(false);
-  const [typing, setTyping] = useState<boolean>(false);
+const REPO_CONTEXT_KEY = 'deplai.pipeline.repoContext';
+const REPO_CONTEXT_MD_KEY = 'deplai.pipeline.repoContextMd';
+const REVIEW_PAYLOAD_KEY = 'deplai.pipeline.reviewPayload';
+const REVIEW_ANSWERS_KEY = 'deplai.pipeline.reviewAnswers';
+const DEPLOYMENT_PROFILE_KEY = 'deplai.pipeline.deploymentProfile';
+const ARCHITECTURE_VIEW_KEY = 'deplai.pipeline.architectureJson';
+const APPROVAL_PAYLOAD_KEY = 'deplai.pipeline.approvalPayload';
+const PLANNING_PROJECT_KEY = 'deplai.pipeline.planningProjectId';
+
+interface RepositoryContextJson {
+  document_kind: 'repository_context';
+  workspace: string;
+  project_name: string;
+  summary?: string;
+  language?: Record<string, unknown>;
+  frameworks?: Array<Record<string, unknown>>;
+  data_stores?: Array<Record<string, unknown>>;
+  processes?: Array<Record<string, unknown>>;
+  build?: Record<string, unknown>;
+  health?: Record<string, unknown>;
+  readme_notes?: string | null;
+  conflicts?: Array<{ field?: string; reason?: string }>;
+  low_confidence_items?: Array<{ field?: string; reason?: string }>;
+}
+
+interface ArchitectureQuestionOption {
+  value: string;
+  label: string;
+  description?: string | null;
+}
+
+interface ArchitectureQuestion {
+  id: string;
+  category: string;
+  question: string;
+  required: boolean;
+  default?: string | null;
+  options?: ArchitectureQuestionOption[];
+}
+
+interface ArchitectureReviewPayload {
+  context_json: RepositoryContextJson;
+  questions: ArchitectureQuestion[];
+  defaults: Record<string, string>;
+  conflicts: Array<{ field?: string; reason?: string }>;
+  low_confidence_items: Array<{ field?: string; reason?: string }>;
+}
+
+function readStoredJson<T>(key: string): T | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredJson(key: string, value: unknown): void {
+  if (typeof window === 'undefined') return;
+  sessionStorage.setItem(key, JSON.stringify(value));
+}
+
+function clearPlanningState(): void {
+  if (typeof window === 'undefined') return;
+  [
+    REPO_CONTEXT_KEY,
+    REPO_CONTEXT_MD_KEY,
+    REVIEW_PAYLOAD_KEY,
+    REVIEW_ANSWERS_KEY,
+    DEPLOYMENT_PROFILE_KEY,
+    ARCHITECTURE_VIEW_KEY,
+    APPROVAL_PAYLOAD_KEY,
+    'deplai.pipeline.costEstimate',
+    'deplai.pipeline.iacFiles',
+    'deplai.pipeline.iacRun',
+    'deplai.pipeline.qaContext',
+  ].forEach((key) => sessionStorage.removeItem(key));
+}
+
+function resolvePlanningWorkspace(projectId?: string | null, projectName?: string): string {
+  return buildDeploymentWorkspace(String(projectId || '').trim(), projectName);
+}
+
+export function QAPage({
+  onNavigate,
+  autopilot = false,
+  projectId,
+  projectName,
+}: {
+  onNavigate: (v: string) => void;
+  autopilot?: boolean;
+  projectId?: string | null;
+  projectName?: string;
+}) {
+  const [loading, setLoading] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+  const [context, setContext] = useState<RepositoryContextJson | null>(() => readStoredJson<RepositoryContextJson>(REPO_CONTEXT_KEY));
+  const [contextMd, setContextMd] = useState<string>(() => readStoredJson<string>(REPO_CONTEXT_MD_KEY) || '');
   const [autopilotApplied, setAutopilotApplied] = useState<boolean>(false);
-  const chatRef = useRef<HTMLDivElement>(null);
-  const questions = [
-    'What AWS region should this deploy to, and do you need multi-AZ resilience?',
-    'What runtime stack powers this service? (e.g. Python + uvicorn, Node + pm2)',
-    'Expected baseline traffic - RPS, concurrent users, peak load pattern?',
-    'Which EC2 instance family is appropriate? (general-purpose, compute-optimised, memory-optimised)',
-    'Should internet traffic route through CloudFront, or direct to ALB?',
-  ];
-  const defaults = [
-    'eu-north-1 - single AZ, Free Tier mode.',
-    'Python 3.11 + uvicorn, 2 workers per instance.',
-    '~500 RPS peak, ~50 concurrent users, mostly read traffic.',
-    't3.micro (Free Tier safe) - general-purpose.',
-    'CloudFront -> ALB - no custom domain required yet.',
-  ];
-
-  const persistQaContext = (resolvedAnswers: string[]) => {
-    if (typeof window === 'undefined') return;
-    const qaSummary = questions
-      .map((q, i) => {
-        const a = String(resolvedAnswers[i] || '').trim();
-        return a ? `Q: ${q}\nA: ${a}` : '';
-      })
-      .filter(Boolean)
-      .join('\n\n');
-    const first = String(resolvedAnswers[0] || '');
-    const regionMatch = first.match(/\b[a-z]{2}-[a-z]+-\d\b/i);
-    const deploymentRegion = regionMatch?.[0]?.toLowerCase() || 'eu-north-1';
-    sessionStorage.setItem('deplai.pipeline.qaContext', JSON.stringify({
-      qa_summary: qaSummary,
-      deployment_region: deploymentRegion,
-    }));
-    sessionStorage.setItem('deplai.pipeline.qaAnswers', JSON.stringify(resolvedAnswers));
-  };
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    try {
-      const raw = sessionStorage.getItem('deplai.pipeline.qaAnswers');
-      if (!raw) return;
-      const saved = JSON.parse(raw);
-      if (!Array.isArray(saved) || saved.length === 0) return;
-      const restoredAnswers = saved.map((v) => String(v || ''));
-      // Migrate old minimum-default region from Mumbai to Stockholm for free-tier baseline.
-      if (
-        restoredAnswers[0]
-        && /ap-south-1/i.test(restoredAnswers[0])
-        && /free\s*tier/i.test(restoredAnswers[0])
-      ) {
-        restoredAnswers[0] = restoredAnswers[0].replace(/ap-south-1/ig, 'eu-north-1');
-      }
-      const msgs: Message[] = [];
-      questions.forEach((q, i) => {
-        const answer = restoredAnswers[i];
-        if (!answer) return;
-        msgs.push({ role: 'agent', text: q });
-        msgs.push({ role: 'user', text: answer });
-      });
-      msgs.push({ role: 'agent', text: 'Context already captured. You can review and proceed.' });
-      setMessages(msgs);
-      setAnswers(restoredAnswers);
-      setStep(Math.min(restoredAnswers.length, questions.length));
-      if (restoredAnswers.length >= questions.length) {
-        setDone(true);
-      }
-    } catch {
-      // ignore restore errors
+    if (typeof window === 'undefined' || !projectId) return;
+    const storedProjectId = sessionStorage.getItem(PLANNING_PROJECT_KEY);
+    if (storedProjectId && storedProjectId !== projectId) {
+      clearPlanningState();
+      setContext(null);
+      setContextMd('');
+      setError(null);
+      setAutopilotApplied(false);
     }
-  }, []);
+  }, [projectId]);
 
-  useEffect(() => {
-    if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
-  }, [messages]);
-
-  const submit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const ans = input.trim();
-    if (!ans) return;
-    const nextAnswers = [...answers, ans];
-    setAnswers(nextAnswers);
-    setMessages((m) => [...m, { role: 'user', text: ans }]);
-    setInput('');
-    setTyping(true);
-    setTimeout(() => {
-      const next = step + 1;
-      setTyping(false);
-      if (next < questions.length) {
-        setStep(next);
-        setMessages((m) => [...m, { role: 'agent', text: questions[next] }]);
-      } else {
-        setMessages((m) => [...m, { role: 'agent', text: 'Perfect. Context captured. Proceeding to architecture generation and cost estimation.' }]);
-        persistQaContext(nextAnswers);
-        setDone(true);
+  const runAnalysis = useCallback(async () => {
+    if (!projectId) {
+      setError('Select a project before running repository analysis.');
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/repository-analysis/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: projectId, workspace: resolvePlanningWorkspace(projectId, projectName) }),
+      });
+      const data = await res.json().catch(() => ({})) as {
+        success?: boolean;
+        context_json?: RepositoryContextJson;
+        context_md?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.success || !data.context_json) {
+        throw new Error(data.error || 'Repository analysis failed.');
       }
-    }, 900);
-  };
-
-  const applyDefaults = () => {
-    const msgs: Message[] = [];
-    questions.forEach((q, i) => {
-      msgs.push({ role: 'agent', text: q });
-      msgs.push({ role: 'user', text: defaults[i] });
-    });
-    msgs.push({ role: 'agent', text: 'Minimum-cost defaults applied. Advancing to architecture generation.' });
-    setMessages(msgs);
-    setAnswers(defaults);
-    persistQaContext(defaults);
-    setDone(true);
-    setStep(questions.length);
-  };
+      setContext(data.context_json);
+      setContextMd(String(data.context_md || ''));
+      sessionStorage.setItem(PLANNING_PROJECT_KEY, projectId);
+      writeStoredJson(REPO_CONTEXT_KEY, data.context_json);
+      writeStoredJson(REPO_CONTEXT_MD_KEY, String(data.context_md || ''));
+      writeStoredJson('deplai.pipeline.qaContext', {
+        qa_summary: String(data.context_json.summary || ''),
+        deployment_region: 'eu-north-1',
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Repository analysis failed.');
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId, projectName]);
 
   useEffect(() => {
-    if (!autopilot || done || autopilotApplied) return;
-    const timerId = window.setTimeout(() => {
-      setAutopilotApplied(true);
-      applyDefaults();
-      window.setTimeout(() => onNavigate('arch'), 500);
-    }, 120);
+    if (context || loading || error || !projectId) return;
+    void runAnalysis();
+  }, [context, error, loading, projectId, runAnalysis]);
+
+  useEffect(() => {
+    if (!autopilot || autopilotApplied || !context) return;
+    setAutopilotApplied(true);
+    const timerId = window.setTimeout(() => onNavigate('arch'), 250);
     return () => window.clearTimeout(timerId);
-  }, [applyDefaults, autopilot, autopilotApplied, done, onNavigate]);
+  }, [autopilot, autopilotApplied, context, onNavigate]);
+
+  const frameworks = Array.isArray(context?.frameworks) ? context?.frameworks : [];
+  const dataStores = Array.isArray(context?.data_stores) ? context?.data_stores : [];
+  const processes = Array.isArray(context?.processes) ? context?.processes : [];
+  const conflicts = Array.isArray(context?.conflicts) ? context?.conflicts : [];
+  const lowConfidence = Array.isArray(context?.low_confidence_items) ? context?.low_confidence_items : [];
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 fade-in">
-      <Header title="Q/A Context Gathering" subtitle="The DeplAI Agent collects architecture requirements before generating infrastructure." badge={{ text: 'Awaiting operator input', cls: 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20' }} actions={<><Btn onClick={applyDefaults} size="sm" variant="default" disabled={done}>Use minimum defaults</Btn><Tag color="indigo">Stage 6 - GATE</Tag></>} />
-      <div className="flex-1 min-h-0 flex flex-col overflow-hidden p-7">
-        <div ref={chatRef} className="flex-1 min-h-0 overflow-y-auto space-y-4 mb-4 custom-scrollbar pr-2">
-          {messages.map((m, i) => (
-            <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : ''}`}>
-              {m.role === 'agent' && <div className="flex items-start gap-3 max-w-2xl"><div className="w-8 h-8 rounded-xl bg-cyan-500/15 border border-cyan-500/25 flex items-center justify-center flex-shrink-0"><svg viewBox="0 0 28 28" className="w-4 h-4" fill="none"><polygon points="14,2 25,8 25,20 14,26 3,20 3,8" stroke="#06b6d4" strokeWidth="1.5" /><circle cx="14" cy="14" r="2.5" fill="#06b6d4" /></svg></div><div><p className="text-[10px] text-cyan-400 font-bold uppercase tracking-widest mb-1.5">DeplAI Agent</p><div className="bg-zinc-900 border border-white/5 rounded-xl rounded-tl-sm px-4 py-3 text-sm text-zinc-300 leading-relaxed">{m.text}</div></div></div>}
-              {m.role === 'user' && <div className="max-w-2xl"><p className="text-[10px] text-zinc-500 font-bold uppercase tracking-widest mb-1.5 text-right">Operator</p><div className="bg-indigo-500/10 border border-indigo-500/20 rounded-xl rounded-tr-sm px-4 py-3 text-sm text-indigo-100 leading-relaxed">{m.text}</div></div>}
+    <div className="flex-1 overflow-y-auto fade-in custom-scrollbar">
+      <Header
+        title="Repository Analyzer"
+        subtitle="Scans the selected codebase and produces the structured context used by the deployment decision flow."
+        badge={loading
+          ? { text: 'Analyzing repository', cls: 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' }
+          : error
+            ? { text: 'Analysis failed', cls: 'bg-red-500/10 text-red-400 border border-red-500/20' }
+            : context
+              ? { text: 'Context ready', cls: 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' }
+              : { text: 'Waiting for project', cls: 'bg-zinc-500/10 text-zinc-400 border border-zinc-500/20' }}
+        actions={<><Tag color="indigo">Stage 6</Tag><Btn onClick={() => { void runAnalysis(); }} size="sm" variant="default" disabled={loading || !projectId}>{loading ? 'Analyzing...' : 'Re-run analysis'}</Btn></>}
+      />
+      <div className="p-7 space-y-5">
+        {error && <div className="bg-red-500/5 border border-red-500/20 rounded-xl p-4 text-sm text-red-300">{error}</div>}
+        {context && (
+          <>
+            <div className="grid grid-cols-4 gap-4">
+              <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4">
+                <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Runtime</p>
+                <p className="text-lg font-semibold text-zinc-100">{String(context.language?.runtime || 'unknown')}</p>
+                <p className="text-xs text-zinc-500 mt-1">{String(context.language?.primary || 'unknown')} {String(context.language?.version || '')}</p>
+              </div>
+              <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4">
+                <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Frameworks</p>
+                <p className="text-lg font-semibold text-zinc-100">{frameworks.length}</p>
+                <p className="text-xs text-zinc-500 mt-1 truncate">{frameworks.map((item) => String(item.name || '')).join(', ') || 'None detected'}</p>
+              </div>
+              <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4">
+                <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Data stores</p>
+                <p className="text-lg font-semibold text-zinc-100">{dataStores.length}</p>
+                <p className="text-xs text-zinc-500 mt-1 truncate">{dataStores.map((item) => String(item.type || '')).join(', ') || 'None detected'}</p>
+              </div>
+              <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4">
+                <p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Processes</p>
+                <p className="text-lg font-semibold text-zinc-100">{processes.length}</p>
+                <p className="text-xs text-zinc-500 mt-1 truncate">{processes.map((item) => String(item.type || '')).join(', ') || 'Implicit only'}</p>
+              </div>
             </div>
-          ))}
-          {typing && <div className="flex items-start gap-3"><div className="w-8 h-8 rounded-xl bg-cyan-500/15 border border-cyan-500/25 flex items-center justify-center flex-shrink-0"><svg viewBox="0 0 28 28" className="w-4 h-4" fill="none"><polygon points="14,2 25,8 25,20 14,26 3,20 3,8" stroke="#06b6d4" strokeWidth="1.5" /><circle cx="14" cy="14" r="2.5" fill="#06b6d4" /></svg></div><div className="bg-zinc-900 border border-white/5 rounded-xl px-4 py-3 flex gap-1 items-center">{[0, 1, 2].map((j) => <span key={j} className="w-1.5 h-1.5 rounded-full bg-zinc-500 pulse-dot" style={{ animationDelay: `${j * 0.2}s` }} />)}</div></div>}
-        </div>
-        {done ? <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-xl p-4 flex items-center justify-between"><div className="flex items-center gap-3"><svg className="w-5 h-5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg><span className="text-sm font-medium text-emerald-300">Context captured - ready for architecture generation.</span></div><Btn onClick={() => onNavigate('arch')} variant="primary">Proceed to Architecture</Btn></div> : <form onSubmit={submit} className="flex gap-3"><input value={input} onChange={(e) => setInput(e.target.value)} placeholder="Type your answer..." className="flex-1 bg-zinc-900 border border-white/8 rounded-xl px-4 py-3 text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" disabled={typing} /><button type="submit" disabled={typing || !input.trim()} className="px-5 py-3 bg-indigo-500 hover:bg-indigo-400 text-white font-semibold rounded-xl transition-all disabled:opacity-40 flex items-center gap-2 text-sm">Send<svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg></button></form>}
+
+            <div className="grid grid-cols-3 gap-5">
+              <div className="col-span-2 bg-zinc-900 rounded-2xl border border-white/5 p-5">
+                <div className="flex items-center justify-between mb-4">
+                  <p className="text-sm font-semibold text-zinc-200">Detected repository context</p>
+                  <Tag color="zinc">{context.workspace}</Tag>
+                </div>
+                <p className="text-sm text-zinc-400 leading-relaxed mb-4">{context.summary || 'No summary generated.'}</p>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Frameworks</p>
+                    <div className="space-y-2">
+                      {frameworks.length === 0 && <p className="text-xs text-zinc-500">No framework signals detected.</p>}
+                      {frameworks.map((item, index) => (
+                        <div key={`${String(item.name || 'framework')}-${index}`} className="rounded-xl border border-white/5 bg-black/20 px-3 py-2">
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-sm text-zinc-200">{String(item.name || 'unknown')}</span>
+                            <Tag color={String(item.confidence || '').toLowerCase() === 'high' ? 'emerald' : 'amber'}>{String(item.confidence || 'medium')}</Tag>
+                          </div>
+                          <p className="text-[11px] text-zinc-500 mt-1">{String(item.role || '')}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Data stores</p>
+                    <div className="space-y-2">
+                      {dataStores.length === 0 && <p className="text-xs text-zinc-500">No datastore requirements detected.</p>}
+                      {dataStores.map((item, index) => (
+                        <div key={`${String(item.type || 'store')}-${index}`} className="rounded-xl border border-white/5 bg-black/20 px-3 py-2">
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-sm text-zinc-200">{String(item.type || 'unknown')}</span>
+                            <Tag color={String(item.confidence || '').toLowerCase() === 'high' ? 'emerald' : 'amber'}>{String(item.confidence || 'medium')}</Tag>
+                          </div>
+                          <p className="text-[11px] text-zinc-500 mt-1">{Array.isArray(item.signals) ? item.signals.join(', ') : 'No signals recorded'}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                {contextMd && (
+                  <div className="mt-5 pt-5 border-t border-white/5">
+                    <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Analysis notes</p>
+                    <pre className="text-[12px] whitespace-pre-wrap leading-relaxed text-zinc-400 bg-black/20 rounded-xl border border-white/5 p-4">{contextMd}</pre>
+                  </div>
+                )}
+              </div>
+              <div className="space-y-4">
+                <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4">
+                  <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-3">Flags</p>
+                  <div className="space-y-2">
+                    {conflicts.length === 0 && lowConfidence.length === 0 && <p className="text-xs text-zinc-500">No conflicts or low-confidence findings.</p>}
+                    {conflicts.map((item, index) => (
+                      <div key={`conflict-${index}`} className="rounded-xl border border-red-500/20 bg-red-500/5 px-3 py-2">
+                        <p className="text-sm text-red-300">{String(item.reason || 'Conflict detected')}</p>
+                      </div>
+                    ))}
+                    {lowConfidence.map((item, index) => (
+                      <div key={`low-${index}`} className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2">
+                        <p className="text-sm text-amber-300">{String(item.reason || 'Low-confidence finding')}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4">
+                  <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-3">Build + health</p>
+                  <div className="space-y-2 text-[12px]">
+                    <div className="flex justify-between gap-3"><span className="text-zinc-500">Build</span><span className="text-zinc-300 font-mono text-right">{String(context.build?.build_command || 'not found')}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-zinc-500">Start</span><span className="text-zinc-300 font-mono text-right">{String(context.build?.start_command || 'not found')}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-zinc-500">Health</span><span className="text-zinc-300 font-mono text-right">{String(context.health?.endpoint || '/')}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-zinc-500">Dockerfile</span><span className="text-zinc-300 text-right">{context.build?.has_dockerfile ? 'present' : 'missing'}</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-2xl p-5 flex items-center justify-between">
+              <div>
+                <p className="text-sm font-semibold text-emerald-300">Repository context is ready for review.</p>
+                <p className="text-xs text-zinc-500 mt-1">Proceed to the decision wizard to answer only the unresolved deployment questions.</p>
+              </div>
+              <Btn onClick={() => onNavigate('arch')} variant="primary">Proceed to Review</Btn>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -280,7 +432,7 @@ function inferInfraPlan(architecture: { nodes?: RuntimeArchNode[] }, region: str
   };
 }
 
-export function ArchPage({ onNavigate, projectId, projectName }: ArchPageProps) {
+function LegacyArchPage({ onNavigate, projectId, projectName }: ArchPageProps) {
   const [approved, setApproved] = useState<boolean>(false);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -525,6 +677,292 @@ export function ArchPage({ onNavigate, projectId, projectName }: ArchPageProps) 
   );
 }
 
+export const __legacyApprovalGate = {
+  parseQASessionContext,
+  inferInfraPlan,
+  LegacyArchPage,
+};
+
+export function ArchPage({ onNavigate, projectId, projectName }: ArchPageProps) {
+  const [approved, setApproved] = useState<boolean>(false);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [submitting, setSubmitting] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+  const [review, setReview] = useState<ArchitectureReviewPayload | null>(() => readStoredJson<ArchitectureReviewPayload>(REVIEW_PAYLOAD_KEY));
+  const [answers, setAnswers] = useState<Record<string, string>>(() => readStoredJson<Record<string, string>>(REVIEW_ANSWERS_KEY) || {});
+  const [deploymentProfile, setDeploymentProfile] = useState<Record<string, unknown> | null>(() => readStoredJson<Record<string, unknown>>(DEPLOYMENT_PROFILE_KEY));
+  const [nodes, setNodes] = useState<RuntimeArchNode[]>([]);
+  const [edges, setEdges] = useState<RuntimeArchEdge[]>([]);
+  const [costRows, setCostRows] = useState<RuntimeCostItem[]>(COST_BREAKDOWN);
+  const [total, setTotal] = useState<number>(COST_BREAKDOWN.reduce((a, b) => a + b.monthly, 0));
+  const [budgetCap, setBudgetCap] = useState<number>(100);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !projectId) return;
+    const storedProjectId = sessionStorage.getItem(PLANNING_PROJECT_KEY);
+    if (storedProjectId && storedProjectId !== projectId) {
+      clearPlanningState();
+      setApproved(false);
+      setError(null);
+      setLoading(true);
+      setReview(null);
+      setAnswers({});
+      setDeploymentProfile(null);
+      setNodes([]);
+      setEdges([]);
+      setCostRows(COST_BREAKDOWN);
+      setTotal(COST_BREAKDOWN.reduce((sum, item) => sum + item.monthly, 0));
+      setBudgetCap(100);
+    }
+  }, [projectId]);
+
+  const hydratePreview = useCallback(() => {
+    const approval = readStoredJson<Stage7ApprovalPayload>(APPROVAL_PAYLOAD_KEY);
+    const architecture = readStoredJson<{ nodes?: RuntimeArchNode[]; edges?: RuntimeArchEdge[] }>(ARCHITECTURE_VIEW_KEY);
+    if (architecture?.nodes) setNodes(architecture.nodes);
+    if (architecture?.edges) setEdges(architecture.edges);
+    if (!approval) return;
+    const diagramNodes = Array.isArray(approval.diagram?.nodes) ? approval.diagram?.nodes : [];
+    const diagramEdges = Array.isArray(approval.diagram?.edges) ? approval.diagram?.edges : [];
+    if (diagramNodes.length > 0) {
+      setNodes(diagramNodes.map((n) => ({
+        id: String(n.id || ''),
+        label: String(n.label || n.type || ''),
+        type: String(n.type || ''),
+      })));
+    }
+    if (diagramEdges.length > 0) {
+      setEdges(diagramEdges.map((e) => ({
+        from: String(e.from || ''),
+        to: String(e.to || ''),
+        label: String(e.style || ''),
+      })));
+    }
+    const normalizedBreakdown = normalizeCostBreakdown(approval.cost_estimate?.line_items);
+    const computedTotal = Number(approval.cost_estimate?.total_monthly_usd);
+    const payloadCap = Number(approval.budget_gate?.cap_usd);
+    if (normalizedBreakdown.length > 0) setCostRows(normalizedBreakdown);
+    if (Number.isFinite(computedTotal)) {
+      setTotal(computedTotal);
+    } else if (normalizedBreakdown.length > 0) {
+      setTotal(normalizedBreakdown.reduce((sum, item) => sum + item.monthly, 0));
+    }
+    if (Number.isFinite(payloadCap) && payloadCap > 0) setBudgetCap(payloadCap);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadReview() {
+      if (!projectId) {
+        setError('Select a project before starting the deployment review.');
+        setLoading(false);
+        return;
+      }
+      if (review) {
+        setAnswers((prev) => Object.keys(prev).length > 0 ? prev : { ...(review.defaults || {}) });
+        hydratePreview();
+        setLoading(false);
+        return;
+      }
+      setLoading(true);
+      try {
+        const storedContext = readStoredJson<RepositoryContextJson>(REPO_CONTEXT_KEY);
+        const workspace = String(storedContext?.workspace || resolvePlanningWorkspace(projectId, projectName));
+        const res = await fetch('/api/architecture/review/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ project_id: projectId, workspace }),
+        });
+        const data = await res.json().catch(() => ({})) as { success?: boolean; review?: ArchitectureReviewPayload; error?: string };
+        if (!res.ok || !data.success || !data.review) {
+          throw new Error(data.error || 'Failed to start architecture review.');
+        }
+        if (!cancelled) {
+          setReview(data.review);
+          const initialAnswers = { ...(data.review.defaults || {}) };
+          setAnswers(initialAnswers);
+          writeStoredJson(REVIEW_PAYLOAD_KEY, data.review);
+          writeStoredJson(REVIEW_ANSWERS_KEY, initialAnswers);
+        }
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to start architecture review.');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    void loadReview();
+    return () => {
+      cancelled = true;
+    };
+  }, [hydratePreview, projectId, projectName, review]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    writeStoredJson(REVIEW_ANSWERS_KEY, answers);
+  }, [answers]);
+
+  const groupedQuestions = useMemo(() => {
+    const groups = new Map<string, ArchitectureQuestion[]>();
+    (review?.questions || []).forEach((question) => {
+      groups.set(question.category, [...(groups.get(question.category) || []), question]);
+    });
+    return Array.from(groups.entries());
+  }, [review]);
+
+  const layout = useMemo(() => nodes.map((node, index) => ({
+    ...node,
+    x: 140 + (index % 3) * 210,
+    y: 56 + Math.floor(index / 3) * 92,
+    color: pickNodeColor(node.type),
+  })), [nodes]);
+  const nodePos = useMemo(() => {
+    const map = new Map<string, { x: number; y: number }>();
+    layout.forEach((item) => map.set(String(item.id), { x: item.x, y: item.y }));
+    return map;
+  }, [layout]);
+  const categoryTotals = useMemo(() => {
+    const totals = new Map<string, number>();
+    costRows.forEach((item) => totals.set(item.type || 'General', (totals.get(item.type || 'General') || 0) + item.monthly));
+    return Array.from(totals.entries()).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  }, [costRows]);
+
+  const generateProfile = async () => {
+    if (!projectId || !review) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const workspace = String(review.context_json.workspace || resolvePlanningWorkspace(projectId, projectName));
+      const res = await fetch('/api/architecture/review/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: projectId, workspace, answers }),
+      });
+      const data = await res.json().catch(() => ({})) as {
+        success?: boolean;
+        deployment_profile?: Record<string, unknown>;
+        architecture_view?: Record<string, unknown>;
+        approval_payload?: Stage7ApprovalPayload;
+        error?: string;
+      };
+      if (!res.ok || !data.success || !data.deployment_profile || !data.architecture_view) {
+        throw new Error(data.error || 'Failed to generate deployment profile.');
+      }
+      setDeploymentProfile(data.deployment_profile);
+      sessionStorage.setItem(PLANNING_PROJECT_KEY, projectId);
+      writeStoredJson(REVIEW_ANSWERS_KEY, answers);
+      writeStoredJson(DEPLOYMENT_PROFILE_KEY, data.deployment_profile);
+      writeStoredJson(ARCHITECTURE_VIEW_KEY, data.architecture_view);
+      writeStoredJson(APPROVAL_PAYLOAD_KEY, data.approval_payload || {});
+      hydratePreview();
+      const normalizedBreakdown = normalizeCostBreakdown(data.approval_payload?.cost_estimate?.line_items);
+      const computedTotal = Number(data.approval_payload?.cost_estimate?.total_monthly_usd);
+      const payloadCap = Number(data.approval_payload?.budget_gate?.cap_usd);
+      writeStoredJson('deplai.pipeline.costEstimate', {
+        total_monthly_usd: Number.isFinite(computedTotal) ? computedTotal : normalizedBreakdown.reduce((sum, item) => sum + item.monthly, 0),
+        budget_cap_usd: Number.isFinite(payloadCap) && payloadCap > 0 ? payloadCap : 100,
+        breakdown: normalizedBreakdown,
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to generate deployment profile.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const percent = Math.round(Math.min((total / budgetCap) * 100, 100));
+
+  return (
+    <div className="flex-1 overflow-y-auto fade-in custom-scrollbar">
+      <Header title="Deployment Review Wizard" subtitle="Answer only unresolved deployment questions, review the generated profile, then approve Terraform generation." badge={loading ? { text: 'Loading review', cls: 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' } : deploymentProfile ? { text: 'Awaiting approval', cls: 'bg-amber-500/10 text-amber-400 border border-amber-500/20' } : { text: 'Awaiting answers', cls: 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20' }} actions={<><Tag color="amber">Stage 7</Tag><Tag color="zinc">GATE</Tag></>} />
+      <div className="p-7 space-y-5">
+        {error && <div className="bg-red-500/5 border border-red-500/20 rounded-xl p-4 text-sm text-red-300">{error}</div>}
+        {review && (
+          <div className="bg-zinc-900 rounded-2xl border border-white/5 p-5">
+            <div className="flex items-center justify-between mb-4">
+              <div><p className="text-sm font-semibold text-zinc-200">Detected repository context</p><p className="text-xs text-zinc-500 mt-1">{review.context_json.summary || 'No repository summary available.'}</p></div>
+              <Btn onClick={() => { void generateProfile(); }} variant="primary" size="sm" disabled={loading || submitting}>{submitting ? 'Generating profile...' : 'Generate Deployment Profile'}</Btn>
+            </div>
+            <div className="grid grid-cols-3 gap-4 mb-5">
+              <div className="rounded-2xl border border-white/5 bg-black/20 p-4"><p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Frameworks</p><p className="text-sm text-zinc-300">{(review.context_json.frameworks || []).map((item) => String(item.name || '')).join(', ') || 'None detected'}</p></div>
+              <div className="rounded-2xl border border-white/5 bg-black/20 p-4"><p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Data stores</p><p className="text-sm text-zinc-300">{(review.context_json.data_stores || []).map((item) => String(item.type || '')).join(', ') || 'None detected'}</p></div>
+              <div className="rounded-2xl border border-white/5 bg-black/20 p-4"><p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Build</p><p className="text-sm text-zinc-300 font-mono">{String(review.context_json.build?.build_command || 'not found')}</p></div>
+            </div>
+            <div className="grid grid-cols-3 gap-5">
+              <div className="col-span-2 space-y-4">
+                {groupedQuestions.map(([category, questions]) => (
+                  <div key={category} className="rounded-2xl border border-white/5 bg-black/20 p-4">
+                    <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-3">{category}</p>
+                    <div className="grid grid-cols-2 gap-4">
+                      {questions.map((question) => {
+                        const value = String(answers[question.id] ?? question.default ?? '');
+                        const hasOptions = Array.isArray(question.options) && question.options.length > 0;
+                        return (
+                          <label key={question.id} className="block">
+                            <span className="block text-sm text-zinc-200 mb-2">{question.question}</span>
+                            {hasOptions ? (
+                              <select value={value} onChange={(e) => setAnswers((prev) => ({ ...prev, [question.id]: e.target.value }))} className="w-full bg-zinc-900 border border-white/8 rounded-xl px-3 py-2.5 text-sm text-zinc-200 focus:outline-none focus:border-cyan-500/40">
+                                {(question.options || []).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                              </select>
+                            ) : (
+                              <input value={value} onChange={(e) => setAnswers((prev) => ({ ...prev, [question.id]: e.target.value }))} className="w-full bg-zinc-900 border border-white/8 rounded-xl px-3 py-2.5 text-sm text-zinc-200 focus:outline-none focus:border-cyan-500/40" />
+                            )}
+                            {hasOptions && <p className="text-[11px] text-zinc-500 mt-1">{(question.options || []).find((option) => option.value === value)?.description || ''}</p>}
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="space-y-4">
+                <div className="bg-zinc-950/50 rounded-2xl border border-white/5 p-4">
+                  <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-3">Conflicts</p>
+                  {(review.conflicts || []).length === 0 && <p className="text-xs text-zinc-500">No hard conflicts detected.</p>}
+                  {(review.conflicts || []).map((item, index) => <div key={`conf-${index}`} className="rounded-xl border border-red-500/20 bg-red-500/5 px-3 py-2 text-sm text-red-300 mb-2">{String(item.reason || 'Conflict detected')}</div>)}
+                </div>
+                <div className="bg-zinc-950/50 rounded-2xl border border-white/5 p-4">
+                  <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-3">Low confidence</p>
+                  {(review.low_confidence_items || []).length === 0 && <p className="text-xs text-zinc-500">No low-confidence items.</p>}
+                  {(review.low_confidence_items || []).map((item, index) => <div key={`low-${index}`} className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-sm text-amber-300 mb-2">{String(item.reason || 'Low-confidence signal')}</div>)}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {deploymentProfile && (
+          <>
+            <div className="grid grid-cols-4 gap-4">
+              <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4"><p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Application type</p><p className="text-lg font-semibold text-zinc-100">{String(deploymentProfile.application_type || 'unknown')}</p></div>
+              <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4"><p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Compute</p><p className="text-lg font-semibold text-zinc-100">{String((deploymentProfile.compute as { strategy?: string } | undefined)?.strategy || 'unknown')}</p></div>
+              <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4"><p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Environment</p><p className="text-lg font-semibold text-zinc-100">{String(deploymentProfile.environment || 'unknown')}</p></div>
+              <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4"><p className="text-[10px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Networking</p><p className="text-lg font-semibold text-zinc-100">{String((deploymentProfile.networking as { layout?: string } | undefined)?.layout || 'unknown')}</p></div>
+            </div>
+            <div className="grid grid-cols-3 gap-5">
+              <div className="col-span-2 bg-zinc-900 rounded-2xl border border-white/5 overflow-hidden">
+                <div className="flex items-center justify-between px-5 py-3.5 border-b border-white/5"><p className="text-sm font-semibold text-zinc-200">Derived architecture view - AWS (eu-north-1)</p><div className="flex gap-2"><Tag color="zinc">{layout.length} nodes</Tag><Tag color="zinc">{edges.length} edges</Tag></div></div>
+                <div className="p-5">
+                  <svg viewBox="0 0 700 400" className="w-full rounded-lg" style={{ background: '#0f0f11' }}>
+                    <defs><marker id="arr" markerWidth="8" markerHeight="6" refX="6" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#3f3f46" /></marker></defs>
+                    {edges.map((e, i) => { const from = nodePos.get(String(e.from)); const to = nodePos.get(String(e.to)); if (!from || !to) return null; return <line key={`${e.from}-${e.to}-${i}`} x1={from.x} y1={from.y} x2={to.x} y2={to.y} stroke="#3f3f46" strokeWidth="1.5" markerEnd="url(#arr)" strokeDasharray="5,3" />; })}
+                    {layout.map((n) => <g key={n.id} transform={`translate(${n.x - 60},${n.y - 22})`}><rect width="120" height="44" rx="8" fill={n.color + '18'} stroke={n.color} strokeWidth="1" strokeOpacity=".6" /><text x="60" y="17" textAnchor="middle" fill={n.color} fontSize="9" fontFamily="monospace" fontWeight="600">{String(n.id).toUpperCase()}</text><text x="60" y="31" textAnchor="middle" fill="#a1a1aa" fontSize="10" fontFamily="-apple-system,sans-serif">{n.label || n.type}</text></g>)}
+                  </svg>
+                </div>
+              </div>
+              <div className="space-y-4">
+                <div className="bg-zinc-900 rounded-2xl border border-white/5 p-5"><p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-3">Monthly estimate</p><p className="text-4xl font-bold text-emerald-400 font-mono">${total.toFixed(2)}</p><div className="mt-4 pt-4 border-t border-white/5 space-y-1.5">{categoryTotals.map(([name, value]) => <div key={name} className="flex justify-between text-xs"><span className="text-zinc-500">{name}</span><span className="text-zinc-300 font-mono">${value.toFixed(2)}</span></div>)}</div></div>
+                <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4"><p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Budget gate</p><div className="flex items-center justify-between mb-1.5"><span className="text-xs text-zinc-400">Budget cap</span><span className="text-xs font-mono text-zinc-300">${budgetCap.toFixed(2)}</span></div><div className="h-2 bg-zinc-800 rounded-full overflow-hidden"><div className={`h-full rounded-full ${total <= budgetCap ? 'bg-gradient-to-r from-emerald-500 to-cyan-500' : 'bg-gradient-to-r from-amber-500 to-red-500'}`} style={{ width: `${percent}%` }} /></div><p className={`text-[11px] mt-1.5 ${total <= budgetCap ? 'text-emerald-400' : 'text-amber-400'}`}>{percent}% of cap used</p></div>
+              </div>
+            </div>
+            <div className="bg-zinc-900 rounded-2xl border border-white/5 overflow-hidden"><div className="px-5 py-3.5 border-b border-white/5"><p className="text-sm font-semibold text-zinc-200">Cost breakdown by service</p></div><table className="w-full text-sm"><thead><tr className="border-b border-white/5">{['Service', 'Type', 'Monthly (USD)', 'Notes'].map((h) => <th key={h} className="text-left px-5 py-3 text-[11px] uppercase tracking-wider text-zinc-500 font-semibold">{h}</th>)}</tr></thead><tbody>{costRows.map((r, i) => <tr key={i} className="border-b border-white/4 last:border-0 hover:bg-white/2"><td className="px-5 py-3 text-zinc-200 font-medium">{r.service}</td><td className="px-5 py-3"><Tag color="zinc">{r.type}</Tag></td><td className="px-5 py-3 font-mono text-zinc-300">${r.monthly.toFixed(2)}</td><td className="px-5 py-3 text-zinc-500 text-xs">{r.note || '-'}</td></tr>)}<tr className="bg-zinc-800/50"><td className="px-5 py-3 font-bold text-zinc-100">Total</td><td /><td className="px-5 py-3 font-mono font-bold text-emerald-400">${total.toFixed(2)}</td><td /></tr></tbody></table></div>
+            {!approved ? <div className="bg-amber-500/5 border border-amber-500/20 rounded-2xl p-5 flex items-center justify-between"><div><p className="text-sm font-semibold text-amber-300">Approve deployment profile</p><p className="text-xs text-zinc-500 mt-1">This profile will be used as the canonical Terraform input.</p></div><Btn onClick={() => { setApproved(true); setTimeout(() => onNavigate('iac'), 400); }} variant="primary" size="lg">Approve + Generate IaC</Btn></div> : <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-xl p-4 text-center"><p className="text-emerald-400 font-semibold">Approved. Advancing to Terraform generation...</p></div>}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 interface IacPageProps {
   onNavigate: (v: string) => void;
   projectId?: string | null;
@@ -540,12 +978,28 @@ interface IacGenerationResponse {
   success?: boolean;
   summary?: string;
   files?: GeneratedIacFile[];
+  run_id?: string | null;
+  workspace?: string | null;
+  provider_version?: string | null;
+  state_bucket?: string | null;
+  lock_table?: string | null;
+  manifest?: unknown[];
+  dag_order?: string[];
+  warnings?: string[];
   iac_repo_pr?: {
     attempted?: boolean;
     success?: boolean;
     pr_url?: string | null;
   };
   error?: string;
+}
+
+interface SavedIacRun {
+  run_id: string;
+  workspace: string;
+  provider_version?: string;
+  state_bucket?: string;
+  lock_table?: string;
 }
 
 function buildFileTreeFromPaths(paths: string[]): Array<{ name: string; type: 'file' | 'dir'; children?: unknown[] }> {
@@ -603,10 +1057,15 @@ function detectTerraformResources(files: GeneratedIacFile[]): Array<{ name: stri
     .slice(0, 12);
 }
 
-function readIacContext(): { qaSummary: string; architectureJson: Record<string, unknown> | null } {
-  if (typeof window === 'undefined') return { qaSummary: '', architectureJson: null };
+function readIacContext(): {
+  qaSummary: string;
+  architectureJson: Record<string, unknown> | null;
+  deploymentProfile: Record<string, unknown> | null;
+} {
+  if (typeof window === 'undefined') return { qaSummary: '', architectureJson: null, deploymentProfile: null };
   let qaSummary = '';
   let architectureJson: Record<string, unknown> | null = null;
+  let deploymentProfile: Record<string, unknown> | null = null;
   try {
     const qaRaw = sessionStorage.getItem('deplai.pipeline.qaContext');
     if (qaRaw) {
@@ -622,7 +1081,34 @@ function readIacContext(): { qaSummary: string; architectureJson: Record<string,
   } catch {
     architectureJson = null;
   }
-  return { qaSummary, architectureJson };
+  try {
+    const profileRaw = sessionStorage.getItem(DEPLOYMENT_PROFILE_KEY);
+    if (profileRaw) deploymentProfile = JSON.parse(profileRaw) as Record<string, unknown>;
+  } catch {
+    deploymentProfile = null;
+  }
+  return { qaSummary, architectureJson, deploymentProfile };
+}
+
+function readSavedIacRun(): SavedIacRun | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = sessionStorage.getItem('deplai.pipeline.iacRun');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<SavedIacRun>;
+    const runId = String(parsed.run_id || '').trim();
+    const workspace = String(parsed.workspace || '').trim();
+    if (!runId || !workspace) return null;
+    return {
+      run_id: runId,
+      workspace,
+      provider_version: String(parsed.provider_version || '').trim() || undefined,
+      state_bucket: String(parsed.state_bucket || '').trim() || undefined,
+      lock_table: String(parsed.lock_table || '').trim() || undefined,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
@@ -633,6 +1119,10 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
   const [files, setFiles] = useState<GeneratedIacFile[]>([]);
   const [prUrl, setPrUrl] = useState<string | null>(null);
   const [sendingPr, setSendingPr] = useState<boolean>(false);
+  const [liveValidated, setLiveValidated] = useState<boolean>(false);
+  const [awsAccessKeyId, setAwsAccessKeyId] = useState<string>(() => readSavedAws().aws_access_key_id);
+  const [awsSecretAccessKey, setAwsSecretAccessKey] = useState<string>(() => readSavedAws().aws_secret_access_key);
+  const [awsRegion, setAwsRegion] = useState<string>(() => readSavedAws().aws_region);
 
   const fileMap = useMemo(() => {
     const map: Record<string, string> = {};
@@ -655,6 +1145,29 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
     return '';
   }, [fileMap, selected]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined' || !projectId) return;
+    const storedProjectId = sessionStorage.getItem(PLANNING_PROJECT_KEY);
+    if (storedProjectId && storedProjectId !== projectId) {
+      clearPlanningState();
+      setError(null);
+      setLoading(true);
+      setFiles([]);
+      setSummary('Generating IaC bundle...');
+      setSelected('terraform/main.tf');
+      setPrUrl(null);
+      setLiveValidated(false);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    writeSavedAws({
+      aws_access_key_id: awsAccessKeyId,
+      aws_secret_access_key: awsSecretAccessKey,
+      aws_region: awsRegion || 'eu-north-1',
+    });
+  }, [awsAccessKeyId, awsRegion, awsSecretAccessKey]);
+
   const generateIac = async () => {
     if (!projectId) {
       setError('Select a project before generating IaC.');
@@ -664,14 +1177,19 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
     setLoading(true);
     setError(null);
     try {
-      const { qaSummary, architectureJson } = readIacContext();
+      const { qaSummary, architectureJson, deploymentProfile } = readIacContext();
       const body: Record<string, unknown> = {
         project_id: projectId,
         provider: 'aws',
         qa_summary: qaSummary,
         architecture_context: qaSummary,
+        aws_access_key_id: awsAccessKeyId.trim() || undefined,
+        aws_secret_access_key: awsSecretAccessKey.trim() || undefined,
+        aws_region: awsRegion.trim() || 'eu-north-1',
       };
-      if (architectureJson && Object.keys(architectureJson).length > 0) {
+      if (deploymentProfile && Object.keys(deploymentProfile).length > 0) {
+        body.architecture_json = deploymentProfile;
+      } else if (architectureJson && Object.keys(architectureJson).length > 0) {
         body.architecture_json = architectureJson;
       }
       const res = await fetch('/api/pipeline/iac', {
@@ -684,7 +1202,9 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
         throw new Error(data.error || 'Failed to generate IaC bundle.');
       }
       const generated = Array.isArray(data.files) ? data.files : [];
+      const hasLiveValidation = Boolean(data.run_id && data.workspace);
       setFiles(generated);
+      setLiveValidated(hasLiveValidation);
       setSummary(String(data.summary || `Generated ${generated.length} files.`));
       setPrUrl(String(data.iac_repo_pr?.pr_url || '') || null);
       if (generated.length > 0) {
@@ -693,8 +1213,20 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
       }
       if (typeof window !== 'undefined') {
         sessionStorage.setItem('deplai.pipeline.iacFiles', JSON.stringify(generated));
+        if (hasLiveValidation && data.run_id && data.workspace) {
+          sessionStorage.setItem('deplai.pipeline.iacRun', JSON.stringify({
+            run_id: data.run_id,
+            workspace: data.workspace,
+            provider_version: data.provider_version || '',
+            state_bucket: data.state_bucket || '',
+            lock_table: data.lock_table || '',
+          }));
+        } else {
+          sessionStorage.removeItem('deplai.pipeline.iacRun');
+        }
       }
     } catch (e) {
+      setLiveValidated(false);
       setError(e instanceof Error ? e.message : 'IaC generation failed.');
     } finally {
       setLoading(false);
@@ -724,7 +1256,9 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
           ? { text: 'Generating IaC bundle', cls: 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' }
           : error
             ? { text: 'IaC generation failed', cls: 'bg-red-500/10 text-red-400 border border-red-500/20' }
-            : { text: 'IaC generated - validated', cls: 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' }}
+            : liveValidated
+              ? { text: 'IaC generated - validated', cls: 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' }
+              : { text: 'IaC generated - offline', cls: 'bg-amber-500/10 text-amber-400 border border-amber-500/20' }}
         actions={
           <>
             <Tag color="emerald">Stage 8</Tag>
@@ -738,7 +1272,43 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
         {summary}
         {error && <span className="text-red-400 ml-3">{error}</span>}
       </div>
-      <div className="flex flex-1 overflow-hidden">
+      <div className="mx-7 mt-4 rounded-2xl border border-white/5 bg-zinc-900/60 p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-sm font-semibold text-zinc-100">AWS credentials for Stage 8</p>
+            <p className="mt-1 text-xs text-zinc-400 max-w-3xl">
+              Optional for Terraform file generation. If provided, DeplAI also attempts backend bootstrap and live Terraform validation during this stage.
+              Without credentials, Stage 8 still generates Terraform files and AWS access is only required before deploy/apply.
+            </p>
+          </div>
+          <Tag color={awsAccessKeyId.trim() && awsSecretAccessKey.trim() ? 'emerald' : 'zinc'}>
+            {awsAccessKeyId.trim() && awsSecretAccessKey.trim() ? 'Saved locally' : 'Optional'}
+          </Tag>
+        </div>
+        <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
+          <div>
+            <p className="mb-1.5 text-[11px] text-zinc-500">AWS_ACCESS_KEY_ID</p>
+            <input value={awsAccessKeyId} onChange={(e) => setAwsAccessKeyId(e.target.value)} placeholder="AKIA..." className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
+          </div>
+          <div>
+            <p className="mb-1.5 text-[11px] text-zinc-500">AWS_SECRET_ACCESS_KEY</p>
+            <input type="password" value={awsSecretAccessKey} onChange={(e) => setAwsSecretAccessKey(e.target.value)} placeholder="Enter AWS secret access key" className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
+          </div>
+          <div>
+            <p className="mb-1.5 text-[11px] text-zinc-500">AWS_REGION</p>
+            <input value={awsRegion} onChange={(e) => setAwsRegion(e.target.value)} placeholder="eu-north-1" className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
+          </div>
+        </div>
+        <div className="mt-3 flex items-center justify-between gap-4">
+          <p className="text-[11px] text-zinc-500">
+            Credentials are persisted in this browser session as you type so Stage 9 and deploy reuse the same values.
+          </p>
+          <Btn onClick={() => void generateIac()} variant="default" size="sm" disabled={loading}>
+            {loading ? 'Generating...' : 'Re-run with current settings'}
+          </Btn>
+        </div>
+      </div>
+      <div className="mt-4 flex flex-1 overflow-hidden">
         <div className="w-64 flex-shrink-0 bg-[#09090b] border-r border-white/5 overflow-y-auto custom-scrollbar">
           <div className="p-3">
             <p className="text-[10px] uppercase tracking-wider text-zinc-600 font-semibold px-2 py-1.5">File tree</p>
@@ -764,7 +1334,7 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
         <div className="w-64 flex-shrink-0 bg-[#09090b] border-l border-white/5 overflow-y-auto custom-scrollbar p-4 space-y-4">
           <div>
             <p className="text-[10px] uppercase tracking-wider text-zinc-600 font-semibold mb-2">Validation</p>
-            {[{ k: 'terraform init', v: loading ? '...' : error ? '!' : 'ok' }, { k: 'terraform validate', v: loading ? '...' : error ? '!' : 'ok' }, { k: 'terraform plan', v: loading ? '...' : error ? '!' : 'ok' }, { k: 'tflint', v: loading ? '...' : error ? '!' : 'ok' }].map((r, i) => <div key={i} className="flex justify-between py-1.5 border-b border-white/4 last:border-0 text-xs"><span className="text-zinc-500 font-mono">{r.k}</span><span className={r.v === 'ok' ? 'text-emerald-400 font-bold' : r.v === '...' ? 'text-zinc-500 font-bold' : 'text-amber-400 font-bold'}>{r.v}</span></div>)}
+            {[{ k: 'terraform init', v: loading ? '...' : error ? '!' : liveValidated ? 'ok' : 'deferred' }, { k: 'terraform validate', v: loading ? '...' : error ? '!' : liveValidated ? 'ok' : 'deferred' }, { k: 'terraform plan', v: loading ? '...' : error ? '!' : liveValidated ? 'ok' : 'deferred' }, { k: 'tflint', v: loading ? '...' : error ? '!' : liveValidated ? 'ok' : 'deferred' }].map((r, i) => <div key={i} className="flex justify-between py-1.5 border-b border-white/4 last:border-0 text-xs"><span className="text-zinc-500 font-mono">{r.k}</span><span className={r.v === 'ok' ? 'text-emerald-400 font-bold' : r.v === '...' ? 'text-zinc-500 font-bold' : 'text-amber-400 font-bold'}>{r.v}</span></div>)}
           </div>
           <div>
             <p className="text-[10px] uppercase tracking-wider text-zinc-600 font-semibold mb-2">Resources</p>
@@ -810,6 +1380,15 @@ function readSavedAws(): { aws_access_key_id: string; aws_secret_access_key: str
   } catch {
     return { aws_access_key_id: '', aws_secret_access_key: '', aws_region: 'eu-north-1' };
   }
+}
+
+function writeSavedAws(aws: { aws_access_key_id: string; aws_secret_access_key: string; aws_region: string }): void {
+  if (typeof window === 'undefined') return;
+  sessionStorage.setItem('pipeline.aws', JSON.stringify({
+    aws_access_key_id: aws.aws_access_key_id,
+    aws_secret_access_key: aws.aws_secret_access_key,
+    aws_region: aws.aws_region || 'eu-north-1',
+  }));
 }
 
 function readSavedCost(): CostEstimateState {
@@ -905,6 +1484,14 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
     };
   }, [projectId, scanStatus]);
 
+  useEffect(() => {
+    writeSavedAws({
+      aws_access_key_id: awsAccessKeyId,
+      aws_secret_access_key: awsSecretAccessKey,
+      aws_region: awsRegion || 'eu-north-1',
+    });
+  }, [awsAccessKeyId, awsRegion, awsSecretAccessKey]);
+
   const gates = [
     { label: 'Cost within budget', pass: within || overridden },
     { label: 'No critical CVEs remaining', pass: noCriticalCves },
@@ -916,11 +1503,11 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
   const allGatesPassed = gates.every((g) => g.pass);
 
   const onProceed = () => {
-    sessionStorage.setItem('pipeline.aws', JSON.stringify({
+    writeSavedAws({
       aws_access_key_id: awsAccessKeyId,
       aws_secret_access_key: awsSecretAccessKey,
       aws_region: awsRegion || 'eu-north-1',
-    }));
+    });
     setAuditTrail((prev) => [
       ...prev,
       { who: 'admin', action: 'Confirmed GitOps gates', ts: new Date().toLocaleTimeString() },
@@ -1037,9 +1624,32 @@ interface DeployApiResult {
   success?: boolean;
   cloudfront_url?: string | null;
   outputs?: Record<string, unknown>;
+  raw_outputs?: Record<string, unknown>;
   details?: Record<string, unknown> | null;
+  sensitive_output_arns?: Record<string, string> | null;
   ec2_key_name?: string | null;
   generated_ec2_private_key_pem?: string | null;
+  keypair?: {
+    key_name?: string | null;
+    private_key_pem?: string | null;
+  } | null;
+  ec2?: {
+    instance_id?: string | null;
+    state?: string | null;
+    type?: string | null;
+    public_ip?: string | null;
+    private_ip?: string | null;
+    public_dns?: string | null;
+    private_dns?: string | null;
+    instance_arn?: string | null;
+  } | null;
+  network?: {
+    vpc_id?: string | null;
+    subnet_id?: string | null;
+  } | null;
+  cdn?: {
+    cloudfront_url?: string | null;
+  } | null;
   error?: string;
 }
 
@@ -1471,7 +2081,7 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
         setDeploymentHistory(
           saved.deploymentHistory
             .filter((row) => row && typeof row.id === 'string' && typeof row.createdAt === 'string')
-            .map((row) => ({
+            .map((row): DeploymentHistoryEntry => ({
               id: String(row.id),
               createdAt: String(row.createdAt),
               status: row.status === 'error' ? 'error' : 'done',
@@ -1755,6 +2365,7 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
     try {
       patchState({ progress: 20 });
       appendLog('Calling /api/pipeline/deploy for runtime apply...');
+      const savedRun = readSavedIacRun();
 
       const res = await fetch('/api/pipeline/deploy', {
         method: 'POST',
@@ -1763,7 +2374,11 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
           project_id: projectId,
           provider: 'aws',
           runtime_apply: true,
-          files: iacFiles,
+          run_id: savedRun?.run_id,
+          workspace: savedRun?.workspace,
+          state_bucket: savedRun?.state_bucket,
+          lock_table: savedRun?.lock_table,
+          files: savedRun ? [] : iacFiles,
           aws_access_key_id: aws.aws_access_key_id,
           aws_secret_access_key: aws.aws_secret_access_key,
           aws_region: aws.aws_region,
@@ -1925,7 +2540,7 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
     }
   };
 
-  const runtimeOutputs = deployResult?.outputs;
+  const runtimeOutputs = deployResult?.raw_outputs || deployResult?.outputs;
   const liveRuntimeDetails = useMemo(() => {
     const details = deployResult?.details as Record<string, unknown> | null | undefined;
     if (!details || typeof details !== 'object') return null;
@@ -1935,27 +2550,29 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
   }, [deployResult?.details]);
   const liveRuntimeInstance = liveRuntimeDetails?.instance;
   const liveRuntimeCounts = liveRuntimeDetails?.resource_counts;
-  const cloudfrontUrl = deployResult?.cloudfront_url || pickOutput(runtimeOutputs, ['cloudfront_url', 'cloudfront_domain_name']);
+  const cloudfrontUrl = deployResult?.cdn?.cloudfront_url || deployResult?.cloudfront_url || pickOutput(runtimeOutputs, ['cloudfront_url', 'cloudfront_domain_name']);
   const albDns = pickOutput(runtimeOutputs, ['alb_dns_name', 'load_balancer_dns_name']);
   const rdsEndpoint = pickOutput(runtimeOutputs, ['rds_endpoint', 'database_endpoint', 'db_endpoint']);
   const websiteBucket = pickOutput(runtimeOutputs, ['website_bucket', 's3_bucket_name', 'static_bucket_name']);
-  const generatedPem = deployResult?.generated_ec2_private_key_pem
+  const generatedPem = deployResult?.keypair?.private_key_pem
+    || deployResult?.generated_ec2_private_key_pem
     || pickOutputRaw(runtimeOutputs, ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem'])
     || pickNestedOutputRaw((deployResult?.details as Record<string, unknown> | undefined), ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem']);
-  const keyName = deployResult?.ec2_key_name
+  const keyName = deployResult?.keypair?.key_name
+    || deployResult?.ec2_key_name
     || pickOutputRaw(runtimeOutputs, ['ec2_key_name', 'generated_ec2_key_name', 'key_name'])
     || pickNestedOutputRaw((deployResult?.details as Record<string, unknown> | undefined), ['ec2_key_name', 'generated_ec2_key_name', 'key_name'])
     || 'deplai-ec2-key';
-  const ec2InstanceId = String(liveRuntimeInstance?.instance_id || pickOutput(runtimeOutputs, ['ec2_instance_id', 'instance_id']));
-  const ec2InstanceArn = String(liveRuntimeInstance?.instance_arn || pickOutput(runtimeOutputs, ['ec2_instance_arn', 'instance_arn']));
-  const ec2InstanceState = String(liveRuntimeInstance?.instance_state || pickOutput(runtimeOutputs, ['ec2_instance_state', 'instance_state']));
-  const ec2InstanceType = String(liveRuntimeInstance?.instance_type || pickOutput(runtimeOutputs, ['ec2_instance_type', 'instance_type']));
-  const ec2PublicIp = String(liveRuntimeInstance?.public_ipv4_address || pickOutput(runtimeOutputs, ['ec2_public_ip', 'public_ip', 'instance_public_ip']));
-  const ec2PrivateIp = String(liveRuntimeInstance?.private_ipv4_address || pickOutput(runtimeOutputs, ['ec2_private_ip', 'private_ip', 'instance_private_ip']));
-  const ec2PublicDns = String(liveRuntimeInstance?.public_dns || pickOutput(runtimeOutputs, ['ec2_public_dns', 'instance_public_dns', 'public_dns']));
-  const ec2PrivateDns = String(liveRuntimeInstance?.private_dns || pickOutput(runtimeOutputs, ['ec2_private_dns', 'private_dns', 'instance_private_dns']));
-  const ec2VpcId = String(liveRuntimeInstance?.vpc_id || pickOutput(runtimeOutputs, ['ec2_vpc_id', 'vpc_id']));
-  const ec2SubnetId = String(liveRuntimeInstance?.subnet_id || pickOutput(runtimeOutputs, ['ec2_subnet_id', 'subnet_id']));
+  const ec2InstanceId = String(liveRuntimeInstance?.instance_id || deployResult?.ec2?.instance_id || pickOutput(runtimeOutputs, ['ec2_instance_id', 'instance_id']));
+  const ec2InstanceArn = String(liveRuntimeInstance?.instance_arn || deployResult?.ec2?.instance_arn || pickOutput(runtimeOutputs, ['ec2_instance_arn', 'instance_arn']));
+  const ec2InstanceState = String(liveRuntimeInstance?.instance_state || deployResult?.ec2?.state || pickOutput(runtimeOutputs, ['ec2_instance_state', 'instance_state']));
+  const ec2InstanceType = String(liveRuntimeInstance?.instance_type || deployResult?.ec2?.type || pickOutput(runtimeOutputs, ['ec2_instance_type', 'instance_type']));
+  const ec2PublicIp = String(liveRuntimeInstance?.public_ipv4_address || deployResult?.ec2?.public_ip || pickOutput(runtimeOutputs, ['ec2_public_ip', 'public_ip', 'instance_public_ip']));
+  const ec2PrivateIp = String(liveRuntimeInstance?.private_ipv4_address || deployResult?.ec2?.private_ip || pickOutput(runtimeOutputs, ['ec2_private_ip', 'private_ip', 'instance_private_ip']));
+  const ec2PublicDns = String(liveRuntimeInstance?.public_dns || deployResult?.ec2?.public_dns || pickOutput(runtimeOutputs, ['ec2_public_dns', 'instance_public_dns', 'public_dns']));
+  const ec2PrivateDns = String(liveRuntimeInstance?.private_dns || deployResult?.ec2?.private_dns || pickOutput(runtimeOutputs, ['ec2_private_dns', 'private_dns', 'instance_private_dns']));
+  const ec2VpcId = String(liveRuntimeInstance?.vpc_id || deployResult?.network?.vpc_id || pickOutput(runtimeOutputs, ['ec2_vpc_id', 'vpc_id']));
+  const ec2SubnetId = String(liveRuntimeInstance?.subnet_id || deployResult?.network?.subnet_id || pickOutput(runtimeOutputs, ['ec2_subnet_id', 'subnet_id']));
   const displayedResourceSummary = useMemo(() => {
     if (!liveRuntimeCounts) return resourceSummary;
     const normalized = new Map<string, number>([

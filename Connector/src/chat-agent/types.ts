@@ -6,6 +6,7 @@ export type ToolName =
   | 'run_scan'
   | 'navigate_to_results'
   | 'start_remediation'
+  | 'plan_deployment'
   | 'create_github_repo'
   | 'ask_for_github_pat'
   | 'generate_code';

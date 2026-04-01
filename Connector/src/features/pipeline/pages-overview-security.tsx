@@ -31,6 +31,9 @@ export function OverviewPage({
   remediationRuntimeState = 'idle',
 }: OverviewPageProps) {
   const done = stages.filter((s) => s.status === 'success').length;
+  const sharedStages = stages.filter((stage) => stage.track === 'shared' || stage.id === 0);
+  const securityStages = stages.filter((stage) => stage.track === 'security');
+  const deploymentStages = stages.filter((stage) => stage.track === 'deployment');
   const codeFindings = scanResults?.code_security || [];
   const scaFindings = scanResults?.supply_chain || [];
   const totalFindings = codeFindings.reduce((sum, finding) => sum + (finding.count || 0), 0) + scaFindings.length;
@@ -86,17 +89,43 @@ export function OverviewPage({
               <p className="text-sm font-semibold text-zinc-200">Stage progress</p>
               <div className="flex gap-2">{[{ l: 'Completed', c: 'bg-emerald-500' }, { l: 'Active', c: 'bg-amber-400' }, { l: 'Pending', c: 'bg-zinc-700' }].map((l, i) => <div key={i} className="flex items-center gap-1.5 text-[11px] text-zinc-500"><span className={`w-2 h-2 rounded-full ${l.c}`} />{l.l}</div>)}</div>
             </div>
-            <div className="p-5 grid grid-cols-2 gap-2">
-              {stages.map((s) => (
-                <button key={s.key} onClick={() => setCurrent(s.key)} className={`flex items-center gap-2.5 p-3 rounded-xl border transition-all text-left hover:scale-[1.01] ${s.status === 'success' ? 'bg-emerald-500/5 border-emerald-500/15' : s.status === 'active' ? 'bg-amber-500/5 border-amber-500/20' : s.status === 'running' ? 'bg-cyan-500/5 border-cyan-500/20' : 'border-white/4 hover:border-white/10'}`}>
-                  <StageIcon status={s.status} gate={s.gate} />
-                  <div className="flex-1 min-w-0">
-                    <p className={`text-[11.5px] font-medium truncate ${s.status === 'success' ? 'text-zinc-300' : s.status === 'active' ? 'text-amber-300' : s.status === 'running' ? 'text-cyan-300' : 'text-zinc-600'}`}>{s.label}</p>
-                    {s.duration && <p className="text-[10px] text-zinc-600 font-mono">{s.duration}</p>}
+            <div className="p-5 space-y-5">
+              {[
+                { label: 'Shared', items: sharedStages },
+                { label: 'Security', items: securityStages },
+                { label: 'Deployment', items: deploymentStages },
+              ].map((section) => (
+                <div key={section.label}>
+                  <div className="mb-2 flex items-center gap-2">
+                    <span className="text-[10px] uppercase tracking-widest text-zinc-600 font-semibold">{section.label} Track</span>
+                    <div className="h-px flex-1 bg-zinc-800" />
                   </div>
-                  <span className="text-[10px] text-zinc-700 font-mono">{s.id}</span>
-                </button>
+                  <div className="grid grid-cols-2 gap-2">
+                    {section.items.map((s) => (
+                      <button key={s.key} onClick={() => setCurrent(s.key)} className={`flex items-center gap-2.5 p-3 rounded-xl border transition-all text-left hover:scale-[1.01] ${s.status === 'success' ? 'bg-emerald-500/5 border-emerald-500/15' : s.status === 'active' ? 'bg-amber-500/5 border-amber-500/20' : s.status === 'running' ? 'bg-cyan-500/5 border-cyan-500/20' : 'border-white/4 hover:border-white/10'}`}>
+                        <StageIcon status={s.status} gate={s.gate} />
+                        <div className="flex-1 min-w-0">
+                          <p className={`text-[11.5px] font-medium truncate ${s.status === 'success' ? 'text-zinc-300' : s.status === 'active' ? 'text-amber-300' : s.status === 'running' ? 'text-cyan-300' : 'text-zinc-600'}`}>{s.label}</p>
+                          {s.duration && <p className="text-[10px] text-zinc-600 font-mono">{s.duration}</p>}
+                        </div>
+                        <span className="text-[10px] text-zinc-700 font-mono">{s.id}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
               ))}
+            </div>
+            <div className="border-t border-white/5 px-5 py-4">
+              <div className="grid grid-cols-2 gap-3">
+                <button onClick={() => setCurrent('scan')} className="rounded-xl border border-white/8 bg-black/20 px-4 py-3 text-left transition-all hover:border-cyan-500/20 hover:bg-cyan-500/5">
+                  <p className="text-sm font-semibold text-zinc-100">Security Track</p>
+                  <p className="mt-1 text-xs text-zinc-500">Run SAST/SCA, remediation, PR, merge, and verification.</p>
+                </button>
+                <button onClick={() => setCurrent('qa')} className="rounded-xl border border-white/8 bg-black/20 px-4 py-3 text-left transition-all hover:border-cyan-500/20 hover:bg-cyan-500/5">
+                  <p className="text-sm font-semibold text-zinc-100">Deployment Track</p>
+                  <p className="mt-1 text-xs text-zinc-500">Start from repository analysis, answer deployment questions, generate IaC, then deploy.</p>
+                </button>
+              </div>
             </div>
           </div>
           <div className="bg-zinc-900 rounded-2xl border border-white/5 overflow-hidden flex flex-col">

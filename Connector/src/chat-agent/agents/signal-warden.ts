@@ -41,6 +41,12 @@ const INTENT_PATTERNS: Array<{
   },
   {
     mode: 'tool_call',
+    intent: 'plan_deployment',
+    pattern: /\b(deploy|deployment|terraform|iac|infrastructure|infra plan|deployment plan|provision aws)\b/i,
+    required_params: ['project_id'],
+  },
+  {
+    mode: 'tool_call',
     intent: 'create_github_repo',
     pattern: /\b(create (?:a )?(?:github )?(?:repo|repository)|push (?:to )?github|deploy to github)\b/i,
     required_params: ['repo_name'],
@@ -145,6 +151,7 @@ export function runSignalWarden(ctx: AgentContext): SignalWardenResult {
     run_security_scan: 'run_scan',
     navigate_to_results: 'navigate_to_results',
     start_remediation: 'start_remediation',
+    plan_deployment: 'plan_deployment',
     create_github_repo: 'create_github_repo',
     generate_code: 'generate_code',
   };

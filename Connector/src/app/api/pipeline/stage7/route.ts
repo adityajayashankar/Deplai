@@ -10,6 +10,26 @@ interface Stage7Body {
   environment?: string;
 }
 
+function classifyAgenticRouteError(err: unknown, action: string): { message: string; status: number } {
+  const raw = err instanceof Error ? err.message : String(err || 'unknown upstream error');
+  const lowered = raw.toLowerCase();
+  if (
+    lowered.includes('fetch failed') ||
+    lowered.includes('econnrefused') ||
+    lowered.includes('enotfound') ||
+    lowered.includes('network')
+  ) {
+    return {
+      message: `Agentic Layer is unavailable while trying to ${action}. Start the service at ${AGENTIC_URL} and retry.`,
+      status: 502,
+    };
+  }
+  return {
+    message: raw || `${action} failed.`,
+    status: 500,
+  };
+}
+
 export async function POST(req: NextRequest) {
   try {
     const { user, error } = await requireAuth();
@@ -54,8 +74,8 @@ export async function POST(req: NextRequest) {
       approval_payload: data.approval_payload || null,
     });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Stage 7 route failed';
-    return NextResponse.json({ error: msg }, { status: 500 });
+    const classified = classifyAgenticRouteError(err, 'generate the Stage 7 approval payload');
+    return NextResponse.json({ error: classified.message }, { status: classified.status });
   }
 }
 
