@@ -138,6 +138,29 @@ active_terraform_applies: dict[str, dict] = {}
 terraform_apply_results: dict[str, dict] = {}
 
 
+def _normalize_remediation_request(request: RemediationRequest) -> RemediationRequest:
+    raw_provider = str(request.llm_provider or "").strip().lower()
+    raw_api_key = str(request.llm_api_key or "").strip()
+    raw_model = str(request.llm_model or "").strip()
+
+    if raw_provider and raw_provider != "claude":
+        logger.info(
+            "Ignoring remediation provider override '%s'; remediation is Claude SDK only.",
+            raw_provider,
+        )
+
+    normalized_api_key = raw_api_key if raw_api_key.startswith("sk-ant-") else None
+    normalized_model = raw_model if "claude" in raw_model.lower() else None
+
+    return request.model_copy(
+        update={
+            "llm_provider": "claude",
+            "llm_api_key": normalized_api_key,
+            "llm_model": normalized_model,
+        }
+    )
+
+
 async def _broadcast_pipeline_event(project_id: str, msg_type: str, content: str) -> None:
     text = str(content or "").strip()
     if not text:
@@ -416,6 +439,7 @@ async def cleanup():
 @app.post("/api/remediate/validate", response_model=RemediationResponse, dependencies=[Depends(verify_api_key)])
 async def validate_remediation(request: RemediationRequest):
     """Validate a remediation request and store context."""
+    request = _normalize_remediation_request(request)
     logger.info(
         "Remediation request: project=%s type=%s user=%s",
         request.project_id, request.project_type, request.user_id,

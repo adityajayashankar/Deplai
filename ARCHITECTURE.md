@@ -1,368 +1,384 @@
 # DeplAI Architecture
 
-This document describes the active runtime architecture in this repository. It is intentionally implementation-first: the goal is to explain the system that actually runs today, not an older target-state design.
+This document describes the active runtime architecture in this repository. It focuses on what the code actually does today.
 
-## System Overview
+## 1. System Summary
 
-DeplAI is a staged DevSecOps control plane built around three runtime layers:
+DeplAI is a staged DevSecOps orchestration platform with:
 
-- `Connector`: the user-facing Next.js application and backend-for-frontend layer
-- `Agentic Layer`: the FastAPI orchestration service for scan, remediation, architecture, cost, and deploy actions
-- Supporting analysis modules: `KGagent` and `diagram_cost-estimation_agent`
+- a Next.js control plane and BFF in `Connector`
+- a FastAPI orchestration runtime in `Agentic Layer`
+- a KG-backed analysis path for remediation enrichment
+- a Stage 7 subprocess for diagram and cost packaging
+- Terraform generation and AWS-focused runtime deployment
 
-The platform accepts a GitHub repository or local project, runs security analysis, guides remediation through human approval, generates architecture and delivery artifacts, applies policy checks, and then deploys through GitOps or AWS runtime apply.
+The platform is optimized for:
 
-## Runtime Topology
+- repository intake
+- security scanning
+- supervised remediation
+- architecture and cost planning
+- IaC generation
+- gated deployment
+
+## 2. Runtime Topology
 
 ```mermaid
 flowchart LR
-    U[User Browser] --> C[Connector<br/>Next.js UI + BFF]
-    C --> DB[(MySQL)]
-    C --> G[GitHub API]
-    C -->|REST + X-API-Key| A[Agentic Layer<br/>FastAPI]
-    C -->|WS token + WebSocket| A
+    User[User Browser] --> Connector[Connector<br/>Next.js UI + BFF]
+    Connector --> MySQL[(MySQL)]
+    Connector --> GitHub[GitHub APIs]
 
-    A --> D[(Docker Engine)]
-    D --> V1[(codebase_deplai)]
-    D --> V2[(security_reports)]
-    D --> V3[(LLM_Output)]
-    D --> V4[(grype_db_cache)]
+    Connector -->|REST + X-API-Key| Agentic[Agentic Layer<br/>FastAPI]
+    Connector -->|HMAC token + WebSocket| Agentic
 
-    A --> KG[KGagent<br/>in-process import]
-    KG --> N[(Neo4j)]
-    KG --> Q[(Qdrant)]
+    Agentic --> Docker[(Docker Engine)]
+    Docker --> Code[(codebase_deplai)]
+    Docker --> Reports[(security_reports)]
+    Docker --> Output[(LLM_Output)]
+    Docker --> Grype[(grype_db_cache)]
 
-    A --> S7[diagram_cost-estimation_agent<br/>subprocess]
-    A --> G
+    Agentic --> KG[KGagent<br/>in-process import]
+    KG --> Neo4j[(Neo4j)]
+    KG --> Qdrant[(Qdrant)]
+
+    Agentic --> Stage7[diagram_cost-estimation_agent<br/>subprocess]
+    Agentic --> Terraform[terraform_agent]
+    Agentic --> AWS[AWS APIs]
+    Agentic --> Azure[Azure pricing path]
+    Agentic --> GCP[GCP pricing path]
 ```
 
-## Architectural Flow
+## 3. Major Components
 
-```mermaid
-flowchart TB
-    subgraph USER[User Interaction]
-        UI[DeplAI Dashboard]
-    end
+### 3.1 Connector
 
-    subgraph STEP0[Stage 0: Preflight]
-        PF[Pipeline readiness checks]
-    end
-
-    subgraph STEP1[Stage 1: Scan]
-        SC[Load repository or local project]
-        SAST[Bearer SAST]
-        SCA[Syft and Grype SCA]
-    end
-
-    subgraph STEP2[Stage 2: KG Analysis]
-        KG2[KG analysis]
-        KGN[(Neo4j)]
-        KGQ[(Qdrant)]
-    end
-
-    subgraph STEP3[Stage 3: Remediation]
-        RS[Remediation runner]
-        RP[Plan]
-        RPR[Propose]
-        RC[Critique]
-        RSY[Synthesize]
-    end
-
-    subgraph STEP4[Stage 4: Pull Request]
-        PR[Push branch]
-        OPR[Open PR]
-    end
-
-    subgraph STEP45[Stage 4.5: Merge Gate]
-        MG[Manual merge approval]
-    end
-
-    subgraph STEP46[Stage 4.6: Post-Merge]
-        PM[Refresh and continue]
-    end
-
-    subgraph STEP6[Stage 6: QA Context]
-        QA[Capture infra and delivery answers]
-    end
-
-    subgraph STEP7[Stage 7: Architecture and Cost]
-        AG[Architecture generation]
-        DG[Diagram generation]
-        CE[Cost estimation]
-    end
-
-    subgraph STEP75[Stage 7.5: Approval]
-        AP[Approve architecture and cost]
-    end
-
-    subgraph STEP8[Stage 8: IaC]
-        TF[Terraform generation]
-        TEMP[Template fallback]
-    end
-
-    subgraph STEP9[Stage 9: Policy]
-        PG[Budget and delivery policy gate]
-    end
-
-    subgraph STEP10[Stage 10: Deploy]
-        GD[GitOps push]
-        AWSDEP[AWS runtime apply]
-        PD[Runtime details and outputs]
-    end
-
-    UI --> PF
-    PF --> SC
-    SC --> SAST
-    SC --> SCA
-    SAST --> KG2
-    SCA --> KG2
-    KG2 --> KGN
-    KG2 --> KGQ
-    KG2 --> RS
-    RS --> RP
-    RP --> RPR
-    RPR --> RC
-    RC -->|reject| RP
-    RC -->|accept| RSY
-    RSY --> PR
-    PR --> OPR
-    OPR --> MG
-    MG --> PM
-    PM --> QA
-    QA --> AG
-    AG --> DG
-    DG --> CE
-    CE --> AP
-    AP --> TF
-    TF --> TEMP
-    TF --> PG
-    PG --> GD
-    PG --> AWSDEP
-    AWSDEP --> PD
-```
-
-## Core Components
-
-### Connector
-
-`Connector/` is the control plane entry point and BFF.
+`Connector/` is the user-facing control plane and backend-for-frontend.
 
 Responsibilities:
 
-- user authentication and session handling
-- project ownership and authorization checks
-- GitHub OAuth, GitHub App, repository sync, and PR/deploy integration
-- pipeline stage orchestration in the dashboard
-- WebSocket token minting for scan and remediation streams
-- policy checks and request shaping before calling the backend
+- user authentication and session management
+- project ownership validation
+- GitHub App and OAuth flows
+- project sync and repository operations
+- dashboard state and pipeline stage orchestration
+- API proxying into Agentic Layer
+- WebSocket token minting
+- some local fallback generation flows for IaC and deployment packaging
 
-Important characteristics:
+Frameworks and libraries:
 
-- persists project and chat metadata in MySQL
-- exposes pipeline routes under `Connector/src/app/api`
-- holds local project uploads under `Connector/tmp/local-projects`
-- drives most later pipeline stages over HTTP rather than queue workers
+- Next.js 16
+- React 19
+- TypeScript 5
+- Tailwind CSS 4
+- `iron-session`
+- `@octokit/auth-app`
+- `@octokit/rest`
 
-### Agentic Layer
+### 3.2 Agentic Layer
 
 `Agentic Layer/` is the orchestration runtime.
 
 Responsibilities:
 
-- scan validation and scan execution orchestration
-- remediation execution and cycle management
-- architecture generation and cost estimation APIs
-- Stage 7 subprocess invocation
-- Terraform generation handoff
-- Terraform runtime apply, stop, status, destroy, and runtime details
-- health and readiness reporting
+- scan validation and scan execution
+- remediation orchestration and rescan loop
+- architecture generation
+- architecture review start and complete flows
+- cost estimation
+- Stage 7 approval payload generation
+- Terraform generation
+- runtime Terraform apply and destroy flows
+- pipeline and health endpoints
 
-Important runtime state in memory:
+Frameworks and libraries:
 
-- active scan runners
-- active remediation runners
-- pipeline websocket subscribers
-- active Terraform apply contexts
-- cached apply results
+- FastAPI
+- Uvicorn
+- Pydantic v2
+- Docker SDK for Python
+- LangGraph
+- LangChain packages
+- Anthropic SDK
+- boto3
 
-Important characteristics:
+### 3.3 KGagent
 
-- protected by `DEPLAI_SERVICE_KEY`
-- verifies HMAC-bound WebSocket tokens using `WS_TOKEN_SECRET`
-- uses Docker to manage working volumes and scanner execution
-
-### KGagent
-
-`KGagent/` is not a required standalone service in the active path. It is imported by the remediation flow inside the backend.
-
-Responsibilities:
-
-- enrich remediation with graph-backed CVE and CWE context
-- query Neo4j and optional vector retrieval dependencies
-- tolerate dependency unavailability without hard-failing the full remediation flow
-
-### Stage 7 Agent
-
-`diagram_cost-estimation_agent/` is executed by the backend as a subprocess during approval-pack generation.
+`KGagent/` is imported in-process by the backend remediation flow. It is not a required separate HTTP service in the active runtime path.
 
 Responsibilities:
 
-- transform infra planning data into diagram output
-- estimate cost across cloud providers
-- produce approval payloads for the Stage 7.5 gate
-- feed the downstream IaC and deployment stages with structured artifact data
+- query graph-backed security intelligence
+- correlate top CVEs and CWEs
+- feed structured business and vulnerability context back to remediation
 
-## Stage Mapping
+Dependencies:
 
-The active stage order surfaced in the UI is defined in `Connector/src/features/pipeline/data.ts`.
+- Neo4j
+- Qdrant
+- sentence-transformers
 
-Stages:
+Behavioral note:
 
-- `0` preflight
-- `1` scan
-- `2` KG analysis
-- `3` remediation
-- `4` remediation PR
-- `4.5` merge gate
-- `4.6` post-merge actions
-- `6` QA context gathering
-- `7` architecture and cost
-- `7.5` approval gate
-- `8` IaC generation
-- `9` GitOps and policy gate
-- `10` deploy
+- outages should degrade KG enrichment only, not block remediation entirely
 
-Operational note:
+### 3.4 Stage 7 Agent
 
-- remediation is hard-capped at `MAX_REMEDIATION_CYCLES = 2`
+`diagram_cost-estimation_agent/` is executed from the backend as a subprocess.
 
-## Data Architecture
+Responsibilities:
 
-### Persistent metadata
+- diagram generation
+- cost estimation packaging
+- Stage 7.5 approval payload preparation
 
-MySQL is used by Connector for durable application metadata, including:
+### 3.5 Terraform Engine
+
+`terraform_agent/` is still used as an engine dependency for Terraform generation, while Connector also contains a local IaC fallback path. Runtime apply is executed from Agentic Layer using the HashiCorp Terraform image.
+
+## 4. Stage Model
+
+The UI exposes the following canonical stage order:
+
+1. `0` preflight
+2. `1` scan
+3. `2` KG analysis
+4. `3` remediation
+5. `4` remediation PR
+6. `4.5` merge gate
+7. `4.6` post-merge actions
+8. `6` Q/A context gathering
+9. `7` architecture + cost
+10. `7.5` approval gate
+11. `8` IaC generation
+12. `9` GitOps/policy gate
+13. `10` deploy
+
+Key runtime constraints:
+
+- remediation cycles are capped at `2`
+- runtime apply is AWS-only
+- deployment can be blocked by budget checks
+
+## 5. End-to-End Flow
+
+```mermaid
+flowchart TB
+    Intake[Project Intake] --> Scan[Stage 1 Scan]
+    Scan --> KG[Stage 2 KG Analysis]
+    KG --> Remediate[Stage 3 Remediation]
+    Remediate --> PR[Stage 4 PR / Persistence]
+    PR --> Merge[Stage 4.5 Merge Gate]
+    Merge --> PostMerge[Stage 4.6 Post-Merge]
+    PostMerge --> QA[Stage 6 Q/A]
+    QA --> Arch[Stage 7 Architecture]
+    Arch --> Cost[Stage 7 Cost]
+    Cost --> Approve[Stage 7.5 Approval]
+    Approve --> IaC[Stage 8 IaC]
+    IaC --> Policy[Stage 9 Policy Gate]
+    Policy --> Deploy[Stage 10 Deploy]
+```
+
+## 6. Agent Architecture
+
+### 6.1 Security analysis agent
+
+The KG-backed analysis path is run before remediation:
+
+- take parsed scan data
+- pick top CVEs and CWEs
+- query KGagent concurrently
+- produce:
+  - `business_logic_summary`
+  - `vulnerability_summary`
+  - structured UI context
+
+### 6.2 Remediation agent stack
+
+The remediation path is the most agentic part of the system.
+
+```mermaid
+flowchart TD
+    Findings[Parsed Scan Findings] --> Dedupe[Root-Cause Dedupe]
+    Dedupe --> Context[Context File Collection]
+    Dedupe --> KGContext[KG Analysis Context]
+    Context --> Planner[Planner Recon]
+    KGContext --> Planner
+    Planner --> Proposer[Claude Proposer]
+    Proposer --> Critic[Claude Critic]
+    Critic -->|reject| Proposer
+    Critic -->|accept or max rounds| Synth[Synthesizer]
+    Synth --> Safety[Safe Write Validation]
+    Safety --> Approval[Human Approval]
+    Approval --> Persist[Local Persist or GitHub PR]
+    Persist --> Rescan[Verification Re-scan]
+```
+
+Current behavior:
+
+- remediation is Claude-only
+- Anthropic SDK is the only active remediation provider path
+- provider overrides are normalized to Claude server-side
+- remediation is repo-wide, not micro-batched
+- findings are deduped before prompt construction
+- a shared Claude budget tracker spans supervisor and fallback remediation
+
+### 6.3 Remediation supervision loop
+
+The supervisor currently follows this model:
+
+1. Build targeted context from deduped root causes.
+2. Run a proposer prompt to generate file changes.
+3. Run a critic prompt to review those changes.
+4. If rejected and under max rounds, retry with critique feedback.
+5. Synthesize validated changes and write only safe updates.
+6. Stop early if the Claude budget cap would be exceeded.
+
+### 6.4 Root-cause dedupe
+
+To avoid wasting budget on redundant findings:
+
+- code-security findings are grouped by `CWE + relative file path`
+- supply-chain findings are grouped by `package + installed version + fix version`
+- only the highest-impact unique groups are sent to KG/remediation
+
+This improves the odds of useful repo-wide fixes under the configured budget cap, but it does not guarantee full remediation of very large repositories in one run.
+
+## 7. Request and Control Flows
+
+### 7.1 Connector to backend
+
+Connector calls Agentic Layer over REST using `DEPLAI_SERVICE_KEY` in `X-API-Key`.
+
+### 7.2 WebSocket execution
+
+Connector issues short-lived HMAC WebSocket tokens using `WS_TOKEN_SECRET`.
+
+Backend verifies:
+
+- signature
+- expiry
+- project binding
+- user identity binding
+
+### 7.3 Remediation persistence
+
+For GitHub projects:
+
+- remediation changes are committed to a generated branch
+- GitHub push is attempted
+- a PR is created through GitHub API
+
+For local projects:
+
+- files are copied back into `Connector/tmp/local-projects/...`
+
+### 7.4 Deployment modes
+
+There are two active deploy modes:
+
+- `runtime_apply=false`
+  - GitOps/repository-oriented path
+- `runtime_apply=true`
+  - backend runtime Terraform apply
+  - currently AWS-only
+
+## 8. Data and State Architecture
+
+### 8.1 Persistent metadata
+
+Connector uses MySQL for application metadata such as:
 
 - users
-- GitHub installations
-- GitHub repositories
+- repositories
+- installations
 - projects
 - chat sessions
-- chat messages
 
-### Runtime execution state
+### 8.2 Execution artifacts
 
-The backend uses Docker-managed volumes for execution artifacts:
+Agentic Layer relies on Docker volumes:
 
-- `codebase_deplai`: working copy of the project under analysis
-- `security_reports`: scanner outputs from Bearer, Syft, and Grype
-- `LLM_Output`: remediation summaries and related artifacts
-- `grype_db_cache`: vulnerability database cache
+- `codebase_deplai`
+- `security_reports`
+- `LLM_Output`
+- `grype_db_cache`
 
-### Client-side transient state
+### 8.3 In-memory orchestration state
 
-Not every pipeline artifact is server-persisted yet. Some stage data is still carried in UI state or browser storage, especially around QA answers, architecture outputs, cost outputs, and deployment continuation.
+Agentic Layer maintains in-memory maps for:
 
-## Security Boundaries
+- active scans
+- active remediations
+- pipeline subscribers
+- active Terraform applies
+- cached Terraform results
 
-### Connector to backend
+## 9. Framework and Tooling Inventory
 
-- REST calls from Connector to Agentic Layer use `X-API-Key`
-- the shared secret is `DEPLAI_SERVICE_KEY`
+### Frontend
 
-### WebSocket control
+- Next.js
+- React
+- Tailwind CSS
+- TypeScript
+- ESLint
 
-- Connector signs short-lived WebSocket tokens with `WS_TOKEN_SECRET`
-- tokens are bound to `sub`, `project_id`, and expiry
-- Agentic Layer verifies signature, expiry, project binding, and user context match
+### Backend
 
-### Project authorization
+- FastAPI
+- Uvicorn
+- Docker SDK
+- Pydantic
+- boto3
+- httpx
+- requests
 
-- Connector performs project ownership checks before forwarding scan, remediation, or delivery actions
-- backend trust is scoped around the authenticated and prevalidated request coming from Connector
+### Agent/LLM
 
-### Deployment controls
+- Anthropic SDK
+- LangGraph
+- LangChain
 
-- budget guardrails are enforced before deployment proceeds
-- runtime deploy control plane includes status, stop, destroy, and runtime details endpoints
-- GitOps repository updates are performed through GitHub API calls from Connector
+### Security scanning and infra
 
-## Deployment Architecture
+- Bearer
+- Syft
+- Grype
+- HashiCorp Terraform image
 
-There are two deployment modes in the current system.
+## 10. Security Boundaries
 
-### GitOps mode
+- Connector validates session and project ownership before forwarding actions
+- Agentic Layer trusts only requests signed with `DEPLAI_SERVICE_KEY`
+- WebSocket execution is scoped with short-lived HMAC tokens
+- remediation does not expose service keys to the client
+- deployment paths enforce runtime and budget guardrails
 
-Triggered when `runtime_apply=false`.
+## 11. Operational Constraints
 
-Behavior:
+- `docker-compose.yml` starts only `agentic-layer`
+- MySQL, Neo4j, and Qdrant must be started separately
+- runtime deployment remains AWS-only
+- some planning and IaC artifacts are still shaped in Connector rather than persisted as a single backend run object
+- Terraform generation can intentionally fall back to local template generation
 
-- Connector writes generated IaC and workflow assets into a GitHub repository
-- repository variables and workflow files are configured
-- deployment execution is delegated to GitHub Actions or repository workflow logic
+## 12. Source-of-Truth Files
 
-### Runtime apply mode
+When docs and runtime differ, these files win:
 
-Triggered when `runtime_apply=true`.
+- `Connector/src/app/api/**`
+- `Agentic Layer/main.py`
+- `Agentic Layer/remediation.py`
+- `Agentic Layer/agent/remediation_supervisor.py`
+- `Agentic Layer/claude_remediator.py`
+- `Agentic Layer/stage7_bridge.py`
+- `Connector/src/features/pipeline/**`
 
-Behavior:
+## 13. Related Docs
 
-- Connector forwards the apply request to Agentic Layer
-- Agentic Layer executes Terraform apply for AWS-focused deployments
-- apply state is tracked in memory and exposed through status and stop endpoints
-- post-deploy details are returned through runtime detail routes
-
-## Health Model
-
-### Backend health
-
-`/health` in Agentic Layer currently checks at least:
-
-- Docker daemon availability
-- Neo4j connectivity
-
-### Connector health composition
-
-`/api/pipeline/health` in Connector turns backend and local checks into a service-level readiness model, including:
-
-- scan
-- remediation
-- KG agent
-- architecture
-- diagram
-- cost
-- terraform
-- GitOps deploy
-- runtime deploy
-
-## Active Versus Legacy Paths
-
-This repository contains code that is not the primary runtime path.
-
-Active path:
-
-- Connector BFF routes
-- Agentic Layer orchestration
-- in-process KG analysis
-- Stage 7 subprocess execution
-- Connector-managed IaC fallback and deployment orchestration
-
-Legacy or non-primary path:
-
-- top-level `terraform_agent/` as a standalone generator runtime
-- older queue and worker style documentation
-- Terraform RAG-based generation path
-
-## Current Constraints
-
-- `docker-compose.yml` starts `agentic-layer` only
-- MySQL, Neo4j, and Qdrant are not provisioned by the compose file
-- runtime deployment is AWS-only
-- delivery UX remains AWS-first
-- not all workflow artifacts are yet persisted as a single canonical run object
-- Terraform generation can intentionally fall back to static templates
-
-## Related Documents
-
-- operational guide: `RUNBOOK.md`
-- platform overview: `README.md`
-- architecture contract notes: `ARCHITECTURE_CONTRACTS.md`
+- `README.md`
+- `RUNBOOK.md`
+- `ARCHITECTURE_CONTRACTS.md`
+- `UI_AGENT_HANDOFF.md`

@@ -1,0 +1,809 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { 
+  Github, 
+  Cloud, 
+  Cpu, 
+  Shield, 
+  AlertTriangle, 
+  Eye, 
+  EyeOff, 
+  CheckCircle2, 
+  Terminal,
+  Key,
+  Database,
+  Lock,
+  Activity
+} from 'lucide-react';
+
+// ==========================================
+// PIXEL CARD COMPONENT
+// ==========================================
+
+class Pixel {
+  width;
+  height;
+  ctx;
+  x;
+  y;
+  color;
+  speed;
+  size;
+  sizeStep;
+  minSize;
+  maxSizeInteger;
+  maxSize;
+  delay;
+  counter;
+  counterStep;
+  isIdle;
+  isReverse;
+  isShimmer;
+
+  constructor(canvas, context, x, y, color, speed, delay) {
+    const dpr = window.devicePixelRatio || 1;
+    this.width = canvas.width / dpr;
+    this.height = canvas.height / dpr;
+    this.ctx = context;
+    this.x = x;
+    this.y = y;
+    this.color = color;
+    this.speed = (Math.random() * 0.8 + 0.1) * speed;
+    this.size = 0;
+    this.sizeStep = Math.random() * 0.4;
+    this.minSize = 0.5;
+    this.maxSizeInteger = 2;
+    this.maxSize = Math.random() * (this.maxSizeInteger - this.minSize) + this.minSize;
+    this.delay = delay;
+    this.counter = 0;
+    this.counterStep = Math.random() * 4 + (this.width + this.height) * 0.01;
+    this.isIdle = false;
+    this.isReverse = false;
+    this.isShimmer = false;
+  }
+
+  draw() {
+    const centerOffset = this.maxSizeInteger * 0.5 - this.size * 0.5;
+    this.ctx.fillStyle = this.color;
+    this.ctx.fillRect(Math.round(this.x + centerOffset), Math.round(this.y + centerOffset), Math.round(this.size), Math.round(this.size));
+  }
+
+  appear() {
+    this.isIdle = false;
+    if (this.counter <= this.delay) { this.counter += this.counterStep; return; }
+    if (this.size >= this.maxSize) this.isShimmer = true;
+    if (this.isShimmer) this.shimmer();
+    else this.size += this.sizeStep;
+    this.draw();
+  }
+
+  disappear() {
+    this.isShimmer = false;
+    this.counter = 0;
+    if (this.size <= 0) { this.isIdle = true; return; }
+    else this.size -= 0.1;
+    this.draw();
+  }
+
+  shimmer() {
+    if (this.size >= this.maxSize) this.isReverse = true;
+    else if (this.size <= this.minSize) this.isReverse = false;
+    if (this.isReverse) this.size -= this.speed;
+    else this.size += this.speed;
+  }
+}
+
+const PixelCard = ({ gap = 5, speed = 35, colors = '#18181b,#27272a,#3f3f46', noFocus = false, className = '', children }) => {
+  const containerRef = useRef(null);
+  const canvasRef = useRef(null);
+  const pixelsRef = useRef([]);
+  const animationRef = useRef(null);
+  const timePreviousRef = useRef(performance.now());
+  const reducedMotion = useRef(window.matchMedia('(prefers-reduced-motion: reduce)').matches).current;
+
+  const initPixels = useCallback(() => {
+    if (!containerRef.current || !canvasRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const width = Math.floor(rect.width);
+    const height = Math.floor(rect.height);
+    const ctx = canvasRef.current.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvasRef.current.width = width * dpr;
+    canvasRef.current.height = height * dpr;
+    if (ctx) ctx.scale(dpr, dpr);
+
+    const colorsArray = colors.split(',');
+    const pxs = [];
+    for (let x = 0; x < width; x += gap) {
+      for (let y = 0; y < height; y += gap) {
+        const color = colorsArray[Math.floor(Math.random() * colorsArray.length)];
+        const distance = Math.sqrt(Math.pow(x - width / 2, 2) + Math.pow(y - height / 2, 2));
+        if (!ctx) return;
+        pxs.push(new Pixel(canvasRef.current, ctx, x, y, color, (speed * 0.001), reducedMotion ? 0 : distance));
+      }
+    }
+    pixelsRef.current = pxs;
+  }, [colors, gap, reducedMotion, speed]);
+
+  const doAnimate = useCallback((fnName) => {
+    animationRef.current = requestAnimationFrame(() => doAnimate(fnName));
+    const timeNow = performance.now();
+    const timePassed = timeNow - timePreviousRef.current;
+    if (timePassed < 1000 / 60) return;
+    timePreviousRef.current = timeNow - (timePassed % (1000 / 60));
+
+    const ctx = canvasRef.current?.getContext('2d');
+    if (!ctx || !canvasRef.current) return;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.clearRect(0, 0, canvasRef.current.width / dpr, canvasRef.current.height / dpr);
+
+    let allIdle = true;
+    pixelsRef.current.forEach(pixel => {
+      pixel[fnName]();
+      if (!pixel.isIdle) allIdle = false;
+    });
+    if (allIdle && animationRef.current) cancelAnimationFrame(animationRef.current);
+  }, []);
+
+  const handleAnimation = useCallback((name) => {
+    if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
+    animationRef.current = requestAnimationFrame(() => doAnimate(name));
+  }, [doAnimate]);
+
+  useEffect(() => {
+    initPixels();
+    const observer = new ResizeObserver(() => initPixels());
+    if (containerRef.current) observer.observe(containerRef.current);
+    return () => { observer.disconnect(); if (animationRef.current !== null) cancelAnimationFrame(animationRef.current); };
+  }, [initPixels]);
+
+  return (
+    <div 
+      ref={containerRef}
+      className={`relative overflow-hidden isolate group bg-black border border-zinc-800 rounded-lg flex flex-col transition-colors duration-200 select-none ${className}`}
+      onMouseEnter={() => handleAnimation('appear')}
+      onMouseLeave={() => handleAnimation('disappear')}
+      onFocus={(e) => { if (!noFocus && !e.currentTarget.contains(e.relatedTarget)) handleAnimation('appear'); }}
+      onBlur={(e) => { if (!noFocus && !e.currentTarget.contains(e.relatedTarget)) handleAnimation('disappear'); }}
+      tabIndex={noFocus ? -1 : 0}
+    >
+      <canvas className="absolute inset-0 w-full h-full block pointer-events-none z-0 mix-blend-screen" ref={canvasRef} />
+      <div className="relative z-10 flex-grow flex flex-col">
+        {children}
+      </div>
+    </div>
+  );
+};
+
+
+// ==========================================
+// BORDER GLOW UTILITIES & COMPONENT
+// ==========================================
+
+function parseHSL(hslStr) {
+  const match = hslStr.match(/([\d.]+)\s*([\d.]+)%?\s*([\d.]+)%?/);
+  if (!match) return { h: 0, s: 0, l: 100 }; // Default to white
+  return { h: parseFloat(match[1]), s: parseFloat(match[2]), l: parseFloat(match[3]) };
+}
+
+function buildBoxShadow(glowColor, intensity) {
+  const { h, s, l } = parseHSL(glowColor);
+  const base = `${h}deg ${s}% ${l}%`;
+  const layers = [
+    [0, 0, 0, 1, 100, true], [0, 0, 1, 0, 60, true], [0, 0, 3, 0, 50, true],
+    [0, 0, 6, 0, 40, true], [0, 0, 15, 0, 30, true], [0, 0, 25, 2, 20, true],
+    [0, 0, 50, 2, 10, true],
+    [0, 0, 1, 0, 60, false], [0, 0, 3, 0, 50, false], [0, 0, 6, 0, 40, false],
+    [0, 0, 15, 0, 30, false], [0, 0, 25, 2, 20, false], [0, 0, 50, 2, 10, false],
+  ];
+  return layers.map(([x, y, blur, spread, alpha, inset]) => {
+    const a = Math.min(alpha * intensity, 100);
+    return `${inset ? 'inset ' : ''}${x}px ${y}px ${blur}px ${spread}px hsl(${base} / ${a}%)`;
+  }).join(', ');
+}
+
+function easeOutCubic(x) { return 1 - Math.pow(1 - x, 3); }
+function easeInCubic(x) { return x * x * x; }
+
+function animateValue({ start = 0, end = 100, duration = 1000, delay = 0, ease = easeOutCubic, onUpdate, onEnd }) {
+  const t0 = performance.now() + delay;
+  function tick() {
+    const elapsed = performance.now() - t0;
+    const t = Math.min(elapsed / duration, 1);
+    onUpdate(start + (end - start) * ease(t));
+    if (t < 1) requestAnimationFrame(tick);
+    else if (onEnd) onEnd();
+  }
+  setTimeout(() => requestAnimationFrame(tick), delay);
+}
+
+const GRADIENT_POSITIONS = ['80% 55%', '69% 34%', '8% 6%', '41% 38%', '86% 85%', '82% 18%', '51% 4%'];
+const COLOR_MAP = [0, 1, 2, 0, 1, 2, 1];
+
+function buildMeshGradients(colors) {
+  const gradients = [];
+  for (let i = 0; i < 7; i++) {
+    const c = colors[Math.min(COLOR_MAP[i], colors.length - 1)];
+    gradients.push(`radial-gradient(at ${GRADIENT_POSITIONS[i]}, ${c} 0px, transparent 50%)`);
+  }
+  gradients.push(`linear-gradient(${colors[0]} 0 100%)`);
+  return gradients;
+}
+
+const BorderGlow = ({
+  children,
+  className = '',
+  edgeSensitivity = 30,
+  glowColor = '0 0 100', // Pure White
+  backgroundColor = '#050505',
+  borderRadius = 12,
+  glowRadius = 30,
+  glowIntensity = 0.5,
+  coneSpread = 25,
+  animated = false,
+  colors = ['#ffffff', '#71717a', '#000000'], // White to Black gradients
+  fillOpacity = 0.3,
+}) => {
+  const cardRef = useRef(null);
+  const [isHovered, setIsHovered] = useState(false);
+  const [cursorAngle, setCursorAngle] = useState(45);
+  const [edgeProximity, setEdgeProximity] = useState(0);
+  const [sweepActive, setSweepActive] = useState(false);
+
+  const getCenterOfElement = useCallback((el) => {
+    const { width, height } = el.getBoundingClientRect();
+    return [width / 2, height / 2];
+  }, []);
+
+  const getEdgeProximity = useCallback((el, x, y) => {
+    const [cx, cy] = getCenterOfElement(el);
+    const dx = x - cx;
+    const dy = y - cy;
+    let kx = Infinity;
+    let ky = Infinity;
+    if (dx !== 0) kx = cx / Math.abs(dx);
+    if (dy !== 0) ky = cy / Math.abs(dy);
+    return Math.min(Math.max(1 / Math.min(kx, ky), 0), 1);
+  }, [getCenterOfElement]);
+
+  const getCursorAngle = useCallback((el, x, y) => {
+    const [cx, cy] = getCenterOfElement(el);
+    const dx = x - cx;
+    const dy = y - cy;
+    if (dx === 0 && dy === 0) return 0;
+    const radians = Math.atan2(dy, dx);
+    let degrees = radians * (180 / Math.PI) + 90;
+    if (degrees < 0) degrees += 360;
+    return degrees;
+  }, [getCenterOfElement]);
+
+  const handlePointerMove = useCallback((e) => {
+    const card = cardRef.current;
+    if (!card) return;
+    const rect = card.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    setEdgeProximity(getEdgeProximity(card, x, y));
+    setCursorAngle(getCursorAngle(card, x, y));
+  }, [getEdgeProximity, getCursorAngle]);
+
+  useEffect(() => {
+    if (!animated) return;
+    const angleStart = 110;
+    const angleEnd = 465;
+    setSweepActive(true);
+    setCursorAngle(angleStart);
+
+    animateValue({ duration: 500, onUpdate: v => setEdgeProximity(v / 100) });
+    animateValue({ ease: easeInCubic, duration: 1500, end: 50, onUpdate: v => {
+      setCursorAngle((angleEnd - angleStart) * (v / 100) + angleStart);
+    }});
+    animateValue({ ease: easeOutCubic, delay: 1500, duration: 2250, start: 50, end: 100, onUpdate: v => {
+      setCursorAngle((angleEnd - angleStart) * (v / 100) + angleStart);
+    }});
+    animateValue({ ease: easeInCubic, delay: 2500, duration: 1500, start: 100, end: 0,
+      onUpdate: v => setEdgeProximity(v / 100),
+      onEnd: () => setSweepActive(false),
+    });
+  }, [animated]);
+
+  const colorSensitivity = edgeSensitivity + 20;
+  const isVisible = isHovered || sweepActive;
+  const borderOpacity = isVisible
+    ? Math.max(0, (edgeProximity * 100 - colorSensitivity) / (100 - colorSensitivity))
+    : 0;
+  const glowOpacity = isVisible
+    ? Math.max(0, (edgeProximity * 100 - edgeSensitivity) / (100 - edgeSensitivity))
+    : 0;
+
+  const meshGradients = buildMeshGradients(colors);
+  const borderBg = meshGradients.map(g => `${g} border-box`);
+  const fillBg = meshGradients.map(g => `${g} padding-box`);
+  const angleDeg = `${cursorAngle.toFixed(3)}deg`;
+
+  return (
+    <div
+      ref={cardRef}
+      onPointerMove={handlePointerMove}
+      onPointerEnter={() => setIsHovered(true)}
+      onPointerLeave={() => setIsHovered(false)}
+      className={`relative grid isolate ${className}`}
+      style={{
+        background: backgroundColor,
+        borderRadius: `${borderRadius}px`,
+        transform: 'translate3d(0, 0, 0.01px)',
+        boxShadow: 'rgba(0,0,0,0.2) 0 4px 20px',
+      }}
+    >
+      <div
+        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        style={{
+          border: '1px solid transparent',
+          background: [
+            `linear-gradient(${backgroundColor} 0 100%) padding-box`,
+            'linear-gradient(rgb(255 255 255 / 0%) 0% 100%) border-box',
+            ...borderBg,
+          ].join(', '),
+          opacity: borderOpacity,
+          maskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
+          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        }}
+      />
+      <div
+        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        style={{
+          border: '1px solid transparent',
+          background: fillBg.join(', '),
+          maskImage: [
+            'linear-gradient(to bottom, black, black)',
+            'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)',
+            'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)',
+            `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`,
+          ].join(', '),
+          WebkitMaskImage: [
+            'linear-gradient(to bottom, black, black)',
+            'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)',
+            'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)',
+            `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`,
+          ].join(', '),
+          maskComposite: 'subtract, add, add, add, add, add',
+          WebkitMaskComposite: 'source-out, source-over, source-over, source-over, source-over, source-over',
+          opacity: borderOpacity * fillOpacity,
+          mixBlendMode: 'soft-light',
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        }}
+      />
+      <span
+        className="absolute pointer-events-none z-[1] rounded-[inherit]"
+        style={{
+          inset: `${-glowRadius}px`,
+          maskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
+          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
+          opacity: glowOpacity,
+          mixBlendMode: 'plus-lighter',
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        }}
+      >
+        <span
+          className="absolute rounded-[inherit]"
+          style={{
+            inset: `${glowRadius}px`,
+            boxShadow: buildBoxShadow(glowColor, glowIntensity),
+          }}
+        />
+      </span>
+
+      <div className="flex flex-col relative h-full w-full z-[1]">
+        {children}
+      </div>
+    </div>
+  );
+};
+
+// --- Custom Inputs ---
+
+const SecretInput = ({ label, placeholder, defaultValue = '' }) => {
+  const [show, setShow] = useState(false);
+  return (
+    <div className="flex flex-col gap-2 w-full">
+      <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">{label}</label>
+      <div className="relative flex items-center">
+        <input 
+          type={show ? "text" : "password"} 
+          defaultValue={defaultValue}
+          placeholder={placeholder}
+          className="w-full bg-zinc-950 border border-zinc-800 text-white rounded-md px-3 py-2.5 focus:outline-none focus:border-white focus:ring-1 focus:ring-white transition-all font-mono text-sm"
+        />
+        <button 
+          onClick={() => setShow(!show)} 
+          className="absolute right-3 text-zinc-500 hover:text-white transition-colors"
+        >
+          {show ? <EyeOff size={16} /> : <Eye size={16} />}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const Toggle = ({ active, onToggle }) => (
+  <button 
+    onClick={onToggle}
+    className={`w-10 h-5 rounded-full flex items-center px-1 transition-colors border ${active ? 'bg-white border-white' : 'bg-zinc-950 border-zinc-700'}`}
+  >
+    <div className={`w-3 h-3 rounded-full transition-transform ${active ? 'bg-black translate-x-5' : 'bg-zinc-500 translate-x-0'}`} />
+  </button>
+);
+
+const LLM_PROVIDERS = {
+  groq: { name: 'Groq', models: ['Llama 3 70b', 'Llama 3 8b', 'Mixtral 8x7b'], keyPlaceholder: 'gsk_...' },
+  openai: { name: 'OpenAI', models: ['GPT-4o', 'GPT-4 Turbo', 'GPT-3.5 Turbo'], keyPlaceholder: 'sk-...' },
+  claude: { name: 'Claude (Anthropic)', models: ['Claude 3.5 Sonnet', 'Claude 3 Opus', 'Claude 3 Haiku'], keyPlaceholder: 'sk-ant-...' },
+  gemini: { name: 'Gemini (Google)', models: ['Gemini 1.5 Pro', 'Gemini 1.5 Flash'], keyPlaceholder: 'AIza...' }
+};
+
+// --- MAIN APP COMPONENT ---
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState('integrations');
+  const [githubAppActive, setGithubAppActive] = useState(true);
+  const [autoApprove, setAutoApprove] = useState(false);
+  const [budgetOverride, setBudgetOverride] = useState(false);
+
+  const [llmProvider, setLlmProvider] = useState('claude');
+  const [llmModel, setLlmModel] = useState(LLM_PROVIDERS['claude'].models[0]);
+
+  const tabs = [
+    { id: 'integrations', label: 'Integrations', icon: Github },
+    { id: 'cloud', label: 'Cloud & Deploy', icon: Cloud },
+    { id: 'ai', label: 'AI Orchestration', icon: Cpu },
+    { id: 'workspace', label: 'Workspace Secrets', icon: Shield },
+    { id: 'danger', label: 'Danger Zone', icon: AlertTriangle },
+  ];
+
+  return (
+    <div 
+      className="min-h-screen bg-black text-white font-sans selection:bg-white selection:text-black overflow-y-auto"
+      style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}
+    >
+      <style dangerouslySetInnerHTML={{__html: `
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: transparent;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background-color: #262626;
+          border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background-color: #3f3f46;
+        }
+      `}} />
+
+      {/* Header */}
+      <header className="border-b border-zinc-800 px-8 py-5 flex justify-between items-center bg-black/80 backdrop-blur-md sticky top-0 z-50">
+        <div className="flex items-center gap-4">
+          <div className="h-8 w-8 bg-white text-black flex items-center justify-center font-bold text-xl rounded-sm">
+            D
+          </div>
+          <div>
+            <h1 className="text-lg font-bold tracking-tight leading-none mb-1">Platform Settings</h1>
+            <p className="text-[10px] text-zinc-500 uppercase tracking-widest leading-none">Global Config</p>
+          </div>
+        </div>
+        <button className="px-5 py-2 bg-white text-black font-semibold text-sm rounded-md hover:bg-zinc-200 transition-colors">
+          Save Changes
+        </button>
+      </header>
+
+      <main className="max-w-[1400px] mx-auto px-8 py-10 grid grid-cols-12 gap-10">
+        {/* Sidebar Nav */}
+        <aside className="col-span-3 space-y-1 relative">
+          {tabs.map((tab) => {
+            const Icon = tab.icon;
+            const isActive = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-md transition-all text-sm font-medium border border-transparent ${
+                  isActive 
+                    ? 'bg-zinc-900 border-zinc-800 text-white' 
+                    : 'text-zinc-500 hover:text-white hover:bg-zinc-900/50'
+                }`}
+              >
+                <Icon size={16} strokeWidth={isActive ? 2.5 : 2} />
+                {tab.label}
+              </button>
+            );
+          })}
+        </aside>
+
+        {/* Content Area */}
+        <section className="col-span-9 pb-24">
+          
+          {/* TAB: Integrations */}
+          {activeTab === 'integrations' && (
+            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="mb-8">
+                <h2 className="text-xl font-bold tracking-tight">Source Control Integration</h2>
+                <p className="text-sm text-zinc-400 mt-1">Manage GitHub App installation and webhook listener configuration.</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-6">
+                <BorderGlow>
+                  <div className="p-6 flex flex-col h-full gap-6 relative z-10">
+                    <div className="flex items-center justify-between border-b border-zinc-800 pb-4">
+                      <div className="flex items-center gap-3">
+                        <Github size={20} className="text-white" />
+                        <h3 className="font-semibold">GitHub App Identity</h3>
+                      </div>
+                      <Toggle active={githubAppActive} onToggle={() => setGithubAppActive(!githubAppActive)} />
+                    </div>
+                    <div className="space-y-5">
+                      <SecretInput label="GitHub App ID" placeholder="app_123456789" defaultValue="app_8273910" />
+                      <SecretInput label="GitHub Private Key (PEM)" placeholder="-----BEGIN PRIVATE KEY-----" />
+                    </div>
+                  </div>
+                </BorderGlow>
+
+                <PixelCard gap={8} speed={30} colors="#3f3f46,#27272a,#18181b">
+                  <div className="p-6 flex flex-col h-full gap-6">
+                    <div className="flex items-center gap-3 border-b border-zinc-800 pb-4">
+                      <Activity size={20} className="text-white" />
+                      <h3 className="font-semibold">Webhook Listener</h3>
+                    </div>
+                    <div className="space-y-5 flex-grow">
+                      <SecretInput label="Webhook Secret" placeholder="Enter secret to validate payloads" defaultValue="whsec_12398471203" />
+                      
+                      <div className="mt-4 bg-zinc-950 border border-zinc-800 p-4 rounded-md flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <Database className="text-zinc-400" size={16} />
+                          <span className="text-sm font-medium">Status</span>
+                        </div>
+                        <div className="flex items-center gap-1.5 text-[10px] font-bold px-2 py-1 bg-white text-black rounded uppercase tracking-wider">
+                          <CheckCircle2 size={12} /> Receiving
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </PixelCard>
+              </div>
+            </div>
+          )}
+
+          {/* TAB: Cloud */}
+          {activeTab === 'cloud' && (
+            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="mb-8">
+                <h2 className="text-xl font-bold tracking-tight">Cloud & Deployment</h2>
+                <p className="text-sm text-zinc-400 mt-1">Configure runtime environments and guardrails for AWS deployments.</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-6">
+                <BorderGlow>
+                  <div className="p-6 flex flex-col h-full gap-6 relative z-10">
+                    <div className="flex items-center gap-3 border-b border-zinc-800 pb-4">
+                      <Cloud size={20} className="text-white" />
+                      <h3 className="font-semibold">AWS Credentials</h3>
+                    </div>
+                    <div className="space-y-5">
+                      <SecretInput label="Access Key ID" placeholder="AKIA..." defaultValue="AKIAIOSFODNN7EXAMPLE" />
+                      <SecretInput label="Secret Access Key" placeholder="wJalrXU..." defaultValue="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" />
+                      
+                      <div className="flex flex-col gap-2 pt-2">
+                        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Default Region</label>
+                        <select className="bg-zinc-950 border border-zinc-800 text-white rounded-md px-3 py-2.5 focus:outline-none focus:border-white transition-all appearance-none text-sm cursor-pointer">
+                          <option>us-east-1 (N. Virginia)</option>
+                          <option>us-west-2 (Oregon)</option>
+                          <option>eu-central-1 (Frankfurt)</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                </BorderGlow>
+
+                <PixelCard gap={8} speed={30} colors="#3f3f46,#27272a,#18181b">
+                  <div className="p-6 flex flex-col h-full gap-6">
+                    <div className="flex items-center justify-between border-b border-zinc-800 pb-4">
+                      <div className="flex items-center gap-3">
+                        <Shield size={20} className="text-white" />
+                        <h3 className="font-semibold">Budget Guardrails</h3>
+                      </div>
+                    </div>
+                    
+                    <div className="space-y-6">
+                      <div className="flex flex-col gap-2">
+                        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Monthly Limit (USD)</label>
+                        <div className="relative flex items-center">
+                          <span className="absolute left-3 text-zinc-500 text-sm">$</span>
+                          <input type="number" defaultValue={20} className="w-full bg-zinc-950 border border-zinc-800 text-white rounded-md pl-7 pr-3 py-2.5 focus:outline-none focus:border-white transition-all font-mono text-sm" />
+                        </div>
+                        <p className="text-[11px] text-zinc-500 mt-1">Deployments exceeding this estimate will be blocked.</p>
+                      </div>
+
+                      <div className="bg-zinc-950 border border-zinc-800 p-4 rounded-md flex items-center justify-between mt-4 relative z-10">
+                        <div>
+                          <p className="text-sm font-medium text-white">Allow Override</p>
+                          <p className="text-[10px] text-zinc-500 uppercase mt-1 tracking-wider">Bypass limits manually</p>
+                        </div>
+                        <Toggle active={budgetOverride} onToggle={() => setBudgetOverride(!budgetOverride)} />
+                      </div>
+                    </div>
+                  </div>
+                </PixelCard>
+              </div>
+            </div>
+          )}
+
+          {/* TAB: AI Orchestration */}
+          {activeTab === 'ai' && (
+            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="mb-8">
+                <h2 className="text-xl font-bold tracking-tight">AI & Agentic Engine</h2>
+                <p className="text-sm text-zinc-400 mt-1">Set model providers and tune agent pipeline behaviors.</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-6">
+                <BorderGlow>
+                  <div className="p-6 flex flex-col h-full gap-6 relative z-10">
+                    <div className="flex items-center gap-3 border-b border-zinc-800 pb-4">
+                      <Cpu size={20} className="text-white" />
+                      <h3 className="font-semibold">Core Model Provider</h3>
+                    </div>
+                    <div className="space-y-5">
+                      <div className="flex flex-col gap-2">
+                        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">LLM Provider</label>
+                        <select 
+                          value={llmProvider}
+                          onChange={(e) => {
+                            setLlmProvider(e.target.value);
+                            setLlmModel(LLM_PROVIDERS[e.target.value].models[0]);
+                          }}
+                          className="bg-zinc-950 border border-zinc-800 text-white rounded-md px-3 py-2.5 focus:outline-none focus:border-white transition-all appearance-none text-sm cursor-pointer"
+                        >
+                          {Object.entries(LLM_PROVIDERS).map(([key, p]) => (
+                            <option key={key} value={key}>{p.name}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="flex flex-col gap-2">
+                        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Active Model</label>
+                        <select 
+                          value={llmModel}
+                          onChange={(e) => setLlmModel(e.target.value)}
+                          className="bg-zinc-950 border border-zinc-800 text-white rounded-md px-3 py-2.5 focus:outline-none focus:border-white transition-all appearance-none text-sm cursor-pointer"
+                        >
+                          {LLM_PROVIDERS[llmProvider].models.map(m => (
+                            <option key={m} value={m}>{m}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <SecretInput key={llmProvider} label={`${LLM_PROVIDERS[llmProvider].name} API Key`} placeholder={LLM_PROVIDERS[llmProvider].keyPlaceholder} defaultValue="" />
+                    </div>
+                  </div>
+                </BorderGlow>
+
+                <PixelCard gap={8} speed={30} colors="#3f3f46,#27272a,#18181b">
+                  <div className="p-6 flex flex-col h-full gap-6">
+                    <div className="flex items-center gap-3 border-b border-zinc-800 pb-4">
+                      <Terminal size={20} className="text-white" />
+                      <h3 className="font-semibold">Remediation Rules</h3>
+                    </div>
+                    
+                    <div className="space-y-6">
+                      <div className="space-y-3">
+                        <div className="flex justify-between items-center">
+                          <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Max Execution Cycles</label>
+                          <span className="font-mono text-xs bg-white text-black px-1.5 py-0.5 rounded font-bold">2</span>
+                        </div>
+                        <input type="range" min="1" max="5" defaultValue="2" className="w-full accent-white relative z-10 cursor-pointer" />
+                        <p className="text-[11px] text-zinc-500">Backend hard-caps remediation cycles to 2 to prevent infinite loops.</p>
+                      </div>
+
+                      <div className="bg-zinc-950 border border-zinc-800 p-4 rounded-md flex items-center justify-between relative z-10">
+                        <div>
+                          <p className="text-sm font-medium text-white">Auto-Approve Low</p>
+                          <p className="text-[10px] text-zinc-500 uppercase mt-1 tracking-wider">Skip manual review for low sev</p>
+                        </div>
+                        <Toggle active={autoApprove} onToggle={() => setAutoApprove(!autoApprove)} />
+                      </div>
+                    </div>
+                  </div>
+                </PixelCard>
+              </div>
+            </div>
+          )}
+
+          {/* TAB: Danger Zone */}
+          {activeTab === 'danger' && (
+            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="mb-8">
+                <h2 className="text-xl font-bold tracking-tight">Danger Zone</h2>
+                <p className="text-sm text-zinc-400 mt-1">Irreversible platform operations and state destruction.</p>
+              </div>
+
+              <div className="border-2 border-white bg-white text-black p-8 rounded-lg relative overflow-hidden shadow-[0_0_40px_rgba(255,255,255,0.1)]">
+                <div className="absolute inset-0 opacity-5 pointer-events-none" style={{ backgroundImage: 'repeating-linear-gradient(45deg, #000 25%, transparent 25%, transparent 75%, #000 75%, #000), repeating-linear-gradient(45deg, #000 25%, transparent 25%, transparent 75%, #000 75%, #000)', backgroundPosition: '0 0, 20px 20px', backgroundSize: '40px 40px' }}></div>
+                
+                <div className="relative z-10">
+                  <div className="flex items-start gap-4 border-b border-black/20 pb-6 mb-6">
+                    <div className="bg-black text-white p-2.5 rounded-sm">
+                      <AlertTriangle size={24} strokeWidth={2.5} />
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-black uppercase tracking-tight">Global Runtime Cleanup</h3>
+                      <p className="text-black/80 font-medium mt-1 text-sm max-w-2xl">
+                        This executes the <code className="bg-black text-white px-1.5 py-0.5 rounded text-xs font-mono">/api/cleanup</code> endpoint. It drops all active Docker execution volumes (<span className="font-mono text-xs">codebase_deplai</span>, <span className="font-mono text-xs">security_reports</span>) and terminates running instance states across all tracked projects.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-3">
+                    <label className="text-[11px] font-bold uppercase tracking-widest text-black/70">Type "DESTROY ALL" to confirm</label>
+                    <div className="flex gap-4">
+                      <input 
+                        type="text" 
+                        placeholder="DESTROY ALL"
+                        className="bg-transparent border-2 border-black text-black placeholder-black/30 rounded-md px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-black transition-all font-mono font-bold w-64 text-sm"
+                      />
+                      <button className="bg-black text-white font-bold uppercase tracking-wider text-xs px-6 py-2.5 rounded-md hover:bg-zinc-900 transition-colors">
+                        Execute Wipe
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB: Workspace */}
+          {activeTab === 'workspace' && (
+            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <div className="mb-8">
+                <h2 className="text-xl font-bold tracking-tight">Workspace Secrets</h2>
+                <p className="text-sm text-zinc-400 mt-1">Configure core connector tokens and session encryption.</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-6">
+                <PixelCard gap={8} speed={30} colors="#3f3f46,#27272a,#18181b" className="col-span-2">
+                  <div className="p-8 flex flex-col gap-6">
+                    <div className="flex items-center gap-3 border-b border-zinc-800 pb-4">
+                      <Lock size={20} className="text-white" />
+                      <h3 className="font-semibold">Platform Keys</h3>
+                    </div>
+                    <div className="grid grid-cols-2 gap-8 relative z-10">
+                      <div className="space-y-6">
+                        <BorderGlow borderRadius={8} className="border border-zinc-800">
+                          <div className="p-4 bg-black rounded-[inherit]"><SecretInput label="DeplAI Service Key" placeholder="REST auth token" defaultValue="d3pl41_svckey_xxxxx" /></div>
+                        </BorderGlow>
+                        <BorderGlow borderRadius={8} className="border border-zinc-800">
+                          <div className="p-4 bg-black rounded-[inherit]"><SecretInput label="Session Secret" placeholder="Browser session encryption" defaultValue="s3ss10n_s3cr3t_0987654321" /></div>
+                        </BorderGlow>
+                      </div>
+                      <div className="space-y-6">
+                        <BorderGlow borderRadius={8} className="border border-zinc-800">
+                          <div className="p-4 bg-black rounded-[inherit]"><SecretInput label="WebSocket Token Secret" placeholder="HMAC signing key" defaultValue="ws_t0k3n_s3cr3t_xxxxx" /></div>
+                        </BorderGlow>
+                      </div>
+                    </div>
+                  </div>
+                </PixelCard>
+              </div>
+            </div>
+          )}
+
+        </section>
+      </main>
+    </div>
+  );
+}

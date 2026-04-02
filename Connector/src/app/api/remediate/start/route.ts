@@ -57,10 +57,19 @@ export async function POST(request: NextRequest) {
     const { user, error } = await requireAuth();
     if (error) return error;
 
-    const { project_id, cortex_context, github_token, llm_provider, llm_api_key, llm_model, remediation_scope } = await request.json();
+    const { project_id, cortex_context, github_token, llm_api_key, llm_model, remediation_scope } = await request.json();
     const runtimeGithubToken =
       typeof github_token === 'string' && github_token.trim().length > 0
         ? github_token.trim()
+        : null;
+    const normalizedLlmProvider = 'claude';
+    const normalizedLlmApiKey =
+      typeof llm_api_key === 'string' && llm_api_key.trim().startsWith('sk-ant-')
+        ? llm_api_key.trim()
+        : null;
+    const normalizedLlmModel =
+      typeof llm_model === 'string' && llm_model.trim().toLowerCase().includes('claude')
+        ? llm_model.trim()
         : null;
     const scope = remediation_scope === 'major' ? 'major' : 'all';
     let usedInstallationToken = false;
@@ -112,9 +121,9 @@ export async function POST(request: NextRequest) {
           github_token: token,
           repository_url: `https://github.com/${owner}/${repo}`,
           cortex_context: cortex_context || null,
-          llm_provider: llm_provider || null,
-          llm_api_key: llm_api_key || null,
-          llm_model: llm_model || null,
+          llm_provider: normalizedLlmProvider,
+          llm_api_key: normalizedLlmApiKey,
+          llm_model: normalizedLlmModel,
           remediation_scope: scope,
         };
       } else {
@@ -124,9 +133,9 @@ export async function POST(request: NextRequest) {
           project_type: 'local',
           user_id: String(user.id),
           cortex_context: cortex_context || null,
-          llm_provider: llm_provider || null,
-          llm_api_key: llm_api_key || null,
-          llm_model: llm_model || null,
+          llm_provider: normalizedLlmProvider,
+          llm_api_key: normalizedLlmApiKey,
+          llm_model: normalizedLlmModel,
           remediation_scope: scope,
         };
       }
@@ -166,9 +175,9 @@ export async function POST(request: NextRequest) {
         github_token: token,
         repository_url: `https://github.com/${owner}/${repo}`,
         cortex_context: cortex_context || null,
-        llm_provider: llm_provider || null,
-        llm_api_key: llm_api_key || null,
-        llm_model: llm_model || null,
+        llm_provider: normalizedLlmProvider,
+        llm_api_key: normalizedLlmApiKey,
+        llm_model: normalizedLlmModel,
         remediation_scope: scope,
       };
     }
