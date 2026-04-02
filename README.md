@@ -35,8 +35,7 @@ DeplAI is built around a stage-oriented delivery workflow:
 - GitHub branch push and PR creation for remediation changes
 - Local-project persistence for non-GitHub projects
 - Knowledge graph-assisted vulnerability analysis with graceful degradation
-- Architecture generation for AWS, Azure, and GCP request flows
-- Cost estimation with AWS, Azure, and GCP paths
+- AWS architecture generation and cost planning
 - Stage 7.5 approval payload generation
 - Terraform bundle generation plus template fallback
 - Budget-aware deployment gating
@@ -57,8 +56,8 @@ DeplAI is built around a stage-oriented delivery workflow:
 
 ### Planning and delivery
 
-- Architecture JSON generation
-- Cloud cost estimation
+- AWS architecture JSON generation
+- AWS cost estimation
 - Diagram generation
 - Stage approval contracts
 - IaC generation and review
@@ -137,6 +136,21 @@ flowchart LR
     Agentic --> AWS[AWS APIs]
 ```
 
+## Q/A To Deploy Flow
+
+```mermaid
+flowchart LR
+    QA[Stage 6 Q/A Context] --> Stage7[Architecture and Cost Agent]
+    Stage7 --> Arch[AWS Architecture Output]
+    Stage7 --> Cost[AWS Cost Output]
+    Arch --> Terraform[Terraform Agent]
+    Cost --> Terraform
+    Terraform --> Review[Stage 8 IaC Review]
+    Review --> Policy[Stage 9 Policy Gate]
+    Policy --> Deploy[Stage 10 Deployment]
+    Deploy --> Runtime[AWS Runtime Apply or GitOps]
+```
+
 ## Frameworks and Technology Stack
 
 ### Frontend and BFF
@@ -201,7 +215,7 @@ Optional but recommended:
 
 - Neo4j
 - Qdrant
-- AWS credentials for runtime apply and some pricing paths
+- AWS credentials for runtime apply and AWS pricing flows
 - Anthropic API key for remediation
 
 ### Environment

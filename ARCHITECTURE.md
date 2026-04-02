@@ -17,7 +17,7 @@ The platform is optimized for:
 - repository intake
 - security scanning
 - supervised remediation
-- architecture and cost planning
+- AWS architecture and cost planning
 - IaC generation
 - gated deployment
 
@@ -45,8 +45,6 @@ flowchart LR
     Agentic --> Stage7[diagram_cost-estimation_agent<br/>subprocess]
     Agentic --> Terraform[terraform_agent]
     Agentic --> AWS[AWS APIs]
-    Agentic --> Azure[Azure pricing path]
-    Agentic --> GCP[GCP pricing path]
 ```
 
 ## 3. Major Components
@@ -84,9 +82,9 @@ Responsibilities:
 
 - scan validation and scan execution
 - remediation orchestration and rescan loop
-- architecture generation
+- AWS architecture generation
 - architecture review start and complete flows
-- cost estimation
+- AWS cost estimation
 - Stage 7 approval payload generation
 - Terraform generation
 - runtime Terraform apply and destroy flows
@@ -178,6 +176,23 @@ flowchart TB
     Approve --> IaC[Stage 8 IaC]
     IaC --> Policy[Stage 9 Policy Gate]
     Policy --> Deploy[Stage 10 Deploy]
+```
+
+## 5.1 Q/A To Terraform To Deploy
+
+This is the AWS delivery path from planning input to deployment output.
+
+```mermaid
+flowchart LR
+    QA[Stage 6 Q/A Context] --> Agent[Architecture and Cost Agent]
+    Agent --> Arch[AWS Architecture JSON]
+    Agent --> Cost[AWS Cost Estimate]
+    Arch --> TF[terraform_agent]
+    Cost --> TF
+    TF --> Bundle[Terraform Bundle]
+    Bundle --> Gate[Policy and Budget Gate]
+    Gate --> Deploy[Stage 10 Deployment]
+    Deploy --> Runtime[AWS Runtime Apply or GitOps]
 ```
 
 ## 6. Agent Architecture
