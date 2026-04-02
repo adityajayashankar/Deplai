@@ -52,7 +52,7 @@ export async function GET(
     });
   }
 
-  return new NextResponse(content, {
+  return new NextResponse(new Uint8Array(content), {
     headers: {
       'Content-Type': 'image/png',
       'Cache-Control': 'public, max-age=31536000, immutable',

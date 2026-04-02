@@ -15,6 +15,7 @@ can `await emit(...)` between each step for real-time WebSocket streaming.
 
 import asyncio
 import contextvars
+import difflib
 import json
 import os
 import time
@@ -30,11 +31,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from claude_remediator import (  # noqa: E402
-    _call_groq,
-    _call_ollama,
-    _call_openai,
-    _call_gemini,
-    _call_openrouter,
+    ClaudeBudgetTracker,
+    _call_claude_sdk,
     _collect_context_files,
     _extract_json,
     _normalize_changes_with_report,
@@ -88,6 +86,7 @@ class RemediationState(TypedDict):
     llm_provider: str
     llm_api_key: str
     llm_model: str
+    budget_tracker: ClaudeBudgetTracker | None
     # ── Planner output ──────────────────────────────────────────────────────────
     planned_context: dict   # targeted snippets from Planner's tool calls
     # ── Negotiation state ─────────────────────────────────────────────────────
@@ -123,72 +122,34 @@ def _dispatch_llm(
     provider: str,
     api_key: str,
     model: str,
+    budget_tracker: ClaudeBudgetTracker | None = None,
+    stage: str = "remediation_supervisor",
 ) -> tuple[bool, str]:
-    """Route supervisor LLM calls through user-selected provider, then fallback chain."""
+    """Route remediation supervisor calls through the Claude Agent SDK only."""
     provider = (provider or "").strip().lower()
     api_key = (api_key or "").strip()
     model = (model or "").strip()
-    selected_model = (os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b").strip() or "qwen2.5-coder:7b")
-    errors: list[str] = []
+    effective_api_key = api_key if provider in ("", "claude") else ""
+    effective_model = model if provider in ("", "claude") else ""
 
-    def _record(label: str, result: str) -> None:
-        errors.append(f"{label}: {result}")
+    ok, text = _call_with_backoff(
+        lambda: _call_claude_sdk(
+            prompt,
+            effective_api_key,
+            effective_model,
+            budget_tracker=budget_tracker,
+            stage=stage,
+        )
+    )
+    if ok:
+        return ok, text
 
-    # If a specific provider was selected, try it first.
-    try:
-        if provider == "openai":
-            if api_key:
-                ok, text = _call_with_backoff(lambda: _call_openai(prompt, api_key, model or "gpt-4o"))
-                if ok:
-                    return ok, text
-                _record("openai", text)
-            else:
-                _record("openai", "Missing API key for selected provider.")
-        elif provider == "gemini":
-            if api_key:
-                ok, text = _call_with_backoff(lambda: _call_gemini(prompt, api_key, model or "gemini-2.5-pro"))
-                if ok:
-                    return ok, text
-                _record("gemini", text)
-            else:
-                _record("gemini", "Missing API key for selected provider.")
-        elif provider == "openrouter":
-            ok, text = _call_with_backoff(
-                lambda: _call_openrouter(prompt, api_key=api_key or None, preferred_model=model or None)
-            )
-            if ok:
-                return ok, text
-            _record("openrouter", text)
-        elif provider == "groq":
-            ok, text = _call_with_backoff(lambda: _call_groq(prompt))
-            if ok:
-                return ok, text
-            _record("groq", text)
-        elif provider == "ollama":
-            ok, text = _call_with_backoff(lambda: _call_ollama(prompt, selected_model))
-            if ok:
-                return ok, text
-            _record("ollama", text)
-    except Exception as exc:
-        _record(provider or "selected_provider", f"unexpected error: {exc}")
-
-    # Default chain when selected provider failed/unavailable.
-    # Required order: Groq -> Ollama Cloud -> OpenRouter.
-    groq_ok, groq_text = _call_with_backoff(lambda: _call_groq(prompt))
-    if groq_ok:
-        return groq_ok, groq_text
-    _record("groq", groq_text)
-
-    ollama_ok, ollama_text = _call_with_backoff(lambda: _call_ollama(prompt, selected_model))
-    if ollama_ok:
-        return ollama_ok, ollama_text
-    _record("ollama", ollama_text)
-
-    openrouter_ok, openrouter_text = _call_with_backoff(lambda: _call_openrouter(prompt))
-    if openrouter_ok:
-        return openrouter_ok, openrouter_text
-    _record("openrouter", openrouter_text)
-    return (False, " | ".join(errors))
+    if provider and provider != "claude":
+        return (
+            False,
+            f"Remediation only supports the Claude Agent SDK; ignored provider '{provider}'. Claude SDK error: {text}",
+        )
+    return (False, f"Claude SDK remediation supervisor failed: {text}")
 
 # ── Planner: CWE → search-pattern map ─────────────────────────────────────────
 # Maps common CWE IDs to grep-compatible patterns so the Planner can locate
@@ -275,6 +236,9 @@ def _build_proposer_prompt(state: RemediationState) -> str:
                     "count": f.get("count"),
                     "title": f.get("title") or f.get("name"),
                     "description": str(f.get("description", ""))[:180],
+                    "primary_path": f.get("primary_path"),
+                    "root_cause_key": f.get("root_cause_key"),
+                    "root_cause_kind": f.get("root_cause_kind"),
                 }
             )
 
@@ -286,8 +250,12 @@ def _build_proposer_prompt(state: RemediationState) -> str:
                     "cve_id": f.get("cve_id"),
                     "severity": f.get("severity"),
                     "package": f.get("package") or f.get("name"),
-                    "installed_version": f.get("installed_version"),
+                    "installed_version": f.get("installed_version") or f.get("version"),
                     "fix_version": f.get("fix_version"),
+                    "count": f.get("count"),
+                    "related_cve_ids": (f.get("related_cve_ids") or [])[:8],
+                    "root_cause_key": f.get("root_cause_key"),
+                    "root_cause_kind": f.get("root_cause_kind"),
                 }
             )
 
@@ -480,6 +448,8 @@ def _proposer_node(state: RemediationState) -> RemediationState:
         provider=state.get("llm_provider", ""),
         api_key=state.get("llm_api_key", ""),
         model=state.get("llm_model", ""),
+        budget_tracker=state.get("budget_tracker"),
+        stage=f"supervisor_proposer_round_{int(state.get('round', 0)) + 1}",
     )
     if not ok:
         return {**state, "error": f"Proposer LLM call failed: {raw_text}"}
@@ -514,6 +484,8 @@ def _critic_node(state: RemediationState) -> RemediationState:
         provider=state.get("llm_provider", ""),
         api_key=state.get("llm_api_key", ""),
         model=state.get("llm_model", ""),
+        budget_tracker=state.get("budget_tracker"),
+        stage=f"supervisor_critic_round_{int(state.get('round', 0)) + 1}",
     )
 
     if not ok:
@@ -560,8 +532,17 @@ def _synthesizer_node(state: RemediationState) -> RemediationState:
             if not ok_candidate:
                 rejected_changes.append({"path": change.path, "reason": reason})
                 continue
+            file_diff = "\n".join(
+                difflib.unified_diff(
+                    before_content.splitlines(),
+                    change.content.splitlines(),
+                    fromfile=f"a/{change.path}",
+                    tofile=f"b/{change.path}",
+                    lineterm="",
+                )
+            )
             _write_file(change.path, change.content)
-            changed_files.append({"path": change.path, "reason": change.reason})
+            changed_files.append({"path": change.path, "reason": change.reason, "diff": file_diff})
         except Exception as exc:
             return {**state, "error": f"Synthesizer failed writing {change.path}: {exc}"}
 
@@ -601,6 +582,7 @@ def _synthesizer_node(state: RemediationState) -> RemediationState:
             "negotiation_rounds":  rounds_used,
             "critic_verdict":      verdict,
             "critic_score":        critique.get("quality_score", 0),
+            "llm_cost_usd":        round(float(getattr(state.get("budget_tracker"), "total_usd", 0.0)), 6),
         },
     }
 
@@ -663,6 +645,7 @@ async def run_remediation_supervisor(
     llm_api_key: str | None = None,
     llm_model: str | None = None,
     agent_analysis: dict | None = None,
+    budget_tracker: ClaudeBudgetTracker | None = None,
     on_message=None,
 ) -> tuple[bool, dict[str, Any] | str]:
     """
@@ -706,6 +689,7 @@ async def run_remediation_supervisor(
         "llm_provider":   llm_provider or "",
         "llm_api_key":    llm_api_key or "",
         "llm_model":      llm_model or "",
+        "budget_tracker": budget_tracker,
         "round":          0,
         "proposal":       {},
         "proposer_parse_warning": "",

@@ -1,0 +1,1006 @@
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { 
+  Book, 
+  TerminalSquare, 
+  LayoutGrid, 
+  Code, 
+  ChevronRight, 
+  Search, 
+  ArrowLeft,
+  Server,
+  Database,
+  Globe,
+  Network,
+  Cpu,
+  ShieldAlert,
+  Settings,
+  Activity,
+  AlertCircle,
+  ArrowRight,
+  Play,
+  FileJson,
+  Layers,
+  Users,
+  Box,
+  HardDrive,
+  GitPullRequest,
+  CheckCircle2
+} from 'lucide-react';
+
+// ==========================================
+// PIXEL CARD COMPONENT
+// ==========================================
+
+class Pixel {
+  width: number;
+  height: number;
+  ctx: CanvasRenderingContext2D;
+  x: number;
+  y: number;
+  color: string;
+  speed: number;
+  size: number;
+  sizeStep: number;
+  minSize: number;
+  maxSizeInteger: number;
+  maxSize: number;
+  delay: number;
+  counter: number;
+  counterStep: number;
+  isIdle: boolean;
+  isReverse: boolean;
+  isShimmer: boolean;
+
+  constructor(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D, x: number, y: number, color: string, speed: number, delay: number) {
+    const dpr = window.devicePixelRatio || 1;
+    this.width = canvas.width / dpr;
+    this.height = canvas.height / dpr;
+    this.ctx = context;
+    this.x = x;
+    this.y = y;
+    this.color = color;
+    this.speed = (Math.random() * 0.8 + 0.1) * speed;
+    this.size = 0;
+    this.sizeStep = Math.random() * 0.4;
+    this.minSize = 0.5;
+    this.maxSizeInteger = 2;
+    this.maxSize = Math.random() * (this.maxSizeInteger - this.minSize) + this.minSize;
+    this.delay = delay;
+    this.counter = 0;
+    this.counterStep = Math.random() * 4 + (this.width + this.height) * 0.01;
+    this.isIdle = false;
+    this.isReverse = false;
+    this.isShimmer = false;
+  }
+
+  draw() {
+    const centerOffset = this.maxSizeInteger * 0.5 - this.size * 0.5;
+    this.ctx.fillStyle = this.color;
+    this.ctx.fillRect(Math.round(this.x + centerOffset), Math.round(this.y + centerOffset), Math.round(this.size), Math.round(this.size));
+  }
+
+  appear() {
+    this.isIdle = false;
+    if (this.counter <= this.delay) { this.counter += this.counterStep; return; }
+    if (this.size >= this.maxSize) this.isShimmer = true;
+    if (this.isShimmer) this.shimmer();
+    else this.size += this.sizeStep;
+    this.draw();
+  }
+
+  disappear() {
+    this.isShimmer = false;
+    this.counter = 0;
+    if (this.size <= 0) { this.isIdle = true; return; }
+    else this.size -= 0.1;
+    this.draw();
+  }
+
+  shimmer() {
+    if (this.size >= this.maxSize) this.isReverse = true;
+    else if (this.size <= this.minSize) this.isReverse = false;
+    if (this.isReverse) this.size -= this.speed;
+    else this.size += this.speed;
+  }
+}
+
+interface PixelCardProps {
+  gap?: number;
+  speed?: number;
+  colors?: string;
+  noFocus?: boolean;
+  className?: string;
+  children: React.ReactNode;
+}
+
+const PixelCard: React.FC<PixelCardProps> = ({ gap = 5, speed = 35, colors = '#18181b,#27272a,#3f3f46', noFocus = false, className = '', children }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const pixelsRef = useRef<Pixel[]>([]);
+  const animationRef = useRef<ReturnType<typeof requestAnimationFrame> | null>(null);
+  const timePreviousRef = useRef(performance.now());
+  const reducedMotion = useRef(window.matchMedia('(prefers-reduced-motion: reduce)').matches).current;
+
+  const initPixels = useCallback(() => {
+    if (!containerRef.current || !canvasRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const width = Math.floor(rect.width);
+    const height = Math.floor(rect.height);
+    const ctx = canvasRef.current.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvasRef.current.width = width * dpr;
+    canvasRef.current.height = height * dpr;
+    if (ctx) ctx.scale(dpr, dpr);
+
+    const colorsArray = colors.split(',');
+    const pxs = [];
+    for (let x = 0; x < width; x += gap) {
+      for (let y = 0; y < height; y += gap) {
+        const color = colorsArray[Math.floor(Math.random() * colorsArray.length)];
+        const distance = Math.sqrt(Math.pow(x - width / 2, 2) + Math.pow(y - height / 2, 2));
+        if (!ctx) return;
+        pxs.push(new Pixel(canvasRef.current, ctx, x, y, color, (speed * 0.001), reducedMotion ? 0 : distance));
+      }
+    }
+    pixelsRef.current = pxs;
+  }, [colors, gap, reducedMotion, speed]);
+
+  const doAnimate = useCallback((fnName: 'appear' | 'disappear') => {
+    animationRef.current = requestAnimationFrame(() => doAnimate(fnName));
+    const timeNow = performance.now();
+    const timePassed = timeNow - timePreviousRef.current;
+    if (timePassed < 1000 / 60) return;
+    timePreviousRef.current = timeNow - (timePassed % (1000 / 60));
+
+    const ctx = canvasRef.current?.getContext('2d');
+    if (!ctx || !canvasRef.current) return;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.clearRect(0, 0, canvasRef.current.width / dpr, canvasRef.current.height / dpr);
+
+    let allIdle = true;
+    pixelsRef.current.forEach(pixel => {
+      pixel[fnName]();
+      if (!pixel.isIdle) allIdle = false;
+    });
+    if (allIdle && animationRef.current) cancelAnimationFrame(animationRef.current);
+  }, []);
+
+  const handleAnimation = useCallback((name: 'appear' | 'disappear') => {
+    if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
+    animationRef.current = requestAnimationFrame(() => doAnimate(name));
+  }, [doAnimate]);
+
+  useEffect(() => {
+    initPixels();
+    const observer = new ResizeObserver(() => initPixels());
+    if (containerRef.current) observer.observe(containerRef.current);
+    return () => { observer.disconnect(); if (animationRef.current !== null) cancelAnimationFrame(animationRef.current); };
+  }, [initPixels]);
+
+  return (
+    <div
+      ref={containerRef}
+      className={`relative overflow-hidden isolate transition-colors duration-200 ease-[cubic-bezier(0.5,1,0.89,1)] select-none ${className}`}
+      onMouseEnter={() => handleAnimation('appear')}
+      onMouseLeave={() => handleAnimation('disappear')}
+      onFocus={(e) => { if (!noFocus && !e.currentTarget.contains(e.relatedTarget)) handleAnimation('appear'); }}
+      onBlur={(e) => { if (!noFocus && !e.currentTarget.contains(e.relatedTarget)) handleAnimation('disappear'); }}
+      tabIndex={noFocus ? -1 : 0}
+    >
+      <canvas className="absolute inset-0 w-full h-full block pointer-events-none z-0" ref={canvasRef} />
+      <div className="relative z-10 w-full h-full flex flex-col">{children}</div>
+    </div>
+  );
+};
+
+// ==========================================
+// BORDER GLOW UTILITIES & COMPONENT
+// ==========================================
+
+function parseHSL(hslStr: string) {
+  const match = hslStr.match(/([\d.]+)\s*([\d.]+)%?\s*([\d.]+)%?/);
+  if (!match) return { h: 0, s: 0, l: 100 };
+  return { h: parseFloat(match[1]), s: parseFloat(match[2]), l: parseFloat(match[3]) };
+}
+
+function buildBoxShadow(glowColor: string, intensity: number) {
+  const { h, s, l } = parseHSL(glowColor);
+  const base = `${h}deg ${s}% ${l}%`;
+  const layers: [number, number, number, number, number, boolean][] = [
+    [0, 0, 0, 1, 100, true], [0, 0, 1, 0, 60, true], [0, 0, 3, 0, 50, true],
+    [0, 0, 6, 0, 40, true], [0, 0, 15, 0, 30, true], [0, 0, 25, 2, 20, true],
+    [0, 0, 50, 2, 10, true],
+    [0, 0, 1, 0, 60, false], [0, 0, 3, 0, 50, false], [0, 0, 6, 0, 40, false],
+    [0, 0, 15, 0, 30, false], [0, 0, 25, 2, 20, false], [0, 0, 50, 2, 10, false],
+  ];
+  return layers.map(([x, y, blur, spread, alpha, inset]) => {
+    const a = Math.min(alpha * intensity, 100);
+    return `${inset ? 'inset ' : ''}${x}px ${y}px ${blur}px ${spread}px hsl(${base} / ${a}%)`;
+  }).join(', ');
+}
+
+function easeOutCubic(x: number) { return 1 - Math.pow(1 - x, 3); }
+function easeInCubic(x: number) { return x * x * x; }
+
+function animateValue({ start = 0, end = 100, duration = 1000, delay = 0, ease = easeOutCubic, onUpdate, onEnd }: any) {
+  const t0 = performance.now() + delay;
+  function tick() {
+    const elapsed = performance.now() - t0;
+    const t = Math.min(elapsed / duration, 1);
+    onUpdate(start + (end - start) * ease(t));
+    if (t < 1) requestAnimationFrame(tick);
+    else if (onEnd) onEnd();
+  }
+  setTimeout(() => requestAnimationFrame(tick), delay);
+}
+
+const GRADIENT_POSITIONS = ['80% 55%', '69% 34%', '8% 6%', '41% 38%', '86% 85%', '82% 18%', '51% 4%'];
+const COLOR_MAP = [0, 1, 2, 0, 1, 2, 1];
+
+function buildMeshGradients(colors: string[]) {
+  const gradients = [];
+  for (let i = 0; i < 7; i++) {
+    const c = colors[Math.min(COLOR_MAP[i], colors.length - 1)];
+    gradients.push(`radial-gradient(at ${GRADIENT_POSITIONS[i]}, ${c} 0px, transparent 50%)`);
+  }
+  gradients.push(`linear-gradient(${colors[0]} 0 100%)`);
+  return gradients;
+}
+
+interface BorderGlowProps {
+  children?: React.ReactNode;
+  className?: string;
+  edgeSensitivity?: number;
+  glowColor?: string;
+  backgroundColor?: string;
+  borderRadius?: number;
+  glowRadius?: number;
+  glowIntensity?: number;
+  coneSpread?: number;
+  animated?: boolean;
+  colors?: string[];
+  fillOpacity?: number;
+}
+
+const BorderGlow: React.FC<BorderGlowProps> = ({
+  children,
+  className = '',
+  edgeSensitivity = 30,
+  glowColor = '0 0 100', 
+  backgroundColor = '#050505',
+  borderRadius = 12,
+  glowRadius = 30,
+  glowIntensity = 0.5,
+  coneSpread = 25,
+  animated = false,
+  colors = ['#ffffff', '#71717a', '#000000'], 
+  fillOpacity = 0.3,
+}) => {
+  const cardRef = useRef<HTMLDivElement>(null);
+  const [isHovered, setIsHovered] = useState(false);
+  const [cursorAngle, setCursorAngle] = useState(45);
+  const [edgeProximity, setEdgeProximity] = useState(0);
+  const [sweepActive, setSweepActive] = useState(false);
+
+  const getCenterOfElement = useCallback((el: HTMLElement) => {
+    const { width, height } = el.getBoundingClientRect();
+    return [width / 2, height / 2];
+  }, []);
+
+  const getEdgeProximity = useCallback((el: HTMLElement, x: number, y: number) => {
+    const [cx, cy] = getCenterOfElement(el);
+    const dx = x - cx;
+    const dy = y - cy;
+    let kx = Infinity;
+    let ky = Infinity;
+    if (dx !== 0) kx = cx / Math.abs(dx);
+    if (dy !== 0) ky = cy / Math.abs(dy);
+    return Math.min(Math.max(1 / Math.min(kx, ky), 0), 1);
+  }, [getCenterOfElement]);
+
+  const getCursorAngle = useCallback((el: HTMLElement, x: number, y: number) => {
+    const [cx, cy] = getCenterOfElement(el);
+    const dx = x - cx;
+    const dy = y - cy;
+    if (dx === 0 && dy === 0) return 0;
+    const radians = Math.atan2(dy, dx);
+    let degrees = radians * (180 / Math.PI) + 90;
+    if (degrees < 0) degrees += 360;
+    return degrees;
+  }, [getCenterOfElement]);
+
+  const handlePointerMove = useCallback((e: React.PointerEvent) => {
+    const card = cardRef.current;
+    if (!card) return;
+    const rect = card.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    setEdgeProximity(getEdgeProximity(card, x, y));
+    setCursorAngle(getCursorAngle(card, x, y));
+  }, [getEdgeProximity, getCursorAngle]);
+
+  useEffect(() => {
+    if (!animated) return;
+    const angleStart = 110;
+    const angleEnd = 465;
+    setSweepActive(true);
+    setCursorAngle(angleStart);
+
+    animateValue({ duration: 500, onUpdate: (v: number) => setEdgeProximity(v / 100) });
+    animateValue({ ease: easeInCubic, duration: 1500, end: 50, onUpdate: (v: number) => {
+      setCursorAngle((angleEnd - angleStart) * (v / 100) + angleStart);
+    }});
+    animateValue({ ease: easeOutCubic, delay: 1500, duration: 2250, start: 50, end: 100, onUpdate: (v: number) => {
+      setCursorAngle((angleEnd - angleStart) * (v / 100) + angleStart);
+    }});
+    animateValue({ ease: easeInCubic, delay: 2500, duration: 1500, start: 100, end: 0,
+      onUpdate: (v: number) => setEdgeProximity(v / 100),
+      onEnd: () => setSweepActive(false),
+    });
+  }, [animated]);
+
+  const colorSensitivity = edgeSensitivity + 20;
+  const isVisible = isHovered || sweepActive;
+  const borderOpacity = isVisible
+    ? Math.max(0, (edgeProximity * 100 - colorSensitivity) / (100 - colorSensitivity))
+    : 0;
+  const glowOpacity = isVisible
+    ? Math.max(0, (edgeProximity * 100 - edgeSensitivity) / (100 - edgeSensitivity))
+    : 0;
+
+  const meshGradients = buildMeshGradients(colors);
+  const borderBg = meshGradients.map(g => `${g} border-box`);
+  const fillBg = meshGradients.map(g => `${g} padding-box`);
+  const angleDeg = `${cursorAngle.toFixed(3)}deg`;
+
+  return (
+    <div
+      ref={cardRef}
+      onPointerMove={handlePointerMove}
+      onPointerEnter={() => setIsHovered(true)}
+      onPointerLeave={() => setIsHovered(false)}
+      className={`relative grid isolate ${className}`}
+      style={{
+        background: backgroundColor,
+        borderRadius: `${borderRadius}px`,
+        transform: 'translate3d(0, 0, 0.01px)',
+        boxShadow: 'rgba(0,0,0,0.2) 0 4px 20px',
+      }}
+    >
+      <div
+        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        style={{
+          border: '1px solid transparent',
+          background: [
+            `linear-gradient(${backgroundColor} 0 100%) padding-box`,
+            'linear-gradient(rgb(255 255 255 / 0%) 0% 100%) border-box',
+            ...borderBg,
+          ].join(', '),
+          opacity: borderOpacity,
+          maskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
+          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        }}
+      />
+      <div
+        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        style={{
+          border: '1px solid transparent',
+          background: fillBg.join(', '),
+          maskImage: [
+            'linear-gradient(to bottom, black, black)',
+            'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)',
+            'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)',
+            `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`,
+          ].join(', '),
+          WebkitMaskImage: [
+            'linear-gradient(to bottom, black, black)',
+            'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)',
+            'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)',
+            `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`,
+          ].join(', '),
+          maskComposite: 'subtract, add, add, add, add, add',
+          WebkitMaskComposite: 'source-out, source-over, source-over, source-over, source-over, source-over',
+          opacity: borderOpacity * fillOpacity,
+          mixBlendMode: 'soft-light',
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        } as React.CSSProperties}
+      />
+      <span
+        className="absolute pointer-events-none z-[1] rounded-[inherit]"
+        style={{
+          inset: `${-glowRadius}px`,
+          maskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
+          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
+          opacity: glowOpacity,
+          mixBlendMode: 'plus-lighter',
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        } as React.CSSProperties}
+      >
+        <span
+          className="absolute rounded-[inherit]"
+          style={{
+            inset: `${glowRadius}px`,
+            boxShadow: buildBoxShadow(glowColor, glowIntensity),
+          }}
+        />
+      </span>
+
+      <div className="flex flex-col relative h-full w-full z-[1]">
+        {children}
+      </div>
+    </div>
+  );
+};
+
+
+// ==========================================
+// TYPOGRAPHY & LAYOUT HELPERS
+// ==========================================
+
+const H1: React.FC<{ children: React.ReactNode }> = ({ children }) => <h1 className="text-3xl font-bold text-white mb-6 tracking-tight">{children}</h1>;
+const H2: React.FC<{ children: React.ReactNode, icon?: React.ElementType }> = ({ children, icon: Icon }) => (
+  <h2 className="text-lg font-bold text-white mt-12 mb-6 pb-3 border-b border-[#1A1A1A] flex items-center gap-2">
+    {Icon && <Icon className="w-5 h-5 text-zinc-500" />}
+    {children}
+  </h2>
+);
+const H3: React.FC<{ children: React.ReactNode }> = ({ children }) => <h3 className="text-sm font-bold text-zinc-100 mt-8 mb-4 tracking-wide">{children}</h3>;
+const P: React.FC<{ children: React.ReactNode }> = ({ children }) => <p className="text-sm text-zinc-400 leading-relaxed mb-4">{children}</p>;
+const InlineCode: React.FC<{ children: React.ReactNode }> = ({ children }) => <code className="bg-[#111111] border border-[#262626] px-1.5 py-0.5 rounded text-[13px] text-zinc-200 font-mono">{children}</code>;
+
+const CodeBlock: React.FC<{ children: React.ReactNode, title?: string }> = ({ children, title }) => (
+  <div className="bg-[#050505] border border-[#262626] rounded-lg my-4 overflow-hidden shadow-inner">
+    {title && <div className="px-4 py-2 border-b border-[#1A1A1A] bg-[#0A0A0A] text-[11px] font-bold text-zinc-500 uppercase tracking-widest">{title}</div>}
+    <div className="p-4 overflow-x-auto custom-scrollbar">
+      <pre className="text-[13px] font-mono text-zinc-300 leading-relaxed"><code>{children}</code></pre>
+    </div>
+  </div>
+);
+
+const MethodBadge: React.FC<{ method: string }> = ({ method }) => {
+  let style = "bg-zinc-800 text-white"; // default POST
+  if (method === 'GET') style = "bg-white text-black";
+  if (method === 'WS') style = "bg-zinc-900 text-zinc-300 border border-zinc-700";
+  if (method === 'DELETE' || method === 'PATCH') style = "bg-zinc-700 text-zinc-300";
+  
+  return <span className={`inline-block px-2 py-0.5 rounded text-[11px] font-bold mr-3 min-w-[50px] text-center ${style}`}>{method}</span>;
+};
+
+// ==========================================
+// MAIN APP COMPONENT
+// ==========================================
+
+const App = () => {
+  const [activeSection, setActiveSection] = useState('overview');
+
+  const navItems = [
+    { id: 'overview', label: 'Platform Overview', icon: Book },
+    { id: 'architecture', label: 'System Architecture', icon: LayoutGrid },
+    { id: 'api', label: 'API Reference', icon: Code },
+    { id: 'integrations', label: 'Integrations', icon: Layers },
+    { id: 'runbook', label: 'Operational Runbook', icon: TerminalSquare },
+    { id: 'ux', label: 'UX & UI Guidelines', icon: Box }
+  ];
+
+  return (
+    <div 
+      className="flex h-screen bg-[#000000] text-zinc-300 selection:bg-white selection:text-black overflow-hidden"
+      style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}
+    >
+      {/* Top Navigation Bar */}
+      <div className="fixed top-0 left-0 right-0 h-14 bg-[#050505]/90 backdrop-blur-md border-b border-[#1A1A1A] flex items-center justify-between px-6 z-50">
+        <div className="flex items-center gap-3">
+          <div className="w-7 h-7 rounded border border-[#333333] bg-[#0A0A0A] flex items-center justify-center">
+            <Book className="w-4 h-4 text-white" />
+          </div>
+          <span className="text-white font-bold tracking-wide text-sm">DEPL_AI <span className="text-zinc-600 font-normal mx-1">/</span> DOCS</span>
+        </div>
+        <button className="flex items-center gap-2 text-xs font-medium text-zinc-400 hover:text-white transition-colors">
+          <ArrowLeft className="w-4 h-4" /> Back to Dashboard
+        </button>
+      </div>
+
+      {/* Main Layout */}
+      <div className="flex w-full h-full pt-14">
+        
+        {/* Left Sidebar */}
+        <aside className="w-72 border-r border-[#1A1A1A] bg-[#050505] flex flex-col shrink-0 overflow-y-auto z-40">
+          <div className="p-6 pb-2">
+            <div className="relative">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
+              <input 
+                type="text" 
+                placeholder="Search documentation..." 
+                className="w-full pl-9 pr-4 py-2 bg-[#0A0A0A] border border-[#262626] rounded-md text-[13px] focus:outline-none focus:border-zinc-500 text-white placeholder:text-zinc-600"
+              />
+            </div>
+          </div>
+
+          <nav className="flex-1 px-4 py-6 space-y-1">
+            <div className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest mb-3 px-2">Table of Contents</div>
+            {navItems.map(item => {
+              const Icon = item.icon;
+              return (
+                <button 
+                  key={item.id}
+                  onClick={() => setActiveSection(item.id)}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-[13px] font-medium ${
+                    activeSection === item.id 
+                      ? 'bg-[#111111] text-white border border-[#262626]' 
+                      : 'hover:bg-[#0A0A0A] text-zinc-400 hover:text-zinc-200 border border-transparent'
+                  }`}
+                >
+                  <Icon className="w-4 h-4 shrink-0" />
+                  {item.label}
+                  {activeSection === item.id && <ChevronRight className="w-4 h-4 ml-auto text-zinc-600" />}
+                </button>
+              )
+            })}
+          </nav>
+        </aside>
+
+        {/* Right Content Area */}
+        <main className="flex-1 overflow-y-auto custom-scrollbar scroll-smooth bg-[#000000] relative z-0">
+          <div className="max-w-4xl mx-auto px-10 py-12 pb-32 animate-fade-in">
+            
+            {/* OVERVIEW SECTION */}
+            {activeSection === 'overview' && (
+              <div className="animate-fade-in">
+                <H1>Platform Overview</H1>
+                <P>
+                  DeplAI is an agentic DevSecOps platform that takes a GitHub repository or local upload, runs security analysis, drives a human-reviewed remediation loop, generates architecture and cost outputs, produces infrastructure artifacts, enforces delivery policy, and then deploys through either GitOps or direct runtime apply.
+                </P>
+
+                <H2 icon={Activity}>Executive Summary</H2>
+                <BorderGlow borderRadius={12} className="border border-[#1A1A1A] mb-8">
+                  <PixelCard colors="#27272a,#18181b,#3f3f46" gap={8} className="p-6 rounded-[inherit]">
+                    <ul className="space-y-4 text-sm text-zinc-300 list-none relative z-10">
+                      <li className="flex items-start gap-3"><div className="mt-1.5 w-1.5 h-1.5 rounded-sm bg-white shrink-0"></div><span className="leading-relaxed"><strong>Frontend and BFF:</strong> <InlineCode>Connector</InlineCode> using Next.js 16</span></li>
+                      <li className="flex items-start gap-3"><div className="mt-1.5 w-1.5 h-1.5 rounded-sm bg-white shrink-0"></div><span className="leading-relaxed"><strong>Backend orchestrator:</strong> <InlineCode>Agentic Layer</InlineCode> using FastAPI</span></li>
+                      <li className="flex items-start gap-3"><div className="mt-1.5 w-1.5 h-1.5 rounded-sm bg-white shrink-0"></div><span className="leading-relaxed"><strong>Stage 7 execution:</strong> <InlineCode>diagram_cost-estimation_agent</InlineCode> subprocess</span></li>
+                      <li className="flex items-start gap-3"><div className="mt-1.5 w-1.5 h-1.5 rounded-sm bg-white shrink-0"></div><span className="leading-relaxed"><strong>Remediation context:</strong> <InlineCode>KGagent</InlineCode> imported in-process by the backend</span></li>
+                      <li className="flex items-start gap-3"><div className="mt-1.5 w-1.5 h-1.5 rounded-sm bg-white shrink-0"></div><span className="leading-relaxed"><strong>Runtime deployment:</strong> AWS-focused, backed by <InlineCode>/api/terraform/apply</InlineCode></span></li>
+                    </ul>
+                  </PixelCard>
+                </BorderGlow>
+
+                <H2 icon={Users}>Users & Core Journeys</H2>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                  <div className="bg-[#050505] border border-[#1A1A1A] p-5 rounded-lg">
+                    <Code className="w-5 h-5 text-white mb-3"/>
+                    <h3 className="text-sm font-bold text-white mb-2">1. Developer</h3>
+                    <p className="text-xs text-zinc-500">Scans project, triggers remediation, reviews generated PRs.</p>
+                  </div>
+                  <div className="bg-[#050505] border border-[#1A1A1A] p-5 rounded-lg">
+                    <ShieldAlert className="w-5 h-5 text-white mb-3"/>
+                    <h3 className="text-sm font-bold text-white mb-2">2. Security Engineer</h3>
+                    <p className="text-xs text-zinc-500">Inspects finding severity, validates remediation decisions.</p>
+                  </div>
+                  <div className="bg-[#050505] border border-[#1A1A1A] p-5 rounded-lg">
+                    <Network className="w-5 h-5 text-white mb-3"/>
+                    <h3 className="text-sm font-bold text-white mb-2">3. Platform Engineer</h3>
+                    <p className="text-xs text-zinc-500">Approves architecture/cost and executes IaC + deploy.</p>
+                  </div>
+                </div>
+
+                <H3>End-to-End Journey</H3>
+                <div className="bg-[#050505] border border-[#1A1A1A] p-6 rounded-lg text-sm text-zinc-300">
+                  <ol className="list-decimal pl-5 space-y-2">
+                    <li>Select or upload project.</li>
+                    <li>Run scan validation and stream scan execution.</li>
+                    <li>Inspect findings.</li>
+                    <li>Start remediation and review generated change set.</li>
+                    <li>Open/merge PR gate.</li>
+                    <li>Provide deployment Q/A context.</li>
+                    <li>Generate architecture and cost.</li>
+                    <li>Approve Stage 7.5 payload.</li>
+                    <li>Generate IaC.</li>
+                    <li>Apply policy and budget checks.</li>
+                    <li>Deploy via GitOps or runtime apply.</li>
+                  </ol>
+                </div>
+              </div>
+            )}
+
+            {/* ARCHITECTURE SECTION */}
+            {activeSection === 'architecture' && (
+              <div className="animate-fade-in">
+                <H1>System Architecture</H1>
+                <P>
+                  This document describes the active runtime architecture. It is intentionally implementation-first, explaining the system that actually runs today.
+                </P>
+
+                <H2 icon={Network}>Runtime Topology</H2>
+                
+                <div className="bg-[#050505] border border-[#1A1A1A] rounded-xl p-8 mb-8 mt-6 flex flex-col md:flex-row items-center justify-center gap-6 overflow-x-auto">
+                   {/* User */}
+                   <div className="flex flex-col items-center gap-3 shrink-0">
+                     <div className="w-16 h-16 rounded-xl bg-[#111111] border border-[#262626] flex items-center justify-center"><Globe className="w-6 h-6 text-white"/></div>
+                     <span className="text-[11px] font-bold text-zinc-400 uppercase tracking-widest">User Browser</span>
+                   </div>
+                   
+                   <ArrowRight className="w-5 h-5 text-zinc-600 hidden md:block shrink-0" />
+                   
+                   {/* Connector */}
+                   <div className="flex flex-col items-center gap-3 shrink-0">
+                     <BorderGlow borderRadius={12} className="border border-white/20">
+                       <PixelCard colors="#ffffff,#a1a1aa,#000000" gap={6} speed={30} className="w-20 h-20 flex items-center justify-center rounded-[inherit]">
+                         <LayoutGrid className="w-8 h-8 text-white relative z-10"/>
+                       </PixelCard>
+                     </BorderGlow>
+                     <span className="text-[11px] font-bold text-white uppercase tracking-widest text-center">Connector<br/><span className="text-[9px] text-zinc-500">Next.js UI + BFF</span></span>
+                   </div>
+
+                   <ArrowRight className="w-5 h-5 text-zinc-600 hidden md:block shrink-0" />
+                   
+                   {/* Agentic Layer */}
+                   <div className="flex flex-col items-center gap-3 shrink-0">
+                     <BorderGlow borderRadius={12} className="border border-[#333333]">
+                       <PixelCard colors="#3f3f46,#18181b,#000000" gap={6} speed={30} className="w-20 h-20 flex items-center justify-center rounded-[inherit]">
+                         <TerminalSquare className="w-8 h-8 text-white relative z-10"/>
+                       </PixelCard>
+                     </BorderGlow>
+                     <span className="text-[11px] font-bold text-white uppercase tracking-widest text-center">Agentic Layer<br/><span className="text-[9px] text-zinc-500">FastAPI</span></span>
+                   </div>
+
+                   <ArrowRight className="w-5 h-5 text-zinc-600 hidden md:block shrink-0" />
+
+                   {/* Integrations */}
+                   <div className="grid grid-cols-2 gap-3 shrink-0">
+                     <div className="w-12 h-12 rounded-lg bg-[#0A0A0A] border border-[#262626] flex items-center justify-center" title="Docker Engine"><Server className="w-5 h-5 text-zinc-400"/></div>
+                     <div className="w-12 h-12 rounded-lg bg-[#0A0A0A] border border-[#262626] flex items-center justify-center" title="Neo4j KG"><Database className="w-5 h-5 text-zinc-400"/></div>
+                     <div className="w-12 h-12 rounded-lg bg-[#0A0A0A] border border-[#262626] flex items-center justify-center" title="Subprocesses"><Cpu className="w-5 h-5 text-zinc-400"/></div>
+                     <div className="w-12 h-12 rounded-lg bg-[#0A0A0A] border border-[#262626] flex items-center justify-center" title="MySQL"><Database className="w-5 h-5 text-zinc-400"/></div>
+                     <div className="col-span-2 text-center text-[10px] font-bold text-zinc-600 mt-1 uppercase tracking-widest">Dependencies</div>
+                   </div>
+                </div>
+
+                <H2 icon={Database}>Runtime Data / Infra Dependencies</H2>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+                  <div className="bg-[#050505] border border-[#1A1A1A] p-5 rounded-lg">
+                    <H3>Docker Engine & Volumes</H3>
+                    <ul className="text-sm text-zinc-400 font-mono list-disc pl-5 space-y-1">
+                      <li>codebase_deplai</li>
+                      <li>security_reports</li>
+                      <li>LLM_Output</li>
+                      <li>grype_db_cache</li>
+                    </ul>
+                  </div>
+                  <div className="bg-[#050505] border border-[#1A1A1A] p-5 rounded-lg">
+                    <H3>External APIs</H3>
+                    <ul className="text-sm text-zinc-400 list-disc pl-5 space-y-1">
+                      <li><strong>MySQL:</strong> App metadata in Connector.</li>
+                      <li><strong>GitHub:</strong> Repos, PRs, app installations.</li>
+                      <li><strong>Cloud:</strong> AWS pricing/runtime, Azure/GCP estimations.</li>
+                    </ul>
+                  </div>
+                </div>
+
+                <H2 icon={Layers}>Stage Model</H2>
+                <P>The active stage order surfaced in the UI is defined in <InlineCode>Connector/src/features/pipeline/data.ts</InlineCode>.</P>
+                <div className="flex flex-wrap gap-2 mt-4">
+                  {[
+                    "0: Preflight", "1: Scan", "2: KG Analysis", "3: Remediation", 
+                    "4: PR", "4.5: Merge Gate", "4.6: Post-Merge", "6: QA Context", 
+                    "7: Arch + Cost", "7.5: Approval", "8: IaC Gen", "9: Policy Gate", "10: Deploy"
+                  ].map(s => (
+                    <span key={s} className="px-3 py-1.5 bg-[#111111] border border-[#262626] rounded text-xs text-zinc-300 font-medium">
+                      {s}
+                    </span>
+                  ))}
+                </div>
+                <div className="mt-4 p-4 bg-[#050505] border border-[#1A1A1A] rounded-lg">
+                  <h4 className="text-xs font-bold text-white mb-2">Operational Constraints</h4>
+                  <ul className="text-sm text-zinc-400 list-disc pl-5 space-y-1">
+                    <li>Remediation cycles are capped at <InlineCode>2</InlineCode> in backend.</li>
+                    <li>Runtime apply currently supports AWS only.</li>
+                    <li>Deploy can be blocked when <InlineCode>estimated_monthly_usd &gt; budget_limit_usd</InlineCode>.</li>
+                  </ul>
+                </div>
+              </div>
+            )}
+
+            {/* API SECTION */}
+            {activeSection === 'api' && (
+              <div className="animate-fade-in">
+                <H1>API & Integrations</H1>
+                <P>
+                  Authentication model summary:<br/>
+                  1. User session required for Connector BFF routes.<br/>
+                  2. Connector calls Agentic Layer with X-API-Key (<InlineCode>DEPLAI_SERVICE_KEY</InlineCode>).<br/>
+                  3. WebSocket channels use short-lived HMAC token (<InlineCode>WS_TOKEN_SECRET</InlineCode>), project-scoped.
+                </P>
+
+                <H2 icon={Globe}>High-Priority UI Endpoints (Connector BFF)</H2>
+                <div className="bg-[#050505] border border-[#1A1A1A] rounded-lg overflow-hidden mt-6 mb-8">
+                  <table className="w-full text-left border-collapse text-sm">
+                    <thead>
+                      <tr className="bg-[#0A0A0A] border-b border-[#1A1A1A]">
+                        <th className="px-4 py-3 text-[10px] font-bold text-zinc-500 uppercase tracking-wider w-[100px]">Method</th>
+                        <th className="px-4 py-3 text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Endpoint</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#1A1A1A]">
+                      {[
+                        { m: 'POST', e: '/api/scan/validate' },
+                        { m: 'GET', e: '/api/scan/status' },
+                        { m: 'GET', e: '/api/scan/ws-token' },
+                        { m: 'POST', e: '/api/remediate/start' },
+                        { m: 'POST', e: '/api/architecture' },
+                        { m: 'POST', e: '/api/cost' },
+                        { m: 'POST', e: '/api/pipeline/stage7' },
+                        { m: 'GET', e: '/api/pipeline/health' },
+                        { m: 'POST', e: '/api/pipeline/iac' },
+                        { m: 'POST', e: '/api/pipeline/deploy' },
+                        { m: 'POST', e: '/api/pipeline/runtime-details' }
+                      ].map((route, i) => (
+                        <tr key={i} className="hover:bg-[#111111] transition-colors">
+                          <td className="px-4 py-3"><MethodBadge method={route.m} /></td>
+                          <td className="px-4 py-3 font-mono text-[13px] text-zinc-300">{route.e}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <H2 icon={FileJson}>Key Request Contracts</H2>
+                
+                <H3>POST /api/scan/validate</H3>
+                <CodeBlock>
+{`{
+  "project_id": "string",
+  "project_name": "string",
+  "project_type": "local|github",
+  "scan_type": "all|sast|sca",
+  "owner": "optional",
+  "repo": "optional"
+}`}
+                </CodeBlock>
+
+                <H3>POST /api/remediate/start</H3>
+                <CodeBlock>
+{`{
+  "project_id": "string",
+  "cortex_context": "optional string",
+  "github_token": "optional",
+  "llm_provider": "optional",
+  "llm_api_key": "optional",
+  "llm_model": "optional",
+  "remediation_scope": "all|major"
+}`}
+                </CodeBlock>
+
+                <H3>POST /api/architecture</H3>
+                <CodeBlock>
+{`{
+  "prompt": "string",
+  "provider": "aws|azure|gcp",
+  "project_name": "optional",
+  "qa_summary": "optional",
+  "deployment_region": "optional",
+  "llm_provider": "optional",
+  "llm_api_key": "optional",
+  "llm_model": "optional"
+}`}
+                </CodeBlock>
+
+                <H3>POST /api/pipeline/deploy</H3>
+                <CodeBlock>
+{`{
+  "project_id": "string",
+  "provider": "aws|azure|gcp",
+  "runtime_apply": true,
+  "files": [
+    { "path": "terraform/main.tf", "content": "...", "encoding": "utf-8" }
+  ],
+  "run_id": "optional",
+  "workspace": "optional",
+  "aws_access_key_id": "optional",
+  "aws_secret_access_key": "optional",
+  "aws_region": "optional",
+  "estimated_monthly_usd": 12.34,
+  "budget_limit_usd": 20,
+  "budget_override": false
+}`}
+                </CodeBlock>
+              </div>
+            )}
+
+            {/* INTEGRATIONS SECTION */}
+            {activeSection === 'integrations' && (
+              <div className="animate-fade-in">
+                <H1>Integrations</H1>
+                <P>External systems and operational boundaries for DeplAI.</P>
+
+                <div className="space-y-6 mt-8">
+                  <div className="p-6 bg-[#050505] border border-[#1A1A1A] rounded-lg">
+                    <H3>1. GitHub</H3>
+                    <ul className="text-sm text-zinc-400 list-disc pl-5 space-y-2">
+                      <li>Integration modes: GitHub App installation token flow, or Optional PAT flow for GitOps.</li>
+                      <li>UI Implications: Show installation suspended state clearly. Surface PR URL and branch metadata when remediation succeeds.</li>
+                    </ul>
+                  </div>
+
+                  <div className="p-6 bg-[#050505] border border-[#1A1A1A] rounded-lg">
+                    <H3>2. Docker and Scanners</H3>
+                    <ul className="text-sm text-zinc-400 list-disc pl-5 space-y-2">
+                      <li>Scan/remediation rely on Docker availability.</li>
+                      <li>Scanner artifacts persist in Docker volumes.</li>
+                      <li>Health checks should explicitly display <InlineCode>docker_engine</InlineCode> status.</li>
+                    </ul>
+                  </div>
+
+                  <div className="p-6 bg-[#050505] border border-[#1A1A1A] rounded-lg">
+                    <H3>3. KG Dependencies</H3>
+                    <ul className="text-sm text-zinc-400 list-disc pl-5 space-y-2">
+                      <li>Neo4j outage should degrade KG enrichment only, not block core remediation pipeline.</li>
+                      <li>UI should present degraded state copy, not hard-fail entire workflow.</li>
+                    </ul>
+                  </div>
+
+                  <div className="p-6 bg-[#050505] border border-[#1A1A1A] rounded-lg">
+                    <H3>4. Cloud and Pricing</H3>
+                    <ul className="text-sm text-zinc-400 list-disc pl-5 space-y-2">
+                      <li>AWS cost may use live credentials.</li>
+                      <li>Azure and GCP cost paths can run without cloud credentials.</li>
+                      <li>Runtime deploy currently enforces AWS path.</li>
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* RUNBOOK SECTION */}
+            {activeSection === 'runbook' && (
+              <div className="animate-fade-in">
+                <H1>Operational Runbook</H1>
+                <P>
+                  Guide for startup, configuration, pipeline execution, and troubleshooting.
+                </P>
+
+                <H2 icon={Play}>Local Startup Sequence</H2>
+                <ol className="list-decimal pl-5 space-y-3 text-sm text-zinc-300 mb-8">
+                  <li>Start database (MySQL).</li>
+                  <li>Start Docker Desktop.</li>
+                  <li>Start backend:
+                    <CodeBlock>docker compose up -d --build agentic-layer</CodeBlock>
+                  </li>
+                  <li>Start Connector:
+                    <CodeBlock>cd Connector{'\n'}npm install{'\n'}npm run dev</CodeBlock>
+                  </li>
+                  <li>Open <InlineCode>http://localhost:3000</InlineCode>.</li>
+                </ol>
+
+                <H2 icon={Activity}>Health Checks</H2>
+                <div className="space-y-4 mb-8">
+                  <div className="bg-[#050505] border border-[#1A1A1A] p-4 rounded-lg">
+                    <p className="text-sm text-zinc-300 mb-2">1. Backend Health:</p>
+                    <CodeBlock>curl http://localhost:8000/health</CodeBlock>
+                  </div>
+                  <div className="bg-[#050505] border border-[#1A1A1A] p-4 rounded-lg">
+                    <p className="text-sm text-zinc-300 mb-2">2. Connector pipeline health (authenticated):</p>
+                    <CodeBlock>curl http://localhost:3000/api/pipeline/health</CodeBlock>
+                    <p className="text-xs text-zinc-500 mt-2">UI requirement: Render both overall and per-check status (healthy/degraded/down).</p>
+                  </div>
+                </div>
+
+                <H2 icon={ShieldAlert}>Troubleshooting & Failure Modes</H2>
+                <div className="space-y-4">
+                  <div className="p-5 bg-[#050505] border border-[#1A1A1A] rounded-lg">
+                    <h4 className="text-sm font-bold text-white mb-2 flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4 text-zinc-400"/> Scan Issues
+                    </h4>
+                    <ul className="text-sm text-zinc-400 list-disc pl-5 space-y-1">
+                      <li><strong>Scan never leaves not_initiated:</strong> Verify Docker info, check backend health, verify <InlineCode>DEPLAI_SERVICE_KEY</InlineCode>.</li>
+                      <li><strong>Scan still running:</strong> Block IaC with actionable warning.</li>
+                    </ul>
+                  </div>
+
+                  <div className="p-5 bg-[#050505] border border-[#1A1A1A] rounded-lg">
+                    <h4 className="text-sm font-bold text-white mb-2 flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4 text-zinc-400"/> WebSockets & Deployment
+                    </h4>
+                    <ul className="text-sm text-zinc-400 list-disc pl-5 space-y-1">
+                      <li><strong>WS close code 1008:</strong> Token issue (expired, invalid signature, project mismatch).</li>
+                      <li><strong>Budget guardrail block:</strong> deploy returns 422 with <InlineCode>blocked=true</InlineCode>.</li>
+                      <li><strong>Runtime apply stale bundle:</strong> deploy returns 409 requiring Stage 8 regenerate.</li>
+                    </ul>
+                  </div>
+                </div>
+
+                <H2 icon={AlertCircle}>Dangerous Operations</H2>
+                <div className="p-5 bg-rose-500/10 border border-rose-500/20 rounded-lg">
+                  <h4 className="text-sm font-bold text-rose-500 mb-2">Global Backend Cleanup</h4>
+                  <P>Endpoint: <InlineCode>POST /api/cleanup</InlineCode></P>
+                  <P>Only works when backend env has <InlineCode>ALLOW_GLOBAL_CLEANUP=true</InlineCode>. This is destructive for all projects.</P>
+                </div>
+              </div>
+            )}
+
+            {/* UX GUIDELINES SECTION */}
+            {activeSection === 'ux' && (
+              <div className="animate-fade-in">
+                <H1>UX & UI Guidelines</H1>
+                <P>Implementation rules and UI information architecture for generating DeplAI screens.</P>
+
+                <H2 icon={LayoutGrid}>Required Screens</H2>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+                  {[
+                    { t: "1. Project Intake", d: "Repository selection/upload, ownership diagnostics." },
+                    { t: "2. Pipeline Board", d: "Stage timeline, websocket event stream panel." },
+                    { t: "3. Scan Results", d: "SAST/SCA tabs, severity filtering." },
+                    { t: "4. Remediation Workspace", d: "Generated changes summary, approve re-scan, PR status." },
+                    { t: "5. Architecture & Cost", d: "Graph preview, cost breakdown, budget indicator." },
+                    { t: "6. IaC Review", d: "Generated file explorer, diff view, warnings." },
+                    { t: "7. Deploy Console", d: "Apply vs GitOps selector, logs, stop/destroy controls." },
+                    { t: "8. Ops/Health Panel", d: "Service checks and dependency status." }
+                  ].map((s, i) => (
+                    <div key={i} className="p-4 bg-[#050505] border border-[#1A1A1A] rounded-lg">
+                      <h4 className="text-sm font-bold text-white mb-1">{s.t}</h4>
+                      <p className="text-xs text-zinc-500">{s.d}</p>
+                    </div>
+                  ))}
+                </div>
+
+                <H2 icon={Activity}>Pipeline State Model</H2>
+                <P>Each stage should support the following states:</P>
+                <div className="flex flex-wrap gap-2 mb-6">
+                  {['pending', 'active', 'running', 'success', 'error', 'blocked', 'degraded'].map(s => (
+                    <span key={s} className="px-3 py-1 bg-[#111111] border border-[#262626] rounded text-[11px] font-mono text-zinc-300 uppercase tracking-wider">{s}</span>
+                  ))}
+                </div>
+                <P>Gate stages (4.5, 6, 7.5, 9, 10) must enforce explicit user action before advancing.</P>
+
+                <H2 icon={CheckCircle2}>UX Rules for Agent Implementation</H2>
+                <div className="bg-[#050505] border border-[#1A1A1A] p-6 rounded-lg text-sm text-zinc-300">
+                  <ol className="list-decimal pl-5 space-y-3">
+                    <li>Do not hide backend error payloads; map them to user-safe copy plus technical detail drawer.</li>
+                    <li>Preserve idempotency guards for repeated clicks on long-running operations.</li>
+                    <li>Always display source-of-truth stage IDs and last updated timestamp.</li>
+                    <li>Distinguish validation errors (400/422) from runtime failures (500/502/504).</li>
+                    <li>For websocket-driven stages, reconnect with token refresh and exponential backoff.</li>
+                  </ol>
+                </div>
+              </div>
+            )}
+
+          </div>
+        </main>
+      </div>
+
+      <style dangerouslySetInnerHTML={{__html: `
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: transparent;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background-color: #262626;
+          border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background-color: #3f3f46;
+        }
+        @keyframes fadeIn {
+          from { opacity: 0; transform: translateY(10px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in {
+          animation: fadeIn 0.4s ease-out forwards;
+        }
+      `}} />
+    </div>
+  );
+};
+
+export default App;

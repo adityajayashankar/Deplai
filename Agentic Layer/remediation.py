@@ -6,7 +6,6 @@ import json
 import os
 import shlex
 import time
-from collections import deque
 from urllib import error as urlerror
 from urllib import request as urlrequest
 from functools import partial
@@ -16,7 +15,7 @@ from fastapi import WebSocket
 from agent import run_analysis_agent, run_remediation_supervisor
 from Analysis.dataingestor import get_scan_results
 from bearer import run_bearer_scan
-from claude_remediator import run_claude_remediation  # kept as fallback
+from claude_remediator import ClaudeBudgetTracker, run_claude_remediation  # kept as fallback
 from models import RemediationRequest, StreamStatus, WebSocketCommand
 from result_parser import invalidate_cache
 from runner_base import RunnerBase
@@ -25,13 +24,12 @@ from utils import CODEBASE_VOLUME, LLM_OUTPUT_VOLUME, decode_output, get_docker_
 
 TOTAL_STEPS = 15
 MAX_REMEDIATION_CYCLES = 2
-REMEDIATION_BATCH_ENABLED = os.getenv("REMEDIATION_BATCH_ENABLED", "true").strip().lower() == "true"
-REMEDIATION_BATCH_CODE_FINDINGS = int(os.getenv("REMEDIATION_BATCH_CODE_FINDINGS", "8"))
-REMEDIATION_BATCH_SUPPLY_FINDINGS = int(os.getenv("REMEDIATION_BATCH_SUPPLY_FINDINGS", "16"))
-REMEDIATION_MAX_BATCHES_PER_CYCLE = int(os.getenv("REMEDIATION_MAX_BATCHES_PER_CYCLE", "20"))
 REMEDIATION_NO_PROGRESS_LIMIT = int(os.getenv("REMEDIATION_NO_PROGRESS_LIMIT", "2"))
-REMEDIATION_MAX_FAILED_BATCHES = int(os.getenv("REMEDIATION_MAX_FAILED_BATCHES", "4"))
-REMEDIATION_MAX_STALLED_BATCHES = int(os.getenv("REMEDIATION_MAX_STALLED_BATCHES", "8"))
+REMEDIATION_MAX_CODE_ROOT_CAUSES = int(os.getenv("REMEDIATION_MAX_CODE_ROOT_CAUSES", "10"))
+REMEDIATION_MAX_SUPPLY_ROOT_CAUSES = int(os.getenv("REMEDIATION_MAX_SUPPLY_ROOT_CAUSES", "8"))
+REMEDIATION_MAX_CODE_OCCURRENCES_PER_ROOT_CAUSE = int(
+    os.getenv("REMEDIATION_MAX_CODE_OCCURRENCES_PER_ROOT_CAUSE", "3")
+)
 
 SEVERITY_ORDER = ("critical", "high", "medium", "low")
 MAJOR_SEVERITIES = {"critical", "high"}
@@ -77,64 +75,204 @@ def _iter_by_severity(findings: list[dict], allowed_severity: set[str]) -> list[
     return out
 
 
-def _chunk_findings(findings: list[dict], chunk_size: int) -> list[list[dict]]:
-    if not findings:
-        return []
-    size = max(1, int(chunk_size or 1))
-    return [findings[i:i + size] for i in range(0, len(findings), size)]
+def _normalize_rel_path(path: str) -> str:
+    value = str(path or "").strip().replace("\\", "/")
+    while value.startswith("./"):
+        value = value[2:]
+    return "/".join(part for part in value.split("/") if part not in ("", "."))
 
 
-def _build_remediation_queue(scan_data: dict, scope: str) -> tuple[list[dict], dict]:
-    """Build micro-batches that can cover large finding sets safely.
+def _representative_occurrence(occurrences: list[dict]) -> str:
+    for occ in occurrences:
+        path = _normalize_rel_path((occ or {}).get("filename", ""))
+        if path:
+            return path
+    return ""
 
-    Each batch carries a bounded subset of code and supply findings, ordered by
-    severity, so prompt size stays tractable while allowing multi-batch progress.
-    """
+
+def _build_code_root_causes(findings: list[dict], allowed_severity: set[str]) -> tuple[list[dict], dict]:
+    grouped: dict[tuple[str, str, str], dict] = {}
+    raw_occurrence_total = 0
+
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        severity = str(finding.get("severity", "")).strip().lower()
+        if severity not in allowed_severity:
+            continue
+
+        occurrences = [occ for occ in (finding.get("occurrences", []) or []) if isinstance(occ, dict)]
+        raw_occurrence_total += max(int(finding.get("count", len(occurrences) or 1) or 1), len(occurrences) or 1)
+
+        occurrences_by_path: dict[str, list[dict]] = {}
+        for occ in occurrences:
+            path = _normalize_rel_path(occ.get("filename", ""))
+            if not path:
+                path = "__repo__"
+            occurrences_by_path.setdefault(path, []).append(occ)
+
+        if not occurrences_by_path:
+            fallback_path = _normalize_rel_path(finding.get("filename", "")) or "__repo__"
+            occurrences_by_path[fallback_path] = []
+
+        for path, path_occurrences in occurrences_by_path.items():
+            key = (
+                str(finding.get("cwe_id") or "unknown"),
+                severity,
+                path,
+            )
+            existing = grouped.get(key)
+            if existing is None:
+                grouped[key] = {
+                    "cwe_id": finding.get("cwe_id"),
+                    "severity": severity,
+                    "title": finding.get("title") or finding.get("name") or "",
+                    "description": finding.get("description") or "",
+                    "count": len(path_occurrences) or 1,
+                    "occurrences": path_occurrences[:REMEDIATION_MAX_CODE_OCCURRENCES_PER_ROOT_CAUSE],
+                    "primary_path": "" if path == "__repo__" else path,
+                    "root_cause_key": f"code:{finding.get('cwe_id') or 'unknown'}:{path}",
+                    "root_cause_kind": "code_file_cwe",
+                }
+                continue
+
+            existing["count"] = int(existing.get("count", 0) or 0) + (len(path_occurrences) or 1)
+            if not existing.get("description") and finding.get("description"):
+                existing["description"] = finding.get("description")
+            merged_occurrences = list(existing.get("occurrences", []))
+            for occ in path_occurrences:
+                if len(merged_occurrences) >= REMEDIATION_MAX_CODE_OCCURRENCES_PER_ROOT_CAUSE:
+                    break
+                merged_occurrences.append(occ)
+            existing["occurrences"] = merged_occurrences
+
+    deduped = sorted(
+        grouped.values(),
+        key=lambda item: (
+            -_severity_rank(item.get("severity", "")),
+            -int(item.get("count", 1) or 1),
+            str(item.get("cwe_id") or ""),
+            str(item.get("primary_path") or ""),
+        ),
+    )
+    selected = deduped[:REMEDIATION_MAX_CODE_ROOT_CAUSES]
+    return selected, {
+        "raw_total": raw_occurrence_total,
+        "root_causes": len(selected),
+        "root_causes_available": len(deduped),
+    }
+
+
+def _build_supply_root_causes(findings: list[dict], allowed_severity: set[str]) -> tuple[list[dict], dict]:
+    grouped: dict[tuple[str, str, str, str], dict] = {}
+    raw_total = 0
+
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        severity = str(finding.get("severity", "")).strip()
+        severity_lower = severity.lower()
+        if severity_lower not in allowed_severity:
+            continue
+
+        raw_total += 1
+        package = str(finding.get("package") or finding.get("name") or "").strip() or "unknown-package"
+        version = str(
+            finding.get("installed_version")
+            or finding.get("version")
+            or ""
+        ).strip()
+        fix_version = str(finding.get("fix_version") or "").strip()
+        purl = str(finding.get("purl") or "").strip()
+        key = (package.lower(), version, fix_version, purl)
+
+        existing = grouped.get(key)
+        if existing is None:
+            cve_id = str(finding.get("cve_id") or "").strip()
+            related_cves = [cve_id] if cve_id else []
+            grouped[key] = {
+                "cve_id": cve_id,
+                "related_cve_ids": related_cves,
+                "severity": severity or severity_lower,
+                "package": package,
+                "name": package,
+                "version": version,
+                "installed_version": version,
+                "fix_version": fix_version or None,
+                "purl": purl or None,
+                "count": 1,
+                "root_cause_key": f"supply:{package.lower()}:{version}:{fix_version or 'no-fix'}",
+                "root_cause_kind": "package_upgrade",
+            }
+            continue
+
+        existing["count"] = int(existing.get("count", 1) or 1) + 1
+        if _severity_rank(severity) > _severity_rank(str(existing.get("severity", ""))):
+            existing["severity"] = severity
+        cve_id = str(finding.get("cve_id") or "").strip()
+        if cve_id and cve_id not in existing["related_cve_ids"]:
+            existing["related_cve_ids"].append(cve_id)
+        if not existing.get("cve_id") and cve_id:
+            existing["cve_id"] = cve_id
+
+    deduped = sorted(
+        grouped.values(),
+        key=lambda item: (
+            -_severity_rank(item.get("severity", "")),
+            -int(item.get("count", 1) or 1),
+            str(item.get("package") or ""),
+            str(item.get("fix_version") or ""),
+        ),
+    )
+    selected = deduped[:REMEDIATION_MAX_SUPPLY_ROOT_CAUSES]
+    return selected, {
+        "raw_total": raw_total,
+        "root_causes": len(selected),
+        "root_causes_available": len(deduped),
+    }
+
+
+def _build_remediation_batch(scan_data: dict, scope: str) -> tuple[dict, dict]:
+    """Build one full filtered remediation batch for the entire repo."""
     code_all = list(scan_data.get("code_security", []) or [])
     supply_all = list(scan_data.get("supply_chain", []) or [])
     allowed_severity = _severity_for_scope(scope)
 
-    code_filtered = _iter_by_severity(code_all, allowed_severity)
-    supply_filtered = _iter_by_severity(supply_all, allowed_severity)
+    code_filtered, code_stats = _build_code_root_causes(code_all, allowed_severity)
+    supply_filtered, supply_stats = _build_supply_root_causes(supply_all, allowed_severity)
 
     # Fallback for malformed/no-severity findings in all-scope runs.
     if scope == "all":
         if not code_filtered and code_all:
-            code_filtered = code_all
+            code_filtered = code_all[:REMEDIATION_MAX_CODE_ROOT_CAUSES]
+            code_stats = {
+                "raw_total": sum(int((item or {}).get("count", 1) or 1) for item in code_all),
+                "root_causes": len(code_filtered),
+                "root_causes_available": len(code_all),
+            }
         if not supply_filtered and supply_all:
-            supply_filtered = supply_all
+            supply_filtered = supply_all[:REMEDIATION_MAX_SUPPLY_ROOT_CAUSES]
+            supply_stats = {
+                "raw_total": len(supply_all),
+                "root_causes": len(supply_filtered),
+                "root_causes_available": len(supply_all),
+            }
 
-    if not REMEDIATION_BATCH_ENABLED:
-        batch = dict(scan_data)
-        batch["code_security"] = code_filtered
-        batch["supply_chain"] = supply_filtered
-        return [batch], {
-            "scope": scope,
-            "enabled": False,
-            "code_total": len(code_filtered),
-            "supply_total": len(supply_filtered),
-            "queue_size": 1,
-        }
-
-    code_chunks = _chunk_findings(code_filtered, REMEDIATION_BATCH_CODE_FINDINGS)
-    supply_chunks = _chunk_findings(supply_filtered, REMEDIATION_BATCH_SUPPLY_FINDINGS)
-    queue_size = max(len(code_chunks), len(supply_chunks), 1)
-
-    queue: list[dict] = []
-    for idx in range(queue_size):
-        batch = dict(scan_data)
-        batch["code_security"] = code_chunks[idx] if idx < len(code_chunks) else []
-        batch["supply_chain"] = supply_chunks[idx] if idx < len(supply_chunks) else []
-        queue.append(batch)
-
-    return queue, {
+    batch = dict(scan_data)
+    batch["code_security"] = code_filtered
+    batch["supply_chain"] = supply_filtered
+    return batch, {
         "scope": scope,
-        "enabled": True,
         "code_total": len(code_filtered),
         "supply_total": len(supply_filtered),
-        "queue_size": len(queue),
-        "code_chunk_size": max(1, REMEDIATION_BATCH_CODE_FINDINGS),
-        "supply_chunk_size": max(1, REMEDIATION_BATCH_SUPPLY_FINDINGS),
+        "code_raw_total": code_stats.get("raw_total", 0),
+        "supply_raw_total": supply_stats.get("raw_total", 0),
+        "code_root_causes": code_stats.get("root_causes", len(code_filtered)),
+        "supply_root_causes": supply_stats.get("root_causes", len(supply_filtered)),
+        "code_root_causes_available": code_stats.get("root_causes_available", len(code_filtered)),
+        "supply_root_causes_available": supply_stats.get("root_causes_available", len(supply_filtered)),
+        "repo_wide": True,
+        "selection_mode": "root_cause_deduped",
     }
 
 
@@ -520,6 +658,12 @@ echo "PUSHED"
         if remediation_scope not in ("major", "all"):
             remediation_scope = "all"
         await self._send_message("info", f"Remediation scope selected: {remediation_scope}")
+        budget_tracker = ClaudeBudgetTracker()
+        await self._send_message(
+            "info",
+            f"Claude remediation budget cap: ${budget_tracker.budget_cap_usd:.2f} per run.",
+        )
+        budget_exhausted = False
 
         no_progress_cycles = 0
         last_remaining = self._count_findings_for_scope(scan_data, remediation_scope)
@@ -530,99 +674,84 @@ echo "PUSHED"
             if cycle > 0:
                 await self._send_message("phase", f"{cycle_label} Starting remediation cycle")
 
-            queue, queue_stats = _build_remediation_queue(scan_data, remediation_scope)
-            queue_total = len(queue)
+            batch_scan_data, queue_stats = _build_remediation_batch(scan_data, remediation_scope)
+            code_count = len(batch_scan_data.get("code_security", []) or [])
+            supply_count = len(batch_scan_data.get("supply_chain", []) or [])
             await self._send_message(
                 "info",
                 (
-                    f"{cycle_label} Queue prepared: {queue_total} micro-batch(es) "
-                    f"(code findings: {queue_stats.get('code_total', 0)}, "
-                    f"supply findings: {queue_stats.get('supply_total', 0)}, "
+                    f"{cycle_label} Repo-wide remediation pass prepared "
+                    f"(code root causes: {queue_stats.get('code_root_causes', 0)}/"
+                    f"{queue_stats.get('code_root_causes_available', 0)} from "
+                    f"{queue_stats.get('code_raw_total', 0)} raw occurrences, "
+                    f"supply root causes: {queue_stats.get('supply_root_causes', 0)}/"
+                    f"{queue_stats.get('supply_root_causes_available', 0)} from "
+                    f"{queue_stats.get('supply_raw_total', 0)} raw findings, "
                     f"scope={queue_stats.get('scope', remediation_scope)})"
-                    + (" [batched]" if queue_stats.get("enabled") else " [single-pass]")
                 ),
             )
-
-            batch_queue: deque[dict] = deque(queue)
-            batches_to_run = min(queue_total, max(1, REMEDIATION_MAX_BATCHES_PER_CYCLE))
-            if queue_total > batches_to_run:
-                await self._send_message(
-                    "warning",
-                    f"{cycle_label} Queue truncated to {batches_to_run} batch(es) for this cycle; remaining batches will continue in the next cycle.",
-                )
 
             cycle_summary_parts: list[str] = []
             cycle_changed_files: list[dict] = []
             cycle_rejected_changes: list[dict] = []
             cycle_applied_changes = 0
             cycle_proposed_changes = 0
-            failed_batches = 0
+            self._check_cancelled()
+            await self._send_message(
+                "phase",
+                f"{cycle_label} Processing repo-wide remediation pass (code root causes={code_count}, supply root causes={supply_count})",
+            )
 
-            for batch_index in range(batches_to_run):
-                self._check_cancelled()
-                batch_scan_data = batch_queue.popleft()
+            # Step 2.5: Knowledge Graph Analysis for the repo-wide pass
+            await self._send_message("phase", f"{cycle_label} Knowledge Graph Analysis")
+            agent_analysis: dict = {}
+            try:
+                async def _on_kg_message(msg_type: str, content: str):
+                    await self._send_message(msg_type, content)
 
-                code_count = len(batch_scan_data.get("code_security", []) or [])
-                supply_count = len(batch_scan_data.get("supply_chain", []) or [])
-                await self._send_message(
-                    "phase",
-                    (
-                        f"{cycle_label} Processing micro-batch {batch_index + 1}/{batches_to_run} "
-                        f"(code={code_count}, supply={supply_count})"
-                    ),
+                agent_analysis = await run_analysis_agent(
+                    project_id=self.project_id,
+                    scan_data=batch_scan_data,
+                    on_message=_on_kg_message,
                 )
+                await self._send_message("kg_result", json.dumps({
+                    "business_logic_summary": agent_analysis.get("business_logic_summary", ""),
+                    "vulnerability_summary":  agent_analysis.get("vulnerability_summary", ""),
+                    "context":               agent_analysis.get("context"),
+                }))
+            except Exception as _kg_exc:
+                await self._send_message("warning", f"Knowledge graph analysis skipped: {_kg_exc}")
 
-                # Step 2.5: Knowledge Graph Analysis for this batch
-                await self._send_message("phase", f"{cycle_label} Knowledge Graph Analysis (batch {batch_index + 1})")
-                agent_analysis: dict = {}
-                try:
-                    async def _on_kg_message(msg_type: str, content: str):
-                        await self._send_message(msg_type, content)
+            self._check_cancelled()
 
-                    agent_analysis = await run_analysis_agent(
-                        project_id=self.project_id,
-                        scan_data=batch_scan_data,
-                        on_message=_on_kg_message,
-                    )
-                    await self._send_message("kg_result", json.dumps({
-                        "business_logic_summary": agent_analysis.get("business_logic_summary", ""),
-                        "vulnerability_summary":  agent_analysis.get("vulnerability_summary", ""),
-                        "context":               agent_analysis.get("context"),
-                    }))
-                except Exception as _kg_exc:
-                    await self._send_message("warning", f"Knowledge graph analysis skipped: {_kg_exc}")
+            # Step 3: Run remediation for the full repo pass
+            await self._send_message("phase", f"{cycle_label} Running Remediation Supervisor")
+            try:
+                async def _on_supervisor_message(msg_type: str, content: str):
+                    await self._send_message(msg_type, content)
 
-                self._check_cancelled()
-
-                # Step 3: Run remediation for this batch
-                await self._send_message(
-                    "phase",
-                    f"{cycle_label} Running Remediation Supervisor (batch {batch_index + 1})",
+                success, remediation_result = await run_remediation_supervisor(
+                    scan_data=batch_scan_data,
+                    cortex_context=self.context.cortex_context,
+                    llm_provider=self.context.llm_provider,
+                    llm_api_key=self.context.llm_api_key,
+                    llm_model=self.context.llm_model,
+                    agent_analysis=agent_analysis,
+                    budget_tracker=budget_tracker,
+                    on_message=_on_supervisor_message,
                 )
-                try:
-                    async def _on_supervisor_message(msg_type: str, content: str):
-                        await self._send_message(msg_type, content)
+            except Exception as _sup_exc:
+                success = False
+                remediation_result = str(_sup_exc)
 
-                    success, remediation_result = await run_remediation_supervisor(
-                        scan_data=batch_scan_data,
-                        cortex_context=self.context.cortex_context,
-                        llm_provider=self.context.llm_provider,
-                        llm_api_key=self.context.llm_api_key,
-                        llm_model=self.context.llm_model,
-                        agent_analysis=agent_analysis,
-                        on_message=_on_supervisor_message,
-                    )
-                except Exception as _sup_exc:
-                    success = False
-                    remediation_result = str(_sup_exc)
-
-                if not success:
+            if not success:
+                if "budget exceeded" in str(remediation_result).lower():
+                    budget_exhausted = True
+                    await self._send_message("warning", f"Stopping remediation early: {remediation_result}")
+                else:
                     await self._send_message(
                         "warning",
-                        (
-                            f"Supervisor failed on batch {batch_index + 1} ({remediation_result}), "
-                            "falling back to single-pass remediation."
-                        ),
+                        f"Supervisor failed for repo-wide remediation ({remediation_result}), falling back to single-pass remediation.",
                     )
                     try:
                         fb_ok, fb_result = await self._run_step(
@@ -634,43 +763,21 @@ echo "PUSHED"
                                 llm_api_key=self.context.llm_api_key,
                                 llm_model=self.context.llm_model,
                                 agent_analysis=agent_analysis,
+                                budget_tracker=budget_tracker,
                             )
                         )
                         if fb_ok:
                             success, remediation_result = True, fb_result
                         else:
-                            failed_batches += 1
-                            await self._send_message(
-                                "warning",
-                                f"Fallback remediation failed on batch {batch_index + 1}: {fb_result}",
-                            )
-                            if failed_batches >= REMEDIATION_MAX_FAILED_BATCHES:
-                                await self._send_message(
-                                    "warning",
-                                    (
-                                        "Too many consecutive remediation batch failures in this cycle; "
-                                        "stopping further micro-batches and continuing pipeline with partial results."
-                                    ),
-                                )
-                                break
-                            continue
+                            if "budget exceeded" in str(fb_result).lower():
+                                budget_exhausted = True
+                                await self._send_message("warning", f"Stopping remediation early: {fb_result}")
+                            else:
+                                await self._send_message("warning", f"Fallback remediation failed: {fb_result}")
                     except Exception as _fb_exc:
-                        failed_batches += 1
-                        await self._send_message(
-                            "warning",
-                            f"Fallback remediation error on batch {batch_index + 1}: {_fb_exc}",
-                        )
-                        if failed_batches >= REMEDIATION_MAX_FAILED_BATCHES:
-                            await self._send_message(
-                                "warning",
-                                (
-                                    "Too many consecutive remediation batch failures in this cycle; "
-                                    "stopping further micro-batches and continuing pipeline with partial results."
-                                ),
-                            )
-                            break
-                        continue
+                        await self._send_message("warning", f"Fallback remediation error: {_fb_exc}")
 
+            if success:
                 summary = remediation_result.get("summary", "")
                 changed_files = remediation_result.get("changed_files", [])
                 rejected_changes = remediation_result.get("rejected_changes", [])
@@ -680,16 +787,15 @@ echo "PUSHED"
                 cycle_proposed_changes += proposed_change_count
                 cycle_applied_changes += applied_change_count
                 if summary:
-                    cycle_summary_parts.append(f"[Batch {batch_index + 1}] {summary}")
+                    cycle_summary_parts.append(summary)
                 cycle_changed_files.extend(changed_files)
                 cycle_rejected_changes.extend(rejected_changes)
 
                 if changed_files:
-                    failed_batches = 0
                     await self._send_message(
                         "success",
                         (
-                            f"Batch {batch_index + 1}: applied {len(changed_files)} file update(s) "
+                            f"{cycle_label} Applied {len(changed_files)} file update(s) "
                             f"(proposed={proposed_change_count}, applied={applied_change_count})."
                         ),
                     )
@@ -697,34 +803,21 @@ echo "PUSHED"
                         await self._send_message("info", f"Updated {item.get('path', 'unknown path')}")
                     await self._send_message("changed_files", json.dumps(changed_files))
                 else:
-                    failed_batches += 1
                     if proposed_change_count > 0:
                         await self._send_message(
                             "warning",
                             (
-                                f"Batch {batch_index + 1}: proposals generated but no safe file updates were applied "
+                                f"{cycle_label} Proposals were generated but no safe file updates were applied "
                                 f"(proposed={proposed_change_count}, applied={applied_change_count})."
                             ),
                         )
                     else:
-                        await self._send_message(
-                            "warning",
-                            f"Batch {batch_index + 1}: remediation agent produced no safe changes.",
-                        )
-                    if failed_batches >= REMEDIATION_MAX_STALLED_BATCHES:
-                        await self._send_message(
-                            "warning",
-                            (
-                                "No safe progress across many consecutive micro-batches; "
-                                "ending this cycle early to avoid unnecessary churn."
-                            ),
-                        )
-                        break
+                        await self._send_message("warning", f"{cycle_label} Remediation agent produced no safe changes.")
 
                 if rejected_changes:
                     await self._send_message(
                         "warning",
-                        f"Batch {batch_index + 1}: {len(rejected_changes)} proposed change(s) rejected by safety filters.",
+                        f"{cycle_label} {len(rejected_changes)} proposed change(s) were rejected by safety filters.",
                     )
                     for item in rejected_changes[:6]:
                         await self._send_message(
@@ -734,6 +827,11 @@ echo "PUSHED"
                                 f"{item.get('reason', 'unspecified reason')}"
                             ),
                         )
+
+            await self._send_message(
+                "info",
+                f"{cycle_label} Claude spend so far: ${budget_tracker.total_usd:.4f}/${budget_tracker.budget_cap_usd:.2f}",
+            )
 
             self._check_cancelled()
 
@@ -750,11 +848,17 @@ echo "PUSHED"
                 "--- LLM SUMMARY ---",
                 consolidated_summary or "No summary generated.",
                 "",
-                "--- BATCH METRICS ---",
-                f"Queue size: {queue_total}",
-                f"Batches attempted this cycle: {batches_to_run}",
+                "--- PASS METRICS ---",
+                "Repo-wide remediation pass: 1",
+                f"Selection mode: {queue_stats.get('selection_mode', 'full')}",
+                f"Code raw occurrences in scope: {queue_stats.get('code_raw_total', 0)}",
+                f"Code root causes sent to remediator: {queue_stats.get('code_root_causes', 0)}",
+                f"Supply raw findings in scope: {queue_stats.get('supply_raw_total', 0)}",
+                f"Supply root causes sent to remediator: {queue_stats.get('supply_root_causes', 0)}",
                 f"Proposed changes: {cycle_proposed_changes}",
                 f"Applied changes: {cycle_applied_changes}",
+                f"Claude spend so far (USD): {budget_tracker.total_usd:.6f}",
+                f"Claude budget cap (USD): {budget_tracker.budget_cap_usd:.2f}",
                 "",
                 "--- CHANGED FILES ---",
             ]
@@ -771,6 +875,13 @@ echo "PUSHED"
                 await self._send_message("success", "Remediation summary saved to LLM_Output/summary.txt")
             else:
                 await self._send_message("warning", f"Could not write remediation summary: {error_msg}")
+
+            if budget_exhausted and cycle_applied_changes <= 0:
+                await self._send_message(
+                    "warning",
+                    "Stopping remediation loop because the Claude budget cap was reached before any additional safe changes could be applied.",
+                )
+                break
 
             if cycle_applied_changes <= 0 and not cycle_changed_files:
                 no_progress_cycles += 1
@@ -884,5 +995,15 @@ echo "PUSHED"
                     f"{remaining_vulns} finding(s) may still remain in scope ({remediation_scope}).",
                 )
 
-        await self._send_message("success", "Remediation loop completed successfully")
+            if budget_exhausted:
+                await self._send_message(
+                    "warning",
+                    "Ending remediation after the current approval/rescan cycle because the Claude budget cap has been reached.",
+                )
+                break
+
+        await self._send_message(
+            "success",
+            f"Remediation loop completed successfully within budget (${budget_tracker.total_usd:.4f}/${budget_tracker.budget_cap_usd:.2f}).",
+        )
         return True

@@ -890,8 +890,32 @@ export default function DashboardHomeApp() {
     const project = projectsById[projectId];
     if (!project) return;
     primePipelineState(projectId, 'scan');
-    await startScan(projectId, project.name);
-    router.push('/dashboard/pipeline');
+    try {
+      const response = await fetch('/api/scan/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: projectId,
+          project_name: project.name,
+          project_type: project.type,
+          installation_id: project.installationId,
+          owner: project.owner,
+          repo: project.repo,
+          scan_type: 'all',
+        }),
+      });
+
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error || 'Failed to start scan');
+      }
+
+      await startScan(projectId, project.name);
+      router.push(`/dashboard/security-analysis/${encodeURIComponent(projectId)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to start scan';
+      window.alert(message);
+    }
   }, [primePipelineState, projectsById, router, startScan]);
 
   const handleDelete = useCallback(async (projectId: string) => {

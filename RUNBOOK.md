@@ -1,270 +1,487 @@
 # DeplAI Runbook
 
-Operational guide for startup, pipeline execution, and troubleshooting.
+Operational guide for starting, validating, running, and troubleshooting the active DeplAI stack.
 
-## 1. Services and Startup
+## 1. What This Runbook Covers
 
-`docker-compose.yml` currently runs only:
+This runbook is for the active runtime:
 
-- `agentic-layer` on port `8000`
+- `Connector` as the user-facing control plane
+- `Agentic Layer` as the backend orchestrator
+- Docker-based scan and remediation execution
+- KG-assisted remediation context
+- Stage 7 architecture/cost generation
+- Terraform generation and AWS runtime deploy
 
-`Connector` runs separately (`npm run dev` / `next start`).
+## 2. Prerequisites
 
-## Startup Sequence
+Required:
+
+- Node.js 20+
+- Python 3.13+
+- Docker Desktop or Docker Engine
+- MySQL 8+
+
+Required for repository-backed flows:
+
+- GitHub OAuth credentials
+- GitHub App credentials
+
+Required for remediation:
+
+- `ANTHROPIC_API_KEY`
+
+Optional but recommended:
+
+- Neo4j
+- Qdrant
+- AWS credentials for runtime deploy and some pricing flows
+
+## 3. Services You Must Run
+
+`docker-compose.yml` only starts:
+
+- `agentic-layer`
+
+You must separately run or provide:
+
+- MySQL
+- Connector
+- optionally Neo4j
+- optionally Qdrant
+
+## 4. Environment Configuration
+
+Set these in repo-root `.env`.
+
+### Core runtime
+
+```bash
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+AGENTIC_LAYER_URL=http://localhost:8000
+NEXT_PUBLIC_AGENTIC_WS_URL=ws://localhost:8000
+DEPLAI_SERVICE_KEY=<shared-secret>
+WS_TOKEN_SECRET=<ws-signing-secret>
+SESSION_SECRET=<session-secret>
+CORS_ORIGINS=http://localhost:3000
+```
+
+### Database
+
+```bash
+DB_HOST=localhost
+DB_PORT=3306
+DB_USER=deplai
+DB_PASSWORD=<password>
+DB_NAME=deplai
+```
+
+### GitHub
+
+```bash
+GITHUB_CLIENT_ID=<oauth-client-id>
+GITHUB_CLIENT_SECRET=<oauth-client-secret>
+GITHUB_APP_ID=<app-id>
+GITHUB_PRIVATE_KEY=<pem-with-newlines>
+GITHUB_WEBHOOK_SECRET=<webhook-secret>
+```
+
+### Remediation
+
+```bash
+ANTHROPIC_API_KEY=<anthropic-key>
+REMEDIATION_CLAUDE_MODEL=claude-sonnet-4-5
+DEPLAI_MAX_REMEDIATION_COST_USD=1.00
+```
+
+Useful remediation tuning:
+
+```bash
+REMEDIATION_MAX_CODE_ROOT_CAUSES=10
+REMEDIATION_MAX_SUPPLY_ROOT_CAUSES=8
+REMEDIATION_MAX_CODE_OCCURRENCES_PER_ROOT_CAUSE=3
+REMEDIATION_NO_PROGRESS_LIMIT=2
+```
+
+### Optional infra and graph dependencies
+
+```bash
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=
+QDRANT_URL=
+
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_DEFAULT_REGION=ap-south-1
+```
+
+## 5. First-Time Setup
+
+### 5.1 Initialize MySQL
+
+Load the schema from `Connector/database.sql`.
+
+Example:
+
+```bash
+mysql -u root -p < Connector/database.sql
+```
+
+### 5.2 Install frontend dependencies
+
+```bash
+cd Connector
+npm install
+cd ..
+```
+
+### 5.3 Optional Python validation
+
+```bash
+python -m compileall "Agentic Layer" KGagent terraform_agent diagram_cost-estimation_agent
+```
+
+## 6. Startup Sequence
 
 1. Start MySQL.
 2. Start Docker Desktop.
 3. Start Agentic Layer:
-   ```bash
-   docker compose up -d --build agentic-layer
-   ```
+
+```bash
+docker compose up -d --build agentic-layer
+```
+
 4. Start Connector:
-   ```bash
-   cd Connector
-   npm install
-   npm run dev
-   ```
+
+```bash
+cd Connector
+npm run dev
+```
+
 5. Open `http://localhost:3000`.
 
-## 2. Required Configuration
+## 7. Health Checks
 
-Set these in repo-root `.env`.
-
-## Core
-
-- `AGENTIC_LAYER_URL` (Connector -> Agentic base URL)
-- `DEPLAI_SERVICE_KEY` (REST auth between Connector and Agentic)
-- `WS_TOKEN_SECRET` (WebSocket token signing/verification)
-- `NEXT_PUBLIC_AGENTIC_WS_URL` (optional explicit WS base; otherwise resolved from `AGENTIC_LAYER_URL`)
-- `SESSION_SECRET` (Connector session encryption)
-- `CORS_ORIGINS` (Agentic CORS allowlist)
-
-## Database
-
-- `DB_HOST`
-- `DB_PORT`
-- `DB_USER`
-- `DB_PASSWORD`
-- `DB_NAME`
-
-## GitHub OAuth / App
-
-- `GITHUB_CLIENT_ID`
-- `GITHUB_CLIENT_SECRET`
-- `GITHUB_APP_ID`
-- `GITHUB_PRIVATE_KEY`
-- `GITHUB_WEBHOOK_SECRET`
-
-## Common Optional Runtime Keys
-
-- `GROQ_API_KEY`
-- `OPENROUTER_API_KEY`
-- `OPENAI_API_KEY`
-- `ANTHROPIC_API_KEY`
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
-- `NEO4J_URI`
-- `NEO4J_USER`
-- `NEO4J_PASSWORD`
-
-## 3. Pipeline Stages (Current)
-
-UI stage order:
-
-1. `0` preflight
-2. `1` scan
-3. `2` KG
-4. `3` remediation
-5. `4` PR
-6. `4.5` merge gate
-7. `4.6` post-merge actions
-8. `6` QA
-9. `7` architecture + cost
-10. `7.5` approval gate
-11. `8` IaC generation
-12. `9` GitOps/policy gate
-13. `10` deploy
-
-Backend remediation is hard-capped at 2 cycles.
-
-## 4. Operational Checks
-
-## Backend health
+### 7.1 Backend health
 
 ```bash
 curl http://localhost:8000/health
 ```
 
-Expected fields:
+Expected checks include:
 
-- `docker_engine` check
-- `neo4j` check
+- Docker engine connectivity
+- Neo4j health or degraded state
 
-## Connector pipeline health
+### 7.2 Connector pipeline health
 
 ```bash
 curl http://localhost:3000/api/pipeline/health
 ```
 
-Requires authenticated session.
+Requires an authenticated session in normal usage.
 
-## Python syntax validation
+### 7.3 Docker volumes
 
-From repo root:
-
-```powershell
-python -m compileall "Agentic Layer" KGagent terraform_agent diagram_cost-estimation_agent
+```bash
+docker volume ls
 ```
 
-Behavior:
-
-- Compiles all Python packages in-place to catch syntax-level errors early.
-
-## 5. Stage Operations
-
-## Stage 1: Scan
-
-- Validate via `POST /api/scan/validate`.
-- Stream via `WS /ws/scan/{project_id}`.
-- Poll via `GET /api/scan/status?project_id=...`.
-- Read results via `GET /api/scan/results?project_id=...`.
-
-Scanner outputs land in `security_reports` volume.
-
-## Stage 3: Remediation
-
-- Start via `POST /api/remediate/start`.
-- Stream via `WS /ws/remediate/{project_id}`.
-- Human approval required: send `{"action":"approve_rescan"}` to remediation WS.
-
-Persistence behavior:
-
-- GitHub project: push branch + open PR.
-- Local project: copy back to `Connector/tmp/local-projects/...`.
-
-## Stage 7 and 7.5: Architecture/Cost/Approval
-
-- Architecture route (`/api/architecture`) uses deterministic AWS template path in current UI flow.
-- Stage7 route (`/api/pipeline/stage7`) proxies to backend subprocess agent.
-- Stage7 payload includes diagram, cost estimate, budget gate.
-
-## Stage 8: IaC
-
-- Endpoint: `POST /api/pipeline/iac`.
-- Hard gate: requires valid scan state.
-- Behavior:
-  - try backend terraform generator first,
-  - fallback to template bundle if needed.
-
-## Stage 9: Policy
-
-- Budget and security gates are checked in UI.
-- Deploy API also enforces budget guardrail server-side.
-
-## Stage 10: Deploy
-
-- Runtime apply path:
-  - `POST /api/pipeline/deploy` with `runtime_apply=true`.
-  - AWS only.
-- Recovery/control paths:
-  - `POST /api/pipeline/deploy/status`
-  - `POST /api/pipeline/deploy/stop`
-  - `POST /api/pipeline/deploy/destroy`
-  - `POST /api/pipeline/runtime-details`
-
-## 6. Docker Volumes
+Expected runtime volumes:
 
 - `codebase_deplai`
 - `security_reports`
 - `LLM_Output`
 - `grype_db_cache`
 
-List:
+## 8. Normal Operating Flow
 
-```bash
-docker volume ls
+```mermaid
+flowchart LR
+    Start[Start Services] --> Health[Check Health]
+    Health --> Scan[Run Scan]
+    Scan --> Results[Inspect Results]
+    Results --> Remediate[Run Remediation]
+    Remediate --> Approve[Approve Changes]
+    Approve --> Verify[Re-scan / Verify]
+    Verify --> QA[Provide Q/A Context]
+    QA --> Arch[Architecture + Cost]
+    Arch --> IaC[IaC Generation]
+    IaC --> Deploy[Deploy]
 ```
 
-Inspect scan reports:
+## 9. Stage Operations
+
+### 9.1 Stage 1: Scan
+
+Primary routes:
+
+- `POST /api/scan/validate`
+- `GET /api/scan/status`
+- `GET /api/scan/results`
+- `GET /api/scan/ws-token`
+- backend `WS /ws/scan/{project_id}`
+
+Operational notes:
+
+- scan artifacts are written into `security_reports`
+- Docker must be healthy
+- GitHub-backed scans require valid repo access
+
+### 9.2 Stage 2 and 3: KG Analysis and Remediation
+
+Primary routes:
+
+- `POST /api/remediate/start`
+- backend `POST /api/remediate/validate`
+- backend `WS /ws/remediate/{project_id}`
+
+Current remediation behavior:
+
+- Claude-only via Anthropic SDK
+- repo-wide pass per cycle
+- root-cause dedupe before prompt construction
+- shared spend cap across supervisor and fallback calls
+- human approval required before persistence and re-scan
+
+Approval command over remediation WebSocket:
+
+```json
+{"action":"approve_rescan"}
+```
+
+Persistence behavior:
+
+- GitHub project:
+  - push remediation branch
+  - open PR
+- local project:
+  - copy changes back to `Connector/tmp/local-projects/...`
+
+### 9.3 Stage 7 and 7.5: Architecture, Cost, Approval
+
+Primary routes:
+
+- `POST /api/architecture`
+- `POST /api/cost`
+- `POST /api/pipeline/stage7`
+- `POST /api/architecture/review/start`
+- `POST /api/architecture/review/complete`
+
+Operational notes:
+
+- AWS has the strongest deterministic/fallback support
+- Azure and GCP are supported for architecture/cost request flows
+- Stage 7 packaging runs through the diagram-cost subprocess
+
+### 9.4 Stage 8: IaC
+
+Primary route:
+
+- `POST /api/pipeline/iac`
+
+Requirements:
+
+- valid `project_id`
+- at least one of:
+  - `qa_summary`
+  - `architecture_context`
+  - `architecture_json`
+
+Operational notes:
+
+- AWS path requires `architecture_json`
+- Connector may fall back to local Terraform bundle generation
+
+### 9.5 Stage 9 and 10: Policy and Deploy
+
+Primary routes:
+
+- `POST /api/pipeline/deploy`
+- `POST /api/pipeline/deploy/status`
+- `POST /api/pipeline/deploy/stop`
+- `POST /api/pipeline/deploy/destroy`
+- `POST /api/pipeline/runtime-details`
+- `POST /api/pipeline/deploy/verify`
+
+Deploy modes:
+
+- `runtime_apply=false`
+  - GitOps/repository-oriented path
+- `runtime_apply=true`
+  - backend Terraform apply
+  - AWS-only
+
+Budget behavior:
+
+- deploy can be blocked when `estimated_monthly_usd > budget_limit_usd`
+- unless `budget_override=true`
+
+## 10. Operational Commands
+
+### 10.1 Follow backend logs
+
+```bash
+docker compose logs -f agentic-layer
+```
+
+### 10.2 Inspect security reports volume
 
 ```bash
 docker run --rm -v security_reports:/vol alpine sh -c "ls -lah /vol"
 ```
 
-## 7. Troubleshooting
+### 10.3 Inspect remediation output volume
 
-## Scan never leaves `not_initiated`
+```bash
+docker run --rm -v LLM_Output:/vol alpine sh -c "ls -lah /vol && [ -f /vol/summary.txt ] && cat /vol/summary.txt || true"
+```
 
-1. Verify Docker:
-   ```bash
-   docker info
-   ```
-2. Verify backend:
-   ```bash
-   curl http://localhost:8000/health
-   ```
-3. Verify shared key (`DEPLAI_SERVICE_KEY`) matches in both services.
-4. Check logs:
-   ```bash
-   docker compose logs -f agentic-layer
-   ```
+### 10.4 Confirm Docker daemon
 
-## WebSocket closes with 1008
+```bash
+docker info
+```
 
-Likely token validation issue:
+## 11. Troubleshooting
 
-- `WS_TOKEN_SECRET` mismatch
-- expired token
-- project/user mismatch
+### 11.1 Scan stays `not_initiated`
 
 Check:
 
-- Connector `/api/scan/ws-token` response
-- backend log around `_verify_ws_token`
+1. Docker is running.
+2. `agentic-layer` is healthy.
+3. `DEPLAI_SERVICE_KEY` matches between Connector and backend.
+4. GitHub project metadata is valid for repo-backed scans.
 
-## Remediation completed but no PR
+Commands:
+
+```bash
+docker info
+curl http://localhost:8000/health
+docker compose logs -f agentic-layer
+```
+
+### 11.2 WebSocket closes with `1008`
+
+Likely causes:
+
+- missing or expired token
+- `WS_TOKEN_SECRET` mismatch
+- token project mismatch
+- token user mismatch
+
+Check:
+
+- Connector `/api/scan/ws-token`
+- Connector `/api/pipeline/ws-config`
+- backend logs around WebSocket verification
+
+### 11.3 Remediation starts but produces no PR
 
 Possible reasons:
 
-- no safe file changes were produced,
-- repository metadata/token issue,
-- GitHub push failed.
+- no safe file changes were accepted
+- GitHub push permissions failed
+- repository URL or token mismatch
+- remediation stopped early on budget or no-progress conditions
 
-Use:
+Check:
 
-- `POST /api/pipeline/remediation-pr` to resolve latest remediation PR
-- backend logs for push and PR creation errors.
+- remediation WebSocket messages
+- `POST /api/pipeline/remediation-pr`
+- backend logs
+- `LLM_Output/summary.txt`
 
-## IaC generation blocked
+### 11.4 Remediation stops early
 
-`/api/pipeline/iac` rejects when scan is:
+Likely causes:
 
-- `running`
-- `not_initiated`
-- `error`
+- Claude budget cap reached
+- repeated no-progress cycles
+- no safe changes after validation
 
-Run/complete scan first.
+Relevant variables:
 
-## Deploy blocked by budget
+- `DEPLAI_MAX_REMEDIATION_COST_USD`
+- `REMEDIATION_NO_PROGRESS_LIMIT`
+- `REMEDIATION_MAX_CODE_ROOT_CAUSES`
+- `REMEDIATION_MAX_SUPPLY_ROOT_CAUSES`
 
-`/api/pipeline/deploy` returns block when:
+### 11.5 KG is unavailable
 
-- `estimated_monthly_usd > budget_limit_usd`
-- and `budget_override != true`
+Expected behavior:
 
-## Runtime deploy fails quickly with stale bundle error
+- remediation should continue with degraded context
 
-Stage 10 runtime deploy validates safety fields in Terraform bundle.
-Re-run Stage 8 IaC generation, then retry deploy.
+Check:
 
-## 8. Dangerous Operations
+- Neo4j connectivity
+- KG import/runtime errors in backend logs
 
-Global backend cleanup endpoint:
+### 11.6 IaC generation is blocked
+
+Common causes:
+
+- scan still running
+- scan never completed
+- missing required context
+- invalid `architecture_json`
+
+Check:
+
+- `/api/scan/status`
+- `/api/scan/results`
+- request contract in `ARCHITECTURE_CONTRACTS.md`
+
+### 11.7 Deploy blocked by budget
+
+Expected behavior:
+
+- deploy route returns a blocked response when estimated cost exceeds budget and override is not enabled
+
+Fix:
+
+- raise `budget_limit_usd`
+- set `budget_override=true`
+- reduce the planned architecture cost
+
+### 11.8 Runtime deploy fails quickly
+
+Common causes:
+
+- stale Terraform bundle
+- missing AWS credentials
+- AWS quota or capacity issues
+- invalid generated Terraform
+
+Check:
+
+- deploy status route
+- backend apply logs
+- runtime details route
+- regenerate Stage 8 bundle and retry
+
+## 12. Dangerous Operations
+
+Global cleanup route:
 
 - `POST /api/cleanup`
 
-Only works when backend env has:
+Guard:
 
-- `ALLOW_GLOBAL_CLEANUP=true`
+- backend must run with `ALLOW_GLOBAL_CLEANUP=true`
 
-This is destructive for all projects.
+Warning:
+
+- this is destructive across all projects
+
+## 13. Recommended Operator Workflow
+
+- Start services and verify health first.
+- Run scan before touching remediation or IaC.
+- Treat remediation as approval-gated, not fully autonomous.
+- Use post-remediation re-scan results as the source of truth.
+- Use runtime apply only when AWS credentials and budget guardrails are ready.
+- For large repositories, expect partial remediation in one run even with root-cause dedupe and cost control.

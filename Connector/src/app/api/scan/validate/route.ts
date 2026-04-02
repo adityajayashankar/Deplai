@@ -40,6 +40,17 @@ interface GitHubRepoRow {
   suspended_at: string | null;
 }
 
+function isBackendConnectivityError(error: unknown): boolean {
+  const code = (error as { code?: string; cause?: { code?: string } })?.code
+    || (error as { cause?: { code?: string } })?.cause?.code;
+  return code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EHOSTUNREACH' || code === 'ETIMEDOUT';
+}
+
+function isBackendTimeoutError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error || '').toLowerCase();
+  return (error instanceof Error && error.name === 'TimeoutError') || message.includes('aborted due to timeout') || message.includes('timed out');
+}
+
 export async function POST(request: NextRequest) {
   try {
     const { user, error } = await requireAuth();
@@ -183,6 +194,18 @@ export async function POST(request: NextRequest) {
     const data = await response.json();
     return NextResponse.json(data);
   } catch (routeError: unknown) {
+    if (isBackendTimeoutError(routeError)) {
+      return NextResponse.json(
+        { error: `Agentic Layer timed out at ${AGENTIC_URL}. The backend is likely paused or hung.` },
+        { status: 504 },
+      );
+    }
+    if (isBackendConnectivityError(routeError)) {
+      return NextResponse.json(
+        { error: `Agentic Layer is unreachable at ${AGENTIC_URL}. Start the service and retry.` },
+        { status: 502 },
+      );
+    }
     console.error('Scan validation error:', routeError);
     return NextResponse.json({ error: 'Failed to validate scan' }, { status: 500 });
   }

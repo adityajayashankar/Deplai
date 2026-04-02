@@ -9,12 +9,19 @@ import re
 import difflib
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from math import ceil
 from typing import Any
+
+from anthropic import Anthropic
 
 from utils import CODEBASE_VOLUME, decode_output, get_docker_client, get_repo_root
 
-DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-7-sonnet-latest")
+DEFAULT_MODEL = (
+    os.getenv("REMEDIATION_CLAUDE_MODEL", "").strip()
+    or os.getenv("CLAUDE_MODEL", "").strip()
+    or "claude-sonnet-4-5"
+)
 REMEDIATION_BACKEND = os.getenv("REMEDIATION_LLM_BACKEND", "auto").strip().lower()
 MAX_CONTEXT_FILES = int(os.getenv("REMEDIATION_MAX_CONTEXT_FILES", "12"))
 MAX_PATCH_FILES = int(os.getenv("REMEDIATION_MAX_PATCH_FILES", "10"))
@@ -23,6 +30,7 @@ OPENAI_COMPAT_TIMEOUT = int(os.getenv("REMEDIATION_LLM_TIMEOUT_SECONDS", "120"))
 MAX_PROVIDER_MODELS = int(os.getenv("REMEDIATION_MAX_PROVIDER_MODELS", "2"))
 MAX_PROMPT_CHARS = int(os.getenv("REMEDIATION_MAX_PROMPT_CHARS", "26000"))
 MAX_COMPLETION_TOKENS = int(os.getenv("REMEDIATION_MAX_COMPLETION_TOKENS", "2048"))
+MAX_REMEDIATION_COST_USD = float(os.getenv("DEPLAI_MAX_REMEDIATION_COST_USD", "1.00") or "1.00")
 OLLAMA_CLOUD_CHAT_ENDPOINT = "https://ollama.com/api/chat"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b").strip() or "qwen2.5-coder:7b"
 
@@ -47,6 +55,20 @@ DEFAULT_OPENROUTER_MODELS = [
     "moonshotai/kimi-k2-instruct",
     "meta-llama/llama-4-scout-17b-16e-instruct",
 ]
+
+MODEL_PRICING_PER_MILLION: dict[str, tuple[float, float]] = {
+    "claude-opus-4-6": (5.00, 25.00),
+    "claude-opus-4-5": (5.00, 25.00),
+    "claude-opus-4-1": (15.00, 75.00),
+    "claude-opus-4": (15.00, 75.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-sonnet-4-5": (3.00, 15.00),
+    "claude-sonnet-4": (3.00, 15.00),
+    "claude-3-7-sonnet-latest": (3.00, 15.00),
+    "claude-3-5-sonnet-20241022": (3.00, 15.00),
+    "claude-haiku-4-5": (1.00, 5.00),
+    "claude-3-5-haiku-20241022": (0.80, 4.00),
+}
 
 MANIFEST_FILES = {
     "package.json",
@@ -75,6 +97,49 @@ class Change:
 class RejectedChange:
     path: str
     reason: str
+
+
+@dataclass
+class ClaudeBudgetTracker:
+    budget_cap_usd: float = MAX_REMEDIATION_COST_USD
+    total_usd: float = 0.0
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def guard(self, *, model: str, prompt: str, max_tokens: int, stage: str) -> None:
+        projected_cost = _usd_cost_for_tokens(
+            model,
+            _estimate_tokens(prompt),
+            max_tokens,
+        )
+        if self.total_usd + projected_cost > self.budget_cap_usd:
+            raise RuntimeError(
+                f"Claude remediation budget exceeded for {stage}. "
+                f"Current spend ${self.total_usd:.4f}, projected worst-case ${projected_cost:.4f}, "
+                f"cap ${self.budget_cap_usd:.2f}."
+            )
+
+    def record_response(self, *, model: str, prompt: str, stage: str, response: Any) -> float:
+        usage = getattr(response, "usage", None)
+        input_tokens = int(
+            getattr(usage, "input_tokens", 0)
+            + getattr(usage, "cache_creation_input_tokens", 0)
+            + getattr(usage, "cache_read_input_tokens", 0)
+        )
+        output_tokens = int(getattr(usage, "output_tokens", 0))
+        if input_tokens <= 0:
+            input_tokens = _estimate_tokens(prompt)
+        cost_usd = _usd_cost_for_tokens(model, input_tokens, output_tokens)
+        self.total_usd = round(self.total_usd + cost_usd, 6)
+        self.calls.append(
+            {
+                "stage": stage,
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": round(cost_usd, 6),
+            }
+        )
+        return cost_usd
 
 
 CONTAINER_TIMEOUT = int(os.getenv("REMEDIATION_CONTAINER_TIMEOUT", "120"))
@@ -313,6 +378,38 @@ def _validate_change_candidate(path: str, before: str, after: str) -> tuple[bool
             return (False, f"JSON syntax error: {exc}")
 
     return (True, "")
+
+
+def _build_unified_diff(path: str, before: str, after: str) -> str:
+    return "\n".join(
+        difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="",
+        )
+    )
+
+
+def _pricing_for_model(model: str) -> tuple[float, float]:
+    normalized = str(model or "").strip().lower()
+    if normalized in MODEL_PRICING_PER_MILLION:
+        return MODEL_PRICING_PER_MILLION[normalized]
+    if "haiku" in normalized:
+        return MODEL_PRICING_PER_MILLION["claude-3-5-haiku-20241022"]
+    if "opus" in normalized:
+        return MODEL_PRICING_PER_MILLION["claude-opus-4-5"]
+    return MODEL_PRICING_PER_MILLION["claude-sonnet-4-5"]
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, ceil(len(str(text or "")) / 4))
+
+
+def _usd_cost_for_tokens(model: str, input_tokens: int, output_tokens: int) -> float:
+    input_rate, output_rate = _pricing_for_model(model)
+    return ((max(0, input_tokens) * input_rate) + (max(0, output_tokens) * output_rate)) / 1_000_000
 
 
 def _sanitize_json_control_chars(text: str) -> str:
@@ -649,6 +746,9 @@ def _build_prompt(
             "count": finding.get("count"),
             "title": finding.get("title") or finding.get("name") or finding.get("message"),
             "description": str(finding.get("description", ""))[:180],
+            "primary_path": finding.get("primary_path"),
+            "root_cause_key": finding.get("root_cause_key"),
+            "root_cause_kind": finding.get("root_cause_kind"),
         }
         if include_occurrences:
             occ = finding.get("occurrences", [])
@@ -674,9 +774,13 @@ def _build_prompt(
                 "cve_id": finding.get("cve_id"),
                 "severity": finding.get("severity"),
                 "package": finding.get("package") or finding.get("name"),
-                "installed_version": finding.get("installed_version"),
+                "installed_version": finding.get("installed_version") or finding.get("version"),
                 "fix_version": finding.get("fix_version"),
                 "description": str(finding.get("description", ""))[:140],
+                "count": finding.get("count"),
+                "related_cve_ids": (finding.get("related_cve_ids") or [])[:8],
+                "root_cause_key": finding.get("root_cause_key"),
+                "root_cause_kind": finding.get("root_cause_kind"),
             }
         )
 
@@ -928,6 +1032,58 @@ def _call_groq(prompt: str) -> tuple[bool, str]:
     return (False, "Groq completion failed across fallback models: " + " | ".join(errors))
 
 
+def _call_claude_sdk(
+    prompt: str,
+    api_key: str | None = None,
+    model: str | None = None,
+    budget_tracker: ClaudeBudgetTracker | None = None,
+    stage: str = "remediation",
+) -> tuple[bool, str]:
+    resolved_api_key = (
+        str(api_key or "").strip()
+        or os.getenv("ANTHROPIC_API_KEY", "").strip()
+        or os.getenv("CLAUDE_API_KEY", "").strip()
+    )
+    if not resolved_api_key:
+        return (False, "Missing ANTHROPIC_API_KEY for remediation.")
+
+    resolved_model = str(model or "").strip() or DEFAULT_MODEL
+    try:
+        if budget_tracker is not None:
+            budget_tracker.guard(
+                model=resolved_model,
+                prompt=prompt,
+                max_tokens=MAX_COMPLETION_TOKENS,
+                stage=stage,
+            )
+        client = Anthropic(api_key=resolved_api_key, timeout=OPENAI_COMPAT_TIMEOUT)
+        response = client.messages.create(
+            model=resolved_model,
+            max_tokens=MAX_COMPLETION_TOKENS,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if budget_tracker is not None:
+            budget_tracker.record_response(
+                model=resolved_model,
+                prompt=prompt,
+                stage=stage,
+                response=response,
+            )
+    except Exception as e:
+        return (False, str(e))
+
+    text_parts: list[str] = []
+    for block in getattr(response, "content", []):
+        block_text = getattr(block, "text", None)
+        if isinstance(block_text, str) and block_text.strip():
+            text_parts.append(block_text)
+
+    text = "\n".join(text_parts).strip()
+    if not text:
+        return (False, f"Claude SDK returned no text content for model {resolved_model}.")
+    return (True, text)
+
+
 def _call_openrouter(
     prompt: str,
     api_key: str | None = None,
@@ -1084,6 +1240,7 @@ def run_claude_remediation(
     llm_api_key: str | None = None,
     llm_model: str | None = None,
     agent_analysis: dict | None = None,
+    budget_tracker: ClaudeBudgetTracker | None = None,
 ) -> tuple[bool, dict[str, Any] | str]:
     """Generate and apply remediation edits in the codebase volume."""
     contexts = _collect_context_files(scan_data)
@@ -1091,43 +1248,26 @@ def run_claude_remediation(
         return (False, "No readable source files were available for remediation.")
 
     def _run_chain(prompt: str) -> tuple[bool, str]:
-        ok, raw_text = False, ""
-        errors: list[str] = []
-
-        # 1. Route through user-selected provider first (mirrors _dispatch_llm in
-        #    remediation_supervisor.py so fallback remediation respects user choice).
         provider_lower = (llm_provider or "").strip().lower()
-        if provider_lower and llm_api_key:
-            if provider_lower == "openai":
-                ok, raw_text = _call_openai(prompt, llm_api_key, llm_model or "gpt-4o")
-            elif provider_lower in ("gemini", "google"):
-                ok, raw_text = _call_gemini(prompt, llm_api_key, llm_model or "gemini-2.5-pro")
-            elif provider_lower == "openrouter":
-                ok, raw_text = _call_openrouter(prompt, api_key=llm_api_key, preferred_model=llm_model)
-            if not ok:
-                errors.append(f"user-provider({provider_lower}): {raw_text}")
+        effective_api_key = llm_api_key if provider_lower in ("", "claude") else None
+        effective_model = llm_model if provider_lower in ("", "claude") else None
 
-        # 2. Groq → Ollama → OpenRouter fallback chain
-        if not ok:
-            groq_ok, groq_text = _call_groq(prompt)
-            if groq_ok:
-                ok, raw_text = True, groq_text
-            else:
-                errors.append(f"groq: {groq_text}")
-                ollama_ok, ollama_text = _call_ollama(prompt, model=OLLAMA_MODEL)
-                if ollama_ok:
-                    ok, raw_text = True, ollama_text
-                else:
-                    errors.append(f"ollama_cloud: {ollama_text}")
-                    openrouter_ok, openrouter_text = _call_openrouter(prompt)
-                    if openrouter_ok:
-                        ok, raw_text = True, openrouter_text
-                    else:
-                        errors.append(f"openrouter: {openrouter_text}")
-
+        ok, raw_text = _call_claude_sdk(
+            prompt,
+            effective_api_key,
+            effective_model,
+            budget_tracker=budget_tracker,
+            stage="fallback_remediation",
+        )
         if ok:
             return (True, raw_text)
-        return (False, "Remediation LLM fallback chain failed: " + " ; ".join(errors))
+
+        if provider_lower and provider_lower != "claude":
+            return (
+                False,
+                f"Remediation only supports the Claude Agent SDK; ignored provider '{provider_lower}'. Claude SDK error: {raw_text}",
+            )
+        return (False, "Claude SDK remediation failed: " + raw_text)
 
     ok = False
     raw_text = ""
@@ -1175,8 +1315,9 @@ def run_claude_remediation(
             if not ok_candidate:
                 rejected_changes.append({"path": change.path, "reason": reason})
                 continue
+            file_diff = _build_unified_diff(change.path, before_content, change.content)
             _write_file(change.path, change.content)
-            changed_files.append({"path": change.path, "reason": change.reason})
+            changed_files.append({"path": change.path, "reason": change.reason, "diff": file_diff})
         except Exception as e:
             return (False, f"Failed writing {change.path}: {e}")
 
@@ -1193,5 +1334,6 @@ def run_claude_remediation(
             "changed_files": changed_files,
             "rejected_changes": rejected_changes,
             "files_considered": list(contexts.keys()),
+            "llm_cost_usd": round(float(budget_tracker.total_usd), 6) if budget_tracker is not None else None,
         },
     )

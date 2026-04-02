@@ -1,0 +1,1228 @@
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { 
+  LayoutGrid, 
+  Settings, 
+  LogOut, 
+  Search, 
+  List, 
+  Grid, 
+  ChevronRight, 
+  ChevronDown,
+  ChevronUp,
+  RefreshCw, 
+  Plus, 
+  Zap, 
+  Upload, 
+  Github, 
+  Ticket, 
+  Trash2,
+  Server,
+  FileText,
+  Play,
+  ArrowRight,
+  MonitorSmartphone,
+  Rocket,
+  Activity,
+  TerminalSquare,
+  Power,
+  RotateCw,
+  Clock,
+  Cpu,
+  Network,
+  HardDrive,
+  GitCommit,
+  CheckCircle2,
+  AlertCircle,
+  Copy,
+  User,
+  Info,
+  Globe,
+  ExternalLink,
+  Database
+} from 'lucide-react';
+
+// ==========================================
+// PIXEL CARD COMPONENT
+// ==========================================
+
+class Pixel {
+  constructor(canvas, context, x, y, color, speed, delay) {
+    const dpr = window.devicePixelRatio || 1;
+    this.width = canvas.width / dpr;
+    this.height = canvas.height / dpr;
+    this.ctx = context;
+    this.x = x;
+    this.y = y;
+    this.color = color;
+    this.speed = (Math.random() * 0.8 + 0.1) * speed;
+    this.size = 0;
+    this.sizeStep = Math.random() * 0.4;
+    this.minSize = 0.5;
+    this.maxSizeInteger = 2;
+    this.maxSize = Math.random() * (this.maxSizeInteger - this.minSize) + this.minSize;
+    this.delay = delay;
+    this.counter = 0;
+    this.counterStep = Math.random() * 4 + (this.width + this.height) * 0.01;
+    this.isIdle = false;
+    this.isReverse = false;
+    this.isShimmer = false;
+  }
+
+  draw() {
+    const centerOffset = this.maxSizeInteger * 0.5 - this.size * 0.5;
+    this.ctx.fillStyle = this.color;
+    this.ctx.fillRect(Math.round(this.x + centerOffset), Math.round(this.y + centerOffset), Math.round(this.size), Math.round(this.size));
+  }
+
+  appear() {
+    this.isIdle = false;
+    if (this.counter <= this.delay) { this.counter += this.counterStep; return; }
+    if (this.size >= this.maxSize) this.isShimmer = true;
+    if (this.isShimmer) this.shimmer();
+    else this.size += this.sizeStep;
+    this.draw();
+  }
+
+  disappear() {
+    this.isShimmer = false;
+    this.counter = 0;
+    if (this.size <= 0) { this.isIdle = true; return; }
+    else this.size -= 0.1;
+    this.draw();
+  }
+
+  shimmer() {
+    if (this.size >= this.maxSize) this.isReverse = true;
+    else if (this.size <= this.minSize) this.isReverse = false;
+    if (this.isReverse) this.size -= this.speed;
+    else this.size += this.speed;
+  }
+}
+
+const PixelCard = ({ gap = 5, speed = 35, colors = '#18181b,#27272a,#3f3f46', noFocus = false, className = '', children }) => {
+  const containerRef = useRef(null);
+  const canvasRef = useRef(null);
+  const pixelsRef = useRef([]);
+  const animationRef = useRef(null);
+  const timePreviousRef = useRef(performance.now());
+  const reducedMotion = useRef(window.matchMedia('(prefers-reduced-motion: reduce)').matches).current;
+
+  const initPixels = () => {
+    if (!containerRef.current || !canvasRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const width = Math.floor(rect.width);
+    const height = Math.floor(rect.height);
+    const ctx = canvasRef.current.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvasRef.current.width = width * dpr;
+    canvasRef.current.height = height * dpr;
+    if (ctx) ctx.scale(dpr, dpr);
+
+    const colorsArray = colors.split(',');
+    const pxs = [];
+    for (let x = 0; x < width; x += gap) {
+      for (let y = 0; y < height; y += gap) {
+        const color = colorsArray[Math.floor(Math.random() * colorsArray.length)];
+        const distance = Math.sqrt(Math.pow(x - width / 2, 2) + Math.pow(y - height / 2, 2));
+        if (!ctx) return;
+        pxs.push(new Pixel(canvasRef.current, ctx, x, y, color, (speed * 0.001), reducedMotion ? 0 : distance));
+      }
+    }
+    pixelsRef.current = pxs;
+  };
+
+  const doAnimate = (fnName) => {
+    animationRef.current = requestAnimationFrame(() => doAnimate(fnName));
+    const timeNow = performance.now();
+    const timePassed = timeNow - timePreviousRef.current;
+    if (timePassed < 1000 / 60) return;
+    timePreviousRef.current = timeNow - (timePassed % (1000 / 60));
+
+    const ctx = canvasRef.current?.getContext('2d');
+    if (!ctx || !canvasRef.current) return;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.clearRect(0, 0, canvasRef.current.width / dpr, canvasRef.current.height / dpr);
+
+    let allIdle = true;
+    pixelsRef.current.forEach(pixel => {
+      pixel[fnName]();
+      if (!pixel.isIdle) allIdle = false;
+    });
+    if (allIdle && animationRef.current) cancelAnimationFrame(animationRef.current);
+  };
+
+  const handleAnimation = (name) => {
+    if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
+    animationRef.current = requestAnimationFrame(() => doAnimate(name));
+  };
+
+  useEffect(() => {
+    initPixels();
+    const observer = new ResizeObserver(() => initPixels());
+    if (containerRef.current) observer.observe(containerRef.current);
+    return () => { observer.disconnect(); if (animationRef.current !== null) cancelAnimationFrame(animationRef.current); };
+  }, [gap, speed, colors, noFocus]);
+
+  return (
+    <div 
+      ref={containerRef}
+      className={`relative overflow-hidden isolate transition-colors duration-200 ease-[cubic-bezier(0.5,1,0.89,1)] select-none ${className}`}
+      onMouseEnter={() => handleAnimation('appear')}
+      onMouseLeave={() => handleAnimation('disappear')}
+      onFocus={(e) => { if (!noFocus && !e.currentTarget.contains(e.relatedTarget)) handleAnimation('appear'); }}
+      onBlur={(e) => { if (!noFocus && !e.currentTarget.contains(e.relatedTarget)) handleAnimation('disappear'); }}
+      tabIndex={noFocus ? -1 : 0}
+    >
+      <canvas className="absolute inset-0 w-full h-full block pointer-events-none z-0" ref={canvasRef} />
+      <div className="relative z-10 w-full h-full flex flex-col">{children}</div>
+    </div>
+  );
+};
+
+const RunButton = ({ onClick, disabled = false, className = '', children }) => {
+  return (
+    <div className={`h-[42px] w-full ${className}`}>
+      <PixelCard
+        noFocus={true}
+        colors="#3f3f46,#27272a,#18181b" 
+        gap={4}
+        speed={35}
+        className={`w-full h-full rounded-md transition-all shadow-sm ${
+          disabled 
+            ? 'bg-[#111111] opacity-50 cursor-not-allowed border border-[#262626]' 
+            : 'bg-white hover:bg-zinc-200 cursor-pointer border border-zinc-200 shadow-[0_0_15px_rgba(255,255,255,0.15)]'
+        }`}
+      >
+        <button 
+          onClick={disabled ? undefined : onClick} 
+          disabled={disabled}
+          className={`w-full h-full flex items-center justify-center gap-2 font-bold text-[13px] tracking-wide outline-none focus:outline-none transition-colors ${
+            disabled ? 'text-zinc-500' : 'text-black'
+          }`}
+        >
+          {children}
+        </button>
+      </PixelCard>
+    </div>
+  );
+};
+
+// ==========================================
+// BORDER GLOW UTILITIES & COMPONENT
+// ==========================================
+
+function parseHSL(hslStr) {
+  const match = hslStr.match(/([\d.]+)\s*([\d.]+)%?\s*([\d.]+)%?/);
+  if (!match) return { h: 0, s: 0, l: 100 }; // Default to white
+  return { h: parseFloat(match[1]), s: parseFloat(match[2]), l: parseFloat(match[3]) };
+}
+
+function buildBoxShadow(glowColor, intensity) {
+  const { h, s, l } = parseHSL(glowColor);
+  const base = `${h}deg ${s}% ${l}%`;
+  const layers = [
+    [0, 0, 0, 1, 100, true], [0, 0, 1, 0, 60, true], [0, 0, 3, 0, 50, true],
+    [0, 0, 6, 0, 40, true], [0, 0, 15, 0, 30, true], [0, 0, 25, 2, 20, true],
+    [0, 0, 50, 2, 10, true],
+    [0, 0, 1, 0, 60, false], [0, 0, 3, 0, 50, false], [0, 0, 6, 0, 40, false],
+    [0, 0, 15, 0, 30, false], [0, 0, 25, 2, 20, false], [0, 0, 50, 2, 10, false],
+  ];
+  return layers.map(([x, y, blur, spread, alpha, inset]) => {
+    const a = Math.min(alpha * intensity, 100);
+    return `${inset ? 'inset ' : ''}${x}px ${y}px ${blur}px ${spread}px hsl(${base} / ${a}%)`;
+  }).join(', ');
+}
+
+function easeOutCubic(x) { return 1 - Math.pow(1 - x, 3); }
+function easeInCubic(x) { return x * x * x; }
+
+function animateValue({ start = 0, end = 100, duration = 1000, delay = 0, ease = easeOutCubic, onUpdate, onEnd }) {
+  const t0 = performance.now() + delay;
+  function tick() {
+    const elapsed = performance.now() - t0;
+    const t = Math.min(elapsed / duration, 1);
+    onUpdate(start + (end - start) * ease(t));
+    if (t < 1) requestAnimationFrame(tick);
+    else if (onEnd) onEnd();
+  }
+  setTimeout(() => requestAnimationFrame(tick), delay);
+}
+
+const GRADIENT_POSITIONS = ['80% 55%', '69% 34%', '8% 6%', '41% 38%', '86% 85%', '82% 18%', '51% 4%'];
+const COLOR_MAP = [0, 1, 2, 0, 1, 2, 1];
+
+function buildMeshGradients(colors) {
+  const gradients = [];
+  for (let i = 0; i < 7; i++) {
+    const c = colors[Math.min(COLOR_MAP[i], colors.length - 1)];
+    gradients.push(`radial-gradient(at ${GRADIENT_POSITIONS[i]}, ${c} 0px, transparent 50%)`);
+  }
+  gradients.push(`linear-gradient(${colors[0]} 0 100%)`);
+  return gradients;
+}
+
+const BorderGlow = ({
+  children,
+  className = '',
+  edgeSensitivity = 30,
+  glowColor = '0 0 100', // Pure White
+  backgroundColor = '#050505',
+  borderRadius = 12,
+  glowRadius = 30,
+  glowIntensity = 0.5,
+  coneSpread = 25,
+  animated = false,
+  colors = ['#ffffff', '#71717a', '#000000'], // White to Black gradients
+  fillOpacity = 0.3,
+}) => {
+  const cardRef = useRef(null);
+  const [isHovered, setIsHovered] = useState(false);
+  const [cursorAngle, setCursorAngle] = useState(45);
+  const [edgeProximity, setEdgeProximity] = useState(0);
+  const [sweepActive, setSweepActive] = useState(false);
+
+  const getCenterOfElement = useCallback((el) => {
+    const { width, height } = el.getBoundingClientRect();
+    return [width / 2, height / 2];
+  }, []);
+
+  const getEdgeProximity = useCallback((el, x, y) => {
+    const [cx, cy] = getCenterOfElement(el);
+    const dx = x - cx;
+    const dy = y - cy;
+    let kx = Infinity;
+    let ky = Infinity;
+    if (dx !== 0) kx = cx / Math.abs(dx);
+    if (dy !== 0) ky = cy / Math.abs(dy);
+    return Math.min(Math.max(1 / Math.min(kx, ky), 0), 1);
+  }, [getCenterOfElement]);
+
+  const getCursorAngle = useCallback((el, x, y) => {
+    const [cx, cy] = getCenterOfElement(el);
+    const dx = x - cx;
+    const dy = y - cy;
+    if (dx === 0 && dy === 0) return 0;
+    const radians = Math.atan2(dy, dx);
+    let degrees = radians * (180 / Math.PI) + 90;
+    if (degrees < 0) degrees += 360;
+    return degrees;
+  }, [getCenterOfElement]);
+
+  const handlePointerMove = useCallback((e) => {
+    const card = cardRef.current;
+    if (!card) return;
+    const rect = card.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    setEdgeProximity(getEdgeProximity(card, x, y));
+    setCursorAngle(getCursorAngle(card, x, y));
+  }, [getEdgeProximity, getCursorAngle]);
+
+  useEffect(() => {
+    if (!animated) return;
+    const angleStart = 110;
+    const angleEnd = 465;
+    setSweepActive(true);
+    setCursorAngle(angleStart);
+
+    animateValue({ duration: 500, onUpdate: v => setEdgeProximity(v / 100) });
+    animateValue({ ease: easeInCubic, duration: 1500, end: 50, onUpdate: v => {
+      setCursorAngle((angleEnd - angleStart) * (v / 100) + angleStart);
+    }});
+    animateValue({ ease: easeOutCubic, delay: 1500, duration: 2250, start: 50, end: 100, onUpdate: v => {
+      setCursorAngle((angleEnd - angleStart) * (v / 100) + angleStart);
+    }});
+    animateValue({ ease: easeInCubic, delay: 2500, duration: 1500, start: 100, end: 0,
+      onUpdate: v => setEdgeProximity(v / 100),
+      onEnd: () => setSweepActive(false),
+    });
+  }, [animated]);
+
+  const colorSensitivity = edgeSensitivity + 20;
+  const isVisible = isHovered || sweepActive;
+  const borderOpacity = isVisible
+    ? Math.max(0, (edgeProximity * 100 - colorSensitivity) / (100 - colorSensitivity))
+    : 0;
+  const glowOpacity = isVisible
+    ? Math.max(0, (edgeProximity * 100 - edgeSensitivity) / (100 - edgeSensitivity))
+    : 0;
+
+  const meshGradients = buildMeshGradients(colors);
+  const borderBg = meshGradients.map(g => `${g} border-box`);
+  const fillBg = meshGradients.map(g => `${g} padding-box`);
+  const angleDeg = `${cursorAngle.toFixed(3)}deg`;
+
+  return (
+    <div
+      ref={cardRef}
+      onPointerMove={handlePointerMove}
+      onPointerEnter={() => setIsHovered(true)}
+      onPointerLeave={() => setIsHovered(false)}
+      className={`relative grid isolate ${className}`}
+      style={{
+        background: backgroundColor,
+        borderRadius: `${borderRadius}px`,
+        transform: 'translate3d(0, 0, 0.01px)',
+        boxShadow: 'rgba(0,0,0,0.2) 0 4px 20px',
+      }}
+    >
+      <div
+        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        style={{
+          border: '1px solid transparent',
+          background: [
+            `linear-gradient(${backgroundColor} 0 100%) padding-box`,
+            'linear-gradient(rgb(255 255 255 / 0%) 0% 100%) border-box',
+            ...borderBg,
+          ].join(', '),
+          opacity: borderOpacity,
+          maskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
+          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        }}
+      />
+      <div
+        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        style={{
+          border: '1px solid transparent',
+          background: fillBg.join(', '),
+          maskImage: [
+            'linear-gradient(to bottom, black, black)',
+            'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)',
+            'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)',
+            `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`,
+          ].join(', '),
+          WebkitMaskImage: [
+            'linear-gradient(to bottom, black, black)',
+            'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)',
+            'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)',
+            'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)',
+            `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`,
+          ].join(', '),
+          maskComposite: 'subtract, add, add, add, add, add',
+          WebkitMaskComposite: 'source-out, source-over, source-over, source-over, source-over, source-over',
+          opacity: borderOpacity * fillOpacity,
+          mixBlendMode: 'soft-light',
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        }}
+      />
+      <span
+        className="absolute pointer-events-none z-[1] rounded-[inherit]"
+        style={{
+          inset: `${-glowRadius}px`,
+          maskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
+          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
+          opacity: glowOpacity,
+          mixBlendMode: 'plus-lighter',
+          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
+        }}
+      >
+        <span
+          className="absolute rounded-[inherit]"
+          style={{
+            inset: `${glowRadius}px`,
+            boxShadow: buildBoxShadow(glowColor, glowIntensity),
+          }}
+        />
+      </span>
+
+      <div className="flex flex-col relative h-full w-full z-[1]">
+        {children}
+      </div>
+    </div>
+  );
+};
+
+// --- CONFIGURATION ACTION CARD ---
+const ConfigurationCard = ({ title, desc, btnText, icon: Icon }) => (
+  <div className="bg-[#050505] border border-[#262626] rounded-lg p-5 flex flex-col hover:border-zinc-500 transition-all group">
+     <div className="flex items-center gap-2 mb-2">
+        <Icon className="w-4 h-4 text-zinc-400 group-hover:text-white transition-colors" />
+        <h5 className="text-sm font-bold text-white">{title}</h5>
+     </div>
+     <p className="text-xs text-zinc-500 mb-5 flex-1 leading-relaxed">{desc}</p>
+     <button className="px-4 py-1.5 bg-[#111111] hover:bg-white hover:text-black border border-[#333333] rounded text-xs font-bold text-zinc-300 transition-colors self-start flex items-center gap-2">
+       {btnText} <ExternalLink className="w-3 h-3" />
+     </button>
+  </div>
+);
+
+// --- MAIN APP COMPONENT ---
+
+const App = () => {
+  const [activeTab, setActiveTab] = useState('manage_instances'); 
+  const [viewMode, setViewMode] = useState('list');
+  const [expandedInstanceId, setExpandedInstanceId] = useState(null);
+
+  // Mocks
+  const deployments = [
+    {
+      id: 1,
+      name: 'core-payment-gateway',
+      source: 'Github',
+      branch: 'main',
+      time: 'Deployed 4d ago',
+      status: 'success',
+      visibility: 'PUBLIC'
+    },
+    {
+      id: 2,
+      name: 'auth-service-v2',
+      source: 'Github',
+      branch: 'main',
+      time: 'Update available',
+      status: 'pending',
+      visibility: 'PUBLIC'
+    }
+  ];
+
+  const instances = [
+    {
+      id: 'i-0x7291be82',
+      name: 'production-api-eu',
+      branch: 'main',
+      cloud: 'AWS',
+      region: 'eu-north-1',
+      specs: 't3.micro • 2 vCPU • 1GB',
+      ip: '13.51.244.101',
+      privateIp: '172.31.25.254',
+      dns: 'ec2-13-51-244-101.eu-north-1.compute.amazonaws.com',
+      status: 'running',
+      uptime: '14d 2h',
+      lastDeploy: '2 hours ago',
+      ami: 'ami-0c55b159cbfafe1f0',
+      volumes: 2,
+      vpc: 'vpc-08219aeb3',
+      subnet: 'subnet-09f1a23c',
+      nacl: 'acl-04a1122bc',
+      iamRole: 'deplai-ec2-prod-role',
+      arn: 'arn:aws:ec2:eu-north-1:311208285842:instance/i-0x7291be82',
+      cloudfront: 'd2918883xyz.cloudfront.net'
+    },
+    {
+      id: 'i-0x4f12ca11',
+      name: 'staging-auth-svc',
+      branch: 'dev',
+      cloud: 'AWS',
+      region: 'us-east-1',
+      specs: 't3.small • 2 vCPU • 2GB',
+      ip: '54.120.88.21',
+      privateIp: '10.0.1.12',
+      dns: 'ec2-54-120-88-21.compute-1.amazonaws.com',
+      status: 'stopped',
+      uptime: '-',
+      lastDeploy: '1 day ago',
+      ami: 'ami-0b92a472c918a35e1',
+      volumes: 1,
+      vpc: 'vpc-0112aa2e1',
+      subnet: 'subnet-00ac125d',
+      nacl: 'acl-09d2211bb',
+      iamRole: 'deplai-ec2-staging-role',
+      arn: 'arn:aws:ec2:us-east-1:311208285842:instance/i-0x4f12ca11',
+      cloudfront: 'N/A'
+    }
+  ];
+
+  const deploymentHistory = [
+    { id: 1, repo: 'core-payment-gateway', branch: 'main', commit: 'a1b2c3d', status: 'success', time: '2 hours ago', user: 'adityajayashankar' },
+    { id: 2, repo: 'staging-auth-svc', branch: 'dev', commit: 'f9e8d7c', status: 'failed', time: '1 day ago', user: 'adityajayashankar' },
+    { id: 3, repo: 'analytics-worker-1', branch: 'feature/reporting', commit: 'b5a4c3d', status: 'success', time: '3 days ago', user: 'system-auto' },
+    { id: 4, repo: 'core-payment-gateway', branch: 'main', commit: 'c4d3e2f', status: 'success', time: '14 days ago', user: 'adityajayashankar' },
+  ];
+
+  // RENDER DEPLOYMENTS
+  const renderDeploymentsView = () => (
+    <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
+      {/* Top Cards Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-10">
+        
+        <BorderGlow 
+          backgroundColor="#050505" 
+          glowColor="0 0 100" 
+          borderRadius={12} 
+          className="border border-[#1A1A1A] shadow-sm"
+        >
+          <PixelCard colors="#3f3f46,#27272a,#18181b" gap={8} speed={35} className="w-full h-full p-5 flex flex-col rounded-[inherit]">
+            <h3 className="text-[11px] font-bold tracking-widest text-zinc-500 uppercase mb-3">Deployments</h3>
+            <div className="flex items-end gap-3 mb-5">
+              <span className="text-4xl font-semibold text-white leading-none">2</span>
+              <span className="text-[13px] text-zinc-500 mb-1">active</span>
+            </div>
+            <div className="flex gap-2 mt-auto">
+              <span className="text-[11px] font-medium px-2 py-1 bg-[#111111] border border-[#262626] rounded text-zinc-400 flex items-center gap-1.5">
+                <Github className="w-3 h-3 text-white" /> 2 remote
+              </span>
+              <span className="text-[11px] font-medium px-2 py-1 bg-[#111111] border border-[#262626] rounded text-zinc-400 flex items-center gap-1.5">
+                <FileText className="w-3 h-3 text-white" /> 0 local
+              </span>
+            </div>
+          </PixelCard>
+        </BorderGlow>
+
+        <BorderGlow 
+          backgroundColor="#0A0A0A" 
+          colors={['#ffffff', '#a1a1aa', '#000000']}
+          glowColor="0 0 100" 
+          borderRadius={12}
+          animated={true}
+          className="border border-[#262626] group cursor-pointer"
+        >
+          <PixelCard colors="#71717a,#52525b,#3f3f46" gap={8} speed={35} className="w-full h-full p-5 flex flex-col rounded-[inherit]">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-8 h-8 rounded bg-white/10 border border-white/20 flex items-center justify-center">
+                <Plus className="w-4 h-4 text-white" />
+              </div>
+              <h3 className="text-base font-semibold text-white">Add Project</h3>
+            </div>
+            <p className="text-[13px] text-zinc-400 leading-relaxed mb-4">
+              Connect more GitHub repositories to secure your supply chain.
+            </p>
+            <div className="mt-auto text-[13px] font-medium text-white flex items-center gap-1 opacity-70 group-hover:opacity-100 transition-opacity">
+              Connect now <ArrowRight className="w-3.5 h-3.5" />
+            </div>
+          </PixelCard>
+        </BorderGlow>
+
+        <BorderGlow 
+          backgroundColor="#050505" 
+          glowColor="0 0 100" 
+          borderRadius={12} 
+          className="border border-[#1A1A1A] overflow-hidden"
+        >
+          <PixelCard colors="#3f3f46,#27272a,#18181b" gap={8} speed={35} className="w-full h-full p-5 flex flex-col rounded-[inherit]">
+            <div className="flex items-center gap-2 mb-2 relative z-10">
+              <Zap className="w-4 h-4 text-white" />
+              <h3 className="text-base font-semibold text-white">Global Edge</h3>
+            </div>
+            <p className="text-[13px] text-zinc-500 mb-5 relative z-10 leading-relaxed">
+              Deploy live endpoints to global edge networks instantly.
+            </p>
+            
+            <div className="mt-auto relative z-10">
+               <RunButton>
+                 <Play className="w-3.5 h-3.5 fill-current" /> Start Edge Deploy
+               </RunButton>
+            </div>
+          </PixelCard>
+        </BorderGlow>
+
+        <BorderGlow 
+          backgroundColor="#050505" 
+          glowColor="0 0 100" 
+          borderRadius={12} 
+          className="border border-[#1A1A1A] group cursor-pointer transition-colors"
+        >
+          <PixelCard colors="#3f3f46,#27272a,#18181b" gap={8} speed={35} className="w-full h-full p-5 flex flex-col items-center justify-center text-center rounded-[inherit]">
+            <div className="flex flex-col items-center justify-center h-full">
+              <div className="w-10 h-10 rounded-lg bg-[#111111] border border-[#262626] flex items-center justify-center mb-3 group-hover:-translate-y-0.5 transition-transform">
+                <Upload className="w-4 h-4 text-white" />
+              </div>
+              <h3 className="text-[15px] font-semibold text-white mb-1.5">Upload Project</h3>
+              <p className="text-[11px] text-zinc-500 bg-[#111111] px-2.5 py-1 rounded border border-[#1A1A1A]">.zip supported</p>
+            </div>
+          </PixelCard>
+        </BorderGlow>
+
+      </div>
+
+      {/* List Section */}
+      <div className="relative z-10">
+        {/* List Header */}
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            <h2 className="text-xl font-semibold text-white">Deployments</h2>
+            <span className="px-2 py-0.5 rounded bg-[#111111] border border-[#1A1A1A] text-[11px] font-medium text-zinc-400">{deployments.length}</span>
+          </div>
+          
+          <div className="flex items-center gap-3">
+            <div className="relative">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
+              <input 
+                type="text" 
+                placeholder="Search deployments..." 
+                className="pl-9 pr-4 py-1.5 bg-[#050505] border border-[#1A1A1A] rounded-md text-[13px] focus:outline-none focus:border-zinc-500 w-[280px] text-white placeholder:text-zinc-600"
+              />
+            </div>
+            
+            <div className="flex items-center bg-[#050505] border border-[#1A1A1A] rounded-md p-0.5">
+              <button className="p-1.5 rounded bg-[#1A1A1A] text-white">
+                <List className="w-4 h-4" />
+              </button>
+              <button className="p-1.5 rounded text-zinc-500 hover:text-white transition-colors">
+                <Grid className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* List Items */}
+        <div className="space-y-2">
+          {deployments.map((dep) => (
+            <div 
+              key={dep.id} 
+              className="bg-[#050505] border border-[#1A1A1A] rounded-lg p-4 flex items-center gap-4 hover:border-[#262626] transition-colors"
+            >
+              <div className="w-10 h-10 rounded-lg bg-[#111111] border border-[#262626] flex items-center justify-center shrink-0">
+                <MonitorSmartphone className="w-5 h-5 text-white" />
+              </div>
+              
+              <div className="flex-1 min-w-0 flex flex-col justify-center">
+                <div className="flex items-center gap-3 mb-1">
+                  <h4 className="text-[15px] font-semibold text-white truncate">{dep.name}</h4>
+                  {dep.visibility === 'PUBLIC' && (
+                    <span className="text-[9px] tracking-wider font-bold px-1.5 py-0.5 rounded text-white border border-white bg-white/10">PUBLIC</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 text-[12px] text-zinc-500">
+                  <span>{dep.source}</span>
+                  <span className="w-1 h-1 rounded-full bg-zinc-600"></span>
+                  <span className="text-zinc-300">{dep.branch}</span>
+                  <span className="text-white mx-1">•</span>
+                  <span className="text-white font-medium">{dep.time}</span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3 shrink-0">
+                {dep.status === 'success' ? (
+                  <button className="px-3 py-1.5 rounded border border-[#333333] bg-transparent text-[12px] font-semibold text-white hover:bg-white hover:text-black transition-all flex items-center gap-2">
+                    <FileText className="w-3.5 h-3.5" /> View Logs <ChevronRight className="w-3 h-3" />
+                  </button>
+                ) : (
+                  <div className="w-32">
+                     <RunButton>
+                       <Play className="w-3.5 h-3.5 fill-current" /> Deploy Now
+                     </RunButton>
+                  </div>
+                )}
+                
+                <button className="p-1.5 rounded bg-[#111111] border border-[#262626] text-zinc-400 hover:text-white transition-colors flex items-center gap-1.5 px-3 text-[12px] font-medium">
+                  <Ticket className="w-3.5 h-3.5" /> Raise Ticket
+                </button>
+                
+                <button className="p-1.5 rounded text-zinc-500 hover:text-white transition-colors ml-1" title="Delete">
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+
+  // RENDER MANAGE INSTANCES (Enterprise B&W View)
+  const renderManageInstancesView = () => (
+    <div className="flex-1 overflow-y-auto p-8 custom-scrollbar">
+      
+      {/* Top Enterprise KPIs */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+        <BorderGlow 
+          backgroundColor="#050505" 
+          glowColor="0 0 100" 
+          borderRadius={12} 
+          glowIntensity={0.6}
+          className="border border-[#1A1A1A]"
+        >
+          <PixelCard colors="#3f3f46,#27272a,#18181b" gap={6} speed={35} className="w-full h-full p-5 flex flex-col rounded-[inherit]">
+            <div className="flex items-center gap-3 mb-2 relative z-10">
+              <div className="w-8 h-8 rounded bg-white/10 flex items-center justify-center border border-white/20">
+                <Activity className="w-4 h-4 text-white" />
+              </div>
+              <h3 className="text-[12px] font-semibold text-zinc-400">Active Instances</h3>
+            </div>
+            <div className="text-3xl font-bold text-white relative z-10">2</div>
+          </PixelCard>
+        </BorderGlow>
+
+        <BorderGlow 
+          backgroundColor="#050505" 
+          glowColor="0 0 100" 
+          borderRadius={12} 
+          glowIntensity={0.6}
+          className="border border-[#1A1A1A]"
+        >
+           <PixelCard colors="#3f3f46,#27272a,#18181b" gap={6} speed={35} className="w-full h-full p-5 flex flex-col rounded-[inherit]">
+             <div className="flex items-center gap-3 mb-2 relative z-10">
+              <div className="w-8 h-8 rounded bg-[#111111] flex items-center justify-center border border-[#262626]">
+                <Cpu className="w-4 h-4 text-white" />
+              </div>
+              <h3 className="text-[12px] font-semibold text-zinc-400">Compute Used</h3>
+            </div>
+            <div className="text-3xl font-bold text-white relative z-10">4 <span className="text-lg text-zinc-500 font-normal">vCPU</span></div>
+          </PixelCard>
+        </BorderGlow>
+
+        <BorderGlow 
+          backgroundColor="#050505" 
+          glowColor="0 0 100" 
+          borderRadius={12} 
+          glowIntensity={0.6}
+          className="border border-[#1A1A1A]"
+        >
+           <PixelCard colors="#3f3f46,#27272a,#18181b" gap={6} speed={35} className="w-full h-full p-5 flex flex-col rounded-[inherit]">
+             <div className="flex items-center gap-3 mb-2 relative z-10">
+              <div className="w-8 h-8 rounded bg-[#111111] flex items-center justify-center border border-[#262626]">
+                <Network className="w-4 h-4 text-white" />
+              </div>
+              <h3 className="text-[12px] font-semibold text-zinc-400">Network Egress</h3>
+            </div>
+            <div className="text-3xl font-bold text-white relative z-10">12.4 <span className="text-lg text-zinc-500 font-normal">GB</span></div>
+          </PixelCard>
+        </BorderGlow>
+
+        <BorderGlow 
+          backgroundColor="#050505" 
+          glowColor="0 0 100" 
+          borderRadius={12} 
+          glowIntensity={0.6}
+          className="border border-[#1A1A1A]"
+        >
+           <PixelCard colors="#3f3f46,#27272a,#18181b" gap={6} speed={35} className="w-full h-full p-5 flex flex-col rounded-[inherit]">
+             <div className="flex items-center gap-3 mb-2 relative z-10">
+              <div className="w-8 h-8 rounded bg-[#111111] flex items-center justify-center border border-[#262626]">
+                <span className="text-white font-bold">$</span>
+              </div>
+              <h3 className="text-[12px] font-semibold text-zinc-400">Est. Monthly Cost</h3>
+            </div>
+            <div className="text-3xl font-bold text-white relative z-10">$45.00</div>
+          </PixelCard>
+        </BorderGlow>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 relative z-10">
+        {/* Left Side: Instance List */}
+        <div className="lg:col-span-2 space-y-4">
+           <div className="flex items-center justify-between mb-2">
+              <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                 Deployed Environments
+              </h2>
+              <div className="flex gap-2">
+                <button className="px-3 py-1.5 rounded-md bg-[#111111] border border-[#262626] text-xs font-medium text-white hover:bg-white hover:text-black transition-colors">All Regions</button>
+                <button className="px-3 py-1.5 rounded-md bg-[#111111] border border-[#262626] text-xs font-medium text-white flex items-center gap-1.5 hover:bg-white hover:text-black transition-colors"><List className="w-3.5 h-3.5"/> Filter</button>
+              </div>
+           </div>
+
+           {/* Instance Cards */}
+           {instances.map(instance => (
+             <div key={instance.id} className="bg-[#050505] border border-[#1A1A1A] rounded-xl p-5 hover:border-[#333333] transition-colors group">
+                <div className="flex justify-between items-start mb-4">
+                   <div className="flex items-start gap-4">
+                      <div className="w-10 h-10 rounded-lg bg-[#111111] border border-[#262626] flex items-center justify-center shrink-0">
+                         <Server className="w-5 h-5 text-white" />
+                      </div>
+                      <div>
+                         <div className="flex items-center gap-3 mb-1">
+                           <h3 className="text-base font-semibold text-white">{instance.name}</h3>
+                           <span className="text-[10px] font-mono text-zinc-400 bg-[#111111] px-1.5 py-0.5 rounded border border-[#262626]">{instance.id}</span>
+                         </div>
+                         <div className="flex items-center gap-2 text-xs text-zinc-500 font-medium">
+                           <GitCommit className="w-3.5 h-3.5" /> Branch: <span className="text-zinc-300 font-mono">{instance.branch}</span>
+                           <span className="text-zinc-600 px-1">•</span>
+                           <span>{instance.cloud} {instance.region}</span>
+                         </div>
+                      </div>
+                   </div>
+
+                   {/* Status Badge */}
+                   {instance.status === 'running' ? (
+                     <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/10 border border-white/20 text-white text-[10px] font-bold uppercase tracking-wider">
+                       <span className="flex h-1.5 w-1.5 relative"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span><span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-white"></span></span>
+                       Running
+                     </div>
+                   ) : (
+                     <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-500 text-[10px] font-bold uppercase tracking-wider">
+                       <div className="w-1.5 h-1.5 rounded-full bg-zinc-600"></div> Stopped
+                     </div>
+                   )}
+                </div>
+
+                <div className="grid grid-cols-3 gap-4 py-4 border-t border-b border-[#1A1A1A] mb-4">
+                   <div>
+                     <span className="block text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-1">Instance Specs</span>
+                     <div className="text-[13px] font-medium text-zinc-300">{instance.specs}</div>
+                   </div>
+                   <div>
+                     <span className="block text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-1">IP Address</span>
+                     <div className="text-[13px] font-mono text-zinc-300 flex items-center gap-2">
+                       {instance.ip} <Copy className="w-3 h-3 text-zinc-500 cursor-pointer hover:text-white transition-colors" />
+                     </div>
+                   </div>
+                   <div>
+                     <span className="block text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-1">Uptime</span>
+                     <div className="text-[13px] font-medium text-zinc-300">{instance.uptime}</div>
+                   </div>
+                </div>
+
+                {/* Advanced Details Toggle (Expanded Mode) */}
+                {expandedInstanceId === instance.id && (
+                  <div className="mt-6 pt-6 mb-2 animate-fade-in border-t border-[#1A1A1A]">
+                     
+                     {/* Detailed Summary Box */}
+                     <div className="mb-8">
+                        <h4 className="text-xs font-bold text-white uppercase tracking-wider mb-4 flex items-center gap-2">
+                          <Info className="w-4 h-4 text-zinc-400" /> Instance Summary
+                        </h4>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-y-6 gap-x-4 bg-[#050505] p-5 rounded-lg border border-[#262626]">
+                           <div className="flex flex-col gap-1.5">
+                             <span className="text-[10px] font-bold text-zinc-500 uppercase">Instance ID</span>
+                             <div className="flex items-center gap-2 text-xs font-mono text-zinc-200">
+                               <span className="truncate">{instance.id}</span>
+                               <Copy className="w-3 h-3 text-zinc-600 hover:text-white cursor-pointer transition-colors" />
+                             </div>
+                           </div>
+
+                           <div className="flex flex-col gap-1.5">
+                             <span className="text-[10px] font-bold text-zinc-500 uppercase">Public IPv4</span>
+                             <div className="flex items-center gap-2 text-xs font-mono text-zinc-200">
+                               <span className="truncate">{instance.ip}</span>
+                               <ExternalLink className="w-3 h-3 text-zinc-600 hover:text-white cursor-pointer transition-colors" />
+                             </div>
+                           </div>
+
+                           <div className="flex flex-col gap-1.5">
+                             <span className="text-[10px] font-bold text-zinc-500 uppercase">Private IPv4</span>
+                             <div className="flex items-center gap-2 text-xs font-mono text-zinc-200">
+                               <span className="truncate">{instance.privateIp}</span>
+                               <Copy className="w-3 h-3 text-zinc-600 hover:text-white cursor-pointer transition-colors" />
+                             </div>
+                           </div>
+
+                           <div className="flex flex-col gap-1.5">
+                             <span className="text-[10px] font-bold text-zinc-500 uppercase">Instance State</span>
+                             <div className="flex items-center gap-2 text-xs font-semibold text-zinc-200">
+                               {instance.status === 'running' && <span className="w-1.5 h-1.5 rounded-full bg-white"></span>}
+                               {instance.status === 'stopped' && <span className="w-1.5 h-1.5 rounded-full bg-zinc-600"></span>}
+                               <span className="capitalize">{instance.status}</span>
+                             </div>
+                           </div>
+
+                           <div className="flex flex-col gap-1.5 md:col-span-2">
+                             <span className="text-[10px] font-bold text-zinc-500 uppercase">Public DNS</span>
+                             <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-300">
+                               <span className="truncate">{instance.dns}</span>
+                               <ExternalLink className="w-3 h-3 text-zinc-600 hover:text-white cursor-pointer transition-colors shrink-0" />
+                             </div>
+                           </div>
+
+                           <div className="flex flex-col gap-1.5">
+                             <span className="text-[10px] font-bold text-zinc-500 uppercase">Instance Type</span>
+                             <div className="flex items-center gap-2 text-xs font-mono text-zinc-200">
+                               <span>{instance.specs.split(' • ')[0]}</span>
+                             </div>
+                           </div>
+
+                           <div className="flex flex-col gap-1.5">
+                             <span className="text-[10px] font-bold text-zinc-500 uppercase">IAM Role</span>
+                             <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-300">
+                               <span className="truncate hover:text-white hover:underline cursor-pointer">{instance.iamRole}</span>
+                             </div>
+                           </div>
+
+                           <div className="flex flex-col gap-1.5">
+                             <span className="text-[10px] font-bold text-zinc-500 uppercase">VPC ID</span>
+                             <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-300">
+                               <span className="truncate hover:text-white hover:underline cursor-pointer">{instance.vpc}</span>
+                             </div>
+                           </div>
+
+                           <div className="flex flex-col gap-1.5">
+                             <span className="text-[10px] font-bold text-zinc-500 uppercase">Subnet ID</span>
+                             <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-300">
+                               <span className="truncate hover:text-white hover:underline cursor-pointer">{instance.subnet}</span>
+                             </div>
+                           </div>
+
+                           <div className="flex flex-col gap-1.5 md:col-span-2">
+                             <span className="text-[10px] font-bold text-zinc-500 uppercase">Instance ARN</span>
+                             <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-500">
+                               <span className="truncate">{instance.arn}</span>
+                             </div>
+                           </div>
+
+                        </div>
+                     </div>
+
+                     {/* Configuration & Actions Cards */}
+                     <div>
+                        <h4 className="text-xs font-bold text-white uppercase tracking-wider mb-4 flex items-center gap-2">
+                          <Settings className="w-4 h-4 text-zinc-400" /> Configuration & Actions
+                        </h4>
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                           <ConfigurationCard 
+                             title="Connect to your instance" 
+                             desc="Once your instance is running, log into it securely from your local computer." 
+                             btnText="Connect" 
+                             icon={TerminalSquare} 
+                           />
+                           <ConfigurationCard 
+                             title="Connect an RDS database" 
+                             desc="Configure the connection between an EC2 instance and a database to allow traffic flow." 
+                             btnText="Connect RDS" 
+                             icon={Database} 
+                           />
+                           <ConfigurationCard 
+                             title="Create Load Balancer" 
+                             desc="Create an application, network gateway or classic Elastic Load Balancer for this target." 
+                             btnText="Create ALB" 
+                             icon={Network} 
+                           />
+                           <ConfigurationCard 
+                             title="Manage detailed monitoring" 
+                             desc="Enable or disable detailed monitoring. View high-resolution graphs with a 1-minute period." 
+                             btnText="Manage monitoring" 
+                             icon={Activity} 
+                           />
+                           <ConfigurationCard 
+                             title="Create EBS snapshot policy" 
+                             desc="Create a policy that automates the creation, retention, and deletion of EBS snapshots." 
+                             btnText="Create policy" 
+                             icon={HardDrive} 
+                           />
+                           <ConfigurationCard 
+                             title="Create billing usage alerts" 
+                             desc="To manage costs and avoid surprise bills, set up email notifications for usage thresholds." 
+                             btnText="Create alerts" 
+                             icon={AlertCircle} 
+                           />
+                        </div>
+                     </div>
+                  </div>
+                )}
+
+                {/* Actions Row */}
+                <div className="flex justify-between items-center mt-2">
+                   <div className="text-xs text-zinc-500 flex items-center gap-1.5">
+                     <Clock className="w-3.5 h-3.5" /> Last deployed {instance.lastDeploy}
+                   </div>
+                   <div className="flex gap-2">
+                     <button 
+                       onClick={() => setExpandedInstanceId(expandedInstanceId === instance.id ? null : instance.id)}
+                       className={`h-8 px-3 rounded flex items-center gap-1.5 transition-colors text-xs font-medium ${expandedInstanceId === instance.id ? 'bg-white text-black border border-white' : 'bg-[#111111] border border-[#262626] hover:bg-[#1A1A1A] text-zinc-300'}`}
+                     >
+                        {expandedInstanceId === instance.id ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />} Details
+                     </button>
+                     <div className="w-px h-5 bg-[#262626] self-center mx-1"></div>
+                     <button className="h-8 px-3 rounded flex items-center gap-2 bg-[#111111] border border-[#262626] hover:bg-white hover:text-black transition-colors text-xs font-medium text-zinc-300">
+                        <TerminalSquare className="w-3.5 h-3.5" /> Terminal
+                     </button>
+                     <button className="w-8 h-8 rounded flex items-center justify-center bg-[#111111] border border-[#262626] hover:bg-white hover:text-black transition-colors text-zinc-400" title="Restart">
+                        <RotateCw className="w-3.5 h-3.5" />
+                     </button>
+                     <button className="w-8 h-8 rounded flex items-center justify-center bg-[#111111] border border-[#262626] hover:bg-white hover:text-black transition-colors text-zinc-400" title="Stop/Start">
+                        <Power className="w-3.5 h-3.5" />
+                     </button>
+                     <button className="w-8 h-8 rounded flex items-center justify-center bg-[#111111] border border-[#262626] hover:bg-white hover:text-black transition-colors text-zinc-400 ml-2" title="Destroy">
+                        <Trash2 className="w-3.5 h-3.5" />
+                     </button>
+                   </div>
+                </div>
+             </div>
+           ))}
+        </div>
+
+        {/* Right Side: Deployment History Timeline */}
+        <div className="lg:col-span-1">
+           <div className="bg-[#050505] border border-[#1A1A1A] rounded-xl flex flex-col h-[calc(100vh-220px)] sticky top-4">
+              <div className="p-4 border-b border-[#1A1A1A] flex items-center gap-2">
+                 <HistoryIcon className="w-4 h-4 text-white" />
+                 <h3 className="font-semibold text-white text-sm">Deployment History</h3>
+              </div>
+              
+              <div className="flex-1 overflow-y-auto custom-scrollbar p-5">
+                 <div className="relative space-y-6 before:absolute before:inset-0 before:ml-[11px] before:-translate-x-px md:before:mx-auto md:before:translate-x-0 before:h-full before:w-0.5 before:bg-gradient-to-b before:from-transparent before:via-[#333333] before:to-transparent">
+                    {deploymentHistory.map((log, i) => (
+                      <div key={log.id} className="relative flex items-start gap-4">
+                         {/* Timeline Dot */}
+                         <div className={`absolute left-0 w-6 h-6 rounded-full border-4 border-[#050505] ${log.status === 'success' ? 'bg-white' : 'bg-black border border-white'} flex items-center justify-center shrink-0 z-10`}>
+                            {log.status === 'success' ? <CheckCircle2 className="w-3 h-3 text-black" /> : <AlertCircle className="w-3 h-3 text-white" />}
+                         </div>
+                         
+                         {/* Content */}
+                         <div className="ml-8 bg-[#0A0A0A] border border-[#262626] rounded-lg p-3 w-full">
+                            <div className="flex justify-between items-start mb-1">
+                               <span className="text-xs font-bold text-white">{log.repo}</span>
+                               <span className="text-[10px] text-zinc-500 whitespace-nowrap">{log.time}</span>
+                            </div>
+                            <p className="text-[11px] text-zinc-400 mb-2">
+                               Deployed branch <span className="font-mono text-zinc-300">{log.branch}</span> • <span className="font-mono text-white">{log.commit}</span>
+                            </p>
+                            <div className="flex items-center gap-1.5 text-[10px] text-zinc-500 font-medium">
+                               <User className="w-3 h-3" /> by {log.user}
+                            </div>
+                         </div>
+                      </div>
+                    ))}
+                 </div>
+                 
+                 <button className="w-full mt-6 py-2 border border-[#262626] rounded bg-transparent hover:bg-white hover:text-black transition-colors text-xs font-semibold text-zinc-300">
+                   Load More Activity
+                 </button>
+              </div>
+           </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div 
+      className="flex h-screen bg-[#000000] text-zinc-300 selection:bg-white selection:text-black"
+      style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}
+    >
+      
+      {/* --- SIDEBAR --- */}
+      <aside className="w-64 border-r border-[#1A1A1A] bg-[#050505] flex flex-col shrink-0">
+        {/* Brand */}
+        <div className="h-16 flex items-center px-6 gap-3 border-b border-[#1A1A1A]">
+          <div className="w-7 h-7 rounded border border-[#333333] bg-[#0A0A0A] flex items-center justify-center">
+            <Server className="w-4 h-4 text-white" />
+          </div>
+          <span className="text-white font-bold tracking-wide text-sm">DEPL_AI</span>
+        </div>
+
+        {/* Nav Links */}
+        <nav className="flex-1 px-3 py-6 space-y-1">
+          <button 
+            onClick={() => setActiveTab('overview')}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-sm font-medium ${activeTab === 'overview' ? 'bg-[#111111] text-white border border-[#262626]' : 'hover:bg-[#0A0A0A] text-zinc-400 hover:text-zinc-200 border border-transparent'}`}
+          >
+            <LayoutGrid className="w-4 h-4" />
+            Overview
+          </button>
+          
+          <button 
+            onClick={() => setActiveTab('deployments')}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-sm font-medium ${activeTab === 'deployments' ? 'bg-[#111111] text-white border border-[#262626] relative' : 'hover:bg-[#0A0A0A] text-zinc-400 hover:text-zinc-200 border border-transparent'}`}
+          >
+            {activeTab === 'deployments' && <div className="absolute left-0 top-1.5 bottom-1.5 w-1 bg-white rounded-r-md shadow-[0_0_10px_rgba(255,255,255,0.5)]"></div>}
+            <Rocket className="w-4 h-4" />
+            Deployments
+          </button>
+
+          <button 
+            onClick={() => setActiveTab('manage_instances')}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-sm font-medium ${activeTab === 'manage_instances' ? 'bg-[#111111] text-white border border-[#262626] relative' : 'hover:bg-[#0A0A0A] text-zinc-400 hover:text-zinc-200 border border-transparent'}`}
+          >
+            {activeTab === 'manage_instances' && <div className="absolute left-0 top-1.5 bottom-1.5 w-1 bg-white rounded-r-md shadow-[0_0_10px_rgba(255,255,255,0.5)]"></div>}
+            <HardDrive className="w-4 h-4" />
+            Manage Instance
+          </button>
+
+          <button 
+            onClick={() => setActiveTab('settings')}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all text-sm font-medium ${activeTab === 'settings' ? 'bg-[#111111] text-white border border-[#262626]' : 'hover:bg-[#0A0A0A] text-zinc-400 hover:text-zinc-200 border border-transparent'}`}
+          >
+            <Settings className="w-4 h-4" />
+            Settings
+          </button>
+        </nav>
+
+        {/* User Profile */}
+        <div className="p-4 border-t border-[#1A1A1A]">
+          <div className="flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-[#111111] transition-colors cursor-pointer">
+            <div className="w-8 h-8 rounded-full bg-zinc-200 flex items-center justify-center">
+              <div className="w-6 h-6 rounded-full bg-black/10 flex items-center justify-center text-xs font-bold text-black">
+                A
+              </div>
+            </div>
+            <div className="flex-1 overflow-hidden">
+              <p className="text-sm font-bold text-white truncate">adityajayashankar</p>
+              <div className="flex items-center gap-1 text-[11px] text-zinc-500 mt-0.5">
+                <LogOut className="w-3 h-3" />
+                <span>Sign out</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      {/* --- MAIN CONTENT --- */}
+      <main className="flex-1 flex flex-col h-full overflow-hidden bg-[#000000]">
+        
+        {/* Header */}
+        <header className="h-16 flex items-center justify-between px-8 border-b border-[#1A1A1A]">
+          <div className="flex items-center gap-2 text-[13px] text-zinc-500">
+            <span className="hover:text-zinc-300 cursor-pointer transition-colors">Dashboard</span>
+            <span className="text-zinc-700">/</span>
+            <span className="text-white font-medium">
+              {activeTab === 'manage_instances' ? 'Manage Instance' : 'Command Center'}
+            </span>
+          </div>
+          
+          <div className="flex items-center gap-3">
+            <button className="flex items-center gap-2 px-3 py-1.5 rounded-md border border-[#262626] bg-[#0A0A0A] hover:bg-white hover:text-black transition-all text-[13px] font-bold text-zinc-300">
+              <Server className="w-3.5 h-3.5" />
+              Manage Org
+            </button>
+            <div className="w-px h-4 bg-[#262626] mx-1"></div>
+            <button className="p-1.5 rounded-md hover:bg-white transition-all text-zinc-500 hover:text-black">
+              <RefreshCw className="w-4 h-4" />
+            </button>
+          </div>
+        </header>
+
+        {/* View Switcher */}
+        {activeTab === 'deployments' && renderDeploymentsView()}
+        {activeTab === 'manage_instances' && renderManageInstancesView()}
+        {activeTab === 'overview' && <div className="flex-1 flex items-center justify-center text-zinc-600 font-medium">Overview Panel (Coming Soon)</div>}
+        {activeTab === 'settings' && <div className="flex-1 flex items-center justify-center text-zinc-600 font-medium">Settings Panel (Coming Soon)</div>}
+        
+      </main>
+
+      {/* Global CSS for scrollbar and animations */}
+      <style dangerouslySetInnerHTML={{__html: `
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: transparent;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background-color: #262626;
+          border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background-color: #3f3f46;
+        }
+        @keyframes fadeIn {
+          from { opacity: 0; transform: translateY(-5px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in {
+          animation: fadeIn 0.25s ease-out forwards;
+        }
+      `}} />
+    </div>
+  );
+};
+
+// Extracted History Icon 
+function HistoryIcon(props) {
+  return (
+    <svg
+      {...props}
+      xmlns="http://www.w3.org/2000/svg"
+      width="24"
+      height="24"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+      <path d="M3 3v5h5" />
+      <path d="M12 7v5l4 2" />
+    </svg>
+  )
+}
+
+export default App;

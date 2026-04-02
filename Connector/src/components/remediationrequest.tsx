@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { useLLM, LLM_PROVIDERS, type LLMProvider } from '@/lib/llm-context';
+import { useLLM, LLM_PROVIDERS } from '@/lib/llm-context';
 
 interface RemediationRequestProps {
   isOpen: boolean;
@@ -10,27 +10,25 @@ interface RemediationRequestProps {
   projectType?: 'local' | 'github' | null;
 }
 
+const REMEDIATION_PROVIDER = 'claude' as const;
+const REMEDIATION_PROVIDER_CONFIG = LLM_PROVIDERS.find((provider) => provider.id === REMEDIATION_PROVIDER)!;
+const REMEDIATION_DEFAULT_MODEL = 'claude-sonnet-4-5';
+
 export default function RemediationRequest({ isOpen, onClose, onContinue, projectType }: RemediationRequestProps) {
   const [githubToken, setGithubToken] = useState('');
-  const { provider, setProvider, apiKeys, setApiKey, selectedModels, setModel } = useLLM();
+  const { apiKeys, setApiKey, selectedModels, setModel } = useLLM();
   const [keyInput, setKeyInput] = useState('');
   const [modelInput, setModelInput] = useState('');
-
-  const handleProviderSelect = (p: LLMProvider) => {
-    setProvider(p);
-    setKeyInput(apiKeys[p] || '');
-    setModelInput(selectedModels[p] || LLM_PROVIDERS.find(x => x.id === p)!.flagship);
-  };
 
   if (!isOpen) return null;
 
   const handleContinue = () => {
     const token = githubToken.trim();
     const key = keyInput.trim();
-    const model = modelInput.trim() || selectedModels[provider] || LLM_PROVIDERS.find(p => p.id === provider)!.flagship;
-    if (key && key !== apiKeys[provider]) setApiKey(provider, key);
-    if (model !== selectedModels[provider]) setModel(provider, model);
-    onContinue(token || undefined, provider, key || apiKeys[provider] || undefined, model);
+    const model = modelInput.trim() || REMEDIATION_DEFAULT_MODEL;
+    if (key && key !== apiKeys[REMEDIATION_PROVIDER]) setApiKey(REMEDIATION_PROVIDER, key);
+    if (model !== selectedModels[REMEDIATION_PROVIDER]) setModel(REMEDIATION_PROVIDER, model);
+    onContinue(token || undefined, REMEDIATION_PROVIDER, key || apiKeys[REMEDIATION_PROVIDER] || undefined, model);
     setGithubToken('');
     onClose();
   };
@@ -38,14 +36,6 @@ export default function RemediationRequest({ isOpen, onClose, onContinue, projec
   const handleClose = () => {
     setGithubToken('');
     onClose();
-  };
-
-  const PROVIDER_COLORS: Record<LLMProvider, string> = {
-    claude:     'border-orange-500/50 bg-orange-500/10 text-orange-300',
-    openai:     'border-emerald-500/50 bg-emerald-500/10 text-emerald-300',
-    gemini:     'border-blue-500/50 bg-blue-500/10 text-blue-300',
-    groq:       'border-purple-500/50 bg-purple-500/10 text-purple-300',
-    openrouter: 'border-sky-500/50 bg-sky-500/10 text-sky-300',
   };
 
   return (
@@ -82,32 +72,23 @@ export default function RemediationRequest({ isOpen, onClose, onContinue, projec
             </p>
           </div>
 
-          {/* AI Provider selector */}
+          {/* Claude remediation config */}
           <div className="mb-5">
-            <label className="block text-sm font-medium text-zinc-300 mb-2.5">AI Model</label>
-            <div className="grid grid-cols-5 gap-1.5">
-              {LLM_PROVIDERS.map(p => (
-                <button
-                  key={p.id}
-                  onClick={() => handleProviderSelect(p.id)}
-                  className={`py-2 px-1 rounded-xl border text-xs font-semibold transition-all text-center ${
-                    provider === p.id
-                      ? PROVIDER_COLORS[p.id]
-                      : 'border-white/8 bg-white/3 text-zinc-500 hover:text-zinc-300 hover:bg-white/8'
-                  }`}
-                >
-                  {p.label}
-                </button>
-              ))}
+            <label className="block text-sm font-medium text-zinc-300 mb-2.5">Remediation Agent</label>
+            <div className="rounded-xl border border-orange-500/20 bg-orange-500/10 px-3 py-2.5">
+              <div className="text-sm font-semibold text-orange-200">Claude Agent SDK</div>
+              <p className="mt-1 text-[11px] leading-relaxed text-orange-100/70">
+                Remediation runs on Claude only. Other LLM providers are not used for this workflow.
+              </p>
             </div>
             {/* Model text input */}
             <div className="mt-2.5">
               <input
                 type="text"
-                value={modelInput !== '' ? modelInput : (selectedModels[provider] || '')}
+                value={modelInput !== '' ? modelInput : REMEDIATION_DEFAULT_MODEL}
                 onChange={e => setModelInput(e.target.value)}
-                onFocus={() => { if (modelInput === '') setModelInput(selectedModels[provider] || LLM_PROVIDERS.find(p => p.id === provider)!.flagship); }}
-                placeholder={LLM_PROVIDERS.find(p => p.id === provider)?.flagship}
+                onFocus={() => { if (modelInput === '') setModelInput(REMEDIATION_DEFAULT_MODEL); }}
+                placeholder={REMEDIATION_DEFAULT_MODEL}
                 className="w-full bg-black/40 border border-white/10 rounded-xl px-3 py-2.5 text-xs text-white placeholder-zinc-600 focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/30 outline-none transition-all font-mono"
                 autoComplete="off"
                 spellCheck={false}
@@ -117,10 +98,10 @@ export default function RemediationRequest({ isOpen, onClose, onContinue, projec
             <div className="mt-2 relative">
               <input
                 type="password"
-                value={keyInput !== '' ? keyInput : (apiKeys[provider] || '')}
+                value={keyInput !== '' ? keyInput : (apiKeys[REMEDIATION_PROVIDER] || '')}
                 onChange={e => setKeyInput(e.target.value)}
-                onFocus={() => { if (keyInput === '') setKeyInput(apiKeys[provider] || ''); }}
-                placeholder={LLM_PROVIDERS.find(p => p.id === provider)?.placeholder || 'API key...'}
+                onFocus={() => { if (keyInput === '') setKeyInput(apiKeys[REMEDIATION_PROVIDER] || ''); }}
+                placeholder={REMEDIATION_PROVIDER_CONFIG.placeholder || 'API key...'}
                 className="w-full bg-black/40 border border-white/10 rounded-xl px-3 py-2.5 text-xs text-white placeholder-zinc-600 focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/30 outline-none transition-all font-mono"
                 autoComplete="off"
                 spellCheck={false}
