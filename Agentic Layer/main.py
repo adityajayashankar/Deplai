@@ -315,7 +315,7 @@ async def _handle_websocket(
 
                 task = asyncio.create_task(run_workflow(runner))
                 runner._task = task  # attach so cancel() can interrupt it
-            elif command.action == "approve_rescan":
+            else:
                 runner = active.get(project_id)
                 if runner is None:
                     await websocket.send_json({

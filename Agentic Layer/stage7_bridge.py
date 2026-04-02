@@ -53,15 +53,7 @@ def _estimate_stage7_costs(
 ) -> tuple[list[dict[str, Any]], float, list[str], str]:
     region_label = _aws_region_label(region)
     pricing_nodes: list[dict[str, Any]] = []
-    line_items, total_monthly, cost_warnings, estimate_type = _estimate_stage7_costs(
-        region=region,
-        compute=compute,
-        services=services,
-        storage=storage,
-        database=database,
-        cache=cache,
-        cdn=cdn,
-    )
+    line_items: list[dict[str, Any]] = []
     warnings: list[str] = []
 
     if "website_bucket" in storage:
@@ -232,10 +224,18 @@ def _stage7_fallback_payload(
     database = str(infra_plan.get("database") or "").strip().lower()
     cache = str(infra_plan.get("cache") or "").strip().lower()
     cdn = str(infra_plan.get("cdn") or "").strip().lower()
+    line_items, total_monthly, cost_warnings, estimate_type = _estimate_stage7_costs(
+        region=region,
+        compute=compute,
+        services=services,
+        storage=storage,
+        database=database,
+        cache=cache,
+        cdn=cdn,
+    )
 
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
-    line_items: list[dict[str, Any]] = []
 
     def add_node(node_id: str, label: str, node_type: str, color: str, existing: bool = False) -> None:
         if any(existing_node.get("id") == node_id for existing_node in nodes):

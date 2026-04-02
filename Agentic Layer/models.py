@@ -43,11 +43,12 @@ class ScanValidationResponse(BaseModel):
 
 
 class WebSocketCommand(BaseModel):
-    action: Literal["start", "approve_rescan"]
+    action: Literal["start", "continue_round", "push_current", "approve_push"]
 
 
 class StreamStatus(str, Enum):
     running = "running"
+    waiting_decision = "waiting_decision"
     waiting_approval = "waiting_approval"
     completed = "completed"
     error = "error"

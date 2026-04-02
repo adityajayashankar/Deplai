@@ -158,7 +158,14 @@ def run_terraform_command(
             container.start()
             result = container.wait(timeout=timeout_seconds)
             stdout = _decode_output(container.logs(stdout=True, stderr=True))
-            status_code = int((result or {}).get("StatusCode") or 1)
+            if isinstance(result, dict):
+                raw_status = result.get("StatusCode")
+            else:
+                raw_status = result
+            try:
+                status_code = int(raw_status)
+            except Exception:
+                status_code = 1
             _sync_volume_to_local(local_dir, volume_name)
             if status_code != 0:
                 _emit_progress(apply_context, "error", f"terraform {primary} failed.")

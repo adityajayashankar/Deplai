@@ -284,20 +284,49 @@ class RemediationRunner(RunnerBase):
         self.context = remediation_context
         self.project_id = remediation_context.project_id
         self._docker = get_docker_client()
-        self._approval_event = asyncio.Event()
+        self._command_event = asyncio.Event()
+        self._approval_event = self._command_event
+        self._pending_action: str | None = None
+        self._decision_requested = False
         self._approval_requested = False
         self._last_pr_url: str | None = None
 
     async def handle_command(self, command: WebSocketCommand):
-        if command.action != "approve_rescan":
+        if command.action == "continue_round":
+            if not self._decision_requested:
+                await self._send_message("warning", "Continue request ignored: remediation is not waiting for a round decision.")
+                return
+            if self._command_event.is_set():
+                return
+            self._pending_action = "continue_round"
+            self._command_event.set()
+            await self._send_message("success", "Operator selected another remediation round. Running a verification scan before the next pass.")
             return
-        if not self._approval_requested:
-            await self._send_message("warning", "Approval ignored: remediation is not waiting for approval.")
+
+        if command.action == "push_current":
+            if not self._decision_requested:
+                await self._send_message("warning", "Push request ignored: remediation is not waiting for a round decision.")
+                return
+            if self._command_event.is_set():
+                return
+            self._pending_action = "push_current"
+            self._command_event.set()
+            await self._send_message("success", "Operator selected the current fixes. Moving to final approval before persistence.")
             return
-        if self._approval_event.is_set():
-            return
-        self._approval_event.set()
-        await self._send_message("success", "Human approval received. Starting security re-scan.")
+
+        if command.action == "approve_push":
+            if not self._approval_requested:
+                await self._send_message("warning", "Approval ignored: remediation is not waiting for final approval.")
+                return
+            if self._command_event.is_set():
+                return
+            self._pending_action = "approve_push"
+            self._command_event.set()
+            await self._send_message("success", "Final approval received. Persisting approved remediation changes and starting verification re-scan.")
+
+    def _clear_pending_action(self):
+        self._pending_action = None
+        self._command_event.clear()
 
     def _ensure_output_volume(self) -> tuple[bool, str]:
         try:
@@ -597,19 +626,51 @@ echo "PUSHED"
 
         return all(success for success, _, _ in results)
 
-    async def _wait_for_human_approval(self):
-        self._approval_requested = True
-        await self._send_message("phase", "Awaiting Human Approval")
+    async def _wait_for_round_decision(self) -> str:
+        self._decision_requested = True
+        self._approval_requested = False
+        self._clear_pending_action()
+        await self._send_message("phase", "Review Current Fixes")
         await self._send_message(
             "warning",
-            "Review remediation changes and approve to rerun Bearer, Syft, and Grype.",
+            "Review the changed files. Choose whether to push these fixes forward for approval or run one more remediation round first.",
         )
-        await self._send_status(StreamStatus.waiting_approval)
+        await self._send_status(StreamStatus.waiting_decision)
 
-        while not self._approval_event.is_set():
+        while not self._command_event.is_set():
             self._check_cancelled()
             await asyncio.sleep(0.2)
 
+        action = str(self._pending_action or "").strip().lower()
+        self._decision_requested = False
+        self._clear_pending_action()
+
+        if action == "continue_round":
+            await self._send_status(StreamStatus.running)
+            return action
+        if action == "push_current":
+            return action
+
+        await self._send_message("warning", "Unknown remediation decision received. Defaulting to final approval.")
+        return "push_current"
+
+    async def _wait_for_human_approval(self):
+        self._approval_requested = True
+        self._decision_requested = False
+        self._clear_pending_action()
+        await self._send_message("phase", "Awaiting Human Approval")
+        await self._send_message(
+            "warning",
+            "Review remediation changes and approve to persist the fixes, create the PR if applicable, and rerun Bearer, Syft, and Grype.",
+        )
+        await self._send_status(StreamStatus.waiting_approval)
+
+        while not self._command_event.is_set():
+            self._check_cancelled()
+            await asyncio.sleep(0.2)
+
+        self._approval_requested = False
+        self._clear_pending_action()
         await self._send_status(StreamStatus.running)
 
     @staticmethod
@@ -909,6 +970,64 @@ echo "PUSHED"
 
             self._check_cancelled()
 
+            offer_round_decision = (
+                cycle == 0
+                and bool(cycle_changed_files)
+                and cycle + 1 < MAX_REMEDIATION_CYCLES
+                and not budget_exhausted
+            )
+            if offer_round_decision:
+                next_action = await self._wait_for_round_decision()
+                if next_action == "continue_round":
+                    await self._send_message("info", "Invalidating previous scan cache")
+                    await self._run_step(lambda: invalidate_cache(self.project_id))
+
+                    rescanned = await self._run_rescan()
+                    if not rescanned:
+                        return await self._terminate("Security re-scan failed after the operator requested another remediation round.")
+
+                    rescan_ok, rescan_data = await self._run_step(partial(get_scan_results, self.project_id))
+                    if not rescan_ok:
+                        return await self._terminate("Could not reload scan results after the operator requested another remediation round.")
+
+                    remaining_vulns = self._count_findings_for_scope(rescan_data, remediation_scope)
+                    if remaining_vulns == 0:
+                        await self._send_message(
+                            "success",
+                            f"{cycle_label} Verification scan shows no remaining findings in scope ({remediation_scope}). Proceeding to final approval.",
+                        )
+                    else:
+                        await self._send_message(
+                            "info",
+                            f"{cycle_label} {remaining_vulns} finding(s) remain in scope ({remediation_scope}) after the first remediation round.",
+                        )
+                        if remaining_vulns >= last_remaining:
+                            no_progress_cycles += 1
+                            await self._send_message(
+                                "warning",
+                                (
+                                    f"{cycle_label} Remaining findings did not decrease "
+                                    f"({remaining_vulns} >= {last_remaining}). "
+                                    f"No-progress streak: {no_progress_cycles}/{REMEDIATION_NO_PROGRESS_LIMIT}."
+                                ),
+                            )
+                            if no_progress_cycles >= REMEDIATION_NO_PROGRESS_LIMIT:
+                                await self._send_message(
+                                    "warning",
+                                    "Stopping remediation due to repeated no-progress after verification rescans. Proceeding with the current fixes.",
+                                )
+                        else:
+                            no_progress_cycles = 0
+
+                    last_remaining = remaining_vulns
+                    if remaining_vulns > 0 and no_progress_cycles < REMEDIATION_NO_PROGRESS_LIMIT:
+                        await self._send_message(
+                            "info",
+                            f"Starting next remediation cycle ({cycle + 2}/{MAX_REMEDIATION_CYCLES})...",
+                        )
+                        scan_data = rescan_data
+                        continue
+
             # Step 5: Wait for explicit human approval before persisting & rescanning
             await self._wait_for_human_approval()
 
@@ -980,6 +1099,12 @@ echo "PUSHED"
             else:
                 no_progress_cycles = 0
             last_remaining = remaining_vulns
+
+            await self._send_message(
+                "info",
+                "Approved remediation changes have been verified. Ending the remediation loop before any additional PR rounds.",
+            )
+            break
 
             if cycle + 1 < MAX_REMEDIATION_CYCLES:
                 await self._send_message(

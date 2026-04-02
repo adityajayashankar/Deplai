@@ -167,7 +167,14 @@ def _run_terraform_with_tracking(
         container.start()
         result = container.wait()
         logs = decode_output(container.logs(stdout=True, stderr=True))
-        status_code = int((result or {}).get("StatusCode") or 1)
+        if isinstance(result, dict):
+            raw_status = result.get("StatusCode")
+        else:
+            raw_status = result
+        try:
+            status_code = int(raw_status)
+        except Exception:
+            status_code = 1
         if status_code != 0:
             _emit_progress(apply_context, "error", f"terraform {primary} failed.")
             raise RuntimeError(logs or f"terraform command failed (exit {status_code})")
