@@ -7,8 +7,13 @@ The active runtime in this repository is:
 - `Connector`: Next.js 16 control plane and backend-for-frontend
 - `Agentic Layer`: FastAPI orchestration service
 - `KGagent`: graph-backed security context injected into remediation
-- `diagram_cost-estimation_agent`: Stage 7 diagram and cost subprocess
-- `terraform_agent`: backend Terraform engine dependency, plus Connector fallback bundle generation
+- `Diagram-Cost-Agent`: Stage 7 diagram and cost implementation
+- `Terraform Agent/agent`: Terraform generation engine imported as `terraform_agent.agent.*`
+- `Customization Agent/tenant_builder_app`: tenant customization backend and frontend
+
+Repository path note:
+
+- `diagram_cost-estimation_agent/` and `terraform_agent/` exist as placeholder folders in this workspace, while active implementations currently live in `Diagram-Cost-Agent/` and `Terraform Agent/agent/`.
 
 ## What DeplAI Does
 
@@ -35,11 +40,17 @@ DeplAI is built around a stage-oriented delivery workflow:
 - GitHub branch push and PR creation for remediation changes
 - Local-project persistence for non-GitHub projects
 - Knowledge graph-assisted vulnerability analysis with graceful degradation
+- Stage 6 repository analysis (`/api/repository-analysis/run`) and architecture review start/complete workflows
 - AWS architecture generation and cost planning
 - Stage 7.5 approval payload generation
+- Deterministic Stage 7 fallback payload generation when subprocess execution is unavailable
 - Terraform bundle generation plus template fallback
 - Budget-aware deployment gating
 - AWS runtime Terraform apply, status, stop, destroy, and runtime-details flows
+- Multi-provider chat support (`claude`, `openai`, `gemini`, `groq`, `openrouter`, `ollama`) with server fallback chain
+- Tenant customization proxy flows from Connector into customization backend (`/api/customization/*`)
+- Tenant customization implementation outputs including modified-file diffs and plan markdown
+- Tenant branding asset upload and preview endpoints for customization workflows
 - Pipeline dashboard with WebSocket-backed stage telemetry
 
 ## Key Capabilities
@@ -58,10 +69,19 @@ DeplAI is built around a stage-oriented delivery workflow:
 
 - AWS architecture JSON generation
 - AWS cost estimation
+- Repository analysis context generation for deployment planning
+- Architecture review question generation and completion flows
 - Diagram generation
 - Stage approval contracts
 - IaC generation and review
 - GitOps or runtime deployment mode
+
+### Tenant customization
+
+- Conversational tenant manifest drafting and confirmation
+- Frontend plus backend customization graph execution
+- Deterministic fallback customization pass for static and heterogeneous repositories
+- Branding asset transform, storage, and repo patching during implement runs
 
 ### Control plane and operations
 
@@ -79,8 +99,10 @@ DeplAI is built around a stage-oriented delivery workflow:
 - `run_analysis_agent`: queries KGagent for CVE/CWE intelligence and produces remediation context
 - `run_remediation_supervisor`: LangGraph-style proposer/critic/synthesizer remediation loop
 - `run_claude_remediation`: fallback single-pass Claude remediator
-- `diagram_cost-estimation_agent`: subprocess agent for diagram plus cost payload generation
-- `terraform_agent`: Terraform generation engine used by backend generation paths
+- `repository_analysis.service`: detects framework/runtime/process/data-store context for Stage 6 planning
+- `architecture_decision.service`: builds architecture review questions and produces deployment profile outputs
+- `stage7_bridge`: executes Stage 7 subprocess payload generation with deterministic fallback
+- `terraform_agent` imports: backend Terraform generation engine used by backend generation paths (active implementation under `Terraform Agent/agent`)
 
 ### Remediation architecture
 
@@ -193,8 +215,11 @@ DeplAI/
 |- Connector/                      Next.js UI, BFF routes, auth, GitHub integration
 |- Agentic Layer/                  FastAPI orchestration for scan, remediation, architecture, cost, IaC, deploy
 |- KGagent/                        Graph-backed security analysis used during remediation
-|- diagram_cost-estimation_agent/  Stage 7 diagram and cost subprocess
-|- terraform_agent/                Terraform generation engine
+|- Diagram-Cost-Agent/             Active Stage 7 diagram and cost agent implementation
+|- Terraform Agent/agent/          Active Terraform generation engine implementation
+|- Customization Agent/            Tenant customization runtime (backend + frontend)
+|- diagram_cost-estimation_agent/  Placeholder path currently targeted by Stage 7 bridge lookup
+|- terraform_agent/                Placeholder package path in this workspace
 |- runtime/                        Runtime/deploy support artifacts
 |- ARCHITECTURE.md                 Detailed runtime and agent architecture
 |- RUNBOOK.md                      Startup, operations, and troubleshooting guide
@@ -254,6 +279,8 @@ AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
 AWS_DEFAULT_REGION=ap-south-1
 
+CUSTOMIZATION_AGENT_BASE_URL=http://127.0.0.1:8010
+
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=
@@ -278,7 +305,15 @@ npm install
 npm run dev
 ```
 
-5. Open `http://localhost:3000`.
+5. Optional: start customization backend if you will use tenant customization routes:
+
+```bash
+cd "Customization Agent/tenant_builder_app/backend"
+pip install -r requirements.txt
+uvicorn main:app --host 127.0.0.1 --port 8010
+```
+
+6. Open `http://localhost:3000`.
 
 ### Sanity checks
 
@@ -291,15 +326,18 @@ curl http://localhost:8000/health
 Python syntax check:
 
 ```bash
-python -m compileall "Agentic Layer" KGagent terraform_agent diagram_cost-estimation_agent
+python -m compileall "Agentic Layer" KGagent "Terraform Agent/agent" "Diagram-Cost-Agent"
 ```
 
 ## Current Constraints
 
 - `docker-compose.yml` only starts `agentic-layer`
 - MySQL, Neo4j, and Qdrant are not provisioned by compose
+- `Connector` customization routes require a separate customization backend (default `http://127.0.0.1:8010`) when those routes are used
 - Runtime apply currently supports AWS only
+- Stage 7 can intentionally fall back to deterministic payload generation if subprocess execution fails
 - Terraform generation may intentionally fall back to Connector-generated bundles
+- Directory naming is currently mixed (`Diagram-Cost-Agent` vs `diagram_cost-estimation_agent`, `Terraform Agent/agent` vs `terraform_agent` placeholders)
 - KG degradation should not block remediation
 - Remediation is cost-capped; it does not guarantee that every vulnerability in a very large repo will be fixed in one run
 

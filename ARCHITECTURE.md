@@ -9,8 +9,10 @@ DeplAI is a staged DevSecOps orchestration platform with:
 - a Next.js control plane and BFF in `Connector`
 - a FastAPI orchestration runtime in `Agentic Layer`
 - a KG-backed analysis path for remediation enrichment
-- a Stage 7 subprocess for diagram and cost packaging
+- a Stage 6 planning layer for repository analysis and architecture Q/A
+- a Stage 7 subprocess for diagram and cost packaging with deterministic fallback
 - Terraform generation and AWS-focused runtime deployment
+- a separate tenant customization runtime integrated through Connector proxy routes
 
 The platform is optimized for:
 
@@ -45,6 +47,8 @@ flowchart LR
     Agentic --> Stage7[diagram_cost-estimation_agent<br/>subprocess]
     Agentic --> Terraform[terraform_agent]
     Agentic --> AWS[AWS APIs]
+
+    Connector --> Customization[Customization Agent<br/>tenant_builder_app backend]
 ```
 
 ## 3. Major Components
@@ -123,7 +127,7 @@ Behavioral note:
 
 ### 3.4 Stage 7 Agent
 
-`diagram_cost-estimation_agent/` is executed from the backend as a subprocess.
+Stage 7 execution is bridged by `Agentic Layer/stage7_bridge.py`.
 
 Responsibilities:
 
@@ -131,9 +135,38 @@ Responsibilities:
 - cost estimation packaging
 - Stage 7.5 approval payload preparation
 
+Operational behavior:
+
+- the bridge currently resolves the subprocess runner at `diagram_cost-estimation_agent/run_stage7.py`
+- if the subprocess path is missing, returns empty output, or returns invalid JSON, the bridge emits a deterministic fallback approval payload
+
 ### 3.5 Terraform Engine
 
-`terraform_agent/` is still used as an engine dependency for Terraform generation, while Connector also contains a local IaC fallback path. Runtime apply is executed from Agentic Layer using the HashiCorp Terraform image.
+Terraform generation is consumed through imports like `terraform_agent.agent.*` in Agentic Layer. In this repository, the active engine implementation is under `Terraform Agent/agent/`, while Connector also contains a local IaC fallback path. Runtime apply is executed from Agentic Layer using the HashiCorp Terraform image.
+
+### 3.6 Stage 6 Planning Services
+
+Stage 6 planning is implemented directly in Agentic Layer through:
+
+- `repository_analysis.service` for framework/runtime/process/data-store/build inference
+- `architecture_decision.service` for question generation, answer completion, deployment profile synthesis, and Stage 7 approval wiring
+
+Primary routes:
+
+- `POST /api/repository-analysis/run`
+- `POST /api/architecture/review/start`
+- `POST /api/architecture/review/complete`
+
+### 3.7 Customization Runtime
+
+`Customization Agent/tenant_builder_app` provides tenant-specific customization flows and is integrated through Connector proxy routes in `Connector/src/app/api/customization/[...path]/route.ts`.
+
+Current integration behavior:
+
+- default upstream is `http://127.0.0.1:8010`
+- Connector rewrites shorthand paths (for example implement/reset-repo/assets) to backend tenant endpoints
+- repo-bound calls resolve and inject `base_repo_path` before proxying
+- preview routes can serve either base repo files or tenant `SubSpace-*` working copies
 
 ## 4. Stage Model
 
@@ -299,6 +332,23 @@ There are two active deploy modes:
   - backend runtime Terraform apply
   - currently AWS-only
 
+### 7.5 Chat LLM Provider Routing
+
+Connector chat supports user-supplied provider configs and built-in fallback.
+
+Supported providers in route logic:
+
+- `claude`
+- `openai`
+- `gemini`
+- `groq`
+- `openrouter`
+- `ollama`
+
+Built-in fallback chain when no client provider call succeeds:
+
+- Groq -> Ollama Cloud -> OpenRouter
+
 ## 8. Data and State Architecture
 
 ### 8.1 Persistent metadata
@@ -378,6 +428,9 @@ Agentic Layer maintains in-memory maps for:
 - runtime deployment remains AWS-only
 - some planning and IaC artifacts are still shaped in Connector rather than persisted as a single backend run object
 - Terraform generation can intentionally fall back to local template generation
+- directory naming is mixed in the current workspace:
+  - Stage 7 implementation is active under `Diagram-Cost-Agent/`, while bridge lookup currently targets `diagram_cost-estimation_agent/`
+  - Terraform implementation is active under `Terraform Agent/agent/`, while `terraform_agent/` at repo root is currently an empty placeholder
 
 ## 12. Source-of-Truth Files
 
@@ -390,6 +443,9 @@ When docs and runtime differ, these files win:
 - `Agentic Layer/claude_remediator.py`
 - `Agentic Layer/stage7_bridge.py`
 - `Connector/src/features/pipeline/**`
+- `Agentic Layer/repository_analysis/service.py`
+- `Agentic Layer/architecture_decision/service.py`
+- `Connector/src/app/api/customization/[...path]/route.ts`
 
 ## 13. Related Docs
 

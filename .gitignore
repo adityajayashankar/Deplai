@@ -61,6 +61,17 @@ __pycache__/
 *.jsonl
 *.mjs
 
+# Allow tracked config/source artifacts in Customization Agent
+!Customization Agent/**/*.json
+!Customization Agent/**/*.jsonl
+!Customization Agent/**/*.mjs
+
+# Customization Agent runtime artifacts
+Customization Agent/SubSpace-*
+Customization Agent/CulturePlace-main/frontend/.env.local
+Customization Agent/tenant_builder_app/backend/logs/customization.log
+Customization Agent/tenant_builder_app/backend/tenants/
+
 # KGagent data and config files — needed as Neo4j fallback and for agent config
 !KGagent/**/*.json
 !KGagent/**/*.jsonl

@@ -1123,6 +1123,27 @@ export default function DashboardHomeApp() {
     }
   }, [primePipelineState, projectsById, router, startScan]);
 
+  const handleOpenCustomization = useCallback((repo: DashboardRepository) => {
+    const derivedTenantId = repo.name
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 63);
+
+    const fallbackTenantId = repo.id
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 63);
+
+    const tenantId = derivedTenantId || fallbackTenantId || 'draft-tenant';
+    router.push(
+      `/dashboard/customization?projectId=${encodeURIComponent(repo.id)}&projectName=${encodeURIComponent(repo.name)}&tenantId=${encodeURIComponent(tenantId)}`,
+    );
+  }, [router]);
+
   const handleDelete = useCallback(async (projectId: string) => {
     const project = projectsById[projectId];
     if (!project) return;
@@ -1425,12 +1446,15 @@ export default function DashboardHomeApp() {
                       </div>
 
                       <div className={`flex shrink-0 items-center gap-2 ${viewMode === 'grid' ? 'w-full justify-between border-t border-[#1A1A1A] pt-2' : ''}`}>
-                        <div className="flex gap-2">
+                        <div className="flex flex-wrap gap-2">
                           <PixelNoiseButton onClick={() => handleDeploy(repo.id)} className="px-5 py-2 text-sm">
                             <Rocket className="h-3.5 w-3.5" /> Deploy
                           </PixelNoiseButton>
                           <PixelNoiseButton onClick={() => void handleRunScan(repo.id)} className="px-5 py-2 text-sm">
                             <Zap className="h-3.5 w-3.5 fill-current" /> Run Scan
+                          </PixelNoiseButton>
+                          <PixelNoiseButton onClick={() => handleOpenCustomization(repo)} className="px-5 py-2 text-sm">
+                            <Settings className="h-3.5 w-3.5" /> Customize UI
                           </PixelNoiseButton>
                         </div>
                         <div className="flex items-center gap-1">

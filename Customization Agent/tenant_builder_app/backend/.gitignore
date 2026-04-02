@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment variables
+.env
+
+# macOS
+.DS_Store
+
+tenant_builder_app/backend/tenants/

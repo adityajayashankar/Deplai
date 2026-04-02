@@ -1,0 +1,512 @@
+Tenant Builder Customization Engine: Detailed Guide
+
+1. What This System Does
+
+The Tenant Builder backend converts natural-language tenant requirements into a persisted tenant manifest and then applies those requirements to a tenant-specific repository clone.
+
+At a high level, the system supports:
+
+1. Conversational manifest authoring (/chat).
+2. Manifest confirmation and change gating (/confirm).
+3. Deterministic + LLM-assisted code customization (/api/tenant/implement).
+4. Optional React bootstrap templateization.
+5. Asset upload and code patching for branding images.
+6. Validation and run reporting.
+
+The engine is designed to work with two frontend roots in the target repo:
+
+1. frontend
+2. admin-frontend
+
+---
+
+2. Core Runtime Components
+
+2.1 API Layer
+
+Main entrypoint: backend/main.py
+
+Important endpoints:
+
+1. POST /chat
+2. GET /manifest
+3. POST /confirm
+4. POST /api/tenant/implement
+5. POST /api/admin/tenant/reset-repo
+6. POST /api/tenant/assets/upload
+7. GET /api/tenant/assets/{tenant_id}/{asset_type}
+8. GET /api/tenant/assets/{tenant_id}
+9. GET /api/tenant/repo-index/{tenant_id}
+10. GET /api/tenant/plan/{tenant_id}
+
+2.2 Conversation Pipeline
+
+Graph file: backend/graph/conversation_graph.py
+
+Nodes:
+
+1. conversation_handler
+2. termination_check
+3. question_agent (manifest extraction)
+4. end_node
+
+Manifest extraction node: backend/agents/manifest_agent.py
+
+Interpreter: backend/llm_interpreter.py
+
+2.3 Customization Pipeline
+
+Graph file: backend/graph/customization_graph.py
+
+Node sequence in full mode:
+
+1. frontend_scanner
+2. backend_scanner
+3. react_templateizer
+4. frontend_planner
+5. frontend_modifier
+6. backend_planner
+7. backend_modifier
+8. validator
+9. reporter
+
+Frontend-only mode sequence:
+
+1. frontend_scanner
+2. react_templateizer
+3. frontend_planner
+4. frontend_modifier
+5. validator
+6. reporter
+
+Orchestrator: backend/runner.py
+
+---
+
+3. Data Model and State Management
+
+3.1 Tenant Manifest State
+
+State manager: backend/manifest_state.py
+
+Behavior:
+
+1. Creates per-tenant session state under backend/tenants/{tenant_id}.
+2. Maintains both draft and confirmed manifests.
+3. Tracks confirmation state:
+   - confirmed_tenant_id
+   - has_unconfirmed_changes
+   - is_confirmed
+4. Requires re-confirmation after any post-confirm change.
+
+3.2 Manifest Shape
+
+Default manifest includes:
+
+1. categories.branding
+2. categories.theme
+3. categories.domains
+4. categories.portals
+5. categories.features
+6. categories.integrations
+7. flow_rules
+8. extensions
+
+extensions is where freeform/custom commands are stored, including nl_key_value entries used heavily by customization.
+
+---
+
+4. End-to-End Execution Flow
+
+4.1 Chat Stage (POST /chat)
+
+1. User sends tenant message.
+2. Conversation graph checks stop phrases.
+3. Manifest agent runs LLMInterpreter.interpret(...).
+4. Interpreter returns:
+   - response
+   - manifest_patch
+   - questions
+5. ManifestState.apply_patch(...) deep-merges patch into draft.
+
+Important deterministic behavior in llm_interpreter.py:
+
+1. Explicit termination handling for "done", "no changes", etc.
+2. Deterministic exact text replacement parser for commands like:
+   - change any text saying 'Culture Place' to 'PVL'
+   - change all instances of 'Culture Place' to 'PVL'
+   - replace 'Culture Place' with 'PVL'
+3. Falls back to LLM prompt extraction when deterministic parser does not match.
+
+4.2 Confirm Stage (POST /confirm)
+
+1. Saves draft as confirmed manifest.json.
+2. Clears unconfirmed-change flag.
+3. Implementation becomes allowed.
+
+4.3 Implement Stage (POST /api/tenant/implement)
+
+Input model fields:
+
+1. tenant_id
+2. run_templatizer (bool)
+3. app_targets (["frontend", "admin-frontend"] subset)
+
+Execution in runner.py:
+
+1. Validates manifest (manifest_validator.py).
+2. Ensures tenant repo exists (repo_service.py).
+3. Builds and stores semantic repo index (repo_index_service.py).
+4. Runs LangGraph customization flow.
+5. Runs deterministic customizer pass (deterministic_customizer.py).
+6. Runs asset copy and patch pass (asset_copier.py).
+7. Writes plan report (plan_report_service.py).
+8. Returns combined modified files and errors.
+
+---
+
+5. Frontend/Backend Graph Nodes in Detail
+
+5.1 Frontend Scanner
+
+Entry alias: backend/agents/frontend_scanner_agent.py
+Implementation: backend/agents/repo_scanner_agent.py
+
+What it does:
+
+1. Enumerates files in selected app roots only.
+2. Uses import graph expansion from seeds (landing/index/home).
+3. Uses extension scope hints (for example landing.*, topbar.*) to prioritize candidate files.
+4. Sends candidates to LLM for classification into:
+   - branding_targets
+   - theme_targets
+   - api_targets
+5. Produces repo_map consumed by planner.
+
+5.2 React Templateizer (Optional)
+
+Implementation: backend/agents/react_templateizer_agent.py
+
+What it does:
+
+1. Runs only when run_templatizer=true.
+2. Scans selected app roots for React-like files.
+3. Rewrites static JSX text nodes into getTenantText(scope,key,fallback) calls.
+4. Adds tenant config import where needed.
+5. Uses per-app marker files in .deplai/ to avoid rerunning same bootstrap.
+6. Writes templateizer_report into state/response.
+
+5.3 Frontend Planner
+
+Entry alias: backend/agents/planner_agent.py
+Function: plan_frontend_changes
+
+Primary behavior:
+
+1. Logs manifest fields detected.
+2. Builds candidate contexts from scanner output.
+3. Attempts LLM JSON plan.
+4. If planner LLM fails or is unavailable, falls back to deterministic planner.
+
+Deterministic planner currently covers:
+
+1. Hero headline fallback patches.
+2. nl_key_value scope.key entries -> set_object_property in <app-root>/utils/data.js.
+3. Branding field-to-data.js properties (companyName, title, email).
+4. Literal replacement fallback for generic exact text updates (non scope.key targets), emitting replace_all_text operations across selected frontend roots.
+
+5.4 Frontend Modifier
+
+Entry alias: backend/agents/frontend_modifier_agent.py
+Implementation: backend/agents/modifier_agent.py
+
+What it does:
+
+1. Applies planned operations to files.
+2. Restricts modifications to selected UI app roots only.
+3. Optionally performs LLM review of each change before apply.
+4. Performs syntax checks where possible.
+5. Records before/after excerpts in modification_records.
+
+Supported operations:
+
+1. replace_text
+2. replace_all_text
+3. replace_regex
+4. set_object_property
+5. insert_before
+
+5.5 Backend Scanner / Planner / Modifier
+
+Files:
+
+1. backend/agents/backend_scanner_agent.py
+2. backend/agents/backend_planner_agent.py
+3. backend/agents/backend_modifier_agent.py
+
+Key behavior:
+
+1. Backend scan/planning only activates when backend intent exists.
+2. Planner is gated by both:
+   - backend intent
+   - classified backend targets
+3. Backend modifier applies only backend-file changes and validates Python syntax for .py.
+
+5.6 Validator
+
+Implementation: backend/agents/validator_agent.py
+
+Validation layers:
+
+1. Syntax checks for modified frontend and backend files.
+2. JSON validity checks for .json files.
+3. Optional LLM semantic consistency checks using modification_records.
+
+5.7 Reporter
+
+In customization_graph.py, report_modifications logs:
+
+1. Modified files list and count.
+2. No-change warning block when zero files changed.
+
+---
+
+6. Deterministic Post-Graph Services
+
+These always run after graph execution in runner.py, regardless of LLM planner success.
+
+6.1 Deterministic Customizer
+
+File: backend/services/deterministic_customizer.py
+
+Responsibilities:
+
+1. Writes tenant theme CSS.
+2. Writes tenant feature flags file.
+3. Writes tenant branding helper file.
+4. Patches data.js, domain config, API setup, titles/metadata.
+5. Applies feature-toggle code patches.
+6. Applies literal replacement extensions across selected frontend roots.
+
+Dual-root support:
+
+1. Runs per selected app_targets.
+2. Skips roots not present in repo.
+
+6.2 Asset Copier
+
+File: backend/services/asset_copier.py
+
+Responsibilities:
+
+1. Resolves uploaded asset source from backend/tenants/{tenant}/assets.
+2. Copies asset into each selected app root public/ folder.
+3. Patches usage references in files such as:
+   - utils/data.js
+   - pages/_document.js
+   - pages/_app.js
+   - landing/topbar components
+
+Supported asset types:
+
+1. logo_light
+2. logo_dark
+3. favicon
+4. og_image
+5. hero_illustration
+6. why_background
+7. activities_background
+8. curated_image
+
+---
+
+7. Repo Provisioning and Safety
+
+File: backend/services/repo_service.py
+
+Behavior:
+
+1. Per-tenant repo path format: SubSpace-{tenant}.
+2. Copy from base repo only when tenant repo absent.
+3. Keep one long-lived tenant repo unless explicit reset.
+4. Explicit hard reset endpoint: POST /api/admin/tenant/reset-repo.
+5. Runtime port patching for tenant repo dev isolation.
+6. Dependency installation during clone/reset.
+
+Safety guard:
+
+1. Rejects destructive ops on non SubSpace-* paths.
+
+---
+
+8. LLM Configuration and Switchback
+
+Files:
+
+1. backend/services/llm_client.py
+2. backend/LLM_SWITCHBACK_GUIDE.md
+
+Primary env vars:
+
+1. LLM_API_URL
+2. LLM_MODEL_ID
+3. LLM_API_KEY
+4. LLM_PROVIDER
+5. LLM_USE_RESPONSE_FORMAT
+6. LLM_MAX_RETRIES
+7. LLM_RETRY_BASE_DELAY_SECONDS
+
+Behavior notes:
+
+1. If provider rejects response_format, client retries without it.
+2. Transient HTTP retry handling is built in.
+3. If scanner/planner LLM is not configured, deterministic fallback paths still execute where implemented.
+
+---
+
+9. Runtime Controls and Modes
+
+In runner.py:
+
+1. ENABLE_LLM_CUSTOMIZATION_GRAPH
+   - true (default): run graph
+   - false: skip graph and run deterministic services only
+2. CUSTOMIZATION_SCOPE
+   - frontend / frontend-only / frontend_only:
+     backend nodes skipped
+
+Per-request controls (/api/tenant/implement):
+
+1. run_templatizer
+2. app_targets
+
+---
+
+10. Artifacts Produced Per Tenant
+
+Under backend/tenants/{tenant_id}:
+
+1. manifest.json (confirmed)
+2. draft.manifest.json (working draft)
+3. repo-index.json (semantic index)
+4. repo-index.cache.json (index cache)
+5. plan.md (plan/run report)
+6. assets/* (uploaded branding assets)
+
+Global log:
+
+1. backend/logs/customization.log
+
+---
+
+11. Typical Operator Runbook
+
+1. Start backend API:
+   - uvicorn main:app --reload (from tenant_builder_app/backend)
+2. Start frontend UI:
+   - Next.js app under tenant_builder_app/frontend
+3. Set tenant ID in UI.
+4. Send chat instructions.
+5. Confirm manifest.
+6. Optionally upload assets.
+7. Choose app targets and run templateizer option.
+8. Run implement.
+9. Inspect:
+   - API response modified_files / errors
+   - backend/tenants/{tenant}/plan.md
+   - backend/logs/customization.log
+
+---
+
+12. Troubleshooting Guide
+
+12.1 Symptom: "Planner produced no modifications"
+
+Common causes:
+
+1. Planner LLM returned invalid/non-JSON output.
+2. No meaningful target/replacement match in candidate files.
+3. Missing manifest confirmation or stale manifest content.
+
+Checks:
+
+1. Confirm extension exists in manifest (extensions).
+2. Verify scanner found target files in logs.
+3. Verify literal text exists in discovered candidates.
+4. Check if deterministic fallback should handle the request type.
+
+12.2 Symptom: Exact replace command did not apply
+
+Use quoted command format:
+
+1. change all instances of 'Culture Place' to 'PVL'
+2. replace 'Culture Place' with 'PVL'
+
+Then verify:
+
+1. /chat response says exact replacement was applied.
+2. Manifest includes nl_key_value extension with:
+   - target_raw: "Culture Place"
+   - value: "PVL"
+3. Implement logs show fallback-generated replace_all_text changes when LLM planner fails.
+
+12.3 Symptom: Backend changes unexpectedly skipped
+
+Expected when either condition is false:
+
+1. Backend intent not detected.
+2. No backend classified targets.
+
+Check backend scanner/planner logs for gating messages.
+
+12.4 Symptom: No files modified but implementation succeeded
+
+This means graph/process completed but produced no effective diffs. Review:
+
+1. planned_changes count in plan report.
+2. Validator/reporter messages.
+3. Whether requested new values already existed in code.
+
+---
+
+13. Known Constraints
+
+1. LLM outputs are parsed as strict JSON; malformed responses trigger fallbacks/errors.
+2. Deterministic planner is intentionally conservative and only emits meaningful changes.
+3. Some broad natural-language intents still depend on LLM extraction quality.
+4. Templateizer currently targets React/Next-style text node patterns; it is not a full AST transform.
+
+---
+
+14. Quick Reference: Which File Owns What
+
+1. API endpoints: backend/main.py
+2. Tenant state/session/confirm: backend/manifest_state.py
+3. Chat flow graph: backend/graph/conversation_graph.py
+4. Manifest interpretation: backend/llm_interpreter.py
+5. Customization run orchestration: backend/runner.py
+6. Customization graph wiring: backend/graph/customization_graph.py
+7. Frontend scan/planner/modifier:
+   - backend/agents/repo_scanner_agent.py
+   - backend/agents/planner_agent.py
+   - backend/agents/modifier_agent.py
+8. Backend scan/planner/modifier:
+   - backend/agents/backend_scanner_agent.py
+   - backend/agents/backend_planner_agent.py
+   - backend/agents/backend_modifier_agent.py
+9. Validation: backend/agents/validator_agent.py
+10. Deterministic apply layer: backend/services/deterministic_customizer.py
+11. Asset apply layer: backend/services/asset_copier.py
+12. Repo provisioning/reset: backend/services/repo_service.py
+13. Repo indexing: backend/services/repo_index_service.py
+14. Plan report generation: backend/services/plan_report_service.py
+15. LLM transport client: backend/services/llm_client.py
+
+---
+
+15. Suggested Next Documentation Additions
+
+1. Add request/response JSON examples for every endpoint.
+2. Add a failure taxonomy with log signatures and recovery steps.
+3. Add a test matrix for frontend-only, admin-only, and dual-root runs.
+4. Add a customization command cookbook (exact replace, scoped text, style changes, feature toggles).

@@ -36,6 +36,7 @@ Optional but recommended:
 - Neo4j
 - Qdrant
 - AWS credentials for runtime deploy and AWS pricing flows
+- Python environment for customization backend (`Customization Agent/tenant_builder_app/backend`)
 
 ## 3. Services You Must Run
 
@@ -47,6 +48,7 @@ You must separately run or provide:
 
 - MySQL
 - Connector
+- Customization backend (only required when using `/api/customization/*` flows)
 - optionally Neo4j
 - optionally Qdrant
 
@@ -64,6 +66,7 @@ DEPLAI_SERVICE_KEY=<shared-secret>
 WS_TOKEN_SECRET=<ws-signing-secret>
 SESSION_SECRET=<session-secret>
 CORS_ORIGINS=http://localhost:3000
+CUSTOMIZATION_AGENT_BASE_URL=http://127.0.0.1:8010
 ```
 
 ### Database
@@ -139,7 +142,7 @@ cd ..
 ### 5.3 Optional Python validation
 
 ```bash
-python -m compileall "Agentic Layer" KGagent terraform_agent diagram_cost-estimation_agent
+python -m compileall "Agentic Layer" KGagent "Terraform Agent/agent" "Diagram-Cost-Agent" "Customization Agent/tenant_builder_app/backend"
 ```
 
 ## 6. Startup Sequence
@@ -159,7 +162,15 @@ cd Connector
 npm run dev
 ```
 
-5. Open `http://localhost:3000`.
+5. Optional: start customization backend (required for `/api/customization/*`):
+
+```bash
+cd "Customization Agent/tenant_builder_app/backend"
+pip install -r requirements.txt
+uvicorn main:app --host 127.0.0.1 --port 8010
+```
+
+6. Open `http://localhost:3000`.
 
 ## 7. Health Checks
 
@@ -194,6 +205,12 @@ Expected runtime volumes:
 - `security_reports`
 - `LLM_Output`
 - `grype_db_cache`
+
+### 7.4 Customization backend health (optional)
+
+```bash
+curl http://127.0.0.1:8010/health
+```
 
 ## 8. Normal Operating Flow
 
@@ -266,15 +283,30 @@ Primary routes:
 - `POST /api/architecture`
 - `POST /api/cost`
 - `POST /api/pipeline/stage7`
-- `POST /api/architecture/review/start`
-- `POST /api/architecture/review/complete`
 
 Operational notes:
 
 - this runbook treats architecture and cost as AWS-only
 - Stage 7 packaging runs through the diagram-cost subprocess
+- if subprocess execution fails or returns invalid output, backend returns a deterministic fallback Stage 7 approval payload
 
-### 9.4 Stage 8: IaC
+### 9.4 Stage 6: Repository Analysis and Architecture Review
+
+This stage typically runs before Stage 7 in end-to-end execution, even though it is documented after Stage 7 here for route grouping clarity.
+
+Primary routes:
+
+- `POST /api/repository-analysis/run`
+- `POST /api/architecture/review/start`
+- `POST /api/architecture/review/complete`
+
+Operational notes:
+
+- repository analysis infers runtime/framework/process/data-store/build hints from source
+- architecture review generates structured deployment questions, then synthesizes deployment profile + architecture view on completion
+- completion can trigger Stage 7 approval payload generation through the bridge path
+
+### 9.5 Stage 8: IaC
 
 Primary route:
 
@@ -293,7 +325,7 @@ Operational notes:
 - AWS path requires `architecture_json`
 - Connector may fall back to local Terraform bundle generation
 
-### 9.5 Stage 9 and 10: Policy and Deploy
+### 9.6 Stage 9 and 10: Policy and Deploy
 
 Primary routes:
 
@@ -461,6 +493,36 @@ Check:
 - backend apply logs
 - runtime details route
 - regenerate Stage 8 bundle and retry
+
+### 11.9 Customization routes return 502
+
+Likely causes:
+
+- customization backend is not running on `CUSTOMIZATION_AGENT_BASE_URL`
+- backend URL is unset and default `http://127.0.0.1:8010` is unavailable
+
+Check:
+
+```bash
+curl http://127.0.0.1:8010/health
+```
+
+Fix:
+
+- start `Customization Agent/tenant_builder_app/backend`
+- set `CUSTOMIZATION_AGENT_BASE_URL` to the correct host/port for your environment
+
+### 11.10 Customization implement returns 409
+
+Likely causes:
+
+- manifest is not confirmed yet
+- manifest changed after last confirm
+
+Fix sequence:
+
+1. call customization `confirm`
+2. re-run `implement`
 
 ## 12. Dangerous Operations
 
