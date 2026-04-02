@@ -1,4 +1,8 @@
+// @ts-nocheck
+'use client';
+
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { 
   Book, LayoutGrid, TerminalSquare, Code, ChevronRight, Search, ArrowLeft,
   Server, Database, Globe, Network, Cpu, ShieldAlert, Settings, Activity,
@@ -305,7 +309,7 @@ const BorderGlow = ({
       }}
     >
       <div
-        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        className="absolute inset-0 rounded-[inherit] -z-1"
         style={{
           border: '1px solid transparent',
           background: [
@@ -320,7 +324,7 @@ const BorderGlow = ({
         }}
       />
       <div
-        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        className="absolute inset-0 rounded-[inherit] -z-1"
         style={{
           border: '1px solid transparent',
           background: fillBg.join(', '),
@@ -350,7 +354,7 @@ const BorderGlow = ({
         }}
       />
       <span
-        className="absolute pointer-events-none z-[1] rounded-[inherit]"
+        className="absolute pointer-events-none z-1 rounded-[inherit]"
         style={{
           inset: `${-glowRadius}px`,
           maskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
@@ -369,7 +373,7 @@ const BorderGlow = ({
         />
       </span>
 
-      <div className="flex flex-col relative h-full w-full z-[1]">
+      <div className="flex flex-col relative h-full w-full z-1">
         {children}
       </div>
     </div>
@@ -437,7 +441,7 @@ const MethodBadge = ({ method }) => {
   if (method === 'GET') style = "bg-white text-black";
   if (method === 'POST') style = "bg-zinc-800 text-white";
   
-  return <span className={`inline-block px-2 py-1 rounded text-[10px] font-bold mr-3 min-w-[50px] text-center ${style}`}>{method}</span>;
+  return <span className={`inline-block px-2 py-1 rounded text-[10px] font-bold mr-3 min-w-12.5 text-center ${style}`}>{method}</span>;
 };
 
 // Architecture Nodes for the flowchart
@@ -484,6 +488,7 @@ const DownArrow = () => (
 // ==========================================
 
 export default function DocumentationPortal() {
+  const router = useRouter();
   const [activePage, setActivePage] = useState('architecture'); // Set default to architecture to show the new flow
   const mainScrollRef = useRef(null);
 
@@ -531,7 +536,17 @@ export default function DocumentationPortal() {
             <div className="w-7 h-7 rounded border border-[#333333] bg-[#0A0A0A] flex items-center justify-center">
               <Book className="w-4 h-4 text-white" />
             </div>
-            <span className="text-white font-bold tracking-wide text-sm">DEPL_AI <span className="text-zinc-600 font-normal mx-1">/</span> DOCS</span>
+            <div className="text-white font-bold tracking-wide text-sm">
+              <button
+                type="button"
+                onClick={() => router.push('/dashboard')}
+                className="hover:text-zinc-300 transition-colors"
+              >
+                DEPL_AI
+              </button>
+              <span className="text-zinc-600 font-normal mx-1">/</span>
+              <span>DOCS</span>
+            </div>
           </div>
         </div>
 
@@ -574,11 +589,20 @@ export default function DocumentationPortal() {
       <div className="flex-1 flex flex-col overflow-hidden bg-transparent">
         <header className="h-16 flex items-center justify-between px-8 border-b border-[#1A1A1A] bg-[#050505]/90 backdrop-blur-md z-10 shrink-0">
           <div className="flex items-center gap-2 text-[13px] text-zinc-500">
-            <span className="hover:text-zinc-300 cursor-pointer transition-colors">DeplAI</span>
+            <button
+              type="button"
+              onClick={() => router.push('/dashboard')}
+              className="hover:text-zinc-300 cursor-pointer transition-colors"
+            >
+              DeplAI
+            </button>
             <span className="text-zinc-700">/</span>
             <span className="text-white font-medium">{PAGE_TITLES[activePage]}</span>
           </div>
-          <button className="flex items-center gap-2 text-xs font-medium text-zinc-400 hover:text-white transition-colors">
+          <button
+            onClick={() => router.push('/dashboard')}
+            className="flex items-center gap-2 text-xs font-medium text-zinc-400 hover:text-white transition-colors"
+          >
             <ArrowLeft className="w-4 h-4" /> Back to Dashboard
           </button>
         </header>
@@ -712,7 +736,7 @@ export default function DocumentationPortal() {
                 <BorderGlow borderRadius={12} className="border border-[#1A1A1A] my-6">
                   <PixelCard gap={8} speed={30} colors="#3f3f46,#27272a,#18181b" className="p-8 rounded-[inherit]">
                     <div className="overflow-x-auto pb-6 custom-scrollbar">
-                      <div className="min-w-[1100px] flex flex-col gap-8 relative z-10">
+                      <div className="min-w-275 flex flex-col gap-8 relative z-10">
 
                         {/* Tier 1: User & Connector */}
                         <div className="flex items-center gap-4 bg-[#000000]/50 p-4 rounded-xl border border-[#262626]">
@@ -955,7 +979,7 @@ export default function DocumentationPortal() {
                   <table className="w-full text-left border-collapse text-sm">
                     <thead>
                       <tr className="bg-[#0A0A0A] border-b border-[#1A1A1A]">
-                        <th className="p-4 text-[10px] font-bold text-zinc-500 uppercase tracking-widest w-[100px]">Method</th>
+                        <th className="p-4 text-[10px] font-bold text-zinc-500 uppercase tracking-widest w-25">Method</th>
                         <th className="p-4 text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Route</th>
                       </tr>
                     </thead>
@@ -984,7 +1008,7 @@ export default function DocumentationPortal() {
                   <table className="w-full text-left border-collapse text-sm">
                     <thead>
                       <tr className="bg-[#0A0A0A] border-b border-[#1A1A1A]">
-                        <th className="p-4 text-[10px] font-bold text-zinc-500 uppercase tracking-widest w-[100px]">Method</th>
+                        <th className="p-4 text-[10px] font-bold text-zinc-500 uppercase tracking-widest w-25">Method</th>
                         <th className="p-4 text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Route</th>
                       </tr>
                     </thead>
@@ -1191,3 +1215,4 @@ export default function DocumentationPortal() {
     </div>
   );
 }
+

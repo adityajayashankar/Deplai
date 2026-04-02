@@ -414,7 +414,7 @@ const BorderGlow: React.FC<BorderGlowProps> = ({
       style={{ background: backgroundColor, borderRadius: `${borderRadius}px`, transform: 'translate3d(0, 0, 0.01px)' }}
     >
       <div
-        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        className="absolute inset-0 rounded-[inherit] -z-1"
         style={{
           border: '1px solid transparent',
           background: [`linear-gradient(${backgroundColor} 0 100%) padding-box`, 'linear-gradient(rgb(255 255 255 / 0%) 0% 100%) border-box', ...borderBg].join(', '),
@@ -425,7 +425,7 @@ const BorderGlow: React.FC<BorderGlowProps> = ({
         }}
       />
       <div
-        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        className="absolute inset-0 rounded-[inherit] -z-1"
         style={{
           border: '1px solid transparent',
           background: fillBg.join(', '),
@@ -455,7 +455,7 @@ const BorderGlow: React.FC<BorderGlowProps> = ({
         } as CSSProperties}
       />
       <span
-        className="absolute pointer-events-none z-[1] rounded-[inherit]"
+        className="absolute pointer-events-none z-1 rounded-[inherit]"
         style={{
           inset: `${-glowRadius}px`,
           maskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
@@ -467,7 +467,7 @@ const BorderGlow: React.FC<BorderGlowProps> = ({
       >
         <span className="absolute rounded-[inherit]" style={{ inset: `${glowRadius}px`, boxShadow: buildBoxShadow(glowColor, glowIntensity) }} />
       </span>
-      <div className="relative z-[1] flex h-full w-full flex-col">{children}</div>
+      <div className="relative z-1 flex h-full w-full flex-col">{children}</div>
     </div>
   );
 };
@@ -811,7 +811,7 @@ function RunButton({
 
 function SpinnerCard({ label }: { label: string }) {
   return (
-    <div className="flex min-h-[280px] items-center justify-center rounded-lg border border-[#1A1A1A] bg-[#050505]">
+    <div className="flex min-h-70 items-center justify-center rounded-lg border border-[#1A1A1A] bg-[#050505]">
       <div className="flex items-center gap-3 text-sm text-zinc-400">
         <RefreshCw className="h-4 w-4 animate-spin" />
         <span>{label}</span>
@@ -858,7 +858,7 @@ function DiffViewer({ diff }: { diff: string }) {
       <div className="border-b border-[#1A1A1A] px-4 py-2 text-[11px] font-medium uppercase tracking-widest text-zinc-500">
         Unified Diff
       </div>
-      <div className="max-h-[360px] overflow-auto px-4 py-3 font-mono text-[12px] leading-relaxed">
+      <div className="max-h-90 overflow-auto px-4 py-3 font-mono text-[12px] leading-relaxed">
         {lines.map((line, index) => {
           let classes = 'text-zinc-400';
           if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) classes = 'text-indigo-300';
@@ -1399,7 +1399,7 @@ export default function SecurityAnalysisPage() {
 
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
           <div className="lg:col-span-2">
-            <BorderGlow backgroundColor="#050505" colors={['#6366f1', '#050505']} glowColor="250 80 50" borderRadius={8} className="flex h-[420px] flex-col overflow-hidden border border-[#1A1A1A] shadow-xl">
+            <BorderGlow backgroundColor="#050505" colors={['#6366f1', '#050505']} glowColor="250 80 50" borderRadius={8} className="flex h-105 flex-col overflow-hidden border border-[#1A1A1A] shadow-xl">
               <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-[#000000] px-4 py-2.5">
                 <div className="flex items-center gap-2 text-xs font-mono text-zinc-400">
                   <TerminalSquare className="h-4 w-4" />
@@ -1485,7 +1485,7 @@ export default function SecurityAnalysisPage() {
             <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Vulnerability Results</h1>
             <p className="text-sm text-zinc-400">The latest scan could not be loaded.</p>
           </div>
-          <AlertCard tone="error" title="Results Unavailable" message={error} action={<RunButton className="max-w-[260px]" onClick={() => void fetchStatusAndResults({ trackError: true })}>Retry Loading Results</RunButton>} />
+          <AlertCard tone="error" title="Results Unavailable" message={error} action={<RunButton className="max-w-65" onClick={() => void fetchStatusAndResults({ trackError: true })}>Retry Loading Results</RunButton>} />
         </div>
       );
     }
@@ -1514,7 +1514,7 @@ export default function SecurityAnalysisPage() {
             message="This project passed the current security scan. Continue to deployment or return to the dashboard."
             action={(
               <div className="flex flex-wrap gap-3">
-                <RunButton className="max-w-[260px]" onClick={() => router.push(`/dashboard/deploy?projectId=${encodeURIComponent(projectId)}&entry=card`)}>
+                <RunButton className="max-w-65" onClick={() => router.push(`/dashboard/deploy?projectId=${encodeURIComponent(projectId)}&entry=card`)}>
                   Continue to Delivery
                 </RunButton>
                 <button
@@ -1671,12 +1671,12 @@ export default function SecurityAnalysisPage() {
                 speed={28}
                 className="mt-6 overflow-hidden rounded-xl border border-[#1A1A1A] bg-[#050505] shadow-xl"
               >
-                <div className="relative z-10 flex items-center justify-between bg-gradient-to-r from-indigo-500/10 to-transparent p-6">
+                <div className="relative z-10 flex items-center justify-between bg-linear-to-r from-indigo-500/10 to-transparent p-6">
                   <div>
                     <h3 className="mb-1 flex items-center gap-2 text-base font-bold text-indigo-400"><Sparkles className="h-4 w-4" />AI Auto-Remediation Available</h3>
                     <p className="text-[13px] text-zinc-400">Deploy the remediation agent to patch these vulnerabilities, create a PR, and verify with a re-scan.</p>
                   </div>
-                  <div className="w-[220px]"><RunButton onClick={() => { setSetupOpen(true); setActiveStage('remediate_setup'); }}>Setup AI Agent</RunButton></div>
+                  <div className="w-55"><RunButton onClick={() => { setSetupOpen(true); setActiveStage('remediate_setup'); }}>Setup AI Agent</RunButton></div>
                 </div>
               </PixelCard>
             ) : null}
@@ -1734,7 +1734,7 @@ export default function SecurityAnalysisPage() {
       </div>
       {remediationState === 'error' ? <AlertCard tone="error" title="Remediation Failed" message={[...remMessages].reverse().find((message) => message.type === 'error')?.content || error || 'The remediation run failed.'} /> : null}
 
-      <BorderGlow backgroundColor="#000000" colors={['#a855f7', '#000000']} glowColor="280 80 50" borderRadius={8} className="flex h-[500px] flex-col overflow-hidden border border-[#1A1A1A] shadow-2xl">
+      <BorderGlow backgroundColor="#000000" colors={['#a855f7', '#000000']} glowColor="280 80 50" borderRadius={8} className="flex h-125 flex-col overflow-hidden border border-[#1A1A1A] shadow-2xl">
         <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-[#0A0A0A] px-5 py-4">
           <div className="flex items-center gap-2"><Bot className="h-4 w-4 text-purple-400" /><h3 className="text-sm font-semibold text-zinc-200">Agent Terminal</h3></div>
         </div>
@@ -1758,7 +1758,7 @@ export default function SecurityAnalysisPage() {
           {kgExpanded ? (
             <div className="space-y-4 p-5">
               {latestKgResult.business_logic_summary ? <div><div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Business Context</div><div className="rounded-lg border border-[#1A1A1A] bg-black/50 p-4 text-sm leading-relaxed text-zinc-300">{latestKgResult.business_logic_summary}</div></div> : null}
-              {latestKgResult.vulnerability_summary ? <div><div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Vulnerability Summary</div><div className="custom-scrollbar max-h-[260px] overflow-y-auto rounded-lg border border-[#1A1A1A] bg-black/50 p-4 font-mono text-[12px] leading-relaxed text-zinc-300"><pre className="whitespace-pre-wrap">{latestKgResult.vulnerability_summary}</pre></div></div> : null}
+              {latestKgResult.vulnerability_summary ? <div><div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Vulnerability Summary</div><div className="custom-scrollbar max-h-65 overflow-y-auto rounded-lg border border-[#1A1A1A] bg-black/50 p-4 font-mono text-[12px] leading-relaxed text-zinc-300"><pre className="whitespace-pre-wrap">{latestKgResult.vulnerability_summary}</pre></div></div> : null}
             </div>
           ) : null}
         </BorderGlow>
@@ -1892,7 +1892,7 @@ export default function SecurityAnalysisPage() {
         <PixelBlast pixelSize={4} color="#3f3f46" noiseAmount={0.03} />
       </div>
 
-      <aside className="relative z-20 flex h-full w-[260px] shrink-0 flex-col border-r border-[#1A1A1A] bg-[#050505]">
+      <aside className="relative z-20 flex h-full w-65 shrink-0 flex-col border-r border-[#1A1A1A] bg-[#050505]">
         <div className="flex h-16 items-center border-b border-[#1A1A1A] px-6">
           <div className="flex items-center gap-3">
             <div className="flex h-6 w-6 items-center justify-center rounded border border-[#262626] bg-[#111111] text-xs font-bold text-white">N</div>
@@ -1946,4 +1946,5 @@ export default function SecurityAnalysisPage() {
     </div>
   );
 }
+
 

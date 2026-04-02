@@ -20,5 +20,5 @@ export async function GET() {
     state,
   });
 
-  return NextResponse.redirect(`https://github.com/login/oauth/authorize?${params}`);
+  return NextResponse.redirect(`https://github.com/login/oauth/authorize?${params}`, 302);
 }

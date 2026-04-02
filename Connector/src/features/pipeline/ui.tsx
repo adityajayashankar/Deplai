@@ -1,4 +1,4 @@
-﻿import React, { useState } from 'react';
+import React, { useState } from 'react';
 import { SEVERITY_CFG } from './data';
 import type { FileNodeData, PipelineProject, Severity, Stage } from './types';
 
@@ -63,7 +63,7 @@ export const StageIcon: React.FC<{ status: string; gate?: boolean }> = ({ status
   }
   if (status === 'running') {
     return (
-      <svg className="w-4 h-4 text-cyan-400 flex-shrink-0 spin" viewBox="0 0 24 24" fill="none">
+      <svg className="w-4 h-4 text-cyan-400 shrink-0 spin" viewBox="0 0 24 24" fill="none">
         <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity=".25" />
         <path d="M22 12a10 10 0 00-10-10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
       </svg>
@@ -71,13 +71,13 @@ export const StageIcon: React.FC<{ status: string; gate?: boolean }> = ({ status
   }
   if (gate) {
     return (
-      <svg className="w-4 h-4 text-zinc-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <svg className="w-4 h-4 text-zinc-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
       </svg>
     );
   }
   return (
-    <svg className="w-4 h-4 text-zinc-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+    <svg className="w-4 h-4 text-zinc-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
       <circle cx="12" cy="12" r="9" strokeWidth={1.5} strokeDasharray="4 2" />
     </svg>
   );
@@ -91,7 +91,7 @@ interface HeaderProps {
 }
 
 export const Header: React.FC<HeaderProps> = ({ title, subtitle, badge, actions }) => (
-  <div className="flex items-start justify-between px-7 py-5 border-b border-white/5 flex-shrink-0">
+  <div className="flex items-start justify-between px-7 py-5 border-b border-white/5 shrink-0">
     <div>
       {badge && (
         <div className={`inline-flex items-center gap-1.5 text-[11px] font-semibold px-2.5 py-1 rounded-full mb-2 ${badge.cls}`}>
@@ -174,7 +174,7 @@ const StageRow: React.FC<StageRowProps> = ({ stage, active, onClick }) => {
     <button onClick={onClick} className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg transition-all text-left group ${active ? 'bg-cyan-500/10 border border-cyan-500/20' : 'hover:bg-white/4 border border-transparent'}`}>
       <StageIcon status={stage.status} gate={stage.gate} />
       <div className="flex-1 min-w-0">
-        <p className={`text-[11.5px] font-medium truncate leading-tight ${statusColors[stage.status] || 'text-zinc-600'} ${active ? '!text-cyan-300' : ''}`}>{stage.label}</p>
+        <p className={`text-[11.5px] font-medium truncate leading-tight ${statusColors[stage.status] || 'text-zinc-600'} ${active ? 'text-cyan-300!' : ''}`}>{stage.label}</p>
         {stage.duration && <p className="text-[10px] text-zinc-600 font-mono mt-0.5">{stage.duration}</p>}
         {stage.gate && stage.status !== 'success' && <p className="text-[10px] text-amber-500/70 mt-0.5">Requires approval</p>}
       </div>
@@ -211,7 +211,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const githubLabel = githubConnected ? githubAccounts.join(', ') : 'Not connected';
 
   return (
-    <aside className="w-72 flex-shrink-0 bg-[#09090b] border-r border-white/5 flex flex-col overflow-hidden">
+    <aside className="w-72 shrink-0 bg-[#09090b] border-r border-white/5 flex flex-col overflow-hidden">
       <div className="px-4 py-4 border-b border-white/5">
         <button onClick={onBackToDashboard} className="mb-4 flex items-center gap-2.5 text-left hover:opacity-90 transition-opacity">
           <div className="w-7 h-7 rounded-lg bg-cyan-500/15 border border-cyan-500/25 flex items-center justify-center">
@@ -238,7 +238,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <span className="text-[11px] font-semibold text-cyan-400 font-mono">{pct}%</span>
           </div>
           <div className="h-1 bg-zinc-800 rounded-full overflow-hidden">
-            <div className="h-full bg-gradient-to-r from-cyan-500 to-indigo-500 rounded-full transition-all duration-700" style={{ width: `${pct}%` }} />
+            <div className="h-full bg-linear-to-r from-cyan-500 to-indigo-500 rounded-full transition-all duration-700" style={{ width: `${pct}%` }} />
           </div>
           <div className="flex justify-between mt-2">
             <span className="text-[10px] text-zinc-500">{successCount}/{stages.length} complete</span>
@@ -250,7 +250,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {sharedStages.map((s) => <StageRow key={s.key} stage={s} active={current === s.key} onClick={() => setCurrent(s.key)} />)}
         <div className="mx-2 my-3">
           <div className="flex items-center gap-2 mb-1.5">
-            <span className="text-[9px] uppercase tracking-widest text-zinc-600 font-semibold flex-shrink-0">Security Track</span>
+            <span className="text-[9px] uppercase tracking-widest text-zinc-600 font-semibold shrink-0">Security Track</span>
             <div className="flex-1 h-px bg-zinc-800" />
           </div>
           <div className="ml-3 space-y-0.5 border-l border-zinc-800 pl-3">
@@ -259,7 +259,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
         <div className="mx-2 my-3">
           <div className="flex items-center gap-2 mb-1.5">
-            <span className="text-[9px] uppercase tracking-widest text-zinc-600 font-semibold flex-shrink-0">Deployment Track</span>
+            <span className="text-[9px] uppercase tracking-widest text-zinc-600 font-semibold shrink-0">Deployment Track</span>
             <div className="flex-1 h-px bg-zinc-800" />
           </div>
           <div className="ml-3 space-y-0.5 border-l border-zinc-800 pl-3">
@@ -277,7 +277,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <span className="w-2 h-2 rounded-full bg-emerald-400 shadow-sm" />
         </div>
         <div className="mt-2.5 pt-2.5 border-t border-white/5 flex items-center gap-2">
-          <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 text-zinc-400 flex-shrink-0" fill="currentColor"><path d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.482 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.462-1.11-1.462-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.161 22 16.416 22 12c0-5.523-4.477-10-10-10z" /></svg>
+          <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 text-zinc-400 shrink-0" fill="currentColor"><path d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.482 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.462-1.11-1.462-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.161 22 16.416 22 12c0-5.523-4.477-10-10-10z" /></svg>
           <div className="flex-1 min-w-0">
             <p className={`text-[11px] truncate ${githubConnected ? 'text-zinc-300' : 'text-zinc-500'}`}>{githubLabel}</p>
             <p className={`text-[10px] ${githubConnected ? 'text-emerald-400' : 'text-amber-400'}`}>{githubConnected ? 'GitHub connected' : 'GitHub connector required'}</p>
@@ -337,9 +337,9 @@ export function ProjectSelector({ projects, selectedProjectId, onSelect }: Proje
                   className={`w-full flex items-center gap-2 px-3 py-2 text-[11px] hover:bg-white/5 transition-colors ${isSelected ? 'text-emerald-400' : 'text-zinc-300'}`}
                 >
                   {isGithub ? (
-                    <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 flex-shrink-0" fill="currentColor"><path d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.482 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.462-1.11-1.462-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.161 22 16.416 22 12c0-5.523-4.477-10-10-10z" /></svg>
+                    <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0" fill="currentColor"><path d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.865 8.166 6.839 9.489.5.092.682-.217.682-.482 0-.237-.008-.866-.013-1.7-2.782.603-3.369-1.34-3.369-1.34-.454-1.156-1.11-1.462-1.11-1.462-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.831.092-.646.35-1.086.636-1.336-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.025A9.564 9.564 0 0112 6.844c.85.004 1.705.114 2.504.336 1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.161 22 16.416 22 12c0-5.523-4.477-10-10-10z" /></svg>
                   ) : (
-                    <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+                    <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
                   )}
                   <span className="truncate">{project.name}</span>
                 </button>
@@ -357,7 +357,7 @@ export function ProjectSelector({ projects, selectedProjectId, onSelect }: Proje
 function Checkbox({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
   return (
     <div className="flex items-start gap-3 cursor-pointer group" onClick={() => onChange(!checked)}>
-      <div className={`mt-0.5 flex-shrink-0 w-4 h-4 rounded-sm flex items-center justify-center border transition-colors ${checked ? 'bg-blue-600 border-blue-600' : 'bg-transparent border-zinc-500 group-hover:border-zinc-400'}`}>
+      <div className={`mt-0.5 shrink-0 w-4 h-4 rounded-sm flex items-center justify-center border transition-colors ${checked ? 'bg-blue-600 border-blue-600' : 'bg-transparent border-zinc-500 group-hover:border-zinc-400'}`}>
         {checked && <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>}
       </div>
       <span className="text-sm text-zinc-200 group-hover:text-white transition-colors flex-1 select-none">{label}</span>
@@ -414,7 +414,7 @@ export const FileNode: React.FC<FileNodeProps> = ({ node, selected, setSelected,
   if (isFile) {
     return (
       <button onClick={() => setSelected(fname)} className={`w-full flex items-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono transition-colors ${isActive ? 'bg-cyan-500/10 text-cyan-300' : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/3'}`} style={{ paddingLeft: `${8 + depth * 12}px` }}>
-        <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+        <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
         {fname}
       </button>
     );
@@ -423,11 +423,12 @@ export const FileNode: React.FC<FileNodeProps> = ({ node, selected, setSelected,
   return (
     <div>
       <button onClick={() => setOpen(!open)} className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] text-zinc-500 hover:text-zinc-300 transition-colors" style={{ paddingLeft: `${8 + depth * 12}px` }}>
-        <svg className={`w-3 h-3 flex-shrink-0 transition-transform ${open ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
-        <svg className="w-3.5 h-3.5 text-yellow-500 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M2 6a2 2 0 012-2h5l2 2h7a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" /></svg>
+        <svg className={`w-3 h-3 shrink-0 transition-transform ${open ? 'rotate-90' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
+        <svg className="w-3.5 h-3.5 text-yellow-500 shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M2 6a2 2 0 012-2h5l2 2h7a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" /></svg>
         {node.name}
       </button>
       {open && node.children && <div>{node.children.map((c, i) => <FileNode key={i} node={c} selected={selected} setSelected={setSelected} depth={depth + 1} />)}</div>}
     </div>
   );
 };
+

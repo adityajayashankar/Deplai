@@ -122,7 +122,7 @@ export function RemediationPage({
           <div className="px-4 py-3 border-b border-white/5">
             <p className="text-sm font-semibold text-zinc-200">Remediation Stream</p>
           </div>
-          <div className="p-4 bg-zinc-950/70 font-mono text-[11px] max-h-[560px] overflow-y-auto space-y-1.5 custom-scrollbar">
+          <div className="p-4 bg-zinc-950/70 font-mono text-[11px] max-h-140 overflow-y-auto space-y-1.5 custom-scrollbar">
             {messages.length === 0 && <p className="text-zinc-600">No remediation events yet.</p>}
             {messages.slice(-200).map((msg, idx) => (
               <div key={`${msg.timestamp || idx}-${idx}`} className={msg.type === 'error' ? 'text-red-400' : msg.type === 'success' ? 'text-emerald-400' : msg.type === 'phase' ? 'text-cyan-400' : 'text-zinc-400'}>
@@ -185,3 +185,4 @@ export function PostMergePage({ onSkip, onRerunScan, rerunInProgress }: PostMerg
     </div>
   );
 }
+

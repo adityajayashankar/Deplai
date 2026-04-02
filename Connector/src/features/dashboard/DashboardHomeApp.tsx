@@ -13,6 +13,7 @@ import { useRouter } from 'next/navigation';
 import * as THREE from 'three';
 import {
   ArrowRight,
+  Book,
   Check,
   ChevronDown,
   Cpu,
@@ -137,6 +138,7 @@ const DASHBOARD_TABS: Array<{ key: string; label: string; icon: LucideIcon }> = 
   { key: 'overview', label: 'Overview', icon: LayoutGrid },
   { key: 'deployments', label: 'Deployments', icon: Rocket },
   { key: 'instances', label: 'Manage Instance', icon: Cpu },
+  { key: 'documentation', label: 'Documentation', icon: Book },
   { key: 'settings', label: 'Settings', icon: Settings },
 ];
 
@@ -418,7 +420,7 @@ const TextType = ({
     },
     <span className="inline" style={{ color }}>{displayedText}</span>,
     showCursor && (
-      <span className={`ml-[1px] inline-block opacity-100 ${shouldHideCursor ? 'hidden' : ''} ${cursorClassName}`}>
+      <span className={`ml-px inline-block opacity-100 ${shouldHideCursor ? 'hidden' : ''} ${cursorClassName}`}>
         {cursorCharacter}
       </span>
     ),
@@ -521,7 +523,7 @@ const BorderGlow = ({
       }}
     >
       <div
-        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        className="absolute inset-0 rounded-[inherit] -z-1"
         style={{
           border: '1px solid transparent',
           background: [`linear-gradient(${backgroundColor} 0 100%) padding-box`, 'linear-gradient(rgb(255 255 255 / 0%) 0% 100%) border-box', ...borderBg].join(', '),
@@ -532,7 +534,7 @@ const BorderGlow = ({
         }}
       />
       <div
-        className="absolute inset-0 rounded-[inherit] -z-[1]"
+        className="absolute inset-0 rounded-[inherit] -z-1"
         style={{
           border: '1px solid transparent',
           background: fillBg.join(', '),
@@ -546,7 +548,7 @@ const BorderGlow = ({
         } as CSSProperties}
       />
       <span
-        className="absolute pointer-events-none z-[1] rounded-[inherit]"
+        className="absolute pointer-events-none z-1 rounded-[inherit]"
         style={{
           inset: `${-glowRadius}px`,
           maskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
@@ -558,7 +560,7 @@ const BorderGlow = ({
       >
         <span className="absolute rounded-[inherit]" style={{ inset: `${glowRadius}px`, boxShadow: buildBoxShadow(glowColor, glowIntensity) }} />
       </span>
-      <div className="relative z-[1] flex h-full w-full flex-col">{children}</div>
+      <div className="relative z-1 flex h-full w-full flex-col">{children}</div>
     </div>
   );
 };
@@ -566,7 +568,7 @@ const BorderGlow = ({
 const PixelBlast = ({
   variant = 'square',
   pixelSize = 3,
-  color = '#818CF8',
+  color = '#ffffff',
   className,
   style,
   antialias = true,
@@ -776,13 +778,13 @@ function BranchDropdown({
             void loadBranches();
           }
         }}
-        className={`group relative flex min-w-[120px] cursor-pointer items-center rounded-md border bg-[#13161F] py-1 pl-2.5 pr-7 transition-colors ${isOpen ? 'border-indigo-500/50' : 'border-[#1E2330] hover:border-[#2A3143]'}`}
+        className={`group relative flex min-w-30 cursor-pointer items-center rounded-md border bg-[#111111] py-1 pl-2.5 pr-7 transition-colors ${isOpen ? 'border-white/40' : 'border-[#1A1A1A] hover:border-[#2A2A2A]'}`}
       >
-        <GitBranch className={`mr-2 h-3.5 w-3.5 transition-colors ${isOpen ? 'text-indigo-400' : 'text-[#4B5563] group-hover:text-indigo-400'}`} />
+        <GitBranch className={`mr-2 h-3.5 w-3.5 transition-colors ${isOpen ? 'text-white' : 'text-[#71717a] group-hover:text-white'}`} />
         <span className="flex-1 truncate font-mono text-[12px] leading-none text-slate-300">{selected}</span>
-        <ChevronDown className={`pointer-events-none absolute right-2 h-3.5 w-3.5 transition-transform duration-200 ${isOpen ? 'rotate-180 text-indigo-400' : 'text-[#4B5563] group-hover:text-slate-300'}`} />
+        <ChevronDown className={`pointer-events-none absolute right-2 h-3.5 w-3.5 transition-transform duration-200 ${isOpen ? 'rotate-180 text-white' : 'text-[#71717a] group-hover:text-slate-300'}`} />
       </div>
-      <div className={`absolute left-0 top-[calc(100%+6px)] z-[80] min-w-[160px] origin-top overflow-hidden rounded-lg border border-[#1E2330] bg-[#0A0C12] shadow-[0_10px_40px_-10px_rgba(0,0,0,0.8)] transition-all duration-200 ${isOpen ? 'translate-y-0 scale-y-100 opacity-100' : 'pointer-events-none -translate-y-2 scale-y-95 opacity-0'}`}>
+      <div className={`absolute left-0 top-[calc(100%+6px)] z-80 min-w-40 origin-top overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#0A0C12] shadow-[0_10px_40px_-10px_rgba(0,0,0,0.8)] transition-all duration-200 ${isOpen ? 'translate-y-0 scale-y-100 opacity-100' : 'pointer-events-none -translate-y-2 scale-y-95 opacity-0'}`}>
         <div className="p-1">
           {loading && <div className="px-3 py-2 text-[12px] text-slate-400">Loading branches...</div>}
           {branches.map((branch) => (
@@ -792,13 +794,13 @@ function BranchDropdown({
                 setSelected(branch);
                 setIsOpen(false);
               }}
-              className={`flex cursor-pointer items-center justify-between rounded-md px-3 py-2 font-mono text-[12px] transition-colors ${selected === branch ? 'bg-indigo-500/10 font-medium text-indigo-400' : 'text-slate-300 hover:bg-[#181C27] hover:text-white'}`}
+              className={`flex cursor-pointer items-center justify-between rounded-md px-3 py-2 font-mono text-[12px] transition-colors ${selected === branch ? 'bg-white/10 font-medium text-white' : 'text-slate-300 hover:bg-[#141414] hover:text-white'}`}
             >
               <div className="flex items-center gap-2">
-                <GitBranch className={`h-3 w-3 ${selected === branch ? 'text-indigo-400' : 'text-transparent'}`} />
+                <GitBranch className={`h-3 w-3 ${selected === branch ? 'text-white' : 'text-transparent'}`} />
                 {branch}
               </div>
-              {selected === branch && <Check className="h-3.5 w-3.5 text-indigo-400" />}
+              {selected === branch && <Check className="h-3.5 w-3.5 text-white" />}
             </div>
           ))}
         </div>
@@ -1025,6 +1027,7 @@ function mapProjectsToRepositories(projects: ProjectRecord[]): DashboardReposito
 export default function DashboardHomeApp() {
   const router = useRouter();
   const { startScan } = useScan();
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   const [activeTab, setActiveTab] = useState('overview');
   const [viewMode, setViewMode] = useState<ViewMode>('list');
   const [typingTrigger, setTypingTrigger] = useState(0);
@@ -1035,6 +1038,7 @@ export default function DashboardHomeApp() {
   const [userName, setUserName] = useState('adityajayashankar');
   const [loggingOut, setLoggingOut] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [uploadingLocalProject, setUploadingLocalProject] = useState(false);
 
   const loadDashboardData = useCallback(async () => {
     setRefreshing(true);
@@ -1133,6 +1137,50 @@ export default function DashboardHomeApp() {
     }
   }, [loadDashboardData, projectsById]);
 
+  const handleUploadCardClick = useCallback(() => {
+    if (uploadingLocalProject) return;
+    uploadInputRef.current?.click();
+  }, [uploadingLocalProject]);
+
+  const handleLocalProjectFileChange = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file) return;
+
+    const defaultName = file.name.replace(/\.zip$/i, '').trim() || 'Local Project';
+    const projectName = window.prompt('Project name', defaultName);
+
+    if (!projectName || !projectName.trim()) {
+      input.value = '';
+      return;
+    }
+
+    setUploadingLocalProject(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('name', projectName.trim());
+
+      const response = await fetch('/api/projects/upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error || 'Failed to upload local project');
+      }
+
+      await loadDashboardData();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to upload local project';
+      window.alert(message);
+    } finally {
+      setUploadingLocalProject(false);
+      input.value = '';
+    }
+  }, [loadDashboardData]);
+
   const handleLogout = useCallback(async () => {
     setLoggingOut(true);
     try {
@@ -1156,13 +1204,14 @@ export default function DashboardHomeApp() {
   const githubCount = repositories.filter((repo) => repo.type === 'github').length;
   const localCount = repositories.filter((repo) => repo.type === 'local').length;
   const firstRepository = repositories[0];
+  const headerTitle = activeTab === 'instances' ? 'Manage Instance' : 'Command Center';
 
   return (
-    <div className="relative flex h-screen overflow-hidden bg-[#06070B] font-sans text-slate-300 selection:bg-indigo-500/30">
+    <div className="relative flex h-screen overflow-hidden bg-[#050505] font-sans text-slate-300 selection:bg-white/30">
       <div className="pointer-events-none absolute inset-0 z-0 opacity-40">
         <PixelBlast
           variant="diamond"
-          color="#6366f1"
+          color="#ffffff"
           pixelSize={4}
           patternScale={2}
           patternDensity={0.6}
@@ -1172,8 +1221,8 @@ export default function DashboardHomeApp() {
         />
       </div>
 
-      <aside className="relative z-20 flex w-64 shrink-0 flex-col border-r border-[#1E2330] bg-[#06070B]">
-        <div className="group flex h-16 cursor-pointer items-center border-b border-[#1E2330] px-8" onMouseEnter={() => setTypingTrigger((prev) => prev + 1)}>
+      <aside className="relative z-20 flex w-64 shrink-0 flex-col border-r border-[#1A1A1A] bg-[#050505]">
+        <div className="group flex h-16 cursor-pointer items-center border-b border-[#1A1A1A] px-8" onMouseEnter={() => setTypingTrigger((prev) => prev + 1)}>
           <TextType
             key={typingTrigger}
             text="DEPL_AI"
@@ -1183,7 +1232,7 @@ export default function DashboardHomeApp() {
             loop={false}
             showCursor
             cursorCharacter="|"
-            cursorClassName="animate-[customBlink_1s_step-end_infinite] font-light text-indigo-400"
+            cursorClassName="animate-[customBlink_1s_step-end_infinite] font-light text-white"
           />
         </div>
 
@@ -1192,29 +1241,33 @@ export default function DashboardHomeApp() {
             <button
               key={key}
               onClick={() => {
+                if (key === 'documentation') {
+                  router.push('/dashboard/documentation');
+                  return;
+                }
                 setActiveTab(key);
                 if (key === 'deployments') router.push('/dashboard/deploy');
                 if (key === 'instances') return;
               }}
-              className={`relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-all ${activeTab === key ? 'border border-indigo-500/20 bg-gradient-to-r from-indigo-500/10 to-transparent text-indigo-100' : 'text-[#8F98A8] hover:bg-[#0A0D14] hover:text-slate-200'}`}
+              className={`relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-all ${activeTab === key ? 'border border-white/25 bg-linear-to-r from-white/10 to-transparent text-white' : 'text-[#a1a1aa] hover:bg-[#0A0A0A] hover:text-slate-200'}`}
             >
-              {activeTab === key && <div className="absolute -left-px top-2 bottom-2 w-[3px] rounded-r-md bg-indigo-500 shadow-[0_0_12px_rgba(99,102,241,0.8)]" />}
-              <Icon className={`h-4 w-4 ${activeTab === key ? 'text-indigo-400' : ''}`} />
+              {activeTab === key && <div className="absolute -left-px top-2 bottom-2 w-0.75 rounded-r-md bg-white shadow-[0_0_12px_rgba(255,255,255,0.8)]" />}
+              <Icon className={`h-4 w-4 ${activeTab === key ? 'text-white' : ''}`} />
               {label}
             </button>
           ))}
         </nav>
 
-        <div className="border-t border-[#1E2330] p-4">
-          <button onClick={handleLogout} disabled={loggingOut} className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-[#0A0D14]">
+        <div className="border-t border-[#1A1A1A] p-4">
+          <button onClick={handleLogout} disabled={loggingOut} className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-[#0A0A0A]">
             <div className="flex h-8 w-8 items-center justify-center rounded-full bg-[#71D08C]">
-              <div className="flex h-6 w-6 items-center justify-center rounded-full bg-white/20 text-xs font-bold text-[#06070B]">
+              <div className="flex h-6 w-6 items-center justify-center rounded-full bg-white/20 text-xs font-bold text-[#050505]">
                 {(userName || 'U').charAt(0).toUpperCase()}
               </div>
             </div>
             <div className="flex-1 overflow-hidden">
               <p className="truncate text-sm font-medium text-white">{userName}</p>
-              <div className="mt-0.5 flex items-center gap-1 text-[11px] text-[#8F98A8]">
+              <div className="mt-0.5 flex items-center gap-1 text-[11px] text-[#a1a1aa]">
                 <LogOut className="h-3 w-3" />
                 <span>{loggingOut ? 'Signing out...' : 'Sign out'}</span>
               </div>
@@ -1224,19 +1277,19 @@ export default function DashboardHomeApp() {
       </aside>
 
       <main className="relative z-10 flex h-full flex-1 flex-col overflow-hidden bg-transparent">
-        <header className="flex h-16 items-center justify-between border-b border-[#1E2330]/50 bg-[#06070B]/60 px-8 backdrop-blur-md">
-          <div className="flex items-center gap-2 text-[13px] text-[#8F98A8]">
+        <header className="flex h-16 items-center justify-between border-b border-[#1A1A1A]/50 bg-[#050505]/60 px-8 backdrop-blur-md">
+          <div className="flex items-center gap-2 text-[13px] text-[#a1a1aa]">
             <span className="cursor-pointer transition-colors hover:text-slate-200">Dashboard</span>
-            <span className="text-[#4B5563]">/</span>
-            <span className="font-medium text-white">{activeTab === 'instances' ? 'Manage Instance' : 'Command Center'}</span>
+            <span className="text-[#71717a]">/</span>
+            <span className="font-medium text-white">{headerTitle}</span>
           </div>
           <div className="flex items-center gap-3">
-            <button onClick={() => router.push('/dashboard/projects')} className="flex items-center gap-2 rounded-md border border-[#1E2330] px-3 py-1.5 text-[13px] font-medium text-slate-300 transition-all hover:bg-[#13161F]">
+            <button onClick={() => router.push('/dashboard/projects')} className="flex items-center gap-2 rounded-md border border-[#1A1A1A] px-3 py-1.5 text-[13px] font-medium text-slate-300 transition-all hover:bg-[#111111]">
               <Server className="h-3.5 w-3.5" />
               Manage Org
             </button>
-            <div className="mx-1 h-4 w-px bg-[#1E2330]" />
-            <button onClick={() => void loadDashboardData()} className="rounded-md p-1.5 text-[#8F98A8] transition-all hover:bg-[#13161F] hover:text-white" title="Refresh">
+            <div className="mx-1 h-4 w-px bg-[#1A1A1A]" />
+            <button onClick={() => void loadDashboardData()} className="rounded-md p-1.5 text-[#a1a1aa] transition-all hover:bg-[#111111] hover:text-white" title="Refresh">
               <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
             </button>
           </div>
@@ -1247,21 +1300,21 @@ export default function DashboardHomeApp() {
         ) : (
         <div className="custom-scrollbar relative z-10 flex-1 overflow-y-auto p-8" onScroll={handleMainScroll}>
           <div className="mb-10 grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-4">
-            <BorderGlow backgroundColor="#000000" glowColor="230 80 60" glowIntensity={1} glowRadius={15} fillOpacity={0} borderRadius={16} className="p-6 shadow-lg">
+            <BorderGlow backgroundColor="#000000" colors={['#ffffff', '#d4d4d8', '#a1a1aa']} glowColor="0 0 100" glowIntensity={1} glowRadius={15} fillOpacity={0} borderRadius={16} className="p-6 shadow-lg">
               <div className="mb-4 flex items-center justify-between">
-                <h3 className="text-xs font-semibold uppercase tracking-widest text-[#8F98A8]">Repositories</h3>
+                <h3 className="text-xs font-semibold uppercase tracking-widest text-[#a1a1aa]">Repositories</h3>
                 <div className="flex gap-1">
-                  <div className="h-1 w-6 rounded-full bg-[#1E2330]" />
-                  <div className="h-1 w-6 rounded-full bg-[#1E2330]" />
+                  <div className="h-1 w-6 rounded-full bg-[#1A1A1A]" />
+                  <div className="h-1 w-6 rounded-full bg-[#1A1A1A]" />
                 </div>
               </div>
               <div className="mt-2 mb-6 flex items-end gap-3">
                 <span className="text-5xl leading-none tracking-tight text-white">{activeCount}</span>
-                <span className="mb-1 text-[13px] font-medium text-[#8F98A8]">tracked</span>
+                <span className="mb-1 text-[13px] font-medium text-[#a1a1aa]">tracked</span>
               </div>
               <div className="mt-auto flex gap-2">
-                <span className="flex items-center gap-1.5 rounded-md border border-[#1E2330] bg-[#13161F] px-2.5 py-1 text-[11px] font-medium text-[#8F98A8]"><Github className="h-3.5 w-3.5" /> {githubCount} remote</span>
-                <span className="flex items-center gap-1.5 rounded-md border border-[#1E2330] bg-[#13161F] px-2.5 py-1 text-[11px] font-medium text-[#8F98A8]"><FileText className="h-3.5 w-3.5" /> {localCount} local</span>
+                <span className="flex items-center gap-1.5 rounded-md border border-[#1A1A1A] bg-[#111111] px-2.5 py-1 text-[11px] font-medium text-[#a1a1aa]"><Github className="h-3.5 w-3.5" /> {githubCount} remote</span>
+                <span className="flex items-center gap-1.5 rounded-md border border-[#1A1A1A] bg-[#111111] px-2.5 py-1 text-[11px] font-medium text-[#a1a1aa]"><FileText className="h-3.5 w-3.5" /> {localCount} local</span>
               </div>
             </BorderGlow>
 
@@ -1269,12 +1322,12 @@ export default function DashboardHomeApp() {
               <button onClick={() => router.push('/dashboard/projects')} className="flex h-full w-full flex-col items-start text-left">
                 <div className="mb-3 mt-1 flex items-center gap-3">
                   <div className="flex h-8 w-8 items-center justify-center rounded-md border border-white/10 bg-white/5">
-                    <Plus className="h-4 w-4 text-indigo-300" />
+                    <Plus className="h-4 w-4 text-white" />
                   </div>
                   <h3 className="text-base font-semibold text-white">Add Project</h3>
                 </div>
-                <p className="mb-4 text-[13px] leading-relaxed text-indigo-200/60">Connect more GitHub repositories to secure your supply chain.</p>
-                <div className="mt-auto flex items-center gap-1 text-[13px] font-medium text-indigo-300 transition-colors group-hover:text-indigo-200">
+                <p className="mb-4 text-[13px] leading-relaxed text-zinc-300">Connect more GitHub repositories to secure your supply chain.</p>
+                <div className="mt-auto flex items-center gap-1 text-[13px] font-medium text-white transition-colors group-hover:text-zinc-200">
                   Connect now <ArrowRight className="ml-1 h-3.5 w-3.5" />
                 </div>
               </button>
@@ -1291,7 +1344,7 @@ export default function DashboardHomeApp() {
                 <Server className="h-4 w-4 text-[#FF9900]" />
                 <h3 className="text-base font-semibold text-slate-200">AWS Deployment</h3>
               </div>
-              <p className="relative z-10 mb-6 text-[13px] leading-relaxed text-[#8F98A8]">Deploy live endpoints directly to Amazon Web Services infrastructure.</p>
+              <p className="relative z-10 mb-6 text-[13px] leading-relaxed text-[#a1a1aa]">Deploy live endpoints directly to Amazon Web Services infrastructure.</p>
               <PixelNoiseButton
                 onClick={() => (firstRepository ? handleDeploy(firstRepository.id) : router.push('/dashboard/deploy'))}
                 theme="orange"
@@ -1302,36 +1355,44 @@ export default function DashboardHomeApp() {
             </BorderGlow>
 
             <BorderGlow backgroundColor="#000000" glowColor="220 40 50" glowIntensity={1} glowRadius={15} fillOpacity={0} borderRadius={16} className="group cursor-pointer p-1 shadow-lg">
-              <button onClick={() => router.push('/dashboard/projects')} className="flex h-full w-full flex-col items-center justify-center rounded-xl border border-dashed border-[#2A3143] p-5 text-center transition-colors group-hover:border-[#4B5563] group-hover:bg-[#10131C]/50">
-                <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-md border border-[#2A3143] bg-[#181C27] shadow-sm transition-transform group-hover:-translate-y-0.5">
-                  <Upload className="h-4 w-4 text-indigo-400" />
+              <button onClick={handleUploadCardClick} disabled={uploadingLocalProject} className="flex h-full w-full flex-col items-center justify-center rounded-xl border border-dashed border-[#2A2A2A] p-5 text-center transition-colors group-hover:border-[#71717a] group-hover:bg-[#0A0A0A]/50 disabled:cursor-not-allowed disabled:opacity-70">
+                <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-md border border-[#2A2A2A] bg-[#141414] shadow-sm transition-transform group-hover:-translate-y-0.5">
+                  <Upload className="h-4 w-4 text-white" />
                 </div>
-                <h3 className="mb-2 text-[14px] font-semibold text-slate-200">Upload Project</h3>
-                <p className="rounded border border-[#1E2330] bg-[#181C27] px-2.5 py-1 text-[11px] font-medium text-[#8F98A8]">.zip supported</p>
+                <h3 className="mb-2 text-[14px] font-semibold text-slate-200">{uploadingLocalProject ? 'Uploading...' : 'Upload Project'}</h3>
+                <p className="rounded border border-[#1A1A1A] bg-[#141414] px-2.5 py-1 text-[11px] font-medium text-[#a1a1aa]">.zip supported</p>
               </button>
             </BorderGlow>
+
+            <input
+              ref={uploadInputRef}
+              type="file"
+              accept=".zip,application/zip"
+              className="hidden"
+              onChange={handleLocalProjectFileChange}
+            />
           </div>
 
           <div className="mt-8">
             <div className="mb-6 flex items-center justify-between">
               <div className="flex items-center gap-3">
                 <h2 className="text-xl font-semibold text-white">Repositories</h2>
-                <span className="rounded border border-[#1E2330] bg-[#181C27] px-2 py-0.5 text-[11px] font-medium text-[#8F98A8]">{filteredRepositories.length}</span>
+                <span className="rounded border border-[#1A1A1A] bg-[#141414] px-2 py-0.5 text-[11px] font-medium text-[#a1a1aa]">{filteredRepositories.length}</span>
               </div>
               <div className="flex items-center gap-3">
                 <div className="relative">
-                  <Search className="absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-[#8F98A8]" />
+                  <Search className="absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-[#a1a1aa]" />
                   <input
                     value={search}
                     onChange={(event) => setSearch(event.target.value)}
                     type="text"
                     placeholder="Search repositories..."
-                    className="w-[280px] rounded-md border border-[#1E2330] bg-[#0A0D14] py-1.5 pr-4 pl-9 text-[13px] text-slate-200 placeholder:text-[#4B5563] focus:border-indigo-500/50 focus:outline-none"
+                    className="w-70 rounded-md border border-[#1A1A1A] bg-[#0A0A0A] py-1.5 pr-4 pl-9 text-[13px] text-slate-200 placeholder:text-[#71717a] focus:border-white/50 focus:outline-none"
                   />
                 </div>
-                <div className="flex items-center rounded-md border border-[#1E2330] bg-[#0A0D14] p-0.5">
-                  <button onClick={() => setViewMode('list')} className={`rounded p-1.5 transition-colors ${viewMode === 'list' ? 'bg-[#1E2330] text-white' : 'text-[#8F98A8] hover:text-white'}`}><List className="h-4 w-4" /></button>
-                  <button onClick={() => setViewMode('grid')} className={`rounded p-1.5 transition-colors ${viewMode === 'grid' ? 'bg-[#1E2330] text-white' : 'text-[#8F98A8] hover:text-white'}`}><Grid className="h-4 w-4" /></button>
+                <div className="flex items-center rounded-md border border-[#1A1A1A] bg-[#0A0A0A] p-0.5">
+                  <button onClick={() => setViewMode('list')} className={`rounded p-1.5 transition-colors ${viewMode === 'list' ? 'bg-[#1A1A1A] text-white' : 'text-[#a1a1aa] hover:text-white'}`}><List className="h-4 w-4" /></button>
+                  <button onClick={() => setViewMode('grid')} className={`rounded p-1.5 transition-colors ${viewMode === 'grid' ? 'bg-[#1A1A1A] text-white' : 'text-[#a1a1aa] hover:text-white'}`}><Grid className="h-4 w-4" /></button>
                 </div>
               </div>
             </div>
@@ -1339,20 +1400,20 @@ export default function DashboardHomeApp() {
             <div className={viewMode === 'list' ? 'space-y-3' : 'grid grid-cols-1 gap-4 lg:grid-cols-2'}>
               {filteredRepositories.map((repo, index) => (
                 <div key={repo.id} className="relative" style={{ zIndex: filteredRepositories.length - index }}>
-                  <BorderGlow backgroundColor="#000000" colors={['#818CF8', '#C084FC', '#38BDF8']} glowColor="230 70 60" glowIntensity={0.8} glowRadius={12} fillOpacity={0} borderRadius={12} className="group border border-[#1E2330] shadow-sm transition-colors hover:border-transparent">
+                  <BorderGlow backgroundColor="#000000" colors={['#ffffff', '#d4d4d8', '#a1a1aa']} glowColor="0 0 100" glowIntensity={0.8} glowRadius={12} fillOpacity={0} borderRadius={12} className="group border border-[#1A1A1A] shadow-sm transition-colors hover:border-transparent">
                     <div className={`flex h-full w-full p-4 ${viewMode === 'list' ? 'items-center gap-4' : 'flex-col items-start gap-4'}`}>
                       <div className={`flex w-full ${viewMode === 'list' ? 'flex-1 items-center gap-4' : 'items-start gap-3'}`}>
-                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#1E2330] bg-[#141824] shadow-sm transition-colors group-hover:border-[#2A3143]">
-                          <Github className="h-5 w-5 text-indigo-400" />
+                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#1A1A1A] bg-[#111111] shadow-sm transition-colors group-hover:border-[#2A2A2A]">
+                          <Github className="h-5 w-5 text-white" />
                         </div>
                         <div className="flex min-w-0 flex-1 flex-col justify-center">
                           <div className="mb-1 flex items-center gap-3">
                             <h4 className="truncate text-[15px] font-semibold text-slate-200">{repo.name}</h4>
                             <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold tracking-wider ${repo.visibility === 'PUBLIC' ? 'border border-[#04D288]/20 bg-[#04D288]/10 text-[#04D288]' : 'border border-[#F59E0B]/20 bg-[#F59E0B]/10 text-[#F59E0B]'}`}>{repo.visibility}</span>
                           </div>
-                          <div className="flex flex-wrap items-center gap-2 text-[12px] text-[#8F98A8]">
+                          <div className="flex flex-wrap items-center gap-2 text-[12px] text-[#a1a1aa]">
                             <span>{repo.source}</span>
-                            <span className="h-1 w-1 rounded-full bg-[#4B5563]" />
+                            <span className="h-1 w-1 rounded-full bg-[#71717a]" />
                             <BranchDropdown
                               installationId={repo.installationId}
                               owner={repo.owner}
@@ -1363,18 +1424,18 @@ export default function DashboardHomeApp() {
                         </div>
                       </div>
 
-                      <div className={`flex shrink-0 items-center gap-2 ${viewMode === 'grid' ? 'w-full justify-between border-t border-[#1E2330] pt-2' : ''}`}>
+                      <div className={`flex shrink-0 items-center gap-2 ${viewMode === 'grid' ? 'w-full justify-between border-t border-[#1A1A1A] pt-2' : ''}`}>
                         <div className="flex gap-2">
-                          <PixelNoiseButton onClick={() => handleDeploy(repo.id)}>
+                          <PixelNoiseButton onClick={() => handleDeploy(repo.id)} className="px-5 py-2 text-sm">
                             <Rocket className="h-3.5 w-3.5" /> Deploy
                           </PixelNoiseButton>
-                          <PixelNoiseButton onClick={() => void handleRunScan(repo.id)}>
+                          <PixelNoiseButton onClick={() => void handleRunScan(repo.id)} className="px-5 py-2 text-sm">
                             <Zap className="h-3.5 w-3.5 fill-current" /> Run Scan
                           </PixelNoiseButton>
                         </div>
                         <div className="flex items-center gap-1">
-                          <div className={`mx-1 h-5 w-px bg-[#1E2330] ${viewMode === 'grid' ? 'hidden' : ''}`} />
-                          <button onClick={() => void handleDelete(repo.id)} className="ml-1 rounded-md p-1.5 text-[#8F98A8] transition-colors hover:bg-[#F43F5E]/10 hover:text-[#F43F5E]" title="Delete">
+                          <div className={`mx-1 h-5 w-px bg-[#1A1A1A] ${viewMode === 'grid' ? 'hidden' : ''}`} />
+                          <button onClick={() => void handleDelete(repo.id)} className="ml-1 rounded-md p-1.5 text-[#a1a1aa] transition-colors hover:bg-[#F43F5E]/10 hover:text-[#F43F5E]" title="Delete">
                             <Trash2 className="h-4 w-4" />
                           </button>
                         </div>
@@ -1392,8 +1453,8 @@ export default function DashboardHomeApp() {
       <style dangerouslySetInnerHTML={{ __html: `
         .custom-scrollbar::-webkit-scrollbar { width: 6px; }
         .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #1E2330; border-radius: 10px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background-color: #2A3143; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #1A1A1A; border-radius: 10px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background-color: #2A2A2A; }
         @keyframes customBlink {
           0%, 100% { opacity: 1; }
           50% { opacity: 0; }
@@ -1403,3 +1464,5 @@ export default function DashboardHomeApp() {
     </div>
   );
 }
+
+

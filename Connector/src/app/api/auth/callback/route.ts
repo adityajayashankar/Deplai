@@ -69,11 +69,11 @@ export async function GET(request: NextRequest) {
 
     if (!code) {
       await session.save();
-      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=no_code`);
+      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=no_code`, 302);
     }
     if (!expectedState || !returnedState || !stateExpiresAt || Date.now() > stateExpiresAt || !safeStateMatches(expectedState, returnedState)) {
       await session.save();
-      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=auth_failed`);
+      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=auth_failed`, 302);
     }
 
     const tokenResponse = await fetch('https://github.com/login/oauth/access_token', {
@@ -94,13 +94,13 @@ export async function GET(request: NextRequest) {
 
     if (!tokenResponse.ok || tokenData.error) {
       await session.save();
-      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=token_error`);
+      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=token_error`, 302);
     }
 
     const accessToken = tokenData.access_token;
     if (!accessToken) {
       await session.save();
-      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=token_missing`);
+      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=token_missing`, 302);
     }
 
     const [githubUserResponse, emailsResponse] = await Promise.all([
@@ -110,7 +110,7 @@ export async function GET(request: NextRequest) {
 
     if (!githubUserResponse.ok || !emailsResponse.ok) {
       await session.save();
-      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=auth_failed`);
+      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=auth_failed`, 302);
     }
 
     const githubUser = await githubUserResponse.json() as GitHubUser;
@@ -118,13 +118,13 @@ export async function GET(request: NextRequest) {
 
     if (!githubUser?.id || !githubUser?.login) {
       await session.save();
-      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=auth_failed`);
+      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=auth_failed`, 302);
     }
 
     const primaryEmail = emails.find((e) => e.primary)?.email || emails[0]?.email;
     if (!primaryEmail) {
       await session.save();
-      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=no_email`);
+      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=no_email`, 302);
     }
 
     let [user] = await query<Array<{ id: string }>>(
@@ -206,9 +206,9 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/dashboard`);
+    return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/dashboard`, 302);
   } catch (error) {
     console.error('Auth callback error:', error);
-    return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=auth_failed`);
+    return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/?error=auth_failed`, 302);
   }
 }

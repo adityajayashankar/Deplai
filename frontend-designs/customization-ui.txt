@@ -1,0 +1,661 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { 
+  TerminalSquare, Send, Upload, RefreshCw, AlertTriangle, 
+  CheckCircle2, XCircle, FileJson, Image as ImageIcon, 
+  MessageSquare, Play, ShieldAlert, Key, RefreshCcw,
+  Bot, User, Clock, ChevronRight, Lock
+} from 'lucide-react';
+
+// ==========================================
+// ENTERPRISE UI EFFECTS
+// ==========================================
+
+class Pixel {
+  constructor(canvas, context, x, y, color, speed, delay) {
+    const dpr = window.devicePixelRatio || 1;
+    this.width = canvas.width / dpr;
+    this.height = canvas.height / dpr;
+    this.ctx = context;
+    this.x = x;
+    this.y = y;
+    this.color = color;
+    this.speed = (Math.random() * 0.8 + 0.1) * speed;
+    this.size = 0;
+    this.sizeStep = Math.random() * 0.4;
+    this.minSize = 0.5;
+    this.maxSizeInteger = 2;
+    this.maxSize = Math.random() * (this.maxSizeInteger - this.minSize) + this.minSize;
+    this.delay = delay;
+    this.counter = 0;
+    this.counterStep = Math.random() * 4 + (this.width + this.height) * 0.01;
+    this.isIdle = false;
+    this.isReverse = false;
+    this.isShimmer = false;
+  }
+  draw() {
+    const centerOffset = this.maxSizeInteger * 0.5 - this.size * 0.5;
+    this.ctx.fillStyle = this.color;
+    this.ctx.fillRect(Math.round(this.x + centerOffset), Math.round(this.y + centerOffset), Math.round(this.size), Math.round(this.size));
+  }
+  appear() {
+    this.isIdle = false;
+    if (this.counter <= this.delay) { this.counter += this.counterStep; return; }
+    if (this.size >= this.maxSize) this.isShimmer = true;
+    if (this.isShimmer) this.shimmer();
+    else this.size += this.sizeStep;
+    this.draw();
+  }
+  disappear() {
+    this.isShimmer = false;
+    this.counter = 0;
+    if (this.size <= 0) { this.isIdle = true; return; }
+    else this.size -= 0.1;
+    this.draw();
+  }
+  shimmer() {
+    if (this.size >= this.maxSize) this.isReverse = true;
+    else if (this.size <= this.minSize) this.isReverse = false;
+    if (this.isReverse) this.size -= this.speed;
+    else this.size += this.speed;
+  }
+}
+
+const PixelCard = ({ gap = 5, speed = 35, colors = '#3f3f46,#18181b,#ffffff', className = '', children }) => {
+  const containerRef = useRef(null);
+  const canvasRef = useRef(null);
+  const pixelsRef = useRef([]);
+  const animationRef = useRef(null);
+  const timePreviousRef = useRef(performance.now());
+  
+  const initPixels = useCallback(() => {
+    if (!containerRef.current || !canvasRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const width = Math.floor(rect.width);
+    const height = Math.floor(rect.height);
+    const ctx = canvasRef.current.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvasRef.current.width = width * dpr;
+    canvasRef.current.height = height * dpr;
+    if (ctx) ctx.scale(dpr, dpr);
+
+    const colorsArray = colors.split(',');
+    const pxs = [];
+    for (let x = 0; x < width; x += gap) {
+      for (let y = 0; y < height; y += gap) {
+        const color = colorsArray[Math.floor(Math.random() * colorsArray.length)];
+        const distance = Math.sqrt(Math.pow(x - width / 2, 2) + Math.pow(y - height / 2, 2));
+        if (!ctx) return;
+        pxs.push(new Pixel(canvasRef.current, ctx, x, y, color, (speed * 0.001), distance));
+      }
+    }
+    pixelsRef.current = pxs;
+  }, [colors, gap, speed]);
+
+  const doAnimate = useCallback((fnName) => {
+    animationRef.current = requestAnimationFrame(() => doAnimate(fnName));
+    const timeNow = performance.now();
+    const timePassed = timeNow - timePreviousRef.current;
+    if (timePassed < 1000 / 60) return;
+    timePreviousRef.current = timeNow - (timePassed % (1000 / 60));
+
+    const ctx = canvasRef.current?.getContext('2d');
+    if (!ctx || !canvasRef.current) return;
+    const dpr = window.devicePixelRatio || 1;
+    ctx.clearRect(0, 0, canvasRef.current.width / dpr, canvasRef.current.height / dpr);
+
+    let allIdle = true;
+    pixelsRef.current.forEach(pixel => {
+      pixel[fnName]();
+      if (!pixel.isIdle) allIdle = false;
+    });
+    if (allIdle && animationRef.current) cancelAnimationFrame(animationRef.current);
+  }, []);
+
+  const handleAnimation = useCallback((name) => {
+    if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
+    animationRef.current = requestAnimationFrame(() => doAnimate(name));
+  }, [doAnimate]);
+
+  useEffect(() => {
+    initPixels();
+    const observer = new ResizeObserver(() => initPixels());
+    if (containerRef.current) observer.observe(containerRef.current);
+    return () => { observer.disconnect(); if (animationRef.current !== null) cancelAnimationFrame(animationRef.current); };
+  }, [initPixels]);
+
+  return (
+    <div
+      ref={containerRef}
+      className={`relative overflow-hidden isolate transition-colors duration-200 select-none ${className}`}
+      onMouseEnter={() => handleAnimation('appear')}
+      onMouseLeave={() => handleAnimation('disappear')}
+    >
+      <canvas className="absolute inset-0 w-full h-full block pointer-events-none z-0 mix-blend-lighten opacity-30" ref={canvasRef} />
+      <div className="relative z-10 w-full h-full flex flex-col">{children}</div>
+    </div>
+  );
+};
+
+const BorderGlow = ({ children, className = '', active = false }) => {
+  const glowColor = active ? 'from-white/30 via-white/10' : 'from-zinc-500/10 via-zinc-500/5';
+  return (
+    <div className={`relative group ${className}`}>
+      <div className={`absolute -inset-[1px] bg-gradient-to-r ${glowColor} to-transparent rounded-lg opacity-100 blur-sm transition duration-500`}></div>
+      <div className="relative bg-[#050505] border border-[#262626] rounded-lg h-full flex flex-col overflow-hidden">
+        {children}
+      </div>
+    </div>
+  );
+};
+
+// ==========================================
+// MOCK DATA & TYPES
+// ==========================================
+
+const MOCK_MANIFEST = {
+  version: "1.0.0",
+  branding: {
+    primary_color: "#000000",
+    secondary_color: "#ffffff",
+    logo_url: null,
+    favicon_url: null
+  },
+  features: {
+    enable_sso: true,
+    enable_custom_domain: false
+  },
+  last_updated: new Date().toISOString()
+};
+
+// ==========================================
+// MAIN CONSOLE COMPONENT
+// ==========================================
+
+export default function TenantConsole() {
+  // Core State
+  const [tenantId, setTenantId] = useState('');
+  const [isConfirmed, setIsConfirmed] = useState(false);
+  const [manifestJson, setManifestJson] = useState(null);
+  
+  // Chat State
+  const [chatInput, setChatInput] = useState('');
+  const [chatMessages, setChatMessages] = useState([
+    { role: 'agent', content: 'Operator console initialized. Awaiting Tenant ID.', timestamp: new Date().toLocaleTimeString() }
+  ]);
+  
+  // Asset State
+  const [assetType, setAssetType] = useState('logo');
+  const [uploadedAssetsSession, setUploadedAssetsSession] = useState([]);
+  
+  // Implementation & Validator State
+  const [implementRun, setImplementRun] = useState({
+    appTargets: ['frontend', 'admin-frontend', 'expert', 'corporates'],
+    validatorIssues: [],
+    repairPassUsed: false
+  });
+
+  // Status & Loaders
+  const [status, setStatus] = useState({ level: 'info', text: 'Enter Tenant ID to continue.' });
+  const [loading, setLoading] = useState({
+    chat: false, manifest: false, confirm: false, implement: false, 
+    repair: false, upload: false, resetSession: false, resetRepo: false
+  });
+
+  const chatEndRef = useRef(null);
+
+  // --- Initialization ---
+  useEffect(() => {
+    const saved = localStorage.getItem('tenant_id');
+    if (saved) {
+      setTenantId(saved);
+      setStatus({ level: 'info', text: 'Restored session for Tenant ID: ' + saved });
+      handleFetchManifest(saved);
+    }
+  }, []);
+
+  useEffect(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), [chatMessages, loading.chat]);
+
+  // --- Handlers ---
+
+  const handleTenantChange = (e) => {
+    const val = e.target.value;
+    setTenantId(val);
+    localStorage.setItem('tenant_id', val);
+    setIsConfirmed(false);
+    setManifestJson(null);
+    setImplementRun({ appTargets: ['frontend', 'admin-frontend', 'expert', 'corporates'], validatorIssues: [], repairPassUsed: false });
+    
+    if (val.trim() === '') {
+      setStatus({ level: 'warning', text: 'Tenant required: Enter Tenant ID to continue.' });
+    } else {
+      setStatus({ level: 'info', text: 'Tenant ID updated. Fetch manifest to begin.' });
+    }
+  };
+
+  const handleChatSubmit = (e) => {
+    e.preventDefault();
+    if (!chatInput.trim() || !tenantId) return;
+
+    const newMessage = { role: 'user', content: chatInput, timestamp: new Date().toLocaleTimeString() };
+    setChatMessages(prev => [...prev, newMessage]);
+    setChatInput('');
+    setLoading(p => ({ ...p, chat: true }));
+    setStatus({ level: 'info', text: 'Chat sent: Sending message to customization agent...' });
+
+    setTimeout(() => {
+      setChatMessages(prev => [...prev, { role: 'agent', content: 'I have updated the manifest based on your request. Please review the changes.', timestamp: new Date().toLocaleTimeString() }]);
+      setLoading(p => ({ ...p, chat: false }));
+      setIsConfirmed(false); 
+      setStatus({ level: 'success', text: 'Chat success: Agent response received. Manifest refreshed.' });
+      handleFetchManifest(tenantId);
+    }, 1500);
+  };
+
+  const handleFetchManifest = (tid = tenantId) => {
+    if (!tid) return;
+    setLoading(p => ({ ...p, manifest: true }));
+    setStatus({ level: 'info', text: 'Fetching manifest...' });
+
+    setTimeout(() => {
+      setManifestJson({ tenant_id: tid, ...MOCK_MANIFEST });
+      setLoading(p => ({ ...p, manifest: false }));
+      setStatus({ level: 'success', text: 'Manifest fetched: Manifest loaded successfully.' });
+    }, 800);
+  };
+
+  const handleConfirm = () => {
+    setLoading(p => ({ ...p, confirm: true }));
+    setTimeout(() => {
+      setIsConfirmed(true);
+      setLoading(p => ({ ...p, confirm: false }));
+      setStatus({ level: 'success', text: 'Confirm success: Manifest confirmed. You can now implement.' });
+    }, 600);
+  };
+
+  const handleImplement = () => {
+    if (!isConfirmed) {
+      setStatus({ level: 'error', text: 'Implement blocked: Confirm manifest before implementation.' });
+      return;
+    }
+
+    setLoading(p => ({ ...p, implement: true }));
+    setStatus({ level: 'info', text: 'Implement running: Implementing changes across 4 app targets...' });
+    setImplementRun(p => ({ ...p, validatorIssues: [] }));
+
+    setTimeout(() => {
+      if (!implementRun.repairPassUsed && Math.random() > 0.3) {
+        setImplementRun(p => ({ ...p, validatorIssues: ['[Validator] Primary color contrast too low.', '[Validator] Missing required favicon dimension.'] }));
+        setLoading(p => ({ ...p, implement: false }));
+        setStatus({ level: 'warning', text: 'Validator issues: Validator found issues. Review and approve one repair pass.' });
+      } else {
+        setLoading(p => ({ ...p, implement: false }));
+        setStatus({ level: 'success', text: `Implementation Success: Rolled out to ${implementRun.appTargets.join(', ')}.` });
+        setIsConfirmed(false);
+      }
+    }, 2000);
+  };
+
+  const handleRepair = () => {
+    setLoading(p => ({ ...p, repair: true }));
+    setStatus({ level: 'info', text: 'Repair running: Running one-time repair pass...' });
+    setImplementRun(p => ({ ...p, repairPassUsed: true }));
+
+    setTimeout(() => {
+      setImplementRun(p => ({ ...p, validatorIssues: [] })); 
+      setLoading(p => ({ ...p, repair: false }));
+      setStatus({ level: 'success', text: `Implementation Success (Post-Repair): Rolled out to ${implementRun.appTargets.join(', ')}.` });
+      setIsConfirmed(false);
+    }, 2500);
+  };
+
+  const handleUpload = (e) => {
+    const file = e.target.files?.[0];
+    if (!file || !tenantId) return;
+
+    setLoading(p => ({ ...p, upload: true }));
+    setStatus({ level: 'info', text: `Uploading ${assetType}...` });
+
+    setTimeout(() => {
+      const newAsset = {
+        assetType,
+        fileName: file.name,
+        previewUrl: URL.createObjectURL(file), 
+        uploadedAt: new Date().toLocaleTimeString()
+      };
+      setUploadedAssetsSession(prev => [...prev, newAsset]);
+      setLoading(p => ({ ...p, upload: false }));
+      setStatus({ level: 'success', text: 'Upload success: Asset uploaded and manifest updated.' });
+      
+      if (manifestJson) {
+        setManifestJson({
+          ...manifestJson,
+          branding: { ...manifestJson.branding, [`${assetType}_url`]: `s3://tenant-${tenantId}/assets/${file.name}` }
+        });
+        setIsConfirmed(false); 
+      }
+    }, 1200);
+  };
+
+  const handleResetSession = () => {
+    setLoading(p => ({ ...p, resetSession: true }));
+    setTimeout(() => {
+      setChatMessages([{ role: 'agent', content: 'Session reset. Awaiting instructions.', timestamp: new Date().toLocaleTimeString() }]);
+      setUploadedAssetsSession([]);
+      setImplementRun({ appTargets: ['frontend', 'admin-frontend', 'expert', 'corporates'], validatorIssues: [], repairPassUsed: false });
+      setIsConfirmed(false);
+      setLoading(p => ({ ...p, resetSession: false }));
+      setStatus({ level: 'success', text: 'Reset session success: Session reset complete.' });
+    }, 500);
+  };
+
+  const handleResetRepo = () => {
+    if (window.confirm("Reset repo confirm: This will reset tenant repo state entirely. Continue?")) {
+      setLoading(p => ({ ...p, resetRepo: true }));
+      setStatus({ level: 'warning', text: 'Resetting repository...' });
+      setTimeout(() => {
+        handleFetchManifest(); 
+        setLoading(p => ({ ...p, resetRepo: false }));
+        setStatus({ level: 'success', text: 'Reset repo success: Tenant repo reset complete.' });
+      }, 1500);
+    }
+  };
+
+  const isGlobalDisabled = !tenantId.trim();
+
+  const StatusIcon = () => {
+    if (status.level === 'success') return <CheckCircle2 className="w-4 h-4 text-white shrink-0" />;
+    if (status.level === 'error') return <XCircle className="w-4 h-4 text-rose-500 shrink-0" />;
+    if (status.level === 'warning') return <AlertTriangle className="w-4 h-4 text-white shrink-0" />;
+    return <TerminalSquare className="w-4 h-4 text-zinc-500 shrink-0" />;
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-[#000000] text-zinc-300 font-sans selection:bg-white selection:text-black overflow-hidden" style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}>
+      <style dangerouslySetInnerHTML={{ __html: `
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #262626; border-radius: 10px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background-color: #3f3f46; }
+      `}} />
+
+      {/* HEADER */}
+      <header className="h-14 flex items-center justify-between px-6 border-b border-[#1A1A1A] bg-[#050505] shrink-0 z-20">
+        <div className="flex items-center gap-3">
+          <div className="w-6 h-6 rounded bg-white text-black font-bold flex items-center justify-center tracking-tighter text-[10px]">TC</div>
+          <h1 className="text-white font-bold tracking-widest text-[11px] uppercase">Tenant Customization Operator</h1>
+        </div>
+        
+        <div className="flex items-center gap-3 bg-[#000000] border border-[#262626] rounded-md px-3 py-1">
+          <Key className="w-3.5 h-3.5 text-zinc-500" />
+          <input 
+            type="text" 
+            value={tenantId}
+            onChange={handleTenantChange}
+            placeholder="Enter Tenant ID..." 
+            className="bg-transparent text-[12px] font-mono focus:outline-none text-white placeholder:text-zinc-600 transition-colors w-48"
+          />
+        </div>
+      </header>
+
+      {/* MAIN GRID */}
+      <main className="flex-1 grid grid-cols-12 overflow-hidden relative">
+        
+        {/* GLOBAL LOCK OVERLAY */}
+        {isGlobalDisabled && (
+          <div className="absolute inset-0 z-50 bg-[#000000]/80 backdrop-blur-sm flex items-center justify-center">
+            <div className="bg-[#050505] border border-[#262626] p-6 rounded-lg flex flex-col items-center gap-4 text-center max-w-sm">
+              <div className="w-12 h-12 rounded-full bg-[#111111] border border-[#262626] flex items-center justify-center">
+                <Lock className="w-5 h-5 text-white" />
+              </div>
+              <div>
+                <h3 className="text-white font-bold mb-1">Workspace Locked</h3>
+                <p className="text-xs text-zinc-400 leading-relaxed">Please enter a valid Tenant ID in the header bar to load the customization workspace.</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* LEFT PANE: Chat */}
+        <section className="col-span-3 flex flex-col border-r border-[#1A1A1A] bg-[#000000]">
+          <div className="px-4 py-3 border-b border-[#1A1A1A] flex items-center gap-2 bg-[#050505]">
+            <MessageSquare className="w-3.5 h-3.5 text-zinc-400"/>
+            <span className="text-[10px] font-bold text-zinc-300 uppercase tracking-widest">Agent Chat</span>
+          </div>
+          
+          <div className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-5">
+            {chatMessages.map((msg, i) => (
+              <div key={i} className="flex flex-col gap-1.5">
+                <div className="flex items-center gap-2 px-1">
+                   {msg.role === 'agent' ? <Bot className="w-3 h-3 text-zinc-500" /> : <User className="w-3 h-3 text-zinc-500" />}
+                   <span className="text-[10px] font-bold text-zinc-500 uppercase">{msg.role === 'agent' ? 'Agent' : 'You'}</span>
+                   <span className="text-[9px] font-mono text-zinc-600 ml-auto">{msg.timestamp}</span>
+                </div>
+                <div className={`p-3 text-[12px] leading-relaxed border rounded-md ${msg.role === 'agent' ? 'bg-[#050505] border-[#1A1A1A] text-zinc-300' : 'bg-[#111111] border-[#262626] text-white'}`}>
+                  {msg.content}
+                </div>
+              </div>
+            ))}
+            {loading.chat && (
+              <div className="flex flex-col gap-1.5 animate-pulse">
+                <div className="flex items-center gap-2 px-1">
+                   <Bot className="w-3 h-3 text-zinc-500" />
+                   <span className="text-[10px] font-bold text-zinc-500 uppercase">Agent</span>
+                </div>
+                <div className="p-3 text-[12px] border rounded-md bg-[#050505] border-[#1A1A1A] text-zinc-500">
+                  Processing request...
+                </div>
+              </div>
+            )}
+            <div ref={chatEndRef} />
+          </div>
+
+          <div className="p-3 border-t border-[#1A1A1A] bg-[#050505]">
+            <form onSubmit={handleChatSubmit} className="relative flex items-center">
+              <input 
+                type="text" 
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                disabled={loading.chat}
+                placeholder="Edit manifest naturally..." 
+                className="w-full bg-[#000000] border border-[#262626] rounded pl-3 pr-10 py-2.5 text-xs text-zinc-200 focus:outline-none focus:border-white transition-colors"
+              />
+              <button 
+                type="submit" 
+                disabled={!chatInput.trim() || loading.chat}
+                className="absolute right-1.5 p-1.5 rounded bg-white text-black disabled:bg-transparent disabled:text-zinc-600 transition-colors"
+              >
+                <Send className="w-3 h-3" />
+              </button>
+            </form>
+          </div>
+        </section>
+
+        {/* MIDDLE PANE: Manifest & Assets */}
+        <section className="col-span-5 flex flex-col border-r border-[#1A1A1A] bg-[#000000]">
+          
+          {/* Manifest Top */}
+          <div className="flex-1 flex flex-col min-h-0">
+            <div className="px-4 py-3 border-b border-[#1A1A1A] flex items-center justify-between bg-[#050505]">
+              <div className="flex items-center gap-2">
+                <FileJson className="w-3.5 h-3.5 text-zinc-400" />
+                <span className="text-[10px] font-bold text-zinc-300 uppercase tracking-widest">Manifest JSON</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className={`w-2 h-2 rounded-full ${isConfirmed ? 'bg-white' : 'bg-zinc-600'}`}></span>
+                <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">{isConfirmed ? 'CONFIRMED' : 'DRAFT'}</span>
+              </div>
+            </div>
+            <div className="flex-1 p-4 overflow-y-auto custom-scrollbar font-mono text-[12px] leading-relaxed text-zinc-300 bg-[#000000]">
+              {manifestJson ? (
+                <pre className="whitespace-pre-wrap break-all">
+                  {JSON.stringify(manifestJson, null, 2).replace(
+                    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+                    (match) => {
+                      let cls = 'text-zinc-300';
+                      if (/^"/.test(match)) {
+                        if (/:$/.test(match)) cls = 'text-zinc-400'; // Key
+                        else cls = 'text-white'; // String value
+                      } else if (/true|false/.test(match)) {
+                        cls = 'text-zinc-300 italic'; // Boolean
+                      } else if (/null/.test(match)) {
+                        cls = 'text-zinc-500'; // Null
+                      } else {
+                        cls = 'text-zinc-200'; // Number
+                      }
+                      return `<span class="${cls}">${match}</span>`;
+                    }
+                  )}
+                </pre>
+              ) : (
+                <div className="h-full flex flex-col items-center justify-center text-zinc-600 space-y-3">
+                  <FileJson className="w-6 h-6 opacity-30" />
+                  <p className="text-xs">No manifest loaded in current session.</p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Assets Bottom */}
+          <div className="h-56 border-t border-[#1A1A1A] flex flex-col bg-[#050505]">
+            <div className="px-4 py-3 border-b border-[#1A1A1A] flex items-center gap-2">
+              <ImageIcon className="w-3.5 h-3.5 text-zinc-400" />
+              <span className="text-[10px] font-bold text-zinc-300 uppercase tracking-widest">Branding Assets</span>
+            </div>
+            <div className="p-4 flex flex-col h-full overflow-hidden">
+              <div className="flex gap-2 mb-4 shrink-0">
+                  <select 
+                    value={assetType}
+                    onChange={e => setAssetType(e.target.value)}
+                    disabled={loading.upload}
+                    className="bg-[#000000] border border-[#262626] text-zinc-300 text-xs rounded px-2 py-1.5 focus:outline-none focus:border-white cursor-pointer"
+                  >
+                    <option value="logo">Logo</option>
+                    <option value="favicon">Favicon</option>
+                    <option value="banner">Banner</option>
+                  </select>
+                  <label className={`flex-1 border border-dashed border-[#333333] bg-[#000000] rounded flex items-center justify-center gap-2 text-xs text-zinc-400 hover:text-white hover:border-zinc-500 transition-colors cursor-pointer ${loading.upload ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                    <Upload className="w-3.5 h-3.5" />
+                    {loading.upload ? 'Uploading...' : 'Select File'}
+                    <input type="file" className="hidden" accept="image/*" onChange={handleUpload} disabled={loading.upload} />
+                  </label>
+              </div>
+
+              <div className="flex-1 overflow-y-auto custom-scrollbar space-y-2">
+                {uploadedAssetsSession.map((asset, i) => (
+                  <div key={i} className="flex items-center justify-between bg-[#000000] border border-[#1A1A1A] px-3 py-2 rounded text-xs">
+                    <div className="flex items-center gap-3">
+                      <div className="text-[9px] font-bold uppercase text-zinc-500 w-12">{asset.assetType}</div>
+                      <span className="text-zinc-300 font-mono truncate max-w-[120px]">{asset.fileName}</span>
+                    </div>
+                    <a href={asset.previewUrl} target="_blank" rel="noreferrer" className="text-zinc-500 hover:text-white transition-colors underline">Preview</a>
+                  </div>
+                ))}
+                {uploadedAssetsSession.length === 0 && (
+                  <div className="text-xs text-zinc-600 text-center py-4">No assets uploaded in this session.</div>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* RIGHT PANE: Operations */}
+        <section className="col-span-4 flex flex-col bg-[#050505]">
+          
+          {/* Status Terminal */}
+          <div className="p-4 border-b border-[#1A1A1A]">
+            <BorderGlow active={true} className="h-32">
+              <div className="p-3 bg-black rounded-[inherit] flex flex-col h-full overflow-hidden">
+                <div className="flex items-center gap-2 mb-2 text-zinc-500 border-b border-[#1A1A1A] pb-2">
+                  <TerminalSquare className="w-3.5 h-3.5" />
+                  <span className="text-[9px] font-bold uppercase tracking-widest">System Output</span>
+                </div>
+                <div className="flex-1 flex gap-3 font-mono text-[12px] leading-relaxed overflow-y-auto custom-scrollbar">
+                  <StatusIcon />
+                  <div className="flex flex-col">
+                    <span className={status.level === 'error' ? 'text-rose-400' : 'text-zinc-200'}>
+                      {status.text}
+                    </span>
+                    {status.details && <span className="text-zinc-500 mt-1">{status.details}</span>}
+                  </div>
+                </div>
+              </div>
+            </BorderGlow>
+          </div>
+
+          {/* Action Row */}
+          <div className="flex-1 p-5 space-y-6 overflow-y-auto custom-scrollbar">
+            <div className="space-y-3">
+              <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Pipeline Controls</span>
+              
+              <div className="grid grid-cols-2 gap-3">
+                <button onClick={() => handleFetchManifest()} disabled={loading.manifest} className="p-3 border border-[#262626] bg-[#000000] hover:bg-[#111111] hover:border-zinc-500 rounded flex flex-col items-center justify-center gap-2 disabled:opacity-50 transition-all">
+                  <RefreshCw className={`w-4 h-4 text-zinc-300 ${loading.manifest ? 'animate-spin' : ''}`} />
+                  <span className="text-[11px] font-bold text-white uppercase tracking-wider">Fetch</span>
+                </button>
+
+                <button onClick={handleConfirm} disabled={loading.confirm || isConfirmed} className={`p-3 border rounded flex flex-col items-center justify-center gap-2 disabled:opacity-50 transition-all ${isConfirmed ? 'border-white bg-white text-black' : 'border-[#262626] bg-[#000000] hover:bg-[#111111] hover:border-zinc-500 text-white'}`}>
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span className="text-[11px] font-bold uppercase tracking-wider">{isConfirmed ? 'Confirmed' : 'Confirm'}</span>
+                </button>
+              </div>
+
+              <PixelCard gap={4} speed={40} colors="#ffffff,#a1a1aa,#000000" className="mt-3 rounded border border-[#262626] hover:border-white transition-colors cursor-pointer">
+                <button 
+                  onClick={handleImplement}
+                  disabled={!isConfirmed || loading.implement}
+                  className="w-full py-4 bg-transparent text-white font-bold text-[12px] tracking-widest uppercase flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <Play className="w-4 h-4 fill-current" /> 
+                  {loading.implement ? 'Implementing...' : 'Execute Implement'}
+                </button>
+              </PixelCard>
+            </div>
+
+            {/* Target Scope Information */}
+            <div className="space-y-3 pt-4 border-t border-[#1A1A1A]">
+              <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Implementation Scope</span>
+              <div className="flex flex-wrap gap-2">
+                {implementRun.appTargets.map(target => (
+                  <span key={target} className="px-2 py-1 bg-[#111111] border border-[#262626] rounded text-[10px] font-mono text-zinc-400">{target}</span>
+                ))}
+              </div>
+            </div>
+
+            {/* HITL Validator Repair Prompt */}
+            {implementRun.validatorIssues.length > 0 && !implementRun.repairPassUsed && (
+              <div className="p-4 border border-[#262626] bg-[#000000] rounded flex flex-col gap-3 animate-fade-in relative overflow-hidden">
+                <div className="absolute left-0 top-0 bottom-0 w-1 bg-white"></div>
+                <div className="flex items-center gap-2 text-white font-bold text-xs uppercase tracking-wider"><ShieldAlert className="w-4 h-4"/> Validator Intervention</div>
+                <p className="text-xs text-zinc-400 leading-relaxed">Validation failed during implementation. Review issues and approve a one-time repair pass.</p>
+                <div className="bg-[#111111] p-3 rounded border border-[#262626]">
+                  <ul className="text-[11px] font-mono text-zinc-300 list-disc pl-4 space-y-1">
+                    {implementRun.validatorIssues.map((issue, idx) => <li key={idx}>{issue}</li>)}
+                  </ul>
+                </div>
+                <button 
+                  onClick={handleRepair}
+                  disabled={loading.repair}
+                  className="mt-1 py-2.5 bg-white text-black font-bold text-[11px] uppercase tracking-wider rounded hover:bg-zinc-200 transition-colors w-full"
+                >
+                  {loading.repair ? 'Running Repair...' : 'Approve Repair Pass'}
+                </button>
+              </div>
+            )}
+          </div>
+          
+          {/* Admin Row */}
+          <div className="p-4 border-t border-[#1A1A1A] bg-[#000000] grid grid-cols-2 gap-3 shrink-0">
+            <button onClick={handleResetSession} disabled={loading.resetSession} className="py-2.5 bg-[#111111] border border-[#262626] hover:bg-[#1A1A1A] hover:border-zinc-500 rounded text-[11px] font-bold uppercase tracking-wider text-zinc-300 transition-colors flex items-center justify-center gap-2">
+              <RefreshCcw className="w-3.5 h-3.5" /> Session
+            </button>
+            <button onClick={handleResetRepo} disabled={loading.resetRepo} className="py-2.5 bg-[#111111] border border-[#262626] hover:bg-[#1A1A1A] hover:border-rose-500/50 rounded text-[11px] font-bold uppercase tracking-wider text-rose-500 transition-colors flex items-center justify-center gap-2">
+              <AlertTriangle className="w-3.5 h-3.5" /> Repo
+            </button>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  );
+}

@@ -656,7 +656,7 @@ function LegacyArchPage({ onNavigate, projectId, projectName }: ArchPageProps) {
             <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4">
               <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Budget gate</p>
               <div className="flex items-center justify-between mb-1.5"><span className="text-xs text-zinc-400">Budget cap</span><span className="text-xs font-mono text-zinc-300">${budgetCap.toFixed(2)}</span></div>
-              <div className="h-2 bg-zinc-800 rounded-full overflow-hidden"><div className={`h-full rounded-full ${total <= budgetCap ? 'bg-gradient-to-r from-emerald-500 to-cyan-500' : 'bg-gradient-to-r from-amber-500 to-red-500'}`} style={{ width: `${percent}%` }} /></div>
+              <div className="h-2 bg-zinc-800 rounded-full overflow-hidden"><div className={`h-full rounded-full ${total <= budgetCap ? 'bg-linear-to-r from-emerald-500 to-cyan-500' : 'bg-linear-to-r from-amber-500 to-red-500'}`} style={{ width: `${percent}%` }} /></div>
               <p className={`text-[11px] mt-1.5 ${total <= budgetCap ? 'text-emerald-400' : 'text-amber-400'}`}>{Math.round((total / budgetCap) * 100)}% of cap used</p>
             </div>
           </div>
@@ -951,7 +951,7 @@ export function ArchPage({ onNavigate, projectId, projectName }: ArchPageProps) 
               </div>
               <div className="space-y-4">
                 <div className="bg-zinc-900 rounded-2xl border border-white/5 p-5"><p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-3">Monthly estimate</p><p className="text-4xl font-bold text-emerald-400 font-mono">${total.toFixed(2)}</p><div className="mt-4 pt-4 border-t border-white/5 space-y-1.5">{categoryTotals.map(([name, value]) => <div key={name} className="flex justify-between text-xs"><span className="text-zinc-500">{name}</span><span className="text-zinc-300 font-mono">${value.toFixed(2)}</span></div>)}</div></div>
-                <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4"><p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Budget gate</p><div className="flex items-center justify-between mb-1.5"><span className="text-xs text-zinc-400">Budget cap</span><span className="text-xs font-mono text-zinc-300">${budgetCap.toFixed(2)}</span></div><div className="h-2 bg-zinc-800 rounded-full overflow-hidden"><div className={`h-full rounded-full ${total <= budgetCap ? 'bg-gradient-to-r from-emerald-500 to-cyan-500' : 'bg-gradient-to-r from-amber-500 to-red-500'}`} style={{ width: `${percent}%` }} /></div><p className={`text-[11px] mt-1.5 ${total <= budgetCap ? 'text-emerald-400' : 'text-amber-400'}`}>{percent}% of cap used</p></div>
+                <div className="bg-zinc-900 rounded-2xl border border-white/5 p-4"><p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-2">Budget gate</p><div className="flex items-center justify-between mb-1.5"><span className="text-xs text-zinc-400">Budget cap</span><span className="text-xs font-mono text-zinc-300">${budgetCap.toFixed(2)}</span></div><div className="h-2 bg-zinc-800 rounded-full overflow-hidden"><div className={`h-full rounded-full ${total <= budgetCap ? 'bg-linear-to-r from-emerald-500 to-cyan-500' : 'bg-linear-to-r from-amber-500 to-red-500'}`} style={{ width: `${percent}%` }} /></div><p className={`text-[11px] mt-1.5 ${total <= budgetCap ? 'text-emerald-400' : 'text-amber-400'}`}>{percent}% of cap used</p></div>
               </div>
             </div>
             <div className="bg-zinc-900 rounded-2xl border border-white/5 overflow-hidden"><div className="px-5 py-3.5 border-b border-white/5"><p className="text-sm font-semibold text-zinc-200">Cost breakdown by service</p></div><table className="w-full text-sm"><thead><tr className="border-b border-white/5">{['Service', 'Type', 'Monthly (USD)', 'Notes'].map((h) => <th key={h} className="text-left px-5 py-3 text-[11px] uppercase tracking-wider text-zinc-500 font-semibold">{h}</th>)}</tr></thead><tbody>{costRows.map((r, i) => <tr key={i} className="border-b border-white/4 last:border-0 hover:bg-white/2"><td className="px-5 py-3 text-zinc-200 font-medium">{r.service}</td><td className="px-5 py-3"><Tag color="zinc">{r.type}</Tag></td><td className="px-5 py-3 font-mono text-zinc-300">${r.monthly.toFixed(2)}</td><td className="px-5 py-3 text-zinc-500 text-xs">{r.note || '-'}</td></tr>)}<tr className="bg-zinc-800/50"><td className="px-5 py-3 font-bold text-zinc-100">Total</td><td /><td className="px-5 py-3 font-mono font-bold text-emerald-400">${total.toFixed(2)}</td><td /></tr></tbody></table></div>
@@ -1309,14 +1309,14 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
         </div>
       </div>
       <div className="mt-4 flex flex-1 overflow-hidden">
-        <div className="w-64 flex-shrink-0 bg-[#09090b] border-r border-white/5 overflow-y-auto custom-scrollbar">
+        <div className="w-64 shrink-0 bg-[#09090b] border-r border-white/5 overflow-y-auto custom-scrollbar">
           <div className="p-3">
             <p className="text-[10px] uppercase tracking-wider text-zinc-600 font-semibold px-2 py-1.5">File tree</p>
             {tree.map((node, i) => <FileNode key={i} node={node as never} selected={selected} setSelected={setSelected} />)}
           </div>
         </div>
         <div className="flex-1 overflow-hidden flex flex-col">
-          <div className="flex items-center gap-3 px-4 py-2.5 bg-zinc-900/50 border-b border-white/5 flex-shrink-0">
+          <div className="flex items-center gap-3 px-4 py-2.5 bg-zinc-900/50 border-b border-white/5 shrink-0">
             <svg className="w-4 h-4 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
             <span className="text-xs font-mono text-zinc-400">{resolvedSelectedPath || selected || 'No file selected'}</span>
             <div className="flex gap-1.5 ml-auto">
@@ -1331,7 +1331,7 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
             {!loading && !error && (!resolvedSelectedPath || !fileMap[resolvedSelectedPath]) && <div className="p-5 text-zinc-500 text-sm">Select a generated file from the tree.</div>}
           </div>
         </div>
-        <div className="w-64 flex-shrink-0 bg-[#09090b] border-l border-white/5 overflow-y-auto custom-scrollbar p-4 space-y-4">
+        <div className="w-64 shrink-0 bg-[#09090b] border-l border-white/5 overflow-y-auto custom-scrollbar p-4 space-y-4">
           <div>
             <p className="text-[10px] uppercase tracking-wider text-zinc-600 font-semibold mb-2">Validation</p>
             {[{ k: 'terraform init', v: loading ? '...' : error ? '!' : liveValidated ? 'ok' : 'deferred' }, { k: 'terraform validate', v: loading ? '...' : error ? '!' : liveValidated ? 'ok' : 'deferred' }, { k: 'terraform plan', v: loading ? '...' : error ? '!' : liveValidated ? 'ok' : 'deferred' }, { k: 'tflint', v: loading ? '...' : error ? '!' : liveValidated ? 'ok' : 'deferred' }].map((r, i) => <div key={i} className="flex justify-between py-1.5 border-b border-white/4 last:border-0 text-xs"><span className="text-zinc-500 font-mono">{r.k}</span><span className={r.v === 'ok' ? 'text-emerald-400 font-bold' : r.v === '...' ? 'text-zinc-500 font-bold' : 'text-amber-400 font-bold'}>{r.v}</span></div>)}
@@ -1558,7 +1558,7 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
                 <p className="text-xl font-semibold text-zinc-400 font-mono">${cap.toFixed(2)}</p>
               </div>
             </div>
-            <div className="h-3 bg-zinc-800 rounded-full overflow-hidden mb-2"><div className={`h-full rounded-full transition-all ${within ? 'bg-gradient-to-r from-emerald-500 to-cyan-500' : 'bg-gradient-to-r from-amber-500 to-red-500'}`} style={{ width: `${Math.min(pct, 100)}%` }} /></div>
+            <div className="h-3 bg-zinc-800 rounded-full overflow-hidden mb-2"><div className={`h-full rounded-full transition-all ${within ? 'bg-linear-to-r from-emerald-500 to-cyan-500' : 'bg-linear-to-r from-amber-500 to-red-500'}`} style={{ width: `${Math.min(pct, 100)}%` }} /></div>
             <div className="flex justify-between text-xs"><span className="text-zinc-500">{pct}% of budget used</span><span className={within ? 'text-emerald-400' : 'text-red-400'}>{within ? 'Within policy' : 'Exceeds cap'}</span></div>
           </div>
 
@@ -1571,7 +1571,7 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
                 { secret: 'GITHUB_TOKEN', status: 'auto', masked: 'Provided by Actions runner' },
               ].map((s, i) => (
                 <div key={i} className="flex items-center gap-3 p-3 bg-zinc-950 rounded-lg border border-white/5">
-                  <svg className={`w-4 h-4 flex-shrink-0 ${s.status === 'missing' ? 'text-amber-400' : 'text-emerald-400'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+                  <svg className={`w-4 h-4 shrink-0 ${s.status === 'missing' ? 'text-amber-400' : 'text-emerald-400'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
                   <span className="text-sm font-medium text-zinc-200 w-48">{s.secret}</span>
                   <span className="text-[11px] font-mono text-zinc-500 flex-1 truncate">{s.masked}</span>
                   <Tag color={s.status === 'auto' ? 'zinc' : s.status === 'missing' ? 'amber' : 'emerald'}>{s.status === 'auto' ? 'auto' : s.status}</Tag>
@@ -1586,7 +1586,7 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
             <p className="text-[11px] uppercase tracking-wider text-zinc-500 font-semibold mb-3">Policy gates</p>
             {gates.map((g, i) => (
               <div key={i} className="flex items-center gap-2.5 py-2.5 border-b border-white/4 last:border-0">
-                {g.pass ? <svg className="w-4 h-4 text-emerald-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg> : <svg className="w-4 h-4 text-red-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg>}
+                {g.pass ? <svg className="w-4 h-4 text-emerald-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg> : <svg className="w-4 h-4 text-red-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg>}
                 <span className="text-[12px] text-zinc-300">{g.label}</span>
               </div>
             ))}
@@ -2745,14 +2745,14 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
                   <span className="text-sm font-bold font-mono text-cyan-400">{progress}%</span>
                 </div>
               </div>
-              <div className="h-1.5 bg-zinc-800"><div className="h-full bg-gradient-to-r from-cyan-500 to-indigo-500 transition-all duration-500" style={{ width: `${progress}%` }} /></div>
+              <div className="h-1.5 bg-zinc-800"><div className="h-full bg-linear-to-r from-cyan-500 to-indigo-500 transition-all duration-500" style={{ width: `${progress}%` }} /></div>
               <div className="p-4 max-h-72 overflow-y-auto space-y-2 bg-zinc-950/70 custom-scrollbar">
                 {logs.map((l, i) => (
                   <div key={i} className="flex items-start gap-3">
-                    <span className="text-[10px] font-mono text-zinc-600 flex-shrink-0 mt-0.5">{l.ts}</span>
-                    {l.type === 'success' && <svg className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>}
-                    {l.type === 'info' && <span className="w-1.5 h-1.5 rounded-full bg-cyan-500 flex-shrink-0 mt-1.5 pulse-dot" />}
-                    {l.type === 'error' && <svg className="w-3.5 h-3.5 text-red-400 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg>}
+                    <span className="text-[10px] font-mono text-zinc-600 shrink-0 mt-0.5">{l.ts}</span>
+                    {l.type === 'success' && <svg className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>}
+                    {l.type === 'info' && <span className="w-1.5 h-1.5 rounded-full bg-cyan-500 shrink-0 mt-1.5 pulse-dot" />}
+                    {l.type === 'error' && <svg className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg>}
                     <span className={`text-[11px] ${l.type === 'success' ? 'text-emerald-400 font-semibold' : l.type === 'error' ? 'text-red-400' : 'text-zinc-400'}`}>{l.text}</span>
                   </div>
                 ))}
@@ -2895,5 +2895,6 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
     </div>
   );
 }
+
 
 
