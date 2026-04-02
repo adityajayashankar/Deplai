@@ -13,14 +13,16 @@ interface ChangedFile {
 }
 
 interface RemediationPageProps {
-  state: 'idle' | 'running' | 'waiting_approval' | 'completed' | 'error';
+  state: 'idle' | 'running' | 'waiting_decision' | 'waiting_approval' | 'completed' | 'error';
   scanStatus?: string;
   messages: RuntimeMessage[];
   changedFiles: ChangedFile[];
   prUrl: string | null;
   noChangesDetected: boolean;
   onStart: () => void;
-  onSendPr: () => void;
+  onContinueRound: () => void;
+  onUseCurrentFixes: () => void;
+  onApprovePush: () => void;
   onContinueWithoutPr: () => void;
   onNavigate: (v: string) => void;
 }
@@ -33,7 +35,9 @@ export function RemediationPage({
   prUrl,
   noChangesDetected,
   onStart,
-  onSendPr,
+  onContinueRound,
+  onUseCurrentFixes,
+  onApprovePush,
   onContinueWithoutPr,
   onNavigate,
 }: RemediationPageProps) {
@@ -42,8 +46,10 @@ export function RemediationPage({
     ? { text: 'Remediation running', cls: 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/20' }
     : skipBecauseNoFindings
       ? { text: 'No vulnerabilities found', cls: 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' }
+    : state === 'waiting_decision'
+      ? { text: 'Choose next step', cls: 'bg-amber-500/10 text-amber-400 border border-amber-500/20' }
     : state === 'waiting_approval'
-      ? { text: 'Awaiting send PR approval', cls: 'bg-amber-500/10 text-amber-400 border border-amber-500/20' }
+      ? { text: 'Awaiting final approval', cls: 'bg-amber-500/10 text-amber-400 border border-amber-500/20' }
       : state === 'completed'
         ? { text: 'Remediation completed', cls: 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' }
         : state === 'error'
@@ -63,8 +69,10 @@ export function RemediationPage({
           <div className="bg-zinc-900 rounded-xl border border-white/5 p-4 space-y-3">
             <p className="text-sm font-semibold text-zinc-200">Actions</p>
             <div className="flex flex-wrap gap-2">
-              <Btn onClick={onStart} variant="primary" size="sm" disabled={skipBecauseNoFindings || state === 'running' || state === 'waiting_approval'}>Start remediation</Btn>
-              <Btn onClick={onSendPr} variant="indigo" size="sm" disabled={state !== 'waiting_approval'}>Send PR</Btn>
+              <Btn onClick={onStart} variant="primary" size="sm" disabled={skipBecauseNoFindings || state === 'running' || state === 'waiting_decision' || state === 'waiting_approval'}>Start remediation</Btn>
+              <Btn onClick={onUseCurrentFixes} variant="indigo" size="sm" disabled={state !== 'waiting_decision'}>Use current fixes</Btn>
+              <Btn onClick={onContinueRound} variant="default" size="sm" disabled={state !== 'waiting_decision'}>Run another round</Btn>
+              <Btn onClick={onApprovePush} variant="indigo" size="sm" disabled={state !== 'waiting_approval'}>Approve and send PR</Btn>
               {prUrl && <Btn onClick={() => window.open(prUrl, '_blank', 'noopener,noreferrer')} variant="default" size="sm">Open PR</Btn>}
               <Btn onClick={() => onNavigate('merge')} variant="ghost" size="sm" disabled={!prUrl}>Go to merge gate</Btn>
               <Btn

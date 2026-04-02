@@ -25,6 +25,7 @@ const MESSAGE_STYLES: Record<string, { color: string; prefix: string }> = {
 
 const STATUS_CONFIG: Record<string, { dot: string; label: string }> = {
   running:   { dot: 'bg-green-500', label: 'Running' },
+  waiting_decision: { dot: 'bg-amber-500', label: 'Waiting Decision' },
   waiting_approval: { dot: 'bg-yellow-500', label: 'Waiting Approval' },
   completed: { dot: 'bg-blue-500', label: 'Completed' },
   error:     { dot: 'bg-red-500', label: 'Error' },
@@ -39,6 +40,7 @@ export default function MonitorPopup({ projectId, isOpen, onClose }: MonitorPopu
   // Determine active state — remediation takes priority if active
   const isRemediating =
     remState === 'running' ||
+    remState === 'waiting_decision' ||
     remState === 'waiting_approval' ||
     remState === 'completed' ||
     remState === 'error';

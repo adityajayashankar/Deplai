@@ -62,7 +62,7 @@ function readSavedCostEstimate(): { totalMonthlyUsd: number | null; budgetCapUsd
 
 export default function PipelineDashboardApp() {
   const router = useRouter();
-  const { startScan, startRemediation, approveRemediationRescan, getRemediationState, getScanState } = useScan();
+  const { startScan, startRemediation, continueRemediationRound, pushCurrentRemediationChanges, approveRemediationPush, getRemediationState, getScanState } = useScan();
 
   const validStageKeys = useMemo(() => new Set(['overview', ...STAGES.map((s) => s.key)]), []);
   const [current, setCurrent] = useState<string>('overview');
@@ -512,10 +512,20 @@ export default function PipelineDashboardApp() {
     }
   }, [selectedProjectId, startRemediation]);
 
-  const onSendPr = useCallback(async () => {
+  const onContinueRound = useCallback(async () => {
     if (!selectedProjectId) return;
-    approveRemediationRescan(selectedProjectId);
-  }, [approveRemediationRescan, selectedProjectId]);
+    continueRemediationRound(selectedProjectId);
+  }, [continueRemediationRound, selectedProjectId]);
+
+  const onUseCurrentFixes = useCallback(async () => {
+    if (!selectedProjectId) return;
+    pushCurrentRemediationChanges(selectedProjectId);
+  }, [pushCurrentRemediationChanges, selectedProjectId]);
+
+  const onApprovePush = useCallback(async () => {
+    if (!selectedProjectId) return;
+    approveRemediationPush(selectedProjectId);
+  }, [approveRemediationPush, selectedProjectId]);
 
   const onConfirmMerged = useCallback(() => {
     setMergeConfirmed(true);
@@ -640,7 +650,7 @@ export default function PipelineDashboardApp() {
         remediate.duration = 'skipped (no findings)';
       } else {
         if (remediation.state === 'running') remediate.status = 'running';
-        if (remediation.state === 'waiting_approval') remediate.status = 'active';
+        if (remediation.state === 'waiting_decision' || remediation.state === 'waiting_approval') remediate.status = 'active';
         if (remediation.state === 'completed') remediate.status = 'success';
         if (remediation.state === 'error') remediate.status = 'active';
       }
@@ -657,7 +667,7 @@ export default function PipelineDashboardApp() {
       else if (noRemediationChanges) {
         pr.status = 'success';
         pr.duration = 'skipped (no changes)';
-      } else if (remediation.state === 'waiting_approval') pr.status = 'active';
+      } else if (remediation.state === 'waiting_decision' || remediation.state === 'waiting_approval') pr.status = 'active';
     }
 
     const merge = base.find((s) => s.key === 'merge');
@@ -786,7 +796,9 @@ export default function PipelineDashboardApp() {
             prUrl={prUrl}
             noChangesDetected={noRemediationChanges}
             onStart={onStartRemediation}
-            onSendPr={onSendPr}
+            onContinueRound={onContinueRound}
+            onUseCurrentFixes={onUseCurrentFixes}
+            onApprovePush={onApprovePush}
             onContinueWithoutPr={onContinueWithoutPr}
             onNavigate={setCurrent}
           />

@@ -885,12 +885,13 @@ function inferBaseStage({
 }: {
   setupOpen: boolean;
   approvalSent: boolean;
-  remediationState: 'idle' | 'running' | 'waiting_approval' | 'completed' | 'error';
+  remediationState: 'idle' | 'running' | 'waiting_decision' | 'waiting_approval' | 'completed' | 'error';
   hasScanOutcome: boolean;
   hasVulnerabilities: boolean;
-  scanState: 'idle' | 'running' | 'completed' | 'error' | 'waiting_approval';
+  scanState: 'idle' | 'running' | 'completed' | 'error' | 'waiting_decision' | 'waiting_approval';
 }): PipelineStageId {
   if (approvalSent || remediationState === 'completed') return 'pr_rescan';
+  if (remediationState === 'waiting_decision') return 'approval';
   if (remediationState === 'waiting_approval') return 'approval';
   if (remediationState === 'running' || remediationState === 'error') return 'remediate_run';
   if (setupOpen && hasScanOutcome && hasVulnerabilities) return 'remediate_setup';
@@ -907,7 +908,9 @@ export default function SecurityAnalysisPage() {
     getScanState,
     startScan,
     startRemediation,
-    approveRemediationRescan,
+    continueRemediationRound,
+    pushCurrentRemediationChanges,
+    approveRemediationPush,
     getRemediationState,
     getCachedResults,
     setCachedResults,
@@ -1172,7 +1175,7 @@ export default function SecurityAnalysisPage() {
 
   const approvalSent = useMemo(() => {
     if (locallyApproved || remediationState === 'completed') return true;
-    return remMessages.some((message) => typeof message.content === 'string' && message.content.includes('Human approval received. Starting security re-scan.'));
+    return remMessages.some((message) => typeof message.content === 'string' && message.content.includes('Final approval received. Persisting approved remediation changes'));
   }, [locallyApproved, remMessages, remediationState]);
 
   const prUrlFromMessages = useMemo(() => {
@@ -1367,10 +1370,19 @@ export default function SecurityAnalysisPage() {
     }
   }, [apiKeys, githubToken, keyInput, modelInput, projectId, selectedModels, setApiKey, setModel, startRemediation]);
 
-  const handleApproveAndRescan = useCallback(() => {
+  const handleContinueRound = useCallback(() => {
+    continueRemediationRound(projectId);
+    setActiveStage('remediate_run');
+  }, [continueRemediationRound, projectId]);
+
+  const handlePushCurrentFixes = useCallback(() => {
+    pushCurrentRemediationChanges(projectId);
+  }, [projectId, pushCurrentRemediationChanges]);
+
+  const handleApproveAndPush = useCallback(() => {
     setLocallyApproved(true);
-    approveRemediationRescan(projectId);
-  }, [approveRemediationRescan, projectId]);
+    approveRemediationPush(projectId);
+  }, [approveRemediationPush, projectId]);
 
   const selectedDiff = useMemo(() => changedFiles.find((item) => item.path === selectedDiffPath) || changedFiles[0] || null, [changedFiles, selectedDiffPath]);
 
@@ -1729,7 +1741,7 @@ export default function SecurityAnalysisPage() {
         <div className="custom-scrollbar flex-1 overflow-y-auto bg-[#000000] p-6 font-mono text-[13px] leading-relaxed">
           {remMessages.map((message, index) => {
             const logText = String(message.content || '');
-            const toneClass = message.type === 'kg_phase' ? 'text-violet-300' : logText.includes('[waiting_approval]') || message.type === 'warning' ? 'text-amber-400 font-medium' : message.type === 'success' ? 'text-emerald-400' : message.type === 'error' ? 'text-rose-400' : 'text-zinc-400';
+            const toneClass = message.type === 'kg_phase' ? 'text-violet-300' : logText.includes('[waiting_approval]') || logText.includes('[waiting_decision]') || message.type === 'warning' ? 'text-amber-400 font-medium' : message.type === 'success' ? 'text-emerald-400' : message.type === 'error' ? 'text-rose-400' : 'text-zinc-400';
             return <div key={`${message.timestamp}-${index}`} className="mb-2 flex gap-4 animate-fade-in"><span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span><span className={toneClass}>{logText}</span></div>;
           })}
           {remediatingThisProject ? <div className="mt-2 animate-pulse text-zinc-600">_</div> : null}
@@ -1754,43 +1766,76 @@ export default function SecurityAnalysisPage() {
     </div>
   );
 
-  const renderApprovalView = () => (
-    <div className="relative z-10 mx-auto flex min-h-full w-full max-w-4xl animate-fade-in flex-col space-y-6 p-8">
-      <div className="mb-6 mt-4 flex items-center justify-between border-b border-[#1A1A1A] pb-6">
-        <div><h1 className="mb-2 text-2xl font-semibold text-zinc-100">Review Patches</h1><p className="text-sm text-zinc-400">Review changed files, inspect diffs, then approve to push a PR and trigger the re-scan.</p></div>
-        <div className="inline-flex items-center gap-2 rounded border border-amber-500/20 bg-amber-500/10 px-3 py-1 text-[11px] font-bold uppercase text-amber-500"><CheckCircle2 className="h-3.5 w-3.5" />Awaiting Approval</div>
-      </div>
+  const renderApprovalView = () => {
+    const waitingForDecision = remediationState === 'waiting_decision';
 
-      <div className="overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505] shadow-xl">
-        <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-[#000000] p-4"><span className="text-sm font-semibold text-zinc-200">Changed Files</span><span className="text-xs font-mono text-zinc-500">{changedFiles.length} modification{changedFiles.length === 1 ? '' : 's'}</span></div>
-        <div className="p-0">
-          {changedFiles.length === 0 ? (
-            <div className="p-4 text-sm text-zinc-500">No changed file metadata is available for this remediation run.</div>
-          ) : changedFiles.map((item) => (
-            <div key={item.path} className="flex items-center justify-between border-b border-[#1A1A1A] p-4 transition-colors last:border-b-0 hover:bg-[#111111]">
-              <div className="flex min-w-0 items-center gap-3">
-                {item.path.endsWith('.json') ? <FileJson className="h-4 w-4 text-zinc-400" /> : <FileCode2 className="h-4 w-4 text-zinc-400" />}
-                <div className="min-w-0"><span className="block truncate text-sm font-mono text-zinc-300">{item.path}</span>{item.reason ? <span className="mt-0.5 block text-xs text-zinc-500">{item.reason}</span> : null}</div>
+    return (
+      <div className="relative z-10 mx-auto flex min-h-full w-full max-w-4xl animate-fade-in flex-col space-y-6 p-8">
+        <div className="mb-6 mt-4 flex items-center justify-between border-b border-[#1A1A1A] pb-6">
+          <div>
+            <h1 className="mb-2 text-2xl font-semibold text-zinc-100">{waitingForDecision ? 'Choose Next Step' : 'Approve & Push Fixes'}</h1>
+            <p className="text-sm text-zinc-400">
+              {waitingForDecision
+                ? 'The first remediation round finished. Review the patch set and decide whether to push these fixes or run one more remediation round.'
+                : 'Review the current patch set one last time, then approve persistence, PR creation, and the verification re-scan.'}
+            </p>
+          </div>
+          <div className="inline-flex items-center gap-2 rounded border border-amber-500/20 bg-amber-500/10 px-3 py-1 text-[11px] font-bold uppercase text-amber-500">
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            {waitingForDecision ? 'Decision Required' : 'Final Approval'}
+          </div>
+        </div>
+
+        <div className="overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505] shadow-xl">
+          <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-[#000000] p-4"><span className="text-sm font-semibold text-zinc-200">Changed Files</span><span className="text-xs font-mono text-zinc-500">{changedFiles.length} modification{changedFiles.length === 1 ? '' : 's'}</span></div>
+          <div className="p-0">
+            {changedFiles.length === 0 ? (
+              <div className="p-4 text-sm text-zinc-500">No changed file metadata is available for this remediation run.</div>
+            ) : changedFiles.map((item) => (
+              <div key={item.path} className="flex items-center justify-between border-b border-[#1A1A1A] p-4 transition-colors last:border-b-0 hover:bg-[#111111]">
+                <div className="flex min-w-0 items-center gap-3">
+                  {item.path.endsWith('.json') ? <FileJson className="h-4 w-4 text-zinc-400" /> : <FileCode2 className="h-4 w-4 text-zinc-400" />}
+                  <div className="min-w-0"><span className="block truncate text-sm font-mono text-zinc-300">{item.path}</span>{item.reason ? <span className="mt-0.5 block text-xs text-zinc-500">{item.reason}</span> : null}</div>
+                </div>
+                <button type="button" onClick={() => setSelectedDiffPath(item.path)} className="flex items-center gap-2 rounded bg-[#1A1A1A] px-3 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-[#262626]"><Eye className="h-3 w-3" />View Diff</button>
               </div>
-              <button type="button" onClick={() => setSelectedDiffPath(item.path)} className="flex items-center gap-2 rounded bg-[#1A1A1A] px-3 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-[#262626]"><Eye className="h-3 w-3" />View Diff</button>
+            ))}
+          </div>
+        </div>
+
+        {selectedDiff ? <div className="space-y-3"><div className="flex items-center justify-between"><div className="text-sm font-semibold text-zinc-200">{selectedDiff.path}</div>{selectedDiff.reason ? <div className="text-xs text-zinc-500">{selectedDiff.reason}</div> : null}</div>{selectedDiff.diff ? <DiffViewer diff={selectedDiff.diff} /> : <AlertCard tone="warning" title="Diff Unavailable" message="This file change did not include a diff payload." />}</div> : null}
+
+        {waitingForDecision ? (
+          <div className="grid gap-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6 md:grid-cols-2">
+            <div className="rounded-md border border-[#1A1A1A] bg-[#000000] p-4">
+              <div className="text-sm font-semibold text-zinc-100">Push current fixes</div>
+              <p className="mt-2 text-sm leading-relaxed text-zinc-400">Stop after this patch set, move to final approval, and then create the PR with the current changes.</p>
+              <div className="mt-4">
+                <RunButton onClick={handlePushCurrentFixes}>Use These Fixes</RunButton>
+              </div>
             </div>
-          ))}
-        </div>
+            <div className="rounded-md border border-[#1A1A1A] bg-[#000000] p-4">
+              <div className="text-sm font-semibold text-zinc-100">Run another round</div>
+              <p className="mt-2 text-sm leading-relaxed text-zinc-400">Re-scan the updated codebase and let the remediation agent take one more pass before final approval.</p>
+              <div className="mt-4">
+                <RunButton onClick={handleContinueRound}>Run Another Round</RunButton>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
+            <div className="mb-6 rounded-md border border-[#1A1A1A] bg-[#000000] p-4">
+              <label className="flex cursor-pointer items-start gap-3">
+                <input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)} className="mt-1 h-4 w-4 rounded border-[#4B5563] bg-[#111111] text-indigo-600" />
+                <span className="text-sm leading-relaxed text-zinc-400">I approve these code modifications. Persist the fix branch, open a Pull Request automatically if this is a GitHub project, and trigger the verification re-scan.</span>
+              </label>
+            </div>
+            <RunButton disabled={!approved} onClick={handleApproveAndPush}>Approve &amp; Push PR</RunButton>
+          </div>
+        )}
       </div>
-
-      {selectedDiff ? <div className="space-y-3"><div className="flex items-center justify-between"><div className="text-sm font-semibold text-zinc-200">{selectedDiff.path}</div>{selectedDiff.reason ? <div className="text-xs text-zinc-500">{selectedDiff.reason}</div> : null}</div>{selectedDiff.diff ? <DiffViewer diff={selectedDiff.diff} /> : <AlertCard tone="warning" title="Diff Unavailable" message="This file change did not include a diff payload." />}</div> : null}
-
-      <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
-        <div className="mb-6 rounded-md border border-[#1A1A1A] bg-[#000000] p-4">
-          <label className="flex cursor-pointer items-start gap-3">
-            <input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)} className="mt-1 h-4 w-4 rounded border-[#4B5563] bg-[#111111] text-indigo-600" />
-            <span className="text-sm leading-relaxed text-zinc-400">I approve these code modifications. Push the branch, open a Pull Request automatically, and trigger the verification re-scan.</span>
-          </label>
-        </div>
-        <RunButton disabled={!approved} onClick={handleApproveAndRescan}>Approve &amp; Push PR</RunButton>
-      </div>
-    </div>
-  );
+    );
+  };
 
   const renderPrRescanView = () => {
     const verificationPending = !remediationFinished || loading || loadingResults;

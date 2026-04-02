@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { ArrowRight, Bot, CheckCircle2, ChevronRight, CircleDashed, Download, ExternalLink, RefreshCw, Rocket, Send, Server, Terminal, User } from 'lucide-react';
+import { ArrowRight, CheckCircle2, ChevronRight, CircleDashed, Download, ExternalLink, RefreshCw, Rocket, Server, Terminal } from 'lucide-react';
 import { buildDeploymentWorkspace } from '@/lib/deployment-planning-contract';
 import {
   APPROVAL_PAYLOAD_KEY,
@@ -44,8 +44,6 @@ import {
 
 type PipelineStageId = 'analysis' | 'qa' | 'architecture' | 'approval' | 'terraform' | 'aws_config' | 'deploy' | 'outputs';
 
-type QaMessage = { sender: 'agent' | 'user'; text: string; questionId?: string; timestamp: string };
-
 const SIDEBAR_STAGES: Array<{ id: PipelineStageId; label: string; details: string }> = [
   { id: 'analysis', label: 'Repository Analysis', details: 'Codebase Scan' },
   { id: 'qa', label: 'Questions', details: 'Interactive Q&A' },
@@ -59,24 +57,6 @@ const SIDEBAR_STAGES: Array<{ id: PipelineStageId; label: string; details: strin
 
 function timestampLabel(date = new Date()) {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function buildQaTranscript(review: ArchitectureReviewPayload | null, answers: Record<string, string>) {
-  if (!review) return { messages: [] as QaMessage[], unansweredIndex: 0 };
-  const messages: QaMessage[] = [];
-  let unansweredIndex = review.questions.length;
-  review.questions.forEach((question, index) => {
-    messages.push({ sender: 'agent', text: question.question, questionId: question.id, timestamp: timestampLabel() });
-    const answer = answers[question.id];
-    if (answer?.trim()) {
-      const label = question.options?.find((option) => option.value === answer)?.label || answer;
-      messages.push({ sender: 'user', text: label, questionId: question.id, timestamp: timestampLabel() });
-    } else if (unansweredIndex === review.questions.length) {
-      unansweredIndex = index;
-    }
-  });
-  if (unansweredIndex === review.questions.length && review.questions.length > 0) unansweredIndex = review.questions.length - 1;
-  return { messages, unansweredIndex };
 }
 
 function readCostEstimate() {
@@ -455,6 +435,23 @@ function labelForAnswer(
   return question?.options?.find((option) => option.value === value)?.label || value;
 }
 
+function formatQuestionCategory(value: string): string {
+  const raw = String(value || '').trim();
+  if (!raw) return 'Deployment';
+  return raw
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part[0]?.toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function questionInputPlaceholder(questionId: string, fallback: string | null | undefined): string {
+  const value = String(fallback || '').trim();
+  if (value) return value;
+  if (questionId === 'q_domain') return 'api.example.com';
+  return 'Type your answer';
+}
+
 function buildQaSummary(
   review: ArchitectureReviewPayload | null,
   answers: Record<string, string>,
@@ -525,9 +522,6 @@ export default function DeploymentTrackApp() {
   const [repoContextMd, setRepoContextMd] = useState<string>(() => readStoredJson<string>(REPO_CONTEXT_MD_KEY) || '');
   const [review, setReview] = useState<ArchitectureReviewPayload | null>(() => readStoredJson<ArchitectureReviewPayload>(REVIEW_PAYLOAD_KEY));
   const [answers, setAnswers] = useState<Record<string, string>>(() => readStoredJson<Record<string, string>>(REVIEW_ANSWERS_KEY) || {});
-  const [messages, setMessages] = useState<QaMessage[]>([]);
-  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
-  const [chatInput, setChatInput] = useState('');
   const [deploymentProfile, setDeploymentProfile] = useState<Record<string, unknown> | null>(() => readStoredJson<Record<string, unknown>>(DEPLOYMENT_PROFILE_KEY));
   const [architectureView, setArchitectureView] = useState<Record<string, unknown> | null>(() => readStoredJson<Record<string, unknown>>(ARCHITECTURE_VIEW_KEY));
   const [approvalPayload, setApprovalPayload] = useState<ApprovalPayload | null>(() => readStoredJson<ApprovalPayload>(APPROVAL_PAYLOAD_KEY));
@@ -553,9 +547,39 @@ export default function DeploymentTrackApp() {
   const expectedWorkspace = useMemo(() => (
     selectedProject ? buildDeploymentWorkspace(selectedProject.id, selectedProject.name) : ''
   ), [selectedProject]);
-  const qaState = useMemo(() => buildQaTranscript(review, answers), [answers, review]);
-  const currentQuestion = review?.questions?.[currentQuestionIndex] || null;
-  const allQuestionsAnswered = Boolean(review && review.questions.every((question) => String(answers[question.id] || '').trim()));
+  const reviewQuestions = useMemo(() => review?.questions || [], [review]);
+  const requiredQuestions = useMemo(
+    () => reviewQuestions.filter((question) => question.required !== false),
+    [reviewQuestions],
+  );
+  const answeredRequiredCount = useMemo(
+    () => requiredQuestions.filter((question) => String(answers[question.id] || '').trim()).length,
+    [answers, requiredQuestions],
+  );
+  const answeredQuestionCount = useMemo(
+    () => reviewQuestions.filter((question) => String(answers[question.id] || '').trim()).length,
+    [answers, reviewQuestions],
+  );
+  const allQuestionsAnswered = Boolean(
+    review && requiredQuestions.every((question) => String(answers[question.id] || '').trim()),
+  );
+  const nextRequiredQuestion = useMemo(
+    () => requiredQuestions.find((question) => !String(answers[question.id] || '').trim()) || null,
+    [answers, requiredQuestions],
+  );
+  const optionalQuestionCount = Math.max(reviewQuestions.length - requiredQuestions.length, 0);
+  const groupedQuestions = useMemo(() => {
+    const groups = new Map<string, typeof reviewQuestions>();
+    reviewQuestions.forEach((question) => {
+      const key = formatQuestionCategory(question.category);
+      groups.set(key, [...(groups.get(key) || []), question]);
+    });
+    return Array.from(groups.entries());
+  }, [reviewQuestions]);
+  const reviewCompletionPercent = useMemo(() => {
+    if (requiredQuestions.length === 0) return 0;
+    return Math.round((answeredRequiredCount / requiredQuestions.length) * 100);
+  }, [answeredRequiredCount, requiredQuestions.length]);
   const hasAwsSecrets = Boolean(aws.aws_access_key_id.trim() && aws.aws_secret_access_key.trim());
   const costEstimate = readCostEstimate();
   const patchState = useCallback((patch: Partial<ActiveDeployState> | ((prev: ActiveDeployState) => ActiveDeployState)) => {
@@ -858,13 +882,6 @@ export default function DeploymentTrackApp() {
   }, [aws.aws_region, qaSummary, selectedProjectId]);
 
   useEffect(() => {
-    setMessages(qaState.messages);
-    setCurrentQuestionIndex(qaState.unansweredIndex);
-    const next = review?.questions?.[qaState.unansweredIndex];
-    if (next) setChatInput(String(answers[next.id] || ''));
-  }, [answers, qaState.messages, qaState.unansweredIndex, review]);
-
-  useEffect(() => {
     fetch('/api/projects', { cache: 'no-store' })
       .then((response) => response.json())
       .then((data: { projects?: ProjectRecord[] }) => setProjects(Array.isArray(data.projects) ? data.projects : []))
@@ -902,9 +919,6 @@ export default function DeploymentTrackApp() {
       setRepoContextMd('');
       setReview(null);
       setAnswers({});
-      setMessages([]);
-      setCurrentQuestionIndex(0);
-      setChatInput('');
       setDeploymentProfile(null);
       setArchitectureView(null);
       setApprovalPayload(null);
@@ -1161,13 +1175,9 @@ export default function DeploymentTrackApp() {
     void loadReview().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to start architecture review.'));
   }, [activeStage, expectedWorkspace, loadReview, repoContext, review, selectedProject, setAndPersistStage]);
 
-  const submitAnswer = useCallback((value: string) => {
-    if (!currentQuestion) return;
-    const trimmed = value.trim();
-    if (!trimmed) return;
-    setAnswers((prev) => ({ ...prev, [currentQuestion.id]: trimmed }));
-    setChatInput('');
-  }, [currentQuestion]);
+  const updateAnswer = useCallback((questionId: string, value: string) => {
+    setAnswers((prev) => ({ ...prev, [questionId]: value }));
+  }, []);
 
   const generatePlan = useCallback(async () => {
     if (!selectedProject || !review) return;
@@ -1698,7 +1708,266 @@ export default function DeploymentTrackApp() {
         <div className="custom-scrollbar flex-1 overflow-y-auto p-8">
           {error && <div className="mx-auto mb-6 max-w-5xl rounded-md border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">{error}</div>}
           {activeStage === 'analysis' && <div className="mx-auto max-w-5xl space-y-6">{selectedProject ? <><div><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Repository Analysis</h1><p className="text-sm text-zinc-400">{analysisLoading ? 'Scanning codebase and waiting for Agentic Layer.' : 'Scanning codebase to infer runtime and deployment requirements.'}</p></div><div className="grid grid-cols-3 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Runtime</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : String(repoContext?.language?.runtime || 'Unknown')}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Frameworks</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : analysisFrameworkNames.join(' / ') || 'None detected'}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Data Stores</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : analysisDataStoreNames.join(', ') || 'None detected'}</div></div></div>{!analysisLoading && repoContext && <div className="grid grid-cols-2 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Scanner Summary</div><div className="space-y-2 text-sm text-zinc-300"><div>{String(repoContext.summary || 'No summary generated yet.')}</div><div className="text-zinc-500">Workspace: <span className="font-mono text-zinc-300">{repoContext.workspace}</span></div><div className="text-zinc-500">Build: <span className="font-mono text-zinc-300">{String(repoContext.build?.build_command || 'not detected')}</span></div><div className="text-zinc-500">Start: <span className="font-mono text-zinc-300">{String(repoContext.build?.start_command || 'not detected')}</span></div><div className="text-zinc-500">Health: <span className="font-mono text-zinc-300">{String(repoContext.health?.endpoint || 'not detected')}</span></div></div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Terraform Context</div><pre className="max-h-[220px] overflow-y-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-400">{qaSummary || 'Repository context will appear here after the scanner completes.'}</pre></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Processes & Config</div><div className="space-y-2 text-sm text-zinc-300">{analysisProcessLines.length > 0 ? analysisProcessLines.map((line) => <div key={line}>{line}</div>) : <div className="text-zinc-500">No explicit processes detected.</div>}{analysisConfigNames.length > 0 && <div className="pt-3 text-zinc-500">Config values: <span className="text-zinc-300">{analysisConfigNames.join(', ')}</span></div>}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Secrets & Flags</div><div className="space-y-2 text-sm text-zinc-300">{analysisSecretNames.length > 0 ? <div>Required secrets: {analysisSecretNames.join(', ')}</div> : <div className="text-zinc-500">No required secrets detected.</div>}{analysisFlagLines.length > 0 ? analysisFlagLines.map((line) => <div key={line} className="text-amber-300">{line}</div>) : <div className="text-zinc-500">No major flags raised by the scanner.</div>}{repoContext.readme_notes && <div className="text-zinc-400">{String(repoContext.readme_notes)}</div>}</div></div></div>}{!analysisLoading && repoContextMd && <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Scanner Markdown</div><pre className="max-h-[320px] overflow-y-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-400">{repoContextMd}</pre></div>}<div className="flex justify-end"><button onClick={() => setAndPersistStage('qa')} disabled={analysisLoading || !repoContext || repoContext.workspace !== expectedWorkspace} className="flex items-center gap-2 rounded-md bg-zinc-100 px-6 py-2.5 text-sm font-semibold text-black hover:bg-white disabled:cursor-not-allowed disabled:bg-[#111111] disabled:text-zinc-500">{analysisLoading ? 'Scanning Repository...' : 'Continue to Questions'} <ArrowRight className="h-4 w-4" /></button></div></> : <div className="rounded-xl border border-[#1A1A1A] bg-[#050505] p-8"><h1 className="mb-2 text-2xl font-semibold text-zinc-100">Choose a Repository from the Dashboard</h1><p className="max-w-2xl text-sm leading-relaxed text-zinc-400">Deployment Track only runs against a specific repository. Start from a repo card on the dashboard so the AWS deployment flow is bound to the correct project.</p><div className="mt-6"><button onClick={() => router.push('/dashboard')} className="rounded-md bg-zinc-100 px-5 py-2.5 text-sm font-semibold text-black hover:bg-white">Back to Dashboard</button></div></div>}</div>}
-          {activeStage === 'qa' && <div className="mx-auto max-w-4xl"><div className="border-b border-[#1A1A1A] py-6"><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Deployment Questions</h1><p className="text-sm text-zinc-400">{reviewLoading ? 'Preparing deployment questions from repository analysis.' : 'Resolving architectural ambiguity based on codebase scan.'}</p></div><div className="custom-scrollbar max-h-[480px] space-y-6 overflow-y-auto px-2 py-6">{messages.map((message, index) => <div key={`${message.questionId || index}-${message.sender}`} className={`flex gap-4 ${message.sender === 'user' ? 'flex-row-reverse' : ''}`}><div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md ${message.sender === 'agent' ? 'border border-[#262626] bg-[#111111]' : 'bg-[#1A1A1A]'}`}>{message.sender === 'agent' ? <Bot className="h-4 w-4 text-zinc-300" /> : <User className="h-4 w-4 text-zinc-400" />}</div><div className={`rounded-lg p-4 text-[13px] leading-relaxed ${message.sender === 'agent' ? 'rounded-tl-sm border border-[#1A1A1A] bg-[#050505] text-zinc-300' : 'rounded-tr-sm border border-[#262626] bg-[#111111] text-zinc-200'}`}>{message.text}</div></div>)}{reviewLoading && <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-4 text-sm text-zinc-400">Waiting for Agentic Layer to generate deployment questions...</div>}</div><div className="bg-black py-4">{currentQuestion?.options && <div className="mb-3 flex flex-wrap gap-2">{currentQuestion.options.map((option) => <button key={option.value} onClick={() => submitAnswer(option.value)} className="rounded-md border border-[#262626] bg-[#050505] px-3 py-2 text-xs font-medium text-zinc-300 hover:border-[#3f3f46]">{option.label}</button>)}</div>}<form onSubmit={(event) => { event.preventDefault(); submitAnswer(chatInput); }} className="flex gap-2"><input value={chatInput} onChange={(event) => setChatInput(event.target.value)} disabled={!currentQuestion} className="flex-1 rounded-md border border-[#262626] bg-[#050505] px-4 py-2.5 text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none disabled:opacity-50" /><button type="submit" disabled={!chatInput.trim() || !currentQuestion} className="rounded-md bg-zinc-100 px-6 font-semibold text-black hover:bg-white disabled:cursor-not-allowed disabled:opacity-50"><Send className="h-4 w-4" /></button></form>{allQuestionsAnswered && <div className="mt-4 flex justify-end"><button onClick={() => void generatePlan().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to generate deployment profile.'))} className="flex items-center gap-2 rounded-md bg-indigo-600 px-5 py-2 text-sm font-semibold text-white hover:bg-indigo-500">Generate Architecture <ArrowRight className="h-4 w-4" /></button></div>}</div></div>}
+          {activeStage === 'qa' && (
+            <div className="mx-auto max-w-6xl space-y-6">
+              <div className="border-b border-[#1A1A1A] py-6">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                  <div>
+                    <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Deployment Questions</h1>
+                    <p className="text-sm text-zinc-400">
+                      {reviewLoading
+                        ? 'Preparing deployment questions from repository analysis.'
+                        : 'Answer the required deployment questions so DeplAI can generate an AWS architecture and Terraform plan.'}
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                    <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] px-4 py-3">
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Required</div>
+                      <div className="mt-1 text-xl font-semibold text-zinc-100">{answeredRequiredCount}/{requiredQuestions.length || 0}</div>
+                    </div>
+                    <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] px-4 py-3">
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Progress</div>
+                      <div className="mt-1 text-xl font-semibold text-zinc-100">{reviewCompletionPercent}%</div>
+                    </div>
+                    <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] px-4 py-3 sm:col-span-1 col-span-2">
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Next Up</div>
+                      <div className="mt-1 text-sm font-medium text-zinc-200">{nextRequiredQuestion ? formatQuestionCategory(nextRequiredQuestion.category) : 'Ready to generate'}</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {reviewLoading ? (
+                <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
+                  <div className="space-y-4">
+                    {Array.from({ length: 4 }).map((_, index) => (
+                      <div key={index} className="animate-pulse rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
+                        <div className="mb-4 h-3 w-24 rounded bg-[#111111]" />
+                        <div className="mb-3 h-6 w-3/4 rounded bg-[#111111]" />
+                        <div className="h-10 w-full rounded bg-[#111111]" />
+                      </div>
+                    ))}
+                  </div>
+                  <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6 text-sm text-zinc-400">
+                    Building the deployment questionnaire from repository analysis...
+                  </div>
+                </div>
+              ) : review ? (
+                <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
+                  <div className="space-y-6">
+                    <div className="grid gap-4 md:grid-cols-3">
+                      <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-5">
+                        <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Repository</div>
+                        <div className="mt-2 text-sm font-medium text-zinc-100">{selectedProject?.name || 'Unknown project'}</div>
+                        <div className="mt-2 text-xs text-zinc-500">{String(repoContext?.language?.runtime || 'Unknown runtime')}</div>
+                      </div>
+                      <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-5">
+                        <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Detected Stack</div>
+                        <div className="mt-2 text-sm text-zinc-200">
+                          {analysisFrameworkNames.length > 0 ? analysisFrameworkNames.join(' / ') : 'Frameworks not detected'}
+                        </div>
+                        <div className="mt-2 text-xs text-zinc-500">
+                          {analysisDataStoreNames.length > 0 ? `Data: ${analysisDataStoreNames.join(', ')}` : 'No managed datastore detected'}
+                        </div>
+                      </div>
+                      <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-5">
+                        <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Question Scope</div>
+                        <div className="mt-2 text-sm text-zinc-200">{reviewQuestions.length} total questions</div>
+                        <div className="mt-2 text-xs text-zinc-500">{optionalQuestionCount} optional</div>
+                      </div>
+                    </div>
+
+                    {groupedQuestions.map(([category, questions]) => (
+                      <section key={category} className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
+                        <div className="mb-5 flex items-center justify-between gap-4">
+                          <div>
+                            <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">{category}</div>
+                            <div className="mt-1 text-sm text-zinc-400">
+                              {questions.filter((question) => String(answers[question.id] || '').trim()).length}/{questions.length} answered
+                            </div>
+                          </div>
+                          <div className="h-2 w-28 overflow-hidden rounded-full bg-[#111111]">
+                            <div
+                              className="h-full rounded-full bg-indigo-500"
+                              style={{
+                                width: `${Math.round((questions.filter((question) => String(answers[question.id] || '').trim()).length / Math.max(questions.length, 1)) * 100)}%`,
+                              }}
+                            />
+                          </div>
+                        </div>
+
+                        <div className="space-y-4">
+                          {questions.map((question, index) => {
+                            const answer = String(answers[question.id] || '').trim();
+                            const suggested = String(question.default || '').trim();
+                            const isRequired = question.required !== false;
+                            const isNext = nextRequiredQuestion?.id === question.id;
+                            return (
+                              <div
+                                key={question.id}
+                                className={`rounded-2xl border p-5 transition-colors ${
+                                  isNext
+                                    ? 'border-indigo-500/40 bg-indigo-500/5'
+                                    : answer
+                                      ? 'border-emerald-500/20 bg-emerald-500/5'
+                                      : 'border-[#1A1A1A] bg-black/40'
+                                }`}
+                              >
+                                <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                                  <div>
+                                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                                      <span className="rounded-full border border-[#262626] bg-[#111111] px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest text-zinc-500">
+                                        Question {index + 1}
+                                      </span>
+                                      <span
+                                        className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest ${
+                                          isRequired
+                                            ? 'border-amber-500/20 bg-amber-500/10 text-amber-300'
+                                            : 'border-zinc-700 bg-[#111111] text-zinc-500'
+                                        }`}
+                                      >
+                                        {isRequired ? 'Required' : 'Optional'}
+                                      </span>
+                                      {isNext ? (
+                                        <span className="rounded-full border border-indigo-500/20 bg-indigo-500/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest text-indigo-300">
+                                          Next
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                    <h2 className="text-base font-medium leading-relaxed text-zinc-100">{question.question}</h2>
+                                  </div>
+                                  {answer ? (
+                                    <div className="inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-300">
+                                      <CheckCircle2 className="h-3.5 w-3.5" />
+                                      Answered
+                                    </div>
+                                  ) : null}
+                                </div>
+
+                                {Array.isArray(question.options) && question.options.length > 0 ? (
+                                  <div className="grid gap-3 md:grid-cols-2">
+                                    {question.options.map((option) => {
+                                      const selected = answer === option.value;
+                                      const suggestedOption = !answer && suggested === option.value;
+                                      return (
+                                        <button
+                                          key={option.value}
+                                          type="button"
+                                          onClick={() => updateAnswer(question.id, option.value)}
+                                          className={`rounded-xl border px-4 py-3 text-left transition-colors ${
+                                            selected
+                                              ? 'border-indigo-500 bg-indigo-500/10 text-white'
+                                              : 'border-[#262626] bg-[#050505] text-zinc-300 hover:border-[#3f3f46] hover:bg-[#0A0A0A]'
+                                          }`}
+                                        >
+                                          <div className="flex items-start justify-between gap-3">
+                                            <div>
+                                              <div className="text-sm font-medium">{option.label}</div>
+                                              {option.description ? (
+                                                <div className="mt-1 text-xs leading-relaxed text-zinc-500">{option.description}</div>
+                                              ) : null}
+                                            </div>
+                                            {selected ? (
+                                              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-indigo-300" />
+                                            ) : suggestedOption ? (
+                                              <span className="rounded-full border border-zinc-700 px-2 py-0.5 text-[10px] uppercase tracking-widest text-zinc-500">
+                                                Suggested
+                                              </span>
+                                            ) : null}
+                                          </div>
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                ) : (
+                                  <div className="space-y-3">
+                                    <input
+                                      value={answer}
+                                      onChange={(event) => updateAnswer(question.id, event.target.value)}
+                                      placeholder={questionInputPlaceholder(question.id, question.default)}
+                                      className="w-full rounded-xl border border-[#262626] bg-[#050505] px-4 py-3 text-sm text-zinc-200 outline-none transition-colors placeholder:text-zinc-600 focus:border-indigo-500/50"
+                                    />
+                                    {suggested ? (
+                                      <div className="text-xs text-zinc-500">
+                                        Suggested default: <span className="font-mono text-zinc-300">{suggested}</span>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </section>
+                    ))}
+                  </div>
+
+                  <div className="space-y-4 lg:sticky lg:top-8 lg:self-start">
+                    <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
+                      <div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Readiness</div>
+                      <div className="mb-3 text-3xl font-semibold text-zinc-100">{reviewCompletionPercent}%</div>
+                      <div className="h-2 overflow-hidden rounded-full bg-[#111111]">
+                        <div className="h-full rounded-full bg-indigo-500" style={{ width: `${reviewCompletionPercent}%` }} />
+                      </div>
+                      <div className="mt-4 space-y-2 text-xs text-zinc-400">
+                        <div>Required answered: <span className="font-mono text-zinc-200">{answeredRequiredCount}/{requiredQuestions.length || 0}</span></div>
+                        <div>Total answered: <span className="font-mono text-zinc-200">{answeredQuestionCount}/{reviewQuestions.length || 0}</span></div>
+                        {nextRequiredQuestion ? (
+                          <div>Next question: <span className="text-zinc-200">{nextRequiredQuestion.question}</span></div>
+                        ) : (
+                          <div className="text-emerald-300">All required deployment questions are complete.</div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
+                      <div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Repository Signal</div>
+                      <div className="space-y-3 text-sm text-zinc-300">
+                        <div>
+                          <div className="text-zinc-500">Workspace</div>
+                          <div className="mt-1 font-mono text-xs text-zinc-200">{review.context_json.workspace}</div>
+                        </div>
+                        <div>
+                          <div className="text-zinc-500">Runtime</div>
+                          <div className="mt-1 text-zinc-200">{String(repoContext?.language?.runtime || 'Unknown')}</div>
+                        </div>
+                        <div>
+                          <div className="text-zinc-500">Build Command</div>
+                          <div className="mt-1 font-mono text-xs text-zinc-200">{String(repoContext?.build?.build_command || 'not detected')}</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
+                      <div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">What Happens Next</div>
+                      <div className="space-y-2 text-sm text-zinc-400">
+                        <div>1. Generate AWS architecture and cost estimate.</div>
+                        <div>2. Review and approve the plan.</div>
+                        <div>3. Generate Terraform and continue to deployment.</div>
+                      </div>
+                      <button
+                        onClick={() => void generatePlan().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to generate deployment profile.'))}
+                        disabled={!allQuestionsAnswered}
+                        className="mt-6 flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-[#111111] disabled:text-zinc-500"
+                      >
+                        Generate Architecture & Cost
+                        <ArrowRight className="h-4 w-4" />
+                      </button>
+                      {!allQuestionsAnswered ? (
+                        <div className="mt-3 text-xs text-zinc-500">
+                          Finish the required questions to unlock the plan.
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-8 text-sm text-zinc-400">
+                  The deployment questionnaire could not be loaded. Return to repository analysis and retry.
+                </div>
+              )}
+            </div>
+          )}
           {activeStage === 'architecture' && <div className="mx-auto max-w-6xl space-y-6"><div><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Architecture & Cost Estimate</h1><p className="text-sm text-zinc-400">Generated topology for AWS ({architectureRegion}) from repository analysis and deployment Q&A.</p></div><div className="grid grid-cols-3 gap-6"><div className="col-span-2 overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="flex items-center justify-between border-b border-[#1A1A1A] px-5 py-4"><div><div className="text-sm font-semibold text-zinc-100">Generated Architecture Graph</div><div className="text-xs text-zinc-500">{architectureNodes.length} nodes / {architectureEdges.length} edges</div></div></div><div className="p-5">{architectureLayout.length > 0 ? <svg viewBox="0 0 700 400" className="w-full rounded-lg bg-black"><defs><marker id="deploy-track-arrow" markerWidth="8" markerHeight="6" refX="6" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#3f3f46" /></marker></defs>{architectureEdges.map((edge, index) => { const from = architectureNodePositions.get(edge.from); const to = architectureNodePositions.get(edge.to); if (!from || !to) return null; return <line key={`${edge.from}-${edge.to}-${index}`} x1={from.x} y1={from.y} x2={to.x} y2={to.y} stroke="#3f3f46" strokeWidth="1.5" strokeDasharray="5,3" markerEnd="url(#deploy-track-arrow)" />; })}{architectureLayout.map((node) => <g key={node.id} transform={`translate(${node.x - 60},${node.y - 22})`}><rect width="120" height="44" rx="8" fill={`${node.color}18`} stroke={node.color} strokeWidth="1" strokeOpacity=".65" /><text x="60" y="17" textAnchor="middle" fill={node.color} fontSize="9" fontFamily="monospace" fontWeight="600">{node.id.toUpperCase()}</text><text x="60" y="31" textAnchor="middle" fill="#a1a1aa" fontSize="10" fontFamily="-apple-system,sans-serif">{node.label || node.type}</text></g>)}<text x="350" y="392" textAnchor="middle" fill="#52525b" fontSize="10" fontFamily="-apple-system,sans-serif">Rendered from architecture review output</text></svg> : <div className="rounded-lg border border-dashed border-[#262626] bg-black px-6 py-16 text-center text-sm text-zinc-500">Architecture output is not available yet. Complete Q&A generation to populate the graph.</div>}</div></div><div className="space-y-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Monthly Estimate</div><div className="text-3xl font-semibold text-zinc-100">${costEstimate.total.toFixed(2)}</div><div className="mt-2 text-xs text-zinc-500">Budget cap: ${costEstimate.cap.toFixed(2)}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Q&A Context</div><div className="text-xs leading-relaxed text-zinc-400">{qaSummary ? <pre className="whitespace-pre-wrap font-sans text-xs leading-relaxed text-zinc-400">{qaSummary}</pre> : 'Waiting for deployment answers.'}</div></div><button onClick={() => setAndPersistStage('approval')} className="w-full rounded-md bg-zinc-100 py-3 text-sm font-semibold text-black hover:bg-white">Review & Approve</button></div></div>{architectureCostRows.length > 0 && <div className="overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="border-b border-[#1A1A1A] px-5 py-4 text-sm font-semibold text-zinc-100">Cost Breakdown</div><table className="w-full text-sm"><thead><tr className="border-b border-[#1A1A1A] text-left text-[11px] uppercase tracking-widest text-zinc-500"><th className="px-5 py-3">Service</th><th className="px-5 py-3">Type</th><th className="px-5 py-3">Monthly</th><th className="px-5 py-3">Notes</th></tr></thead><tbody>{architectureCostRows.map((row, index) => <tr key={`${row.service}-${index}`} className="border-b border-[#111111] last:border-0"><td className="px-5 py-3 text-zinc-200">{row.service}</td><td className="px-5 py-3 text-zinc-400">{row.type}</td><td className="px-5 py-3 font-mono text-zinc-200">${row.monthly.toFixed(2)}</td><td className="px-5 py-3 text-zinc-500">{row.note || '-'}</td></tr>)}<tr className="bg-black/60"><td className="px-5 py-3 font-semibold text-zinc-100">Total</td><td className="px-5 py-3" /><td className="px-5 py-3 font-mono font-semibold text-zinc-100">${costEstimate.total.toFixed(2)}</td><td className="px-5 py-3" /></tr></tbody></table></div>}</div>}
           {activeStage === 'approval' && <div className="mx-auto max-w-3xl space-y-6"><div className="mt-4 mb-8 border-b border-[#1A1A1A] pb-6"><h1 className="mb-2 text-2xl font-semibold text-zinc-100">Sign-off</h1><p className="text-sm text-zinc-400">Review deployment contract before generating infrastructure code.</p></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-6 rounded-md border border-[#1A1A1A] bg-black p-4"><label className="flex items-start gap-3"><input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)} className="mt-1 h-4 w-4 rounded border-[#4B5563] bg-[#111111] text-indigo-600" /><span className="text-sm leading-relaxed text-zinc-400">I approve the architectural design and estimated runtime costs. Proceed with generating Terraform configurations.</span></label></div><button disabled={!approved} onClick={() => { setAndPersistStage('terraform'); void generateTerraform().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'IaC generation failed.')); }} className="w-full rounded-md bg-indigo-600 py-3 text-sm font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500">Approve & Generate IaC</button></div></div>}
           {activeStage === 'terraform' && <div className="mx-auto flex max-w-6xl flex-col gap-6"><div className="flex items-center justify-between"><div><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Terraform Output</h1><p className="text-sm text-zinc-400">Code generated by the Terraform agent from the approved architecture.</p></div><button onClick={() => setAndPersistStage('aws_config')} disabled={iacFiles.length === 0} className="rounded-md bg-zinc-100 px-5 py-2 text-sm font-semibold text-black hover:bg-white disabled:bg-[#111111] disabled:text-zinc-500">Continue to Config</button></div><div className="grid grid-cols-3 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5"><div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Terraform Agent</div><div className="text-sm text-zinc-200">{savedRun?.run_id ? 'Connected to saved run' : 'Using generated file bundle'}</div><div className="mt-3 space-y-2 text-xs text-zinc-500"><div>Run ID: <span className="font-mono text-zinc-300">{savedRun?.run_id || 'pending'}</span></div><div>Workspace: <span className="font-mono text-zinc-300">{savedRun?.workspace || 'local session'}</span></div><div>Files: <span className="font-mono text-zinc-300">{iacFiles.length}</span></div></div></div><div className="col-span-2 flex gap-6"><div className="custom-scrollbar h-[520px] w-64 shrink-0 overflow-y-auto rounded-lg border border-[#1A1A1A] bg-[#050505] p-3 text-sm">{iacFiles.map((file) => <button key={file.path} onClick={() => setSelectedFile(file.path)} className={`mb-2 block w-full rounded px-2 py-1 text-left ${activeIacFilePath === file.path ? 'bg-[#111111] text-zinc-200' : 'text-zinc-300 hover:bg-[#111111]'}`}>{file.path}</button>)}</div><div className="flex h-[520px] flex-1 flex-col rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="border-b border-[#1A1A1A] bg-black px-4 py-2.5 font-mono text-[11px] text-zinc-400">{activeIacFilePath || 'Generated files'}</div><div className="custom-scrollbar flex-1 overflow-y-auto p-5 font-mono text-[13px] leading-relaxed text-zinc-300"><pre className="whitespace-pre-wrap">{(iacFiles.find((file) => file.path === activeIacFilePath) || iacFiles[0])?.content || 'Generate Terraform to view files.'}</pre></div></div></div></div></div>}

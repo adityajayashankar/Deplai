@@ -7,7 +7,7 @@ const SCAN_CONTEXT_STORAGE_KEY = 'deplai.scan-context.v1';
 const MAX_PROJECT_ENTRIES = 40;
 const MAX_MESSAGES_PER_PROJECT = 500;
 
-type OperationState = 'idle' | 'running' | 'waiting_approval' | 'completed' | 'error';
+type OperationState = 'idle' | 'running' | 'waiting_decision' | 'waiting_approval' | 'completed' | 'error';
 export type ScanState = OperationState;
 export type RemediationState = OperationState;
 export type VulnStatus = 'not_initiated' | 'found' | 'not_found';
@@ -56,7 +56,9 @@ interface ScanContextValue {
     llmModel?: string,
     remediationScope?: 'major' | 'all',
   ) => Promise<void>;
-  approveRemediationRescan: (projectId: string) => void;
+  continueRemediationRound: (projectId: string) => void;
+  pushCurrentRemediationChanges: (projectId: string) => void;
+  approveRemediationPush: (projectId: string) => void;
   getRemediationState: (projectId: string) => ProjectRemediationState;
   resetRemediation: (projectId: string) => void;
   isAnyRemediating: boolean;
@@ -156,7 +158,7 @@ function connectWebSocket(
         onMessage(projectId, data.data as ScanMessage);
         break;
       case 'status':
-        if (['running', 'waiting_approval', 'completed', 'error'].includes(data.status)) {
+        if (['running', 'waiting_decision', 'waiting_approval', 'completed', 'error'].includes(data.status)) {
           onStatus(projectId, data.status);
         }
         break;
@@ -169,22 +171,78 @@ function connectWebSocket(
   return ws;
 }
 
+function trimMessageList(messages: ScanMessage[]): ScanMessage[] {
+  if (!Array.isArray(messages)) return [];
+  return messages.slice(-MAX_MESSAGES_PER_PROJECT);
+}
+
+function clampRecordSize<T>(input: Record<string, T>): Record<string, T> {
+  const entries = Object.entries(input || {});
+  if (entries.length <= MAX_PROJECT_ENTRIES) return input || {};
+  return Object.fromEntries(entries.slice(entries.length - MAX_PROJECT_ENTRIES));
+}
+
+function normalizeStoredScanStates(input: Record<string, ProjectScanState> | undefined): Record<string, ProjectScanState> {
+  const out: Record<string, ProjectScanState> = {};
+  for (const [projectId, state] of Object.entries(input || {})) {
+    if (!projectId || !state) continue;
+    out[projectId] = {
+      state: state.state || 'idle',
+      projectName: String(state.projectName || ''),
+      messages: trimMessageList(Array.isArray(state.messages) ? state.messages : []),
+    };
+  }
+  return clampRecordSize(out);
+}
+
+function normalizeStoredRemediationStates(input: Record<string, ProjectRemediationState> | undefined): Record<string, ProjectRemediationState> {
+  const out: Record<string, ProjectRemediationState> = {};
+  for (const [projectId, state] of Object.entries(input || {})) {
+    if (!projectId || !state) continue;
+    out[projectId] = {
+      state: state.state || 'idle',
+      messages: trimMessageList(Array.isArray(state.messages) ? state.messages : []),
+    };
+  }
+  return clampRecordSize(out);
+}
+
+function normalizeStoredResultsCache(input: Record<string, CachedScanResults> | undefined): Record<string, CachedScanResults> {
+  const out: Record<string, CachedScanResults> = {};
+  for (const [projectId, cached] of Object.entries(input || {})) {
+    if (!projectId || !cached) continue;
+    out[projectId] = {
+      status: cached.status || 'not_initiated',
+      data: cached.data ?? null,
+    };
+  }
+  return clampRecordSize(out);
+}
+
+function readPersistedSnapshot(): PersistedScanContextSnapshot | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(SCAN_CONTEXT_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as PersistedScanContextSnapshot;
+  } catch {
+    return null;
+  }
+}
+
 export function ScanProvider({ children }: { children: React.ReactNode }) {
-  const [scanStates, setScanStates] = useState<Record<string, ProjectScanState>>({});
-  const [remediationStates, setRemediationStates] = useState<Record<string, ProjectRemediationState>>({});
-  const [resultsCache, setResultsCache] = useState<Record<string, CachedScanResults>>({});
+  const [scanStates, setScanStates] = useState<Record<string, ProjectScanState>>(() => normalizeStoredScanStates(readPersistedSnapshot()?.scanStates));
+  const [remediationStates, setRemediationStates] = useState<Record<string, ProjectRemediationState>>(() => normalizeStoredRemediationStates(readPersistedSnapshot()?.remediationStates));
+  const [resultsCache, setResultsCache] = useState<Record<string, CachedScanResults>>(() => normalizeStoredResultsCache(readPersistedSnapshot()?.resultsCache));
   const wsRefs = useRef<Record<string, WebSocket>>({});
   const remWsRefs = useRef<Record<string, WebSocket>>({});
 
   const trimMessages = useCallback((messages: ScanMessage[]) => {
-    if (!Array.isArray(messages)) return [];
-    return messages.slice(-MAX_MESSAGES_PER_PROJECT);
+    return trimMessageList(messages);
   }, []);
 
   const clampMapSize = useCallback(<T,>(input: Record<string, T>): Record<string, T> => {
-    const entries = Object.entries(input || {});
-    if (entries.length <= MAX_PROJECT_ENTRIES) return input || {};
-    return Object.fromEntries(entries.slice(entries.length - MAX_PROJECT_ENTRIES));
+    return clampRecordSize(input);
   }, []);
 
   const normalizeScanStates = useCallback((input: Record<string, ProjectScanState> | undefined) => {
@@ -223,19 +281,6 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     }
     return clampMapSize(out);
   }, [clampMapSize]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(SCAN_CONTEXT_STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw) as PersistedScanContextSnapshot;
-      setScanStates(normalizeScanStates(parsed.scanStates));
-      setRemediationStates(normalizeRemediationStates(parsed.remediationStates));
-      setResultsCache(normalizeResultsCache(parsed.resultsCache));
-    } catch {
-      // Ignore corrupted client cache.
-    }
-  }, [normalizeRemediationStates, normalizeResultsCache, normalizeScanStates]);
 
   useEffect(() => {
     const handleStorage = (event: StorageEvent) => {
@@ -463,10 +508,22 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     );
   }, [appendRemediationMessage, updateRemediationStatus]);
 
-  const approveRemediationRescan = useCallback((projectId: string) => {
+  const continueRemediationRound = useCallback((projectId: string) => {
     const ws = remWsRefs.current[projectId];
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ action: 'approve_rescan' }));
+    ws.send(JSON.stringify({ action: 'continue_round' }));
+  }, []);
+
+  const pushCurrentRemediationChanges = useCallback((projectId: string) => {
+    const ws = remWsRefs.current[projectId];
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ action: 'push_current' }));
+  }, []);
+
+  const approveRemediationPush = useCallback((projectId: string) => {
+    const ws = remWsRefs.current[projectId];
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ action: 'approve_push' }));
   }, []);
 
   const getRemediationState = useCallback((projectId: string): ProjectRemediationState => {
@@ -542,14 +599,16 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     activeScanIds,
     resetAll,
     startRemediation,
-    approveRemediationRescan,
+    continueRemediationRound,
+    pushCurrentRemediationChanges,
+    approveRemediationPush,
     getRemediationState,
     resetRemediation,
     isAnyRemediating,
     activeRemediationIds,
     getCachedResults,
     setCachedResults,
-  }), [startScan, getScanState, activeScanIds, resetAll, startRemediation, approveRemediationRescan, getRemediationState, resetRemediation, isAnyRemediating, activeRemediationIds, getCachedResults, setCachedResults]);
+  }), [startScan, getScanState, activeScanIds, resetAll, startRemediation, continueRemediationRound, pushCurrentRemediationChanges, approveRemediationPush, getRemediationState, resetRemediation, isAnyRemediating, activeRemediationIds, getCachedResults, setCachedResults]);
 
   return (
     <ScanContext.Provider value={value}>
