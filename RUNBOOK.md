@@ -35,7 +35,7 @@ Optional but recommended:
 
 - Neo4j
 - Qdrant
-- AWS credentials for runtime deploy and some pricing flows
+- AWS credentials for runtime deploy and AWS pricing flows
 
 ## 3. Services You Must Run
 
@@ -206,9 +206,9 @@ flowchart LR
     Remediate --> Approve[Approve Changes]
     Approve --> Verify[Re-scan / Verify]
     Verify --> QA[Provide Q/A Context]
-    QA --> Arch[Architecture + Cost]
-    Arch --> IaC[IaC Generation]
-    IaC --> Deploy[Deploy]
+    QA --> Agent[Architecture and Cost Agent]
+    Agent --> Terraform[terraform_agent]
+    Terraform --> Deploy[Deploy]
 ```
 
 ## 9. Stage Operations
@@ -271,8 +271,7 @@ Primary routes:
 
 Operational notes:
 
-- AWS has the strongest deterministic/fallback support
-- Azure and GCP are supported for architecture/cost request flows
+- this runbook treats architecture and cost as AWS-only
 - Stage 7 packaging runs through the diagram-cost subprocess
 
 ### 9.4 Stage 8: IaC
