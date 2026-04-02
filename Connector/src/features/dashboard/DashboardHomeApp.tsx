@@ -36,6 +36,7 @@ import {
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useScan } from '@/lib/scan-context';
+import ManageInstancesApp from '@/features/deployment/ManageInstancesApp';
 
 type ViewMode = 'list' | 'grid';
 type PixelBlastVariant = 'square' | 'circle' | 'triangle' | 'diamond';
@@ -806,6 +807,206 @@ function BranchDropdown({
   );
 }
 
+function PixelNoiseButton({
+  onClick,
+  children,
+  className = '',
+  theme = 'light',
+}: {
+  onClick: () => void;
+  children: React.ReactNode;
+  className?: string;
+  theme?: 'light' | 'orange';
+}) {
+  class PixelButtonNode {
+    width: number;
+    height: number;
+    ctx: CanvasRenderingContext2D;
+    x: number;
+    y: number;
+    color: string;
+    speed: number;
+    size: number;
+    sizeStep: number;
+    minSize: number;
+    maxSizeInteger: number;
+    maxSize: number;
+    delay: number;
+    counter: number;
+    counterStep: number;
+    isIdle: boolean;
+    isReverse: boolean;
+    isShimmer: boolean;
+
+    constructor(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D, x: number, y: number, color: string, speed: number, delay: number) {
+      const dpr = window.devicePixelRatio || 1;
+      this.width = canvas.width / dpr;
+      this.height = canvas.height / dpr;
+      this.ctx = context;
+      this.x = x;
+      this.y = y;
+      this.color = color;
+      this.speed = (Math.random() * 0.8 + 0.1) * speed;
+      this.size = 0;
+      this.sizeStep = Math.random() * 0.4;
+      this.minSize = 0.5;
+      this.maxSizeInteger = 2;
+      this.maxSize = Math.random() * (this.maxSizeInteger - this.minSize) + this.minSize;
+      this.delay = delay;
+      this.counter = 0;
+      this.counterStep = Math.random() * 4 + (this.width + this.height) * 0.01;
+      this.isIdle = false;
+      this.isReverse = false;
+      this.isShimmer = false;
+    }
+
+    draw() {
+      const centerOffset = this.maxSizeInteger * 0.5 - this.size * 0.5;
+      this.ctx.fillStyle = this.color;
+      this.ctx.fillRect(
+        Math.round(this.x + centerOffset),
+        Math.round(this.y + centerOffset),
+        Math.round(this.size),
+        Math.round(this.size),
+      );
+    }
+
+    appear() {
+      this.isIdle = false;
+      if (this.counter <= this.delay) {
+        this.counter += this.counterStep;
+        return;
+      }
+      if (this.size >= this.maxSize) this.isShimmer = true;
+      if (this.isShimmer) this.shimmer();
+      else this.size += this.sizeStep;
+      this.draw();
+    }
+
+    disappear() {
+      this.isShimmer = false;
+      this.counter = 0;
+      if (this.size <= 0) {
+        this.isIdle = true;
+        return;
+      }
+      this.size -= 0.1;
+      this.draw();
+    }
+
+    shimmer() {
+      if (this.size >= this.maxSize) this.isReverse = true;
+      else if (this.size <= this.minSize) this.isReverse = false;
+      if (this.isReverse) this.size -= this.speed;
+      else this.size += this.speed;
+    }
+  }
+
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pixelsRef = useRef<PixelButtonNode[]>([]);
+  const animationRef = useRef<number | null>(null);
+  const timePreviousRef = useRef<number>(performance.now());
+  const reducedMotionRef = useRef(false);
+
+  useEffect(() => {
+    reducedMotionRef.current = Boolean(window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }, []);
+
+  const initPixels = useCallback(() => {
+    if (!buttonRef.current || !canvasRef.current) return;
+    const rect = buttonRef.current.getBoundingClientRect();
+    const width = Math.floor(rect.width);
+    const height = Math.floor(rect.height);
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(dpr, dpr);
+
+    const colors = theme === 'orange'
+      ? ['#FF9900', '#FFB84D', '#F97316']
+      : ['#111111', '#3f3f46', '#52525b'];
+    const gap = 5;
+    const speed = 35 * 0.001;
+    const nextPixels: PixelButtonNode[] = [];
+
+    for (let x = 0; x < width; x += gap) {
+      for (let y = 0; y < height; y += gap) {
+        const color = colors[Math.floor(Math.random() * colors.length)] || '#3f3f46';
+        const distance = Math.sqrt(Math.pow(x - width / 2, 2) + Math.pow(y - height / 2, 2));
+        nextPixels.push(new PixelButtonNode(canvas, ctx, x, y, color, speed, reducedMotionRef.current ? 0 : distance));
+      }
+    }
+    pixelsRef.current = nextPixels;
+  }, [theme]);
+
+  const animate = useCallback((mode: 'appear' | 'disappear') => {
+    animationRef.current = requestAnimationFrame(() => animate(mode));
+    const timeNow = performance.now();
+    const timePassed = timeNow - timePreviousRef.current;
+    if (timePassed < 1000 / 60) return;
+    timePreviousRef.current = timeNow - (timePassed % (1000 / 60));
+
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (!ctx || !canvas) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+
+    let allIdle = true;
+    pixelsRef.current.forEach((pixel) => {
+      pixel[mode]();
+      if (!pixel.isIdle) allIdle = false;
+    });
+
+    if (allIdle && animationRef.current !== null) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
+    }
+  }, []);
+
+  const triggerAnimation = useCallback((mode: 'appear' | 'disappear') => {
+    if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
+    animationRef.current = requestAnimationFrame(() => animate(mode));
+  }, [animate]);
+
+  useEffect(() => {
+    initPixels();
+    const observer = new ResizeObserver(() => initPixels());
+    if (buttonRef.current) observer.observe(buttonRef.current);
+
+    return () => {
+      observer.disconnect();
+      if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
+    };
+  }, [initPixels]);
+
+  const buttonThemeClass = theme === 'orange'
+    ? 'border-[#FF9900]/50 bg-[#FF9900]/15 text-[#FF9900] shadow-[0_0_15px_rgba(255,153,0,0.18)] hover:bg-[#FF9900]/25'
+    : 'border-zinc-200/80 bg-zinc-100 text-black shadow-[0_2px_10px_rgba(255,255,255,0.15)] hover:bg-white';
+
+  return (
+    <button
+      ref={buttonRef}
+      onClick={onClick}
+      onMouseEnter={() => triggerAnimation('appear')}
+      onMouseLeave={() => triggerAnimation('disappear')}
+      onFocus={() => triggerAnimation('appear')}
+      onBlur={() => triggerAnimation('disappear')}
+      className={`group/pixel relative overflow-hidden rounded-md border px-4 py-1.5 text-[12px] font-semibold transition-all ${buttonThemeClass} ${className}`}
+    >
+      <canvas ref={canvasRef} aria-hidden className="pointer-events-none absolute inset-0 h-full w-full" />
+      <span className="relative z-10 flex items-center gap-1.5">{children}</span>
+    </button>
+  );
+}
+
 function mapProjectsToRepositories(projects: ProjectRecord[]): DashboardRepository[] {
   return projects.map((project) => ({
     id: project.id,
@@ -993,7 +1194,7 @@ export default function DashboardHomeApp() {
               onClick={() => {
                 setActiveTab(key);
                 if (key === 'deployments') router.push('/dashboard/deploy');
-                if (key === 'instances') router.push('/dashboard/instances');
+                if (key === 'instances') return;
               }}
               className={`relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-all ${activeTab === key ? 'border border-indigo-500/20 bg-gradient-to-r from-indigo-500/10 to-transparent text-indigo-100' : 'text-[#8F98A8] hover:bg-[#0A0D14] hover:text-slate-200'}`}
             >
@@ -1027,7 +1228,7 @@ export default function DashboardHomeApp() {
           <div className="flex items-center gap-2 text-[13px] text-[#8F98A8]">
             <span className="cursor-pointer transition-colors hover:text-slate-200">Dashboard</span>
             <span className="text-[#4B5563]">/</span>
-            <span className="font-medium text-white">Command Center</span>
+            <span className="font-medium text-white">{activeTab === 'instances' ? 'Manage Instance' : 'Command Center'}</span>
           </div>
           <div className="flex items-center gap-3">
             <button onClick={() => router.push('/dashboard/projects')} className="flex items-center gap-2 rounded-md border border-[#1E2330] px-3 py-1.5 text-[13px] font-medium text-slate-300 transition-all hover:bg-[#13161F]">
@@ -1041,6 +1242,9 @@ export default function DashboardHomeApp() {
           </div>
         </header>
 
+        {activeTab === 'instances' ? (
+          <ManageInstancesApp embedded />
+        ) : (
         <div className="custom-scrollbar relative z-10 flex-1 overflow-y-auto p-8" onScroll={handleMainScroll}>
           <div className="mb-10 grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-4">
             <BorderGlow backgroundColor="#000000" glowColor="230 80 60" glowIntensity={1} glowRadius={15} fillOpacity={0} borderRadius={16} className="p-6 shadow-lg">
@@ -1088,9 +1292,13 @@ export default function DashboardHomeApp() {
                 <h3 className="text-base font-semibold text-slate-200">AWS Deployment</h3>
               </div>
               <p className="relative z-10 mb-6 text-[13px] leading-relaxed text-[#8F98A8]">Deploy live endpoints directly to Amazon Web Services infrastructure.</p>
-              <button onClick={() => firstRepository ? handleDeploy(firstRepository.id) : router.push('/dashboard/deploy')} className="relative z-10 mt-auto flex w-full items-center justify-center gap-2 rounded-md border border-[#FF9900]/30 bg-[#FF9900]/10 py-2.5 text-[13px] font-medium text-[#FF9900] shadow-[0_0_15px_rgba(255,153,0,0.15)] transition-all hover:bg-[#FF9900] hover:text-black group-hover:shadow-[0_0_20px_rgba(255,153,0,0.3)]">
+              <PixelNoiseButton
+                onClick={() => (firstRepository ? handleDeploy(firstRepository.id) : router.push('/dashboard/deploy'))}
+                theme="orange"
+                className="relative z-10 mt-auto w-full justify-center py-2.5 text-[13px]"
+              >
                 <Play className="h-3.5 w-3.5 fill-current" /> Deploy to AWS
-              </button>
+              </PixelNoiseButton>
             </BorderGlow>
 
             <BorderGlow backgroundColor="#000000" glowColor="220 40 50" glowIntensity={1} glowRadius={15} fillOpacity={0} borderRadius={16} className="group cursor-pointer p-1 shadow-lg">
@@ -1157,14 +1365,12 @@ export default function DashboardHomeApp() {
 
                       <div className={`flex shrink-0 items-center gap-2 ${viewMode === 'grid' ? 'w-full justify-between border-t border-[#1E2330] pt-2' : ''}`}>
                         <div className="flex gap-2">
-                          <button onClick={() => handleDeploy(repo.id)} className="group/btn relative flex items-center gap-1.5 overflow-hidden rounded-md border border-[#2A3143] bg-[#13161F] px-4 py-1.5 text-[12px] font-medium text-slate-300 shadow-sm transition-all hover:border-[#4B5563] hover:text-white">
-                            <div className="absolute inset-0 translate-x-[-100%] bg-gradient-to-r from-indigo-500/0 via-indigo-500/10 to-indigo-500/0 transition-transform duration-700 ease-in-out group-hover/btn:translate-x-[100%]" />
-                            <Rocket className="relative z-10 h-3.5 w-3.5 text-indigo-400 transition-colors group-hover/btn:text-indigo-300" />
-                            <span className="relative z-10">Deploy</span>
-                          </button>
-                          <button onClick={() => void handleRunScan(repo.id)} className="flex items-center gap-1.5 rounded-md bg-gradient-to-r from-[#AC26C6] to-[#E0249F] px-4 py-1.5 text-[12px] font-medium text-white shadow-[0_2px_10px_rgba(224,36,159,0.2)] transition-opacity hover:opacity-90">
+                          <PixelNoiseButton onClick={() => handleDeploy(repo.id)}>
+                            <Rocket className="h-3.5 w-3.5" /> Deploy
+                          </PixelNoiseButton>
+                          <PixelNoiseButton onClick={() => void handleRunScan(repo.id)}>
                             <Zap className="h-3.5 w-3.5 fill-current" /> Run Scan
-                          </button>
+                          </PixelNoiseButton>
                         </div>
                         <div className="flex items-center gap-1">
                           <div className={`mx-1 h-5 w-px bg-[#1E2330] ${viewMode === 'grid' ? 'hidden' : ''}`} />
@@ -1180,6 +1386,7 @@ export default function DashboardHomeApp() {
             </div>
           </div>
         </div>
+        )}
       </main>
 
       <style dangerouslySetInnerHTML={{ __html: `

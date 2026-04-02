@@ -278,6 +278,11 @@ export function persistDeploySnapshot(projectId: string, snapshot: DeployStateSn
   localStorage.setItem(`${DEPLOY_STATE_STORAGE_PREFIX}${projectId}`, JSON.stringify(snapshot));
 }
 
+export function removeDeploySnapshot(projectId: string): void {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem(`${DEPLOY_STATE_STORAGE_PREFIX}${projectId}`);
+}
+
 export function loadDeploySnapshot(projectId: string): DeployStateSnapshot | null {
   if (typeof window === 'undefined') return null;
   try {

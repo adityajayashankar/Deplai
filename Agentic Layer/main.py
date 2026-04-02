@@ -32,6 +32,7 @@ from models import (
     TerraformApplyStatusRequest, TerraformApplyStatusResponse,
     AwsRuntimeDetailsRequest, AwsRuntimeDetailsResponse,
     AwsDestroyRequest, AwsDestroyResponse,
+    AwsInstanceActionRequest, AwsInstanceActionResponse,
 )
 from environment import EnvironmentInitializer
 from cleanup import cleanup_volumes, cleanup_project_reports
@@ -892,6 +893,13 @@ async def terraform_apply_stop(request: TerraformApplyStopRequest):
 @app.post("/api/aws/runtime-details", response_model=AwsRuntimeDetailsResponse, dependencies=[Depends(verify_api_key)])
 async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
     try:
+        requested_project_name = str(request.project_name or "").strip()
+        requested_instance_id = str(request.instance_id or "").strip()
+        has_specific_target = bool(
+            requested_instance_id
+            or (requested_project_name and requested_project_name != "deplai-project")
+        )
+
         session = boto3.session.Session(
             aws_access_key_id=request.aws_access_key_id,
             aws_secret_access_key=request.aws_secret_access_key,
@@ -914,11 +922,11 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
         ]
 
         tagged_instances = []
-        if request.project_name:
+        if requested_project_name:
             try:
                 tagged_res = ec2.describe_instances(
                     Filters=[
-                        {"Name": "tag:Project", "Values": [request.project_name]},
+                        {"Name": "tag:Project", "Values": [requested_project_name]},
                         {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
                     ]
                 )
@@ -931,9 +939,9 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
                 tagged_instances = []
 
         target_instance = None
-        if request.instance_id:
+        if requested_instance_id:
             try:
-                by_id = ec2.describe_instances(InstanceIds=[request.instance_id])
+                by_id = ec2.describe_instances(InstanceIds=[requested_instance_id])
                 by_id_instances = [
                     i
                     for r in by_id.get("Reservations", [])
@@ -945,7 +953,7 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
                 target_instance = None
         if target_instance is None and tagged_instances:
             target_instance = tagged_instances[0]
-        if target_instance is None and running_instances:
+        if target_instance is None and not has_specific_target and running_instances:
             target_instance = running_instances[0]
 
         vpcs = ec2.describe_vpcs().get("Vpcs", []) or []
@@ -977,9 +985,17 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
             "vpc_id": "n/a",
             "subnet_id": "n/a",
             "instance_arn": "n/a",
+            "launch_time": None,
         }
         if target_instance:
             iid = str(target_instance.get("InstanceId") or "")
+            launch_time_raw = target_instance.get("LaunchTime")
+            launch_time_iso = None
+            if launch_time_raw:
+                try:
+                    launch_time_iso = launch_time_raw.astimezone(timezone.utc).isoformat()
+                except Exception:
+                    launch_time_iso = str(launch_time_raw)
             instance = {
                 "instance_id": iid or "n/a",
                 "public_ipv4_address": str(target_instance.get("PublicIpAddress") or "n/a"),
@@ -995,13 +1011,17 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
                     if iid and account_id
                     else "n/a"
                 ),
+                "launch_time": launch_time_iso,
             }
+
+        lookup_status = "ok" if target_instance else "not_found"
 
         return AwsRuntimeDetailsResponse(
             success=True,
             details={
                 "region": request.aws_region,
                 "account_id": account_id or None,
+                "lookup_status": lookup_status,
                 "instance": instance,
                 "resource_counts": {
                     "ec2_instances_total": len(all_instances),
@@ -1020,6 +1040,87 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
         )
     except Exception as exc:
         return AwsRuntimeDetailsResponse(success=False, error=str(exc))
+
+
+@app.post("/api/aws/instance-action", response_model=AwsInstanceActionResponse, dependencies=[Depends(verify_api_key)])
+async def aws_instance_action(request: AwsInstanceActionRequest):
+    """Perform start/stop/reboot on a specific EC2 instance and return refreshed live details."""
+    try:
+        action = str(request.action or "").strip().lower()
+        if action not in {"start", "stop", "reboot"}:
+            return AwsInstanceActionResponse(success=False, error="action must be one of: start, stop, reboot")
+
+        session = boto3.session.Session(
+            aws_access_key_id=request.aws_access_key_id,
+            aws_secret_access_key=request.aws_secret_access_key,
+            region_name=request.aws_region,
+        )
+        ec2 = session.client("ec2", region_name=request.aws_region)
+        sts = session.client("sts", region_name=request.aws_region)
+        account_id = str(sts.get_caller_identity().get("Account", ""))
+
+        try:
+            if action == "start":
+                ec2.start_instances(InstanceIds=[request.instance_id])
+            elif action == "stop":
+                ec2.stop_instances(InstanceIds=[request.instance_id])
+            else:
+                ec2.reboot_instances(InstanceIds=[request.instance_id])
+        except Exception as exc:
+            message = str(exc or "")
+            tolerated = (
+                "IncorrectInstanceState" in message
+                or "is not in a state from which it can be started" in message
+                or "is not in a state from which it can be stopped" in message
+            )
+            if not tolerated:
+                return AwsInstanceActionResponse(success=False, error=message or "Failed to execute instance action")
+
+        response = ec2.describe_instances(InstanceIds=[request.instance_id])
+        instances = [
+            i
+            for reservation in response.get("Reservations", [])
+            for i in reservation.get("Instances", [])
+        ]
+        target = instances[0] if instances else None
+        if not target:
+            return AwsInstanceActionResponse(success=False, error="Instance not found after action execution")
+
+        launch_time_raw = target.get("LaunchTime")
+        launch_time_iso = None
+        if launch_time_raw:
+            try:
+                launch_time_iso = launch_time_raw.astimezone(timezone.utc).isoformat()
+            except Exception:
+                launch_time_iso = str(launch_time_raw)
+
+        iid = str(target.get("InstanceId") or request.instance_id)
+        details = {
+            "action": action,
+            "region": request.aws_region,
+            "account_id": account_id or None,
+            "instance": {
+                "instance_id": iid,
+                "public_ipv4_address": str(target.get("PublicIpAddress") or "n/a"),
+                "private_ipv4_address": str(target.get("PrivateIpAddress") or "n/a"),
+                "instance_state": str((target.get("State") or {}).get("Name") or "n/a"),
+                "instance_type": str(target.get("InstanceType") or "n/a"),
+                "public_dns": str(target.get("PublicDnsName") or "n/a"),
+                "private_dns": str(target.get("PrivateDnsName") or "n/a"),
+                "vpc_id": str(target.get("VpcId") or "n/a"),
+                "subnet_id": str(target.get("SubnetId") or "n/a"),
+                "instance_arn": (
+                    f"arn:aws:ec2:{request.aws_region}:{account_id}:instance/{iid}"
+                    if iid and account_id
+                    else "n/a"
+                ),
+                "launch_time": launch_time_iso,
+            },
+        }
+
+        return AwsInstanceActionResponse(success=True, details=details)
+    except Exception as exc:
+        return AwsInstanceActionResponse(success=False, error=str(exc))
 
 
 @app.post("/api/aws/destroy-runtime", response_model=AwsDestroyResponse, dependencies=[Depends(verify_api_key)])

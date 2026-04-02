@@ -269,6 +269,21 @@ class AwsDestroyResponse(BaseModel):
     error: Optional[str] = None
 
 
+class AwsInstanceActionRequest(BaseModel):
+    project_name: str = "deplai-project"
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_region: str = "eu-north-1"
+    instance_id: str
+    action: str  # start | stop | reboot
+
+
+class AwsInstanceActionResponse(BaseModel):
+    success: bool
+    details: Optional[dict] = None
+    error: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Stage 7 approval payload (diagram + cost + budget gate)
 # ---------------------------------------------------------------------------
