@@ -78,6 +78,29 @@ export async function GET() {
     const { user, error } = await requireAuth();
     if (error) return error;
 
+    try {
+      await githubService.linkUserInstallation(user.id, user.login);
+    } catch (linkError) {
+      console.warn('Projects link bootstrap failed:', linkError);
+    }
+
+    // Claim personal installations that are still unowned after webhook-only onboarding.
+    await query(
+      `UPDATE github_installations
+       SET user_id = ?
+       WHERE user_id IS NULL
+         AND account_type = 'User'
+         AND LOWER(account_login) = LOWER(?)`,
+      [user.id, user.login]
+    );
+
+    // Best-effort reconciliation so removed installations/repositories do not linger in UI.
+    try {
+      await githubService.syncInstallations(user.id);
+    } catch (syncError) {
+      console.warn('Projects sync before GET /api/projects failed:', syncError);
+    }
+
     let localProjects: LocalProjectRow[] = [];
     try {
       localProjects = await query<LocalProjectRow[]>(

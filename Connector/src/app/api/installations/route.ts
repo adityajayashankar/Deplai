@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
 import { requireAuth } from '@/lib/auth';
+import { githubService } from '@/lib/github';
 
 interface InstallationRow {
   id: string;
@@ -15,6 +16,29 @@ export async function GET() {
   try {
     const { user, error } = await requireAuth();
     if (error) return error;
+
+    try {
+      await githubService.linkUserInstallation(user.id, user.login);
+    } catch (linkError) {
+      console.warn('Installation link bootstrap failed:', linkError);
+    }
+
+    // Claim personal installations that arrived via webhook before OAuth callback linked ownership.
+    await query(
+      `UPDATE github_installations
+       SET user_id = ?
+       WHERE user_id IS NULL
+         AND account_type = 'User'
+         AND LOWER(account_login) = LOWER(?)`,
+      [user.id, user.login]
+    );
+
+    // Keep UI in sync with GitHub uninstall/removal events even if webhooks lag.
+    try {
+      await githubService.syncInstallations(user.id);
+    } catch (syncError) {
+      console.warn('Installations sync before GET /api/installations failed:', syncError);
+    }
 
     const installations = await query<InstallationRow[]>(
       `SELECT

@@ -1455,27 +1455,23 @@ export default function App() {
 
   const handleGitHubAction = useCallback(() => {
     if (!isLoggedIn) {
-      window.location.assign('/api/auth/login');
+      window.location.assign('/api/auth/login?force=1');
       return;
     }
     if (!githubConnected) {
-      window.location.assign(GITHUB_APP_INSTALL_URL);
+      router.push('/dashboard/projects');
       return;
     }
     router.push('/dashboard');
   }, [githubConnected, isLoggedIn, router]);
 
   const handleLaunchWorkspace = useCallback(() => {
-    if (githubConnected) {
+    if (isLoggedIn) {
       router.push('/dashboard');
       return;
     }
-    if (isLoggedIn) {
-      window.location.assign(GITHUB_APP_INSTALL_URL);
-      return;
-    }
-    window.location.assign('/api/auth/login');
-  }, [githubConnected, isLoggedIn, router]);
+    window.location.assign('/api/auth/login?force=1');
+  }, [isLoggedIn, router]);
 
   if (booting) {
     return <LoadingScreen invert />;

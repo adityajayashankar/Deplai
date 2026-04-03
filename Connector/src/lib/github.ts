@@ -335,6 +335,51 @@ export class GitHubService {
   }
 
   /**
+   * Best-effort linker for local/dev setups where GitHub webhooks may not reach this app.
+   * It discovers the personal installation for the current GitHub login and binds it to user_id.
+   */
+  async linkUserInstallation(userId: string, githubLogin: string): Promise<boolean> {
+    try {
+      const { data } = await this.app.apps.getUserInstallation({ username: githubLogin });
+      const installation = data;
+      const accountLogin = installation.account?.login;
+      const accountType = installation.account?.type || 'User';
+      const installationId = installation.id;
+
+      if (!accountLogin || !installationId) return false;
+
+      await query(
+        `INSERT INTO github_installations
+         (id, installation_id, account_login, account_type, user_id, suspended_at, metadata)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           account_login = VALUES(account_login),
+           account_type = VALUES(account_type),
+           suspended_at = VALUES(suspended_at),
+           metadata = VALUES(metadata),
+           user_id = IF(user_id IS NULL OR user_id = VALUES(user_id), VALUES(user_id), user_id)`,
+        [
+          uuidv4(),
+          installationId,
+          accountLogin,
+          accountType,
+          userId,
+          installation.suspended_at ? new Date(installation.suspended_at) : null,
+          JSON.stringify({ installation }),
+        ]
+      );
+
+      return true;
+    } catch (err: any) {
+      if (err?.status === 404) {
+        return false;
+      }
+      console.warn(`Failed to link installation for ${githubLogin}:`, err?.message || err);
+      return false;
+    }
+  }
+
+  /**
    * Sync all installations for a user against the GitHub API.
    * Removes installations that no longer exist on GitHub,
    * prunes repos that were removed, and adds any new ones.

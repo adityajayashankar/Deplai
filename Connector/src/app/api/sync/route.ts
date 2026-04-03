@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
 import { githubService } from '@/lib/github';
+import { query } from '@/lib/db';
 
 function isConnectivityError(error: unknown): boolean {
   const err = error as { code?: string };
@@ -17,6 +18,21 @@ export async function POST() {
   try {
     const { user, error } = await requireAuth();
     if (error) return error;
+
+    try {
+      await githubService.linkUserInstallation(user.id, user.login);
+    } catch (linkError) {
+      console.warn('Sync link bootstrap failed:', linkError);
+    }
+
+    await query(
+      `UPDATE github_installations
+       SET user_id = ?
+       WHERE user_id IS NULL
+         AND account_type = 'User'
+         AND LOWER(account_login) = LOWER(?)`,
+      [user.id, user.login]
+    );
 
     const { removed, added } = await githubService.syncInstallations(user.id);
 

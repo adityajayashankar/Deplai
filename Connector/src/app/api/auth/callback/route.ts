@@ -59,7 +59,30 @@ export async function GET(request: NextRequest) {
     const session = await getIronSession<SessionData>(cookieStore, sessionOptions);
     const { searchParams } = new URL(request.url);
     const code = searchParams.get('code');
+    const installationIdParam = String(searchParams.get('installation_id') || '').trim();
+    const setupAction = String(searchParams.get('setup_action') || '').trim();
     const returnedState = String(searchParams.get('state') || '').trim();
+
+    // GitHub App setup callback can reuse this URL and does not guarantee OAuth state.
+    // Route these callbacks directly back to dashboard and bind installation ownership when possible.
+    if (installationIdParam && setupAction) {
+      if (session.isLoggedIn && session.user) {
+        await query(
+          `UPDATE github_installations
+           SET user_id = ?
+           WHERE installation_id = ?
+             AND (user_id IS NULL OR user_id = ?)` ,
+          [session.user.id, Number(installationIdParam), session.user.id]
+        ).catch((error) => {
+          console.warn('Failed to bind installation ownership during setup callback:', error);
+        });
+      }
+
+      session.oauthState = undefined;
+      session.oauthStateExpiresAt = undefined;
+      await session.save();
+      return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/dashboard`, 302);
+    }
 
     const expectedState = String(session.oauthState || '').trim();
     const stateExpiresAt = Number(session.oauthStateExpiresAt || 0);
