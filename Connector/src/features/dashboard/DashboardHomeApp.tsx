@@ -38,6 +38,7 @@ import {
 import type { LucideIcon } from 'lucide-react';
 import { useScan } from '@/lib/scan-context';
 import ManageInstancesApp from '@/features/deployment/ManageInstancesApp';
+import SettingsApp from '@/features/dashboard/SettingsApp';
 
 type ViewMode = 'list' | 'grid';
 type PixelBlastVariant = 'square' | 'circle' | 'triangle' | 'diamond';
@@ -1225,7 +1226,11 @@ export default function DashboardHomeApp() {
   const githubCount = repositories.filter((repo) => repo.type === 'github').length;
   const localCount = repositories.filter((repo) => repo.type === 'local').length;
   const firstRepository = repositories[0];
-  const headerTitle = activeTab === 'instances' ? 'Manage Instance' : 'Command Center';
+  const headerTitle = activeTab === 'instances'
+    ? 'Manage Instance'
+    : activeTab === 'settings'
+      ? 'Settings'
+      : 'Command Center';
 
   return (
     <div className="relative flex h-screen overflow-hidden bg-[#050505] font-sans text-slate-300 selection:bg-white/30">
@@ -1318,6 +1323,10 @@ export default function DashboardHomeApp() {
 
         {activeTab === 'instances' ? (
           <ManageInstancesApp embedded />
+        ) : activeTab === 'settings' ? (
+        <div className="custom-scrollbar relative z-10 flex-1 overflow-y-auto p-8" onScroll={handleMainScroll}>
+          <SettingsApp />
+        </div>
         ) : (
         <div className="custom-scrollbar relative z-10 flex-1 overflow-y-auto p-8" onScroll={handleMainScroll}>
           <div className="mb-10 grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-4">
