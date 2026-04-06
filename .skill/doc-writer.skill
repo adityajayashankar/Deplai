@@ -1,0 +1,422 @@
+---
+name: doc-writer
+description: Generate enterprise-grade technical documentation from a codebase. Use this skill whenever the agent is asked to document a project, write or update a README, produce API reference docs, generate architecture docs, write a changelog, or explain how a system works based on source files. Trigger on: "document this", "write docs for", "generate README", "create API docs", "explain the architecture", "write a changelog", "document the codebase", "prepare docs", "enterprise docs", or any request to produce developer-facing documentation from code. This skill enforces specificity — no vague, generic, or hand-wavy content is acceptable.
+---
+
+# doc-writer
+
+Analyze a codebase and produce **enterprise-grade** technical documentation. Every claim must be sourced from the code. Every section must be specific enough that a new engineer could act on it without a single follow-up question.
+
+---
+
+## THE CORE RULE — Specificity over everything
+
+Before writing any sentence, ask: *could this sentence describe any other project?*
+If yes, rewrite it with concrete names, numbers, types, and behaviors sourced from the code.
+
+### Banned phrases — never write these
+
+| Banned | Replace with |
+|---|---|
+| "handles errors gracefully" | List the exact error codes, messages, and recovery behavior |
+| "connects to the database" | State DB engine, version, host pattern, pool size, env var |
+| "processes the request" | Describe the exact transformation: input type → steps → output type |
+| "various configuration options" | List every option, its type, default, and effect |
+| "integrates with external services" | Name each service, API version, auth method, and failure behavior |
+| "scalable architecture" | State the actual scaling model, trigger metric, and limits |
+| "easy to deploy" | Give the exact commands |
+| "supports multiple environments" | Name each env, what differs, which vars change |
+| "see the source code for details" | Extract and state those details inline |
+| "may return an error" | Document every error code and its cause |
+
+---
+
+## Step 0 — Determine the target doc type
+
+| Doc type | Output file | When |
+|---|---|---|
+| API Reference | `docs/api-reference.md` | REST endpoints, SDK methods, exported modules |
+| Architecture | `docs/architecture.md` | System design, component relationships, ADRs |
+| README | `README.md` | Project entry point for new engineers |
+| Changelog | `CHANGELOG.md` | Release history from git log |
+
+If multiple are requested: README → Architecture → API Reference → Changelog. Cross-link all of them.
+
+---
+
+## Step 1 — Deep codebase reconnaissance
+
+Do not write a single word of documentation until you have read every relevant file.
+
+```bash
+# Full project tree
+find . -not -path '*/node_modules/*' -not -path '*/.git/*' \
+       -not -path '*/__pycache__/*' -not -path '*/dist/*' \
+       -not -path '*/.next/*' | sort
+
+# Dependency manifest — note exact versions
+cat package.json pyproject.toml go.mod requirements.txt 2>/dev/null
+
+# Environment contract
+cat .env.example .env.template 2>/dev/null
+
+# Infrastructure
+cat docker-compose.yml Dockerfile 2>/dev/null
+ls .github/workflows/ 2>/dev/null && cat .github/workflows/*.yml
+
+# Type definitions and schemas
+find . \( -name '*.d.ts' -o -name 'schema.prisma' -o -name '*.schema.ts' \
+       -o -name 'openapi.yaml' -o -name 'openapi.json' \) \
+       -not -path '*/node_modules/*'
+
+# Git history
+git log --no-merges --format="%H|||%s|||%ad|||%an" --date=short -100 2>/dev/null
+```
+
+Read every route file, agent file, service file, config file, and type definition. Do not skim.
+
+---
+
+## Step 1B — Diagram inference (run before writing any doc)
+
+Read `references/diagram-inference.md` now. Execute Phases 1–3 from that file before writing any documentation.
+
+Generate all applicable diagrams from the codebase. The diagrams are not decorative — they are the primary artifact for architecture docs and appear in the README summary too. Every node and edge must be sourced from code evidence. Never use placeholder names.
+
+Diagrams to generate (skip only if no evidence found):
+1. **System Architecture Overview** — `graph TD`, all components and relationships
+2. **Data Flow** — `sequenceDiagram`, the primary user journey end-to-end
+3. **Agent Interaction Graph** — `graph LR`, if multi-agent system
+4. **Deployment Topology** — `graph TD`, from docker-compose / Terraform / env vars
+5. **ER Diagram** — `erDiagram`, if Prisma schema / SQL migrations / ORM models found
+
+Store your inferred component model mentally before writing prose — it ensures the written doc and the diagrams are consistent.
+
+---
+
+## Step 2 — Enterprise documentation per doc type
+
+### 2A — README
+
+The README is the contract between the codebase and its engineers. Every section must be complete enough to act on without reading the source.
+
+**Header block**
+```markdown
+# Project Name
+> <precise one-line description: what it does, not what it is>
+
+**Stack**: Exact technologies and versions (e.g., Next.js 14.2, FastAPI 0.111, Python 3.12)
+**Status**: Production | Beta | Internal
+**Owner**: Team or person
+```
+
+**Overview** — Must answer:
+- What specific problem does this solve? (be concrete — not "helps teams manage deployments")
+- Who uses it and how? (engineers, via CLI, via dashboard, via API?)
+- What are the hard constraints or non-goals?
+
+**Prerequisites** — Must list:
+- Every required runtime with minimum version (e.g., `Node.js >= 20.11.0`)
+- Every required external service with version (e.g., `PostgreSQL 15`, `Redis 7.2`)
+- Required credentials or IAM permissions
+- OS/platform constraints if any
+
+**Installation** — Numbered, copy-pasteable sequence. Every command must work from a fresh clone. Every placeholder must be explained.
+
+**Configuration** — Complete table of every env var:
+```markdown
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DATABASE_URL` | ✅ | — | PostgreSQL connection string. Format: `postgresql://user:pass@host:5432/db` |
+| `API_KEY` | ✅ | — | 32-char hex. Generate: `openssl rand -hex 16` |
+| `LOG_LEVEL` | ❌ | `info` | One of: `debug`, `info`, `warn`, `error` |
+| `MAX_CONCURRENCY` | ❌ | `4` | Max parallel agent runs. Each uses ~512MB RAM. |
+```
+
+**Running** — Specify every run mode:
+- Local dev (command, port, hot reload behavior, seed data if needed)
+- Production build (build command, start command, expected startup time)
+- Docker (exact `docker run` or `docker-compose up`)
+- Tests (command, flags, what a passing run looks like)
+
+**Troubleshooting** — The 3–5 most common failure modes with exact symptoms and remediation. Source these from error handling code.
+
+**Architecture summary** — ASCII or Mermaid component diagram. Link to `docs/architecture.md`.
+
+---
+
+### 2B — Architecture Document
+
+Must explain WHY, not just WHAT. A senior engineer should understand every non-obvious design decision.
+
+**System Context**
+- What this system does within the broader product/org
+- Hard constraints it was designed under (latency budget, cost ceiling, compliance)
+- Explicit non-goals
+
+**Component Inventory** — One row per module/service/agent:
+```markdown
+| Component | Type | Responsibility | Owns | Depends On |
+|---|---|---|---|---|
+| `DeploymentAgent` | LangGraph Agent | Generates Terraform plans from infra spec | — | `TerraformRunner`, `StateStore` |
+| `StateStore` | Service | Persists pipeline state across steps | `pipeline_runs` table | PostgreSQL |
+```
+
+**Data Flow — Step-by-step trace**
+Trace the most important user journey through the system. Every step must include:
+- Which component handles it
+- Input (type/schema)
+- Transformation
+- Output (type/schema)
+- Failure mode and behavior
+
+```markdown
+### Deployment Pipeline — Happy Path
+
+1. **User submits deployment** → `POST /api/pipelines`
+   - Input: `{ repoUrl: string, branch: string, envTarget: "staging" | "production" }`
+   - `PipelineController` validates schema, generates `pipelineId` (UUID v4)
+   - Writes `status: "queued"` to `pipeline_runs` table
+   - Enqueues to BullMQ `pipeline:execute` queue — 3 retries, exponential backoff
+
+2. **Worker picks up job** → `PipelineWorker`
+   - Reads full config from `pipeline_runs` by `pipelineId`
+   - Spawns `RepositoryAnalyzerAgent` with `{ repoUrl, branch, maxDepth: 3 }`
+   ...
+```
+
+**Agent / Service Contracts** — For each agent/service:
+```markdown
+### AgentName
+
+**Purpose**: One sentence — what decision or transformation does this agent own?
+
+**Input**:
+```typescript
+interface AgentNameInput {
+  field: string;           // Description, constraints
+  options?: AgentOptions;  // Defaults to { timeout: 30000 }
+}
+```
+
+**Output**:
+```typescript
+interface AgentNameOutput {
+  result: ResultType;
+  confidence: number;  // 0.0–1.0
+  metadata: { durationMs: number; tokensUsed: number };
+}
+```
+
+**Failure modes**:
+| Condition | Behavior | Recovery |
+|---|---|---|
+| LLM timeout (>30s) | Throws `AgentTimeoutError` | Retried up to 3× by orchestrator |
+| Invalid output schema | Throws `SchemaValidationError` | Pipeline marked `failed`, logged |
+```
+
+**Architecture Decision Records (ADRs)**
+Every non-obvious technology choice gets an ADR:
+```markdown
+### ADR-001: LangGraph for agent orchestration
+
+**Decision**: Use LangGraph instead of a custom state machine.
+
+**Context**: 6 specialized agents need structured state passing, human-in-the-loop approval gates, and per-node retry without restarting the full graph.
+
+**Alternatives considered**:
+- Custom state machine — rejected: too much boilerplate for conditional branching and retry
+- Temporal — rejected: operational complexity exceeds current team capacity
+
+**Tradeoffs**:
+- ✅ Built-in graph execution, checkpointing, streaming
+- ✅ Native human-in-the-loop support
+- ❌ Debugging requires LangGraph internals familiarity
+- ❌ Limited observability tooling vs Temporal
+```
+
+**Non-Functional Characteristics** — Concrete numbers only:
+```markdown
+| Property | Target | Notes |
+|---|---|---|
+| API p95 latency | < 200ms | Excluding agent runs |
+| Agent run duration | 2–8 min | Varies by repo size |
+| Max concurrent pipelines | 10 | Queue beyond this |
+| DB connection pool | max: 10, idle: 2 | Set via `DATABASE_URL` params |
+```
+
+**Security Model**
+- Auth mechanism (exact scheme: JWT with RS256, API key in header, OAuth PKCE)
+- What is/isn't accessible unauthenticated
+- Secret management (env vars, AWS Secrets Manager, Vault — be specific)
+- Network exposure (which ports, VPC, public endpoints)
+
+---
+
+### 2C — API / Code Reference
+
+Every endpoint or exported function must be fully specified. No "see source for details."
+
+**REST endpoint format**:
+```markdown
+## `POST /api/pipelines`
+
+One-sentence description of what this endpoint does.
+
+**Auth**: Bearer token required  
+**Rate limit**: 10 req/min per API key. Returns `429` when exceeded.  
+**Idempotency**: Not idempotent — each call creates a new pipeline run.
+
+### Request
+
+**Headers**
+| Header | Required | Value |
+|---|---|---|
+| `Authorization` | ✅ | `Bearer <32-char hex token>` |
+| `Content-Type` | ✅ | `application/json` |
+
+**Body**
+```typescript
+{
+  repoUrl: string;       // HTTPS clone URL only. SSH not supported.
+  branch: string;        // Must exist on remote. Max 255 chars.
+  envTarget: "staging" | "production";
+  options?: {
+    dryRun?: boolean;    // Default: false. Plans but does not apply Terraform.
+  }
+}
+```
+
+**Example**
+```bash
+curl -X POST https://api.example.com/api/pipelines \
+  -H "Authorization: Bearer a1b2c3d4..." \
+  -H "Content-Type: application/json" \
+  -d '{"repoUrl": "https://github.com/org/api", "branch": "main", "envTarget": "staging"}'
+```
+
+### Response — `201 Created`
+```json
+{
+  "pipelineId": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "queued",
+  "createdAt": "2025-04-06T10:00:00.000Z",
+  "_links": {
+    "self": "/api/pipelines/550e8400-...",
+    "logs": "/api/pipelines/550e8400-.../logs"
+  }
+}
+```
+
+### Error reference
+| Status | Code | Cause | Resolution |
+|---|---|---|---|
+| `400` | `INVALID_REPO_URL` | Not a valid HTTPS URL | Use HTTPS clone URL |
+| `401` | `INVALID_TOKEN` | Token missing, malformed, or revoked | Re-issue via `/api/auth/token` |
+| `409` | `PIPELINE_ALREADY_RUNNING` | Pipeline active for this repo+branch | Wait or cancel the active run |
+| `429` | `RATE_LIMITED` | >10 req/min | Retry after `Retry-After` header (seconds) |
+| `500` | `INTERNAL_ERROR` | Unexpected server error | Retry with backoff; file issue if persistent |
+```
+
+**TypeScript function format**:
+```markdown
+## `functionName(param, options?)`
+
+One-sentence description.
+
+**Signature**
+```typescript
+async function functionName(
+  param: ParamType,
+  options?: { flag?: boolean }
+): Promise<ReturnType>
+```
+
+**Parameters**
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `param.field` | `string` | ✅ | What it is, constraints |
+| `options.flag` | `boolean` | ❌ | Default `false`. Effect if true. |
+
+**Returns**: `Promise<ReturnType>` — description of the resolved value.
+
+**Throws**
+| Error | Condition |
+|---|---|
+| `DatabaseError` | DB write fails |
+| `QueueError` | Enqueue fails after 3 retries |
+
+**Example**
+```typescript
+const result = await functionName({ field: "value" }, { flag: true });
+```
+```
+
+---
+
+### 2D — Changelog
+
+Source every entry from `git log`. Never invent or generalize.
+
+```bash
+git log --no-merges --format="%H|||%s|||%ad|||%an" --date=short -100
+```
+
+Flag breaking changes with `⚠️ BREAKING`. Include PR/issue numbers from commit messages.
+
+```markdown
+## [2.1.0] — 2025-04-06
+
+### Added
+- `POST /api/pipelines` accepts `X-Idempotency-Key` for deduplication within 5-minute window (#312)
+
+### Changed
+- ⚠️ **BREAKING**: `PipelineRun.state` renamed to `PipelineRun.status` across all API responses (#301)
+
+### Fixed
+- `TerraformAgent` no longer hangs when AWS credentials expire mid-run — now throws `CredentialExpiredError` after 30s (#288)
+
+### Security
+- Upgraded `jsonwebtoken` 8.5.1 → 9.0.2 to patch CVE-2022-23529 (#315)
+```
+
+---
+
+## Step 3 — Anti-vagueness self-review checklist
+
+Run this before outputting anything. Fail = rewrite that section.
+
+**Specificity**
+- [ ] Every component has a one-sentence responsibility that couldn't apply to any other component
+- [ ] Every env var is listed with type, default, and effect — not just its name
+- [ ] Every error condition has an exact code and cause — not "may fail"
+- [ ] Every CLI command is copy-pasteable with no unexplained placeholders
+- [ ] Every data type is sourced from actual type definitions — not inferred
+- [ ] Every version number comes from `package.json`/`pyproject.toml` — not approximated
+- [ ] Every agent has documented input schema, output schema, and failure modes
+- [ ] At least one end-to-end data flow is traced step-by-step with types at each step
+
+**Completeness**
+- [ ] A new engineer could clone, configure, and run the project using only the README
+- [ ] All major modules are covered — no "and other components" hand-waves
+- [ ] Architecture doc explains WHY decisions were made, not just what was decided
+- [ ] API reference covers every non-internal endpoint or exported function
+- [ ] Security model is documented — auth, secrets, network exposure
+
+**Quality**
+- [ ] No banned phrases from the Core Rule
+- [ ] All code blocks have language specifiers
+- [ ] Docs are cross-linked
+- [ ] Consistent terminology throughout
+
+---
+
+## Step 4 — Output
+
+Write each doc to its target path. Do not truncate — enterprise documentation is complete documentation. If a doc is long, add a table of contents at the top.
+
+## Reference files
+
+- `references/diagram-inference.md` — **Read this before writing any doc.** Full diagram inference engine: codebase mining commands, component model, Mermaid templates for all 5 diagram types, placement rules, and validation checklist.
+- `references/templates.md` — Full boilerplate for each doc type
+- `references/style-guide.md` — Tone, terminology, and formatting rules

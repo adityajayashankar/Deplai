@@ -1,809 +1,1062 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+'use client';
+
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { 
-  Github, 
-  Cloud, 
-  Cpu, 
-  Shield, 
-  AlertTriangle, 
-  Eye, 
-  EyeOff, 
-  CheckCircle2, 
-  Terminal,
-  Key,
-  Database,
-  Lock,
-  Activity
+  Github, Cloud, Cpu, Lock, AlertTriangle, User, Shield, Bell, 
+  Settings, Bot, Activity, Laptop, Smartphone, Eye, EyeOff,
+  Copy, ChevronDown, Key, Network, Menu, X, CheckCircle2
 } from 'lucide-react';
 
 // ==========================================
-// PIXEL CARD COMPONENT
+// THEME CONSTANTS
 // ==========================================
+const T = {
+  bg: 'bg-[#0A0B0F]',
+  surface: 'bg-[#111318]',
+  border: 'border-[#1E2028]',
+  text: 'text-zinc-100',
+  muted: 'text-zinc-400',
+  hint: 'text-zinc-500',
+  mono: 'font-mono text-zinc-300',
+  accent: 'text-[#4F6EF7]',
+  success: 'text-[#22C55E]',
+  warning: 'text-[#F59E0B]',
+  danger: 'text-[#EF4444]',
+  dangerBg: 'bg-[#EF4444]/10',
+  dangerBorder: 'border-[#EF4444]/20',
+};
 
+// ==========================================
+// PIXEL EFFECT FOR BUTTONS
+// ==========================================
 class Pixel {
-  width;
-  height;
-  ctx;
-  x;
-  y;
-  color;
-  speed;
-  size;
-  sizeStep;
-  minSize;
-  maxSizeInteger;
-  maxSize;
-  delay;
-  counter;
-  counterStep;
-  isIdle;
-  isReverse;
-  isShimmer;
-
   constructor(canvas, context, x, y, color, speed, delay) {
-    const dpr = window.devicePixelRatio || 1;
-    this.width = canvas.width / dpr;
-    this.height = canvas.height / dpr;
+    this.width = canvas.width;
+    this.height = canvas.height;
     this.ctx = context;
-    this.x = x;
-    this.y = y;
-    this.color = color;
+    this.x = x; this.y = y; this.color = color;
     this.speed = (Math.random() * 0.8 + 0.1) * speed;
     this.size = 0;
     this.sizeStep = Math.random() * 0.4;
     this.minSize = 0.5;
     this.maxSizeInteger = 2;
     this.maxSize = Math.random() * (this.maxSizeInteger - this.minSize) + this.minSize;
-    this.delay = delay;
-    this.counter = 0;
+    this.delay = delay; this.counter = 0;
     this.counterStep = Math.random() * 4 + (this.width + this.height) * 0.01;
-    this.isIdle = false;
-    this.isReverse = false;
-    this.isShimmer = false;
+    this.isIdle = false; this.isReverse = false; this.isShimmer = false;
   }
-
   draw() {
-    const centerOffset = this.maxSizeInteger * 0.5 - this.size * 0.5;
+    const o = this.maxSizeInteger * 0.5 - this.size * 0.5;
     this.ctx.fillStyle = this.color;
-    this.ctx.fillRect(Math.round(this.x + centerOffset), Math.round(this.y + centerOffset), Math.round(this.size), Math.round(this.size));
+    // Removed Math.round to allow crisp sub-pixel rendering 
+    this.ctx.fillRect(this.x + o, this.y + o, this.size, this.size);
   }
-
   appear() {
     this.isIdle = false;
     if (this.counter <= this.delay) { this.counter += this.counterStep; return; }
     if (this.size >= this.maxSize) this.isShimmer = true;
-    if (this.isShimmer) this.shimmer();
-    else this.size += this.sizeStep;
+    if (this.isShimmer) this.shimmer(); else this.size += this.sizeStep;
     this.draw();
   }
-
   disappear() {
-    this.isShimmer = false;
-    this.counter = 0;
+    this.isShimmer = false; this.counter = 0;
     if (this.size <= 0) { this.isIdle = true; return; }
     else this.size -= 0.1;
     this.draw();
   }
-
   shimmer() {
     if (this.size >= this.maxSize) this.isReverse = true;
     else if (this.size <= this.minSize) this.isReverse = false;
-    if (this.isReverse) this.size -= this.speed;
-    else this.size += this.speed;
+    if (this.isReverse) this.size -= this.speed; else this.size += this.speed;
   }
 }
 
-const PixelCard = ({ gap = 5, speed = 35, colors = '#18181b,#27272a,#3f3f46', noFocus = false, className = '', children }) => {
+const PixelButton = ({ children, onClick, disabled = false, variant = 'default', className = '', 'aria-label': ariaLabel }) => {
   const containerRef = useRef(null);
   const canvasRef = useRef(null);
   const pixelsRef = useRef([]);
   const animationRef = useRef(null);
-  const timePreviousRef = useRef(performance.now());
-  const reducedMotion = useRef(window.matchMedia('(prefers-reduced-motion: reduce)').matches).current;
+  
+  // Use high-contrast pixels based on the button background
+  const colors = variant === 'danger' ? '#ffffff,#fca5a5,#b91c1c' : 
+                 variant === 'outline' ? '#ffffff,#d4d4d8,#a1a1aa' : 
+                 '#000000,#3f3f46,#71717a';
 
   const initPixels = useCallback(() => {
     if (!containerRef.current || !canvasRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
-    const width = Math.floor(rect.width);
-    const height = Math.floor(rect.height);
-    const ctx = canvasRef.current.getContext('2d');
+    if (rect.width === 0 || rect.height === 0) return;
+
     const dpr = window.devicePixelRatio || 1;
-    canvasRef.current.width = width * dpr;
-    canvasRef.current.height = height * dpr;
-    if (ctx) ctx.scale(dpr, dpr);
+    canvasRef.current.width = rect.width * dpr;
+    canvasRef.current.height = rect.height * dpr;
+    const ctx = canvasRef.current.getContext('2d');
+    ctx.scale(dpr, dpr);
 
     const colorsArray = colors.split(',');
     const pxs = [];
-    for (let x = 0; x < width; x += gap) {
-      for (let y = 0; y < height; y += gap) {
+    // Spaced tightly for denser effect
+    for (let x = 0; x < rect.width; x += 5) {
+      for (let y = 0; y < rect.height; y += 5) {
         const color = colorsArray[Math.floor(Math.random() * colorsArray.length)];
-        const distance = Math.sqrt(Math.pow(x - width / 2, 2) + Math.pow(y - height / 2, 2));
-        if (!ctx) return;
-        pxs.push(new Pixel(canvasRef.current, ctx, x, y, color, (speed * 0.001), reducedMotion ? 0 : distance));
+        pxs.push(new Pixel(canvasRef.current, ctx, x, y, color, 0.06, 0));
       }
     }
     pixelsRef.current = pxs;
-  }, [colors, gap, reducedMotion, speed]);
+  }, [colors]);
 
   const doAnimate = useCallback((fnName) => {
     animationRef.current = requestAnimationFrame(() => doAnimate(fnName));
-    const timeNow = performance.now();
-    const timePassed = timeNow - timePreviousRef.current;
-    if (timePassed < 1000 / 60) return;
-    timePreviousRef.current = timeNow - (timePassed % (1000 / 60));
-
     const ctx = canvasRef.current?.getContext('2d');
     if (!ctx || !canvasRef.current) return;
+    
     const dpr = window.devicePixelRatio || 1;
     ctx.clearRect(0, 0, canvasRef.current.width / dpr, canvasRef.current.height / dpr);
-
+    
     let allIdle = true;
-    pixelsRef.current.forEach(pixel => {
-      pixel[fnName]();
-      if (!pixel.isIdle) allIdle = false;
-    });
+    pixelsRef.current.forEach(p => { p[fnName](); if (!p.isIdle) allIdle = false; });
     if (allIdle && animationRef.current) cancelAnimationFrame(animationRef.current);
   }, []);
 
-  const handleAnimation = useCallback((name) => {
-    if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
-    animationRef.current = requestAnimationFrame(() => doAnimate(name));
-  }, [doAnimate]);
-
   useEffect(() => {
     initPixels();
-    const observer = new ResizeObserver(() => initPixels());
-    if (containerRef.current) observer.observe(containerRef.current);
-    return () => { observer.disconnect(); if (animationRef.current !== null) cancelAnimationFrame(animationRef.current); };
+    // Add ResizeObserver so canvas adjusts if tab layout shifts
+    const ro = new ResizeObserver(() => initPixels());
+    if (containerRef.current) ro.observe(containerRef.current);
+    
+    return () => {
+      ro.disconnect();
+      animationRef.current && cancelAnimationFrame(animationRef.current);
+    };
   }, [initPixels]);
 
+  const baseStyles = "relative overflow-hidden flex items-center justify-center px-4 py-2 rounded-md font-semibold text-sm transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed";
+  const variants = {
+    default: `bg-zinc-100 text-black hover:bg-white ${T.border}`,
+    danger: `bg-[#EF4444] text-white hover:bg-red-500`,
+    outline: `bg-transparent text-zinc-300 border ${T.border} hover:border-zinc-500 hover:text-white`
+  };
+
   return (
-    <div 
+    <button
       ref={containerRef}
-      className={`relative overflow-hidden isolate group bg-black border border-zinc-800 rounded-lg flex flex-col transition-colors duration-200 select-none ${className}`}
-      onMouseEnter={() => handleAnimation('appear')}
-      onMouseLeave={() => handleAnimation('disappear')}
-      onFocus={(e) => { if (!noFocus && !e.currentTarget.contains(e.relatedTarget)) handleAnimation('appear'); }}
-      onBlur={(e) => { if (!noFocus && !e.currentTarget.contains(e.relatedTarget)) handleAnimation('disappear'); }}
-      tabIndex={noFocus ? -1 : 0}
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={ariaLabel}
+      className={`${baseStyles} ${variants[variant]} ${className}`}
+      onMouseEnter={() => { if (!disabled && pixelsRef.current.length > 0) { animationRef.current && cancelAnimationFrame(animationRef.current); doAnimate('appear'); } }}
+      onMouseLeave={() => { if (!disabled && pixelsRef.current.length > 0) { animationRef.current && cancelAnimationFrame(animationRef.current); doAnimate('disappear'); } }}
     >
-      <canvas className="absolute inset-0 w-full h-full block pointer-events-none z-0 mix-blend-screen" ref={canvasRef} />
-      <div className="relative z-10 flex-grow flex flex-col">
-        {children}
-      </div>
-    </div>
+      <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none block" />
+      <span className="relative z-10 flex items-center gap-2">{children}</span>
+    </button>
   );
 };
-
 
 // ==========================================
-// BORDER GLOW UTILITIES & COMPONENT
+// SHARED COMPONENTS
 // ==========================================
 
-function parseHSL(hslStr) {
-  const match = hslStr.match(/([\d.]+)\s*([\d.]+)%?\s*([\d.]+)%?/);
-  if (!match) return { h: 0, s: 0, l: 100 }; // Default to white
-  return { h: parseFloat(match[1]), s: parseFloat(match[2]), l: parseFloat(match[3]) };
-}
-
-function buildBoxShadow(glowColor, intensity) {
-  const { h, s, l } = parseHSL(glowColor);
-  const base = `${h}deg ${s}% ${l}%`;
-  const layers = [
-    [0, 0, 0, 1, 100, true], [0, 0, 1, 0, 60, true], [0, 0, 3, 0, 50, true],
-    [0, 0, 6, 0, 40, true], [0, 0, 15, 0, 30, true], [0, 0, 25, 2, 20, true],
-    [0, 0, 50, 2, 10, true],
-    [0, 0, 1, 0, 60, false], [0, 0, 3, 0, 50, false], [0, 0, 6, 0, 40, false],
-    [0, 0, 15, 0, 30, false], [0, 0, 25, 2, 20, false], [0, 0, 50, 2, 10, false],
-  ];
-  return layers.map(([x, y, blur, spread, alpha, inset]) => {
-    const a = Math.min(alpha * intensity, 100);
-    return `${inset ? 'inset ' : ''}${x}px ${y}px ${blur}px ${spread}px hsl(${base} / ${a}%)`;
-  }).join(', ');
-}
-
-function easeOutCubic(x) { return 1 - Math.pow(1 - x, 3); }
-function easeInCubic(x) { return x * x * x; }
-
-function animateValue({ start = 0, end = 100, duration = 1000, delay = 0, ease = easeOutCubic, onUpdate, onEnd }) {
-  const t0 = performance.now() + delay;
-  function tick() {
-    const elapsed = performance.now() - t0;
-    const t = Math.min(elapsed / duration, 1);
-    onUpdate(start + (end - start) * ease(t));
-    if (t < 1) requestAnimationFrame(tick);
-    else if (onEnd) onEnd();
-  }
-  setTimeout(() => requestAnimationFrame(tick), delay);
-}
-
-const GRADIENT_POSITIONS = ['80% 55%', '69% 34%', '8% 6%', '41% 38%', '86% 85%', '82% 18%', '51% 4%'];
-const COLOR_MAP = [0, 1, 2, 0, 1, 2, 1];
-
-function buildMeshGradients(colors) {
-  const gradients = [];
-  for (let i = 0; i < 7; i++) {
-    const c = colors[Math.min(COLOR_MAP[i], colors.length - 1)];
-    gradients.push(`radial-gradient(at ${GRADIENT_POSITIONS[i]}, ${c} 0px, transparent 50%)`);
-  }
-  gradients.push(`linear-gradient(${colors[0]} 0 100%)`);
-  return gradients;
-}
-
-const BorderGlow = ({
-  children,
-  className = '',
-  edgeSensitivity = 30,
-  glowColor = '0 0 100', // Pure White
-  backgroundColor = '#050505',
-  borderRadius = 12,
-  glowRadius = 30,
-  glowIntensity = 0.5,
-  coneSpread = 25,
-  animated = false,
-  colors = ['#ffffff', '#71717a', '#000000'], // White to Black gradients
-  fillOpacity = 0.3,
-}) => {
-  const cardRef = useRef(null);
-  const [isHovered, setIsHovered] = useState(false);
-  const [cursorAngle, setCursorAngle] = useState(45);
-  const [edgeProximity, setEdgeProximity] = useState(0);
-  const [sweepActive, setSweepActive] = useState(false);
-
-  const getCenterOfElement = useCallback((el) => {
-    const { width, height } = el.getBoundingClientRect();
-    return [width / 2, height / 2];
-  }, []);
-
-  const getEdgeProximity = useCallback((el, x, y) => {
-    const [cx, cy] = getCenterOfElement(el);
-    const dx = x - cx;
-    const dy = y - cy;
-    let kx = Infinity;
-    let ky = Infinity;
-    if (dx !== 0) kx = cx / Math.abs(dx);
-    if (dy !== 0) ky = cy / Math.abs(dy);
-    return Math.min(Math.max(1 / Math.min(kx, ky), 0), 1);
-  }, [getCenterOfElement]);
-
-  const getCursorAngle = useCallback((el, x, y) => {
-    const [cx, cy] = getCenterOfElement(el);
-    const dx = x - cx;
-    const dy = y - cy;
-    if (dx === 0 && dy === 0) return 0;
-    const radians = Math.atan2(dy, dx);
-    let degrees = radians * (180 / Math.PI) + 90;
-    if (degrees < 0) degrees += 360;
-    return degrees;
-  }, [getCenterOfElement]);
-
-  const handlePointerMove = useCallback((e) => {
-    const card = cardRef.current;
-    if (!card) return;
-    const rect = card.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    setEdgeProximity(getEdgeProximity(card, x, y));
-    setCursorAngle(getCursorAngle(card, x, y));
-  }, [getEdgeProximity, getCursorAngle]);
-
-  useEffect(() => {
-    if (!animated) return;
-    const angleStart = 110;
-    const angleEnd = 465;
-    setSweepActive(true);
-    setCursorAngle(angleStart);
-
-    animateValue({ duration: 500, onUpdate: v => setEdgeProximity(v / 100) });
-    animateValue({ ease: easeInCubic, duration: 1500, end: 50, onUpdate: v => {
-      setCursorAngle((angleEnd - angleStart) * (v / 100) + angleStart);
-    }});
-    animateValue({ ease: easeOutCubic, delay: 1500, duration: 2250, start: 50, end: 100, onUpdate: v => {
-      setCursorAngle((angleEnd - angleStart) * (v / 100) + angleStart);
-    }});
-    animateValue({ ease: easeInCubic, delay: 2500, duration: 1500, start: 100, end: 0,
-      onUpdate: v => setEdgeProximity(v / 100),
-      onEnd: () => setSweepActive(false),
-    });
-  }, [animated]);
-
-  const colorSensitivity = edgeSensitivity + 20;
-  const isVisible = isHovered || sweepActive;
-  const borderOpacity = isVisible
-    ? Math.max(0, (edgeProximity * 100 - colorSensitivity) / (100 - colorSensitivity))
-    : 0;
-  const glowOpacity = isVisible
-    ? Math.max(0, (edgeProximity * 100 - edgeSensitivity) / (100 - edgeSensitivity))
-    : 0;
-
-  const meshGradients = buildMeshGradients(colors);
-  const borderBg = meshGradients.map(g => `${g} border-box`);
-  const fillBg = meshGradients.map(g => `${g} padding-box`);
-  const angleDeg = `${cursorAngle.toFixed(3)}deg`;
-
-  return (
-    <div
-      ref={cardRef}
-      onPointerMove={handlePointerMove}
-      onPointerEnter={() => setIsHovered(true)}
-      onPointerLeave={() => setIsHovered(false)}
-      className={`relative grid isolate ${className}`}
-      style={{
-        background: backgroundColor,
-        borderRadius: `${borderRadius}px`,
-        transform: 'translate3d(0, 0, 0.01px)',
-        boxShadow: 'rgba(0,0,0,0.2) 0 4px 20px',
-      }}
-    >
-      <div
-        className="absolute inset-0 rounded-[inherit] -z-[1]"
-        style={{
-          border: '1px solid transparent',
-          background: [
-            `linear-gradient(${backgroundColor} 0 100%) padding-box`,
-            'linear-gradient(rgb(255 255 255 / 0%) 0% 100%) border-box',
-            ...borderBg,
-          ].join(', '),
-          opacity: borderOpacity,
-          maskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
-          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
-          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
-        }}
-      />
-      <div
-        className="absolute inset-0 rounded-[inherit] -z-[1]"
-        style={{
-          border: '1px solid transparent',
-          background: fillBg.join(', '),
-          maskImage: [
-            'linear-gradient(to bottom, black, black)',
-            'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)',
-            'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)',
-            'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)',
-            'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)',
-            'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)',
-            `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`,
-          ].join(', '),
-          WebkitMaskImage: [
-            'linear-gradient(to bottom, black, black)',
-            'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)',
-            'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)',
-            'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)',
-            'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)',
-            'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)',
-            `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`,
-          ].join(', '),
-          maskComposite: 'subtract, add, add, add, add, add',
-          WebkitMaskComposite: 'source-out, source-over, source-over, source-over, source-over, source-over',
-          opacity: borderOpacity * fillOpacity,
-          mixBlendMode: 'soft-light',
-          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
-        }}
-      />
-      <span
-        className="absolute pointer-events-none z-[1] rounded-[inherit]"
-        style={{
-          inset: `${-glowRadius}px`,
-          maskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
-          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
-          opacity: glowOpacity,
-          mixBlendMode: 'plus-lighter',
-          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
-        }}
-      >
-        <span
-          className="absolute rounded-[inherit]"
-          style={{
-            inset: `${glowRadius}px`,
-            boxShadow: buildBoxShadow(glowColor, glowIntensity),
-          }}
-        />
-      </span>
-
-      <div className="flex flex-col relative h-full w-full z-[1]">
-        {children}
+const SettingSection = ({ title, description, children, badge }) => (
+  <div className={`${T.surface} border ${T.border} rounded-xl overflow-hidden mb-6`}>
+    <div className={`p-6 border-b ${T.border} flex justify-between items-start`}>
+      <div>
+        <h3 className="text-base font-semibold text-white">{title}</h3>
+        {description && <p className={`text-sm ${T.muted} mt-1`}>{description}</p>}
       </div>
+      {badge}
     </div>
-  );
-};
-
-// --- Custom Inputs ---
-
-const SecretInput = ({ label, placeholder, defaultValue = '' }) => {
-  const [show, setShow] = useState(false);
-  return (
-    <div className="flex flex-col gap-2 w-full">
-      <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">{label}</label>
-      <div className="relative flex items-center">
-        <input 
-          type={show ? "text" : "password"} 
-          defaultValue={defaultValue}
-          placeholder={placeholder}
-          className="w-full bg-zinc-950 border border-zinc-800 text-white rounded-md px-3 py-2.5 focus:outline-none focus:border-white focus:ring-1 focus:ring-white transition-all font-mono text-sm"
-        />
-        <button 
-          onClick={() => setShow(!show)} 
-          className="absolute right-3 text-zinc-500 hover:text-white transition-colors"
-        >
-          {show ? <EyeOff size={16} /> : <Eye size={16} />}
-        </button>
-      </div>
-    </div>
-  );
-};
-
-const Toggle = ({ active, onToggle }) => (
-  <button 
-    onClick={onToggle}
-    className={`w-10 h-5 rounded-full flex items-center px-1 transition-colors border ${active ? 'bg-white border-white' : 'bg-zinc-950 border-zinc-700'}`}
-  >
-    <div className={`w-3 h-3 rounded-full transition-transform ${active ? 'bg-black translate-x-5' : 'bg-zinc-500 translate-x-0'}`} />
-  </button>
+    <div className="p-6 flex flex-col gap-6">{children}</div>
+  </div>
 );
 
-const LLM_PROVIDERS = {
-  groq: { name: 'Groq', models: ['Llama 3 70b', 'Llama 3 8b', 'Mixtral 8x7b'], keyPlaceholder: 'gsk_...' },
-  openai: { name: 'OpenAI', models: ['GPT-4o', 'GPT-4 Turbo', 'GPT-3.5 Turbo'], keyPlaceholder: 'sk-...' },
-  claude: { name: 'Claude (Anthropic)', models: ['Claude 3.5 Sonnet', 'Claude 3 Opus', 'Claude 3 Haiku'], keyPlaceholder: 'sk-ant-...' },
-  gemini: { name: 'Gemini (Google)', models: ['Gemini 1.5 Pro', 'Gemini 1.5 Flash'], keyPlaceholder: 'AIza...' }
+const SettingField = ({ label, children, layout = 'horizontal' }) => (
+  <div className={layout === 'horizontal' ? "flex items-start justify-between gap-8 flex-col sm:flex-row" : "flex flex-col gap-2"}>
+    <label className={`text-sm font-medium ${T.text} shrink-0 ${layout === 'horizontal' ? 'sm:w-1/3 pt-2' : ''}`}>{label}</label>
+    <div className={layout === 'horizontal' ? "flex-1 w-full" : "w-full"}>{children}</div>
+  </div>
+);
+
+// FIX 1: aria-labels on eye + copy buttons
+const SecretField = ({ value, metadata, dataField }) => {
+  const [revealed, setRevealed] = useState(false);
+  return (
+    <div className={`flex flex-col gap-3 p-4 rounded-lg bg-[#0A0B0F] border ${T.border}`}>
+      <div className="relative flex items-center">
+        <Key className={`absolute left-3 w-4 h-4 ${T.hint}`} aria-hidden="true" />
+        <input
+          type={revealed ? "text" : "password"}
+          value={value}
+          disabled
+          data-field={dataField}
+          aria-label={dataField ? `Secret value for ${dataField}` : 'Secret value'}
+          className={`w-full ${T.surface} border ${T.border} ${T.mono} rounded-md pl-9 pr-24 py-2.5 text-sm disabled:opacity-70`}
+        />
+        <div className="absolute right-2 flex items-center gap-1">
+          <button
+            onClick={() => setRevealed(!revealed)}
+            aria-label={revealed ? 'Hide secret' : 'Reveal secret'}
+            className={`p-1.5 rounded ${T.hint} hover:text-white transition-colors`}
+          >
+            {revealed ? <EyeOff size={14} aria-hidden="true" /> : <Eye size={14} aria-hidden="true" />}
+          </button>
+          <div className="w-px h-4 bg-[#1E2028]" />
+          <button
+            aria-label="Copy to clipboard"
+            className={`p-1.5 rounded ${T.hint} hover:text-white transition-colors`}
+          >
+            <Copy size={14} aria-hidden="true" />
+          </button>
+        </div>
+      </div>
+      {metadata && (
+        <div className="flex flex-col sm:flex-row sm:items-center gap-4 text-[10px] font-mono text-zinc-500 pt-2 border-t border-[#1E2028]/50">
+          <span>Last used: <strong className="text-zinc-400">{metadata.used}</strong></span>
+          <span>Last rotated: <strong className="text-zinc-400">{metadata.rotated}</strong></span>
+          <span>Depends on: <strong className="text-zinc-400">{metadata.deps}</strong></span>
+        </div>
+      )}
+    </div>
+  );
 };
 
-// --- MAIN APP COMPONENT ---
+const TextInput = ({ value, placeholder = "", type = "text", dataField }) => (
+  <input
+    type={type} value={value} placeholder={placeholder} disabled
+    data-field={dataField}
+    className={`w-full ${T.bg} border ${T.border} ${T.text} rounded-md px-3 py-2.5 text-sm disabled:opacity-60`}
+  />
+);
 
-export default function App() {
+const SelectInput = ({ value, dataField }) => (
+  <div className="relative w-full">
+    <select disabled data-field={dataField} className={`w-full ${T.bg} border ${T.border} ${T.text} rounded-md pl-3 pr-8 py-2.5 text-sm appearance-none disabled:opacity-60`}>
+      <option>{value}</option>
+    </select>
+    <ChevronDown className={`absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 ${T.hint} pointer-events-none`} aria-hidden="true" />
+  </div>
+);
+
+const ToggleSwitch = ({ active, dataField }) => (
+  <div
+    data-field={dataField}
+    role="switch"
+    aria-checked={active}
+    aria-readonly="true"
+    className={`w-10 h-5 rounded-full flex items-center px-1 border opacity-60 cursor-not-allowed ${active ? 'bg-white border-white' : `bg-[#0A0B0F] ${T.border}`}`}
+  >
+    <div className={`w-3 h-3 rounded-full transition-transform ${active ? 'bg-black translate-x-5' : 'bg-zinc-500 translate-x-0'}`} />
+  </div>
+);
+
+const StatusBadge = ({ status, label }) => {
+  const isGreen = status === 'success';
+  return (
+    <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border ${isGreen ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : 'bg-zinc-500/10 text-zinc-400 border-zinc-500/20'}`}>
+      {isGreen ? <CheckCircle2 className="w-3 h-3" aria-hidden="true" /> : <Activity className="w-3 h-3" aria-hidden="true" />}
+      {label}
+    </div>
+  );
+};
+
+// FIX 2: Consistent notification toggle — replaces raw <input type="checkbox">
+const NotifToggle = ({ checked }) => (
+  <div
+    role="switch"
+    aria-checked={checked}
+    aria-readonly="true"
+    className={`mx-auto w-8 h-4 rounded-full flex items-center px-0.5 border cursor-not-allowed transition-colors ${checked ? 'bg-[#4F6EF7] border-[#4F6EF7]' : `bg-[#0A0B0F] ${T.border}`}`}
+  >
+    <div className={`w-3 h-3 rounded-full transition-transform bg-white ${checked ? 'translate-x-4' : 'translate-x-0'}`} />
+  </div>
+);
+
+// ==========================================
+// WORKSPACE TABS
+// ==========================================
+
+const WorkspaceIntegrations = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">Integrations</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Manage source control and webhook integrations for the workspace.</p>
+    </div>
+
+    <SettingSection title="GitHub App" badge={<StatusBadge status="success" label="Connected" />}>
+      <SettingField label="App ID"><TextInput value="823041" dataField="githubAppId" /></SettingField>
+      <SettingField label="Private Key"><SecretField value="••••••••••••••••" dataField="githubPrivateKey" /></SettingField>
+      <SettingField label="Webhook Secret"><SecretField value="••••••••••••••••" dataField="githubWebhookSecret" /></SettingField>
+      <SettingField label="Installation ID"><TextInput value="48291033" dataField="githubInstallationId" /></SettingField>
+      <div className={`p-4 rounded-md ${T.bg} border ${T.border}`}>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          <div><p className={`text-[10px] font-bold uppercase ${T.hint} mb-1`}>Webhook Health</p><StatusBadge status="success" label="Healthy" /></div>
+          <div><p className={`text-[10px] font-bold uppercase ${T.hint} mb-1`}>Last Event</p><p className={`text-sm ${T.mono}`}>2 minutes ago</p></div>
+          <div><p className={`text-[10px] font-bold uppercase ${T.hint} mb-1`}>Failures (24h)</p><p className={`text-sm ${T.mono}`}>0</p></div>
+          <div><p className={`text-[10px] font-bold uppercase ${T.hint} mb-1`}>Retry Status</p><p className={`text-sm ${T.mono}`}>Idle</p></div>
+        </div>
+      </div>
+      <div className="flex flex-wrap items-center gap-3 pt-2">
+        <PixelButton variant="default">Test Connection</PixelButton>
+        <PixelButton variant="outline">Re-authorize App</PixelButton>
+        <PixelButton variant="outline">Retry Webhook</PixelButton>
+      </div>
+    </SettingSection>
+
+    <SettingSection title="Coming Soon Connectors">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        {['Jira', 'Slack', 'PagerDuty'].map(tool => (
+          <div key={tool} className={`p-5 rounded-lg border ${T.border} bg-[#0A0B0F]/50 flex flex-col items-center justify-center gap-3 opacity-60`}>
+            <div className="w-10 h-10 rounded-full bg-[#111318] border border-[#1E2028] flex items-center justify-center">
+              <Network className="w-5 h-5 text-zinc-500" aria-hidden="true" />
+            </div>
+            <span className="text-sm font-medium text-zinc-400">{tool}</span>
+            <span className="text-[9px] font-bold uppercase tracking-widest bg-zinc-800/50 text-zinc-500 px-2 py-0.5 rounded">Coming Soon</span>
+          </div>
+        ))}
+      </div>
+    </SettingSection>
+  </div>
+);
+
+const WorkspaceCloudDeploy = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">Cloud & Deploy</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Configure target environments and financial safety guardrails.</p>
+    </div>
+
+    <SettingSection title="Provider Credentials">
+      <SettingField label="Provider"><SelectInput value="AWS" dataField="cloudProvider" /></SettingField>
+      <SettingField label="Access Key ID"><SecretField value="••••••••••••••••" dataField="awsAccessKey" /></SettingField>
+      <SettingField label="Secret Access Key"><SecretField value="••••••••••••••••" dataField="awsSecretKey" /></SettingField>
+      <SettingField label="Role ARN"><TextInput value="arn:aws:iam::123456789012:role/DeplAI-Role" dataField="awsRoleArn" /></SettingField>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <SettingField label="Default Region" layout="vertical"><TextInput value="us-east-1" dataField="awsDefaultRegion" /></SettingField>
+        <SettingField label="Account ID" layout="vertical"><TextInput value="123456789012" dataField="awsAccountId" /></SettingField>
+      </div>
+      <div className="flex flex-wrap items-center gap-3 pt-2">
+        <PixelButton variant="default">Validate Credentials</PixelButton>
+        <PixelButton variant="outline">Test Connection</PixelButton>
+      </div>
+    </SettingSection>
+
+    <SettingSection title="Budget Guardrails">
+      <SettingField label="Monthly Cap"><TextInput value="$500" dataField="budgetMonthlyCap" /></SettingField>
+      <SettingField label="Warning Threshold">
+        <div className="flex items-center gap-4">
+          <input type="range" disabled value="80" max="100" data-field="budgetWarnThreshold" aria-label="Warning threshold" className="flex-1 opacity-50 cursor-not-allowed" />
+          <span className={`${T.mono} text-sm w-10 text-right`}>80%</span>
+        </div>
+      </SettingField>
+      <SettingField label="Hard Stop"><TextInput value="95%" dataField="budgetHardStop" /></SettingField>
+      <SettingField label="Budget Override"><ToggleSwitch active={false} dataField="budgetOverrideToggle" /></SettingField>
+    </SettingSection>
+
+    <SettingSection title="Policy Validation">
+      <div className={`border ${T.border} rounded-md overflow-x-auto`}>
+        <table className="w-full text-left text-sm whitespace-nowrap">
+          <thead className={`bg-[#0A0B0F] border-b ${T.border} text-[10px] uppercase tracking-widest ${T.hint}`}>
+            <tr>
+              <th className="px-4 py-3">Policy Name</th>
+              <th className="px-4 py-3">Scope</th>
+              <th className="px-4 py-3">Effect</th>
+              <th className="px-4 py-3 text-right">Last Evaluated</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#1E2028]">
+            <tr className="bg-[#111318]"><td className="px-4 py-3 font-mono text-zinc-300">DenyRootAccess</td><td className="px-4 py-3 text-zinc-400">Account</td><td className="px-4 py-3 text-rose-400">Deny</td><td className="px-4 py-3 text-zinc-500 text-right text-xs">5 min ago</td></tr>
+            <tr className="bg-[#111318]"><td className="px-4 py-3 font-mono text-zinc-300">RequireMFA</td><td className="px-4 py-3 text-zinc-400">Account</td><td className="px-4 py-3 text-rose-400">Deny</td><td className="px-4 py-3 text-zinc-500 text-right text-xs">5 min ago</td></tr>
+            <tr className="bg-[#111318]"><td className="px-4 py-3 font-mono text-zinc-300">RestrictRegion</td><td className="px-4 py-3 text-zinc-400">OU</td><td className="px-4 py-3 text-rose-400">Deny</td><td className="px-4 py-3 text-zinc-500 text-right text-xs">5 min ago</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </SettingSection>
+  </div>
+);
+
+const WorkspaceAIOrchestration = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">AI Orchestration</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Manage model routing, API keys, and remediation limits.</p>
+    </div>
+
+    <SettingSection title="Provider & Model">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div className="space-y-4 md:border-r border-[#1E2028] md:pr-8">
+          <SettingField label="Primary Provider" layout="vertical"><SelectInput value="Anthropic" dataField="aiPrimaryProvider" /></SettingField>
+          <SettingField label="Primary API Key" layout="vertical"><SecretField value="••••••••••••••••" dataField="aiPrimaryApiKey" /></SettingField>
+          <SettingField label="Primary Model" layout="vertical"><SelectInput value="claude-sonnet-4-20250514" dataField="aiPrimaryModel" /></SettingField>
+        </div>
+        <div className="space-y-4">
+          <SettingField label="Fallback Provider" layout="vertical"><SelectInput value="OpenAI" dataField="aiFallbackProvider" /></SettingField>
+          <SettingField label="Fallback API Key" layout="vertical"><SecretField value="••••••••••••••••" dataField="aiFallbackApiKey" /></SettingField>
+          <SettingField label="Fallback Model" layout="vertical"><SelectInput value="gpt-4o" dataField="aiFallbackModel" /></SettingField>
+        </div>
+      </div>
+      <div className="pt-4 border-t border-[#1E2028]">
+        <SettingField label="Fallback Order" layout="vertical">
+          <div className="flex flex-col gap-2">
+            <div className={`flex items-center gap-3 p-3 ${T.bg} border ${T.border} rounded text-sm`}><span className="text-zinc-500 font-mono">1.</span><span className="text-zinc-200">Anthropic / claude-sonnet</span></div>
+            <div className={`flex items-center gap-3 p-3 ${T.bg} border ${T.border} rounded text-sm`}><span className="text-zinc-500 font-mono">2.</span><span className="text-zinc-200">OpenAI / gpt-4o</span></div>
+          </div>
+        </SettingField>
+      </div>
+    </SettingSection>
+
+    <SettingSection title="Model Policy Controls">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+        <SettingField label="Max Tokens" layout="vertical"><TextInput value="8192" dataField="aiMaxTokens" /></SettingField>
+        <SettingField label="Timeout (s)" layout="vertical"><TextInput value="60" dataField="aiTimeoutSecs" /></SettingField>
+        <SettingField label="Max Retries" layout="vertical"><TextInput value="3" dataField="aiMaxRetries" /></SettingField>
+        <SettingField label="Cost Cap per Run" layout="vertical"><TextInput value="$0.50" dataField="aiCostCap" /></SettingField>
+        <div className="col-span-1 sm:col-span-2">
+          <SettingField label="Failover Behavior" layout="vertical"><SelectInput value="Use Fallback" dataField="aiFailoverBehavior" /></SettingField>
+        </div>
+      </div>
+    </SettingSection>
+
+    <SettingSection title="Remediation Controls">
+      <SettingField label="Max Execution Cycles"><TextInput value="5" dataField="remMaxCycles" /></SettingField>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <SettingField label="Low severity" layout="vertical"><SelectInput value="Auto" dataField="remSevLow" /></SettingField>
+        <SettingField label="Medium severity" layout="vertical"><SelectInput value="Auto" dataField="remSevMed" /></SettingField>
+        <SettingField label="High severity" layout="vertical"><SelectInput value="Manual" dataField="remSevHigh" /></SettingField>
+        <SettingField label="Critical severity" layout="vertical"><SelectInput value="Manual" dataField="remSevCrit" /></SettingField>
+      </div>
+      <SettingField label="Manual Review Gate"><ToggleSwitch active={true} dataField="remManualGate" /></SettingField>
+      <div className="pt-6 border-t border-[#1E2028] grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div>
+          <PixelButton variant="outline" className="w-full mb-3">Test Primary LLM</PixelButton>
+          <div className={`p-3 ${T.bg} border border-emerald-500/20 text-emerald-400 text-xs font-mono rounded`}>Latency: 312ms · Model: claude-sonnet-4 · Tokens: 47 · Cost: $0.001 · ✓ Pass</div>
+        </div>
+        <div>
+          <PixelButton variant="outline" className="w-full mb-3">Test Fallback LLM</PixelButton>
+          <div className={`p-3 ${T.bg} border border-emerald-500/20 text-emerald-400 text-xs font-mono rounded`}>Latency: 450ms · Model: gpt-4o · Tokens: 42 · Cost: $0.001 · ✓ Pass</div>
+        </div>
+      </div>
+    </SettingSection>
+  </div>
+);
+
+const WorkspaceSecrets = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">Workspace Secrets</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Internal platform credentials and symmetric keys. Encrypted at rest.</p>
+    </div>
+    <div className="space-y-4 mb-6">
+      {[
+        { title: 'SERVICE_KEY', field: 'secretServiceKey', meta: { used: '1 hour ago', rotated: '14 days ago', deps: 'Pipeline Orchestrator, RabbitMQ Worker' } },
+        { title: 'SESSION_SECRET', field: 'secretSessionSecret', meta: { used: 'Just now', rotated: '30 days ago', deps: 'Auth Service' } },
+        { title: 'WEBSOCKET_TOKEN_SECRET', field: 'secretWsToken', meta: { used: '3 hours ago', rotated: '30 days ago', deps: 'WebSocket Gateway' } },
+      ].map(({ title, field, meta }) => (
+        <SettingSection key={field} title={title}>
+          <SecretField value="••••••••••••••••" dataField={field} metadata={meta} />
+          <div className="flex gap-3">
+            <PixelButton variant="outline">Rotate</PixelButton>
+            <PixelButton variant="outline">Copy</PixelButton>
+          </div>
+        </SettingSection>
+      ))}
+    </div>
+    <PixelButton variant="default" className="w-full sm:w-max py-3">+ Add Secret</PixelButton>
+  </div>
+);
+
+const WorkspaceDangerZone = () => {
+  const [expanded, setExpanded] = useState({ reset: false, purge: false, del: false });
+  const toggle = (key) => setExpanded(prev => ({ ...prev, [key]: !prev[key] }));
+
+  const DangerCard = ({ id, title, titleRed, impact, recovery, note, confirmPlaceholder, dataField, extraButtons, actionLabel }) => (
+    <div className={`border ${T.dangerBorder} rounded-xl overflow-hidden bg-[#0A0B0F]`}>
+      <div className={`p-4 sm:p-6 flex justify-between items-center ${T.surface}`}>
+        <h3 className={`font-bold text-sm sm:text-base ${titleRed ? 'text-rose-500' : 'text-white'}`}>{title}</h3>
+        <button
+          onClick={() => toggle(id)}
+          aria-expanded={expanded[id]}
+          className="text-xs font-bold bg-[#1A1C23] px-3 py-1.5 rounded text-white hover:bg-[#22252E] transition-colors"
+        >
+          {expanded[id] ? 'Hide' : 'Show'}
+        </button>
+      </div>
+      {expanded[id] && (
+        <div className="p-4 sm:p-6 border-t border-[#1E2028] flex flex-col gap-4">
+          <div className="text-sm text-zinc-400 space-y-1">
+            <p><span className="text-zinc-300 font-medium">Impact:</span> {impact}</p>
+            <p><span className="text-zinc-300 font-medium">Recovery:</span> {recovery}</p>
+          </div>
+          {note && <p className="text-xs text-rose-400 font-mono">{note}</p>}
+          <input
+            disabled type="text" placeholder={confirmPlaceholder}
+            data-field={dataField}
+            className={`w-full ${T.bg} border ${T.border} ${T.text} rounded-md px-3 py-2.5 text-sm disabled:opacity-60`}
+          />
+          <div className="flex flex-wrap gap-3">
+            {extraButtons}
+            <PixelButton variant="danger" disabled>{actionLabel}</PixelButton>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="animate-in fade-in duration-300">
+      <div className="mb-8 pb-4 border-b border-rose-500/30">
+        <h2 className="text-2xl font-bold text-rose-500 tracking-tight">Danger Zone</h2>
+        <p className="text-sm text-rose-400/80 mt-1">Irreversible operations. Owner privileges required.</p>
+      </div>
+      <div className="space-y-4">
+        <DangerCard
+          id="reset" title="Reset All Settings to Default"
+          impact="All workspace settings reverted; environment overrides deleted."
+          recovery="Re-enter all credentials. No data loss beyond settings."
+          confirmPlaceholder="Type: reset workspace settings"
+          dataField="dangerResetSettingsConfirm" actionLabel="Reset Settings"
+          extraButtons={<PixelButton variant="outline">Dry Run</PixelButton>}
+        />
+        <DangerCard
+          id="purge" title="Purge Deployment History"
+          impact="All deployment records, logs, and audit history deleted."
+          recovery="Unrecoverable. Export data first."
+          confirmPlaceholder="Type: purge deployment history"
+          dataField="dangerPurgeHistoryConfirm" actionLabel="Purge History"
+          extraButtons={<><PixelButton variant="outline">Export First</PixelButton><PixelButton variant="outline">Dry Run</PixelButton></>}
+        />
+        <DangerCard
+          id="del" title="Delete Workspace" titleRed
+          impact="All projects, deployments, secrets, and members deleted permanently."
+          recovery="None. Contact support within 7 days for partial recovery."
+          note="No dry-run available."
+          confirmPlaceholder="Type: delete workspace"
+          dataField="dangerDeleteWorkspaceConfirm" actionLabel="Delete Workspace"
+        />
+      </div>
+    </div>
+  );
+};
+
+// ==========================================
+// USER TABS
+// ==========================================
+
+const UserAccount = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">Account Profile</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Manage your personal identity and localization.</p>
+    </div>
+    <SettingSection title="Profile">
+      <div className="flex items-center gap-6 mb-2">
+        <div className="w-20 h-20 rounded-full bg-[#1A1C23] flex items-center justify-center text-2xl font-bold text-white border border-[#2D3039] shrink-0" aria-label="Avatar: AJ">AJ</div>
+        <PixelButton variant="outline">Upload Photo</PixelButton>
+      </div>
+      <SettingField label="Display Name"><TextInput value="AJ" dataField="userDisplayName" /></SettingField>
+      <SettingField label="Role Title"><TextInput value="AI Infrastructure Engineer" dataField="userRoleTitle" /></SettingField>
+      <SettingField label="Bio">
+        <textarea disabled data-field="userBio" value="Building DeplAI — multi-agent AWS deployment automation." className={`w-full ${T.bg} border ${T.border} ${T.text} rounded-md px-3 py-2 text-sm disabled:opacity-60 resize-none h-20`} />
+      </SettingField>
+      <SettingField label="Contact Email"><TextInput value="aj@pesuventurelabs.com" dataField="userContactEmail" /></SettingField>
+      <PixelButton variant="outline" className="w-full sm:w-max">Send Verification</PixelButton>
+    </SettingSection>
+    <SettingSection title="Localization">
+      <SettingField label="Language"><SelectInput value="English (US)" dataField="userLanguage" /></SettingField>
+      <SettingField label="Timezone"><SelectInput value="Asia/Kolkata (IST)" dataField="userTimezone" /></SettingField>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <SettingField label="Date Format" layout="vertical"><SelectInput value="DD/MM/YYYY" dataField="userDateFormat" /></SettingField>
+        <SettingField label="Number Format" layout="vertical"><SelectInput value="1,234.56" dataField="userNumberFormat" /></SettingField>
+      </div>
+    </SettingSection>
+  </div>
+);
+
+const UserSecurity = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">Security</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Manage passwords, MFA, and passkeys.</p>
+    </div>
+    <SettingSection title="Password">
+      <SettingField label="Current Password" layout="vertical"><SecretField value="••••••••••••••••" dataField="userCurrentPassword" /></SettingField>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <SettingField label="New Password" layout="vertical">
+          <SecretField value="••••••••••••••••" dataField="userNewPassword" />
+          <div className="flex gap-1 mt-2">
+            {[1,2,3,4].map(i => <div key={i} className="h-1 flex-1 rounded-full bg-emerald-500" />)}
+            <div className="h-1 flex-1 rounded-full bg-zinc-800" />
+          </div>
+          <p className="text-[10px] font-bold uppercase tracking-widest text-emerald-500 mt-1">Strong</p>
+        </SettingField>
+        <SettingField label="Confirm Password" layout="vertical"><SecretField value="••••••••••••••••" dataField="userConfirmPassword" /></SettingField>
+      </div>
+      <PixelButton variant="default" className="w-full sm:w-max">Change Password</PixelButton>
+    </SettingSection>
+
+    <SettingSection title="Multi-Factor Authentication" badge={<StatusBadge status="success" label="Enabled — Authenticator App" />}>
+      <div className="flex flex-wrap gap-3">
+        <PixelButton variant="outline">Remove TOTP</PixelButton>
+        <PixelButton variant="outline">View Recovery Codes</PixelButton>
+      </div>
+      <div className="pt-4 border-t border-[#1E2028] flex justify-between items-center">
+        <div><p className="text-sm font-medium text-white">SMS Fallback</p><p className="text-xs text-zinc-500">Not configured</p></div>
+        <PixelButton variant="outline">Add Phone</PixelButton>
+      </div>
+    </SettingSection>
+
+    <SettingSection title="Passkeys">
+      <div className="flex items-center justify-between p-4 bg-[#0A0B0F] border border-[#1E2028] rounded-md">
+        <div className="flex items-center gap-3">
+          <Laptop className="w-5 h-5 text-zinc-400" aria-hidden="true" />
+          <div className="text-sm"><p className="text-white font-medium">MacBook Pro</p><p className="text-xs text-zinc-500">Chrome · Added 10 days ago · Last used: today</p></div>
+        </div>
+        <PixelButton variant="outline">Remove</PixelButton>
+      </div>
+      <PixelButton variant="default" className="w-full sm:w-max">Add Passkey</PixelButton>
+    </SettingSection>
+
+    <SettingSection title="Login History">
+      <div className={`border ${T.border} rounded-md overflow-x-auto`}>
+        <table className="w-full text-left text-sm whitespace-nowrap">
+          <thead className={`bg-[#0A0B0F] border-b ${T.border} text-[10px] uppercase tracking-widest ${T.hint}`}>
+            <tr><th className="px-4 py-3">Timestamp</th><th className="px-4 py-3">IP</th><th className="px-4 py-3">Location</th><th className="px-4 py-3">Device</th><th className="px-4 py-3">Method</th><th className="px-4 py-3">Status</th></tr>
+          </thead>
+          <tbody className="divide-y divide-[#1E2028]">
+            <tr className="bg-[#111318] text-zinc-300"><td className="px-4 py-3">10 min ago</td><td className="px-4 py-3 font-mono text-xs">192.168.1.1</td><td className="px-4 py-3">Bengaluru, IN</td><td className="px-4 py-3">Mac / Chrome</td><td className="px-4 py-3">Passkey</td><td className="px-4 py-3 text-emerald-400">Success</td></tr>
+            <tr className="bg-[#111318] text-zinc-300"><td className="px-4 py-3">2 days ago</td><td className="px-4 py-3 font-mono text-xs">10.0.0.45</td><td className="px-4 py-3">Bengaluru, IN</td><td className="px-4 py-3">iPhone / Safari</td><td className="px-4 py-3">Password+MFA</td><td className="px-4 py-3 text-emerald-400">Success</td></tr>
+            <tr className="bg-rose-500/5 text-zinc-300"><td className="px-4 py-3">5 days ago</td><td className="px-4 py-3 font-mono text-xs">142.250.193.46</td><td className="px-4 py-3 text-rose-400 font-bold">New Location</td><td className="px-4 py-3">Windows / Edge</td><td className="px-4 py-3">Password</td><td className="px-4 py-3 text-rose-400">Blocked (MFA)</td></tr>
+            <tr className="bg-[#111318] text-zinc-300"><td className="px-4 py-3">12 days ago</td><td className="px-4 py-3 font-mono text-xs">192.168.1.1</td><td className="px-4 py-3">Bengaluru, IN</td><td className="px-4 py-3">Mac / Chrome</td><td className="px-4 py-3">Passkey</td><td className="px-4 py-3 text-emerald-400">Success</td></tr>
+            <tr className="bg-[#111318] text-zinc-300"><td className="px-4 py-3">15 days ago</td><td className="px-4 py-3 font-mono text-xs">192.168.1.1</td><td className="px-4 py-3">Bengaluru, IN</td><td className="px-4 py-3">Mac / Chrome</td><td className="px-4 py-3">Password+MFA</td><td className="px-4 py-3 text-emerald-400">Success</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </SettingSection>
+  </div>
+);
+
+// FIX 3: Notifications uses NotifToggle instead of raw checkboxes
+const UserNotifications = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">Notifications</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Manage delivery channels and quiet hours.</p>
+    </div>
+
+    <SettingSection title="Event Toggles">
+      <div className={`border ${T.border} rounded-md overflow-x-auto`}>
+        <table className="w-full text-left text-sm whitespace-nowrap">
+          <thead className={`bg-[#0A0B0F] border-b ${T.border} text-[10px] uppercase tracking-widest ${T.hint}`}>
+            <tr>
+              <th className="px-4 py-3">Event</th>
+              <th className="px-4 py-3 text-center w-20">Email</th>
+              <th className="px-4 py-3 text-center w-20">In-App</th>
+              <th className="px-4 py-3 text-center w-20">Slack</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-[#1E2028]">
+            {[
+              ['Deployment started', true, true, false],
+              ['Deployment succeeded', true, true, true],
+              ['Deployment failed', true, true, true],
+              ['Remediation completed', false, true, false],
+              ['Remediation requires approval', true, true, true],
+              ['Budget warning threshold hit', true, true, true],
+              ['Budget hard stop triggered', true, true, true],
+              ['Security finding detected', true, true, false],
+              ['Workspace member added/removed', false, true, false],
+              ['Settings changed (admin events)', true, true, false],
+            ].map(([evt, e, i, s], idx) => (
+              <tr key={idx} className="bg-[#111318] hover:bg-[#13151C] transition-colors">
+                <td className="px-4 py-3 text-zinc-300">{evt}</td>
+                <td className="px-4 py-3 text-center"><NotifToggle checked={e} /></td>
+                <td className="px-4 py-3 text-center"><NotifToggle checked={i} /></td>
+                <td className="px-4 py-3 text-center"><NotifToggle checked={s} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </SettingSection>
+
+    <SettingSection title="Quiet Hours">
+      <SettingField label="Enable quiet hours"><ToggleSwitch active={true} dataField="userQuietHoursToggle" /></SettingField>
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <SettingField label="Start Time" layout="vertical"><TextInput value="22:00" dataField="userQuietStart" /></SettingField>
+        <SettingField label="End Time" layout="vertical"><TextInput value="08:00" dataField="userQuietEnd" /></SettingField>
+        <SettingField label="Timezone" layout="vertical"><TextInput value="IST" dataField="userQuietTz" /></SettingField>
+      </div>
+    </SettingSection>
+  </div>
+);
+
+const UserPreferences = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">Preferences</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Customize appearance, accessibility, and productivity.</p>
+    </div>
+    <SettingSection title="Appearance">
+      <SettingField label="Theme"><SelectInput value="Dark" dataField="userTheme" /></SettingField>
+      <SettingField label="Density"><SelectInput value="Default" dataField="userDensity" /></SettingField>
+      <SettingField label="Font Size"><SelectInput value="Default" dataField="userFontSize" /></SettingField>
+      <SettingField label="Reduced Motion"><ToggleSwitch active={false} dataField="userReducedMotionToggle" /></SettingField>
+    </SettingSection>
+    <SettingSection title="Accessibility">
+      <SettingField label="High Contrast Mode"><ToggleSwitch active={false} dataField="userHighContrastToggle" /></SettingField>
+      <SettingField label="Keyboard Navigation Hints"><ToggleSwitch active={false} dataField="userKbHintsToggle" /></SettingField>
+      <SettingField label="Announce status changes"><ToggleSwitch active={false} dataField="userAnnounceToggle" /></SettingField>
+    </SettingSection>
+    <SettingSection title="Productivity">
+      <SettingField label="Default Landing Page"><SelectInput value="Dashboard" dataField="userLandingPage" /></SettingField>
+      <SettingField label="Default Environment"><SelectInput value="Production" dataField="userDefaultEnv" /></SettingField>
+      <SettingField label="Command Confirmations"><ToggleSwitch active={true} dataField="userCmdConfirmToggle" /></SettingField>
+    </SettingSection>
+  </div>
+);
+
+const UserAIDefaults = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">AI Defaults</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Manage personal AI behavior and keys.</p>
+    </div>
+    <SettingSection title="Provider Preference">
+      <SettingField label="Preferred Provider"><SelectInput value="Anthropic" dataField="userAiProvider" /></SettingField>
+      <SettingField label="Preferred Model"><SelectInput value="claude-sonnet-4-20250514" dataField="userAiModel" /></SettingField>
+      <SettingField label="Fallback Model"><SelectInput value="gpt-4o" dataField="userAiFallback" /></SettingField>
+    </SettingSection>
+    <SettingSection title="Behavior Controls">
+      <SettingField label="Response Style"><SelectInput value="Balanced" dataField="userAiStyle" /></SettingField>
+      <SettingField label="Code Explanation Depth"><SelectInput value="Standard" dataField="userAiCodeDepth" /></SettingField>
+      <SettingField label="Verbosity">
+        <div className="flex items-center gap-4">
+          <input type="range" disabled value="3" min="1" max="5" data-field="userAiVerbosity" aria-label="Verbosity level" className="flex-1 opacity-50 cursor-not-allowed" />
+          <span className={`${T.mono} text-sm w-4 text-right`}>3</span>
+        </div>
+      </SettingField>
+    </SettingSection>
+    <SettingSection title="Personal Safe Limits">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <SettingField label="Run Budget Warning" layout="vertical"><TextInput value="$1.00" dataField="userAiRunBudget" /></SettingField>
+        <SettingField label="Token Warning" layout="vertical"><TextInput value="50K" dataField="userAiTokenWarn" /></SettingField>
+      </div>
+    </SettingSection>
+    <SettingSection title="Bring Your Own Key (BYOK)">
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 bg-[#0A0B0F] border border-[#1E2028] rounded-md mb-4 gap-4">
+        <div className="flex items-center gap-3">
+          <Key className="w-4 h-4 text-zinc-400" aria-hidden="true" />
+          <div className="text-sm">
+            <p className="text-white font-medium">Anthropic · personal-key</p>
+            <p className="text-xs text-zinc-500 mt-0.5">Used 2h ago · <span className="text-emerald-500 font-bold">Active</span></p>
+          </div>
+        </div>
+        <div className="flex gap-2 w-full sm:w-auto">
+          <PixelButton variant="outline" className="flex-1 sm:flex-none">Rotate</PixelButton>
+          <PixelButton variant="outline" className="flex-1 sm:flex-none">Revoke</PixelButton>
+        </div>
+      </div>
+      <PixelButton variant="default" className="w-full sm:w-max">Add API Key</PixelButton>
+    </SettingSection>
+  </div>
+);
+
+const UserIntegrations = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">Integrations</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Connect external accounts for personal workflows.</p>
+    </div>
+    <SettingSection title="GitHub Identity">
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 bg-[#0A0B0F] border border-[#1E2028] rounded-md mb-4 gap-4">
+        <div className="flex items-center gap-3">
+          <Github className="w-5 h-5 text-white" aria-hidden="true" />
+          <div><p className="text-sm font-bold text-white">aj-dev</p><p className="text-xs text-emerald-400">Connected</p></div>
+        </div>
+        <PixelButton variant="outline" className="w-full sm:w-auto">Disconnect</PixelButton>
+      </div>
+      <SettingField label="Personal PAT (Optional)"><SecretField value="••••••••" dataField="userGithubPat" /></SettingField>
+    </SettingSection>
+    <SettingSection title="IDE Preferences">
+      <SettingField label="Preferred Editor"><SelectInput value="VS Code" dataField="userIdeEditor" /></SettingField>
+      <SettingField label="Open files in"><SelectInput value="Editor" dataField="userIdeOpenIn" /></SettingField>
+    </SettingSection>
+  </div>
+);
+
+const UserPrivacyData = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">Privacy & Data</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Manage telemetry, data exports, and consent.</p>
+    </div>
+    <SettingSection title="Telemetry & Marketing">
+      <SettingField label="Usage telemetry"><ToggleSwitch active={true} dataField="userTelemetryToggle" /></SettingField>
+      <SettingField label="Analytics level"><SelectInput value="Basic" dataField="userAnalyticsLevel" /></SettingField>
+      <SettingField label="Product emails"><ToggleSwitch active={false} dataField="userProductEmailsToggle" /></SettingField>
+    </SettingSection>
+    <SettingSection title="Data Controls">
+      <SettingField label="Retention"><SelectInput value="30 days" dataField="userDataRetention" /></SettingField>
+      <div className="flex flex-col sm:flex-row gap-3 pt-4 border-t border-[#1E2028]">
+        <PixelButton variant="outline" className="w-full sm:w-auto">Export My Data</PixelButton>
+        <PixelButton variant="outline" className="w-full sm:w-auto">Download Audit Log</PixelButton>
+        <PixelButton variant="danger" className="w-full sm:w-auto sm:ml-auto">Request Account Deletion</PixelButton>
+      </div>
+    </SettingSection>
+    <SettingSection title="Consent History">
+      <div className={`border ${T.border} rounded-md overflow-x-auto`}>
+        <table className="w-full text-left text-sm whitespace-nowrap">
+          <thead className={`bg-[#0A0B0F] border-b ${T.border} text-[10px] uppercase tracking-widest ${T.hint}`}>
+            <tr><th className="px-4 py-3">Document</th><th className="px-4 py-3">Version</th><th className="px-4 py-3">Accepted At</th><th className="px-4 py-3">IP</th></tr>
+          </thead>
+          <tbody className="divide-y divide-[#1E2028]">
+            <tr className="bg-[#111318]"><td className="px-4 py-3 text-zinc-300">Terms of Service</td><td className="px-4 py-3 text-zinc-400">v2.1</td><td className="px-4 py-3 text-zinc-400">Oct 12, 2023</td><td className="px-4 py-3 font-mono text-xs text-zinc-500">192.168.1.1</td></tr>
+            <tr className="bg-[#111318]"><td className="px-4 py-3 text-zinc-300">Privacy Policy</td><td className="px-4 py-3 text-zinc-400">v1.8</td><td className="px-4 py-3 text-zinc-400">Oct 12, 2023</td><td className="px-4 py-3 font-mono text-xs text-zinc-500">192.168.1.1</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </SettingSection>
+  </div>
+);
+
+const UserBillingUsage = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8">
+      <h2 className="text-2xl font-bold text-white tracking-tight">Billing & Usage</h2>
+      <p className={`text-sm ${T.muted} mt-1`}>Your personal consumption metrics.</p>
+    </div>
+    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
+      {[
+        { label: 'Deployments', value: '12', color: 'text-white' },
+        { label: 'Tokens Used', value: '847K', color: 'text-white' },
+        { label: 'API Calls', value: '234', color: 'text-white' },
+        { label: 'Est. Cost', value: '$3.21', color: 'text-emerald-400' },
+      ].map(({ label, value, color }) => (
+        <div key={label} className={`p-6 ${T.surface} border ${T.border} rounded-xl`}>
+          <p className="text-xs text-zinc-400 uppercase tracking-widest mb-2 font-bold">{label}</p>
+          <p className={`text-3xl font-bold ${color}`}>{value}</p>
+        </div>
+      ))}
+    </div>
+    <SettingSection title="Limits & Quotas">
+      <div>
+        <div className="flex justify-between text-xs mb-1"><span className="text-zinc-400">Token Quota</span><span className="text-zinc-200">~42%</span></div>
+        <div className={`w-full h-2 ${T.bg} rounded-full overflow-hidden border ${T.border}`}><div className="h-full bg-emerald-500 w-[42%]" /></div>
+      </div>
+      <SettingField label="Warn threshold">
+        <div className="flex items-center gap-4">
+          <input type="range" disabled value="80" max="100" aria-label="Warn threshold" className="flex-1 opacity-50 cursor-not-allowed" />
+          <span className={`${T.mono} text-sm w-10 text-right`}>80%</span>
+        </div>
+      </SettingField>
+      <div className={`border ${T.border} rounded-md overflow-x-auto`}>
+        <table className="w-full text-left text-sm whitespace-nowrap">
+          <thead className={`bg-[#0A0B0F] border-b ${T.border} text-[10px] uppercase tracking-widest ${T.hint}`}>
+            <tr><th className="px-4 py-3">Resource</th><th className="px-4 py-3">Used</th><th className="px-4 py-3">Limit</th><th className="px-4 py-3">Reset Date</th></tr>
+          </thead>
+          <tbody className="divide-y divide-[#1E2028]">
+            <tr className="bg-[#111318]"><td className="px-4 py-3 text-zinc-300">Tokens</td><td className="px-4 py-3 text-zinc-400">847,192</td><td className="px-4 py-3 text-zinc-400">2,000,000</td><td className="px-4 py-3 text-zinc-500 text-xs">Nov 1</td></tr>
+            <tr className="bg-[#111318]"><td className="px-4 py-3 text-zinc-300">Deployments</td><td className="px-4 py-3 text-zinc-400">12</td><td className="px-4 py-3 text-zinc-400">50</td><td className="px-4 py-3 text-zinc-500 text-xs">Nov 1</td></tr>
+            <tr className="bg-[#111318]"><td className="px-4 py-3 text-zinc-300">Storage</td><td className="px-4 py-3 text-zinc-400">4.2 GB</td><td className="px-4 py-3 text-zinc-400">10 GB</td><td className="px-4 py-3 text-zinc-500 text-xs">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </SettingSection>
+  </div>
+);
+
+const UserDevicesSessions = () => (
+  <div className="animate-in fade-in duration-300">
+    <div className="mb-8 flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+      <div>
+        <h2 className="text-2xl font-bold text-white tracking-tight">Devices & Sessions</h2>
+        <p className={`text-sm ${T.muted} mt-1`}>Manage active logins and trusted devices.</p>
+      </div>
+      <PixelButton variant="outline" className="w-full sm:w-auto">Revoke All Other Sessions</PixelButton>
+    </div>
+    <SettingSection title="Active Sessions">
+      <div className="flex flex-col divide-y divide-[#1E2028] border border-[#1E2028] rounded-md overflow-hidden">
+        {[
+          { icon: Laptop, iconColor: 'text-emerald-400', name: 'MacBook Pro · Chrome', location: 'Bengaluru, IN', time: 'Active now', isThis: true },
+          { icon: Smartphone, iconColor: 'text-zinc-400', name: 'iPhone 15 · Safari', location: 'Bengaluru, IN', time: '2 hours ago' },
+          { icon: Laptop, iconColor: 'text-zinc-400', name: 'Windows PC · Edge', location: 'Mumbai, IN', time: 'Yesterday' },
+        ].map(({ icon: Icon, iconColor, name, location, time, isThis }) => (
+          <div key={name} className="flex items-center justify-between px-4 py-4 bg-[#111318] gap-4">
+            <div className="flex items-center gap-3 min-w-0">
+              <Icon className={`w-5 h-5 shrink-0 ${iconColor}`} aria-hidden="true" />
+              <div className="min-w-0">
+                <p className="text-white font-medium text-sm flex items-center gap-2 flex-wrap">
+                  {name}
+                  {isThis && <span className="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[9px] uppercase font-bold px-1.5 py-0.5 rounded">This device</span>}
+                </p>
+                <p className="text-xs text-zinc-500 font-mono">{location}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 shrink-0">
+              <span className="text-xs text-zinc-500">{time}</span>
+              {!isThis && <PixelButton variant="outline" className="px-2 py-1 text-xs">Revoke</PixelButton>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </SettingSection>
+    <SettingSection title="Trusted Devices">
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 bg-[#0A0B0F] border border-[#1E2028] rounded-md gap-4">
+        <div className="flex items-center gap-3">
+          <Laptop className="w-5 h-5 text-zinc-400" aria-hidden="true" />
+          <div className="text-sm"><p className="text-white font-medium">MacBook Pro</p><p className="text-xs text-zinc-500">Added 5 days ago · Last seen: today</p></div>
+        </div>
+        <PixelButton variant="outline" className="w-full sm:w-auto">Remove</PixelButton>
+      </div>
+    </SettingSection>
+  </div>
+);
+
+// ==========================================
+// MAIN APP
+// ==========================================
+
+export default function SettingsModule() {
+  const [activeContext, setActiveContext] = useState('workspace');
   const [activeTab, setActiveTab] = useState('integrations');
-  const [githubAppActive, setGithubAppActive] = useState(true);
-  const [autoApprove, setAutoApprove] = useState(false);
-  const [budgetOverride, setBudgetOverride] = useState(false);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
-  const [llmProvider, setLlmProvider] = useState('claude');
-  const [llmModel, setLlmModel] = useState(LLM_PROVIDERS['claude'].models[0]);
-
-  const tabs = [
+  const workspaceTabs = [
     { id: 'integrations', label: 'Integrations', icon: Github },
     { id: 'cloud', label: 'Cloud & Deploy', icon: Cloud },
     { id: 'ai', label: 'AI Orchestration', icon: Cpu },
-    { id: 'workspace', label: 'Workspace Secrets', icon: Shield },
+    { id: 'secrets', label: 'Workspace Secrets', icon: Key },
     { id: 'danger', label: 'Danger Zone', icon: AlertTriangle },
   ];
 
+  const userTabs = [
+    { id: 'account', label: 'Account', icon: User },
+    { id: 'security', label: 'Security', icon: Shield },
+    { id: 'notifications', label: 'Notifications', icon: Bell },
+    { id: 'preferences', label: 'Preferences', icon: Settings },
+    { id: 'aidefaults', label: 'AI Defaults', icon: Bot },
+    { id: 'user_integrations', label: 'Integrations', icon: Github },
+    { id: 'privacy', label: 'Privacy & Data', icon: Lock },
+    { id: 'billing', label: 'Billing & Usage', icon: Activity },
+    { id: 'sessions', label: 'Devices & Sessions', icon: Laptop },
+  ];
+
+  const allTabs = [...workspaceTabs, ...userTabs];
+
+  useEffect(() => {
+    setActiveTab(activeContext === 'workspace' ? 'integrations' : 'account');
+  }, [activeContext]);
+
+  // FIX 4: active tab label for mobile header
+  const activeLabel = allTabs.find(t => t.id === activeTab)?.label ?? '';
+
+  const SidebarNav = ({ tabs, context, label }) => (
+    <div className="mb-8">
+      <h4 className={`px-6 text-[10px] font-bold uppercase tracking-widest ${T.hint} mb-3`}>{label}</h4>
+      <div className="flex flex-col px-3 space-y-0.5">
+        {tabs.map(tab => {
+          const Icon = tab.icon;
+          const isActive = activeContext === context && activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              onClick={() => { setActiveContext(context); setActiveTab(tab.id); setIsMobileMenuOpen(false); }}
+              aria-current={isActive ? 'page' : undefined}
+              className={`w-full text-left px-3 py-2 text-sm font-medium rounded-md transition-all flex items-center justify-between ${isActive ? 'bg-[#111318] text-white' : 'text-zinc-400 hover:text-white hover:bg-[#111318]/50'}`}
+            >
+              <span className="flex items-center gap-3"><Icon size={16} aria-hidden="true" />{tab.label}</span>
+              {isActive && <div className={`w-1 h-4 rounded-full ${context === 'workspace' ? 'bg-[#4F6EF7]' : 'bg-white'}`} />}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+
   return (
-    <div 
-      className="min-h-screen bg-black text-white font-sans selection:bg-white selection:text-black overflow-y-auto"
-      style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" }}
-    >
-      <style dangerouslySetInnerHTML={{__html: `
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-        
-        .custom-scrollbar::-webkit-scrollbar {
-          width: 6px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-track {
-          background: transparent;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-          background-color: #262626;
-          border-radius: 10px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-          background-color: #3f3f46;
-        }
-      `}} />
+    <div className={`min-h-screen ${T.bg} ${T.text} flex font-sans selection:bg-zinc-800`}>
+      {/* Mobile overlay */}
+      {isMobileMenuOpen && (
+        <div className="fixed inset-0 bg-black/60 z-40 md:hidden" onClick={() => setIsMobileMenuOpen(false)} aria-hidden="true" />
+      )}
 
-      {/* Header */}
-      <header className="border-b border-zinc-800 px-8 py-5 flex justify-between items-center bg-black/80 backdrop-blur-md sticky top-0 z-50">
-        <div className="flex items-center gap-4">
-          <div className="h-8 w-8 bg-white text-black flex items-center justify-center font-bold text-xl rounded-sm">
-            D
+      {/* Sidebar */}
+      <nav
+        aria-label="Settings navigation"
+        className={`w-[240px] shrink-0 border-r ${T.border} flex flex-col h-screen fixed md:sticky top-0 bg-[#0A0B0F] z-50 transition-transform duration-300 ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}`}
+      >
+        <div className={`h-16 flex items-center justify-between px-6 border-b ${T.border}`}>
+          <div className="flex items-center gap-3">
+            <div className="w-6 h-6 bg-[#4F6EF7] text-white font-bold flex items-center justify-center text-xs rounded-sm" aria-hidden="true">D</div>
+            <span className="font-semibold tracking-wide text-sm">DeplAI</span>
           </div>
-          <div>
-            <h1 className="text-lg font-bold tracking-tight leading-none mb-1">Platform Settings</h1>
-            <p className="text-[10px] text-zinc-500 uppercase tracking-widest leading-none">Global Config</p>
-          </div>
+          <button className="md:hidden text-zinc-400 hover:text-white" onClick={() => setIsMobileMenuOpen(false)} aria-label="Close menu">
+            <X className="w-5 h-5" aria-hidden="true" />
+          </button>
         </div>
-        <button className="px-5 py-2 bg-white text-black font-semibold text-sm rounded-md hover:bg-zinc-200 transition-colors">
-          Save Changes
-        </button>
-      </header>
+        <div className="flex-1 overflow-y-auto custom-scrollbar py-6">
+          <SidebarNav tabs={workspaceTabs} context="workspace" label="Workspace" />
+          <SidebarNav tabs={userTabs} context="user" label="Your Account" />
+        </div>
+      </nav>
 
-      <main className="max-w-[1400px] mx-auto px-8 py-10 grid grid-cols-12 gap-10">
-        {/* Sidebar Nav */}
-        <aside className="col-span-3 space-y-1 relative">
-          {tabs.map((tab) => {
-            const Icon = tab.icon;
-            const isActive = activeTab === tab.id;
-            return (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`w-full flex items-center gap-3 px-4 py-3 rounded-md transition-all text-sm font-medium border border-transparent ${
-                  isActive 
-                    ? 'bg-zinc-900 border-zinc-800 text-white' 
-                    : 'text-zinc-500 hover:text-white hover:bg-zinc-900/50'
-                }`}
-              >
-                <Icon size={16} strokeWidth={isActive ? 2.5 : 2} />
-                {tab.label}
-              </button>
-            );
-          })}
-        </aside>
+      {/* Main */}
+      <div className="flex-1 flex flex-col min-w-0">
+        <header className={`h-16 flex items-center gap-3 px-4 sm:px-8 border-b ${T.border} bg-[#0A0B0F]/90 backdrop-blur-sm sticky top-0 z-10`}>
+          <button
+            onClick={() => setIsMobileMenuOpen(true)}
+            className="md:hidden p-1.5 -ml-2 text-zinc-400 hover:text-white"
+            aria-label="Open navigation menu"
+          >
+            <Menu className="w-5 h-5" aria-hidden="true" />
+          </button>
 
-        {/* Content Area */}
-        <section className="col-span-9 pb-24">
-          
-          {/* TAB: Integrations */}
-          {activeTab === 'integrations' && (
-            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <div className="mb-8">
-                <h2 className="text-xl font-bold tracking-tight">Source Control Integration</h2>
-                <p className="text-sm text-zinc-400 mt-1">Manage GitHub App installation and webhook listener configuration.</p>
-              </div>
+          {/* FIX 4: Mobile shows active tab name; desktop shows full breadcrumb */}
+          <span className="text-sm font-semibold text-white md:hidden">{activeLabel}</span>
+          <div className="hidden md:flex items-center gap-2 text-sm">
+            <span className={T.muted}>Settings</span>
+            <span className={T.hint}>›</span>
+            <span className={T.muted}>{activeContext === 'workspace' ? 'Workspace' : 'Account'}</span>
+            <span className={T.hint}>›</span>
+            <span className="font-semibold text-white">{activeLabel}</span>
+          </div>
+        </header>
 
-              <div className="grid grid-cols-2 gap-6">
-                <BorderGlow>
-                  <div className="p-6 flex flex-col h-full gap-6 relative z-10">
-                    <div className="flex items-center justify-between border-b border-zinc-800 pb-4">
-                      <div className="flex items-center gap-3">
-                        <Github size={20} className="text-white" />
-                        <h3 className="font-semibold">GitHub App Identity</h3>
-                      </div>
-                      <Toggle active={githubAppActive} onToggle={() => setGithubAppActive(!githubAppActive)} />
-                    </div>
-                    <div className="space-y-5">
-                      <SecretInput label="GitHub App ID" placeholder="app_123456789" defaultValue="app_8273910" />
-                      <SecretInput label="GitHub Private Key (PEM)" placeholder="-----BEGIN PRIVATE KEY-----" />
-                    </div>
-                  </div>
-                </BorderGlow>
+        <main className="flex-1 overflow-y-auto custom-scrollbar p-4 sm:p-8">
+          <div className="max-w-3xl mx-auto w-full">
+            {activeContext === 'workspace' && (
+              <>
+                {activeTab === 'integrations' && <WorkspaceIntegrations />}
+                {activeTab === 'cloud' && <WorkspaceCloudDeploy />}
+                {activeTab === 'ai' && <WorkspaceAIOrchestration />}
+                {activeTab === 'secrets' && <WorkspaceSecrets />}
+                {activeTab === 'danger' && <WorkspaceDangerZone />}
+              </>
+            )}
+            {activeContext === 'user' && (
+              <>
+                {activeTab === 'account' && <UserAccount />}
+                {activeTab === 'security' && <UserSecurity />}
+                {activeTab === 'notifications' && <UserNotifications />}
+                {activeTab === 'preferences' && <UserPreferences />}
+                {activeTab === 'aidefaults' && <UserAIDefaults />}
+                {activeTab === 'user_integrations' && <UserIntegrations />}
+                {activeTab === 'privacy' && <UserPrivacyData />}
+                {activeTab === 'billing' && <UserBillingUsage />}
+                {activeTab === 'sessions' && <UserDevicesSessions />}
+              </>
+            )}
+          </div>
+        </main>
+      </div>
 
-                <PixelCard gap={8} speed={30} colors="#3f3f46,#27272a,#18181b">
-                  <div className="p-6 flex flex-col h-full gap-6">
-                    <div className="flex items-center gap-3 border-b border-zinc-800 pb-4">
-                      <Activity size={20} className="text-white" />
-                      <h3 className="font-semibold">Webhook Listener</h3>
-                    </div>
-                    <div className="space-y-5 flex-grow">
-                      <SecretInput label="Webhook Secret" placeholder="Enter secret to validate payloads" defaultValue="whsec_12398471203" />
-                      
-                      <div className="mt-4 bg-zinc-950 border border-zinc-800 p-4 rounded-md flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <Database className="text-zinc-400" size={16} />
-                          <span className="text-sm font-medium">Status</span>
-                        </div>
-                        <div className="flex items-center gap-1.5 text-[10px] font-bold px-2 py-1 bg-white text-black rounded uppercase tracking-wider">
-                          <CheckCircle2 size={12} /> Receiving
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </PixelCard>
-              </div>
-            </div>
-          )}
-
-          {/* TAB: Cloud */}
-          {activeTab === 'cloud' && (
-            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <div className="mb-8">
-                <h2 className="text-xl font-bold tracking-tight">Cloud & Deployment</h2>
-                <p className="text-sm text-zinc-400 mt-1">Configure runtime environments and guardrails for AWS deployments.</p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-6">
-                <BorderGlow>
-                  <div className="p-6 flex flex-col h-full gap-6 relative z-10">
-                    <div className="flex items-center gap-3 border-b border-zinc-800 pb-4">
-                      <Cloud size={20} className="text-white" />
-                      <h3 className="font-semibold">AWS Credentials</h3>
-                    </div>
-                    <div className="space-y-5">
-                      <SecretInput label="Access Key ID" placeholder="AKIA..." defaultValue="AKIAIOSFODNN7EXAMPLE" />
-                      <SecretInput label="Secret Access Key" placeholder="wJalrXU..." defaultValue="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" />
-                      
-                      <div className="flex flex-col gap-2 pt-2">
-                        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Default Region</label>
-                        <select className="bg-zinc-950 border border-zinc-800 text-white rounded-md px-3 py-2.5 focus:outline-none focus:border-white transition-all appearance-none text-sm cursor-pointer">
-                          <option>us-east-1 (N. Virginia)</option>
-                          <option>us-west-2 (Oregon)</option>
-                          <option>eu-central-1 (Frankfurt)</option>
-                        </select>
-                      </div>
-                    </div>
-                  </div>
-                </BorderGlow>
-
-                <PixelCard gap={8} speed={30} colors="#3f3f46,#27272a,#18181b">
-                  <div className="p-6 flex flex-col h-full gap-6">
-                    <div className="flex items-center justify-between border-b border-zinc-800 pb-4">
-                      <div className="flex items-center gap-3">
-                        <Shield size={20} className="text-white" />
-                        <h3 className="font-semibold">Budget Guardrails</h3>
-                      </div>
-                    </div>
-                    
-                    <div className="space-y-6">
-                      <div className="flex flex-col gap-2">
-                        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Monthly Limit (USD)</label>
-                        <div className="relative flex items-center">
-                          <span className="absolute left-3 text-zinc-500 text-sm">$</span>
-                          <input type="number" defaultValue={20} className="w-full bg-zinc-950 border border-zinc-800 text-white rounded-md pl-7 pr-3 py-2.5 focus:outline-none focus:border-white transition-all font-mono text-sm" />
-                        </div>
-                        <p className="text-[11px] text-zinc-500 mt-1">Deployments exceeding this estimate will be blocked.</p>
-                      </div>
-
-                      <div className="bg-zinc-950 border border-zinc-800 p-4 rounded-md flex items-center justify-between mt-4 relative z-10">
-                        <div>
-                          <p className="text-sm font-medium text-white">Allow Override</p>
-                          <p className="text-[10px] text-zinc-500 uppercase mt-1 tracking-wider">Bypass limits manually</p>
-                        </div>
-                        <Toggle active={budgetOverride} onToggle={() => setBudgetOverride(!budgetOverride)} />
-                      </div>
-                    </div>
-                  </div>
-                </PixelCard>
-              </div>
-            </div>
-          )}
-
-          {/* TAB: AI Orchestration */}
-          {activeTab === 'ai' && (
-            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <div className="mb-8">
-                <h2 className="text-xl font-bold tracking-tight">AI & Agentic Engine</h2>
-                <p className="text-sm text-zinc-400 mt-1">Set model providers and tune agent pipeline behaviors.</p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-6">
-                <BorderGlow>
-                  <div className="p-6 flex flex-col h-full gap-6 relative z-10">
-                    <div className="flex items-center gap-3 border-b border-zinc-800 pb-4">
-                      <Cpu size={20} className="text-white" />
-                      <h3 className="font-semibold">Core Model Provider</h3>
-                    </div>
-                    <div className="space-y-5">
-                      <div className="flex flex-col gap-2">
-                        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">LLM Provider</label>
-                        <select 
-                          value={llmProvider}
-                          onChange={(e) => {
-                            setLlmProvider(e.target.value);
-                            setLlmModel(LLM_PROVIDERS[e.target.value].models[0]);
-                          }}
-                          className="bg-zinc-950 border border-zinc-800 text-white rounded-md px-3 py-2.5 focus:outline-none focus:border-white transition-all appearance-none text-sm cursor-pointer"
-                        >
-                          {Object.entries(LLM_PROVIDERS).map(([key, p]) => (
-                            <option key={key} value={key}>{p.name}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="flex flex-col gap-2">
-                        <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Active Model</label>
-                        <select 
-                          value={llmModel}
-                          onChange={(e) => setLlmModel(e.target.value)}
-                          className="bg-zinc-950 border border-zinc-800 text-white rounded-md px-3 py-2.5 focus:outline-none focus:border-white transition-all appearance-none text-sm cursor-pointer"
-                        >
-                          {LLM_PROVIDERS[llmProvider].models.map(m => (
-                            <option key={m} value={m}>{m}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <SecretInput key={llmProvider} label={`${LLM_PROVIDERS[llmProvider].name} API Key`} placeholder={LLM_PROVIDERS[llmProvider].keyPlaceholder} defaultValue="" />
-                    </div>
-                  </div>
-                </BorderGlow>
-
-                <PixelCard gap={8} speed={30} colors="#3f3f46,#27272a,#18181b">
-                  <div className="p-6 flex flex-col h-full gap-6">
-                    <div className="flex items-center gap-3 border-b border-zinc-800 pb-4">
-                      <Terminal size={20} className="text-white" />
-                      <h3 className="font-semibold">Remediation Rules</h3>
-                    </div>
-                    
-                    <div className="space-y-6">
-                      <div className="space-y-3">
-                        <div className="flex justify-between items-center">
-                          <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Max Execution Cycles</label>
-                          <span className="font-mono text-xs bg-white text-black px-1.5 py-0.5 rounded font-bold">2</span>
-                        </div>
-                        <input type="range" min="1" max="5" defaultValue="2" className="w-full accent-white relative z-10 cursor-pointer" />
-                        <p className="text-[11px] text-zinc-500">Backend hard-caps remediation cycles to 2 to prevent infinite loops.</p>
-                      </div>
-
-                      <div className="bg-zinc-950 border border-zinc-800 p-4 rounded-md flex items-center justify-between relative z-10">
-                        <div>
-                          <p className="text-sm font-medium text-white">Auto-Approve Low</p>
-                          <p className="text-[10px] text-zinc-500 uppercase mt-1 tracking-wider">Skip manual review for low sev</p>
-                        </div>
-                        <Toggle active={autoApprove} onToggle={() => setAutoApprove(!autoApprove)} />
-                      </div>
-                    </div>
-                  </div>
-                </PixelCard>
-              </div>
-            </div>
-          )}
-
-          {/* TAB: Danger Zone */}
-          {activeTab === 'danger' && (
-            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <div className="mb-8">
-                <h2 className="text-xl font-bold tracking-tight">Danger Zone</h2>
-                <p className="text-sm text-zinc-400 mt-1">Irreversible platform operations and state destruction.</p>
-              </div>
-
-              <div className="border-2 border-white bg-white text-black p-8 rounded-lg relative overflow-hidden shadow-[0_0_40px_rgba(255,255,255,0.1)]">
-                <div className="absolute inset-0 opacity-5 pointer-events-none" style={{ backgroundImage: 'repeating-linear-gradient(45deg, #000 25%, transparent 25%, transparent 75%, #000 75%, #000), repeating-linear-gradient(45deg, #000 25%, transparent 25%, transparent 75%, #000 75%, #000)', backgroundPosition: '0 0, 20px 20px', backgroundSize: '40px 40px' }}></div>
-                
-                <div className="relative z-10">
-                  <div className="flex items-start gap-4 border-b border-black/20 pb-6 mb-6">
-                    <div className="bg-black text-white p-2.5 rounded-sm">
-                      <AlertTriangle size={24} strokeWidth={2.5} />
-                    </div>
-                    <div>
-                      <h3 className="text-xl font-black uppercase tracking-tight">Global Runtime Cleanup</h3>
-                      <p className="text-black/80 font-medium mt-1 text-sm max-w-2xl">
-                        This executes the <code className="bg-black text-white px-1.5 py-0.5 rounded text-xs font-mono">/api/cleanup</code> endpoint. It drops all active Docker execution volumes (<span className="font-mono text-xs">codebase_deplai</span>, <span className="font-mono text-xs">security_reports</span>) and terminates running instance states across all tracked projects.
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-col gap-3">
-                    <label className="text-[11px] font-bold uppercase tracking-widest text-black/70">Type "DESTROY ALL" to confirm</label>
-                    <div className="flex gap-4">
-                      <input 
-                        type="text" 
-                        placeholder="DESTROY ALL"
-                        className="bg-transparent border-2 border-black text-black placeholder-black/30 rounded-md px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-black transition-all font-mono font-bold w-64 text-sm"
-                      />
-                      <button className="bg-black text-white font-bold uppercase tracking-wider text-xs px-6 py-2.5 rounded-md hover:bg-zinc-900 transition-colors">
-                        Execute Wipe
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* TAB: Workspace */}
-          {activeTab === 'workspace' && (
-            <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-              <div className="mb-8">
-                <h2 className="text-xl font-bold tracking-tight">Workspace Secrets</h2>
-                <p className="text-sm text-zinc-400 mt-1">Configure core connector tokens and session encryption.</p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-6">
-                <PixelCard gap={8} speed={30} colors="#3f3f46,#27272a,#18181b" className="col-span-2">
-                  <div className="p-8 flex flex-col gap-6">
-                    <div className="flex items-center gap-3 border-b border-zinc-800 pb-4">
-                      <Lock size={20} className="text-white" />
-                      <h3 className="font-semibold">Platform Keys</h3>
-                    </div>
-                    <div className="grid grid-cols-2 gap-8 relative z-10">
-                      <div className="space-y-6">
-                        <BorderGlow borderRadius={8} className="border border-zinc-800">
-                          <div className="p-4 bg-black rounded-[inherit]"><SecretInput label="DeplAI Service Key" placeholder="REST auth token" defaultValue="d3pl41_svckey_xxxxx" /></div>
-                        </BorderGlow>
-                        <BorderGlow borderRadius={8} className="border border-zinc-800">
-                          <div className="p-4 bg-black rounded-[inherit]"><SecretInput label="Session Secret" placeholder="Browser session encryption" defaultValue="s3ss10n_s3cr3t_0987654321" /></div>
-                        </BorderGlow>
-                      </div>
-                      <div className="space-y-6">
-                        <BorderGlow borderRadius={8} className="border border-zinc-800">
-                          <div className="p-4 bg-black rounded-[inherit]"><SecretInput label="WebSocket Token Secret" placeholder="HMAC signing key" defaultValue="ws_t0k3n_s3cr3t_xxxxx" /></div>
-                        </BorderGlow>
-                      </div>
-                    </div>
-                  </div>
-                </PixelCard>
-              </div>
-            </div>
-          )}
-
-        </section>
-      </main>
+      <style dangerouslySetInnerHTML={{__html: `
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #2D3039; border-radius: 10px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background-color: #3f3f46; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-in { animation: fadeIn 0.2s ease-out forwards; }
+      `}} />
     </div>
   );
 }
