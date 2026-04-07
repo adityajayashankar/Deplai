@@ -104,7 +104,8 @@ export async function POST(request: NextRequest) {
         const headRef = String(pr.head?.ref || '');
         // Only count PRs opened by remediation runs for this exact project id prefix.
         // This avoids showing a stale "Create PR" success state after switching repos.
-        return headRef.startsWith(projectPrefix);
+        const newPrefix = `deplai/fix-${projectId.slice(0, 8)}-`;
+        return headRef.startsWith(projectPrefix) || headRef.startsWith(newPrefix);
       });
 
       return NextResponse.json({

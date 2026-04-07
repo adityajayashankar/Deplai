@@ -1,8 +1,75 @@
 import { getIronSession } from 'iron-session';
 import { cookies } from 'next/headers';
 import { NextResponse } from 'next/server';
+import { timingSafeEqual } from 'node:crypto';
 import { sessionOptions, SessionData } from './session';
 import { query } from './db';
+
+function adminEmailSet(): Set<string> {
+  const raw = [process.env.ADMIN_EMAILS, process.env.ADMIN_EMAIL]
+    .filter((value) => typeof value === 'string' && value.trim().length > 0)
+    .join(',');
+
+  return new Set(
+    raw
+      .split(',')
+      .map((entry) => entry.trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+export function isAdminUser(user: SessionData['user'] | null | undefined): boolean {
+  if (!user?.email) return false;
+  const allowed = adminEmailSet();
+  if (allowed.size === 0) return false;
+  return allowed.has(user.email.trim().toLowerCase());
+}
+
+function normalizeSecret(value: string | null | undefined): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function safeSecretEquals(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
+export async function hasWorkspaceAdminAccess(
+  user: SessionData['user'] | null | undefined,
+  providedSecret?: string | null
+): Promise<boolean> {
+  if (isAdminUser(user)) return true;
+
+  const key = normalizeSecret(providedSecret);
+  if (!key) return false;
+
+  const configuredSecrets = [
+    normalizeSecret(process.env.ADMIN_ACCESS_KEY),
+    normalizeSecret(process.env.DEPLAI_SERVICE_KEY),
+  ].filter(Boolean);
+
+  for (const secret of configuredSecrets) {
+    if (safeSecretEquals(key, secret)) {
+      return true;
+    }
+  }
+
+  // Allow workspace unlock with a platform-generated key saved in workspace settings.
+  try {
+    const rows = await query<Array<{ user_id: string }>>(
+      `SELECT user_id
+       FROM user_settings
+       WHERE JSON_UNQUOTE(JSON_EXTRACT(data_json, '$.workspace.serviceKey')) = ?
+       LIMIT 1`,
+      [key]
+    );
+    return rows.length > 0;
+  } catch {
+    return false;
+  }
+}
 
 export async function getAuthenticatedUser() {
   const cookieStore = await cookies();
@@ -23,6 +90,19 @@ export async function requireAuth(): Promise<
     return { error: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }) };
   }
   return { user };
+}
+
+export async function requireAdmin(): Promise<
+  { user: SessionData['user'] & {}; error?: never } | { user?: never; error: NextResponse }
+> {
+  const auth = await requireAuth();
+  if (auth.error) return auth;
+
+  if (!await hasWorkspaceAdminAccess(auth.user)) {
+    return { error: NextResponse.json({ error: 'Forbidden: admin access required' }, { status: 403 }) };
+  }
+
+  return auth;
 }
 
 export async function verifyLocalProjectAccess(

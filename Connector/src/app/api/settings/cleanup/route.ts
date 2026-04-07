@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAuth } from '@/lib/auth';
+import { hasWorkspaceAdminAccess, requireAuth } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 
 type CleanupRequestBody = {
@@ -7,8 +7,16 @@ type CleanupRequestBody = {
 };
 
 export async function POST(request: NextRequest) {
-  const { error } = await requireAuth();
+  const { user, error } = await requireAuth();
   if (error) return error;
+
+  const canManageWorkspace = await hasWorkspaceAdminAccess(
+    user,
+    request.headers.get('x-workspace-admin-key')
+  );
+  if (!canManageWorkspace) {
+    return NextResponse.json({ error: 'Forbidden: admin access required' }, { status: 403 });
+  }
 
   const body = await request.json().catch(() => ({})) as CleanupRequestBody;
   const confirmation = String(body.confirmation || '').trim().toUpperCase();

@@ -57,18 +57,21 @@ export async function POST(request: NextRequest) {
     const { user, error } = await requireAuth();
     if (error) return error;
 
-    const { project_id, cortex_context, github_token, llm_api_key, llm_model, remediation_scope } = await request.json();
+    const { project_id, cortex_context, github_token, llm_provider, llm_api_key, llm_model, remediation_scope } = await request.json();
     const runtimeGithubToken =
       typeof github_token === 'string' && github_token.trim().length > 0
         ? github_token.trim()
         : null;
-    const normalizedLlmProvider = 'claude';
+    const normalizedLlmProvider =
+      typeof llm_provider === 'string' && llm_provider.trim().length > 0
+        ? llm_provider.trim().toLowerCase()
+        : null;
     const normalizedLlmApiKey =
-      typeof llm_api_key === 'string' && llm_api_key.trim().startsWith('sk-ant-')
+      typeof llm_api_key === 'string' && llm_api_key.trim().length > 0
         ? llm_api_key.trim()
         : null;
     const normalizedLlmModel =
-      typeof llm_model === 'string' && llm_model.trim().toLowerCase().includes('claude')
+      typeof llm_model === 'string' && llm_model.trim().length > 0
         ? llm_model.trim()
         : null;
     const scope = remediation_scope === 'major' ? 'major' : 'all';

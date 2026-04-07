@@ -13,11 +13,54 @@ interface RepositoryAnalysisBody {
   workspace?: string;
 }
 
+const AGENTIC_HEALTH_TIMEOUT_MS = 8_000;
+const AGENTIC_ANALYSIS_TIMEOUT_MS = 300_000;
+const AGENTIC_ANALYSIS_RETRIES = 1;
+
+function isTimeoutLikeError(err: unknown): boolean {
+  const raw = err instanceof Error ? err.message : String(err || '');
+  const lowered = raw.toLowerCase();
+  return (
+    (err instanceof Error && err.name === 'TimeoutError')
+    || lowered.includes('aborted due to timeout')
+    || lowered.includes('timed out')
+  );
+}
+
+async function postRepositoryAnalysis(payload: Record<string, unknown>): Promise<Response> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt <= AGENTIC_ANALYSIS_RETRIES; attempt += 1) {
+    try {
+      const response = await fetch(`${AGENTIC_URL}/api/repository-analysis/run`, {
+        method: 'POST',
+        headers: {
+          ...agenticHeaders(),
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(AGENTIC_ANALYSIS_TIMEOUT_MS),
+      });
+
+      if (response.status >= 500 && attempt < AGENTIC_ANALYSIS_RETRIES) {
+        continue;
+      }
+
+      return response;
+    } catch (err) {
+      lastError = err;
+      if (!isTimeoutLikeError(err) || attempt >= AGENTIC_ANALYSIS_RETRIES) {
+        throw err;
+      }
+    }
+  }
+  throw lastError || new Error('Repository analysis failed after retry.');
+}
+
 async function assertAgenticHealthy(action: string): Promise<void> {
   const healthRes = await fetch(`${AGENTIC_URL}/health`, {
     method: 'GET',
     headers: agenticHeaders(),
-    signal: AbortSignal.timeout(3_000),
+    signal: AbortSignal.timeout(AGENTIC_HEALTH_TIMEOUT_MS),
     cache: 'no-store',
   });
   if (!healthRes.ok) {
@@ -74,21 +117,13 @@ export async function POST(req: NextRequest) {
     const workspace = buildDeploymentWorkspace(projectId, body.workspace || projectName);
     await assertAgenticHealthy('run repository analysis');
 
-    const agenticRes = await fetch(`${AGENTIC_URL}/api/repository-analysis/run`, {
-      method: 'POST',
-      headers: {
-        ...agenticHeaders(),
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        project_id: projectId,
-        project_name: projectName,
-        project_type: meta.project_type,
-        user_id: String(user.id),
-        repo_full_name: meta.repo_full_name,
-        workspace,
-      }),
-      signal: AbortSignal.timeout(120_000),
+    const agenticRes = await postRepositoryAnalysis({
+      project_id: projectId,
+      project_name: projectName,
+      project_type: meta.project_type,
+      user_id: String(user.id),
+      repo_full_name: meta.repo_full_name,
+      workspace,
     });
 
     const data = await agenticRes.json().catch(() => ({})) as {

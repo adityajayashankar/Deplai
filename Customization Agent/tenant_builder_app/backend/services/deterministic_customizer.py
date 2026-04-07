@@ -293,9 +293,16 @@ def _iter_text_extensions(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 
         if entry_type == "nl_key_value":
             target_raw = str(entry.get("target_raw", "")).strip().lower()
-            value = entry.get("value")
-            if not target_raw or not isinstance(value, (str, bool, int, float)):
+            has_value = "value" in entry
+            value = entry.get("value", "")
+            if not target_raw:
                 continue
+            if value is None:
+                value = ""
+            elif not isinstance(value, (str, bool, int, float)):
+                if has_value:
+                    continue
+                value = ""
             app_targets = _extension_scope_targets(entry.get("scope", "frontend"))
             # Skip style-qualified targets — they require JSX changes.
             if any(q in target_raw for q in _STYLE_QUALIFIERS):
@@ -317,8 +324,6 @@ def _iter_text_extensions(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                     else:
                         continue
                 else:
-                    if not normalized_value:
-                        continue
                     coerced_value = normalized_value
             items.append({
                 "scope": scope,
@@ -379,7 +384,7 @@ def _iter_literal_replace_extensions(manifest: dict[str, Any]) -> list[dict[str,
 
         find_text = target_raw.strip()
         replace_text = replacement.strip()
-        if not find_text or not replace_text or find_text == replace_text:
+        if not find_text or find_text == replace_text:
             continue
 
         items.append({
@@ -1261,6 +1266,54 @@ def _patch_feature_toggles(repo_root: Path, modified: list[str], app_root: str) 
             _write_text(topbar_path, updated, modified, repo_root)
 
 
+def _resolve_static_root_headline_override(manifest: dict[str, Any]) -> str | None:
+    for entry in _iter_text_extensions(manifest):
+        app_targets = entry.get("app_targets", ["frontend", "admin-frontend", "expert", "corporates"])
+        if "frontend" not in app_targets:
+            continue
+        scope = _canonical_data_scope(str(entry.get("scope", "")))
+        key = str(entry.get("key", "")).strip().lower()
+        if scope not in {"landing", "home"}:
+            continue
+        if key not in {"hero_1", "hero_headline", "headline", "headline_line_1"}:
+            continue
+        value = entry.get("value")
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (bool, int, float)):
+            return str(value)
+        return ""
+    return None
+
+
+def _patch_static_root_headline(repo_root: Path, manifest: dict[str, Any], modified: list[str]) -> None:
+    override = _resolve_static_root_headline_override(manifest)
+    if override is None:
+        return
+
+    entry_candidates = [
+        repo_root / "index.html",
+        repo_root / "index.htm",
+        repo_root / "index.html.html",
+    ]
+
+    for entry_path in entry_candidates:
+        if not entry_path.exists() or not entry_path.is_file():
+            continue
+        original = _read_text(entry_path)
+        if not original:
+            continue
+        updated, count = re.subn(
+            r"(<h1\b[^>]*>)([\s\S]*?)(</h1>)",
+            lambda match: f"{match.group(1)}{override}{match.group(3)}",
+            original,
+            count=1,
+        )
+        if count > 0 and updated != original:
+            _write_text(entry_path, updated, modified, repo_root)
+            break
+
+
 def apply_deterministic_customizations(
     manifest: dict[str, Any],
     repo_path: str,
@@ -1270,6 +1323,9 @@ def apply_deterministic_customizations(
     _assert_tenant_repo(repo_root)
 
     modified: list[str] = []
+
+    # Static repositories keep landing copy in root HTML instead of app-root folders.
+    _patch_static_root_headline(repo_root, manifest, modified)
 
     for app_root in _normalize_app_targets(app_targets):
         if not (repo_root / app_root).exists():

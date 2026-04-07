@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { useLLM, LLM_PROVIDERS } from '@/lib/llm-context';
+import { useLLM, LLM_PROVIDERS, type LLMProvider } from '@/lib/llm-context';
 
 interface RemediationRequestProps {
   isOpen: boolean;
@@ -10,13 +10,11 @@ interface RemediationRequestProps {
   projectType?: 'local' | 'github' | null;
 }
 
-const REMEDIATION_PROVIDER = 'claude' as const;
-const REMEDIATION_PROVIDER_CONFIG = LLM_PROVIDERS.find((provider) => provider.id === REMEDIATION_PROVIDER)!;
 const REMEDIATION_DEFAULT_MODEL = 'claude-sonnet-4-5';
 
 export default function RemediationRequest({ isOpen, onClose, onContinue, projectType }: RemediationRequestProps) {
   const [githubToken, setGithubToken] = useState('');
-  const { apiKeys, setApiKey, selectedModels, setModel } = useLLM();
+  const { provider, setProvider, currentConfig, apiKeys, setApiKey, selectedModels, setModel } = useLLM();
   const [keyInput, setKeyInput] = useState('');
   const [modelInput, setModelInput] = useState('');
 
@@ -25,10 +23,10 @@ export default function RemediationRequest({ isOpen, onClose, onContinue, projec
   const handleContinue = () => {
     const token = githubToken.trim();
     const key = keyInput.trim();
-    const model = modelInput.trim() || REMEDIATION_DEFAULT_MODEL;
-    if (key && key !== apiKeys[REMEDIATION_PROVIDER]) setApiKey(REMEDIATION_PROVIDER, key);
-    if (model !== selectedModels[REMEDIATION_PROVIDER]) setModel(REMEDIATION_PROVIDER, model);
-    onContinue(token || undefined, REMEDIATION_PROVIDER, key || apiKeys[REMEDIATION_PROVIDER] || undefined, model);
+    const model = modelInput.trim() || selectedModels[provider] || currentConfig.flagship || REMEDIATION_DEFAULT_MODEL;
+    if (key && key !== apiKeys[provider]) setApiKey(provider, key);
+    if (model !== selectedModels[provider]) setModel(provider, model);
+    onContinue(token || undefined, provider, key || apiKeys[provider] || undefined, model);
     setGithubToken('');
     onClose();
   };
@@ -76,19 +74,28 @@ export default function RemediationRequest({ isOpen, onClose, onContinue, projec
           <div className="mb-5">
             <label className="block text-sm font-medium text-zinc-300 mb-2.5">Remediation Agent</label>
             <div className="rounded-xl border border-orange-500/20 bg-orange-500/10 px-3 py-2.5">
-              <div className="text-sm font-semibold text-orange-200">Claude Agent SDK</div>
+              <div className="text-sm font-semibold text-orange-200">Remediation Pipeline Engine</div>
               <p className="mt-1 text-[11px] leading-relaxed text-orange-100/70">
-                Remediation runs on Claude only. Other LLM providers are not used for this workflow.
+                Uses the new remediation pipeline modules with backend provider routing.
               </p>
+            </div>
+            <div className="mt-2.5">
+              <select
+                value={provider}
+                onChange={e => setProvider(e.target.value as LLMProvider)}
+                className="w-full bg-black/40 border border-white/10 rounded-xl px-3 py-2.5 text-xs text-white focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/30 outline-none transition-all"
+              >
+                {LLM_PROVIDERS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
+              </select>
             </div>
             {/* Model text input */}
             <div className="mt-2.5">
               <input
                 type="text"
-                value={modelInput !== '' ? modelInput : REMEDIATION_DEFAULT_MODEL}
+                value={modelInput !== '' ? modelInput : (selectedModels[provider] || currentConfig.flagship || REMEDIATION_DEFAULT_MODEL)}
                 onChange={e => setModelInput(e.target.value)}
-                onFocus={() => { if (modelInput === '') setModelInput(REMEDIATION_DEFAULT_MODEL); }}
-                placeholder={REMEDIATION_DEFAULT_MODEL}
+                onFocus={() => { if (modelInput === '') setModelInput(selectedModels[provider] || currentConfig.flagship || REMEDIATION_DEFAULT_MODEL); }}
+                placeholder={selectedModels[provider] || currentConfig.flagship || REMEDIATION_DEFAULT_MODEL}
                 className="w-full bg-black/40 border border-white/10 rounded-xl px-3 py-2.5 text-xs text-white placeholder-zinc-600 focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/30 outline-none transition-all font-mono"
                 autoComplete="off"
                 spellCheck={false}
@@ -98,10 +105,10 @@ export default function RemediationRequest({ isOpen, onClose, onContinue, projec
             <div className="mt-2 relative">
               <input
                 type="password"
-                value={keyInput !== '' ? keyInput : (apiKeys[REMEDIATION_PROVIDER] || '')}
+                value={keyInput !== '' ? keyInput : (apiKeys[provider] || '')}
                 onChange={e => setKeyInput(e.target.value)}
-                onFocus={() => { if (keyInput === '') setKeyInput(apiKeys[REMEDIATION_PROVIDER] || ''); }}
-                placeholder={REMEDIATION_PROVIDER_CONFIG.placeholder || 'API key...'}
+                onFocus={() => { if (keyInput === '') setKeyInput(apiKeys[provider] || ''); }}
+                placeholder={currentConfig.placeholder || 'API key...'}
                 className="w-full bg-black/40 border border-white/10 rounded-xl px-3 py-2.5 text-xs text-white placeholder-zinc-600 focus:border-indigo-500/50 focus:ring-1 focus:ring-indigo-500/30 outline-none transition-all font-mono"
                 autoComplete="off"
                 spellCheck={false}

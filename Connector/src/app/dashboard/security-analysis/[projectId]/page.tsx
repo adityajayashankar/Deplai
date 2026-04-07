@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { useParams, useRouter } from 'next/navigation';
+import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import * as THREE from 'three';
 import {
   AlertCircle,
@@ -22,7 +22,7 @@ import {
   TerminalSquare,
 } from 'lucide-react';
 import { useScan, type VulnStatus } from '@/lib/scan-context';
-import { useLLM, LLM_PROVIDERS } from '@/lib/llm-context';
+import { useLLM, LLM_PROVIDERS, type LLMProvider } from '@/lib/llm-context';
 
 type PipelineStageId = 'scan' | 'results' | 'remediate_setup' | 'remediate_run' | 'approval' | 'pr_rescan';
 
@@ -45,8 +45,6 @@ const STAGE_INDEX: Record<PipelineStageId, number> = {
 };
 
 const RESULTS_HEARTBEAT_MS = 30_000;
-const REMEDIATION_PROVIDER = 'claude' as const;
-const REMEDIATION_PROVIDER_CONFIG = LLM_PROVIDERS.find((entry) => entry.id === REMEDIATION_PROVIDER)!;
 const REMEDIATION_DEFAULT_MODEL = 'claude-sonnet-4-5';
 
 const EMPTY_STATS = { total: 0, critical: 0, high: 0, autoFixable: 0 };
@@ -902,7 +900,9 @@ function inferBaseStage({
 export default function SecurityAnalysisPage() {
   const router = useRouter();
   const params = useParams();
+  const searchParams = useSearchParams();
   const projectId = params.projectId as string;
+  const runAll = searchParams.get('runAll') === '1';
 
   const {
     getScanState,
@@ -917,7 +917,7 @@ export default function SecurityAnalysisPage() {
     resetRemediation,
     isAnyRemediating,
   } = useScan();
-  const { apiKeys, setApiKey, selectedModels, setModel } = useLLM();
+  const { provider, setProvider, currentConfig, apiKeys, setApiKey, selectedModels, setModel } = useLLM();
 
   const { state: scanState, messages: scanMessages, projectName: scanProjectName } = getScanState(projectId);
   const { state: remediationState, messages: remMessages } = getRemediationState(projectId);
@@ -957,9 +957,9 @@ export default function SecurityAnalysisPage() {
   const previousBaseStageRef = useRef<PipelineStageId>('scan');
 
   useEffect(() => {
-    setKeyInput(apiKeys[REMEDIATION_PROVIDER] || '');
-    setModelInput(REMEDIATION_DEFAULT_MODEL);
-  }, [apiKeys, selectedModels]);
+    setKeyInput(apiKeys[provider] || '');
+    setModelInput(selectedModels[provider] || currentConfig.flagship || REMEDIATION_DEFAULT_MODEL);
+  }, [apiKeys, currentConfig.flagship, provider, selectedModels]);
 
   useEffect(() => {
     scanLogEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1232,6 +1232,14 @@ export default function SecurityAnalysisPage() {
   }, [remMessages]);
 
   const hasScanOutcome = useMemo(() => vulnStatus !== 'not_initiated' || scanState === 'completed' || results !== null || loadingResults, [loadingResults, results, scanState, vulnStatus]);
+  const deploymentPath = useMemo(
+    () => `/dashboard/deploy?projectId=${encodeURIComponent(projectId)}&entry=run-all`,
+    [projectId],
+  );
+  const canProceedToDeployment = useMemo(
+    () => hasScanOutcome && !loading && !loadingResults && scanState !== 'running',
+    [hasScanOutcome, loading, loadingResults, scanState],
+  );
   const hasVulnerabilities = useMemo(() => {
     if (!results) return vulnStatus === 'found';
     return (results.supply_chain?.length || 0) > 0 || (results.code_security?.length || 0) > 0;
@@ -1342,11 +1350,11 @@ export default function SecurityAnalysisPage() {
 
   const handleStartRemediation = useCallback(async () => {
     const trimmedKey = keyInput.trim();
-    const trimmedModel = modelInput.trim() || REMEDIATION_DEFAULT_MODEL;
+    const trimmedModel = modelInput.trim() || selectedModels[provider] || currentConfig.flagship || REMEDIATION_DEFAULT_MODEL;
     const trimmedToken = githubToken.trim();
 
-    if (trimmedKey && trimmedKey !== apiKeys[REMEDIATION_PROVIDER]) setApiKey(REMEDIATION_PROVIDER, trimmedKey);
-    if (trimmedModel && trimmedModel !== selectedModels[REMEDIATION_PROVIDER]) setModel(REMEDIATION_PROVIDER, trimmedModel);
+    if (trimmedKey && trimmedKey !== apiKeys[provider]) setApiKey(provider, trimmedKey);
+    if (trimmedModel && trimmedModel !== selectedModels[provider]) setModel(provider, trimmedModel);
 
     setError(null);
     setSetupOpen(false);
@@ -1360,15 +1368,15 @@ export default function SecurityAnalysisPage() {
         projectId,
         undefined,
         trimmedToken || undefined,
-        REMEDIATION_PROVIDER,
-        trimmedKey || apiKeys[REMEDIATION_PROVIDER] || undefined,
+        provider,
+        trimmedKey || apiKeys[provider] || undefined,
         trimmedModel,
       );
       setGithubToken('');
     } catch (remediationError) {
       setError(remediationError instanceof Error ? remediationError.message : 'Failed to start remediation');
     }
-  }, [apiKeys, githubToken, keyInput, modelInput, projectId, selectedModels, setApiKey, setModel, startRemediation]);
+  }, [apiKeys, currentConfig.flagship, githubToken, keyInput, modelInput, projectId, provider, selectedModels, setApiKey, setModel, startRemediation]);
 
   const handleContinueRound = useCallback(() => {
     continueRemediationRound(projectId);
@@ -1682,6 +1690,14 @@ export default function SecurityAnalysisPage() {
             ) : null}
           </>
         )}
+
+        {runAll ? (
+          <div className="flex justify-center pt-2">
+            <RunButton className="max-w-65" disabled={!canProceedToDeployment} onClick={() => router.push(deploymentPath)}>
+              Proceed to Deployment
+            </RunButton>
+          </div>
+        ) : null}
       </div>
     );
   };
@@ -1698,17 +1714,40 @@ export default function SecurityAnalysisPage() {
           <div>
             <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">Remediation Agent</label>
             <div className="rounded-md border border-orange-500/20 bg-orange-500/10 px-4 py-3">
-              <div className="text-sm font-semibold text-orange-200">Claude Agent SDK</div>
-              <p className="mt-1 text-xs text-orange-100/70">This remediation workflow is locked to Claude only.</p>
+              <div className="text-sm font-semibold text-orange-200">Remediation Pipeline Engine</div>
+              <p className="mt-1 text-xs text-orange-100/70">Security track now runs through the new remediation pipeline modules with provider routing in backend.</p>
             </div>
           </div>
           <div>
-            <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">Claude Model</label>
-            <input value={modelInput} onChange={(event) => setModelInput(event.target.value)} placeholder={REMEDIATION_DEFAULT_MODEL} className="w-full rounded-md border border-[#262626] bg-[#000000] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none transition-colors focus:border-indigo-500/50" />
+            <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">LLM Provider</label>
+            <select
+              value={provider}
+              onChange={(event) => setProvider(event.target.value as LLMProvider)}
+              className="w-full rounded-md border border-[#262626] bg-[#000000] px-4 py-2.5 text-sm text-zinc-200 outline-none transition-colors focus:border-indigo-500/50"
+            >
+              {LLM_PROVIDERS.map((entry) => (
+                <option key={entry.id} value={entry.id}>{entry.label}</option>
+              ))}
+            </select>
           </div>
           <div>
-            <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">Anthropic API Key</label>
-            <input type="password" value={keyInput} onChange={(event) => setKeyInput(event.target.value)} placeholder={REMEDIATION_PROVIDER_CONFIG.placeholder || 'API key'} className="w-full rounded-md border border-[#262626] bg-[#000000] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none transition-colors focus:border-indigo-500/50" />
+            <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">Model</label>
+            <input
+              value={modelInput}
+              onChange={(event) => setModelInput(event.target.value)}
+              placeholder={selectedModels[provider] || currentConfig.flagship || REMEDIATION_DEFAULT_MODEL}
+              className="w-full rounded-md border border-[#262626] bg-[#000000] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none transition-colors focus:border-indigo-500/50"
+            />
+          </div>
+          <div>
+            <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">{currentConfig.label} API Key</label>
+            <input
+              type="password"
+              value={keyInput}
+              onChange={(event) => setKeyInput(event.target.value)}
+              placeholder={currentConfig.placeholder || 'API key'}
+              className="w-full rounded-md border border-[#262626] bg-[#000000] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none transition-colors focus:border-indigo-500/50"
+            />
           </div>
           <div className="border-t border-[#1A1A1A] pt-4">
             <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">GitHub PAT (Optional)</label>
@@ -1873,6 +1912,14 @@ export default function SecurityAnalysisPage() {
             {!verificationPending ? <div className="w-full"><RunButton onClick={() => router.push('/dashboard')}>Return to Dashboard</RunButton></div> : null}
           </BorderGlow>
         </div>
+
+        {runAll ? (
+          <div className="flex justify-center pt-2">
+            <RunButton className="max-w-65" disabled={!canProceedToDeployment} onClick={() => router.push(deploymentPath)}>
+              Proceed to Deployment
+            </RunButton>
+          </div>
+        ) : null}
       </div>
     );
   };

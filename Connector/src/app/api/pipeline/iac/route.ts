@@ -8,6 +8,8 @@ import fs from 'fs';
 import path from 'path';
 
 type Provider = 'aws' | 'azure' | 'gcp';
+type IacMode = 'deterministic' | 'llm';
+type LlmProvider = 'groq' | 'openrouter' | 'ollama' | 'opencode' | 'openai';
 
 interface ScanResultsData {
   supply_chain?: Array<{ cve_id?: string; severity?: string; fix_version?: string }>;
@@ -17,6 +19,8 @@ interface ScanResultsData {
 interface IacGenerateBody {
   project_id: string;
   provider?: Provider;
+  iac_mode?: IacMode;
+  budget_cap_usd?: number;
   qa_summary?: string;
   architecture_context?: string;
   // Required in LLM-only IaC mode: full architecture JSON
@@ -33,6 +37,7 @@ interface IacGenerateBody {
   llm_provider?: string;
   llm_api_key?: string;
   llm_model?: string;
+  llm_api_base_url?: string;
 }
 
 interface GeneratedFile {
@@ -55,6 +60,12 @@ interface RepoPersistenceResult {
   reason?: string;
   error?: string;
   files_committed?: number;
+}
+
+interface LlmResolvedConfig {
+  provider: LlmProvider;
+  model: string;
+  apiBaseUrl: string;
 }
 
 function classifyAgenticRouteError(err: unknown, action: string): { message: string; status: number } {
@@ -737,6 +748,312 @@ function clampProvider(value: string | undefined): Provider {
   return 'aws';
 }
 
+function clampIacMode(value: string | undefined): IacMode {
+  return String(value || '').trim().toLowerCase() === 'llm' ? 'llm' : 'deterministic';
+}
+
+function clampLlmProvider(value: string | undefined): LlmProvider {
+  const provider = String(value || '').trim().toLowerCase();
+  if (provider === 'groq' || provider === 'openrouter' || provider === 'ollama' || provider === 'opencode' || provider === 'openai') {
+    return provider;
+  }
+  return 'groq';
+}
+
+function normalizeApiBaseUrl(value: string | undefined): string {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function extractTextContent(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value)) return '';
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') return '';
+      const text = (item as { text?: unknown }).text;
+      return typeof text === 'string' ? text : '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function parseJsonDocument(rawText: string): unknown | null {
+  const trimmed = String(rawText || '').trim();
+  if (!trimmed) return null;
+
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .trim();
+
+  const candidates: string[] = [unfenced];
+  const firstObjectStart = unfenced.indexOf('{');
+  const lastObjectEnd = unfenced.lastIndexOf('}');
+  if (firstObjectStart >= 0 && lastObjectEnd > firstObjectStart) {
+    candidates.push(unfenced.slice(firstObjectStart, lastObjectEnd + 1));
+  }
+
+  const firstArrayStart = unfenced.indexOf('[');
+  const lastArrayEnd = unfenced.lastIndexOf(']');
+  if (firstArrayStart >= 0 && lastArrayEnd > firstArrayStart) {
+    candidates.push(unfenced.slice(firstArrayStart, lastArrayEnd + 1));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function dedupeGeneratedFiles(files: GeneratedFile[]): GeneratedFile[] {
+  const byPath = new Map<string, GeneratedFile>();
+  for (const file of files) {
+    const safePath = normalizeRepoWritePath(file.path);
+    if (!safePath) continue;
+    if (!safePath.startsWith('terraform/') && !safePath.startsWith('ansible/') && safePath !== 'README.md') continue;
+    const content = String(file.content || '');
+    if (!content) continue;
+    if (content.length > 900_000) continue;
+    byPath.set(safePath, {
+      path: safePath,
+      content,
+      encoding: file.encoding === 'base64' ? 'base64' : 'utf-8',
+    });
+    if (byPath.size >= 300) break;
+  }
+  return Array.from(byPath.values());
+}
+
+function parseLlmGeneratedFiles(payload: unknown): GeneratedFile[] {
+  let rawFiles: unknown[] = [];
+
+  if (Array.isArray(payload)) {
+    rawFiles = payload;
+  } else if (payload && typeof payload === 'object') {
+    const fromFiles = (payload as { files?: unknown }).files;
+    if (Array.isArray(fromFiles)) {
+      rawFiles = fromFiles;
+    } else if (fromFiles && typeof fromFiles === 'object') {
+      rawFiles = Object.entries(fromFiles as Record<string, unknown>).map(([path, content]) => ({ path, content }));
+    }
+  }
+
+  const normalized = dedupeGeneratedFiles(
+    rawFiles
+      .filter((entry) => entry && typeof entry === 'object')
+      .map((entry) => {
+        const row = entry as { path?: unknown; content?: unknown; encoding?: unknown };
+        return {
+          path: String(row.path || '').trim(),
+          content: String(row.content || ''),
+          encoding: row.encoding === 'base64' ? 'base64' : 'utf-8',
+        } as GeneratedFile;
+      }),
+  );
+
+  return normalized;
+}
+
+function hasRequiredAwsCoreFiles(files: GeneratedFile[]): boolean {
+  const required = new Set([
+    'terraform/providers.tf',
+    'terraform/backend.tf',
+    'terraform/main.tf',
+    'terraform/variables.tf',
+    'terraform/terraform.tfvars',
+    'terraform/outputs.tf',
+  ]);
+
+  for (const file of files) {
+    required.delete(normalizeRepoWritePath(file.path));
+    if (required.size === 0) return true;
+  }
+  return required.size === 0;
+}
+
+function mergeGeneratedFiles(primary: GeneratedFile[], secondary: GeneratedFile[]): GeneratedFile[] {
+  const merged = new Map<string, GeneratedFile>();
+  for (const file of dedupeGeneratedFiles(primary)) {
+    merged.set(file.path, file);
+  }
+  for (const file of dedupeGeneratedFiles(secondary)) {
+    merged.set(file.path, file);
+  }
+  return Array.from(merged.values());
+}
+
+function resolveLlmConfig(provider: LlmProvider, modelOverride: string, apiBaseOverride: string): LlmResolvedConfig {
+  const defaults: Record<LlmProvider, { model: string; base: string }> = {
+    groq: {
+      model: 'llama-3.3-70b-versatile',
+      base: 'https://api.groq.com/openai/v1',
+    },
+    openrouter: {
+      model: 'meta-llama/llama-3.3-70b-instruct:free',
+      base: 'https://openrouter.ai/api/v1',
+    },
+    ollama: {
+      model: 'llama3.1:8b',
+      base: 'https://api.ollama.com/v1',
+    },
+    opencode: {
+      model: 'openai/gpt-oss-20b',
+      base: process.env.OPENCODE_API_BASE_URL || 'https://api.opencode.ai/v1',
+    },
+    openai: {
+      model: 'gpt-4o-mini',
+      base: 'https://api.openai.com/v1',
+    },
+  };
+
+  return {
+    provider,
+    model: String(modelOverride || '').trim() || defaults[provider].model,
+    apiBaseUrl: normalizeApiBaseUrl(apiBaseOverride || defaults[provider].base),
+  };
+}
+
+async function generateIacBundleWithLlm(params: {
+  provider: Provider;
+  projectName: string;
+  qaSummary: string;
+  architectureContext: string;
+  architectureJson: Record<string, unknown> | null;
+  contextBlock: string;
+  websiteIndexHtml: string;
+  llmProvider: LlmProvider;
+  llmModel: string;
+  llmApiKey: string;
+  llmApiBaseUrl: string;
+}): Promise<{ files: GeneratedFile[]; provider: LlmProvider; model: string; summary: string }> {
+  const resolved = resolveLlmConfig(params.llmProvider, params.llmModel, params.llmApiBaseUrl);
+  const endpoint = `${resolved.apiBaseUrl}/chat/completions`;
+  const architectureSnippet = params.architectureJson
+    ? JSON.stringify(params.architectureJson, null, 2).slice(0, 24_000)
+    : '{}';
+
+  const requiredFiles = params.provider === 'aws'
+    ? [
+      'terraform/providers.tf',
+      'terraform/backend.tf',
+      'terraform/main.tf',
+      'terraform/variables.tf',
+      'terraform/terraform.tfvars',
+      'terraform/outputs.tf',
+    ]
+    : [
+      'terraform/main.tf',
+      'terraform/variables.tf',
+      'terraform/outputs.tf',
+    ];
+
+  const systemPrompt = [
+    'You generate production-ready Terraform IaC bundles.',
+    'Respond with strict JSON only. No markdown fences.',
+    'JSON schema:',
+    '{"summary":"string","files":[{"path":"terraform/main.tf","content":"..."}]}',
+    'Every file object must have path and content as strings.',
+    `Include required files: ${requiredFiles.join(', ')}`,
+    'You may include ansible files and README.md.',
+    'Keep output deterministic and valid Terraform syntax.',
+  ].join('\n');
+
+  const userPrompt = [
+    `Cloud provider: ${params.provider}`,
+    `Project: ${params.projectName}`,
+    '',
+    'Operator Q/A summary:',
+    params.qaSummary || 'n/a',
+    '',
+    'Architecture context:',
+    params.architectureContext || 'n/a',
+    '',
+    'Architecture JSON (trimmed):',
+    architectureSnippet,
+    '',
+    'Security and repository context:',
+    params.contextBlock || 'n/a',
+    '',
+    'Static website index html to host/use where relevant:',
+    params.websiteIndexHtml || '<html><body>deplai</body></html>',
+    '',
+    'Return only JSON. No prose outside the JSON object.',
+  ].join('\n');
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (params.llmApiKey) {
+    headers.Authorization = `Bearer ${params.llmApiKey}`;
+  }
+  if (resolved.provider === 'openrouter') {
+    headers['HTTP-Referer'] = 'https://deplai.local';
+    headers['X-Title'] = 'DeplAI IaC Generator';
+  }
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: resolved.model,
+      temperature: 0.15,
+      max_tokens: 3200,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+    }),
+    signal: AbortSignal.timeout(90_000),
+  });
+
+  const raw = await response.text();
+  let parsedResponse: unknown;
+  try {
+    parsedResponse = JSON.parse(raw);
+  } catch {
+    parsedResponse = null;
+  }
+
+  if (!response.ok) {
+    const message = parsedResponse && typeof parsedResponse === 'object'
+      ? String((parsedResponse as { error?: { message?: unknown } }).error?.message || '').trim()
+      : '';
+    const fallbackMessage = String(raw || '').slice(0, 280).trim();
+    throw new Error(message || fallbackMessage || `LLM provider returned HTTP ${response.status}.`);
+  }
+
+  const content = extractTextContent(
+    parsedResponse && typeof parsedResponse === 'object'
+      ? (parsedResponse as { choices?: Array<{ message?: { content?: unknown } }> }).choices?.[0]?.message?.content
+      : '',
+  );
+
+  const parsedPayload = parseJsonDocument(content);
+  if (!parsedPayload) {
+    throw new Error('LLM output was not valid JSON.');
+  }
+
+  const files = parseLlmGeneratedFiles(parsedPayload);
+  if (files.length === 0) {
+    throw new Error('LLM response did not include usable files.');
+  }
+
+  const summary = parsedPayload && typeof parsedPayload === 'object'
+    ? String((parsedPayload as { summary?: unknown }).summary || '').trim()
+    : '';
+
+  return {
+    files,
+    provider: resolved.provider,
+    model: resolved.model,
+    summary,
+  };
+}
+
 function toAwsProjectSlug(value: string): string {
   const normalized = String(value || '')
     .trim()
@@ -809,6 +1126,7 @@ function buildAwsSixFileBundle(
   contextBlock: string,
   sec: ReturnType<typeof summarizeSecurity>,
   websiteIndexHtml: string,
+  lowCostMode: boolean,
 ): GeneratedFile[] {
   const safeContext = contextBlock.replace(/\r/g, '');
   const ec2HtmlBase64 = Buffer.from(String(websiteIndexHtml || ''), 'utf-8').toString('base64');
@@ -863,7 +1181,7 @@ variable "instance_type" {
 
 variable "enable_ec2" {
   type    = bool
-  default = true
+  default = ${lowCostMode ? 'false' : 'true'}
 }
 
 variable "existing_ec2_key_pair_name" {
@@ -903,7 +1221,7 @@ variable "public_subnet_cidr" {
 
 variable "force_destroy_site_bucket" {
   type    = bool
-  default = true
+  default = false
 }
 
 variable "ec2_root_volume_size" {
@@ -927,7 +1245,7 @@ variable "context_summary" {
 aws_region = "eu-north-1"
 environment = "dev"
 instance_type = "t3.micro"
-enable_ec2 = true
+enable_ec2 = ${lowCostMode ? 'false' : 'true'}
 existing_ec2_key_pair_name = ""
 ingress_cidr_blocks = ["0.0.0.0/0"]
 ssh_ingress_cidr_blocks = []
@@ -935,7 +1253,7 @@ preferred_availability_zones = ["eu-north-1a", "eu-north-1b", "eu-north-1c"]
 use_default_vpc = true
 vpc_cidr_block = "10.42.0.0/16"
 public_subnet_cidr = "10.42.1.0/24"
-force_destroy_site_bucket = true
+force_destroy_site_bucket = false
 ec2_root_volume_size = 8
 bootstrap_index_html_base64 = "${ec2HtmlBase64}"
 context_summary = <<-EOT
@@ -1037,6 +1355,10 @@ resource "aws_security_group" "web" {
   vpc_id      = local.selected_vpc_id
   tags        = local.tags
 
+  lifecycle {
+    create_before_destroy = true
+  }
+
   dynamic "ingress" {
     for_each = var.ssh_ingress_cidr_blocks
     content {
@@ -1119,21 +1441,22 @@ resource "aws_instance" "app" {
     encrypted   = true
   }
 
-  user_data = <<-EOF
-              #!/bin/bash
-              set -euxo pipefail
-              dnf install -y nginx
-              mkdir -p /usr/share/nginx/html
-              cat > /usr/share/nginx/html/index.html <<'HTML'
-              \${base64decode(var.bootstrap_index_html_base64)}
-              HTML
-              systemctl enable nginx
-              systemctl restart nginx
-              EOF
+  user_data = join("\n", [
+    "#!/bin/bash",
+    "set -euxo pipefail",
+    "dnf install -y nginx",
+    "mkdir -p /usr/share/nginx/html",
+    "printf '%s' \"\${var.bootstrap_index_html_base64}\" | base64 --decode > /usr/share/nginx/html/index.html",
+    "systemctl enable nginx",
+    "systemctl restart nginx",
+  ])
 }
 
 resource "random_id" "bucket_suffix" {
   byte_length = 4
+  keepers = {
+    project_name = var.project_name
+  }
 }
 
 resource "aws_s3_bucket" "website" {
@@ -1152,7 +1475,7 @@ resource "aws_s3_bucket_public_access_block" "website" {
 
 resource "aws_s3_bucket_ownership_controls" "website" {
   bucket = aws_s3_bucket.website.id
-  rule { object_ownership = "BucketOwnerPreferred" }
+  rule { object_ownership = "BucketOwnerEnforced" }
 }
 
 resource "aws_s3_object" "index" {
@@ -1194,6 +1517,18 @@ resource "aws_cloudfront_distribution" "website" {
     }
   }
 
+  custom_error_response {
+    error_code         = 403
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+
+  custom_error_response {
+    error_code         = 404
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+
   restrictions {
     geo_restriction {
       restriction_type = "none"
@@ -1225,6 +1560,7 @@ resource "aws_s3_bucket_policy" "website" {
 `;
 
   const outputsTf = `output "cloudfront_url" { value = "https://\${aws_cloudfront_distribution.website.domain_name}" }
+output "cloudfront_domain" { value = aws_cloudfront_distribution.website.domain_name }
 output "website_bucket_name" { value = aws_s3_bucket.website.id }
 output "ec2_instance_id" { value = try(aws_instance.app[0].id, null) }
 output "ec2_instance_arn" { value = try(aws_instance.app[0].arn, null) }
@@ -1237,6 +1573,9 @@ output "ec2_private_dns" { value = try(aws_instance.app[0].private_dns, null) }
 output "ec2_vpc_id" { value = local.selected_vpc_id }
 output "ec2_subnet_id" { value = local.selected_instance_subnet_id }
 output "ec2_key_name" { value = local.selected_ec2_key_name }
+output "availability_warning" {
+  value = var.environment == "production" && var.enable_ec2 ? "Single-AZ EC2 deployment detected. Consider multi-AZ architecture for HA." : ""
+}
 output "generated_ec2_private_key_pem" {
   value     = try(tls_private_key.generated[0].private_key_pem, null)
   sensitive = true
@@ -1271,6 +1610,8 @@ example-host ansible_host=127.0.0.1 ansible_user=ubuntu
   const readme = `# IaC Bundle - ${projectName}
 
 Standard 6-file Terraform fallback bundle generated by DeplAI.
+
+Budget mode: ${lowCostMode ? 'strict <= $1 target (EC2 disabled by default)' : 'standard'}
 
 Terraform files:
 - terraform/providers.tf
@@ -1494,6 +1835,16 @@ export async function POST(req: NextRequest) {
     if ('error' in owned) return owned.error;
 
     const provider = clampProvider(body.provider);
+    const iacMode = clampIacMode(body.iac_mode);
+    const llmProvider = clampLlmProvider(body.llm_provider);
+    const llmApiKey = String(body.llm_api_key || body.openai_api_key || '').trim();
+    const llmModel = String(body.llm_model || '').trim();
+    const llmApiBaseUrl = normalizeApiBaseUrl(body.llm_api_base_url);
+    const requestedBudgetCap = Number(body.budget_cap_usd);
+    const budgetCapUsd = Number.isFinite(requestedBudgetCap) && requestedBudgetCap > 0
+      ? requestedBudgetCap
+      : 100;
+    const lowCostMode = budgetCapUsd <= 1;
     const projectName = String(owned.project?.name || owned.project?.full_name || projectId).split('/').pop() || projectId;
     const qa = String(body.qa_summary || '').trim();
     const arch = String(body.architecture_context || '').trim();
@@ -1596,6 +1947,7 @@ export async function POST(req: NextRequest) {
       ? detectFrontendEntrypoint(sourceRoot)
       : null;
     const websiteAssets = websiteCollection?.assets || [];
+    const effectiveWebsiteAssets = lowCostMode ? [] : websiteAssets;
     const websiteEntrypoint = provider === 'aws'
       ? resolvePrimaryWebsiteHtmlFromAssets(websiteAssets)
       : { relativePath: null, html: null, reason: 'provider is not aws' };
@@ -1609,6 +1961,9 @@ export async function POST(req: NextRequest) {
     if (provider === 'aws') {
       if (websiteCollection?.selectedRoot) {
         iacWarnings.push(`Website assets were collected from '${websiteCollection.selectedRoot}'.`);
+      }
+      if (lowCostMode) {
+        iacWarnings.push('Strict low-cost mode enabled (<= $1). EC2 defaults are disabled and bulk website asset mirroring is skipped.');
       }
       if ((websiteCollection?.assets.length || 0) === 0) {
         iacWarnings.push('No deployable web asset directory was found; using a generated index.html fallback.');
@@ -1651,14 +2006,56 @@ export async function POST(req: NextRequest) {
       }
 
       const safeProjectSlug = toAwsProjectSlug(projectName);
-      const files = [
-        ...buildAwsSixFileBundle(projectName, safeProjectSlug, contextBlock, sec, websiteIndexHtml),
-        ...buildWebsiteSiteFiles(websiteAssets, websiteIndexHtml),
+      const deterministicFiles = [
+        ...buildAwsSixFileBundle(projectName, safeProjectSlug, contextBlock, sec, websiteIndexHtml, lowCostMode),
+        ...buildWebsiteSiteFiles(effectiveWebsiteAssets, websiteIndexHtml),
       ];
+
+      let files = deterministicFiles;
+      let source = 'connector_aws_bundle';
+      let llmSummary = '';
+      if (iacMode === 'llm') {
+        if (!llmApiKey && llmProvider !== 'ollama') {
+          return NextResponse.json(
+            { error: `LLM mode requires llm_api_key for provider '${llmProvider}'.` },
+            { status: 400 },
+          );
+        }
+        try {
+          const llmResult = await generateIacBundleWithLlm({
+            provider,
+            projectName,
+            qaSummary: qa,
+            architectureContext: arch,
+            architectureJson: architectureValidation?.normalized || null,
+            contextBlock,
+            websiteIndexHtml,
+            llmProvider,
+            llmModel,
+            llmApiKey,
+            llmApiBaseUrl,
+          });
+          const llmFiles = mergeGeneratedFiles(llmResult.files, buildWebsiteSiteFiles(effectiveWebsiteAssets, websiteIndexHtml));
+          if (!hasRequiredAwsCoreFiles(llmFiles)) {
+            throw new Error('LLM output missed required AWS Terraform core files.');
+          }
+          files = llmFiles;
+          source = `llm_${llmResult.provider}`;
+          llmSummary = llmResult.summary;
+          iacWarnings.push(`IaC generated via ${llmResult.provider} using model '${llmResult.model}'.`);
+        } catch (llmErr) {
+          source = 'connector_aws_bundle_fallback';
+          iacWarnings.push(`LLM IaC generation failed; falling back to deterministic bundle. Reason: ${llmErr instanceof Error ? llmErr.message : 'unknown error'}`);
+        }
+      }
+
       const allWarnings = [
         ...scanContextWarnings,
         ...iacWarnings,
-        'Generated Terraform bundle locally from repository analysis, interactive Q&A context, and the selected AWS region.',
+        `IaC generation mode: ${iacMode}.`,
+        source.startsWith('llm_')
+          ? 'Generated Terraform bundle from selected LLM provider and repository context.'
+          : 'Generated Terraform bundle locally from repository analysis, interactive Q&A context, and the selected AWS region.',
         'Terraform files use a local backend by default. AWS credentials are only needed later for apply/deploy.',
       ];
       const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, files);
@@ -1672,10 +2069,10 @@ export async function POST(req: NextRequest) {
         provider,
         project_id: projectId,
         project_name: projectName,
-        summary: `Generated ${files.length} Terraform files from repository analysis and operator context.`,
+        summary: llmSummary || `Generated ${files.length} Terraform files from repository analysis and operator context.`,
         files,
         security_context: sec,
-        source: 'connector_aws_bundle',
+        source,
         run_id: null,
         workspace: null,
         provider_version: null,
@@ -1688,6 +2085,7 @@ export async function POST(req: NextRequest) {
         website_asset_stats: {
           selected_root: websiteCollection?.selectedRoot || '',
           asset_count: websiteAssets.length,
+          mirrored_asset_count: effectiveWebsiteAssets.length,
           total_bytes: websiteCollection?.totalBytes || 0,
           truncated: Boolean(websiteCollection?.truncated),
           skipped_large_files: websiteCollection?.skippedLargeFiles || 0,
@@ -1697,19 +2095,56 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const files = provider === 'azure'
+    const deterministicFiles = provider === 'azure'
       ? buildAzureBundle(projectName, contextBlock, sec)
       : buildGcpBundle(projectName, contextBlock, sec);
+    let files = deterministicFiles;
+    let source = 'template';
+    let llmSummary = '';
+
+    if (iacMode === 'llm') {
+      if (!llmApiKey && llmProvider !== 'ollama') {
+        return NextResponse.json(
+          { error: `LLM mode requires llm_api_key for provider '${llmProvider}'.` },
+          { status: 400 },
+        );
+      }
+      try {
+        const llmResult = await generateIacBundleWithLlm({
+          provider,
+          projectName,
+          qaSummary: qa,
+          architectureContext: arch,
+          architectureJson: architectureValidation?.normalized || null,
+          contextBlock,
+          websiteIndexHtml,
+          llmProvider,
+          llmModel,
+          llmApiKey,
+          llmApiBaseUrl,
+        });
+        files = llmResult.files;
+        source = `llm_${llmResult.provider}`;
+        llmSummary = llmResult.summary;
+        iacWarnings.push(`IaC generated via ${llmResult.provider} using model '${llmResult.model}'.`);
+      } catch (llmErr) {
+        source = 'template_fallback';
+        iacWarnings.push(`LLM IaC generation failed; using deterministic provider template. Reason: ${llmErr instanceof Error ? llmErr.message : 'unknown error'}`);
+      }
+    }
+
     const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, files);
     if (iacRepoPr.attempted && !iacRepoPr.success) {
       const persistenceMsg = iacRepoPr.error || iacRepoPr.reason || 'IaC repo persistence failed.';
       iacWarnings.push(`IaC PR persistence: ${persistenceMsg}`);
     }
 
-    const combinedWarnings = [...scanContextWarnings, ...iacWarnings];
-    const summary = combinedWarnings.length > 0
-      ? `Generated ${files.length} IaC files for ${provider.toUpperCase()} with ${combinedWarnings.length} warning(s).`
-      : `Generated ${files.length} IaC files for ${provider.toUpperCase()}.`;
+    const combinedWarnings = [...scanContextWarnings, ...iacWarnings, `IaC generation mode: ${iacMode}.`];
+    const summary = llmSummary || (
+      combinedWarnings.length > 0
+        ? `Generated ${files.length} IaC files for ${provider.toUpperCase()} with ${combinedWarnings.length} warning(s).`
+        : `Generated ${files.length} IaC files for ${provider.toUpperCase()}.`
+    );
 
     return NextResponse.json({
       success: true,
@@ -1719,7 +2154,7 @@ export async function POST(req: NextRequest) {
       summary,
       files,
       security_context: sec,
-      source: 'template',
+      source,
       iac_repo_pr: iacRepoPr,
       warnings: combinedWarnings,
       website_asset_stats: null,

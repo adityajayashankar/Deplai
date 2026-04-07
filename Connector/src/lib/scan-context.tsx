@@ -231,9 +231,10 @@ function readPersistedSnapshot(): PersistedScanContextSnapshot | null {
 }
 
 export function ScanProvider({ children }: { children: React.ReactNode }) {
-  const [scanStates, setScanStates] = useState<Record<string, ProjectScanState>>(() => normalizeStoredScanStates(readPersistedSnapshot()?.scanStates));
-  const [remediationStates, setRemediationStates] = useState<Record<string, ProjectRemediationState>>(() => normalizeStoredRemediationStates(readPersistedSnapshot()?.remediationStates));
-  const [resultsCache, setResultsCache] = useState<Record<string, CachedScanResults>>(() => normalizeStoredResultsCache(readPersistedSnapshot()?.resultsCache));
+  const [scanStates, setScanStates] = useState<Record<string, ProjectScanState>>({});
+  const [remediationStates, setRemediationStates] = useState<Record<string, ProjectRemediationState>>({});
+  const [resultsCache, setResultsCache] = useState<Record<string, CachedScanResults>>({});
+  const [storageHydrated, setStorageHydrated] = useState(false);
   const wsRefs = useRef<Record<string, WebSocket>>({});
   const remWsRefs = useRef<Record<string, WebSocket>>({});
 
@@ -283,6 +284,17 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
   }, [clampMapSize]);
 
   useEffect(() => {
+    const snapshot = readPersistedSnapshot();
+    if (snapshot) {
+      setScanStates(normalizeStoredScanStates(snapshot.scanStates));
+      setRemediationStates(normalizeStoredRemediationStates(snapshot.remediationStates));
+      setResultsCache(normalizeStoredResultsCache(snapshot.resultsCache));
+    }
+    setStorageHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!storageHydrated) return;
     const handleStorage = (event: StorageEvent) => {
       if (event.key !== SCAN_CONTEXT_STORAGE_KEY) return;
       if (!event.newValue) {
@@ -302,9 +314,10 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     };
     window.addEventListener('storage', handleStorage);
     return () => window.removeEventListener('storage', handleStorage);
-  }, [normalizeRemediationStates, normalizeResultsCache, normalizeScanStates]);
+  }, [normalizeRemediationStates, normalizeResultsCache, normalizeScanStates, storageHydrated]);
 
   useEffect(() => {
+    if (!storageHydrated) return;
     const snapshot: PersistedScanContextSnapshot = {
       scanStates: normalizeScanStates(scanStates),
       remediationStates: normalizeRemediationStates(remediationStates),
@@ -331,7 +344,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
         // No-op if storage is unavailable.
       }
     }
-  }, [normalizeRemediationStates, normalizeResultsCache, normalizeScanStates, remediationStates, resultsCache, scanStates]);
+  }, [normalizeRemediationStates, normalizeResultsCache, normalizeScanStates, remediationStates, resultsCache, scanStates, storageHydrated]);
 
   // ── Scan ──
 
@@ -367,12 +380,36 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       } else if (status === 'error') {
         updateScanStatus(projectId, 'error');
       } else {
-        updateScanStatus(projectId, 'idle');
+        setScanStates(prev => {
+          const existing = prev[projectId];
+          if (!existing) return prev;
+          if (existing.state !== 'running') {
+            return { ...prev, [projectId]: { ...existing, state: 'idle' } };
+          }
+          const nextMessages = trimMessages([
+            ...existing.messages,
+            {
+              index: existing.messages.length + 1,
+              total: 0,
+              type: 'error',
+              content: 'Scan connection closed before the backend reported progress. Please retry once.',
+              timestamp: new Date().toISOString(),
+            },
+          ]);
+          return {
+            ...prev,
+            [projectId]: {
+              ...existing,
+              state: 'error',
+              messages: nextMessages,
+            },
+          };
+        });
       }
     } catch {
       updateScanStatus(projectId, 'error');
     }
-  }, [updateScanStatus]);
+  }, [trimMessages, updateScanStatus]);
 
   const startScan = useCallback(async (projectId: string, projectName: string) => {
     const existingWs = wsRefs.current[projectId];

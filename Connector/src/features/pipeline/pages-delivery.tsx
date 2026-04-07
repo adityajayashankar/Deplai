@@ -70,7 +70,53 @@ function readStoredJson<T>(key: string): T | null {
 
 function writeStoredJson(key: string, value: unknown): void {
   if (typeof window === 'undefined') return;
-  sessionStorage.setItem(key, JSON.stringify(value));
+  const serialized = JSON.stringify(value);
+  try {
+    sessionStorage.setItem(key, serialized);
+    return;
+  } catch {
+    if (key !== 'deplai.pipeline.iacFiles') return;
+  }
+
+  // Keep at least a preview set when the browser quota is tight.
+  if (!Array.isArray(value)) return;
+  let budget = 350000;
+  const compact = value
+    .filter((entry) => entry && typeof entry === 'object')
+    .map((entry) => {
+      const row = entry as { path?: unknown; content?: unknown };
+      const path = String(row.path || '').trim();
+      if (!path || budget <= 0) return null;
+      const raw = String(row.content || '');
+      const fileBudget = Math.min(70000, Math.max(0, budget - path.length - 48));
+      if (fileBudget <= 0) return null;
+      let content = raw;
+      if (content.length > fileBudget) {
+        const suffix = '\n\n# [truncated in browser session cache]';
+        const keep = Math.max(0, fileBudget - suffix.length);
+        content = `${content.slice(0, keep)}${suffix}`;
+      }
+      budget -= path.length + content.length;
+      return { path, content };
+    })
+    .filter((entry): entry is { path: string; content: string } => Boolean(entry));
+
+  try {
+    sessionStorage.setItem(key, JSON.stringify(compact));
+  } catch {
+    // Ignore when quota is fully exhausted; current in-memory state remains usable.
+  }
+}
+
+function normalizeIacFilesForUi(files: Array<{ path?: string; content?: string }>): Array<{ path: string; content: string }> {
+  const byPath = new Map<string, { path: string; content: string }>();
+  for (const file of files) {
+    const path = String(file.path || '').trim();
+    if (!path) continue;
+    if (path.startsWith('terraform/site/') && path !== 'terraform/site/index.html') continue;
+    byPath.set(path, { path, content: String(file.content || '') });
+  }
+  return Array.from(byPath.values());
 }
 
 function clearPlanningState(): void {
@@ -977,6 +1023,7 @@ interface GeneratedIacFile {
 interface IacGenerationResponse {
   success?: boolean;
   summary?: string;
+  source?: string;
   files?: GeneratedIacFile[];
   run_id?: string | null;
   workspace?: string | null;
@@ -1001,6 +1048,22 @@ interface SavedIacRun {
   state_bucket?: string;
   lock_table?: string;
 }
+
+type IacMode = 'deterministic' | 'llm';
+type IacLlmProvider = 'groq' | 'openrouter' | 'ollama' | 'opencode';
+
+const IAC_MODE_STORAGE_KEY = 'deplai.pipeline.iacMode';
+const IAC_LLM_PROVIDER_STORAGE_KEY = 'deplai.pipeline.iacLlmProvider';
+const IAC_LLM_MODEL_STORAGE_KEY = 'deplai.pipeline.iacLlmModel';
+const IAC_LLM_API_KEY_STORAGE_KEY = 'deplai.pipeline.iacLlmApiKey';
+const IAC_LLM_BASE_URL_STORAGE_KEY = 'deplai.pipeline.iacLlmBaseUrl';
+
+const IAC_LLM_DEFAULT_MODELS: Record<IacLlmProvider, string> = {
+  groq: 'llama-3.3-70b-versatile',
+  openrouter: 'meta-llama/llama-3.3-70b-instruct:free',
+  ollama: 'llama3.1:8b',
+  opencode: 'openai/gpt-oss-20b',
+};
 
 function buildFileTreeFromPaths(paths: string[]): Array<{ name: string; type: 'file' | 'dir'; children?: unknown[] }> {
   const root: Record<string, unknown> = {};
@@ -1123,6 +1186,29 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
   const [awsAccessKeyId, setAwsAccessKeyId] = useState<string>(() => readSavedAws().aws_access_key_id);
   const [awsSecretAccessKey, setAwsSecretAccessKey] = useState<string>(() => readSavedAws().aws_secret_access_key);
   const [awsRegion, setAwsRegion] = useState<string>(() => readSavedAws().aws_region);
+  const [iacMode, setIacMode] = useState<IacMode>(() => {
+    if (typeof window === 'undefined') return 'deterministic';
+    return localStorage.getItem(IAC_MODE_STORAGE_KEY) === 'llm' ? 'llm' : 'deterministic';
+  });
+  const [llmProvider, setLlmProvider] = useState<IacLlmProvider>(() => {
+    if (typeof window === 'undefined') return 'groq';
+    const stored = String(localStorage.getItem(IAC_LLM_PROVIDER_STORAGE_KEY) || '').toLowerCase();
+    return stored === 'openrouter' || stored === 'ollama' || stored === 'opencode' ? stored : 'groq';
+  });
+  const [llmModel, setLlmModel] = useState<string>(() => {
+    if (typeof window === 'undefined') return IAC_LLM_DEFAULT_MODELS.groq;
+    const storedModel = String(localStorage.getItem(IAC_LLM_MODEL_STORAGE_KEY) || '').trim();
+    const provider = String(localStorage.getItem(IAC_LLM_PROVIDER_STORAGE_KEY) || 'groq').toLowerCase() as IacLlmProvider;
+    return storedModel || IAC_LLM_DEFAULT_MODELS[provider] || IAC_LLM_DEFAULT_MODELS.groq;
+  });
+  const [llmApiKey, setLlmApiKey] = useState<string>(() => {
+    if (typeof window === 'undefined') return '';
+    return String(localStorage.getItem(IAC_LLM_API_KEY_STORAGE_KEY) || '');
+  });
+  const [llmApiBaseUrl, setLlmApiBaseUrl] = useState<string>(() => {
+    if (typeof window === 'undefined') return '';
+    return String(localStorage.getItem(IAC_LLM_BASE_URL_STORAGE_KEY) || '');
+  });
 
   const fileMap = useMemo(() => {
     const map: Record<string, string> = {};
@@ -1168,6 +1254,34 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
     });
   }, [awsAccessKeyId, awsRegion, awsSecretAccessKey]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(IAC_MODE_STORAGE_KEY, iacMode);
+  }, [iacMode]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(IAC_LLM_PROVIDER_STORAGE_KEY, llmProvider);
+    if (!String(llmModel || '').trim()) {
+      setLlmModel(IAC_LLM_DEFAULT_MODELS[llmProvider]);
+    }
+  }, [llmModel, llmProvider]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(IAC_LLM_MODEL_STORAGE_KEY, llmModel);
+  }, [llmModel]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(IAC_LLM_API_KEY_STORAGE_KEY, llmApiKey);
+  }, [llmApiKey]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(IAC_LLM_BASE_URL_STORAGE_KEY, llmApiBaseUrl);
+  }, [llmApiBaseUrl]);
+
   const generateIac = async () => {
     if (!projectId) {
       setError('Select a project before generating IaC.');
@@ -1181,12 +1295,19 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
       const body: Record<string, unknown> = {
         project_id: projectId,
         provider: 'aws',
+        iac_mode: iacMode,
         qa_summary: qaSummary,
         architecture_context: qaSummary,
         aws_access_key_id: awsAccessKeyId.trim() || undefined,
         aws_secret_access_key: awsSecretAccessKey.trim() || undefined,
         aws_region: awsRegion.trim() || 'eu-north-1',
       };
+      if (iacMode === 'llm') {
+        body.llm_provider = llmProvider;
+        body.llm_model = llmModel.trim() || IAC_LLM_DEFAULT_MODELS[llmProvider];
+        body.llm_api_key = llmApiKey.trim() || undefined;
+        body.llm_api_base_url = llmApiBaseUrl.trim() || undefined;
+      }
       if (deploymentProfile && Object.keys(deploymentProfile).length > 0) {
         body.architecture_json = deploymentProfile;
       } else if (architectureJson && Object.keys(architectureJson).length > 0) {
@@ -1201,18 +1322,20 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
       if (!res.ok || !data.success) {
         throw new Error(data.error || 'Failed to generate IaC bundle.');
       }
-      const generated = Array.isArray(data.files) ? data.files : [];
+      const generated = normalizeIacFilesForUi(Array.isArray(data.files) ? data.files : []);
       const hasLiveValidation = Boolean(data.run_id && data.workspace);
       setFiles(generated);
       setLiveValidated(hasLiveValidation);
-      setSummary(String(data.summary || `Generated ${generated.length} files.`));
+      const sourceLabel = String(data.source || '').trim();
+      const sourceSuffix = sourceLabel ? ` [source: ${sourceLabel}]` : '';
+      setSummary(`${String(data.summary || `Generated ${generated.length} files.`)}${sourceSuffix}`);
       setPrUrl(String(data.iac_repo_pr?.pr_url || '') || null);
       if (generated.length > 0) {
         const firstTf = generated.find((f) => f.path.startsWith('terraform/') && f.path.endsWith('.tf'));
         setSelected(firstTf?.path || generated[0].path);
       }
       if (typeof window !== 'undefined') {
-        sessionStorage.setItem('deplai.pipeline.iacFiles', JSON.stringify(generated));
+        writeStoredJson('deplai.pipeline.iacFiles', generated);
         if (hasLiveValidation && data.run_id && data.workspace) {
           sessionStorage.setItem('deplai.pipeline.iacRun', JSON.stringify({
             run_id: data.run_id,
@@ -1298,6 +1421,71 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
             <p className="mb-1.5 text-[11px] text-zinc-500">AWS_REGION</p>
             <input value={awsRegion} onChange={(e) => setAwsRegion(e.target.value)} placeholder="eu-north-1" className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
           </div>
+        </div>
+        <div className="mt-4 rounded-xl border border-white/8 bg-zinc-950/70 p-4">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <p className="text-sm font-semibold text-zinc-100">IaC Generation Mode</p>
+              <p className="mt-1 text-xs text-zinc-500">Switch between deterministic templates and real LLM-driven generation.</p>
+            </div>
+            <select
+              value={iacMode}
+              onChange={(e) => setIacMode(e.target.value === 'llm' ? 'llm' : 'deterministic')}
+              className="rounded-lg border border-white/10 bg-black px-3 py-2 text-xs font-semibold text-zinc-200 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20"
+            >
+              <option value="deterministic">Deterministic fallback</option>
+              <option value="llm">LLM mode</option>
+            </select>
+          </div>
+          {iacMode === 'llm' && (
+            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
+              <div>
+                <p className="mb-1.5 text-[11px] text-zinc-500">LLM Provider</p>
+                <select
+                  value={llmProvider}
+                  onChange={(e) => {
+                    const nextProvider = e.target.value as IacLlmProvider;
+                    setLlmProvider(nextProvider);
+                    setLlmModel((prev) => String(prev || '').trim() || IAC_LLM_DEFAULT_MODELS[nextProvider]);
+                  }}
+                  className="w-full rounded-lg border border-white/10 bg-black px-3 py-2 text-xs font-semibold text-zinc-200 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20"
+                >
+                  <option value="groq">Groq</option>
+                  <option value="openrouter">OpenRouter</option>
+                  <option value="ollama">Ollama Cloud API</option>
+                  <option value="opencode">OpenCode API</option>
+                </select>
+              </div>
+              <div>
+                <p className="mb-1.5 text-[11px] text-zinc-500">Model</p>
+                <input
+                  value={llmModel}
+                  onChange={(e) => setLlmModel(e.target.value)}
+                  placeholder={IAC_LLM_DEFAULT_MODELS[llmProvider]}
+                  className="w-full rounded-lg border border-white/10 bg-black px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20"
+                />
+              </div>
+              <div>
+                <p className="mb-1.5 text-[11px] text-zinc-500">API key</p>
+                <input
+                  type="password"
+                  value={llmApiKey}
+                  onChange={(e) => setLlmApiKey(e.target.value)}
+                  placeholder={llmProvider === 'groq' ? 'gsk_...' : llmProvider === 'openrouter' ? 'sk-or-v1-...' : 'API key'}
+                  className="w-full rounded-lg border border-white/10 bg-black px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20"
+                />
+              </div>
+              <div>
+                <p className="mb-1.5 text-[11px] text-zinc-500">Custom API base URL (optional)</p>
+                <input
+                  value={llmApiBaseUrl}
+                  onChange={(e) => setLlmApiBaseUrl(e.target.value)}
+                  placeholder="https://api.provider.com/v1"
+                  className="w-full rounded-lg border border-white/10 bg-black px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20"
+                />
+              </div>
+            </div>
+          )}
         </div>
         <div className="mt-3 flex items-center justify-between gap-4">
           <p className="text-[11px] text-zinc-500">
@@ -1810,9 +1998,7 @@ function parseIacFilesFromSession(): Array<{ path: string; content: string }> {
     if (!raw) return [];
     const parsed = JSON.parse(raw) as Array<{ path?: string; content?: string }>;
     if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((f) => typeof f.path === 'string' && typeof f.content === 'string')
-      .map((f) => ({ path: String(f.path), content: String(f.content) }));
+    return normalizeIacFilesForUi(parsed);
   } catch {
     return [];
   }

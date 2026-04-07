@@ -126,6 +126,9 @@ The tables below come directly from environment variable reads in Connector and 
 | DB_USER | No | root | MySQL user for Connector pool. |
 | DB_PASSWORD | No | empty | MySQL password for Connector pool. |
 | DB_NAME | No | deplai | MySQL database name for Connector pool. |
+| ADMIN_EMAILS | No | none | Comma-separated allowlist for admin workspace controls (settings workspace tabs, cleanup endpoint). |
+| ADMIN_EMAIL | No | none | Single-email fallback for admin workspace controls when ADMIN_EMAILS is not set. |
+| ADMIN_ACCESS_KEY | No | none | Alternate secret key for workspace admin unlock when email allowlist is unavailable. |
 | CLEANUP_SCAN_VOLUMES_ON_LOGOUT | No | false | If true, logout route calls Agentic /api/cleanup. |
 | ALLOW_GLOBAL_CLEANUP | No | false | Used by settings UI snapshot to surface cleanup capability state. |
 | AWS_ACCESS_KEY_ID | No | none | Used for runtime deploy health and some deployment defaults. |
@@ -140,6 +143,8 @@ The tables below come directly from environment variable reads in Connector and 
 | NEXT_PUBLIC_AGENTIC_WS_URL | No | derived from AGENTIC_LAYER_URL | Optional explicit websocket URL in frontend. |
 | CUSTOMIZATION_AGENT_BASE_URL | No | http://127.0.0.1:8010 | Upstream customization backend base URL. |
 | CUSTOMIZATION_BACKEND_URL | No | http://127.0.0.1:8010 | Fallback alias for customization backend base URL. |
+
+Workspace admin unlock accepts one of: allowlisted admin email, `ADMIN_ACCESS_KEY`, `DEPLAI_SERVICE_KEY`, or a workspace `serviceKey` saved in settings.
 
 ### Agentic Layer variables
 | Variable | Required | Default | Effect |

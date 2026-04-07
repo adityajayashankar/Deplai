@@ -3,5 +3,9 @@
 import CustomizationConsoleApp from '@/features/dashboard/CustomizationConsoleApp';
 
 export default function DashboardCustomizationPage() {
-  return <CustomizationConsoleApp />;
+  return (
+    <div className="h-screen">
+      <CustomizationConsoleApp />
+    </div>
+  );
 }

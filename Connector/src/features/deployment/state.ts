@@ -180,6 +180,58 @@ export const QA_CONTEXT_KEY = 'deplai.pipeline.qaContext';
 export const DEPLOY_STATE_STORAGE_PREFIX = 'deplai.pipeline.deployState.';
 export const DEPLOY_UI_STAGE_STORAGE_PREFIX = 'deplai.deploy.stage.';
 export const DEPLOY_HISTORY_MAX = 20;
+const IAC_SESSION_MAX_TOTAL_CHARS = 400000;
+const IAC_SESSION_MAX_FILE_CHARS = 80000;
+const IAC_TRUNCATION_NOTE = '\n\n# [truncated in browser session cache]';
+
+function normalizeIacFileList(value: unknown): GeneratedIacFile[] {
+  if (!Array.isArray(value)) return [];
+  const byPath = new Map<string, GeneratedIacFile>();
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue;
+    const row = entry as { path?: unknown; content?: unknown };
+    const path = String(row.path || '').trim();
+    const content = String(row.content || '');
+    if (!path) continue;
+
+    // Drop bulk mirrored static asset payloads from UI/session cache.
+    if (path.startsWith('terraform/site/') && path !== 'terraform/site/index.html') continue;
+
+    byPath.set(path, { path, content });
+  }
+
+  return Array.from(byPath.values());
+}
+
+function compactIacFilesForSession(value: unknown): GeneratedIacFile[] {
+  const normalized = normalizeIacFileList(value);
+  if (!normalized.length) return [];
+
+  const compact: GeneratedIacFile[] = [];
+  let usedChars = 0;
+
+  for (const entry of normalized) {
+    const path = entry.path;
+    const source = entry.content;
+    const remaining = IAC_SESSION_MAX_TOTAL_CHARS - usedChars;
+    if (remaining <= 0) break;
+
+    const perFileBudget = Math.min(IAC_SESSION_MAX_FILE_CHARS, Math.max(0, remaining - path.length - 64));
+    if (perFileBudget <= 0) break;
+
+    let content = source;
+    if (content.length > perFileBudget) {
+      const safeLen = Math.max(0, perFileBudget - IAC_TRUNCATION_NOTE.length);
+      content = `${content.slice(0, safeLen)}${IAC_TRUNCATION_NOTE}`;
+    }
+
+    compact.push({ path, content });
+    usedChars += path.length + content.length;
+  }
+
+  return compact;
+}
 
 export function readStoredJson<T>(key: string): T | null {
   if (typeof window === 'undefined') return null;
@@ -194,7 +246,20 @@ export function readStoredJson<T>(key: string): T | null {
 
 export function writeStoredJson(key: string, value: unknown): void {
   if (typeof window === 'undefined') return;
-  sessionStorage.setItem(key, JSON.stringify(value));
+  const serialized = JSON.stringify(key === IAC_FILES_KEY ? normalizeIacFileList(value) : value);
+  try {
+    sessionStorage.setItem(key, serialized);
+    return;
+  } catch {
+    if (key !== IAC_FILES_KEY) return;
+  }
+
+  try {
+    const compact = compactIacFilesForSession(value);
+    sessionStorage.setItem(key, JSON.stringify(compact));
+  } catch {
+    // Ignore quota failures; the in-memory state still keeps the generated files.
+  }
 }
 
 export function clearPlanningState(): void {
@@ -264,10 +329,7 @@ export function readIacFilesFromSession(): GeneratedIacFile[] {
     const raw = sessionStorage.getItem(IAC_FILES_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as Array<{ path?: string; content?: string }>;
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((file) => typeof file.path === 'string' && typeof file.content === 'string')
-      .map((file) => ({ path: String(file.path), content: String(file.content) }));
+    return normalizeIacFileList(parsed);
   } catch {
     return [];
   }

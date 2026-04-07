@@ -91,6 +91,7 @@ REPO_ANALYZER_MODEL = os.getenv("CLAUDE_REPO_ANALYZER_MODEL", "claude-3-5-haiku-
 REVIEW_QUESTION_MODEL = os.getenv("CLAUDE_REVIEW_QUESTION_MODEL", "claude-3-5-haiku-20241022").strip() or "claude-3-5-haiku-20241022"
 INFRA_PLANNER_MODEL = os.getenv("CLAUDE_INFRA_PLANNER_MODEL", os.getenv("CLAUDE_MODEL", "claude-3-7-sonnet-latest")).strip() or "claude-3-7-sonnet-latest"
 MAX_CLAUDE_PIPELINE_COST_USD = float(os.getenv("DEPLAI_CLAUDE_MAX_PIPELINE_COST_USD", "3.0") or "3.0")
+MAX_CLAUDE_TERRAFORM_GEN_COST_USD = float(os.getenv("DEPLAI_CLAUDE_MAX_TERRAFORM_GEN_COST_USD", "1.0") or "1.0")
 MODEL_PRICING_PER_MILLION: dict[str, tuple[float, float]] = {
     "claude-3-5-haiku-20241022": (0.80, 4.00),
     "claude-3-5-sonnet-20241022": (3.00, 15.00),
@@ -158,6 +159,20 @@ def _guard_budget(*, workspace: str, model: str, system_prompt: str, user_prompt
             f"Current spend ${current_total:.4f}, projected worst-case ${projected_cost:.4f}, "
             f"cap ${MAX_CLAUDE_PIPELINE_COST_USD:.2f}."
         )
+
+    if stage == "deployment_profile":
+        calls = list(usage.get("calls") or [])
+        terraform_stage_total = sum(
+            float(call.get("cost_usd") or 0.0)
+            for call in calls
+            if str(call.get("stage") or "") == "deployment_profile"
+        )
+        if terraform_stage_total + projected_cost > MAX_CLAUDE_TERRAFORM_GEN_COST_USD:
+            raise RuntimeError(
+                "Terraform generation LLM budget exceeded. "
+                f"Current spend ${terraform_stage_total:.4f}, projected worst-case ${projected_cost:.4f}, "
+                f"cap ${MAX_CLAUDE_TERRAFORM_GEN_COST_USD:.2f}."
+            )
 
 
 def _record_usage(

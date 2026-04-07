@@ -1,5 +1,6 @@
 import asyncio
 import os
+from urllib.parse import quote
 from fastapi import WebSocket
 
 from models import ScanContext, StreamStatus
@@ -97,29 +98,53 @@ class EnvironmentInitializer(RunnerBase):
             if not repo_url.endswith(".git"):
                 repo_url = repo_url + ".git"
 
+            def _clone(remote_url: str) -> tuple[bool, str]:
+                clone_container = None
+                try:
+                    clone_container = self._docker.containers.run(
+                        "alpine/git",
+                        command=[
+                            "clone", "--depth", "1",
+                            remote_url,
+                            f"/repo/{project_id}",
+                        ],
+                        environment={"GIT_TERMINAL_PROMPT": "0"},
+                        volumes={CODEBASE_VOLUME: {"bind": "/repo", "mode": "rw"}},
+                        detach=True,
+                    )
+                    result = clone_container.wait(timeout=CONTAINER_OP_TIMEOUT)
+                    logs = decode_output(clone_container.logs(tail=40))
+                    clone_container.remove(force=True)
+                    exit_code = result.get("StatusCode", -1)
+                    if exit_code == 0:
+                        return (True, "")
+                    detail = (logs or f"git clone exited with code {exit_code}").strip()
+                    return (False, detail)
+                except Exception as clone_exc:
+                    if clone_container is not None:
+                        try:
+                            clone_container.remove(force=True)
+                        except Exception:
+                            pass
+                    return (False, str(clone_exc))
+
             # Embed the installation token as x-access-token (GitHub's official method
             # for App installation tokens with git HTTP smart protocol).
             # Using http.extraHeader Bearer does NOT work because GitHub's git endpoint
             # returns a WWW-Authenticate: Basic challenge; Bearer causes git to
             # re-prompt for credentials and fail with exit 128.
-            auth_url = repo_url.replace("https://", f"https://x-access-token:{token}@")
+            encoded_token = quote(token, safe="")
+            auth_url = repo_url.replace("https://", f"https://x-access-token:{encoded_token}@")
 
-            container = self._docker.containers.run(
-                "alpine/git",
-                command=[
-                    "clone", "--depth", "1",
-                    auth_url,
-                    f"/repo/{project_id}",
-                ],
-                environment={"GIT_TERMINAL_PROMPT": "0"},
-                volumes={CODEBASE_VOLUME: {"bind": "/repo", "mode": "rw"}},
-                detach=True,
-            )
-            result = container.wait(timeout=CONTAINER_OP_TIMEOUT)
-            container.remove(force=True)
-            exit_code = result.get("StatusCode", -1)
-            if exit_code != 0:
-                return (False, f"git clone failed with exit code {exit_code}")
+            ok, clone_error = _clone(auth_url)
+            if not ok:
+                # Some GitHub App installations are scoped to selected repositories and
+                # can fail auth even for publicly readable repos. Retry anonymously so
+                # scans still work for public repositories.
+                ok_public, public_error = _clone(repo_url)
+                if not ok_public:
+                    detail = clone_error or public_error or "git clone failed"
+                    return (False, f"Git clone failed. {detail}")
 
             # Strip the embedded token from .git/config by resetting the remote URL to
             # the plain https:// form — the token never lingers in the volume.

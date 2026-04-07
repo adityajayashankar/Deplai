@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAuth } from '@/lib/auth';
+import { hasWorkspaceAdminAccess, requireAuth } from '@/lib/auth';
 import { query } from '@/lib/db';
 import {
   cloneDefaultUserSettings,
@@ -21,6 +21,16 @@ type SettingsRow = {
   data_json: unknown;
   updated_at: Date | string | null;
 };
+
+function extractUserOnlyPatch(input: unknown): { user?: unknown } {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  const root = input as Record<string, unknown>;
+  if (root.settings && typeof root.settings === 'object' && !Array.isArray(root.settings)) {
+    const nested = root.settings as Record<string, unknown>;
+    return { user: nested.user };
+  }
+  return { user: root.user };
+}
 
 function isConnectivityError(error: unknown): boolean {
   const dbError = error as DbError;
@@ -106,17 +116,24 @@ async function saveUserSettings(userId: string, settings: UserSettingsData) {
   );
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
     const { user, error } = await requireAuth();
     if (error) return error;
+    const canManageWorkspace = await hasWorkspaceAdminAccess(
+      user,
+      request.headers.get('x-workspace-admin-key')
+    );
 
     await ensureSettingsTable();
     const current = await loadUserSettings(user.id);
 
     return NextResponse.json({
       settings: toPublicUserSettings(current.settings),
-      serverConfig: serverConfigSnapshot(),
+      serverConfig: canManageWorkspace ? serverConfigSnapshot() : {},
+      access: {
+        canManageWorkspace,
+      },
       updatedAt: current.updatedAt,
     });
   } catch (error: unknown) {
@@ -142,11 +159,17 @@ export async function PATCH(request: NextRequest) {
   try {
     const { user, error } = await requireAuth();
     if (error) return error;
+    const canManageWorkspace = await hasWorkspaceAdminAccess(
+      user,
+      request.headers.get('x-workspace-admin-key')
+    );
 
     await ensureSettingsTable();
     const current = await loadUserSettings(user.id);
     const body = await request.json().catch(() => ({})) as { settings?: unknown } | unknown;
-    const incoming = (body as { settings?: unknown })?.settings ?? body;
+    const incoming = canManageWorkspace
+      ? ((body as { settings?: unknown })?.settings ?? body)
+      : extractUserOnlyPatch(body);
 
     const merged = mergeUserSettingsPatch(current.settings, incoming);
     await saveUserSettings(user.id, merged);
@@ -155,7 +178,10 @@ export async function PATCH(request: NextRequest) {
     return NextResponse.json({
       success: true,
       settings: toPublicUserSettings(next.settings),
-      serverConfig: serverConfigSnapshot(),
+      serverConfig: canManageWorkspace ? serverConfigSnapshot() : {},
+      access: {
+        canManageWorkspace,
+      },
       updatedAt: next.updatedAt,
     });
   } catch (error: unknown) {

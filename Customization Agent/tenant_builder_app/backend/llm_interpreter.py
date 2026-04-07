@@ -117,6 +117,10 @@ class LLMInterpreter:
 
     def interpret(self, message: str, current_manifest: dict[str, Any]) -> dict[str, Any]:
         self._current_manifest = current_manifest
+        deterministic_frontend_patch = self._build_deterministic_frontend_patch(
+            message=message,
+            current_manifest=current_manifest,
+        )
 
         if self._is_no_change_request(message):
             return {
@@ -137,8 +141,21 @@ class LLMInterpreter:
         try:
             raw_content = self._call_llm(prompt=prompt)
             parsed = self._parse_model_output(raw_content)
-            return self._normalize_result(parsed)
+            normalized = self._normalize_result(parsed)
+            if deterministic_frontend_patch:
+                existing_patch = normalized.get("manifest_patch")
+                base_patch = existing_patch if isinstance(existing_patch, dict) else {}
+                merged_patch = self._deep_merge(self._copy_dict(base_patch), deterministic_frontend_patch)
+                normalized["manifest_patch"] = merged_patch
+                normalized = self._normalize_result(normalized)
+            return normalized
         except Exception as exc:
+            if deterministic_frontend_patch:
+                return {
+                    "response": "Applied deterministic frontend patch from your request.",
+                    "manifest_patch": deterministic_frontend_patch,
+                    "questions": [],
+                }
             return {
                 "response": f"The LLM interpreter could not process the request safely: {exc}",
                 "manifest_patch": {},
@@ -159,12 +176,12 @@ class LLMInterpreter:
         if landing_patch and isinstance(landing_patch.get("manifest_patch"), dict):
             self._deep_merge(combined, landing_patch["manifest_patch"])
 
-        inline_patch = self._parse_inline_frontend_request(
+        welcome_removal_patch = self._parse_remove_welcome_request(
             message=message,
             current_manifest=current_manifest,
         )
-        if inline_patch:
-            self._deep_merge(combined, inline_patch)
+        if welcome_removal_patch:
+            self._deep_merge(combined, welcome_removal_patch)
 
         return self._prune_empty(combined) if isinstance(combined, dict) else {}
 
@@ -591,6 +608,52 @@ class LLMInterpreter:
                 }
             },
             "questions": [],
+        }
+
+    def _parse_remove_welcome_request(
+        self,
+        message: str,
+        current_manifest: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        normalized = message.strip().lower()
+        if not normalized:
+            return None
+
+        remove_intent = bool(re.search(r"\b(remove|delete|hide|clear)\b", normalized))
+        welcome_intent = bool(re.search(r"\bwelcome\b", normalized))
+        if not (remove_intent and welcome_intent):
+            return None
+
+        existing_extensions = current_manifest.get("extensions")
+        merged_extensions: list[dict[str, Any]] = []
+        if isinstance(existing_extensions, list):
+            for item in existing_extensions:
+                if isinstance(item, dict):
+                    merged_extensions.append(json.loads(json.dumps(item)))
+
+        welcome_override = {
+            "type": "nl_key_value",
+            "scope": "frontend",
+            "target_raw": "landing.hero_1",
+            "value": "",
+        }
+
+        replaced = False
+        for index, existing in enumerate(merged_extensions):
+            if (
+                str(existing.get("type", "")).strip().lower() == "nl_key_value"
+                and str(existing.get("scope", "frontend")).strip().lower() == "frontend"
+                and str(existing.get("target_raw", "")).strip().lower() in {"landing.hero_1", "landing.hero_headline"}
+            ):
+                merged_extensions[index] = welcome_override
+                replaced = True
+                break
+
+        if not replaced:
+            merged_extensions.append(welcome_override)
+
+        return {
+            "extensions": merged_extensions,
         }
 
     def _parse_ui_copy_commands_from_message(
@@ -1092,8 +1155,12 @@ class LLMInterpreter:
     def _prune_empty(self, value: Any) -> Any:
         if isinstance(value, dict):
             cleaned: dict[str, Any] = {}
+            entry_type = str(value.get("type", "")).strip().lower()
             for key, inner in value.items():
                 pruned = self._prune_empty(inner)
+                if key == "value" and isinstance(pruned, str) and pruned == "" and entry_type in {"nl_key_value", "ui_copy"}:
+                    cleaned[key] = pruned
+                    continue
                 if pruned not in ({}, [], ""):
                     cleaned[key] = pruned
             return cleaned

@@ -142,11 +142,15 @@ def _css_var_has_value(file_content: str, var_name: str, value: str) -> bool:
     return re.search(pattern, file_content, flags=re.IGNORECASE) is not None
 
 
-def _get_home_headline_value(manifest: dict[str, Any]) -> str:
-    """Return hero headline value from nl_key_value extensions (or legacy ui_copy)."""
+def _get_home_headline_override(manifest: dict[str, Any]) -> tuple[bool, str]:
+    """Return (has_override, value) for landing hero headline updates.
+
+    has_override distinguishes "no override provided" from
+    "explicitly clear headline".
+    """
     extensions = manifest.get("extensions", [])
     if not isinstance(extensions, list):
-        return ""
+        return False, ""
     for item in extensions:
         if not isinstance(item, dict):
             continue
@@ -154,9 +158,12 @@ def _get_home_headline_value(manifest: dict[str, Any]) -> str:
         if entry_type == "nl_key_value":
             target_raw = str(item.get("target_raw", "")).strip().lower()
             if target_raw in {"landing.hero_1", "landing.hero_headline"}:
-                value = item.get("value")
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
+                value = item.get("value", "")
+                if isinstance(value, str):
+                    return True, value.strip()
+                if isinstance(value, (bool, int, float)):
+                    return True, str(value)
+                return True, ""
         elif entry_type == "ui_copy":
             # Legacy backward compat.
             if item.get("scope") != "home":
@@ -164,10 +171,13 @@ def _get_home_headline_value(manifest: dict[str, Any]) -> str:
             target = str(item.get("target", "")).strip().lower()
             if target not in {"headline", "hero_headline", "headline_line_1", "hero_1"}:
                 continue
-            value = item.get("value")
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return ""
+            value = item.get("value", "")
+            if isinstance(value, str):
+                return True, value.strip()
+            if isinstance(value, (bool, int, float)):
+                return True, str(value)
+            return True, ""
+    return False, ""
 
 
 _STYLE_QUALIFIERS = (" color", " font", " size", " background", " border")
@@ -189,9 +199,16 @@ def _get_nl_key_value_extensions(manifest: dict[str, Any]) -> list[dict[str, Any
             continue
         app_targets = _extension_scope_targets(item.get("scope", "frontend"))
         target_raw = str(item.get("target_raw", "")).strip().lower()
-        value = item.get("value")
-        if not target_raw or not isinstance(value, (str, bool, int, float)):
+        has_value = "value" in item
+        value = item.get("value", "")
+        if not target_raw:
             continue
+        if value is None:
+            value = ""
+        elif not isinstance(value, (str, bool, int, float)):
+            if has_value:
+                continue
+            value = ""
         if any(q in target_raw for q in _STYLE_QUALIFIERS):
             continue
         parts = target_raw.split(".", 1)
@@ -240,7 +257,7 @@ def _get_literal_replace_extensions(manifest: dict[str, Any]) -> list[dict[str, 
 
         old_text = target_raw.strip()
         new_text = replacement.strip()
-        if not old_text or not new_text or old_text == new_text:
+        if not old_text or old_text == new_text:
             continue
 
         key = (old_text, new_text, tuple(sorted(app_targets)))
@@ -415,9 +432,9 @@ def _rewrite_split_jsx_change(change: dict[str, Any], manifest: dict[str, Any], 
     if target and target in file_content:
         return change
 
-    home_headline_value = _get_home_headline_value(manifest)
+    has_home_headline_override, home_headline_value = _get_home_headline_override(manifest)
     replacement = str(change.get("replacement", ""))
-    if not home_headline_value or replacement != home_headline_value:
+    if not has_home_headline_override or replacement != home_headline_value:
         return change
     if not re.search(r"<h1\b[^>]*>[\s\S]*?</h1>", file_content):
         return change
@@ -437,7 +454,7 @@ def _is_meaningful_change(change: dict[str, Any], file_content_by_path: dict[str
     if operation in {"replace_text", "replace_all_text"}:
         target = str(change.get("target", ""))
         replacement = str(change.get("replacement", ""))
-        return bool(target and replacement and target != replacement and target in file_content)
+        return bool(target and target != replacement and target in file_content)
     if operation == "replace_regex":
         pattern = str(change.get("pattern", ""))
         replacement = change.get("replacement")
@@ -449,8 +466,20 @@ def _is_meaningful_change(change: dict[str, Any], file_content_by_path: dict[str
             return False
     if operation == "set_object_property":
         property_name = str(change.get("property", ""))
-        value = str(change.get("value", ""))
-        return bool(property_name and value and f"{property_name}" in file_content and value not in file_content)
+        if not property_name or f"{property_name}" not in file_content:
+            return False
+        value = change.get("value")
+        if isinstance(value, bool):
+            expected = "true" if value else "false"
+            return expected not in file_content.lower()
+        if isinstance(value, (int, float)):
+            expected = str(value)
+            return expected not in file_content
+        if isinstance(value, str):
+            if value == "":
+                return re.search(rf"{re.escape(property_name)}\s*:\s*['\"][^'\"]+['\"]", file_content) is not None
+            return value not in file_content
+        return False
     if operation == "insert_before":
         target = str(change.get("target", ""))
         replacement = str(change.get("replacement", ""))
@@ -478,8 +507,8 @@ def _build_deterministic_changes(
             planned_changes.append(normalized)
             log_planner(f"Generated fallback modification: {normalized}")
 
-    home_headline_value = _get_home_headline_value(manifest)
-    if home_headline_value:
+    has_home_headline_override, home_headline_value = _get_home_headline_override(manifest)
+    if has_home_headline_override:
         for app_root in app_targets:
             landing_path = f"{app_root}/components/landing/index.jsx"
             if landing_path not in allowed_paths:

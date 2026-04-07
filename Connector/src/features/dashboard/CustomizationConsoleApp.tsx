@@ -422,6 +422,11 @@ export default function CustomizationConsoleApp() {
   const tenantFromQuery = useMemo(() => sanitizeTenantId(searchParams.get('tenantId') || ''), [searchParams]);
   const projectIdFromQuery = useMemo(() => searchParams.get('projectId') || '', [searchParams]);
   const projectNameFromQuery = useMemo(() => searchParams.get('projectName') || '', [searchParams]);
+  const runAll = useMemo(() => searchParams.get('runAll') === '1', [searchParams]);
+  const securityPath = useMemo(
+    () => (projectIdFromQuery ? `/dashboard/security-analysis/${encodeURIComponent(projectIdFromQuery)}?runAll=1` : '/dashboard'),
+    [projectIdFromQuery],
+  );
 
   const [tenantId, setTenantId] = useState('');
   const [confirmedTenantId, setConfirmedTenantId] = useState('');
@@ -1187,15 +1192,26 @@ export default function CustomizationConsoleApp() {
           </div>
         </div>
 
-        <div className="flex items-center gap-3 rounded-md border border-[#262626] bg-[#000000] px-3 py-1">
-          <Key className="h-3.5 w-3.5 text-zinc-500" />
-          <input
-            type="text"
-            value={tenantId}
-            onChange={handleTenantChange}
-            placeholder="tenant-id"
-            className="w-48 bg-transparent text-[12px] font-mono text-white placeholder:text-zinc-600 transition-colors focus:outline-none"
-          />
+        <div className="flex items-center gap-3">
+          {runAll && projectIdFromQuery ? (
+            <button
+              type="button"
+              onClick={() => router.push(securityPath)}
+              className="inline-flex items-center justify-center rounded-md border border-[#d4d4d8] bg-zinc-100 px-4 py-2 text-xs font-semibold text-black shadow-[0_8px_30px_rgba(0,0,0,0.35)] transition-colors hover:bg-white"
+            >
+              Move to Security Scan
+            </button>
+          ) : null}
+          <div className="flex items-center gap-3 rounded-md border border-[#262626] bg-[#000000] px-3 py-1">
+            <Key className="h-3.5 w-3.5 text-zinc-500" />
+            <input
+              type="text"
+              value={tenantId}
+              onChange={handleTenantChange}
+              placeholder="tenant-id"
+              className="w-48 bg-transparent text-[12px] font-mono text-white placeholder:text-zinc-600 transition-colors focus:outline-none"
+            />
+          </div>
         </div>
       </header>
 

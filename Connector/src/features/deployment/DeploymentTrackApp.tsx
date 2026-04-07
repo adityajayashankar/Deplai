@@ -43,6 +43,21 @@ import {
 } from './state';
 
 type PipelineStageId = 'analysis' | 'qa' | 'architecture' | 'approval' | 'terraform' | 'aws_config' | 'deploy' | 'outputs';
+type IacMode = 'deterministic' | 'llm';
+type IacLlmProvider = 'groq' | 'openrouter' | 'ollama' | 'opencode';
+
+const IAC_MODE_STORAGE_KEY = 'deplai.pipeline.iacMode';
+const IAC_LLM_PROVIDER_STORAGE_KEY = 'deplai.pipeline.iacLlmProvider';
+const IAC_LLM_MODEL_STORAGE_KEY = 'deplai.pipeline.iacLlmModel';
+const IAC_LLM_API_KEY_STORAGE_KEY = 'deplai.pipeline.iacLlmApiKey';
+const IAC_LLM_BASE_URL_STORAGE_KEY = 'deplai.pipeline.iacLlmBaseUrl';
+
+const IAC_LLM_DEFAULT_MODELS: Record<IacLlmProvider, string> = {
+  groq: 'llama-3.3-70b-versatile',
+  openrouter: 'meta-llama/llama-3.3-70b-instruct:free',
+  ollama: 'llama3.1:8b',
+  opencode: 'openai/gpt-oss-20b',
+};
 
 const SIDEBAR_STAGES: Array<{ id: PipelineStageId; label: string; details: string }> = [
   { id: 'analysis', label: 'Repository Analysis', details: 'Codebase Scan' },
@@ -57,6 +72,16 @@ const SIDEBAR_STAGES: Array<{ id: PipelineStageId; label: string; details: strin
 
 function timestampLabel(date = new Date()) {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+function normalizeIacFiles(files: GeneratedIacFile[]): GeneratedIacFile[] {
+  const byPath = new Map<string, GeneratedIacFile>();
+  for (const file of files) {
+    const path = String(file.path || '').trim();
+    if (!path) continue;
+    if (path.startsWith('terraform/site/') && path !== 'terraform/site/index.html') continue;
+    byPath.set(path, { path, content: String(file.content || '') });
+  }
+  return Array.from(byPath.values());
 }
 
 function readCostEstimate() {
@@ -529,6 +554,29 @@ export default function DeploymentTrackApp() {
   const [iacFiles, setIacFiles] = useState<GeneratedIacFile[]>(() => readIacFilesFromSession());
   const [selectedFile, setSelectedFile] = useState<string>(() => readIacFilesFromSession()[0]?.path || '');
   const [aws, setAws] = useState<AwsSessionConfig>(() => readSavedAws());
+  const [iacMode, setIacMode] = useState<IacMode>(() => {
+    if (typeof window === 'undefined') return 'deterministic';
+    return localStorage.getItem(IAC_MODE_STORAGE_KEY) === 'llm' ? 'llm' : 'deterministic';
+  });
+  const [llmProvider, setLlmProvider] = useState<IacLlmProvider>(() => {
+    if (typeof window === 'undefined') return 'groq';
+    const stored = String(localStorage.getItem(IAC_LLM_PROVIDER_STORAGE_KEY) || '').toLowerCase();
+    return stored === 'openrouter' || stored === 'ollama' || stored === 'opencode' ? stored : 'groq';
+  });
+  const [llmModel, setLlmModel] = useState<string>(() => {
+    if (typeof window === 'undefined') return IAC_LLM_DEFAULT_MODELS.groq;
+    const storedModel = String(localStorage.getItem(IAC_LLM_MODEL_STORAGE_KEY) || '').trim();
+    const provider = String(localStorage.getItem(IAC_LLM_PROVIDER_STORAGE_KEY) || 'groq').toLowerCase() as IacLlmProvider;
+    return storedModel || IAC_LLM_DEFAULT_MODELS[provider] || IAC_LLM_DEFAULT_MODELS.groq;
+  });
+  const [llmApiKey, setLlmApiKey] = useState<string>(() => {
+    if (typeof window === 'undefined') return '';
+    return String(localStorage.getItem(IAC_LLM_API_KEY_STORAGE_KEY) || '');
+  });
+  const [llmApiBaseUrl, setLlmApiBaseUrl] = useState<string>(() => {
+    if (typeof window === 'undefined') return '';
+    return String(localStorage.getItem(IAC_LLM_BASE_URL_STORAGE_KEY) || '');
+  });
   const [deployStatus, setDeployStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const [deployProgress, setDeployProgress] = useState(0);
   const [deployLogs, setDeployLogs] = useState<Array<{ text: string; ts: string; type: 'info' | 'success' | 'error' }>>([]);
@@ -850,6 +898,34 @@ export default function DeploymentTrackApp() {
   useEffect(() => {
     writeSavedAws(aws);
   }, [aws]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(IAC_MODE_STORAGE_KEY, iacMode);
+  }, [iacMode]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(IAC_LLM_PROVIDER_STORAGE_KEY, llmProvider);
+    if (!String(llmModel || '').trim()) {
+      setLlmModel(IAC_LLM_DEFAULT_MODELS[llmProvider]);
+    }
+  }, [llmModel, llmProvider]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(IAC_LLM_MODEL_STORAGE_KEY, llmModel);
+  }, [llmModel]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(IAC_LLM_API_KEY_STORAGE_KEY, llmApiKey);
+  }, [llmApiKey]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(IAC_LLM_BASE_URL_STORAGE_KEY, llmApiBaseUrl);
+  }, [llmApiBaseUrl]);
 
   useEffect(() => {
     if (!selectedProjectId) return;
@@ -1219,6 +1295,11 @@ export default function DeploymentTrackApp() {
       body: JSON.stringify({
         project_id: selectedProject.id,
         provider: 'aws',
+        iac_mode: iacMode,
+        llm_provider: iacMode === 'llm' ? llmProvider : undefined,
+        llm_model: iacMode === 'llm' ? (llmModel.trim() || IAC_LLM_DEFAULT_MODELS[llmProvider]) : undefined,
+        llm_api_key: iacMode === 'llm' ? (llmApiKey.trim() || undefined) : undefined,
+        llm_api_base_url: iacMode === 'llm' ? (llmApiBaseUrl.trim() || undefined) : undefined,
         qa_summary: qaSummary,
         architecture_context: qaSummary || String(repoContext?.summary || ''),
         architecture_json: deploymentProfile || architectureView || undefined,
@@ -1229,16 +1310,16 @@ export default function DeploymentTrackApp() {
     if (!response.ok || !data.success) {
       throw new Error(data.error || 'IaC generation failed.');
     }
-    const files = Array.isArray(data.files) ? data.files : [];
+    const files = normalizeIacFiles(Array.isArray(data.files) ? data.files : []);
     setIacFiles(files);
     if (files[0]?.path) setSelectedFile(files[0].path);
-    sessionStorage.setItem(IAC_FILES_KEY, JSON.stringify(files));
+    writeStoredJson(IAC_FILES_KEY, files);
     if (data.run_id && data.workspace) {
       sessionStorage.setItem(IAC_RUN_KEY, JSON.stringify({ run_id: data.run_id, workspace: data.workspace, provider_version: data.provider_version || '', state_bucket: data.state_bucket || '', lock_table: data.lock_table || '' }));
     } else {
       sessionStorage.removeItem(IAC_RUN_KEY);
     }
-  }, [architectureView, aws.aws_region, deploymentProfile, qaSummary, repoContext?.summary, selectedProject]);
+  }, [architectureView, aws.aws_region, deploymentProfile, iacMode, llmApiBaseUrl, llmApiKey, llmModel, llmProvider, qaSummary, repoContext?.summary, selectedProject]);
 
   const hydrateTerminalDeployResult = useCallback(async (baseResult: DeployApiResult | null) => {
     if (!baseResult?.success || String(baseResult.error || '').trim()) {
@@ -1707,6 +1788,67 @@ export default function DeploymentTrackApp() {
         </header>
         <div className="custom-scrollbar flex-1 overflow-y-auto p-8">
           {error && <div className="mx-auto mb-6 max-w-5xl rounded-md border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">{error}</div>}
+          {selectedProject && (activeStage === 'approval' || activeStage === 'terraform') && (
+            <div className="mx-auto mb-6 max-w-5xl rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
+              <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                  <div className="text-sm font-semibold text-zinc-100">IaC Generation Mode</div>
+                  <div className="mt-1 text-xs text-zinc-500">Choose deterministic fallback templates or real LLM generation.</div>
+                </div>
+                <div className="grid w-full gap-3 md:grid-cols-2 lg:w-auto lg:min-w-[520px]">
+                  <select
+                    value={iacMode}
+                    onChange={(event) => setIacMode(event.target.value === 'llm' ? 'llm' : 'deterministic')}
+                    className="rounded-md border border-[#262626] bg-black px-3 py-2 text-xs font-semibold text-zinc-200 outline-none"
+                  >
+                    <option value="deterministic">Deterministic fallback</option>
+                    <option value="llm">LLM mode</option>
+                  </select>
+                  {iacMode === 'llm' ? (
+                    <select
+                      value={llmProvider}
+                      onChange={(event) => {
+                        const nextProvider = event.target.value as IacLlmProvider;
+                        setLlmProvider(nextProvider);
+                        setLlmModel((prev) => String(prev || '').trim() || IAC_LLM_DEFAULT_MODELS[nextProvider]);
+                      }}
+                      className="rounded-md border border-[#262626] bg-black px-3 py-2 text-xs font-semibold text-zinc-200 outline-none"
+                    >
+                      <option value="groq">Groq</option>
+                      <option value="openrouter">OpenRouter</option>
+                      <option value="ollama">Ollama Cloud API</option>
+                      <option value="opencode">OpenCode API</option>
+                    </select>
+                  ) : null}
+                  {iacMode === 'llm' ? (
+                    <input
+                      value={llmModel}
+                      onChange={(event) => setLlmModel(event.target.value)}
+                      placeholder={IAC_LLM_DEFAULT_MODELS[llmProvider]}
+                      className="rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-xs text-zinc-200 placeholder:text-zinc-600 outline-none"
+                    />
+                  ) : null}
+                  {iacMode === 'llm' ? (
+                    <input
+                      type="password"
+                      value={llmApiKey}
+                      onChange={(event) => setLlmApiKey(event.target.value)}
+                      placeholder={llmProvider === 'groq' ? 'gsk_...' : llmProvider === 'openrouter' ? 'sk-or-v1-...' : 'API key'}
+                      className="rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-xs text-zinc-200 placeholder:text-zinc-600 outline-none"
+                    />
+                  ) : null}
+                  {iacMode === 'llm' ? (
+                    <input
+                      value={llmApiBaseUrl}
+                      onChange={(event) => setLlmApiBaseUrl(event.target.value)}
+                      placeholder="Optional base URL override (https://.../v1)"
+                      className="md:col-span-2 rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-xs text-zinc-200 placeholder:text-zinc-600 outline-none"
+                    />
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          )}
           {activeStage === 'analysis' && <div className="mx-auto max-w-5xl space-y-6">{selectedProject ? <><div><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Repository Analysis</h1><p className="text-sm text-zinc-400">{analysisLoading ? 'Scanning codebase and waiting for Agentic Layer.' : 'Scanning codebase to infer runtime and deployment requirements.'}</p></div><div className="grid grid-cols-3 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Runtime</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : String(repoContext?.language?.runtime || 'Unknown')}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Frameworks</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : analysisFrameworkNames.join(' / ') || 'None detected'}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Data Stores</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : analysisDataStoreNames.join(', ') || 'None detected'}</div></div></div>{!analysisLoading && repoContext && <div className="grid grid-cols-2 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Scanner Summary</div><div className="space-y-2 text-sm text-zinc-300"><div>{String(repoContext.summary || 'No summary generated yet.')}</div><div className="text-zinc-500">Workspace: <span className="font-mono text-zinc-300">{repoContext.workspace}</span></div><div className="text-zinc-500">Build: <span className="font-mono text-zinc-300">{String(repoContext.build?.build_command || 'not detected')}</span></div><div className="text-zinc-500">Start: <span className="font-mono text-zinc-300">{String(repoContext.build?.start_command || 'not detected')}</span></div><div className="text-zinc-500">Health: <span className="font-mono text-zinc-300">{String(repoContext.health?.endpoint || 'not detected')}</span></div></div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Terraform Context</div><pre className="max-h-55 overflow-y-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-400">{qaSummary || 'Repository context will appear here after the scanner completes.'}</pre></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Processes & Config</div><div className="space-y-2 text-sm text-zinc-300">{analysisProcessLines.length > 0 ? analysisProcessLines.map((line) => <div key={line}>{line}</div>) : <div className="text-zinc-500">No explicit processes detected.</div>}{analysisConfigNames.length > 0 && <div className="pt-3 text-zinc-500">Config values: <span className="text-zinc-300">{analysisConfigNames.join(', ')}</span></div>}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Secrets & Flags</div><div className="space-y-2 text-sm text-zinc-300">{analysisSecretNames.length > 0 ? <div>Required secrets: {analysisSecretNames.join(', ')}</div> : <div className="text-zinc-500">No required secrets detected.</div>}{analysisFlagLines.length > 0 ? analysisFlagLines.map((line) => <div key={line} className="text-amber-300">{line}</div>) : <div className="text-zinc-500">No major flags raised by the scanner.</div>}{repoContext.readme_notes && <div className="text-zinc-400">{String(repoContext.readme_notes)}</div>}</div></div></div>}{!analysisLoading && repoContextMd && <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Scanner Markdown</div><pre className="max-h-80 overflow-y-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-400">{repoContextMd}</pre></div>}<div className="flex justify-end"><button onClick={() => setAndPersistStage('qa')} disabled={analysisLoading || !repoContext || repoContext.workspace !== expectedWorkspace} className="flex items-center gap-2 rounded-md bg-zinc-100 px-6 py-2.5 text-sm font-semibold text-black hover:bg-white disabled:cursor-not-allowed disabled:bg-[#111111] disabled:text-zinc-500">{analysisLoading ? 'Scanning Repository...' : 'Continue to Questions'} <ArrowRight className="h-4 w-4" /></button></div></> : <div className="rounded-xl border border-[#1A1A1A] bg-[#050505] p-8"><h1 className="mb-2 text-2xl font-semibold text-zinc-100">Choose a Repository from the Dashboard</h1><p className="max-w-2xl text-sm leading-relaxed text-zinc-400">Deployment Track only runs against a specific repository. Start from a repo card on the dashboard so the AWS deployment flow is bound to the correct project.</p><div className="mt-6"><button onClick={() => router.push('/dashboard')} className="rounded-md bg-zinc-100 px-5 py-2.5 text-sm font-semibold text-black hover:bg-white">Back to Dashboard</button></div></div>}</div>}
           {activeStage === 'qa' && (
             <div className="mx-auto max-w-6xl space-y-6">

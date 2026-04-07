@@ -16,8 +16,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Allow importing root-level packages (e.g. remediation_pipeline) when this
+# service is launched from the Agentic Layer directory.
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from functools import partial
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from models import (
     ScanValidationRequest, ScanValidationResponse,
@@ -37,7 +44,14 @@ from models import (
 from environment import EnvironmentInitializer
 from cleanup import cleanup_volumes, cleanup_project_reports
 from result_parser import get_scan_results, get_scan_status, invalidate_cache
-from remediation import RemediationRunner
+from remediation_pipeline.models import (
+    RemediationNavigateRequest,
+    RemediationPRRequest,
+    RemediationRefreshRequest,
+    RemediationRunRequest as PipelineRemediationRunRequest,
+)
+from remediation_pipeline.orchestrator import RemediationOrchestrator
+from remediation_pipeline.track_runner import RemediationTrackRunner
 from runner_base import RunnerBase
 from architecture_gen import generate_architecture
 from architecture_contract import ArchitectureContractError, parse_architecture_document
@@ -129,7 +143,7 @@ app.add_middleware(
 # In-memory stores
 active_scans: dict[str, EnvironmentInitializer] = {}
 scan_contexts: dict[str, ScanValidationRequest] = {}
-active_remediations: dict[str, RemediationRunner] = {}
+active_remediations: dict[str, RemediationTrackRunner] = {}
 remediation_contexts: dict[str, RemediationRequest] = {}
 # Pipeline monitor subscribers per project (shared websocket bus for dashboard events)
 pipeline_subscribers: dict[str, set[WebSocket]] = {}
@@ -137,27 +151,19 @@ pipeline_indices: dict[str, int] = {}
 pipeline_lock = asyncio.Lock()
 active_terraform_applies: dict[str, dict] = {}
 terraform_apply_results: dict[str, dict] = {}
+remediation_orchestrator = RemediationOrchestrator()
 
 
 def _normalize_remediation_request(request: RemediationRequest) -> RemediationRequest:
-    raw_provider = str(request.llm_provider or "").strip().lower()
-    raw_api_key = str(request.llm_api_key or "").strip()
-    raw_model = str(request.llm_model or "").strip()
-
-    if raw_provider and raw_provider != "claude":
-        logger.info(
-            "Ignoring remediation provider override '%s'; remediation is Claude SDK only.",
-            raw_provider,
-        )
-
-    normalized_api_key = raw_api_key if raw_api_key.startswith("sk-ant-") else None
-    normalized_model = raw_model if "claude" in raw_model.lower() else None
+    raw_provider = str(request.llm_provider or "").strip().lower() or None
+    raw_api_key = str(request.llm_api_key or "").strip() or None
+    raw_model = str(request.llm_model or "").strip() or None
 
     return request.model_copy(
         update={
-            "llm_provider": "claude",
-            "llm_api_key": normalized_api_key,
-            "llm_model": normalized_model,
+            "llm_provider": raw_provider,
+            "llm_api_key": raw_api_key,
+            "llm_model": raw_model,
         }
     )
 
@@ -457,7 +463,7 @@ async def websocket_remediate(websocket: WebSocket, project_id: str):
     """WebSocket endpoint for streaming remediation progress."""
     await _handle_websocket(
         websocket, project_id,
-        create_runner=lambda ws, pid, ctx: RemediationRunner(ws, ctx),
+        create_runner=lambda ws, pid, ctx: RemediationTrackRunner(ws, ctx, remediation_orchestrator),
         contexts=remediation_contexts,
         active=active_remediations,
         missing_context_msg="No remediation context found. Please validate first.",
@@ -465,6 +471,65 @@ async def websocket_remediate(websocket: WebSocket, project_id: str):
         # so the first frontend fetch after 'completed' always reads fresh data.
         on_complete=lambda: invalidate_cache(project_id),
     )
+
+
+@app.post("/remediation/run", dependencies=[Depends(verify_api_key)])
+async def remediation_run(request: PipelineRemediationRunRequest):
+    """Run the remediation pipeline and stream each Fix as SSE."""
+
+    async def event_stream():
+        queue: asyncio.Queue[dict] = asyncio.Queue()
+        done = asyncio.Event()
+
+        def on_fix(fix):
+            queue.put_nowait(fix.model_dump())
+
+        async def worker():
+            try:
+                fixes = await remediation_orchestrator.run(request.project_id, on_fix=on_fix)
+                queue.put_nowait({"type": "summary", "fixes": len(fixes)})
+            except Exception as exc:
+                queue.put_nowait({"type": "error", "error": str(exc)})
+            finally:
+                done.set()
+
+        task = asyncio.create_task(worker())
+        try:
+            while not done.is_set() or not queue.empty():
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+                yield f"data: {json.dumps(payload)}\n\n"
+        finally:
+            await task
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/remediation/status", dependencies=[Depends(verify_api_key)])
+async def remediation_status():
+    """Return current quota/counter status for remediation providers."""
+    return remediation_orchestrator.status().model_dump()
+
+
+@app.post("/remediation/pr", dependencies=[Depends(verify_api_key)])
+async def remediation_pr(request: RemediationPRRequest):
+    """Create a GitHub PR from accepted remediation diffs."""
+    result = remediation_orchestrator.create_pr(request)
+    return result.model_dump()
+
+
+@app.post("/remediation/refresh", dependencies=[Depends(verify_api_key)])
+async def remediation_refresh(request: RemediationRefreshRequest):
+    """Re-read scanner artifacts and return normalized vulnerability totals."""
+    return remediation_orchestrator.refresh(request.project_id)
+
+
+@app.post("/remediation/navigate", dependencies=[Depends(verify_api_key)])
+async def remediation_navigate(request: RemediationNavigateRequest):
+    """Expose track navigation intent for orchestration clients."""
+    return {"success": True, "track": request.track}
 
 
 @app.websocket("/ws/pipeline/{project_id}")
