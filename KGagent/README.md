@@ -12,6 +12,7 @@ This folder contains only the Knowledge-Graph (KG) agent components so you can m
 - `scripts/maintenance/validate_kg.py` - KG validation checks.
 - `vuln-graph-backend/server.js` - optional Node API over Neo4j.
 - `.env.example` - KG-agent-only env template (no secrets).
+- `.env.template` - alternate template name for tooling that expects this convention.
 
 ## Quick start
 
@@ -22,7 +23,7 @@ cd "KG agent"
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-Copy-Item .env.example .env
+Copy-Item .env.template .env
 ```
 
 2. Run the agent:

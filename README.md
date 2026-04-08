@@ -105,6 +105,10 @@ SOURCE Connector/database.sql;
 ### 4. Configure environment variables
 Create env files and populate variables documented below.
 
+```powershell
+Copy-Item .env.template .env
+```
+
 ## Configuration
 The tables below come directly from environment variable reads in Connector and Agentic Layer code.
 

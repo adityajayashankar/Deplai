@@ -1,5 +1,9 @@
 import type { NextConfig } from "next";
+import { loadEnvConfig } from "@next/env";
 import path from "path";
+
+// Load shared workspace env from repo root so Connector and Agentic Layer use one file.
+loadEnvConfig(path.resolve(__dirname, ".."));
 
 const nextConfig: NextConfig = {
   reactCompiler: true,
