@@ -62,11 +62,12 @@ function toIso(value: Date | string | null): string | null {
 }
 
 function serverConfigSnapshot() {
+  const hasSessionSecret = Boolean(process.env.SESSION_SECRET) || process.env.NODE_ENV !== 'production';
   return {
     githubAppConfigured: Boolean(process.env.GITHUB_APP_ID && process.env.GITHUB_PRIVATE_KEY),
     githubWebhookConfigured: Boolean(process.env.GITHUB_WEBHOOK_SECRET),
     awsRuntimeConfigured: Boolean(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY),
-    sessionSecretConfigured: Boolean(process.env.SESSION_SECRET),
+    sessionSecretConfigured: hasSessionSecret,
     serviceKeyConfigured: Boolean(process.env.DEPLAI_SERVICE_KEY),
     cleanupEnabled: String(process.env.ALLOW_GLOBAL_CLEANUP || '').toLowerCase() === 'true',
   };

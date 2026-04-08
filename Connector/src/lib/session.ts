@@ -1,5 +1,4 @@
 import { SessionOptions } from 'iron-session';
-import { requireEnv } from './env';
 
 export interface SessionData {
   user?: {
@@ -15,8 +14,16 @@ export interface SessionData {
   isLoggedIn: boolean;
 }
 
+const devSessionSecret = 'deplai-local-dev-session-secret-2026-fallback';
+const sessionSecret = process.env.SESSION_SECRET?.trim();
+const resolvedSessionSecret = sessionSecret || (process.env.NODE_ENV === 'production' ? '' : devSessionSecret);
+
+if (!resolvedSessionSecret) {
+  throw new Error('Missing required environment variable: SESSION_SECRET');
+}
+
 export const sessionOptions: SessionOptions = {
-  password: requireEnv('SESSION_SECRET'),
+  password: resolvedSessionSecret,
   cookieName: 'deplai_session',
   cookieOptions: {
     secure: process.env.NODE_ENV === 'production',

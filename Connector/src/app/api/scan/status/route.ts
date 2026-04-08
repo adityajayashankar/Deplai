@@ -5,7 +5,14 @@ import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 function isBackendConnectivityError(error: unknown): boolean {
   const code = (error as { code?: string; cause?: { code?: string } })?.code
     || (error as { cause?: { code?: string } })?.cause?.code;
-  return code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EHOSTUNREACH' || code === 'ETIMEDOUT';
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error || '').toLowerCase();
+  return code === 'ECONNREFUSED'
+    || code === 'ENOTFOUND'
+    || code === 'EHOSTUNREACH'
+    || code === 'ETIMEDOUT'
+    || code === 'UND_ERR_SOCKET'
+    || message.includes('other side closed')
+    || message.includes('unable to connect to the remote server');
 }
 
 function isBackendTimeoutError(error: unknown): boolean {
