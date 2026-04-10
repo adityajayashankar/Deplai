@@ -49,9 +49,16 @@ export async function GET() {
         installed_at,
         created_at
        FROM github_installations
-       WHERE user_id = ?
+       WHERE (
+         user_id = ?
+         OR (
+           user_id IS NULL
+           AND account_type = 'User'
+           AND LOWER(account_login) = LOWER(?)
+         )
+       )
        ORDER BY created_at DESC`,
-      [user.id]
+      [user.id, user.login]
     );
 
     return NextResponse.json({ installations });

@@ -12,6 +12,7 @@ import {
   DEPLOYMENT_PROFILE_KEY,
   DEPLOY_HISTORY_MAX,
   IAC_FILES_KEY,
+  IAC_META_KEY,
   IAC_RUN_KEY,
   PLANNING_PROJECT_KEY,
   QA_CONTEXT_KEY,
@@ -22,10 +23,13 @@ import {
   clearPlanningState,
   downloadTextFile,
   extractDeploymentSummary,
+  getDeployableIacFiles,
+  hasTruncatedIacFiles,
   loadDeploySnapshot,
   loadDeployUiStage,
   persistDeploySnapshot,
   readIacFilesFromSession,
+  readSavedIacMeta,
   readSavedAws,
   readSavedIacRun,
   readStoredJson,
@@ -34,6 +38,7 @@ import {
   type ArchitectureReviewPayload,
   type AwsSessionConfig,
   type DeployApiResult,
+  type DeployLogEntry,
   type DeployStateSnapshot,
   type GeneratedIacFile,
   type ProjectRecord,
@@ -46,6 +51,14 @@ type PipelineStageId = 'analysis' | 'qa' | 'architecture' | 'approval' | 'terraf
 type IacMode = 'deterministic' | 'llm';
 type IacLlmProvider = 'groq' | 'openrouter' | 'ollama' | 'opencode';
 
+type IacPrResponse = {
+  attempted?: boolean;
+  success?: boolean;
+  pr_url?: string | null;
+  reason?: string;
+  error?: string;
+};
+
 const IAC_MODE_STORAGE_KEY = 'deplai.pipeline.iacMode';
 const IAC_LLM_PROVIDER_STORAGE_KEY = 'deplai.pipeline.iacLlmProvider';
 const IAC_LLM_MODEL_STORAGE_KEY = 'deplai.pipeline.iacLlmModel';
@@ -53,7 +66,7 @@ const IAC_LLM_API_KEY_STORAGE_KEY = 'deplai.pipeline.iacLlmApiKey';
 const IAC_LLM_BASE_URL_STORAGE_KEY = 'deplai.pipeline.iacLlmBaseUrl';
 
 const IAC_LLM_DEFAULT_MODELS: Record<IacLlmProvider, string> = {
-  groq: 'llama-3.3-70b-versatile',
+  groq: 'llama-3.1-8b-instant',
   openrouter: 'meta-llama/llama-3.3-70b-instruct:free',
   ollama: 'llama3.1:8b',
   opencode: 'openai/gpt-oss-20b',
@@ -540,6 +553,7 @@ export default function DeploymentTrackApp() {
   const idleRecoveryRef = useRef<string | null>(null);
   const analysisRequestRef = useRef<string | null>(null);
   const reviewRequestRef = useRef<string | null>(null);
+  const terraformAutostartRef = useRef<string | null>(null);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [activeStage, setActiveStage] = useState<PipelineStageId>('analysis');
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
@@ -553,6 +567,9 @@ export default function DeploymentTrackApp() {
   const [approved, setApproved] = useState(false);
   const [iacFiles, setIacFiles] = useState<GeneratedIacFile[]>(() => readIacFilesFromSession());
   const [selectedFile, setSelectedFile] = useState<string>(() => readIacFilesFromSession()[0]?.path || '');
+  const [iacPrUrl, setIacPrUrl] = useState<string | null>(null);
+  const [iacPrCreating, setIacPrCreating] = useState(false);
+  const [terraformGenerating, setTerraformGenerating] = useState(false);
   const [aws, setAws] = useState<AwsSessionConfig>(() => readSavedAws());
   const [iacMode, setIacMode] = useState<IacMode>(() => {
     if (typeof window === 'undefined') return 'deterministic';
@@ -579,13 +596,14 @@ export default function DeploymentTrackApp() {
   });
   const [deployStatus, setDeployStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const [deployProgress, setDeployProgress] = useState(0);
-  const [deployLogs, setDeployLogs] = useState<Array<{ text: string; ts: string; type: 'info' | 'success' | 'error' }>>([]);
+  const [deployLogs, setDeployLogs] = useState<DeployLogEntry[]>([]);
   const [deployResult, setDeployResult] = useState<DeployApiResult | null>(null);
   const [deploymentHistory, setDeploymentHistory] = useState<DeployStateSnapshot['deploymentHistory']>([]);
   const [deploySocketState, setDeploySocketState] = useState<PipelineSocketState>('idle');
   const [stopLoading, setStopLoading] = useState(false);
   const [destroyLoading, setDestroyLoading] = useState(false);
   const [verifyLoading, setVerifyLoading] = useState(false);
+  const [budgetOverride, setBudgetOverride] = useState(false);
   const [endpointChecks, setEndpointChecks] = useState<EndpointVerificationCheck[]>([]);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [reviewLoading, setReviewLoading] = useState(false);
@@ -634,18 +652,39 @@ export default function DeploymentTrackApp() {
     if (!selectedProjectId) return;
     patchActiveDeploymentState(selectedProjectId, patch);
   }, [selectedProjectId]);
-  const appendLog = useCallback((text: string, type: 'info' | 'success' | 'error' = 'info') => {
+  const appendLog = useCallback((
+    text: string,
+    type: 'info' | 'success' | 'error' = 'info',
+    meta?: Omit<DeployLogEntry, 'text' | 'ts' | 'type'>,
+  ) => {
     patchState((prev) => {
       const last = prev.logs[prev.logs.length - 1];
-      if (last && last.text === text && last.type === type) {
+      if (
+        last &&
+        last.text === text &&
+        last.type === type &&
+        last.worker_id === meta?.worker_id &&
+        last.worker_status === meta?.worker_status
+      ) {
         return prev;
       }
       return {
         ...prev,
-        logs: [...prev.logs, { text, ts: timestampLabel(), type }],
+        logs: [...prev.logs, { text, ts: timestampLabel(), type, ...meta }],
       };
     });
   }, [patchState]);
+  const updateIacFileContent = useCallback((filePath: string, nextContent: string) => {
+    setIacFiles((prev) => {
+      const nextFiles = prev.map((file) => (
+        file.path === filePath
+          ? { ...file, content: nextContent }
+          : file
+      ));
+      writeStoredJson(IAC_FILES_KEY, nextFiles);
+      return nextFiles;
+    });
+  }, []);
   const pushDeploymentHistory = useCallback((result: DeployApiResult | null, status: 'done' | 'error') => {
     if (!result) return;
     patchState((prev) => {
@@ -673,6 +712,28 @@ export default function DeploymentTrackApp() {
   }, [patchState]);
   const deploySummary = useMemo(() => extractDeploymentSummary(deployResult), [deployResult]);
   const liveRuntimeDetails = useMemo(() => extractLiveRuntimeDetails(deployResult), [deployResult]);
+  const keyPairDownloadMessage = useMemo(() => {
+    const details = deployResult?.details as Record<string, unknown> | null | undefined;
+    const reusedKey = Boolean(details?.key_pair_reused);
+    const existingKeyName = String(details?.existing_ec2_key_pair_name || deploySummary.keyName || '').trim();
+    if (deploySummary.generatedPem) return '';
+    if (reusedKey && existingKeyName) {
+      return `This deploy reused existing EC2 key pair '${existingKeyName}'. No new private PEM was generated, so there is nothing to download. Use the original private key for SSH access.`;
+    }
+    return 'No generated private key is available in this deployment result.';
+  }, [deployResult?.details, deploySummary.generatedPem, deploySummary.keyName]);
+  const terraformWorkerStates = useMemo(() => {
+    const latest = new Map<string, DeployLogEntry>();
+    deployLogs.forEach((log) => {
+      if (!log.worker_id || log.stage !== 'terraform_generation') return;
+      latest.set(log.worker_id, log);
+    });
+    return Array.from(latest.values());
+  }, [deployLogs]);
+  const terraformGenerationLogs = useMemo(
+    () => deployLogs.filter((log) => log.stage === 'terraform_generation' || Boolean(log.worker_id)),
+    [deployLogs],
+  );
   const hasLiveRuntimeDetails = useMemo(
     () => Boolean(liveRuntimeDetails && getLiveRuntimeInstanceId(deployResult) && getLiveRuntimeInstanceId(deployResult) !== 'n/a'),
     [deployResult, liveRuntimeDetails],
@@ -774,8 +835,40 @@ export default function DeploymentTrackApp() {
     return 'border-amber-500/20 bg-amber-500/10 text-amber-300';
   }, [outputBanner.tone]);
   const savedRun = readSavedIacRun();
+  const savedIacMeta = readSavedIacMeta();
+  const activeSavedRun = useMemo(() => {
+    if (!savedRun || !savedIacMeta?.has_run) return null;
+    if (!selectedProjectId || savedIacMeta.project_id !== selectedProjectId) return null;
+    if (savedIacMeta.workspace && expectedWorkspace && savedIacMeta.workspace !== expectedWorkspace) return null;
+    return savedRun;
+  }, [expectedWorkspace, savedIacMeta, savedRun, selectedProjectId]);
+  const sessionIacTruncated = useMemo(() => hasTruncatedIacFiles(iacFiles), [iacFiles]);
+  const deployableIacFiles = useMemo(() => getDeployableIacFiles(iacFiles), [iacFiles]);
+  const shouldUseSavedRunForDeploy = Boolean(activeSavedRun?.run_id) && deployableIacFiles.length === 0;
   const activeIacFilePath = selectedFile || iacFiles[0]?.path || '';
-  const shouldConnectPipelineSocket = Boolean(selectedProject && (activeStage === 'deploy' || activeStage === 'outputs' || deployStatus === 'running'));
+  const hasCurrentIacMeta = useMemo(() => {
+    if (!selectedProjectId || !savedIacMeta) return false;
+    if (savedIacMeta.project_id !== selectedProjectId) return false;
+    if (savedIacMeta.workspace && expectedWorkspace && savedIacMeta.workspace !== expectedWorkspace) return false;
+    return true;
+  }, [expectedWorkspace, savedIacMeta, selectedProjectId]);
+  const terraformRunLabel = useMemo(() => {
+    if (terraformGenerating) return 'Generating with live websocket telemetry';
+    if (shouldUseSavedRunForDeploy) return 'Connected to saved run';
+    if (sessionIacTruncated) return 'Cached preview requires regeneration or saved run';
+    if (hasCurrentIacMeta) return 'Using generated file bundle';
+    if (iacFiles.length > 0) return 'Cached bundle pending refresh';
+    return 'Awaiting Terraform generation';
+  }, [hasCurrentIacMeta, iacFiles.length, sessionIacTruncated, shouldUseSavedRunForDeploy, terraformGenerating]);
+  const shouldConnectPipelineSocket = Boolean(
+    selectedProject && (
+      activeStage === 'terraform'
+      || activeStage === 'deploy'
+      || activeStage === 'outputs'
+      || deployStatus === 'running'
+      || terraformGenerating
+    )
+  );
   const canFetchRuntimeDetails = Boolean(selectedProject && hasAwsSecrets);
   const canVerifyLiveEndpoints = Boolean(
     selectedProject &&
@@ -928,6 +1021,10 @@ export default function DeploymentTrackApp() {
   }, [llmApiBaseUrl]);
 
   useEffect(() => {
+    setIacPrUrl(null);
+  }, [selectedProjectId]);
+
+  useEffect(() => {
     if (!selectedProjectId) return;
     writeStoredJson(REVIEW_ANSWERS_KEY, answers);
   }, [answers, selectedProjectId]);
@@ -977,6 +1074,7 @@ export default function DeploymentTrackApp() {
       setDeployLogs([]);
       setDeployResult(null);
       setDeploymentHistory([]);
+      setBudgetOverride(false);
       setEndpointChecks([]);
       setError(null);
       return;
@@ -1019,6 +1117,16 @@ export default function DeploymentTrackApp() {
     setActiveDeploymentState(nextProjectId, nextState);
     setEndpointChecks([]);
   }, [searchParams]);
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    if (hasCurrentIacMeta || iacFiles.length === 0) return;
+    sessionStorage.removeItem(IAC_FILES_KEY);
+    sessionStorage.removeItem(IAC_RUN_KEY);
+    sessionStorage.removeItem(IAC_META_KEY);
+    setIacFiles([]);
+    setSelectedFile('');
+  }, [hasCurrentIacMeta, iacFiles.length, selectedProjectId]);
 
   useEffect(() => {
     if (!selectedProjectId) return;
@@ -1126,10 +1234,24 @@ export default function DeploymentTrackApp() {
           try {
             const payload = JSON.parse(String(event.data || '')) as {
               type?: string;
-              data?: { type?: 'info' | 'success' | 'error'; content?: string };
+              data?: {
+                type?: 'info' | 'success' | 'error';
+                content?: string;
+                worker_id?: string;
+                worker_role?: string;
+                worker_status?: string;
+                stage?: string;
+                model?: string;
+              };
             };
             if (payload.type !== 'message' || !payload.data?.content) return;
-            appendLog(payload.data.content, payload.data.type || 'info');
+            appendLog(payload.data.content, payload.data.type || 'info', {
+              worker_id: payload.data.worker_id,
+              worker_role: payload.data.worker_role,
+              worker_status: payload.data.worker_status,
+              stage: payload.data.stage,
+              model: payload.data.model,
+            });
           } catch {
             // ignore malformed websocket payloads
           }
@@ -1289,37 +1411,138 @@ export default function DeploymentTrackApp() {
   const generateTerraform = useCallback(async () => {
     if (!selectedProject) return;
     setError(null);
-    const response = await fetch('/api/pipeline/iac', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    setIacPrUrl(null);
+    setTerraformGenerating(true);
+    appendLog('Starting Terraform generation from the approved deployment profile.');
+    try {
+      const response = await fetch('/api/pipeline/iac', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: selectedProject.id,
+          provider: 'aws',
+          iac_mode: iacMode,
+          llm_provider: iacMode === 'llm' ? llmProvider : undefined,
+          llm_model: iacMode === 'llm' ? (llmModel.trim() || IAC_LLM_DEFAULT_MODELS[llmProvider]) : undefined,
+          llm_api_key: iacMode === 'llm' ? (llmApiKey.trim() || undefined) : undefined,
+          llm_api_base_url: iacMode === 'llm' ? (llmApiBaseUrl.trim() || undefined) : undefined,
+          qa_summary: qaSummary,
+          architecture_context: String(repoContext?.summary || ''),
+          repository_context: repoContext || undefined,
+          deployment_profile: deploymentProfile || undefined,
+          approval_payload: approvalPayload || undefined,
+          architecture_json: deploymentProfile || architectureView || undefined,
+          aws_region: aws.aws_region.trim() || 'eu-north-1',
+        }),
+      });
+      const data = await response.json().catch(() => ({})) as {
+        success?: boolean;
+        files?: GeneratedIacFile[];
+        summary?: string;
+        warnings?: string[];
+        run_id?: string;
+        workspace?: string;
+        provider_version?: string;
+        state_bucket?: string;
+        lock_table?: string;
+        source?: string;
+        error?: string;
+      };
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || 'IaC generation failed.');
+      }
+      const files = normalizeIacFiles(Array.isArray(data.files) ? data.files : []);
+      setIacFiles(files);
+      if (files[0]?.path) setSelectedFile(files[0].path);
+      writeStoredJson(IAC_FILES_KEY, files);
+      if (data.run_id && data.workspace) {
+        sessionStorage.setItem(IAC_RUN_KEY, JSON.stringify({ run_id: data.run_id, workspace: data.workspace, provider_version: data.provider_version || '', state_bucket: data.state_bucket || '', lock_table: data.lock_table || '' }));
+      } else {
+        sessionStorage.removeItem(IAC_RUN_KEY);
+      }
+      sessionStorage.setItem(IAC_META_KEY, JSON.stringify({
         project_id: selectedProject.id,
-        provider: 'aws',
-        iac_mode: iacMode,
-        llm_provider: iacMode === 'llm' ? llmProvider : undefined,
-        llm_model: iacMode === 'llm' ? (llmModel.trim() || IAC_LLM_DEFAULT_MODELS[llmProvider]) : undefined,
-        llm_api_key: iacMode === 'llm' ? (llmApiKey.trim() || undefined) : undefined,
-        llm_api_base_url: iacMode === 'llm' ? (llmApiBaseUrl.trim() || undefined) : undefined,
-        qa_summary: qaSummary,
-        architecture_context: qaSummary || String(repoContext?.summary || ''),
-        architecture_json: deploymentProfile || architectureView || undefined,
-        aws_region: aws.aws_region.trim() || 'eu-north-1',
-      }),
-    });
-    const data = await response.json().catch(() => ({})) as { success?: boolean; files?: GeneratedIacFile[]; summary?: string; warnings?: string[]; run_id?: string; workspace?: string; provider_version?: string; state_bucket?: string; lock_table?: string; error?: string };
-    if (!response.ok || !data.success) {
-      throw new Error(data.error || 'IaC generation failed.');
+        workspace: data.workspace || expectedWorkspace,
+        source: String(data.source || ''),
+        generated_at: new Date().toISOString(),
+        has_run: Boolean(data.run_id && data.workspace),
+      }));
+      appendLog(data.summary || `Terraform generation completed with ${files.length} file(s).`, 'success');
+      for (const warning of Array.isArray(data.warnings) ? data.warnings : []) {
+        appendLog(String(warning), 'info');
+      }
+    } finally {
+      setTerraformGenerating(false);
     }
-    const files = normalizeIacFiles(Array.isArray(data.files) ? data.files : []);
-    setIacFiles(files);
-    if (files[0]?.path) setSelectedFile(files[0].path);
-    writeStoredJson(IAC_FILES_KEY, files);
-    if (data.run_id && data.workspace) {
-      sessionStorage.setItem(IAC_RUN_KEY, JSON.stringify({ run_id: data.run_id, workspace: data.workspace, provider_version: data.provider_version || '', state_bucket: data.state_bucket || '', lock_table: data.lock_table || '' }));
-    } else {
+  }, [appendLog, approvalPayload, architectureView, aws.aws_region, deploymentProfile, expectedWorkspace, iacMode, llmApiBaseUrl, llmApiKey, llmModel, llmProvider, qaSummary, repoContext, selectedProject]);
+
+  const createIacPr = useCallback(async () => {
+    if (!selectedProject || iacPrCreating || terraformGenerating || deployableIacFiles.length === 0) return;
+    setError(null);
+    setIacPrCreating(true);
+    try {
+      const response = await fetch('/api/pipeline/iac/pr', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: selectedProject.id,
+          project_name: selectedProject.name,
+          files: deployableIacFiles,
+        }),
+      });
+      const data = await response.json().catch(() => ({})) as IacPrResponse;
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || 'Failed to create IaC PR.');
+      }
+      const prUrl = String(data.pr_url || '').trim();
+      setIacPrUrl(prUrl || null);
+      appendLog(prUrl ? `IaC PR created: ${prUrl}` : 'IaC PR created.', 'success');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Failed to create IaC PR.');
+    } finally {
+      setIacPrCreating(false);
+    }
+  }, [appendLog, deployableIacFiles, iacPrCreating, selectedProject, terraformGenerating]);
+
+  useEffect(() => {
+    if (activeStage !== 'terraform' || !selectedProject) return;
+    if (terraformGenerating || hasCurrentIacMeta) return;
+    if (terraformGenerationLogs.length > 0) return;
+    if (!repoContext || repoContext.workspace !== expectedWorkspace) return;
+    if (!deploymentProfile && !architectureView) return;
+
+    if (shouldUseSavedRunForDeploy) {
       sessionStorage.removeItem(IAC_RUN_KEY);
+      sessionStorage.removeItem(IAC_META_KEY);
     }
-  }, [architectureView, aws.aws_region, deploymentProfile, iacMode, llmApiBaseUrl, llmApiKey, llmModel, llmProvider, qaSummary, repoContext?.summary, selectedProject]);
+
+    const autostartKey = `${selectedProject.id}:${expectedWorkspace}`;
+    if (terraformAutostartRef.current === autostartKey) return;
+    terraformAutostartRef.current = autostartKey;
+
+    sessionStorage.removeItem(IAC_FILES_KEY);
+    sessionStorage.removeItem(IAC_RUN_KEY);
+    sessionStorage.removeItem(IAC_META_KEY);
+    setIacFiles([]);
+    setSelectedFile('');
+    appendLog('No current Terraform run metadata found for this repo. Starting a fresh Terraform generation.', 'info');
+    void generateTerraform().catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : 'IaC generation failed.');
+    });
+  }, [
+    activeStage,
+    appendLog,
+    architectureView,
+    deploymentProfile,
+    expectedWorkspace,
+    generateTerraform,
+    hasCurrentIacMeta,
+    repoContext,
+    selectedProject,
+    shouldUseSavedRunForDeploy,
+    terraformGenerating,
+    terraformGenerationLogs.length,
+  ]);
 
   const hydrateTerminalDeployResult = useCallback(async (baseResult: DeployApiResult | null) => {
     if (!baseResult?.success || String(baseResult.error || '').trim()) {
@@ -1464,14 +1687,17 @@ export default function DeploymentTrackApp() {
       activeDeployment.inFlight = false;
       return;
     }
-    if (!savedRun && iacFiles.length === 0) {
-      setError('No generated Terraform bundle found. Generate Terraform first.');
+    if (!activeSavedRun && deployableIacFiles.length === 0) {
+      const message = sessionIacTruncated
+        ? 'Session-cached Terraform files were truncated. Regenerate Terraform or reuse a saved run before deployment.'
+        : 'No generated Terraform bundle found. Generate Terraform first.';
+      setError(message);
       patchState({
         status: 'error',
         progress: 100,
-        deployResult: { success: false, error: 'No generated Terraform bundle found. Generate Terraform first.' },
+        deployResult: { success: false, error: message },
       });
-      appendLog('No generated IaC files found. Generate Terraform first.', 'error');
+      appendLog(message, 'error');
       activeDeployment.inFlight = false;
       return;
     }
@@ -1495,17 +1721,17 @@ export default function DeploymentTrackApp() {
           project_id: selectedProject.id,
           provider: 'aws',
           runtime_apply: true,
-          run_id: savedRun?.run_id,
-          workspace: savedRun?.workspace,
-          state_bucket: savedRun?.state_bucket,
-          lock_table: savedRun?.lock_table,
-          files: savedRun ? [] : iacFiles,
+          run_id: shouldUseSavedRunForDeploy ? activeSavedRun?.run_id : undefined,
+          workspace: shouldUseSavedRunForDeploy ? activeSavedRun?.workspace : undefined,
+          state_bucket: shouldUseSavedRunForDeploy ? activeSavedRun?.state_bucket : undefined,
+          lock_table: shouldUseSavedRunForDeploy ? activeSavedRun?.lock_table : undefined,
+          files: shouldUseSavedRunForDeploy ? [] : deployableIacFiles,
           aws_access_key_id: aws.aws_access_key_id,
           aws_secret_access_key: aws.aws_secret_access_key,
           aws_region: aws.aws_region,
           estimated_monthly_usd: costEstimate.total,
           budget_limit_usd: costEstimate.cap,
-          budget_override: false,
+          budget_override: budgetOverride,
         }),
       });
       const data = await response.json().catch(() => ({})) as DeployApiResult;
@@ -1556,7 +1782,7 @@ export default function DeploymentTrackApp() {
       }
       activeDeployment.inFlight = false;
     }
-  }, [appendLog, aws.aws_access_key_id, aws.aws_region, aws.aws_secret_access_key, costEstimate.cap, costEstimate.total, deployLogs, deployProgress, deployResult, deployStatus, deploymentHistory, hasAwsSecrets, iacFiles, patchState, pushDeploymentHistory, reconcileDeploymentStatus, savedRun, selectedProject]);
+  }, [activeSavedRun, appendLog, aws.aws_access_key_id, aws.aws_region, aws.aws_secret_access_key, budgetOverride, costEstimate.cap, costEstimate.total, deployLogs, deployProgress, deployResult, deployStatus, deployableIacFiles, deploymentHistory, hasAwsSecrets, patchState, pushDeploymentHistory, reconcileDeploymentStatus, selectedProject, sessionIacTruncated, shouldUseSavedRunForDeploy]);
 
   const stopDeployment = useCallback(async () => {
     if (!selectedProject || stopLoading || deployStatus !== 'running') return;
@@ -1773,6 +1999,10 @@ export default function DeploymentTrackApp() {
     };
   }, [deployProgress, deployStatus, reconcileDeploymentStatus, selectedProject]);
 
+  const showRegenerateTerraformButton =
+    Boolean(selectedProject) &&
+    /provided terraform bundle (is|appears) outdated|stale terraform bundle|default-vpc conditional mode|key pair reuse variable is missing/i.test(String(error || ''));
+
   return (
     <div className="flex h-screen overflow-hidden bg-black font-sans text-zinc-300">
       <aside className="flex h-full w-65 shrink-0 flex-col border-r border-[#1A1A1A] bg-[#050505]">
@@ -1787,22 +2017,37 @@ export default function DeploymentTrackApp() {
           {selectedProject && <div className="flex items-center gap-3"><span className="rounded-md border border-[#262626] bg-[#111111] px-3 py-1.5 font-mono text-xs text-zinc-400">{selectedProject.name}</span><button onClick={() => router.push('/dashboard')} className="text-xs font-semibold text-zinc-400 hover:text-white">Exit</button></div>}
         </header>
         <div className="custom-scrollbar flex-1 overflow-y-auto p-8">
-          {error && <div className="mx-auto mb-6 max-w-5xl rounded-md border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">{error}</div>}
+          {error && (
+            <div className="mx-auto mb-6 flex max-w-5xl items-center justify-between gap-4 rounded-md border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">
+              <div>{error}</div>
+              {showRegenerateTerraformButton ? (
+                <button
+                  onClick={() => {
+                    setAndPersistStage('terraform');
+                    void generateTerraform().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'IaC generation failed.'));
+                  }}
+                  className="shrink-0 rounded-md border border-red-400/30 bg-red-500/20 px-4 py-2 text-xs font-semibold text-red-100 hover:bg-red-500/30"
+                >
+                  Regenerate Terraform
+                </button>
+              ) : null}
+            </div>
+          )}
           {selectedProject && (activeStage === 'approval' || activeStage === 'terraform') && (
             <div className="mx-auto mb-6 max-w-5xl rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
               <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                <div>
-                  <div className="text-sm font-semibold text-zinc-100">IaC Generation Mode</div>
-                  <div className="mt-1 text-xs text-zinc-500">Choose deterministic fallback templates or real LLM generation.</div>
+                  <div>
+                    <div className="text-sm font-semibold text-zinc-100">IaC Generation Mode</div>
+                  <div className="mt-1 text-xs text-zinc-500">AWS always runs through the Agentic multi-worker Terraform pipeline. This setting only chooses whether workers render HCL directly or whether the pipeline stays in deterministic rescue mode.</div>
                 </div>
-                <div className="grid w-full gap-3 md:grid-cols-2 lg:w-auto lg:min-w-[520px]">
+                <div className="grid w-full gap-3 md:grid-cols-2 lg:w-auto lg:min-w-130">
                   <select
                     value={iacMode}
                     onChange={(event) => setIacMode(event.target.value === 'llm' ? 'llm' : 'deterministic')}
                     className="rounded-md border border-[#262626] bg-black px-3 py-2 text-xs font-semibold text-zinc-200 outline-none"
                   >
-                    <option value="deterministic">Deterministic fallback</option>
-                    <option value="llm">LLM mode</option>
+                    <option value="deterministic">Deterministic rescue only</option>
+                    <option value="llm">Agentic workers</option>
                   </select>
                   {iacMode === 'llm' ? (
                     <select
@@ -2112,10 +2357,202 @@ export default function DeploymentTrackApp() {
           )}
           {activeStage === 'architecture' && <div className="mx-auto max-w-6xl space-y-6"><div><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Architecture & Cost Estimate</h1><p className="text-sm text-zinc-400">Generated topology for AWS ({architectureRegion}) from repository analysis and deployment Q&A.</p></div><div className="grid grid-cols-3 gap-6"><div className="col-span-2 overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="flex items-center justify-between border-b border-[#1A1A1A] px-5 py-4"><div><div className="text-sm font-semibold text-zinc-100">Generated Architecture Graph</div><div className="text-xs text-zinc-500">{architectureNodes.length} nodes / {architectureEdges.length} edges</div></div></div><div className="p-5">{architectureLayout.length > 0 ? <svg viewBox="0 0 700 400" className="w-full rounded-lg bg-black"><defs><marker id="deploy-track-arrow" markerWidth="8" markerHeight="6" refX="6" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#3f3f46" /></marker></defs>{architectureEdges.map((edge, index) => { const from = architectureNodePositions.get(edge.from); const to = architectureNodePositions.get(edge.to); if (!from || !to) return null; return <line key={`${edge.from}-${edge.to}-${index}`} x1={from.x} y1={from.y} x2={to.x} y2={to.y} stroke="#3f3f46" strokeWidth="1.5" strokeDasharray="5,3" markerEnd="url(#deploy-track-arrow)" />; })}{architectureLayout.map((node) => <g key={node.id} transform={`translate(${node.x - 60},${node.y - 22})`}><rect width="120" height="44" rx="8" fill={`${node.color}18`} stroke={node.color} strokeWidth="1" strokeOpacity=".65" /><text x="60" y="17" textAnchor="middle" fill={node.color} fontSize="9" fontFamily="monospace" fontWeight="600">{node.id.toUpperCase()}</text><text x="60" y="31" textAnchor="middle" fill="#a1a1aa" fontSize="10" fontFamily="-apple-system,sans-serif">{node.label || node.type}</text></g>)}<text x="350" y="392" textAnchor="middle" fill="#52525b" fontSize="10" fontFamily="-apple-system,sans-serif">Rendered from architecture review output</text></svg> : <div className="rounded-lg border border-dashed border-[#262626] bg-black px-6 py-16 text-center text-sm text-zinc-500">Architecture output is not available yet. Complete Q&A generation to populate the graph.</div>}</div></div><div className="space-y-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Monthly Estimate</div><div className="text-3xl font-semibold text-zinc-100">${costEstimate.total.toFixed(2)}</div><div className="mt-2 text-xs text-zinc-500">Budget cap: ${costEstimate.cap.toFixed(2)}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Q&A Context</div><div className="text-xs leading-relaxed text-zinc-400">{qaSummary ? <pre className="whitespace-pre-wrap font-sans text-xs leading-relaxed text-zinc-400">{qaSummary}</pre> : 'Waiting for deployment answers.'}</div></div><button onClick={() => setAndPersistStage('approval')} className="w-full rounded-md bg-zinc-100 py-3 text-sm font-semibold text-black hover:bg-white">Review & Approve</button></div></div>{architectureCostRows.length > 0 && <div className="overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="border-b border-[#1A1A1A] px-5 py-4 text-sm font-semibold text-zinc-100">Cost Breakdown</div><table className="w-full text-sm"><thead><tr className="border-b border-[#1A1A1A] text-left text-[11px] uppercase tracking-widest text-zinc-500"><th className="px-5 py-3">Service</th><th className="px-5 py-3">Type</th><th className="px-5 py-3">Monthly</th><th className="px-5 py-3">Notes</th></tr></thead><tbody>{architectureCostRows.map((row, index) => <tr key={`${row.service}-${index}`} className="border-b border-[#111111] last:border-0"><td className="px-5 py-3 text-zinc-200">{row.service}</td><td className="px-5 py-3 text-zinc-400">{row.type}</td><td className="px-5 py-3 font-mono text-zinc-200">${row.monthly.toFixed(2)}</td><td className="px-5 py-3 text-zinc-500">{row.note || '-'}</td></tr>)}<tr className="bg-black/60"><td className="px-5 py-3 font-semibold text-zinc-100">Total</td><td className="px-5 py-3" /><td className="px-5 py-3 font-mono font-semibold text-zinc-100">${costEstimate.total.toFixed(2)}</td><td className="px-5 py-3" /></tr></tbody></table></div>}</div>}
           {activeStage === 'approval' && <div className="mx-auto max-w-3xl space-y-6"><div className="mt-4 mb-8 border-b border-[#1A1A1A] pb-6"><h1 className="mb-2 text-2xl font-semibold text-zinc-100">Sign-off</h1><p className="text-sm text-zinc-400">Review deployment contract before generating infrastructure code.</p></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-6 rounded-md border border-[#1A1A1A] bg-black p-4"><label className="flex items-start gap-3"><input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)} className="mt-1 h-4 w-4 rounded border-[#4B5563] bg-[#111111] text-indigo-600" /><span className="text-sm leading-relaxed text-zinc-400">I approve the architectural design and estimated runtime costs. Proceed with generating Terraform configurations.</span></label></div><button disabled={!approved} onClick={() => { setAndPersistStage('terraform'); void generateTerraform().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'IaC generation failed.')); }} className="w-full rounded-md bg-indigo-600 py-3 text-sm font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500">Approve & Generate IaC</button></div></div>}
-          {activeStage === 'terraform' && <div className="mx-auto flex max-w-6xl flex-col gap-6"><div className="flex items-center justify-between"><div><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Terraform Output</h1><p className="text-sm text-zinc-400">Code generated by the Terraform agent from the approved architecture.</p></div><button onClick={() => setAndPersistStage('aws_config')} disabled={iacFiles.length === 0} className="rounded-md bg-zinc-100 px-5 py-2 text-sm font-semibold text-black hover:bg-white disabled:bg-[#111111] disabled:text-zinc-500">Continue to Config</button></div><div className="grid grid-cols-3 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5"><div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Terraform Agent</div><div className="text-sm text-zinc-200">{savedRun?.run_id ? 'Connected to saved run' : 'Using generated file bundle'}</div><div className="mt-3 space-y-2 text-xs text-zinc-500"><div>Run ID: <span className="font-mono text-zinc-300">{savedRun?.run_id || 'pending'}</span></div><div>Workspace: <span className="font-mono text-zinc-300">{savedRun?.workspace || 'local session'}</span></div><div>Files: <span className="font-mono text-zinc-300">{iacFiles.length}</span></div></div></div><div className="col-span-2 flex gap-6"><div className="custom-scrollbar h-130 w-64 shrink-0 overflow-y-auto rounded-lg border border-[#1A1A1A] bg-[#050505] p-3 text-sm">{iacFiles.map((file) => <button key={file.path} onClick={() => setSelectedFile(file.path)} className={`mb-2 block w-full rounded px-2 py-1 text-left ${activeIacFilePath === file.path ? 'bg-[#111111] text-zinc-200' : 'text-zinc-300 hover:bg-[#111111]'}`}>{file.path}</button>)}</div><div className="flex h-130 flex-1 flex-col rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="border-b border-[#1A1A1A] bg-black px-4 py-2.5 font-mono text-[11px] text-zinc-400">{activeIacFilePath || 'Generated files'}</div><div className="custom-scrollbar flex-1 overflow-y-auto p-5 font-mono text-[13px] leading-relaxed text-zinc-300"><pre className="whitespace-pre-wrap">{(iacFiles.find((file) => file.path === activeIacFilePath) || iacFiles[0])?.content || 'Generate Terraform to view files.'}</pre></div></div></div></div></div>}
-          {activeStage === 'aws_config' && <div className="mx-auto max-w-5xl space-y-6"><div className="mt-4 mb-6 border-b border-[#1A1A1A] pb-6"><h1 className="mb-2 text-2xl font-semibold text-zinc-100">AWS Configuration</h1><p className="text-sm text-zinc-400">Provide deploy-time credentials and confirm the Terraform runtime inputs.</p></div><div className="grid grid-cols-3 gap-6"><div className="col-span-2 space-y-6 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="space-y-4"><input value={aws.aws_access_key_id} onChange={(event) => setAws((prev) => ({ ...prev, aws_access_key_id: event.target.value }))} placeholder="AWS_ACCESS_KEY_ID" className="w-full rounded-md border border-[#262626] bg-black px-4 py-2.5 font-mono text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none" /><input type="password" value={aws.aws_secret_access_key} onChange={(event) => setAws((prev) => ({ ...prev, aws_secret_access_key: event.target.value }))} placeholder="AWS_SECRET_ACCESS_KEY" className="w-full rounded-md border border-[#262626] bg-black px-4 py-2.5 font-mono text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none" /><input value={aws.aws_region} onChange={(event) => setAws((prev) => ({ ...prev, aws_region: event.target.value }))} placeholder="AWS_REGION" className="w-full rounded-md border border-[#262626] bg-black px-4 py-2.5 font-mono text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none" /></div><button onClick={() => setAndPersistStage('deploy')} disabled={!hasAwsSecrets || (!savedRun && iacFiles.length === 0)} className="flex w-full items-center justify-center gap-2 rounded-md bg-indigo-600 py-3 font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500"><Rocket className="h-4 w-4" /> Continue to Deploy</button></div><div className="space-y-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div><div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Runtime Inputs</div><div className="mt-3 space-y-2 text-xs text-zinc-400"><div>Terraform source: <span className="font-mono text-zinc-200">{savedRun?.run_id ? 'saved run' : 'session files'}</span></div><div>Workspace: <span className="font-mono text-zinc-200">{savedRun?.workspace || 'local session'}</span></div><div>Estimated monthly cost: <span className="font-mono text-zinc-200">${costEstimate.total.toFixed(2)}</span></div><div>Budget cap: <span className="font-mono text-zinc-200">${costEstimate.cap.toFixed(2)}</span></div></div></div><div className={`rounded-md border px-3 py-2 text-xs ${hasAwsSecrets ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300' : 'border-amber-500/20 bg-amber-500/10 text-amber-300'}`}>{hasAwsSecrets ? 'AWS credentials ready for runtime apply.' : 'Enter AWS credentials to unlock deployment.'}</div></div></div></div>}
-          {activeStage === 'deploy' && <div className="mx-auto max-w-5xl space-y-6"><div className="mb-2 flex items-center justify-between"><div><h1 className="text-2xl font-semibold text-zinc-100">{deployStatus === 'done' ? 'Deployment Complete' : deployStatus === 'running' ? 'Deployment In Progress' : deployStatus === 'error' ? 'Deployment Failed' : 'Ready to Deploy'}</h1><p className="mt-1 text-sm text-zinc-400">Live deployment console backed by pipeline WebSocket events and backend status reconciliation.</p></div><div className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-widest ${deploySocketState === 'connected' ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : deploySocketState === 'connecting' ? 'border-cyan-500/20 bg-cyan-500/10 text-cyan-400' : deploySocketState === 'error' ? 'border-amber-500/20 bg-amber-500/10 text-amber-400' : 'border-zinc-700 bg-[#111111] text-zinc-500'}`}>WS {deploySocketState}</div></div><div className="grid grid-cols-3 gap-6"><div className="col-span-2 flex h-125 flex-col overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="flex items-center justify-between border-b border-[#1A1A1A] bg-black px-4 py-2.5 font-mono text-xs text-zinc-500"><div className="flex items-center gap-2"><Terminal className="h-4 w-4 text-zinc-400" /> STDOUT</div><div>{deployLogs.length} events</div></div><div className="custom-scrollbar flex-1 overflow-y-auto bg-black p-6 font-mono text-[13px]">{deployLogs.map((log, index) => <div key={`${log.ts}-${index}`} className="mb-1 flex gap-4"><span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span><span className={log.type === 'success' ? 'font-medium text-emerald-400' : log.type === 'error' ? 'text-red-400' : 'text-zinc-300'}>{log.text}</span></div>)}<div ref={logEndRef} /></div></div><div className="space-y-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div><div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Execution</div><div className="mt-3 text-3xl font-semibold text-zinc-100">{deployProgress}%</div><div className="mt-2 h-2 overflow-hidden rounded-full bg-[#111111]"><div className={`h-full rounded-full ${deployStatus === 'done' ? 'bg-emerald-500' : deployStatus === 'error' ? 'bg-red-500' : 'bg-indigo-500'}`} style={{ width: `${deployProgress}%` }} /></div><div className="mt-3 text-xs text-zinc-500">Status: <span className="font-mono text-zinc-300">{deployStatus}</span></div></div><div className="space-y-3"><button onClick={() => void startDeploy()} disabled={deployStatus === 'running'} className="flex w-full items-center justify-center gap-2 rounded-md bg-indigo-600 px-6 py-2.5 font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500"><Rocket className="h-4 w-4" /> {deployStatus === 'done' ? 'Re-run Deploy' : 'Start Deploy'}</button><button onClick={() => void stopDeployment()} disabled={deployStatus !== 'running' || stopLoading} className="w-full rounded-md border border-red-500/20 bg-red-500/10 px-6 py-2.5 font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">{stopLoading ? 'Stopping...' : 'Stop Deployment'}</button><button onClick={() => void reconcileDeploymentStatus().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to reconcile deployment status.'))} className="w-full rounded-md border border-[#262626] bg-[#111111] px-6 py-2.5 font-semibold text-zinc-300 hover:bg-[#181818]">Reconcile Backend Status</button>{deployStatus !== 'running' && deployResult && <button onClick={() => setAndPersistStage('outputs')} className="flex w-full items-center justify-center gap-2 rounded-md bg-zinc-100 px-6 py-2.5 font-semibold text-black hover:bg-white">{deployStatus === 'error' ? 'View Results' : 'View Outputs'} <ArrowRight className="h-4 w-4" /></button>}</div></div></div></div>}
-          {activeStage === 'outputs' && <div className="mx-auto max-w-5xl space-y-6"><div className="mt-4 mb-8 border-b border-[#1A1A1A] pb-6"><div className={`mb-4 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-bold uppercase ${outputBannerClassName}`}><CheckCircle2 className="h-3.5 w-3.5" /> {outputBanner.label}</div><h1 className="mb-2 text-2xl font-semibold text-zinc-100">{outputBanner.title}</h1><p className="text-sm text-zinc-400">{outputBanner.description}</p>{backendErrorMessage && <div className="mt-4 rounded-md border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">{backendErrorMessage}</div>}{!backendErrorMessage && !hasLiveRuntimeDetails && deployResult?.success && <div className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-200">Live runtime details are missing for this repo. Fetch the latest runtime details to hydrate outputs before treating this deploy as successful.</div>}</div><div className="grid grid-cols-2 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-6 text-[10px] font-bold uppercase text-zinc-500">Security</div><div className="flex gap-2"><button onClick={() => deploySummary.generatedPem && downloadTextFile(`${deploySummary.keyName}.pem`, deploySummary.generatedPem.endsWith('\n') ? deploySummary.generatedPem : `${deploySummary.generatedPem}\n`)} disabled={!deploySummary.generatedPem} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-[#262626] bg-[#111111] py-2 text-[12px] font-medium text-zinc-200 hover:bg-[#1A1A1A] disabled:cursor-not-allowed disabled:text-zinc-500"><Download className="h-4 w-4" /> Download .PEM</button><button onClick={() => void downloadPpk().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'PPK conversion failed.'))} disabled={!deploySummary.generatedPem} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-[#262626] bg-[#111111] py-2 text-[12px] font-medium text-zinc-200 hover:bg-[#1A1A1A] disabled:cursor-not-allowed disabled:text-zinc-500"><Download className="h-4 w-4" /> Download .PPK</button></div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-4 text-[10px] font-bold uppercase text-zinc-500">Endpoints</div><div className="space-y-3 text-sm"><div className="flex justify-between"><span className="text-zinc-400">Public IP</span><span className="font-mono text-zinc-200">{deploySummary.publicIp}</span></div><div className="flex justify-between"><span className="text-zinc-400">Instance</span><span className="font-mono text-zinc-200">{deploySummary.instanceId}</span></div><div className="flex justify-between"><span className="text-zinc-400">CloudFront</span><div className="flex items-center gap-2"><span className="font-mono text-zinc-200">{deploySummary.cloudfrontUrl}</span>{canOpenCloudfront && <button onClick={() => window.open(deploySummary.cloudfrontUrl.startsWith('http') ? deploySummary.cloudfrontUrl : `https://${deploySummary.cloudfrontUrl}`, '_blank', 'noopener,noreferrer')} className="text-zinc-500 hover:text-zinc-200"><ExternalLink className="h-4 w-4" /></button>}</div></div><div className="flex justify-between"><span className="text-zinc-400">Verification</span><span className={`font-medium ${outputBanner.tone === 'success' ? 'text-emerald-400' : outputBanner.tone === 'error' ? 'text-red-300' : 'text-amber-300'}`}>{outputBanner.label}</span></div></div></div></div><div className="flex gap-3"><button onClick={() => void fetchRuntimeDetails().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to fetch runtime details.'))} disabled={!canFetchRuntimeDetails} className="flex items-center gap-2 rounded-md border border-[#262626] bg-[#111111] px-4 py-2 text-sm font-semibold text-zinc-300 hover:bg-[#181818] disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><RefreshCw className="h-4 w-4" /> Fetch Latest Runtime Details</button><button onClick={() => void verifyLiveEndpoints()} disabled={verifyLoading || !canVerifyLiveEndpoints} className="flex items-center gap-2 rounded-md border border-cyan-500/20 bg-cyan-500/10 px-4 py-2 text-sm font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><ExternalLink className="h-4 w-4" /> {verifyLoading ? 'Verifying...' : 'Verify Live Endpoints'}</button><button onClick={() => void destroyDeployment().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Destroy failed.'))} disabled={destroyLoading || !hasAwsSecrets} className="flex items-center gap-2 rounded-md border border-red-500/20 bg-red-500/10 px-4 py-2 text-sm font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><Server className="h-4 w-4" /> {destroyLoading ? 'Destroying...' : 'Destroy Infrastructure'}</button></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><h3 className="mb-4 text-sm font-semibold text-zinc-200">Endpoint Verification</h3>{effectiveEndpointChecks.length > 0 ? <div className="space-y-3">{effectiveEndpointChecks.map((check) => <div key={`${check.label}-${check.url || 'empty'}`} className="rounded-md border border-[#1A1A1A] bg-black p-4"><div className="flex items-center justify-between"><div><div className="text-sm font-medium text-zinc-200">{check.label}</div><div className="mt-1 font-mono text-[11px] text-zinc-500">{check.url || 'n/a'}</div></div><span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${check.ok ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-300'}`}>{check.ok ? `HTTP ${check.status ?? 200}` : (check.status ? `HTTP ${check.status}` : 'Unreachable')}</span></div><div className="mt-3 text-xs leading-relaxed text-zinc-400">{check.detail}</div></div>)}</div> : <div className="rounded-md border border-dashed border-[#262626] bg-black px-4 py-6 text-sm text-zinc-500">{canVerifyLiveEndpoints ? 'No live verification has been recorded yet. Run `Verify Live Endpoints` to test the deployed URLs.' : 'Verification is unavailable until the current repo has a successful deploy payload and live runtime details.'}</div>}</div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><h3 className="mb-4 text-sm font-semibold text-zinc-200">Deployment History</h3><div className="space-y-3">{deploymentHistory.map((entry) => <div key={entry.id} className="rounded-md border border-[#1A1A1A] bg-black p-4"><div className="flex items-center justify-between"><div><p className="text-sm font-medium text-zinc-200">{new Date(entry.createdAt).toLocaleString()}</p><p className="mt-1 font-mono text-[11px] text-zinc-400">EC2: {entry.instanceId}</p></div><span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${entry.status === 'done' ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-400'}`}>{entry.status === 'done' ? 'Success' : 'Error'}</span></div></div>)}</div></div></div>}
+          {activeStage === 'terraform' && (
+            <div className="mx-auto flex max-w-6xl flex-col gap-6">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Terraform Output</h1>
+                  <p className="text-sm text-zinc-400">Live Terraform agent activity streams over the pipeline websocket, and generated files stay editable before deploy.</p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => void generateTerraform().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'IaC generation failed.'))}
+                    disabled={terraformGenerating}
+                    className="rounded-md border border-[#262626] bg-[#111111] px-5 py-2 text-sm font-semibold text-zinc-200 hover:bg-[#181818] disabled:bg-[#111111] disabled:text-zinc-500"
+                  >
+                    {terraformGenerating ? 'Generating...' : 'Regenerate'}
+                  </button>
+                  <button
+                    onClick={() => void createIacPr()}
+                    disabled={terraformGenerating || iacPrCreating || deployableIacFiles.length === 0 || Boolean(iacPrUrl)}
+                    className="rounded-md border border-cyan-500/20 bg-cyan-500/10 px-5 py-2 text-sm font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"
+                  >
+                    {iacPrUrl ? 'PR ready' : iacPrCreating ? 'Creating PR...' : 'Create PR'}
+                  </button>
+                  {iacPrUrl ? (
+                    <button
+                      onClick={() => window.open(iacPrUrl, '_blank', 'noopener,noreferrer')}
+                      className="flex items-center gap-2 rounded-md border border-[#262626] bg-[#111111] px-5 py-2 text-sm font-semibold text-zinc-200 hover:bg-[#181818]"
+                    >
+                      <ExternalLink className="h-4 w-4" />
+                      Open PR
+                    </button>
+                  ) : null}
+                  <button
+                    onClick={() => setAndPersistStage('aws_config')}
+                    disabled={!activeSavedRun && iacFiles.length === 0}
+                    className="rounded-md bg-zinc-100 px-5 py-2 text-sm font-semibold text-black hover:bg-white disabled:bg-[#111111] disabled:text-zinc-500"
+                  >
+                    Continue to Config
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-6">
+                <div className="space-y-6">
+                  <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
+                    <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Terraform Agent</div>
+                    <div className="text-sm text-zinc-200">{terraformRunLabel}</div>
+                    <div className="mt-3 space-y-2 text-xs text-zinc-500">
+                      <div>Run ID: <span className="font-mono text-zinc-300">{shouldUseSavedRunForDeploy ? activeSavedRun?.run_id : (hasCurrentIacMeta ? 'bundle-only' : 'pending')}</span></div>
+                      <div>Workspace: <span className="font-mono text-zinc-300">{(shouldUseSavedRunForDeploy ? activeSavedRun?.workspace : savedIacMeta?.workspace) || 'pending'}</span></div>
+                      <div>Files: <span className="font-mono text-zinc-300">{iacFiles.length}</span></div>
+                      <div>WS: <span className={`font-mono ${deploySocketState === 'connected' ? 'text-emerald-400' : deploySocketState === 'connecting' ? 'text-cyan-400' : deploySocketState === 'error' ? 'text-amber-400' : 'text-zinc-300'}`}>{deploySocketState}</span></div>
+                      <div>Editor: <span className="font-mono text-zinc-300">live buffer</span></div>
+                    </div>
+                    {sessionIacTruncated ? (
+                      <div className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
+                        This cached IaC preview is truncated. Regenerate before creating a PR.
+                      </div>
+                    ) : null}
+                    {iacPrUrl ? (
+                      <div className="mt-4 rounded-md border border-emerald-500/20 bg-emerald-500/10 p-3 text-xs text-emerald-300">
+                        IaC PR is ready for review.
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
+                    <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Workers</div>
+                    <div className="space-y-2 text-xs">
+                      {terraformWorkerStates.length > 0 ? terraformWorkerStates.map((worker) => (
+                        <div key={worker.worker_id} className="rounded-md border border-[#1A1A1A] bg-black px-3 py-2">
+                          <div className="flex items-center justify-between gap-3">
+                            <div>
+                              <div className="font-medium text-zinc-200">{worker.worker_role || worker.worker_id}</div>
+                              <div className="font-mono text-[11px] text-zinc-500">{worker.worker_id}</div>
+                            </div>
+                            <span className={`rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest ${
+                              worker.worker_status === 'completed'
+                                ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400'
+                                : worker.worker_status === 'failed'
+                                  ? 'border-red-500/20 bg-red-500/10 text-red-300'
+                                  : 'border-cyan-500/20 bg-cyan-500/10 text-cyan-300'
+                            }`}>
+                              {worker.worker_status || 'running'}
+                            </span>
+                          </div>
+                        </div>
+                      )) : (
+                        <div className="text-zinc-500">Worker states will appear once generation starts.</div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex h-80 flex-col overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]">
+                    <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-black px-4 py-2.5 font-mono text-xs text-zinc-500">
+                      <div className="flex items-center gap-2">
+                        <Terminal className="h-4 w-4 text-zinc-400" />
+                        Terraform agent feed
+                      </div>
+                      <div>{terraformGenerationLogs.length} events</div>
+                    </div>
+                    <div className="custom-scrollbar flex-1 overflow-y-auto bg-black p-4 font-mono text-[12px]">
+                      {terraformGenerationLogs.length > 0 ? terraformGenerationLogs.slice(-40).map((log, index) => (
+                        <div key={`${log.ts}-${index}`} className="mb-2 flex gap-3">
+                          <span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span>
+                          <div className="min-w-0">
+                            <div className="mb-1 flex flex-wrap items-center gap-2">
+                              {log.worker_id && <span className="rounded border border-[#262626] bg-[#111111] px-2 py-0.5 text-[10px] uppercase tracking-widest text-zinc-400">{log.worker_id}</span>}
+                              {log.worker_status && <span className={`rounded border px-2 py-0.5 text-[10px] uppercase tracking-widest ${
+                                log.worker_status === 'completed'
+                                  ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400'
+                                  : log.worker_status === 'failed'
+                                    ? 'border-red-500/20 bg-red-500/10 text-red-300'
+                                    : 'border-cyan-500/20 bg-cyan-500/10 text-cyan-300'
+                              }`}>{log.worker_status}</span>}
+                              {log.model && <span className="font-mono text-[10px] text-zinc-600">{log.model}</span>}
+                            </div>
+                            <div className={log.type === 'success' ? 'font-medium text-emerald-400' : log.type === 'error' ? 'text-red-400' : 'text-zinc-300'}>{log.text}</div>
+                          </div>
+                        </div>
+                      )) : (
+                        <div className="text-zinc-500">{iacFiles.length > 0 ? 'Cached Terraform files were loaded without live run metadata. Regenerating will repopulate worker events here.' : 'Start Terraform generation to watch the sub-agent phases here.'}</div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                <div className="col-span-2 flex gap-6">
+                  <div className="custom-scrollbar h-130 w-64 shrink-0 overflow-y-auto rounded-lg border border-[#1A1A1A] bg-[#050505] p-3 text-sm">
+                    {iacFiles.map((file) => (
+                      <button
+                        key={file.path}
+                        onClick={() => setSelectedFile(file.path)}
+                        className={`mb-2 block w-full rounded px-2 py-1 text-left ${activeIacFilePath === file.path ? 'bg-[#111111] text-zinc-200' : 'text-zinc-300 hover:bg-[#111111]'}`}
+                      >
+                        {file.path}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex h-130 flex-1 flex-col rounded-lg border border-[#1A1A1A] bg-[#050505]">
+                    <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-black px-4 py-2.5">
+                      <div className="font-mono text-[11px] text-zinc-400">{activeIacFilePath || 'Generated files'}</div>
+                      <div className="text-[11px] uppercase tracking-widest text-zinc-500">Editable</div>
+                    </div>
+                    <textarea
+                      value={(iacFiles.find((file) => file.path === activeIacFilePath) || iacFiles[0])?.content || ''}
+                      onChange={(event) => {
+                        if (!activeIacFilePath) return;
+                        updateIacFileContent(activeIacFilePath, event.target.value);
+                      }}
+                      disabled={!activeIacFilePath}
+                      placeholder="Generate Terraform to view and edit files."
+                      spellCheck={false}
+                      className="custom-scrollbar flex-1 resize-none bg-[#050505] p-5 font-mono text-[13px] leading-relaxed text-zinc-300 outline-none"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          {activeStage === 'aws_config' && (
+            <div className="mx-auto max-w-5xl space-y-6">
+              <div className="mt-4 mb-6 border-b border-[#1A1A1A] pb-6">
+                <h1 className="mb-2 text-2xl font-semibold text-zinc-100">AWS Configuration</h1>
+                <p className="text-sm text-zinc-400">Provide deploy-time credentials and confirm the Terraform runtime inputs.</p>
+              </div>
+              <div className="grid grid-cols-3 gap-6">
+                <div className="col-span-2 space-y-6 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
+                  <div className="space-y-4">
+                    <input value={aws.aws_access_key_id} onChange={(event) => setAws((prev) => ({ ...prev, aws_access_key_id: event.target.value }))} placeholder="AWS_ACCESS_KEY_ID" className="w-full rounded-md border border-[#262626] bg-black px-4 py-2.5 font-mono text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none" />
+                    <input type="password" value={aws.aws_secret_access_key} onChange={(event) => setAws((prev) => ({ ...prev, aws_secret_access_key: event.target.value }))} placeholder="AWS_SECRET_ACCESS_KEY" className="w-full rounded-md border border-[#262626] bg-black px-4 py-2.5 font-mono text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none" />
+                    <input value={aws.aws_region} onChange={(event) => setAws((prev) => ({ ...prev, aws_region: event.target.value }))} placeholder="AWS_REGION" className="w-full rounded-md border border-[#262626] bg-black px-4 py-2.5 font-mono text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none" />
+                  </div>
+                  <button onClick={() => setAndPersistStage('deploy')} disabled={!hasAwsSecrets || (!activeSavedRun && deployableIacFiles.length === 0)} className="flex w-full items-center justify-center gap-2 rounded-md bg-indigo-600 py-3 font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500">
+                    <Rocket className="h-4 w-4" /> Continue to Deploy
+                  </button>
+                </div>
+                <div className="space-y-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
+                  <div>
+                    <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Runtime Inputs</div>
+                    <div className="mt-3 space-y-2 text-xs text-zinc-400">
+                      <div>Terraform source: <span className="font-mono text-zinc-200">{shouldUseSavedRunForDeploy ? 'saved run' : 'session files'}</span></div>
+                      <div>Workspace: <span className="font-mono text-zinc-200">{shouldUseSavedRunForDeploy ? (activeSavedRun?.workspace || 'pending') : 'local session'}</span></div>
+                      <div>Estimated monthly cost: <span className="font-mono text-zinc-200">${costEstimate.total.toFixed(2)}</span></div>
+                      <div>Budget cap: <span className="font-mono text-zinc-200">${costEstimate.cap.toFixed(2)}</span></div>
+                    </div>
+                  </div>
+                  <div className={`rounded-md border px-3 py-2 text-xs ${hasAwsSecrets ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300' : 'border-amber-500/20 bg-amber-500/10 text-amber-300'}`}>
+                    {hasAwsSecrets ? 'AWS credentials ready for runtime apply.' : 'Enter AWS credentials to unlock deployment.'}
+                  </div>
+                  {sessionIacTruncated && !activeSavedRun && (
+                    <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                      Session-cached Terraform files are truncated preview data and cannot be deployed. Regenerate Terraform to produce a fresh bundle.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+          {activeStage === 'deploy' && <div className="mx-auto max-w-5xl space-y-6"><div className="mb-2 flex items-center justify-between"><div><h1 className="text-2xl font-semibold text-zinc-100">{deployStatus === 'done' ? 'Deployment Complete' : deployStatus === 'running' ? 'Deployment In Progress' : deployStatus === 'error' ? 'Deployment Failed' : 'Ready to Deploy'}</h1><p className="mt-1 text-sm text-zinc-400">Live deployment console backed by pipeline WebSocket events and backend status reconciliation.</p></div><div className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-widest ${deploySocketState === 'connected' ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : deploySocketState === 'connecting' ? 'border-cyan-500/20 bg-cyan-500/10 text-cyan-400' : deploySocketState === 'error' ? 'border-amber-500/20 bg-amber-500/10 text-amber-400' : 'border-zinc-700 bg-[#111111] text-zinc-500'}`}>WS {deploySocketState}</div></div><div className="grid grid-cols-3 gap-6"><div className="col-span-2 flex h-125 flex-col overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="flex items-center justify-between border-b border-[#1A1A1A] bg-black px-4 py-2.5 font-mono text-xs text-zinc-500"><div className="flex items-center gap-2"><Terminal className="h-4 w-4 text-zinc-400" /> STDOUT</div><div>{deployLogs.length} events</div></div><div className="custom-scrollbar flex-1 overflow-y-auto bg-black p-6 font-mono text-[13px]">{deployLogs.map((log, index) => <div key={`${log.ts}-${index}`} className="mb-1 flex gap-4"><span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span><span className={log.type === 'success' ? 'font-medium text-emerald-400' : log.type === 'error' ? 'text-red-400' : 'text-zinc-300'}>{log.text}</span></div>)}<div ref={logEndRef} /></div></div><div className="space-y-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div><div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Execution</div><div className="mt-3 text-3xl font-semibold text-zinc-100">{deployProgress}%</div><div className="mt-2 h-2 overflow-hidden rounded-full bg-[#111111]"><div className={`h-full rounded-full ${deployStatus === 'done' ? 'bg-emerald-500' : deployStatus === 'error' ? 'bg-red-500' : 'bg-indigo-500'}`} style={{ width: `${deployProgress}%` }} /></div><div className="mt-3 text-xs text-zinc-500">Status: <span className="font-mono text-zinc-300">{deployStatus}</span></div></div>{costEstimate.total > costEstimate.cap && <div className="rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200"><div className="font-semibold text-amber-300">Budget guardrail</div><div className="mt-1">Estimated monthly cost ${costEstimate.total.toFixed(2)} exceeds cap ${costEstimate.cap.toFixed(2)}.</div><label className="mt-3 flex items-start gap-3 text-left"><input type="checkbox" checked={budgetOverride} onChange={(event) => setBudgetOverride(event.target.checked)} disabled={deployStatus === 'running'} className="mt-0.5 h-4 w-4 rounded border-[#3f3f46] bg-black text-indigo-500 focus:ring-indigo-500/40" /><span><span className="block font-medium text-amber-100">Override budget guardrail for this deploy</span><span className="mt-1 block text-[11px] text-amber-200/80">Use only when you intentionally approve costs above the configured cap.</span></span></label></div>}<div className="space-y-3"><button onClick={() => void startDeploy()} disabled={deployStatus === 'running'} className="flex w-full items-center justify-center gap-2 rounded-md bg-indigo-600 px-6 py-2.5 font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500"><Rocket className="h-4 w-4" /> {deployStatus === 'done' ? 'Re-run Deploy' : 'Start Deploy'}</button><button onClick={() => void stopDeployment()} disabled={deployStatus !== 'running' || stopLoading} className="w-full rounded-md border border-red-500/20 bg-red-500/10 px-6 py-2.5 font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">{stopLoading ? 'Stopping...' : 'Stop Deployment'}</button><button onClick={() => void reconcileDeploymentStatus().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to reconcile deployment status.'))} className="w-full rounded-md border border-[#262626] bg-[#111111] px-6 py-2.5 font-semibold text-zinc-300 hover:bg-[#181818]">Reconcile Backend Status</button>{deployStatus !== 'running' && deployResult && <button onClick={() => setAndPersistStage('outputs')} className="flex w-full items-center justify-center gap-2 rounded-md bg-zinc-100 px-6 py-2.5 font-semibold text-black hover:bg-white">{deployStatus === 'error' ? 'View Results' : 'View Outputs'} <ArrowRight className="h-4 w-4" /></button>}</div></div></div></div>}
+          {activeStage === 'outputs' && <div className="mx-auto max-w-5xl space-y-6"><div className="mt-4 mb-8 border-b border-[#1A1A1A] pb-6"><div className={`mb-4 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-bold uppercase ${outputBannerClassName}`}><CheckCircle2 className="h-3.5 w-3.5" /> {outputBanner.label}</div><h1 className="mb-2 text-2xl font-semibold text-zinc-100">{outputBanner.title}</h1><p className="text-sm text-zinc-400">{outputBanner.description}</p>{backendErrorMessage && <div className="mt-4 rounded-md border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">{backendErrorMessage}</div>}{!backendErrorMessage && !hasLiveRuntimeDetails && deployResult?.success && <div className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-200">Live runtime details are missing for this repo. Fetch the latest runtime details to hydrate outputs before treating this deploy as successful.</div>}</div><div className="grid grid-cols-2 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-6 text-[10px] font-bold uppercase text-zinc-500">Security</div><div className="flex gap-2"><button onClick={() => deploySummary.generatedPem && downloadTextFile(`${deploySummary.keyName}.pem`, deploySummary.generatedPem.endsWith('\n') ? deploySummary.generatedPem : `${deploySummary.generatedPem}\n`)} disabled={!deploySummary.generatedPem} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-[#262626] bg-[#111111] py-2 text-[12px] font-medium text-zinc-200 hover:bg-[#1A1A1A] disabled:cursor-not-allowed disabled:text-zinc-500"><Download className="h-4 w-4" /> Download .PEM</button><button onClick={() => void downloadPpk().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'PPK conversion failed.'))} disabled={!deploySummary.generatedPem} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-[#262626] bg-[#111111] py-2 text-[12px] font-medium text-zinc-200 hover:bg-[#1A1A1A] disabled:cursor-not-allowed disabled:text-zinc-500"><Download className="h-4 w-4" /> Download .PPK</button></div>{!deploySummary.generatedPem && <div className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">{keyPairDownloadMessage}</div>}</div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-4 text-[10px] font-bold uppercase text-zinc-500">Endpoints</div><div className="space-y-3 text-sm"><div className="flex justify-between"><span className="text-zinc-400">Public IP</span><span className="font-mono text-zinc-200">{deploySummary.publicIp}</span></div><div className="flex justify-between"><span className="text-zinc-400">Instance</span><span className="font-mono text-zinc-200">{deploySummary.instanceId}</span></div><div className="flex justify-between"><span className="text-zinc-400">CloudFront</span><div className="flex items-center gap-2"><span className="font-mono text-zinc-200">{deploySummary.cloudfrontUrl}</span>{canOpenCloudfront && <button onClick={() => window.open(deploySummary.cloudfrontUrl.startsWith('http') ? deploySummary.cloudfrontUrl : `https://${deploySummary.cloudfrontUrl}`, '_blank', 'noopener,noreferrer')} className="text-zinc-500 hover:text-zinc-200"><ExternalLink className="h-4 w-4" /></button>}</div></div><div className="flex justify-between"><span className="text-zinc-400">Verification</span><span className={`font-medium ${outputBanner.tone === 'success' ? 'text-emerald-400' : outputBanner.tone === 'error' ? 'text-red-300' : 'text-amber-300'}`}>{outputBanner.label}</span></div></div></div></div><div className="flex gap-3"><button onClick={() => void fetchRuntimeDetails().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to fetch runtime details.'))} disabled={!canFetchRuntimeDetails} className="flex items-center gap-2 rounded-md border border-[#262626] bg-[#111111] px-4 py-2 text-sm font-semibold text-zinc-300 hover:bg-[#181818] disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><RefreshCw className="h-4 w-4" /> Fetch Latest Runtime Details</button><button onClick={() => void verifyLiveEndpoints()} disabled={verifyLoading || !canVerifyLiveEndpoints} className="flex items-center gap-2 rounded-md border border-cyan-500/20 bg-cyan-500/10 px-4 py-2 text-sm font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><ExternalLink className="h-4 w-4" /> {verifyLoading ? 'Verifying...' : 'Verify Live Endpoints'}</button><button onClick={() => void destroyDeployment().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Destroy failed.'))} disabled={destroyLoading || !hasAwsSecrets} className="flex items-center gap-2 rounded-md border border-red-500/20 bg-red-500/10 px-4 py-2 text-sm font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><Server className="h-4 w-4" /> {destroyLoading ? 'Destroying...' : 'Destroy Infrastructure'}</button></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><h3 className="mb-4 text-sm font-semibold text-zinc-200">Endpoint Verification</h3>{effectiveEndpointChecks.length > 0 ? <div className="space-y-3">{effectiveEndpointChecks.map((check) => <div key={`${check.label}-${check.url || 'empty'}`} className="rounded-md border border-[#1A1A1A] bg-black p-4"><div className="flex items-center justify-between"><div><div className="text-sm font-medium text-zinc-200">{check.label}</div><div className="mt-1 font-mono text-[11px] text-zinc-500">{check.url || 'n/a'}</div></div><span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${check.ok ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-300'}`}>{check.ok ? `HTTP ${check.status ?? 200}` : (check.status ? `HTTP ${check.status}` : 'Unreachable')}</span></div><div className="mt-3 text-xs leading-relaxed text-zinc-400">{check.detail}</div></div>)}</div> : <div className="rounded-md border border-dashed border-[#262626] bg-black px-4 py-6 text-sm text-zinc-500">{canVerifyLiveEndpoints ? 'No live verification has been recorded yet. Run `Verify Live Endpoints` to test the deployed URLs.' : 'Verification is unavailable until the current repo has a successful deploy payload and live runtime details.'}</div>}</div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><h3 className="mb-4 text-sm font-semibold text-zinc-200">Deployment History</h3><div className="space-y-3">{deploymentHistory.map((entry) => <div key={entry.id} className="rounded-md border border-[#1A1A1A] bg-black p-4"><div className="flex items-center justify-between"><div><p className="text-sm font-medium text-zinc-200">{new Date(entry.createdAt).toLocaleString()}</p><p className="mt-1 font-mono text-[11px] text-zinc-400">EC2: {entry.instanceId}</p></div><span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${entry.status === 'done' ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-400'}`}>{entry.status === 'done' ? 'Success' : 'Error'}</span></div></div>)}</div></div></div>}
         </div>
       </div>
       <style dangerouslySetInnerHTML={{ __html: `.custom-scrollbar::-webkit-scrollbar{width:6px}.custom-scrollbar::-webkit-scrollbar-track{background:transparent}.custom-scrollbar::-webkit-scrollbar-thumb{background-color:#262626;border-radius:10px}.custom-scrollbar::-webkit-scrollbar-thumb:hover{background-color:#3f3f46}` }} />

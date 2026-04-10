@@ -371,6 +371,21 @@ function normalizeScalar(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function extractInstanceIdFromRuntimeDetails(runtimeDetails: Record<string, unknown> | null | undefined): string | null {
+  if (!runtimeDetails || typeof runtimeDetails !== 'object') return null;
+  const instance = runtimeDetails.instance;
+  if (!instance || typeof instance !== 'object') return null;
+  return normalizeScalar((instance as Record<string, unknown>).instance_id);
+}
+
+function isRecoverableEc2StateFailure(errorMessage: string): boolean {
+  const lowered = String(errorMessage || '').toLowerCase();
+  return (
+    lowered.includes('no ec2 instance resource was found in state')
+    || lowered.includes('deployment did not provision ec2')
+  );
+}
+
 async function fetchAwsRuntimeDetails(params: {
   projectName: string;
   awsAccessKeyId: string;
@@ -402,6 +417,68 @@ async function fetchAwsRuntimeDetails(params: {
     return null;
   }
   return payload.details;
+}
+
+type AgenticApplyStatusPayload = {
+  success?: boolean;
+  status?: string;
+  result?: Record<string, unknown> | null;
+  error?: string;
+};
+
+async function fetchAgenticApplyStatus(params: {
+  projectId: string;
+  projectName: string;
+}): Promise<AgenticApplyStatusPayload> {
+  const response = await fetch(`${AGENTIC_URL}/api/terraform/apply/status`, {
+    method: 'POST',
+    headers: {
+      ...agenticHeaders(),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      project_id: params.projectId,
+      project_name: params.projectName,
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  const payload = await response.json().catch(() => ({})) as AgenticApplyStatusPayload;
+  if (!response.ok) {
+    throw new Error(String(payload.error || `Agentic apply status failed with status ${response.status}`));
+  }
+  return payload;
+}
+
+async function waitForRecoveredApplyResult(params: {
+  projectId: string;
+  projectName: string;
+  timeoutMs?: number;
+  intervalMs?: number;
+}): Promise<Record<string, unknown> | null> {
+  const timeoutMs = Math.max(10_000, params.timeoutMs ?? 600_000);
+  const intervalMs = Math.max(2_000, params.intervalMs ?? 5_000);
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const statusPayload = await fetchAgenticApplyStatus({
+      projectId: params.projectId,
+      projectName: params.projectName,
+    });
+    const status = String(statusPayload.status || 'idle');
+    const result = statusPayload.result && typeof statusPayload.result === 'object'
+      ? statusPayload.result
+      : null;
+    if (status === 'completed' || status === 'error') {
+      return result;
+    }
+    if (status === 'idle' && result) {
+      return result;
+    }
+    await sleep(intervalMs);
+  }
+
+  return null;
 }
 
 type EndpointCheck = {
@@ -552,9 +629,14 @@ function detectStaleAwsTerraformBundle(files: GeneratedFile[]): string[] {
   const reasons: string[] = [];
 
   const hasUseDefaultVpcVar = /variable\s+"use_default_vpc"\s*\{/i.test(combined);
+  const hasUseExistingVpcVar = /variable\s+"use_existing_vpc"\s*\{/i.test(combined);
   const hasLegacyVpcCreate = /resource\s+"aws_vpc"\s+"main"\s*\{/i.test(combined);
   const hasVpcConditionalCount = /resource\s+"aws_vpc"\s+"main"\s*\{[\s\S]*?count\s*=\s*var\.use_default_vpc\s*\?\s*0\s*:\s*1/i.test(combined);
-  if (hasLegacyVpcCreate && (!hasUseDefaultVpcVar || !hasVpcConditionalCount)) {
+  const hasVpcConditionalCountExisting = /resource\s+"aws_vpc"\s+"main"\s*\{[\s\S]*?count\s*=\s*var\.use_existing_vpc\s*\?\s*0\s*:\s*1/i.test(combined);
+  if (hasLegacyVpcCreate && !(
+    (hasUseDefaultVpcVar && hasVpcConditionalCount)
+    || (hasUseExistingVpcVar && hasVpcConditionalCountExisting)
+  )) {
     reasons.push('Terraform bundle still creates aws_vpc.main without default-VPC conditional mode.');
   }
 
@@ -627,9 +709,9 @@ export async function POST(req: NextRequest) {
     const runtimeMode = body.runtime_apply === true;
     const runId = String(body.run_id || '').trim();
     const workspace = String(body.workspace || '').trim();
-    const hasRunReference = runtimeMode && Boolean(runId && workspace);
     const baseFiles = Array.isArray(body.files) ? body.files : [];
-    if (baseFiles.length === 0 && !hasRunReference) {
+    const useRunReference = runtimeMode && baseFiles.length === 0 && Boolean(runId && workspace);
+    if (baseFiles.length === 0 && !useRunReference) {
       return NextResponse.json(
         { error: 'No generated IaC files provided. Generate Terraform/Ansible first.' },
         { status: 400 },
@@ -666,22 +748,23 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const staleReasons = hasRunReference ? [] : detectStaleAwsTerraformBundle(baseFiles);
+      const staleReasons = useRunReference ? [] : detectStaleAwsTerraformBundle(baseFiles);
+      const staleBundleWarning = staleReasons.length > 0
+        ? {
+          message: 'Provided Terraform bundle appears outdated for current AWS runtime safety constraints.',
+          reasons: staleReasons,
+          recommended_actions: [
+            'Re-run Stage 8 (Generate terraform + ansible) to refresh files.',
+            'Ensure generated Terraform includes variable "use_default_vpc" and unique CloudFront OAC naming.',
+            'Retry deploy after refreshed bundle is loaded in UI state.',
+          ],
+        }
+        : null;
       if (staleReasons.length > 0) {
-        return NextResponse.json(
-          {
-            error: 'Provided Terraform bundle is outdated for current AWS runtime safety constraints. Regenerate Stage 8 IaC and retry deploy.',
-            details: {
-              reasons: staleReasons,
-              required_actions: [
-                'Re-run Stage 8 (Generate terraform + ansible) to refresh files.',
-                'Ensure generated Terraform includes variable "use_default_vpc" and unique CloudFront OAC naming.',
-                'Retry deploy after refreshed bundle is loaded in UI state.',
-              ],
-            },
-          },
-          { status: 409 },
-        );
+        console.warn('Runtime deploy received potentially stale Terraform bundle:', {
+          project_id: projectId,
+          reasons: staleReasons,
+        });
       }
 
       const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
@@ -693,8 +776,8 @@ export async function POST(req: NextRequest) {
         project_id: projectId,
         project_name: projectName,
         provider,
-        run_id: runId || undefined,
-        workspace: workspace || undefined,
+        run_id: useRunReference ? runId || undefined : undefined,
+        workspace: useRunReference ? workspace || undefined : undefined,
         state_bucket: String(body.state_bucket || '').trim() || undefined,
         lock_table: String(body.lock_table || '').trim() || undefined,
         files: baseFiles,
@@ -703,7 +786,9 @@ export async function POST(req: NextRequest) {
         aws_region: awsRegion,
         enforce_free_tier_ec2: enforceFreeTierEc2,
       };
-      let agenticRes: Response;
+      let agenticRes: Response | null = null;
+      let recoveredApplyResult: Record<string, unknown> | null = null;
+      let applyTransportRecovered = false;
       try {
         agenticRes = await fetch(`${AGENTIC_URL}/api/terraform/apply`, {
           method: 'POST',
@@ -712,49 +797,143 @@ export async function POST(req: NextRequest) {
           signal: AbortSignal.timeout(3_600_000),
         });
       } catch (upstreamErr) {
-        const classified = classifyUpstreamError(upstreamErr);
-        return NextResponse.json(
-          {
-            error: classified.error,
-            details: {
-              hint: classified.hint,
-              upstream_error: classified.upstreamError,
-              agentic_origin: resolveAgenticOrigin(),
+        recoveredApplyResult = await waitForRecoveredApplyResult({
+          projectId,
+          projectName,
+        }).catch(() => null);
+        if (!recoveredApplyResult) {
+          const classified = classifyUpstreamError(upstreamErr);
+          return NextResponse.json(
+            {
+              error: classified.error,
+              details: {
+                hint: classified.hint,
+                upstream_error: classified.upstreamError,
+                agentic_origin: resolveAgenticOrigin(),
+              },
             },
-          },
-          { status: 502 },
-        );
+            { status: 502 },
+          );
+        }
+        applyTransportRecovered = true;
       }
 
-      const applyRaw = await agenticRes.text();
-      let applyData: Record<string, unknown> = {};
-      if (applyRaw.trim()) {
-        try {
-          applyData = JSON.parse(applyRaw) as Record<string, unknown>;
-        } catch {
-          applyData = { raw_response_tail: applyRaw.slice(-2000) };
+      let applyData: Record<string, unknown> = recoveredApplyResult || {};
+      if (agenticRes) {
+        const applyRaw = await agenticRes.text();
+        if (applyRaw.trim()) {
+          try {
+            applyData = JSON.parse(applyRaw) as Record<string, unknown>;
+          } catch {
+            applyData = { raw_response_tail: applyRaw.slice(-2000) };
+          }
         }
       }
-      if (!agenticRes.ok || applyData.success !== true) {
+      const applyDetails: Record<string, unknown> = {
+        ...((applyData.details as Record<string, unknown> | null | undefined) ?? {}),
+        ...(applyTransportRecovered ? { apply_transport_recovered: true } : {}),
+      };
+      const runtimeOutputPayload = (applyData.outputs as Record<string, unknown> | null | undefined) ?? undefined;
+      if ((agenticRes && !agenticRes.ok) || applyData.success !== true) {
+        const upstreamError = String(applyData.error || 'Runtime Terraform apply failed.');
+        if (provider === 'aws' && awsAccessKeyId && awsSecretAccessKey && isRecoverableEc2StateFailure(upstreamError)) {
+          const recoveredRuntimeDetails = await fetchAwsRuntimeDetails({
+            projectName,
+            awsAccessKeyId,
+            awsSecretAccessKey,
+            awsRegion,
+            instanceId: extractOutputString(runtimeOutputPayload, ['ec2_instance_id', 'instance_id']),
+          }).catch(() => null);
+          const recoveredInstanceId = extractInstanceIdFromRuntimeDetails(recoveredRuntimeDetails);
+
+          if (recoveredInstanceId && recoveredInstanceId !== 'n/a') {
+            const mergedDetails = {
+              ...(applyDetails || {}),
+              live_runtime_details: recoveredRuntimeDetails,
+              recovered_from_apply_error: upstreamError,
+            };
+            const normalizedRuntime = normalizeDeploymentRuntime({
+              cloudfrontUrl: typeof applyData.cloudfront_url === 'string' ? applyData.cloudfront_url : null,
+              outputs: runtimeOutputPayload,
+              details: mergedDetails,
+              runtimeDetails: recoveredRuntimeDetails,
+            });
+            const verification = await waitForRuntimeVerification({
+              cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
+              publicIp: normalizedRuntime.ec2.public_ip,
+            });
+            if (!verification.verified) {
+              return NextResponse.json(
+                {
+                  error: 'Deployment provisioned infrastructure but no live endpoint became reachable after apply.',
+                  details: {
+                    verification_checks: verification.checks,
+                    live_runtime_details: recoveredRuntimeDetails,
+                    apply_details: mergedDetails,
+                  },
+                  outputs: runtimeOutputPayload ?? {},
+                },
+                { status: 409 },
+              );
+            }
+
+            return NextResponse.json({
+              success: true,
+              provider,
+              project_id: projectId,
+              mode: 'runtime_apply',
+              cloudfront_url: normalizedRuntime.cdn.cloudfront_url,
+              outputs: runtimeOutputPayload ?? {},
+              raw_outputs: runtimeOutputPayload ?? {},
+              details: mergedDetails,
+              sensitive_output_arns:
+                (applyDetails as Record<string, unknown> | undefined)?.sensitive_output_arns ?? null,
+              ec2_key_name: normalizedRuntime.keypair.key_name,
+              generated_ec2_private_key_pem: normalizedRuntime.keypair.private_key_pem,
+              keypair: normalizedRuntime.keypair,
+              ec2: normalizedRuntime.ec2,
+              network: normalizedRuntime.network,
+              cdn: normalizedRuntime.cdn,
+              deployment_verified: true,
+              verification_checks: verification.checks,
+              recovered_from_apply_error: true,
+              ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
+            });
+          }
+        }
+        const staleError = staleBundleWarning
+          ? `${staleBundleWarning.message} ${staleBundleWarning.reasons.join(' ')} Regenerate Terraform and retry.`
+          : null;
         return NextResponse.json(
           {
-            error: String(applyData.error || 'Runtime Terraform apply failed.'),
+            error: staleError ? `${staleError} Upstream: ${upstreamError}` : upstreamError,
             details:
-              applyData.details ??
-              (applyData.raw_response_tail
-                ? { upstream_raw_response_tail: applyData.raw_response_tail }
-                : null),
+              {
+                ...(applyDetails || {}),
+                ...(applyData.raw_response_tail
+                  ? { upstream_raw_response_tail: applyData.raw_response_tail }
+                  : {}),
+                ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
+              },
             outputs: applyData.outputs ?? null,
           },
-          { status: agenticRes.ok ? 500 : agenticRes.status },
+          { status: staleBundleWarning ? 409 : ((agenticRes?.ok ?? true) ? 500 : (agenticRes?.status ?? 500)) },
         );
       }
 
       const expectedEc2 = containsAwsInstanceResource(baseFiles);
-      const applyDetails = (applyData.details as Record<string, unknown> | null | undefined) ?? undefined;
-      const runtimeOutputs = (applyData.outputs as Record<string, unknown> | null | undefined) ?? undefined;
       const ec2FallbackApplied = Boolean(applyDetails?.ec2_fallback_applied);
-      const ec2InstanceId = extractOutputString(runtimeOutputs, ['ec2_instance_id', 'instance_id']);
+      const runtimeDetails = awsAccessKeyId && awsSecretAccessKey
+        ? await fetchAwsRuntimeDetails({
+          projectName,
+          awsAccessKeyId,
+          awsSecretAccessKey,
+          awsRegion,
+          instanceId: extractOutputString(runtimeOutputPayload, ['ec2_instance_id', 'instance_id']),
+        }).catch(() => null)
+        : null;
+      const ec2InstanceId = extractInstanceIdFromRuntimeDetails(runtimeDetails)
+        || extractOutputString(runtimeOutputPayload, ['ec2_instance_id', 'instance_id']);
 
       if (expectedEc2 && (ec2FallbackApplied || !ec2InstanceId)) {
         return NextResponse.json(
@@ -766,26 +945,17 @@ export async function POST(req: NextRequest) {
               expected_ec2: true,
               ec2_fallback_applied: ec2FallbackApplied,
               ec2_instance_id: ec2InstanceId,
+              live_runtime_details: runtimeDetails,
               apply_details: applyDetails ?? null,
             },
-            outputs: runtimeOutputs ?? null,
+            outputs: runtimeOutputPayload ?? null,
           },
           { status: 409 },
         );
       }
 
-      const runtimeOutputPayload = (applyData.outputs as Record<string, unknown> | null | undefined) ?? null;
-      const runtimeDetails = awsAccessKeyId && awsSecretAccessKey
-        ? await fetchAwsRuntimeDetails({
-          projectName,
-          awsAccessKeyId,
-          awsSecretAccessKey,
-          awsRegion,
-          instanceId: extractOutputString(runtimeOutputPayload, ['ec2_instance_id', 'instance_id']),
-        }).catch(() => null)
-        : null;
       const mergedDetails = {
-        ...(((applyData.details as Record<string, unknown> | undefined) || {})),
+        ...(applyDetails || {}),
         ...(runtimeDetails ? { live_runtime_details: runtimeDetails } : {}),
       };
       const normalizedRuntime = normalizeDeploymentRuntime({
@@ -823,7 +993,7 @@ export async function POST(req: NextRequest) {
         raw_outputs: runtimeOutputPayload ?? {},
         details: mergedDetails,
         sensitive_output_arns:
-          (applyData.details as Record<string, unknown> | undefined)?.sensitive_output_arns ?? null,
+          applyDetails?.sensitive_output_arns ?? null,
         ec2_key_name: normalizedRuntime.keypair.key_name,
         generated_ec2_private_key_pem: normalizedRuntime.keypair.private_key_pem,
         keypair: normalizedRuntime.keypair,
@@ -832,6 +1002,7 @@ export async function POST(req: NextRequest) {
         cdn: normalizedRuntime.cdn,
         deployment_verified: true,
         verification_checks: verification.checks,
+        ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
       });
     }
 

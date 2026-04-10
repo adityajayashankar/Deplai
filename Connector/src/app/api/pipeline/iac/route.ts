@@ -2,8 +2,8 @@
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { validateTerraformArchitectureInput } from '@/lib/deployment-planning-contract';
-import { githubService } from '@/lib/github';
-import { resolveProjectMeta as resolveSharedProjectMeta, resolveProjectSourceRoot as resolveSharedProjectSourceRoot } from '@/lib/project-meta';
+import { type RepoPersistenceResult } from '@/lib/iac-pr';
+import { resolveProjectSourceRoot as resolveSharedProjectSourceRoot } from '@/lib/project-meta';
 import fs from 'fs';
 import path from 'path';
 
@@ -23,8 +23,14 @@ interface IacGenerateBody {
   budget_cap_usd?: number;
   qa_summary?: string;
   architecture_context?: string;
+  repository_context?: Record<string, unknown>;
+  deployment_profile?: Record<string, unknown>;
+  approval_payload?: Record<string, unknown>;
   // Required in LLM-only IaC mode: full architecture JSON
   architecture_json?: Record<string, unknown>;
+  security_context?: Record<string, unknown>;
+  website_asset_stats?: Record<string, unknown>;
+  frontend_entrypoint_detection?: Record<string, unknown>;
   // Optional: OpenAI key forwarded to the IaC generator
   openai_api_key?: string;
   aws_access_key_id?: string;
@@ -44,22 +50,6 @@ interface GeneratedFile {
   path: string;
   content: string;
   encoding?: 'utf-8' | 'base64';
-}
-
-interface ProjectMetaRow {
-  project_type: 'local' | 'github';
-  repo_full_name: string | null;
-  installation_uuid: string | null;
-}
-
-interface RepoPersistenceResult {
-  attempted: boolean;
-  success: boolean;
-  pr_url: string | null;
-  branch?: string | null;
-  reason?: string;
-  error?: string;
-  files_committed?: number;
 }
 
 interface LlmResolvedConfig {
@@ -185,6 +175,12 @@ function defaultWebsiteHtml(projectName: string, hintMessage?: string): string {
 
 function normalizeProjectPath(relPath: string): string {
   return relPath.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
+}
+
+function normalizeRepoWritePath(filePath: string): string {
+  const normalized = normalizeProjectPath(filePath || '');
+  if (!normalized || normalized.includes('..')) return '';
+  return normalized;
 }
 
 function normalizeWebsiteObjectKey(relPath: string): string {
@@ -569,179 +565,6 @@ async function resolveProjectSourceRoot(
   return resolveSharedProjectSourceRoot(userId, projectId);
 }
 
-async function resolveProjectMeta(
-  userId: string,
-  projectId: string,
-): Promise<ProjectMetaRow | null> {
-  return resolveSharedProjectMeta(userId, projectId) as Promise<ProjectMetaRow | null>;
-}
-
-function normalizeRepoWritePath(filePath: string): string {
-  const normalized = normalizeProjectPath(filePath || '');
-  if (!normalized || normalized.includes('..')) return '';
-  return normalized;
-}
-
-function isPersistableIacFile(file: GeneratedFile): boolean {
-  const safePath = normalizeRepoWritePath(file.path);
-  if (!safePath) return false;
-  if (safePath.startsWith('terraform/site/')) return false;
-  return safePath.startsWith('terraform/') || safePath.startsWith('ansible/') || safePath === 'README.md';
-}
-
-async function persistIacToRepoPr(
-  userId: string,
-  projectId: string,
-  projectName: string,
-  files: GeneratedFile[],
-): Promise<RepoPersistenceResult> {
-  const meta = await resolveProjectMeta(userId, projectId);
-  if (!meta) {
-    return { attempted: false, success: false, pr_url: null, reason: 'project_metadata_unavailable' };
-  }
-  if (meta.project_type !== 'github') {
-    return { attempted: false, success: false, pr_url: null, reason: 'local_project' };
-  }
-  if (!meta.repo_full_name || !meta.installation_uuid) {
-    return { attempted: false, success: false, pr_url: null, reason: 'missing_repo_metadata' };
-  }
-
-  const persistable = files.filter(isPersistableIacFile);
-  if (persistable.length === 0) {
-    return { attempted: false, success: false, pr_url: null, reason: 'no_persistable_iac_files' };
-  }
-
-  const [owner, repo] = meta.repo_full_name.split('/');
-  if (!owner || !repo) {
-    return { attempted: false, success: false, pr_url: null, reason: 'invalid_repo_name' };
-  }
-
-  try {
-    const octokit = await githubService.getInstallationClient(meta.installation_uuid);
-    const repoInfo = await octokit.repos.get({ owner, repo });
-    const baseBranch = String(repoInfo.data.default_branch || 'main');
-
-    const baseRef = await octokit.git.getRef({
-      owner,
-      repo,
-      ref: `heads/${baseBranch}`,
-    });
-
-    const timestamp = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 12);
-    let branch = `deplai/iac-structure-${timestamp}`;
-    let branchCreated = false;
-    let attempt = 0;
-    while (!branchCreated && attempt < 4) {
-      const suffix = attempt === 0 ? '' : `-${attempt}`;
-      const candidate = `${branch}${suffix}`;
-      try {
-        await octokit.git.createRef({
-          owner,
-          repo,
-          ref: `refs/heads/${candidate}`,
-          sha: baseRef.data.object.sha,
-        });
-        branch = candidate;
-        branchCreated = true;
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err || '');
-        if (!/Reference already exists/i.test(msg)) throw err;
-        attempt += 1;
-      }
-    }
-    if (!branchCreated) {
-      return {
-        attempted: true,
-        success: false,
-        pr_url: null,
-        reason: 'branch_creation_failed',
-        error: 'Could not allocate a unique branch name for IaC PR.',
-      };
-    }
-
-    let committed = 0;
-    for (const file of persistable) {
-      const safePath = normalizeRepoWritePath(file.path);
-      if (!safePath) continue;
-
-      let existingSha: string | undefined;
-      try {
-        const existing = await octokit.repos.getContent({
-          owner,
-          repo,
-          path: safePath,
-          ref: branch,
-        });
-        if (!Array.isArray(existing.data) && existing.data.type === 'file') {
-          existingSha = existing.data.sha;
-        }
-      } catch {
-        existingSha = undefined;
-      }
-
-      const contentBase64 = file.encoding === 'base64'
-        ? file.content
-        : Buffer.from(file.content, 'utf-8').toString('base64');
-
-      await octokit.repos.createOrUpdateFileContents({
-        owner,
-        repo,
-        path: safePath,
-        message: existingSha ? `chore(iac): update ${safePath}` : `feat(iac): add ${safePath}`,
-        content: contentBase64,
-        branch,
-        ...(existingSha ? { sha: existingSha } : {}),
-      });
-      committed += 1;
-    }
-
-    if (committed === 0) {
-      return {
-        attempted: true,
-        success: false,
-        pr_url: null,
-        branch,
-        reason: 'no_changes_to_commit',
-      };
-    }
-
-    const pr = await octokit.pulls.create({
-      owner,
-      repo,
-      base: baseBranch,
-      head: branch,
-      title: `feat(iac): structured Terraform bundle for ${projectName}`,
-      body: [
-        'This PR was generated by DeplAI pipeline IaC stage.',
-        '',
-        'Highlights:',
-        '- Structured Terraform layout (`providers.tf`, `backend.tf`, `main.tf`, `variables.tf`, `terraform.tfvars`, `outputs.tf`)',
-        '- Modularized resources (`modules/`)',
-        '- Environment overlays (`environments/dev`, `environments/prod`)',
-        '- Free-tier-eligible defaults with production-aware hardening baseline',
-      ].join('\n'),
-      maintainer_can_modify: true,
-    });
-
-    return {
-      attempted: true,
-      success: true,
-      pr_url: pr.data.html_url || null,
-      branch,
-      files_committed: committed,
-    };
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Failed to persist IaC as PR.';
-    return {
-      attempted: true,
-      success: false,
-      pr_url: null,
-      reason: 'persist_failed',
-      error: message,
-    };
-  }
-}
-
 function clampProvider(value: string | undefined): Provider {
   const v = (value || '').trim().toLowerCase();
   if (v === 'azure' || v === 'gcp') return v;
@@ -875,6 +698,48 @@ function hasRequiredAwsCoreFiles(files: GeneratedFile[]): boolean {
   return required.size === 0;
 }
 
+function validateAwsTerraformBundle(files: GeneratedFile[]): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+  if (!hasRequiredAwsCoreFiles(files)) {
+    errors.push('bundle is missing one or more required Terraform root files');
+  }
+
+  const tfFiles = files.filter((file) => normalizeRepoWritePath(file.path).endsWith('.tf'));
+  const byPath = new Map<string, string>();
+  for (const file of tfFiles) {
+    byPath.set(normalizeRepoWritePath(file.path), String(file.content || ''));
+  }
+
+  const versionsTf = byPath.get('terraform/versions.tf') || '';
+  const providersTf = byPath.get('terraform/providers.tf') || '';
+  if (/provider\s+"aws"/.test(versionsTf) && /provider\s+"aws"/.test(providersTf)) {
+    errors.push('terraform/versions.tf duplicates the default aws provider configuration');
+  }
+
+  const singleLineVariableBlock = /variable\s+"[^"]+"\s*\{\s*type\s*=\s*[^{}\n]+,\s*default\s*=\s*[^{}\n]+\s*\}/;
+  const conditionalDependsOn = /depends_on\s*=\s*[^\n]*\?/;
+  const bundleHasAwsRegionVar = tfFiles.some((file) => /variable\s+"aws_region"\s*\{/.test(String(file.content || '')));
+  const bundleHasRegionVar = tfFiles.some((file) => /variable\s+"region"\s*\{/.test(String(file.content || '')));
+  for (const file of tfFiles) {
+    const relPath = normalizeRepoWritePath(file.path);
+    const content = String(file.content || '');
+    if (/variable\s+"(?:desired_log_group_name|log_group_override)"\s*\{\{/.test(content)) {
+      errors.push(`${relPath} contains malformed double-brace variable block syntax`);
+    }
+    if (singleLineVariableBlock.test(content)) {
+      errors.push(`${relPath} contains invalid single-line variable block syntax`);
+    }
+    if (conditionalDependsOn.test(content)) {
+      errors.push(`${relPath} contains conditional depends_on syntax Terraform does not accept`);
+    }
+    if (bundleHasAwsRegionVar && !bundleHasRegionVar && /var\.region\b/.test(content)) {
+      errors.push(`${relPath} references var.region even though only aws_region is declared`);
+    }
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
 function mergeGeneratedFiles(primary: GeneratedFile[], secondary: GeneratedFile[]): GeneratedFile[] {
   const merged = new Map<string, GeneratedFile>();
   for (const file of dedupeGeneratedFiles(primary)) {
@@ -889,7 +754,7 @@ function mergeGeneratedFiles(primary: GeneratedFile[], secondary: GeneratedFile[
 function resolveLlmConfig(provider: LlmProvider, modelOverride: string, apiBaseOverride: string): LlmResolvedConfig {
   const defaults: Record<LlmProvider, { model: string; base: string }> = {
     groq: {
-      model: 'llama-3.3-70b-versatile',
+      model: 'llama-3.1-8b-instant',
       base: 'https://api.groq.com/openai/v1',
     },
     openrouter: {
@@ -1054,6 +919,107 @@ async function generateIacBundleWithLlm(params: {
   };
 }
 
+async function generateIacBundleWithTerraformAgent(params: {
+  projectId: string;
+  projectName: string;
+  workspace: string;
+  provider: Provider;
+  iacMode: IacMode;
+  architectureJson: Record<string, unknown>;
+  deploymentProfile?: Record<string, unknown> | null;
+  approvalPayload?: Record<string, unknown> | null;
+  repositoryContext?: Record<string, unknown> | null;
+  awsRegion: string;
+  qaSummary: string;
+  websiteIndexHtml: string;
+  securityContext?: Record<string, unknown> | null;
+  websiteAssetStats?: Record<string, unknown> | null;
+  frontendEntrypointDetection?: Record<string, unknown> | null;
+  llmProvider?: string;
+  llmApiKey?: string;
+  llmModel?: string;
+  llmApiBaseUrl?: string;
+}): Promise<{
+  files: GeneratedFile[];
+  source: string;
+  summary: string;
+  warnings: string[];
+  runId: string | null;
+  workspace: string | null;
+  providerVersion: string | null;
+  stateBucket: string | null;
+  lockTable: string | null;
+  manifest: unknown[];
+  dagOrder: string[];
+  details: Record<string, unknown> | null;
+}> {
+  const response = await fetch(`${AGENTIC_URL}/api/terraform/generate`, {
+    method: 'POST',
+    headers: {
+      ...agenticHeaders(),
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      project_id: params.projectId,
+      provider: params.provider,
+      project_name: params.projectName,
+      workspace: params.workspace,
+      iac_mode: params.iacMode,
+      architecture_json: params.architectureJson,
+      deployment_profile: params.deploymentProfile || undefined,
+      approval_payload: params.approvalPayload || undefined,
+      repository_context: params.repositoryContext || undefined,
+      aws_region: params.awsRegion,
+      qa_summary: params.qaSummary,
+      security_context: params.securityContext || undefined,
+      website_asset_stats: params.websiteAssetStats || undefined,
+      frontend_entrypoint_detection: params.frontendEntrypointDetection || undefined,
+      llm_provider: params.llmProvider || undefined,
+      llm_api_key: params.llmApiKey || undefined,
+      llm_model: params.llmModel || undefined,
+      llm_api_base_url: params.llmApiBaseUrl || undefined,
+      website_index_html: params.websiteIndexHtml,
+    }),
+    signal: AbortSignal.timeout(120_000),
+  });
+
+  const data = await response.json().catch(() => ({})) as {
+    success?: boolean;
+    files?: GeneratedFile[];
+    warnings?: string[];
+    source?: string;
+    error?: string;
+    run_id?: string | null;
+    workspace?: string | null;
+    provider_version?: string | null;
+    state_bucket?: string | null;
+    lock_table?: string | null;
+    manifest?: unknown[];
+    dag_order?: string[];
+    details?: Record<string, unknown> | null;
+  };
+
+  if (!response.ok || !data.success) {
+    throw new Error(data.error || 'Terraform agent generation failed.');
+  }
+
+  const files = dedupeGeneratedFiles(Array.isArray(data.files) ? data.files : []);
+  return {
+    files,
+    source: String(data.source || 'terraform_agent'),
+    summary: `Generated ${files.length} files through the Terraform Agent.`,
+    warnings: Array.isArray(data.warnings) ? data.warnings.map((item) => String(item)) : [],
+    runId: typeof data.run_id === 'string' ? data.run_id : null,
+    workspace: typeof data.workspace === 'string' ? data.workspace : null,
+    providerVersion: typeof data.provider_version === 'string' ? data.provider_version : null,
+    stateBucket: typeof data.state_bucket === 'string' ? data.state_bucket : null,
+    lockTable: typeof data.lock_table === 'string' ? data.lock_table : null,
+    manifest: Array.isArray(data.manifest) ? data.manifest : [],
+    dagOrder: Array.isArray(data.dag_order) ? data.dag_order.map((item) => String(item)) : [],
+    details: data.details && typeof data.details === 'object' ? data.details : null,
+  };
+}
+
 function toAwsProjectSlug(value: string): string {
   const normalized = String(value || '')
     .trim()
@@ -1063,7 +1029,6 @@ function toAwsProjectSlug(value: string): string {
     .replace(/^-+/, '')
     .replace(/-+$/, '');
 
-  // Keep room for suffixes like "-security-logs-<8hex>" under S3's 63-char limit.
   const capped = normalized.slice(0, 40).replace(/-+$/, '');
   return capped || 'deplai-project';
 }
@@ -1120,6 +1085,9 @@ function buildWebsiteSiteFiles(siteAssets: WebsiteAsset[], siteIndexHtml: string
   }));
 }
 
+// Retained as a local fallback template while the deployment track transitions to
+// the Agentic Layer Terraform agent for deterministic AWS generation.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function buildAwsSixFileBundle(
   projectName: string,
   safeProjectSlug: string,
@@ -1441,12 +1409,14 @@ resource "aws_instance" "app" {
     encrypted   = true
   }
 
-  user_data = join("\n", [
+  user_data = join("\\n", [
     "#!/bin/bash",
     "set -euxo pipefail",
     "dnf install -y nginx",
     "mkdir -p /usr/share/nginx/html",
-    "printf '%s' \"\${var.bootstrap_index_html_base64}\" | base64 --decode > /usr/share/nginx/html/index.html",
+    "cat <<'HTML' > /usr/share/nginx/html/index.html",
+    "\${base64decode(var.bootstrap_index_html_base64)}",
+    "HTML",
     "systemctl enable nginx",
     "systemctl restart nginx",
   ])
@@ -2004,65 +1974,128 @@ export async function POST(req: NextRequest) {
           { status: 400 },
         );
       }
+      const normalizedArchitecture = (architectureValidation?.normalized || {}) as Record<string, unknown>;
+      const normalizedDeploymentProfile = (body.deployment_profile || architectureValidation?.normalized || null) as Record<string, unknown> | null;
+      const normalizedFrontendDetection = (body.frontend_entrypoint_detection || frontendDetection || undefined) as Record<string, unknown> | undefined;
 
-      const safeProjectSlug = toAwsProjectSlug(projectName);
-      const deterministicFiles = [
-        ...buildAwsSixFileBundle(projectName, safeProjectSlug, contextBlock, sec, websiteIndexHtml, lowCostMode),
-        ...buildWebsiteSiteFiles(effectiveWebsiteAssets, websiteIndexHtml),
-      ];
-
-      let files = deterministicFiles;
-      let source = 'connector_aws_bundle';
+      let files: GeneratedFile[] = [];
+      let source = 'terraform_agent_multi_worker_dynamic';
       let llmSummary = '';
-      if (iacMode === 'llm') {
-        if (!llmApiKey && llmProvider !== 'ollama') {
-          return NextResponse.json(
-            { error: `LLM mode requires llm_api_key for provider '${llmProvider}'.` },
-            { status: 400 },
-          );
+      let runId: string | null = null;
+      let workspace: string | null = null;
+      let providerVersion: string | null = null;
+      let stateBucket: string | null = null;
+      let lockTable: string | null = null;
+      let manifest: unknown[] = [];
+      let dagOrder: string[] = [];
+      let agentDetails: Record<string, unknown> | null = null;
+
+      if (iacMode === 'llm' && !llmApiKey && llmProvider !== 'ollama') {
+        return NextResponse.json(
+          { error: `LLM mode requires llm_api_key for provider '${llmProvider}'.` },
+          { status: 400 },
+        );
+      }
+
+      try {
+        const agentResult = await generateIacBundleWithTerraformAgent({
+          projectId,
+          projectName,
+          workspace: String((architectureValidation?.normalized as { workspace?: unknown } | null)?.workspace || projectId),
+          provider,
+          iacMode,
+          architectureJson: normalizedArchitecture,
+          deploymentProfile: normalizedDeploymentProfile,
+          approvalPayload: body.approval_payload || null,
+          repositoryContext: body.repository_context || undefined,
+          awsRegion: body.aws_region?.trim() || 'eu-north-1',
+          qaSummary: qa,
+          websiteIndexHtml,
+          securityContext: body.security_context || sec,
+          websiteAssetStats: body.website_asset_stats || {
+            selected_root: websiteCollection?.selectedRoot || '',
+            asset_count: websiteAssets.length,
+            mirrored_asset_count: effectiveWebsiteAssets.length,
+            total_bytes: websiteCollection?.totalBytes || 0,
+            truncated: Boolean(websiteCollection?.truncated),
+            skipped_large_files: websiteCollection?.skippedLargeFiles || 0,
+            entrypoint: websiteEntrypoint.relativePath,
+          },
+          frontendEntrypointDetection: normalizedFrontendDetection,
+          llmProvider: iacMode === 'llm' ? llmProvider : undefined,
+          llmApiKey: iacMode === 'llm' ? llmApiKey : undefined,
+          llmModel: iacMode === 'llm' ? llmModel : undefined,
+          llmApiBaseUrl: iacMode === 'llm' ? llmApiBaseUrl : undefined,
+        });
+        files = mergeGeneratedFiles(agentResult.files, buildWebsiteSiteFiles(effectiveWebsiteAssets, websiteIndexHtml));
+        const generatedBundleValidation = validateAwsTerraformBundle(files);
+        if (!generatedBundleValidation.valid) {
+          throw new Error(`Generated Terraform bundle failed validation: ${generatedBundleValidation.errors.join('; ')}`);
         }
-        try {
-          const llmResult = await generateIacBundleWithLlm({
-            provider,
-            projectName,
-            qaSummary: qa,
-            architectureContext: arch,
-            architectureJson: architectureValidation?.normalized || null,
-            contextBlock,
-            websiteIndexHtml,
-            llmProvider,
-            llmModel,
-            llmApiKey,
-            llmApiBaseUrl,
-          });
-          const llmFiles = mergeGeneratedFiles(llmResult.files, buildWebsiteSiteFiles(effectiveWebsiteAssets, websiteIndexHtml));
-          if (!hasRequiredAwsCoreFiles(llmFiles)) {
-            throw new Error('LLM output missed required AWS Terraform core files.');
-          }
-          files = llmFiles;
-          source = `llm_${llmResult.provider}`;
-          llmSummary = llmResult.summary;
-          iacWarnings.push(`IaC generated via ${llmResult.provider} using model '${llmResult.model}'.`);
-        } catch (llmErr) {
-          source = 'connector_aws_bundle_fallback';
-          iacWarnings.push(`LLM IaC generation failed; falling back to deterministic bundle. Reason: ${llmErr instanceof Error ? llmErr.message : 'unknown error'}`);
-        }
+        source = agentResult.source;
+        llmSummary = agentResult.summary;
+        runId = agentResult.runId;
+        workspace = agentResult.workspace;
+        providerVersion = agentResult.providerVersion;
+        stateBucket = agentResult.stateBucket;
+        lockTable = agentResult.lockTable;
+        manifest = agentResult.manifest;
+        dagOrder = agentResult.dagOrder;
+        agentDetails = agentResult.details;
+        iacWarnings.push(...agentResult.warnings);
+      } catch (agentErr) {
+        const safeProjectSlug = toAwsProjectSlug(projectName);
+        files = mergeGeneratedFiles(
+          buildAwsSixFileBundle(projectName, safeProjectSlug, contextBlock, sec, websiteIndexHtml, lowCostMode),
+          buildWebsiteSiteFiles(effectiveWebsiteAssets, websiteIndexHtml),
+        );
+        source = 'connector_aws_bundle_fallback';
+        llmSummary = `Generated ${files.length} files through the local AWS fallback bundle.`;
+        runId = null;
+        workspace = String((architectureValidation?.normalized as { workspace?: unknown } | null)?.workspace || projectId);
+        providerVersion = null;
+        stateBucket = null;
+        lockTable = null;
+        manifest = [];
+        dagOrder = [];
+        agentDetails = {
+          fallback_reason: agentErr instanceof Error ? agentErr.message : 'unknown error',
+          fallback_mode: 'local_connector_aws_bundle',
+        };
+        iacWarnings.push(
+          `Agentic Terraform generator failed or timed out; used local AWS fallback bundle instead. Reason: ${
+            agentErr instanceof Error ? agentErr.message : 'unknown error'
+          }`,
+        );
+      }
+
+      const finalBundleValidation = validateAwsTerraformBundle(files);
+      if (!finalBundleValidation.valid) {
+        return NextResponse.json(
+          {
+            error: `Generated Terraform bundle failed validation and was not persisted: ${finalBundleValidation.errors.join('; ')}`,
+          },
+          { status: 500 },
+        );
       }
 
       const allWarnings = [
         ...scanContextWarnings,
         ...iacWarnings,
-        `IaC generation mode: ${iacMode}.`,
-        source.startsWith('llm_')
-          ? 'Generated Terraform bundle from selected LLM provider and repository context.'
-          : 'Generated Terraform bundle locally from repository analysis, interactive Q&A context, and the selected AWS region.',
+        source === 'connector_aws_bundle_fallback'
+          ? 'Generated Terraform bundle locally in Connector after Agentic Terraform generation failed.'
+          : `AWS Terraform worker backend: ${iacMode === 'llm' ? 'agentic-llm' : 'agentic-deterministic-rescue'}.`,
+        source === 'connector_aws_bundle_fallback'
+          ? 'This fallback is the lightweight AWS bundle that previously powered successful deploys.'
+          : 'Generated Terraform bundle through the Agentic Layer multi-worker pipeline using repository analysis, approved architecture, and deployment Q&A context.',
         'Terraform files use a local backend by default. AWS credentials are only needed later for apply/deploy.',
       ];
-      const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, files);
-      if (iacRepoPr.attempted && !iacRepoPr.success) {
-        const persistenceMsg = iacRepoPr.error || iacRepoPr.reason || 'IaC repo persistence failed.';
-        allWarnings.push(`IaC PR persistence: ${persistenceMsg}`);
-      }
+      const iacRepoPr: RepoPersistenceResult = {
+        attempted: false,
+        success: false,
+        pr_url: null,
+        reason: 'manual_trigger_required',
+      };
 
       return NextResponse.json({
         success: true,
@@ -2073,13 +2106,14 @@ export async function POST(req: NextRequest) {
         files,
         security_context: sec,
         source,
-        run_id: null,
-        workspace: null,
-        provider_version: null,
-        state_bucket: null,
-        lock_table: null,
-        manifest: [],
-        dag_order: [],
+        run_id: runId,
+        workspace,
+        provider_version: providerVersion,
+        state_bucket: stateBucket,
+        lock_table: lockTable,
+        manifest,
+        dag_order: dagOrder,
+        details: agentDetails,
         iac_repo_pr: iacRepoPr,
         warnings: allWarnings,
         website_asset_stats: {
@@ -2115,7 +2149,7 @@ export async function POST(req: NextRequest) {
           projectName,
           qaSummary: qa,
           architectureContext: arch,
-          architectureJson: architectureValidation?.normalized || null,
+          architectureJson: (architectureValidation?.normalized || null) as Record<string, unknown> | null,
           contextBlock,
           websiteIndexHtml,
           llmProvider,
@@ -2133,11 +2167,12 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const iacRepoPr = await persistIacToRepoPr(String(user.id), projectId, projectName, files);
-    if (iacRepoPr.attempted && !iacRepoPr.success) {
-      const persistenceMsg = iacRepoPr.error || iacRepoPr.reason || 'IaC repo persistence failed.';
-      iacWarnings.push(`IaC PR persistence: ${persistenceMsg}`);
-    }
+    const iacRepoPr: RepoPersistenceResult = {
+      attempted: false,
+      success: false,
+      pr_url: null,
+      reason: 'manual_trigger_required',
+    };
 
     const combinedWarnings = [...scanContextWarnings, ...iacWarnings, `IaC generation mode: ${iacMode}.`];
     const summary = llmSummary || (

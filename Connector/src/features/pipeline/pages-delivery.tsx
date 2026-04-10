@@ -17,6 +17,7 @@ const DEPLOYMENT_PROFILE_KEY = 'deplai.pipeline.deploymentProfile';
 const ARCHITECTURE_VIEW_KEY = 'deplai.pipeline.architectureJson';
 const APPROVAL_PAYLOAD_KEY = 'deplai.pipeline.approvalPayload';
 const PLANNING_PROJECT_KEY = 'deplai.pipeline.planningProjectId';
+const IAC_TRUNCATION_NOTE = '\n\n# [truncated in browser session cache]';
 
 interface RepositoryContextJson {
   document_kind: 'repository_context';
@@ -92,7 +93,7 @@ function writeStoredJson(key: string, value: unknown): void {
       if (fileBudget <= 0) return null;
       let content = raw;
       if (content.length > fileBudget) {
-        const suffix = '\n\n# [truncated in browser session cache]';
+        const suffix = IAC_TRUNCATION_NOTE;
         const keep = Math.max(0, fileBudget - suffix.length);
         content = `${content.slice(0, keep)}${suffix}`;
       }
@@ -117,6 +118,16 @@ function normalizeIacFilesForUi(files: Array<{ path?: string; content?: string }
     byPath.set(path, { path, content: String(file.content || '') });
   }
   return Array.from(byPath.values());
+}
+
+function hasTruncatedIacPreview(files: Array<{ path?: string; content?: string }>): boolean {
+  return normalizeIacFilesForUi(files).some((file) => String(file.content || '').includes(IAC_TRUNCATION_NOTE));
+}
+
+function getDeployableIacFiles(files: Array<{ path?: string; content?: string }>): Array<{ path: string; content: string }> {
+  const normalized = normalizeIacFilesForUi(files);
+  if (!normalized.length) return [];
+  return hasTruncatedIacPreview(normalized) ? [] : normalized;
 }
 
 function clearPlanningState(): void {
@@ -1041,6 +1052,14 @@ interface IacGenerationResponse {
   error?: string;
 }
 
+interface IacPrResponse {
+  attempted?: boolean;
+  success?: boolean;
+  pr_url?: string | null;
+  reason?: string;
+  error?: string;
+}
+
 interface SavedIacRun {
   run_id: string;
   workspace: string;
@@ -1059,7 +1078,7 @@ const IAC_LLM_API_KEY_STORAGE_KEY = 'deplai.pipeline.iacLlmApiKey';
 const IAC_LLM_BASE_URL_STORAGE_KEY = 'deplai.pipeline.iacLlmBaseUrl';
 
 const IAC_LLM_DEFAULT_MODELS: Record<IacLlmProvider, string> = {
-  groq: 'llama-3.3-70b-versatile',
+  groq: 'llama-3.1-8b-instant',
   openrouter: 'meta-llama/llama-3.3-70b-instruct:free',
   ollama: 'llama3.1:8b',
   opencode: 'openai/gpt-oss-20b',
@@ -1290,6 +1309,7 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
     }
     setLoading(true);
     setError(null);
+    setPrUrl(null);
     try {
       const { qaSummary, architectureJson, deploymentProfile } = readIacContext();
       const body: Record<string, unknown> = {
@@ -1363,9 +1383,29 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
   }, [projectId]);
 
   const sendPr = async () => {
-    if (prUrl || sendingPr) return;
+    if (prUrl || sendingPr || loading || error || files.length === 0) return;
     setSendingPr(true);
-    await generateIac();
+    setError(null);
+    try {
+      const res = await fetch('/api/pipeline/iac/pr', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: projectId,
+          project_name: projectName,
+          files,
+        }),
+      });
+      const data = await res.json().catch(() => ({})) as IacPrResponse;
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Failed to create IaC PR.');
+      }
+      setPrUrl(String(data.pr_url || '') || null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to create IaC PR.');
+    } finally {
+      setSendingPr(false);
+    }
   };
 
   const fileTypeTag = selected.endsWith('.tf') ? 'HCL' : selected.endsWith('.yml') || selected.endsWith('.yaml') ? 'YAML' : 'TXT';
@@ -1385,7 +1425,7 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
         actions={
           <>
             <Tag color="emerald">Stage 8</Tag>
-            <Btn onClick={sendPr} variant="default" size="sm" disabled={loading || Boolean(prUrl) || Boolean(error)}>{prUrl ? 'PR sent' : sendingPr ? 'Sending PR...' : 'Send PR (terraform/)'}</Btn>
+            <Btn onClick={sendPr} variant="default" size="sm" disabled={loading || sendingPr || files.length === 0 || Boolean(prUrl) || Boolean(error)}>{prUrl ? 'PR ready' : sendingPr ? 'Creating PR...' : 'Create PR (terraform/)'}</Btn>
             {prUrl && <Btn onClick={() => window.open(prUrl, '_blank', 'noopener,noreferrer')} variant="default" size="sm">Open PR</Btn>}
             <Btn onClick={() => onNavigate('gitops')} variant="primary" size="sm" disabled={loading || Boolean(error)}>Proceed to GitOps</Btn>
           </>
@@ -2199,11 +2239,16 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
   const [runtimeDetailsLoading, setRuntimeDetailsLoading] = useState(false);
   const [stopLoading, setStopLoading] = useState(false);
   const [destroyLoading, setDestroyLoading] = useState(false);
+  const [budgetOverride, setBudgetOverride] = useState(false);
   const [deployStateHydrated, setDeployStateHydrated] = useState(false);
   const idleRecoveryRef = useRef<string | null>(null);
 
   const aws = useMemo(() => parseAwsFromSession(), []);
   const iacFiles = useMemo(() => parseIacFilesFromSession(), []);
+  const deployableIacFiles = useMemo(() => getDeployableIacFiles(iacFiles), [iacFiles]);
+  const iacFilesTruncated = useMemo(() => hasTruncatedIacPreview(iacFiles), [iacFiles]);
+  const savedRun = useMemo(() => readSavedIacRun(), []);
+  const shouldUseSavedRunForDeploy = Boolean(savedRun?.run_id) && deployableIacFiles.length === 0;
   const resources = useMemo(() => summarizeResources(iacFiles), [iacFiles]);
   const resourceSummary = useMemo(() => buildAwsResourceSummary(resources), [resources]);
   const cost = useMemo(() => parseCostFromSession(), []);
@@ -2530,10 +2575,13 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
       entry.inFlight = false;
       return;
     }
-    if (iacFiles.length === 0) {
+    if (!savedRun && deployableIacFiles.length === 0) {
+      const message = iacFilesTruncated
+        ? 'Session-cached Terraform files were truncated. Regenerate Terraform or reuse a saved run before deployment.'
+        : 'No generated IaC files found. Generate Terraform first.';
       patchState({
         status: 'error',
-        logs: [{ text: 'No generated IaC files found. Generate Terraform first.', ts: new Date().toLocaleTimeString(), type: 'error' }],
+        logs: [{ text: message, ts: new Date().toLocaleTimeString(), type: 'error' }],
       });
       entry.inFlight = false;
       return;
@@ -2551,8 +2599,6 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
     try {
       patchState({ progress: 20 });
       appendLog('Calling /api/pipeline/deploy for runtime apply...');
-      const savedRun = readSavedIacRun();
-
       const res = await fetch('/api/pipeline/deploy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2560,17 +2606,17 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
           project_id: projectId,
           provider: 'aws',
           runtime_apply: true,
-          run_id: savedRun?.run_id,
-          workspace: savedRun?.workspace,
-          state_bucket: savedRun?.state_bucket,
-          lock_table: savedRun?.lock_table,
-          files: savedRun ? [] : iacFiles,
+          run_id: shouldUseSavedRunForDeploy ? savedRun?.run_id : undefined,
+          workspace: shouldUseSavedRunForDeploy ? savedRun?.workspace : undefined,
+          state_bucket: shouldUseSavedRunForDeploy ? savedRun?.state_bucket : undefined,
+          lock_table: shouldUseSavedRunForDeploy ? savedRun?.lock_table : undefined,
+          files: shouldUseSavedRunForDeploy ? [] : deployableIacFiles,
           aws_access_key_id: aws.aws_access_key_id,
           aws_secret_access_key: aws.aws_secret_access_key,
           aws_region: aws.aws_region,
           estimated_monthly_usd: cost.total,
           budget_limit_usd: cost.cap,
-          budget_override: false,
+          budget_override: budgetOverride,
         }),
       });
 
@@ -2898,6 +2944,26 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
               <p className="text-xs text-zinc-600 mb-6 max-w-md mx-auto">
                 {hasAwsSecrets ? `Using AWS credentials from GitOps input (${aws.aws_region}).` : 'AWS secrets were not set in GitOps. Deployment will fail until configured.'}
               </p>
+              {cost.total > cost.cap && (
+                <div className="mb-6 max-w-md mx-auto rounded-xl border border-amber-500/20 bg-amber-500/10 p-4 text-left">
+                  <p className="text-sm font-semibold text-amber-300">Budget guardrail</p>
+                  <p className="mt-1 text-xs text-amber-200">
+                    Estimated monthly cost ${cost.total.toFixed(2)} exceeds cap ${cost.cap.toFixed(2)}.
+                  </p>
+                  <label className="mt-3 flex items-start gap-3 text-xs text-amber-100">
+                    <input
+                      type="checkbox"
+                      checked={budgetOverride}
+                      onChange={(event) => setBudgetOverride(event.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-950 text-cyan-500"
+                    />
+                    <span>
+                      <span className="block font-semibold">Override budget guardrail for this deploy</span>
+                      <span className="mt-1 block text-amber-200/80">Use only when you intentionally approve the higher monthly cost.</span>
+                    </span>
+                  </label>
+                </div>
+              )}
               <button onClick={start} className="px-7 py-3 bg-cyan-500 hover:bg-cyan-400 text-zinc-950 font-bold rounded-xl text-sm transition-all shadow-lg shadow-cyan-500/20 flex items-center gap-2 mx-auto" disabled={!projectId}>
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 12h14m-7-7l7 7-7 7" /></svg>
                 Deploy to AWS

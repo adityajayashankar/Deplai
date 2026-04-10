@@ -3,6 +3,7 @@ import { createAppAuth } from '@octokit/auth-app';
 import { query } from './db';
 import { v4 as uuidv4 } from 'uuid';
 import simpleGit from 'simple-git';
+import { createPrivateKey } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { requireEnv } from './env';
@@ -18,6 +19,41 @@ interface CachedToken {
   expiresAt: Date;
 }
 
+function normalizeGitHubPrivateKey(raw: string): string {
+  const trimmed = String(raw || '').trim();
+  const unquoted =
+    (trimmed.startsWith('"') && trimmed.endsWith('"'))
+    || (trimmed.startsWith("'") && trimmed.endsWith("'"))
+      ? trimmed.slice(1, -1)
+      : trimmed;
+
+  let normalized = unquoted
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\r\n/g, '\n');
+
+  if (!normalized.includes('-----BEGIN')) {
+    try {
+      const decoded = Buffer.from(normalized, 'base64').toString('utf8').trim();
+      if (decoded.includes('-----BEGIN')) {
+        normalized = decoded.replace(/\r\n/g, '\n');
+      }
+    } catch {
+      // Keep the original value when it is not valid base64.
+    }
+  }
+
+  const pem = normalized.endsWith('\n') ? normalized : `${normalized}\n`;
+  try {
+    return createPrivateKey({ key: pem, format: 'pem' }).export({
+      type: 'pkcs8',
+      format: 'pem',
+    }).toString();
+  } catch {
+    return pem;
+  }
+}
+
 export class GitHubService {
   private config: GitHubConfig;
   private app: Octokit;
@@ -30,7 +66,7 @@ export class GitHubService {
       authStrategy: createAppAuth,
       auth: {
         appId: config.appId,
-        privateKey: config.privateKey.replace(/\\n/g, '\n'),
+        privateKey: normalizeGitHubPrivateKey(config.privateKey),
       },
     });
   }

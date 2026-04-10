@@ -4,10 +4,23 @@ import { verifyWebhookSignature } from '@/lib/crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { requireEnv } from '@/lib/env';
 
+function candidateWebhookSecrets(): string[] {
+  const primary = requireEnv('GITHUB_WEBHOOK_SECRET').trim();
+  const optional = [
+    process.env.GITHUB_WEBHOOK_SECRET_PREVIOUS,
+    process.env.GITHUB_WEBHOOK_SECRET_LEGACY,
+  ]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+
+  return Array.from(new Set([primary, ...optional]));
+}
+
 export async function POST(request: NextRequest) {
   try {
     const signature = request.headers.get('x-hub-signature-256')?.trim();
     const event = request.headers.get('x-github-event');
+    const deliveryId = request.headers.get('x-github-delivery')?.trim() || 'unknown';
     
     if (!signature || !event) {
       return NextResponse.json(
@@ -17,19 +30,37 @@ export async function POST(request: NextRequest) {
     }
 
     const body = await request.text();
-    
-    const isValid = verifyWebhookSignature(
-      body,
-      signature,
-      requireEnv('GITHUB_WEBHOOK_SECRET')
-    );
+    const secrets = candidateWebhookSecrets();
+    const isValid = secrets.some((secret) => verifyWebhookSignature(body, signature, secret));
+    const allowInsecureWebhook =
+      process.env.NODE_ENV !== 'production'
+      && String(process.env.ALLOW_INSECURE_GITHUB_WEBHOOK || '').toLowerCase() === 'true';
 
     if (!isValid) {
-      console.error('Invalid webhook signature');
+      if (allowInsecureWebhook) {
+        console.warn('Bypassing invalid GitHub webhook signature in development mode.', {
+          delivery_id: deliveryId,
+          event,
+        });
+      } else {
+      const shouldLogInvalidSignature =
+        process.env.NODE_ENV === 'production' ||
+        String(process.env.LOG_INVALID_WEBHOOK_SIGNATURES || '').toLowerCase() === 'true';
+      if (shouldLogInvalidSignature) {
+        console.warn('Invalid webhook signature', {
+          delivery_id: deliveryId,
+          event,
+          accepted_secret_count: secrets.length,
+        });
+      }
       return NextResponse.json(
-        { error: 'Invalid signature' },
+        {
+          error: 'Invalid signature',
+          hint: 'Ensure GitHub App webhook secret matches GITHUB_WEBHOOK_SECRET (or set GITHUB_WEBHOOK_SECRET_PREVIOUS during secret rotation).',
+        },
         { status: 401 }
       );
+      }
     }
 
     const payload = JSON.parse(body);

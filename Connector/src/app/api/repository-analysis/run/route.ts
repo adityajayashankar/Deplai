@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
-import { resolveProjectMeta } from '@/lib/project-meta';
+import { resolveProjectMeta, resolveProjectSourceRoot } from '@/lib/project-meta';
 import {
   buildDeploymentWorkspace,
   validateRepositoryContextJson,
@@ -13,8 +13,7 @@ interface RepositoryAnalysisBody {
   workspace?: string;
 }
 
-const AGENTIC_HEALTH_TIMEOUT_MS = 8_000;
-const AGENTIC_ANALYSIS_TIMEOUT_MS = 300_000;
+const AGENTIC_ANALYSIS_TIMEOUT_MS = 600_000;
 const AGENTIC_ANALYSIS_RETRIES = 1;
 
 function isTimeoutLikeError(err: unknown): boolean {
@@ -54,18 +53,6 @@ async function postRepositoryAnalysis(payload: Record<string, unknown>): Promise
     }
   }
   throw lastError || new Error('Repository analysis failed after retry.');
-}
-
-async function assertAgenticHealthy(action: string): Promise<void> {
-  const healthRes = await fetch(`${AGENTIC_URL}/health`, {
-    method: 'GET',
-    headers: agenticHeaders(),
-    signal: AbortSignal.timeout(AGENTIC_HEALTH_TIMEOUT_MS),
-    cache: 'no-store',
-  });
-  if (!healthRes.ok) {
-    throw new Error(`Agentic Layer health check returned ${healthRes.status} while trying to ${action}.`);
-  }
 }
 
 function classifyAgenticRouteError(err: unknown, action: string): { message: string; status: number } {
@@ -113,10 +100,16 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Project metadata could not be resolved.' }, { status: 404 });
     }
 
+    const preparedSourceRoot = await resolveProjectSourceRoot(String(user.id), projectId);
+    if (!preparedSourceRoot) {
+      return NextResponse.json(
+        { error: 'Repository source could not be prepared locally. Refresh the GitHub repository connection and retry.' },
+        { status: 502 },
+      );
+    }
+
     const projectName = String(owned.project?.name || owned.project?.full_name || projectId).split('/').pop() || projectId;
     const workspace = buildDeploymentWorkspace(projectId, body.workspace || projectName);
-    await assertAgenticHealthy('run repository analysis');
-
     const agenticRes = await postRepositoryAnalysis({
       project_id: projectId,
       project_name: projectName,

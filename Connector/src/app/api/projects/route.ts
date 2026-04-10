@@ -165,9 +165,17 @@ export async function GET() {
           i.account_login
          FROM github_repositories r
          JOIN github_installations i ON i.id = r.installation_id
-         WHERE i.user_id = ? AND r.user_hidden = false
+         WHERE (
+           i.user_id = ?
+           OR (
+             i.user_id IS NULL
+             AND i.account_type = 'User'
+             AND LOWER(i.account_login) = LOWER(?)
+           )
+         )
+           AND r.user_hidden = false
          ORDER BY r.full_name ASC`,
-        [user.id]
+        [user.id, user.login]
       );
 
       // Fallback ownership path: legacy rows can miss github_installations.user_id.
@@ -187,9 +195,18 @@ export async function GET() {
            FROM github_repositories r
            JOIN github_installations i ON i.id = r.installation_id
            LEFT JOIN projects p ON p.repository_id = r.id
-           WHERE (i.user_id = ? OR p.user_id = ?) AND r.user_hidden = false
+           WHERE (
+             i.user_id = ?
+             OR p.user_id = ?
+             OR (
+               i.user_id IS NULL
+               AND i.account_type = 'User'
+               AND LOWER(i.account_login) = LOWER(?)
+             )
+           )
+             AND r.user_hidden = false
            ORDER BY r.full_name ASC`,
-          [user.id, user.id]
+          [user.id, user.id, user.login]
         );
       }
 
@@ -212,9 +229,18 @@ export async function GET() {
              FROM github_repositories r
              JOIN github_installations i ON i.id = r.installation_id
              LEFT JOIN projects p ON p.repository_id = r.id
-             WHERE (i.user_id = ? OR p.user_id = ?) AND r.user_hidden = false
+             WHERE (
+               i.user_id = ?
+               OR p.user_id = ?
+               OR (
+                 i.user_id IS NULL
+                 AND i.account_type = 'User'
+                 AND LOWER(i.account_login) = LOWER(?)
+               )
+             )
+               AND r.user_hidden = false
              ORDER BY r.full_name ASC`,
-            [user.id, user.id]
+            [user.id, user.id, user.login]
           );
         } catch (syncErr) {
           console.warn('GitHub installation sync in /api/projects failed:', syncErr);
@@ -239,9 +265,17 @@ export async function GET() {
              FROM github_repositories r
              JOIN github_installations i ON i.id = r.installation_id
              LEFT JOIN projects p ON p.repository_id = r.id
-             WHERE (i.user_id = ? OR p.user_id = ?)
+             WHERE (
+               i.user_id = ?
+               OR p.user_id = ?
+               OR (
+                 i.user_id IS NULL
+                 AND i.account_type = 'User'
+                 AND LOWER(i.account_login) = LOWER(?)
+               )
+             )
              ORDER BY r.full_name ASC`,
-            [user.id, user.id]
+            [user.id, user.id, user.login]
           );
         } catch (fallbackError: unknown) {
           const dbFallbackError = fallbackError as DbError;

@@ -198,7 +198,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   setCurrent,
   stages,
   githubAccounts = [],
-  githubInstallUrl = 'https://github.com/apps/deplai-gitapp-aj/installations/new',
+  githubInstallUrl = 'https://github.com/apps/deplai-app/installations/new',
   onDisconnectGitHub,
   onBackToDashboard,
 }) => {
@@ -376,7 +376,7 @@ export function RunOptionsModal({
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-      <div className="bg-[#141417] border border-white/10 rounded-xl w-full max-w-[540px] shadow-2xl relative flex flex-col overflow-hidden fade-in">
+      <div className="bg-[#141417] border border-white/10 rounded-xl w-full max-w-135 shadow-2xl relative flex flex-col overflow-hidden fade-in">
         <div className="p-5 border-b border-white/5 flex justify-between items-center bg-[#1a1a1c]">
           <h2 className="text-[12px] uppercase tracking-widest text-zinc-400 font-bold">Run Options</h2>
           <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300 transition-colors">

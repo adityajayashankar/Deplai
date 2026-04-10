@@ -79,7 +79,45 @@ export async function getAuthenticatedUser() {
     return null;
   }
 
+  await reconcileSessionUserRecord(session);
+
   return session.user;
+}
+
+async function reconcileSessionUserRecord(session: SessionData & { save: () => Promise<void> }) {
+  const sessionUser = session.user;
+  if (!sessionUser) return;
+
+  const normalizedEmail = String(sessionUser.email || '').trim().toLowerCase();
+  if (!normalizedEmail) return;
+
+  try {
+    const existing = await query<Array<{ id: string }>>(
+      `SELECT id FROM users WHERE email = ? LIMIT 1`,
+      [normalizedEmail]
+    );
+
+    if (existing[0]) {
+      if (existing[0].id !== sessionUser.id) {
+        session.user = { ...sessionUser, id: existing[0].id };
+        await session.save();
+      }
+      return;
+    }
+
+    await query(
+      `INSERT INTO users (id, email, name)
+       VALUES (?, ?, ?)`,
+      [
+        sessionUser.id,
+        normalizedEmail,
+        String(sessionUser.name || sessionUser.login || 'GitHub User').trim(),
+      ]
+    );
+  } catch (error) {
+    // Keep auth non-blocking if reconciliation fails; downstream handlers can surface DB issues.
+    console.warn('Failed to reconcile authenticated user record:', error);
+  }
 }
 
 export async function requireAuth(): Promise<

@@ -15,18 +15,6 @@ interface ArchitectureReviewCompleteBody {
   answers: Record<string, string>;
 }
 
-async function assertAgenticHealthy(action: string): Promise<void> {
-  const healthRes = await fetch(`${AGENTIC_URL}/health`, {
-    method: 'GET',
-    headers: agenticHeaders(),
-    signal: AbortSignal.timeout(3_000),
-    cache: 'no-store',
-  });
-  if (!healthRes.ok) {
-    throw new Error(`Agentic Layer health check returned ${healthRes.status} while trying to ${action}.`);
-  }
-}
-
 function classifyAgenticRouteError(err: unknown, action: string): { message: string; status: number } {
   const raw = err instanceof Error ? err.message : String(err || 'unknown upstream error');
   const lowered = raw.toLowerCase();
@@ -74,7 +62,6 @@ export async function POST(req: NextRequest) {
 
     const projectName = String(owned.project?.name || owned.project?.full_name || projectId).split('/').pop() || projectId;
     const workspace = buildDeploymentWorkspace(projectId, body.workspace || projectName);
-    await assertAgenticHealthy('complete the architecture review');
     const agenticRes = await fetch(`${AGENTIC_URL}/api/architecture/review/complete`, {
       method: 'POST',
       headers: {

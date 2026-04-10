@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
-const GITHUB_APP_INSTALL_URL = 'https://github.com/apps/deplai-gitapp-aj/installations/new';
+const GITHUB_APP_INSTALL_URL = 'https://github.com/apps/deplai-app/installations/new';
 
 export default function DashboardProjectsRedirectPage() {
   const router = useRouter();
@@ -15,7 +15,10 @@ export default function DashboardProjectsRedirectPage() {
       router.replace('/dashboard');
       return;
     }
-    setPopupBlocked(true);
+    const timer = window.setTimeout(() => {
+      setPopupBlocked(true);
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [router]);
 
   return (

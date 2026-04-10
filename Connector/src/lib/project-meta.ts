@@ -53,13 +53,20 @@ export async function resolveProjectSourceRoot(
   if (meta.project_type === 'github' && meta.repo_full_name && meta.installation_uuid) {
     const [owner, repo] = meta.repo_full_name.split('/');
     if (!owner || !repo) return null;
+    const repoRootFallback = path.join(process.cwd(), 'tmp', 'repos', owner, repo);
     try {
       const repoRoot = await githubService.ensureRepoFresh(meta.installation_uuid, owner, repo);
       if (repoRoot && fs.existsSync(repoRoot) && fs.statSync(repoRoot).isDirectory()) {
         return repoRoot;
       }
     } catch {
+      if (fs.existsSync(repoRootFallback) && fs.statSync(repoRootFallback).isDirectory()) {
+        return repoRootFallback;
+      }
       return null;
+    }
+    if (fs.existsSync(repoRootFallback) && fs.statSync(repoRootFallback).isDirectory()) {
+      return repoRootFallback;
     }
     return null;
   }

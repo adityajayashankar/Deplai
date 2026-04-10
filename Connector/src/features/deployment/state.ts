@@ -104,6 +104,17 @@ export interface GeneratedIacFile {
   content: string;
 }
 
+export interface DeployLogEntry {
+  text: string;
+  ts: string;
+  type: 'info' | 'success' | 'error';
+  worker_id?: string;
+  worker_role?: string;
+  worker_status?: string;
+  stage?: string;
+  model?: string;
+}
+
 export interface DeploymentHistoryEntry {
   id: string;
   createdAt: string;
@@ -117,7 +128,7 @@ export interface DeploymentHistoryEntry {
 export interface DeployStateSnapshot {
   status: 'idle' | 'running' | 'done' | 'error';
   progress: number;
-  logs: Array<{ text: string; ts: string; type: 'info' | 'success' | 'error' }>;
+  logs: DeployLogEntry[];
   deployResult: DeployApiResult | null;
   deploymentHistory: DeploymentHistoryEntry[];
   updatedAt: string;
@@ -129,6 +140,14 @@ export interface SavedIacRun {
   provider_version?: string;
   state_bucket?: string;
   lock_table?: string;
+}
+
+export interface SavedIacMeta {
+  project_id: string;
+  workspace?: string;
+  source?: string;
+  generated_at?: string;
+  has_run?: boolean;
 }
 
 export interface AwsSessionConfig {
@@ -176,6 +195,7 @@ export const APPROVAL_PAYLOAD_KEY = 'deplai.pipeline.approvalPayload';
 export const COST_ESTIMATE_KEY = 'deplai.pipeline.costEstimate';
 export const IAC_FILES_KEY = 'deplai.pipeline.iacFiles';
 export const IAC_RUN_KEY = 'deplai.pipeline.iacRun';
+export const IAC_META_KEY = 'deplai.pipeline.iacMeta';
 export const QA_CONTEXT_KEY = 'deplai.pipeline.qaContext';
 export const DEPLOY_STATE_STORAGE_PREFIX = 'deplai.pipeline.deployState.';
 export const DEPLOY_UI_STAGE_STORAGE_PREFIX = 'deplai.deploy.stage.';
@@ -183,6 +203,16 @@ export const DEPLOY_HISTORY_MAX = 20;
 const IAC_SESSION_MAX_TOTAL_CHARS = 400000;
 const IAC_SESSION_MAX_FILE_CHARS = 80000;
 const IAC_TRUNCATION_NOTE = '\n\n# [truncated in browser session cache]';
+
+export function hasTruncatedIacFiles(value: unknown): boolean {
+  return normalizeIacFileList(value).some((entry) => String(entry.content || '').includes(IAC_TRUNCATION_NOTE));
+}
+
+export function getDeployableIacFiles(value: unknown): GeneratedIacFile[] {
+  const normalized = normalizeIacFileList(value);
+  if (!normalized.length) return [];
+  return hasTruncatedIacFiles(normalized) ? [] : normalized;
+}
 
 function normalizeIacFileList(value: unknown): GeneratedIacFile[] {
   if (!Array.isArray(value)) return [];
@@ -275,6 +305,7 @@ export function clearPlanningState(): void {
     COST_ESTIMATE_KEY,
     IAC_FILES_KEY,
     IAC_RUN_KEY,
+    IAC_META_KEY,
     QA_CONTEXT_KEY,
   ].forEach((key) => sessionStorage.removeItem(key));
 }
@@ -323,6 +354,26 @@ export function readSavedIacRun(): SavedIacRun | null {
   }
 }
 
+export function readSavedIacMeta(): SavedIacMeta | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = sessionStorage.getItem(IAC_META_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<SavedIacMeta>;
+    const projectId = String(parsed.project_id || '').trim();
+    if (!projectId) return null;
+    return {
+      project_id: projectId,
+      workspace: String(parsed.workspace || '').trim() || undefined,
+      source: String(parsed.source || '').trim() || undefined,
+      generated_at: String(parsed.generated_at || '').trim() || undefined,
+      has_run: parsed.has_run === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function readIacFilesFromSession(): GeneratedIacFile[] {
   if (typeof window === 'undefined') return [];
   try {
@@ -356,7 +407,18 @@ export function loadDeploySnapshot(projectId: string): DeployStateSnapshot | nul
       status: parsed.status === 'running' || parsed.status === 'done' || parsed.status === 'error' ? parsed.status : 'idle',
       progress: Number.isFinite(parsed.progress) ? Number(parsed.progress) : 0,
       logs: Array.isArray(parsed.logs)
-        ? parsed.logs.filter((row) => row && typeof row.text === 'string' && typeof row.ts === 'string')
+        ? parsed.logs
+          .filter((row) => row && typeof row.text === 'string' && typeof row.ts === 'string')
+          .map((row): DeployLogEntry => ({
+            text: String(row.text),
+            ts: String(row.ts),
+            type: row.type === 'success' || row.type === 'error' ? row.type : 'info',
+            worker_id: typeof row.worker_id === 'string' ? row.worker_id : undefined,
+            worker_role: typeof row.worker_role === 'string' ? row.worker_role : undefined,
+            worker_status: typeof row.worker_status === 'string' ? row.worker_status : undefined,
+            stage: typeof row.stage === 'string' ? row.stage : undefined,
+            model: typeof row.model === 'string' ? row.model : undefined,
+          }))
         : [],
       deployResult: parsed.deployResult && typeof parsed.deployResult === 'object' ? parsed.deployResult as DeployApiResult : null,
       deploymentHistory: Array.isArray(parsed.deploymentHistory)

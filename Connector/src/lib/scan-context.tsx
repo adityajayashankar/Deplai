@@ -140,8 +140,8 @@ function connectWebSocket(
   projectId: string,
   onMessage: (projectId: string, msg: ScanMessage) => void,
   onStatus: (projectId: string, status: string) => void,
-  onError: (projectId: string) => void,
-  onClose: (projectId: string) => void,
+  onError: (projectId: string, error?: string) => void,
+  onClose: (projectId: string, detail?: { code?: number; reason?: string }) => void,
   wsToken: string,
 ): WebSocket {
   const base = `${normalizeWsBase(wsBaseUrl)}${path}/${projectId}`;
@@ -152,12 +152,34 @@ function connectWebSocket(
   };
 
   ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
+    let data: any;
+    try {
+      data = JSON.parse(event.data);
+    } catch {
+      onMessage(projectId, {
+        index: Date.now(),
+        total: Date.now(),
+        type: 'error',
+        content: 'Received malformed websocket payload from remediation backend.',
+        timestamp: new Date().toISOString(),
+      });
+      onStatus(projectId, 'error');
+      return;
+    }
     switch (data.type) {
       case 'message':
         onMessage(projectId, data.data as ScanMessage);
         break;
       case 'status':
+        if (data.status === 'error' && typeof data.error === 'string' && data.error.trim()) {
+          onMessage(projectId, {
+            index: Date.now(),
+            total: Date.now(),
+            type: 'error',
+            content: data.error.trim(),
+            timestamp: new Date().toISOString(),
+          });
+        }
         if (['running', 'waiting_decision', 'waiting_approval', 'completed', 'error'].includes(data.status)) {
           onStatus(projectId, data.status);
         }
@@ -165,8 +187,10 @@ function connectWebSocket(
     }
   };
 
-  ws.onerror = (event) => { console.error('WebSocket error:', event); onError(projectId); };
-  ws.onclose = () => onClose(projectId);
+  ws.onerror = () => {
+    onError(projectId, 'WebSocket transport error while streaming remediation logs.');
+  };
+  ws.onclose = (event) => onClose(projectId, { code: event.code, reason: event.reason });
 
   return ws;
 }
@@ -514,10 +538,31 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
         }),
       });
       if (!res.ok) {
+        let detail = 'Failed to start remediation.';
+        try {
+          const payload = await res.json();
+          if (typeof payload?.error === 'string' && payload.error.trim()) detail = payload.error.trim();
+        } catch {
+          // ignore body parse failures
+        }
+        appendRemediationMessage(projectId, {
+          index: Date.now(),
+          total: Date.now(),
+          type: 'error',
+          content: detail,
+          timestamp: new Date().toISOString(),
+        });
         updateRemediationStatus(projectId, 'error');
         return;
       }
-    } catch {
+    } catch (error) {
+      appendRemediationMessage(projectId, {
+        index: Date.now(),
+        total: Date.now(),
+        type: 'error',
+        content: error instanceof Error ? error.message : 'Failed to start remediation.',
+        timestamp: new Date().toISOString(),
+      });
       updateRemediationStatus(projectId, 'error');
       return;
     }
@@ -529,13 +574,47 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       '/ws/remediate', projectId,
       appendRemediationMessage,
       updateRemediationStatus,
-      (id) => updateRemediationStatus(id, 'error'),
-      (id) => {
+      (id, detail) => {
+        if (detail) {
+          appendRemediationMessage(id, {
+            index: Date.now(),
+            total: Date.now(),
+            type: 'error',
+            content: detail,
+            timestamp: new Date().toISOString(),
+          });
+        }
+        updateRemediationStatus(id, 'error');
+      },
+      (id, detail) => {
         // If WS closes while remediation is still running, mark as error
         setRemediationStates(prev => {
           const cur = prev[id];
-          if (cur && cur.state === 'running') {
-            return { ...prev, [id]: { ...cur, state: 'error' } };
+          if (cur && !['completed', 'error', 'idle'].includes(cur.state)) {
+            const reason = detail?.reason?.trim();
+            const message = reason
+              ? `WebSocket closed unexpectedly (${detail?.code || 1006}): ${reason}`
+              : `WebSocket closed unexpectedly (${detail?.code || 1006}).`;
+            const alreadyLogged = cur.messages.some((entry) => entry.type === 'error' && entry.content === message);
+            return {
+              ...prev,
+              [id]: {
+                ...cur,
+                state: 'error',
+                messages: alreadyLogged
+                  ? cur.messages
+                  : trimMessages([
+                      ...cur.messages,
+                      {
+                        index: Date.now(),
+                        total: Date.now(),
+                        type: 'error',
+                        content: message,
+                        timestamp: new Date().toISOString(),
+                      },
+                    ]),
+              },
+            };
           }
           return prev;
         });
@@ -543,7 +622,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       },
       wsToken,
     );
-  }, [appendRemediationMessage, updateRemediationStatus]);
+  }, [appendRemediationMessage, trimMessages, updateRemediationStatus]);
 
   const continueRemediationRound = useCallback((projectId: string) => {
     const ws = remWsRefs.current[projectId];
