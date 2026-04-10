@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from inspect import isawaitable
 from typing import Callable
 from urllib import error as urlerror
 from urllib import parse as urlparse
@@ -37,37 +39,241 @@ class RemediationOrchestrator:
         self.validator = DiffValidator()
         self._validator_pool = ThreadPoolExecutor(max_workers=4)
 
-    async def run(self, project_id: str, on_fix: Callable[[Fix], None] | None = None) -> list[Fix]:
+    async def run(
+        self,
+        project_id: str,
+        on_fix: Callable[[Fix], None] | None = None,
+        on_progress: Callable[[str, str], object] | None = None,
+        *,
+        remediation_scope: str = "all",
+        llm_provider: str | None = None,
+        llm_api_key: str | None = None,
+        llm_model: str | None = None,
+        force_claude: bool = False,
+    ) -> list[Fix]:
         vulnerabilities = self.ingester.ingest(project_id)
         groups = self.grouper.group(vulnerabilities)
-        vuln_lookup: dict[str, Vulnerability] = {v.id: v for v in vulnerabilities}
+        snapshot = self._build_snapshot(vulnerabilities, groups, remediation_scope=remediation_scope)
+        selected_groups = self._select_groups_for_run(groups, snapshot)
+        selected_vulnerabilities = self._selected_vulnerabilities(selected_groups)
+        vuln_lookup: dict[str, Vulnerability] = {v.id: v for v in selected_vulnerabilities}
 
         loop = asyncio.get_running_loop()
         fixes: list[Fix] = []
 
-        for group in groups:
-            bundles = self.extractor.extract(project_id, group)
-            for bundle in bundles:
-                fix = await loop.run_in_executor(None, self.generator.generate, bundle, vuln_lookup)
-                validated = await loop.run_in_executor(self._validator_pool, self.validator.validate, project_id, fix)
-                if validated is None:
+        if on_progress is not None and snapshot["strategy_mode"] in {"critical_only", "high_only"}:
+            reason = "Large repository strategy enabled" if snapshot["strategy_reason"] == "large_repo" else "Major-only scope enabled"
+            await self._emit_progress(
+                on_progress,
+                "phase",
+                (
+                    f"{reason}: processing {str(snapshot['selected_severity']).upper()} file groups first "
+                    "and stopping before medium/low severities."
+                ),
+            )
+        if on_progress is not None and snapshot["force_claude"]:
+            await self._emit_progress(
+                on_progress,
+                "info",
+                "Claude SDK forced for staged large-repository remediation.",
+            )
+
+        batch_size = max(1, int(os.getenv("REMEDIATION_PIPELINE_GROUPS_PER_BATCH", "8")))
+        ordered_groups = self._ordered_groups_for_run(selected_groups)
+        total_batches = max(1, (len(ordered_groups) + batch_size - 1) // batch_size) if ordered_groups else 1
+
+        for batch_index in range(0, len(ordered_groups), batch_size):
+            group_batch = ordered_groups[batch_index:batch_index + batch_size]
+            batch_number = (batch_index // batch_size) + 1
+            if on_progress is not None:
+                severities = sorted({group.max_severity.upper() for group in group_batch}) or ["NONE"]
+                await self._emit_progress(
+                    on_progress,
+                    "info",
+                    (
+                        f"Batch {batch_number}/{total_batches}: processing {len(group_batch)} file group(s) "
+                        f"covering {', '.join(severities)} severities "
+                        f"({snapshot['selected_findings']} finding(s) in active stage)."
+                    ),
+                )
+            for group in group_batch:
+                try:
+                    if on_progress is not None:
+                        await self._emit_progress(
+                            on_progress,
+                            "info",
+                            f"Analyzing {group.filepath} ({group.max_severity.upper()}, {len(group.vulns)} finding(s)).",
+                        )
+                    bundles = self.extractor.extract(project_id, group)
+                except Exception as exc:
+                    if on_progress is not None:
+                        await self._emit_progress(
+                            on_progress,
+                            "warning",
+                            f"{group.filepath}: failed to extract source snippets ({type(exc).__name__}: {exc}).",
+                        )
                     continue
-                fixes.append(validated)
-                if on_fix is not None:
-                    on_fix(validated)
+
+                if not bundles:
+                    if on_progress is not None:
+                        await self._emit_progress(
+                            on_progress,
+                            "warning",
+                            f"{group.filepath}: no readable source snippets were extracted for this file group.",
+                        )
+                    continue
+
+                for bundle in bundles:
+                    try:
+                        fix = await loop.run_in_executor(
+                            None,
+                            self.generator.generate,
+                            bundle,
+                            vuln_lookup,
+                            llm_provider,
+                            llm_api_key,
+                            llm_model,
+                            force_claude or bool(snapshot["force_claude"]),
+                        )
+                    except Exception as exc:
+                        if on_progress is not None:
+                            await self._emit_progress(
+                                on_progress,
+                                "warning",
+                                f"{bundle.filepath}: fix generation crashed ({type(exc).__name__}: {exc}).",
+                            )
+                        continue
+
+                    try:
+                        validated = await loop.run_in_executor(self._validator_pool, self.validator.validate, project_id, fix)
+                    except Exception as exc:
+                        if on_progress is not None:
+                            await self._emit_progress(
+                                on_progress,
+                                "warning",
+                                f"{bundle.filepath}: diff validation crashed ({type(exc).__name__}: {exc}).",
+                            )
+                        continue
+
+                    if validated is None:
+                        if on_progress is not None:
+                            await self._emit_progress(
+                                on_progress,
+                                "warning",
+                                f"{bundle.filepath}: generated diff could not be applied cleanly and was dropped.",
+                            )
+                        continue
+                    fixes.append(validated)
+                    if on_fix is not None:
+                        on_fix(validated)
 
         return fixes
 
     def status(self) -> ProviderStatusResponse:
         return self.router.status()
 
-    def refresh(self, project_id: str) -> dict[str, int]:
+    def refresh(self, project_id: str, remediation_scope: str = "all") -> dict[str, int | str]:
         vulnerabilities = self.ingester.ingest(project_id)
         groups = self.grouper.group(vulnerabilities)
+        snapshot = self._build_snapshot(vulnerabilities, groups, remediation_scope=remediation_scope)
         return {
             "vulnerabilities": len(vulnerabilities),
             "groups": len(groups),
+            "critical": snapshot["severity_counts"]["critical"],
+            "high": snapshot["severity_counts"]["high"],
+            "medium": snapshot["severity_counts"]["medium"],
+            "low": snapshot["severity_counts"]["low"],
+            "selected_groups": snapshot["selected_groups"],
+            "selected_findings": snapshot["selected_findings"],
+            "selected_severity": str(snapshot["selected_severity"] or ""),
+            "strategy_mode": snapshot["strategy_mode"],
+            "strategy_reason": snapshot["strategy_reason"],
+            "stop_after_major": int(snapshot["stop_after_major"]),
+            "force_claude": int(snapshot["force_claude"]),
         }
+
+    @staticmethod
+    async def _emit_progress(on_progress: Callable[[str, str], object], msg_type: str, content: str) -> None:
+        result = on_progress(msg_type, content)
+        if isawaitable(result):
+            await result
+
+    @staticmethod
+    def _severity_rank(severity: str) -> int:
+        return {"critical": 4, "high": 3, "medium": 2, "low": 1}.get(str(severity or "").lower(), 0)
+
+    def _build_snapshot(
+        self,
+        vulnerabilities: list[Vulnerability],
+        groups: list,
+        *,
+        remediation_scope: str = "all",
+    ) -> dict[str, object]:
+        threshold = max(1, int(os.getenv("REMEDIATION_LARGE_FINDING_THRESHOLD", "1000")))
+        normalized_scope = "major" if str(remediation_scope or "").strip().lower() == "major" else "all"
+        severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for vuln in vulnerabilities:
+            severity_counts[vuln.severity] = severity_counts.get(vuln.severity, 0) + 1
+
+        strategy_mode = "default"
+        strategy_reason = "default"
+        stop_after_major = False
+        force_claude = False
+        selected_severity: str | None = None
+        selected_subset = list(groups)
+
+        threshold_exceeded = len(vulnerabilities) > threshold
+        major_only_requested = normalized_scope == "major" or threshold_exceeded
+
+        if major_only_requested:
+            stop_after_major = True
+            strategy_reason = "large_repo" if threshold_exceeded else "scope_major"
+            force_claude = threshold_exceeded
+            critical_groups = [group for group in groups if group.max_severity == "critical"]
+            high_groups = [group for group in groups if group.max_severity == "high"]
+            if critical_groups:
+                strategy_mode = "critical_only"
+                selected_severity = "critical"
+                selected_subset = critical_groups
+            elif high_groups:
+                strategy_mode = "high_only"
+                selected_severity = "high"
+                selected_subset = high_groups
+            else:
+                strategy_mode = "major_complete"
+                selected_subset = []
+
+        return {
+            "severity_counts": severity_counts,
+            "selected_groups": len(selected_subset),
+            "selected_findings": sum(len(group.vulns) for group in selected_subset),
+            "selected_severity": selected_severity,
+            "strategy_mode": strategy_mode,
+            "strategy_reason": strategy_reason,
+            "stop_after_major": stop_after_major,
+            "force_claude": force_claude,
+        }
+
+    @staticmethod
+    def _selected_vulnerabilities(groups: list) -> list[Vulnerability]:
+        deduped: dict[str, Vulnerability] = {}
+        for group in groups:
+            for vuln in group.vulns:
+                deduped[vuln.id] = vuln
+        return list(deduped.values())
+
+    def _select_groups_for_run(self, groups: list, snapshot: dict[str, object]) -> list:
+        if snapshot.get("strategy_mode") == "critical_only":
+            return [group for group in groups if group.max_severity == "critical"]
+        if snapshot.get("strategy_mode") == "high_only":
+            return [group for group in groups if group.max_severity == "high"]
+        return groups
+
+    def _ordered_groups_for_run(self, groups: list) -> list:
+        return sorted(
+            groups,
+            key=lambda item: (-self._severity_rank(item.max_severity), item.filepath),
+        )
 
     def create_pr(self, payload: RemediationPRRequest) -> RemediationPRResponse:
         owner, repo = self._parse_repo_url(payload.repository_url)

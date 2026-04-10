@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 from fastapi import WebSocket
 
@@ -66,18 +67,67 @@ class RemediationTrackRunner(RunnerBase):
         while current_round <= MAX_ROUNDS:
             await self._send_message("phase", f"Round {current_round}: ingesting findings and generating fixes")
 
-            snapshot = self.orchestrator.refresh(self.context.project_id)
+            try:
+                snapshot = self.orchestrator.refresh(
+                    self.context.project_id,
+                    remediation_scope=self.context.remediation_scope,
+                )
+            except Exception as exc:
+                return await self._terminate(f"Failed to refresh remediation inputs: {exc}")
             await self._send_message(
                 "info",
-                f"Loaded {snapshot.get('vulnerabilities', 0)} vulnerabilities across {snapshot.get('groups', 0)} file groups.",
+                (
+                    f"Loaded {snapshot.get('vulnerabilities', 0)} vulnerabilities across {snapshot.get('groups', 0)} file groups "
+                    f"(critical={snapshot.get('critical', 0)}, high={snapshot.get('high', 0)}, "
+                    f"medium={snapshot.get('medium', 0)}, low={snapshot.get('low', 0)})."
+                ),
             )
+            if snapshot.get("strategy_mode") == "major_complete":
+                await self._send_message(
+                    "success",
+                    "Critical and high findings are already cleared. Stopping remediation before medium/low severities.",
+                )
+                return True
+            if snapshot.get("strategy_mode") in {"critical_only", "high_only"}:
+                stage = str(snapshot.get("selected_severity") or "major").upper()
+                reason = "Large repository mode active" if snapshot.get("strategy_reason") == "large_repo" else "Major-only remediation scope active"
+                await self._send_message(
+                    "phase",
+                    (
+                        f"{reason}: processing {stage} findings only "
+                        f"({snapshot.get('selected_findings', 0)} finding(s) across {snapshot.get('selected_groups', 0)} file group(s))."
+                    ),
+                )
+            if snapshot.get("force_claude"):
+                claude_model = (
+                    self.context.llm_model
+                    or os.getenv("REMEDIATION_CLAUDE_MODEL", "").strip()
+                    or os.getenv("CLAUDE_MODEL", "").strip()
+                    or "claude-sonnet-4-5"
+                )
+                await self._send_message("info", f"Using Claude SDK for the active staged run ({claude_model}).")
 
             fix_events: list = []
 
             def on_fix(fix):
                 fix_events.append(fix)
 
-            fixes = await self.orchestrator.run(self.context.project_id, on_fix=on_fix)
+            async def on_progress(msg_type: str, content: str):
+                await self._send_message(msg_type, content)
+
+            try:
+                fixes = await self.orchestrator.run(
+                    self.context.project_id,
+                    on_fix=on_fix,
+                    on_progress=on_progress,
+                    remediation_scope=self.context.remediation_scope,
+                    llm_provider=self.context.llm_provider,
+                    llm_api_key=self.context.llm_api_key,
+                    llm_model=self.context.llm_model,
+                    force_claude=bool(snapshot.get("force_claude")),
+                )
+            except Exception as exc:
+                return await self._terminate(f"Remediation pipeline execution failed: {type(exc).__name__}: {exc}")
             self._latest_fixes = fixes
 
             for fix in fix_events:

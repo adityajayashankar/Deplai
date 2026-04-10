@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from .bundle import build_manifest_bundle
+from .enterprise_bundle import build_enterprise_profile_bundle
 from .runtime import DEFAULT_PROVIDER_CONSTRAINT, slugify
 
 
@@ -833,16 +834,6 @@ def build_profile_bundle(
     website_index_html: str,
 ) -> tuple[dict[str, str], list[str]]:
     strategy = str(((payload.get("compute") or {}) if isinstance(payload.get("compute"), dict) else {}).get("strategy") or "")
-    if strategy == "s3_cloudfront":
-        return _static_site_bundle(
-            payload=payload,
-            provider_version=provider_version,
-            state_bucket=state_bucket,
-            lock_table=lock_table,
-            aws_region=aws_region,
-            context_summary=context_summary,
-            website_index_html=website_index_html,
-        )
     if strategy == "ecs_fargate":
         return _ecs_bundle(
             payload=payload,
@@ -852,16 +843,27 @@ def build_profile_bundle(
             aws_region=aws_region,
             context_summary=context_summary,
         )
-    files, warnings = build_manifest_bundle(
-        project_name=str(payload.get("project_name") or "deplai-project"),
-        workspace=str(payload.get("workspace") or slugify(str(payload.get("project_name") or "deplai-project"))),
-        provider_version=provider_version,
-        state_bucket=state_bucket,
-        lock_table=lock_table,
-        aws_region=aws_region,
-        context_summary=context_summary,
-        website_index_html=website_index_html,
-        manifest=[],
-    )
-    warnings.insert(0, "Deployment profile requested an unsupported compute strategy for deterministic bundling; falling back to the legacy EC2-oriented bundle.")
-    return files, warnings
+    try:
+        return build_enterprise_profile_bundle(
+            payload=payload,
+            provider_version=provider_version,
+            state_bucket=state_bucket,
+            lock_table=lock_table,
+            aws_region=aws_region,
+            context_summary=context_summary,
+            website_index_html=website_index_html,
+        )
+    except Exception as exc:
+        files, warnings = build_manifest_bundle(
+            project_name=str(payload.get("project_name") or "deplai-project"),
+            workspace=str(payload.get("workspace") or slugify(str(payload.get("project_name") or "deplai-project"))),
+            provider_version=provider_version,
+            state_bucket=state_bucket,
+            lock_table=lock_table,
+            aws_region=aws_region,
+            context_summary=context_summary,
+            website_index_html=website_index_html,
+            manifest=[],
+        )
+        warnings.insert(0, f"Enterprise renderer failed and fell back to the legacy EC2-oriented bundle: {exc}")
+        return files, warnings

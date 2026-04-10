@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import Lock
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from remediation_pipeline.models import ProviderQuota, ProviderStatusResponse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Agentic Layer"))
+
+from claude_remediator import _call_claude_sdk  # noqa: E402
 
 
 DEFAULT_TIMEOUT_SECONDS = 10
@@ -36,8 +42,29 @@ class LLMRouter:
         self._reset_at_utc = self._next_midnight_utc()
         self._lock = Lock()
 
-    def route(self, prompt: str, estimated_tokens: int) -> tuple[str, str, int]:
+    def route(
+        self,
+        prompt: str,
+        estimated_tokens: int,
+        *,
+        preferred_provider: str | None = None,
+        preferred_api_key: str | None = None,
+        preferred_model: str | None = None,
+        force_claude: bool = False,
+    ) -> tuple[str, str, int]:
         self._reset_if_needed()
+
+        provider_name = str(preferred_provider or "").strip().lower()
+        if force_claude or provider_name == "claude":
+            ok, response = self._dispatch_claude_sdk(
+                prompt,
+                api_key=str(preferred_api_key or "").strip(),
+                model=str(preferred_model or "").strip(),
+            )
+            if ok:
+                tokens_used = max(estimated_tokens, len(response) // 4)
+                return response, "claude", tokens_used
+            raise RuntimeError(f"Claude SDK remediation failed: {response}")
 
         errors: list[str] = []
         for cfg in sorted(self._configs, key=lambda item: item.priority):
@@ -56,6 +83,24 @@ class LLMRouter:
                 continue
 
         raise RuntimeError("All remediation providers failed: " + " | ".join(errors))
+
+    @staticmethod
+    def _dispatch_claude_sdk(prompt: str, *, api_key: str, model: str) -> tuple[bool, str]:
+        effective_api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "").strip()
+        effective_model = (
+            model
+            or os.getenv("REMEDIATION_CLAUDE_MODEL", "").strip()
+            or os.getenv("CLAUDE_MODEL", "").strip()
+            or "claude-sonnet-4-5"
+        )
+        if not effective_api_key:
+            return False, "Missing ANTHROPIC_API_KEY"
+        return _call_claude_sdk(
+            prompt,
+            effective_api_key,
+            effective_model,
+            stage="remediation_pipeline",
+        )
 
     def status(self) -> ProviderStatusResponse:
         self._reset_if_needed()

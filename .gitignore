@@ -56,6 +56,10 @@ __pycache__/
 
 # Claude Code
 .claude/
+.skill/
+remediation-plan.md
+Terraform-generation-plan.md
+.opencode/
 
 *.json
 *.jsonl

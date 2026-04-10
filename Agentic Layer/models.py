@@ -147,7 +147,14 @@ class CostEstimateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class TerraformGenRequest(BaseModel):
+    project_id: Optional[str] = None
     architecture_json: dict[str, Any]
+    repository_context: Optional[dict[str, Any]] = None
+    deployment_profile: Optional[dict[str, Any]] = None
+    approval_payload: Optional[dict[str, Any]] = None
+    security_context: Optional[dict[str, Any]] = None
+    website_asset_stats: Optional[dict[str, Any]] = None
+    frontend_entrypoint_detection: Optional[dict[str, Any]] = None
     provider: str = "aws"
     project_name: str = "deplai-project"
     workspace: str = "default"
@@ -159,9 +166,11 @@ class TerraformGenRequest(BaseModel):
     qa_summary: Optional[str] = None
     openai_api_key: Optional[str] = None
     refresh_docs: Optional[bool] = False
+    iac_mode: Optional[str] = None
     llm_provider: Optional[str] = None
     llm_api_key: Optional[str] = None
     llm_model: Optional[str] = None
+    llm_api_base_url: Optional[str] = None
     website_index_html: Optional[str] = None
 
 

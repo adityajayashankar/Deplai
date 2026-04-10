@@ -30,12 +30,17 @@ def run_cost_estimator(state: AgentState) -> AgentState:
     for node in nodes:
         resource_type = str(node.get("type") or "").strip().lower()
         resource_id = str(node.get("id") or "").strip()
-        known = estimate_cost(resource_type, region, "default")
+        pricing_tier = str(node.get("pricing_tier") or "default").strip() or "default"
+        known = estimate_cost(resource_type, region, pricing_tier)
 
         if known is not None:
             monthly, service, cost_type, notes = known
             if resource_type == "s3" and "LOG" in resource_id.upper():
                 notes = "Log storage, minimal traffic"
+            desired_count = int(node.get("desired_count") or 1)
+            if resource_type == "service" and desired_count > 1:
+                monthly *= desired_count
+                notes = f"{notes}; includes {desired_count} tasks"
             monthly = round_money(monthly)
             total += monthly
             if monthly > 0:

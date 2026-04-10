@@ -10,9 +10,16 @@ services:
       - "8000:8000"
     env_file:
       - ./.env
+      - ./Terraform Agent/agent/.env
     environment:
       DEPLAI_LOCAL_PROJECTS_ROOT: /local-projects
       DEPLAI_GITHUB_REPOS_ROOT: /repos
+      AGENT_LLM_BACKEND: openrouter
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GROQ_MODEL: ${GROQ_MODEL}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL}
+      CLAUDE_API_KEY: ${CLAUDE_API_KEY}
     volumes:
       # Docker socket — allows the container to manage other containers/volumes
       - /var/run/docker.sock:/var/run/docker.sock

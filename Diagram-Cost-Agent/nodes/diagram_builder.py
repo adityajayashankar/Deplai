@@ -14,7 +14,13 @@ _KNOWN_VALUES = {
     "lambda",
     "cloudfront",
     "default_vpc",
+    "custom_vpc",
+    "existing_vpc",
     "cloudwatch",
+    "rds",
+    "elasticache",
+    "ecr",
+    "alb",
     "web_server",
     "website_bucket",
     "security_logs_bucket",
@@ -28,9 +34,13 @@ def _extract_unknown_values(infra_plan: dict[str, Any]) -> list[str]:
     for key, value in infra_plan.items():
         if isinstance(value, list):
             for item in value:
+                if isinstance(item, (dict, list)):
+                    continue
                 token = str(item).strip().lower()
                 if token and token not in _KNOWN_VALUES:
                     discovered.add(token)
+            continue
+        if isinstance(value, dict):
             continue
         token = str(value).strip().lower()
         if token and token not in _KNOWN_VALUES and key != "region":

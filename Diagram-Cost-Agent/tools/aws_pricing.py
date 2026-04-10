@@ -29,14 +29,21 @@ PRICING_TABLE: dict = {
     },
     "rds_postgres": {
         "db.t3.micro": {"ap-south-1": 28.08, "us-east-1": 25.55},
+        "db.t3.small": {"ap-south-1": 56.16, "us-east-1": 51.10},
         "db.t3.medium": {"ap-south-1": 112.32, "us-east-1": 102.20},
+        "db.r6g.large": {"ap-south-1": 215.00, "us-east-1": 196.00},
     },
     "elasticache_redis": {
         "cache.t3.micro": {"ap-south-1": 13.14, "us-east-1": 11.52},
+        "cache.t3.small": {"ap-south-1": 17.35, "us-east-1": 15.20},
+        "cache.t3.medium": {"ap-south-1": 34.70, "us-east-1": 30.40},
+        "cache.r6g.large": {"ap-south-1": 138.00, "us-east-1": 121.00},
     },
     "ecs_fargate": {
         "0.25vcpu_0.5gb": {"ap-south-1": 8.10, "us-east-1": 7.30},
         "0.5vcpu_1gb": {"ap-south-1": 16.20, "us-east-1": 14.60},
+        "web": {"ap-south-1": 23.00, "us-east-1": 23.00},
+        "worker": {"ap-south-1": 15.50, "us-east-1": 15.50},
     },
     "s3": {
         "per_gb_month": {"ap-south-1": 0.023, "us-east-1": 0.023},
@@ -53,6 +60,11 @@ PRICING_TABLE: dict = {
     "vpc": {"monthly_usd": 0.00},
     "subnet": {"monthly_usd": 0.00},
     "security_group": {"monthly_usd": 0.00},
+    "alb": {"ap-south-1": 20.10, "us-east-1": 18.40},
+    "nat_gateway": {"ap-south-1": 39.50, "us-east-1": 32.85},
+    "ecr": {"ap-south-1": 1.20, "us-east-1": 0.90},
+    "task_definition": {"monthly_usd": 0.00},
+    "igw": {"monthly_usd": 0.00},
 }
 
 
@@ -203,21 +215,23 @@ def estimate_cost(resource_type: str, region: str, tier: str = "default") -> Opt
         return round_money(monthly), "AmazonS3", "General", notes
 
     if rtype == "rds":
-        live = _estimate_rds_live(client, aws_region)
+        instance_type = tier if tier in PRICING_TABLE["rds_postgres"] else "db.t3.small"
+        live = _estimate_rds_live(client, aws_region) if instance_type == "db.t3.micro" else None
         if live is not None:
             monthly, notes = live
             return monthly, "AmazonRDS", "AWS Pricing API", notes
-        monthly = _region_value(PRICING_TABLE["rds_postgres"]["db.t3.micro"], aws_region)
+        monthly = _region_value(PRICING_TABLE["rds_postgres"].get(instance_type, {}), aws_region)
         if monthly is None:
             return None
-        notes = "db.t3.micro on-demand baseline"
+        notes = f"{instance_type} on-demand baseline"
         return round_money(monthly), "AmazonRDS", "PostgreSQL", notes
 
     if rtype == "elasticache":
-        monthly = _region_value(PRICING_TABLE["elasticache_redis"]["cache.t3.micro"], aws_region)
+        node_type = tier if tier in PRICING_TABLE["elasticache_redis"] else "cache.t3.small"
+        monthly = _region_value(PRICING_TABLE["elasticache_redis"][node_type], aws_region)
         if monthly is None:
             return None
-        notes = "cache.t3.micro node baseline"
+        notes = f"{node_type} node baseline"
         return round_money(monthly), "AmazonElastiCache", "Redis", notes
 
     if rtype == "ecs":
@@ -227,13 +241,39 @@ def estimate_cost(resource_type: str, region: str, tier: str = "default") -> Opt
         notes = "Fargate task 0.25 vCPU / 0.5GB baseline"
         return round_money(monthly), "AmazonECS", "Fargate", notes
 
+    if rtype == "service":
+        service_tier = tier if tier in PRICING_TABLE["ecs_fargate"] else "web"
+        monthly = _region_value(PRICING_TABLE["ecs_fargate"][service_tier], aws_region)
+        if monthly is None:
+            return None
+        notes = f"Fargate {service_tier} service baseline"
+        return round_money(monthly), "AWSFargate", "FargateService", notes
+
+    if rtype == "alb":
+        monthly = _region_value(PRICING_TABLE["alb"], aws_region)
+        if monthly is None:
+            return None
+        return round_money(monthly), "ElasticLoadBalancing", "ApplicationLoadBalancer", "Baseline ALB hourly + light LCU usage"
+
+    if rtype == "nat_gateway":
+        monthly = _region_value(PRICING_TABLE["nat_gateway"], aws_region)
+        if monthly is None:
+            return None
+        return round_money(monthly), "AmazonVPC", "NATGateway", "Single NAT gateway baseline with light egress"
+
+    if rtype == "ecr":
+        monthly = _region_value(PRICING_TABLE["ecr"], aws_region)
+        if monthly is None:
+            return None
+        return round_money(monthly), "AmazonECR", "ContainerRegistry", "Small private repository storage baseline"
+
     if rtype == "cloudfront":
         return 0.00, "AmazonCloudFront", "General", "Within free tier (first 1TB/month)"
 
     if rtype == "cloudwatch":
         return 0.00, "AmazonCloudWatch", "General", "Basic metrics/logs assumed within free tier"
 
-    if rtype in {"vpc", "subnet", "security_group"}:
+    if rtype in {"vpc", "subnet", "security_group", "task_definition", "igw"}:
         return 0.00, "AmazonVPC", "General", "No direct hourly charge"
 
     if rtype == "lambda":

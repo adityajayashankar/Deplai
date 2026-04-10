@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -533,17 +534,69 @@ def _profile_to_architecture_view(profile: DeploymentProfileDocument) -> Derived
 
 def _profile_to_infra_plan(profile: DeploymentProfileDocument) -> dict[str, Any]:
     storage: list[str] = ["website_bucket"] if profile.compute.strategy == "s3_cloudfront" else []
+    primary_db = next((item for item in profile.data_layer if item.type == "postgresql"), None)
+    cache = next((item for item in profile.data_layer if item.type == "redis"), None)
+    using_private_subnets = profile.networking.layout == "private_subnets"
+    service_profiles = [
+        {
+            "id": service.id,
+            "process_type": service.process_type,
+            "cpu": service.cpu,
+            "memory": service.memory,
+            "port": service.port,
+            "desired_count": service.desired_count,
+            "autoscaling": service.autoscaling,
+            "internet_facing": bool(service.port and profile.networking.load_balancer),
+        }
+        for service in profile.compute.services
+    ]
+    default_region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "eu-north-1"
     return {
         "compute": "ecs" if profile.compute.strategy == "ecs_fargate" else ("ec2" if profile.compute.strategy == "ec2" else None),
         "services": [service.id for service in profile.compute.services],
+        "service_profiles": service_profiles,
         "database": "rds" if any(item.type == "postgresql" for item in profile.data_layer) else None,
+        "database_config": (
+            {
+                "engine": "postgresql",
+                "instance_class": primary_db.instance_class,
+                "storage_gb": primary_db.storage_gb,
+                "multi_az": bool(primary_db.multi_az),
+                "backup_retention_days": primary_db.backup_retention_days,
+            }
+            if primary_db
+            else None
+        ),
         "cache": "elasticache" if any(item.type == "redis" for item in profile.data_layer) else None,
+        "cache_config": (
+            {
+                "engine": "redis",
+                "node_type": cache.node_type,
+                "engine_version": cache.engine_version,
+                "cluster_mode": bool(cache.cluster_mode),
+                "purpose": cache.purpose,
+            }
+            if cache
+            else None
+        ),
         "networking": "custom_vpc" if profile.networking.vpc == "new" else "existing_vpc",
+        "networking_config": {
+            "vpc_mode": profile.networking.vpc,
+            "layout": profile.networking.layout,
+            "public_subnets": 2,
+            "private_subnets": 2 if using_private_subnets else 0,
+            "internet_gateway": profile.networking.vpc == "new",
+            "nat_gateway": bool(profile.networking.nat_gateway and using_private_subnets),
+            "load_balancer": str(profile.networking.load_balancer.get("type") or "").strip().lower() or None,
+            "public_load_balancer": bool(profile.networking.load_balancer.get("public", True)) if profile.networking.load_balancer else False,
+        },
         "cdn": "cloudfront" if profile.compute.strategy == "s3_cloudfront" else None,
         "storage": storage,
         "logging": "cloudwatch",
         "security_groups": ["app_security_group"],
-        "region": "eu-north-1",
+        "container_registry": "ecr" if profile.compute.strategy == "ecs_fargate" else None,
+        "task_definitions": [service.id for service in profile.compute.services] if profile.compute.strategy == "ecs_fargate" else [],
+        "region": default_region,
         "state_backend": "s3_dynamodb",
     }
 

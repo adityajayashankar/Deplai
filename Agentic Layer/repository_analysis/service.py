@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -98,11 +99,17 @@ DATASTORE_HINTS: dict[str, list[str]] = {
 
 def _list_files(root: Path) -> list[Path]:
     files: list[Path] = []
-    for path in root.rglob("*"):
-        if any(part in SKIP_DIRS for part in path.parts):
-            continue
-        if path.is_file():
-            files.append(path)
+    root = root.resolve()
+    # Use os.walk with topdown pruning to avoid traversing heavy directories
+    # like node_modules or .git, which can cause request timeouts.
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        dirnames[:] = [name for name in dirnames if name not in SKIP_DIRS]
+
+        current_dir = Path(dirpath)
+        for filename in filenames:
+            path = current_dir / filename
+            if path.is_file():
+                files.append(path)
     return files
 
 

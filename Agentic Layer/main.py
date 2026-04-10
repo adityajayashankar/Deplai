@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -71,6 +72,31 @@ from stage7_bridge import run_stage7_approval_payload
 from utils import get_docker_client
 
 logger = logging.getLogger(__name__)
+
+
+def _project_slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9-]+", "-", str(value or "").strip().lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug
+
+
+def _instance_name_tag(instance: dict[str, Any]) -> str:
+    for tag in instance.get("Tags") or []:
+        if not isinstance(tag, dict):
+            continue
+        if str(tag.get("Key") or "").strip() == "Name":
+            return str(tag.get("Value") or "").strip()
+    return ""
+
+
+def _instance_matches_project(instance: dict[str, Any], project_name: str) -> bool:
+    requested_slug = _project_slug(project_name)
+    if not requested_slug:
+        return False
+    name_slug = _project_slug(_instance_name_tag(instance))
+    if not name_slug:
+        return False
+    return name_slug == requested_slug or name_slug.startswith(f"{requested_slug}-")
 
 app = FastAPI(
     title="DEPLAI Agentic Layer",
@@ -168,7 +194,7 @@ def _normalize_remediation_request(request: RemediationRequest) -> RemediationRe
     )
 
 
-async def _broadcast_pipeline_event(project_id: str, msg_type: str, content: str) -> None:
+async def _broadcast_pipeline_event(project_id: str, msg_type: str, content: str, meta: dict[str, Any] | None = None) -> None:
     text = str(content or "").strip()
     if not text:
         return
@@ -180,15 +206,21 @@ async def _broadcast_pipeline_event(project_id: str, msg_type: str, content: str
         next_index = pipeline_indices.get(project_id, 0) + 1
         pipeline_indices[project_id] = next_index
 
+    data = {
+        "index": next_index,
+        "total": 0,
+        "type": msg_type or "info",
+        "content": text,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if isinstance(meta, dict):
+        for key, value in meta.items():
+            if value is not None:
+                data[key] = value
+
     payload = {
         "type": "message",
-        "data": {
-            "index": next_index,
-            "total": 0,
-            "type": msg_type or "info",
-            "content": text,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        },
+        "data": data,
     }
 
     dead: list[WebSocket] = []
@@ -747,6 +779,45 @@ async def terraform_generate(request: TerraformGenRequest):
     """Generate Terraform IaC files from a Claude-derived deployment profile."""
     loop = asyncio.get_running_loop()
     architecture_json = dict(request.architecture_json or {})
+    repository_context_json = dict(request.repository_context or {})
+    project_id = str(request.project_id or "").strip()
+
+    def progress_callback(event: dict[str, Any]) -> None:
+        if not project_id:
+            return
+        try:
+            event_type = str(event.get("type") or "info")
+            content = str(event.get("content") or "").strip()
+            meta = {
+                "worker_id": event.get("worker_id"),
+                "worker_role": event.get("worker_role"),
+                "worker_status": event.get("worker_status"),
+                "stage": event.get("stage"),
+                "model": event.get("model"),
+                "workspace": event.get("workspace"),
+                "aws_region": event.get("aws_region"),
+                "compute_strategy": event.get("compute_strategy"),
+                "service_count": event.get("service_count"),
+            }
+            asyncio.run_coroutine_threadsafe(
+                _broadcast_pipeline_event(project_id, event_type, content, meta=meta),
+                loop,
+            )
+        except RuntimeError:
+            return
+
+    if project_id:
+        await _broadcast_pipeline_event(
+            project_id,
+            "info",
+            "Terraform agent workflow started.",
+            meta={
+                "worker_id": "terraform-orchestrator",
+                "worker_role": "Terraform Orchestrator",
+                "worker_status": "started",
+                "stage": "terraform_generation",
+            },
+        )
     agent_result = await loop.run_in_executor(
         None,
         lambda: generate_terraform_bundle(
@@ -754,12 +825,36 @@ async def terraform_generate(request: TerraformGenRequest):
             project_name=request.project_name,
             workspace=request.workspace,
             aws_region=request.aws_region,
+            iac_mode=request.iac_mode,
             qa_summary=request.qa_summary or "",
             website_index_html=request.website_index_html or "",
+            repository_context_json=repository_context_json,
+            deployment_profile_json=dict(request.deployment_profile or {}),
+            approval_payload_json=dict(request.approval_payload or {}),
+            security_context_json=dict(request.security_context or {}),
+            website_asset_stats_json=dict(request.website_asset_stats or {}),
+            frontend_entrypoint_detection_json=dict(request.frontend_entrypoint_detection or {}),
+            llm_provider=request.llm_provider,
+            llm_api_key=request.llm_api_key,
+            llm_model=request.llm_model,
+            llm_api_base_url=request.llm_api_base_url,
+            progress_callback=progress_callback,
         ),
     )
 
     if agent_result and agent_result.get("success"):
+        if project_id:
+            await _broadcast_pipeline_event(
+                project_id,
+                "success",
+                "Terraform agent workflow completed successfully.",
+                meta={
+                    "worker_id": "terraform-orchestrator",
+                    "worker_role": "Terraform Orchestrator",
+                    "worker_status": "completed",
+                    "stage": "terraform_generation",
+                },
+            )
         return TerraformGenResponse(
             success=True,
             provider=request.provider,
@@ -775,11 +870,24 @@ async def terraform_generate(request: TerraformGenRequest):
             files=agent_result.get("files"),
             readme=agent_result.get("readme"),
             source=str(agent_result.get("source") or "terraform_agent"),
+            details=agent_result.get("details"),
         )
 
     error_message = "Terraform agent unavailable."
     if isinstance(agent_result, dict):
         error_message = str(agent_result.get("error") or error_message)
+    if project_id:
+        await _broadcast_pipeline_event(
+            project_id,
+            "error",
+            f"Terraform agent workflow failed: {error_message}",
+            meta={
+                "worker_id": "terraform-orchestrator",
+                "worker_role": "Terraform Orchestrator",
+                "worker_status": "failed",
+                "stage": "terraform_generation",
+            },
+        )
     return TerraformGenResponse(
         success=False,
         provider=request.provider,
@@ -827,7 +935,8 @@ async def terraform_apply(request: TerraformApplyRequest):
     result = None
     try:
         emit_apply_event("info", "Terraform runtime apply started.")
-        if request.run_id and request.workspace:
+        request_files = [f for f in request.files if f is not None] if request.files else []
+        if request.run_id and request.workspace and not request_files:
             emit_apply_event("info", f"Reusing saved Terraform workspace '{request.workspace}'.")
             result = await loop.run_in_executor(
                 None,
@@ -848,12 +957,14 @@ async def terraform_apply(request: TerraformApplyRequest):
             result = await loop.run_in_executor(
                 None,
                 lambda: apply_terraform_bundle(
-                    files=[{"path": f.path, "content": f.content, "encoding": f.encoding} for f in request.files],
+                    files=[{"path": f.path, "content": f.content, "encoding": f.encoding} for f in request_files],
                     project_name=request.project_name,
                     provider=request.provider,
                     aws_access_key_id=request.aws_access_key_id or "",
                     aws_secret_access_key=request.aws_secret_access_key or "",
                     aws_region=request.aws_region or "eu-north-1",
+                    state_bucket=request.state_bucket or "",
+                    lock_table=request.lock_table or "",
                     enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
                     apply_context=apply_ctx,
                 ),
@@ -1003,6 +1114,27 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
             except Exception:
                 tagged_instances = []
 
+        name_matched_instances = []
+        if requested_project_name:
+            try:
+                name_match_res = ec2.describe_instances(
+                    Filters=[
+                        {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
+                    ]
+                )
+                name_matched_instances = [
+                    i
+                    for r in name_match_res.get("Reservations", [])
+                    for i in r.get("Instances", [])
+                    if _instance_matches_project(i, requested_project_name)
+                ]
+                name_matched_instances.sort(
+                    key=lambda item: str(item.get("LaunchTime") or ""),
+                    reverse=True,
+                )
+            except Exception:
+                name_matched_instances = []
+
         target_instance = None
         if requested_instance_id:
             try:
@@ -1018,6 +1150,8 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
                 target_instance = None
         if target_instance is None and tagged_instances:
             target_instance = tagged_instances[0]
+        if target_instance is None and name_matched_instances:
+            target_instance = name_matched_instances[0]
         if target_instance is None and not has_specific_target and running_instances:
             target_instance = running_instances[0]
 
@@ -1080,6 +1214,12 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
             }
 
         lookup_status = "ok" if target_instance else "not_found"
+        if target_instance and requested_instance_id:
+            lookup_status = "instance_id"
+        elif target_instance and tagged_instances:
+            lookup_status = "project_tag"
+        elif target_instance and name_matched_instances:
+            lookup_status = "name_tag"
 
         return AwsRuntimeDetailsResponse(
             success=True,
@@ -1367,6 +1507,14 @@ async def aws_destroy_runtime(request: AwsDestroyRequest):
         return AwsDestroyResponse(success=True, details=details)
     except Exception as exc:
         return AwsDestroyResponse(success=False, error=str(exc))
+
+
+@app.get("/ready")
+async def readiness_check():
+    return {
+        "status": "ready",
+        "service": "agentic-layer",
+    }
 
 
 @app.get("/health")

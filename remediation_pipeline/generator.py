@@ -13,12 +13,27 @@ class FixGenerator:
     def __init__(self, router: LLMRouter) -> None:
         self._router = router
 
-    def generate(self, bundle: SnippetBundle, vuln_lookup: dict[str, Vulnerability]) -> Fix:
+    def generate(
+        self,
+        bundle: SnippetBundle,
+        vuln_lookup: dict[str, Vulnerability],
+        llm_provider: str | None = None,
+        llm_api_key: str | None = None,
+        llm_model: str | None = None,
+        force_claude: bool = False,
+    ) -> Fix:
         ordered_vulns = [vuln_lookup[s.vuln_id] for s in bundle.snippets if s.vuln_id in vuln_lookup]
         prompt = self._build_prompt(bundle, ordered_vulns)
 
         try:
-            response_text, provider, tokens_used = self._router.route(prompt, bundle.token_estimate)
+            response_text, provider, tokens_used = self._router.route(
+                prompt,
+                bundle.token_estimate,
+                preferred_provider=llm_provider,
+                preferred_api_key=llm_api_key,
+                preferred_model=llm_model,
+                force_claude=force_claude,
+            )
         except Exception as exc:
             return Fix(
                 filepath=bundle.filepath,
