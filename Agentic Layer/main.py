@@ -34,6 +34,7 @@ from models import (
     ArchitectureGenRequest, ArchitectureGenResponse,
     CostEstimateRequest, CostEstimateResponse,
     Stage7ApprovalRequest, Stage7ApprovalResponse,
+    TerraformConsultRequest, TerraformConsultResponse,
     TerraformGenRequest, TerraformGenResponse,
     TerraformApplyRequest, TerraformApplyResponse,
     TerraformApplyStopRequest, TerraformApplyStopResponse,
@@ -69,6 +70,7 @@ from deployment_planning_contract import (
 from claude_deployment_pipeline import generate_terraform_bundle
 from repository_analysis import run_repository_analysis
 from stage7_bridge import run_stage7_approval_payload
+from terraform_runner import consult_cloudposse_components
 from utils import get_docker_client
 
 logger = logging.getLogger(__name__)
@@ -825,6 +827,8 @@ async def terraform_generate(request: TerraformGenRequest):
             project_name=request.project_name,
             workspace=request.workspace,
             aws_region=request.aws_region,
+            state_bucket=request.state_bucket,
+            lock_table=request.lock_table,
             iac_mode=request.iac_mode,
             qa_summary=request.qa_summary or "",
             website_index_html=request.website_index_html or "",
@@ -834,10 +838,14 @@ async def terraform_generate(request: TerraformGenRequest):
             security_context_json=dict(request.security_context or {}),
             website_asset_stats_json=dict(request.website_asset_stats or {}),
             frontend_entrypoint_detection_json=dict(request.frontend_entrypoint_detection or {}),
-            llm_provider=request.llm_provider,
-            llm_api_key=request.llm_api_key,
-            llm_model=request.llm_model,
-            llm_api_base_url=request.llm_api_base_url,
+            detected_json=dict(request.detected or {}),
+            user_answers_json=dict(request.user_answers or {}),
+            consultant_decision_json=dict(request.consultant_decision or {}),
+            llm_provider=None,
+            llm_api_key=None,
+            llm_model=None,
+            llm_api_base_url=None,
+            terraform_renderer=request.terraform_renderer,
             progress_callback=progress_callback,
         ),
     )
@@ -870,6 +878,16 @@ async def terraform_generate(request: TerraformGenRequest):
             files=agent_result.get("files"),
             readme=agent_result.get("readme"),
             source=str(agent_result.get("source") or "terraform_agent"),
+            requested_renderer=agent_result.get("requested_renderer"),
+            actual_renderer=agent_result.get("actual_renderer"),
+            unsupported_reason=agent_result.get("unsupported_reason"),
+            renderer=agent_result.get("renderer"),
+            component_catalog_version=agent_result.get("component_catalog_version"),
+            execution_kind=agent_result.get("execution_kind"),
+            llm_iac_calls=agent_result.get("llm_iac_calls"),
+            llm_iac_disabled=agent_result.get("llm_iac_disabled"),
+            decision_applied=agent_result.get("decision_applied"),
+            decision_drift=agent_result.get("decision_drift"),
             details=agent_result.get("details"),
         )
 
@@ -902,7 +920,44 @@ async def terraform_generate(request: TerraformGenRequest):
         warnings=agent_result.get("warnings") if isinstance(agent_result, dict) else None,
         error=error_message,
         source=str(agent_result.get("source") or "unavailable") if isinstance(agent_result, dict) else "unavailable",
+        requested_renderer=agent_result.get("requested_renderer") if isinstance(agent_result, dict) else None,
+        actual_renderer=agent_result.get("actual_renderer") if isinstance(agent_result, dict) else None,
+        unsupported_reason=agent_result.get("unsupported_reason") if isinstance(agent_result, dict) else None,
+        renderer=agent_result.get("renderer") if isinstance(agent_result, dict) else None,
+        component_catalog_version=agent_result.get("component_catalog_version") if isinstance(agent_result, dict) else None,
+        execution_kind=agent_result.get("execution_kind") if isinstance(agent_result, dict) else None,
+        llm_iac_calls=agent_result.get("llm_iac_calls") if isinstance(agent_result, dict) else None,
+        llm_iac_disabled=agent_result.get("llm_iac_disabled") if isinstance(agent_result, dict) else None,
+        decision_applied=agent_result.get("decision_applied") if isinstance(agent_result, dict) else None,
+        decision_drift=agent_result.get("decision_drift") if isinstance(agent_result, dict) else None,
         details=agent_result.get("details") if isinstance(agent_result, dict) else None,
+    )
+
+
+@app.post("/api/terraform/cloudposse/consult", response_model=TerraformConsultResponse, dependencies=[Depends(verify_api_key)])
+async def terraform_cloudposse_consult(request: TerraformConsultRequest):
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: consult_cloudposse_components(
+            architecture_json=dict(request.architecture_json or {}),
+            repository_context_json=dict(request.repository_context or {}),
+            deployment_profile_json=dict(request.deployment_profile or {}),
+            detected_json=dict(request.detected or {}),
+            aws_region=request.aws_region,
+            conversation_history=list(request.conversation_history or []),
+            turn_count=int(request.turn_count or 0),
+            force_decision=bool(request.force_decision),
+        ),
+    )
+    return TerraformConsultResponse(
+        success=bool(result.get("success")),
+        assistant_message=result.get("assistant_message"),
+        ready=bool(result.get("ready")),
+        decision=result.get("decision"),
+        repo_detection_summary=result.get("repo_detection_summary"),
+        turn_count=int(result.get("turn_count") or 0),
+        error=result.get("error"),
     )
 
 
@@ -962,10 +1017,12 @@ async def terraform_apply(request: TerraformApplyRequest):
                     provider=request.provider,
                     aws_access_key_id=request.aws_access_key_id or "",
                     aws_secret_access_key=request.aws_secret_access_key or "",
+                    aws_session_token=request.aws_session_token or "",
                     aws_region=request.aws_region or "eu-north-1",
                     state_bucket=request.state_bucket or "",
                     lock_table=request.lock_table or "",
                     enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
+                    confirm_apply=request.confirm_plan_summary is True,
                     apply_context=apply_ctx,
                 ),
             )
@@ -996,8 +1053,11 @@ async def terraform_apply(request: TerraformApplyRequest):
         success=True,
         provider=request.provider,
         project_name=request.project_name,
+        status=result.get("status"),
         outputs=result.get("outputs"),
         cloudfront_url=result.get("cloudfront_url"),
+        plan_summary=result.get("plan_summary"),
+        requires_plan_confirmation=result.get("status") == "awaiting_plan_confirmation",
         details=result.get("details"),
     )
 

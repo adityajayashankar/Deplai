@@ -155,6 +155,9 @@ class TerraformGenRequest(BaseModel):
     security_context: Optional[dict[str, Any]] = None
     website_asset_stats: Optional[dict[str, Any]] = None
     frontend_entrypoint_detection: Optional[dict[str, Any]] = None
+    detected: Optional[dict[str, Any]] = None
+    user_answers: Optional[dict[str, Any]] = None
+    consultant_decision: Optional[dict[str, Any]] = None
     provider: str = "aws"
     project_name: str = "deplai-project"
     workspace: str = "default"
@@ -172,6 +175,28 @@ class TerraformGenRequest(BaseModel):
     llm_model: Optional[str] = None
     llm_api_base_url: Optional[str] = None
     website_index_html: Optional[str] = None
+    terraform_renderer: Optional[str] = None
+
+
+class TerraformConsultRequest(BaseModel):
+    architecture_json: dict[str, Any]
+    repository_context: Optional[dict[str, Any]] = None
+    deployment_profile: Optional[dict[str, Any]] = None
+    detected: Optional[dict[str, Any]] = None
+    aws_region: str = "eu-north-1"
+    conversation_history: list[dict[str, str]] = Field(default_factory=list)
+    turn_count: int = 0
+    force_decision: bool = False
+
+
+class TerraformConsultResponse(BaseModel):
+    success: bool
+    assistant_message: Optional[str] = None
+    ready: bool = False
+    decision: Optional[dict[str, Any]] = None
+    repo_detection_summary: Optional[str] = None
+    turn_count: int = 0
+    error: Optional[str] = None
 
 
 class TerraformGenResponse(BaseModel):
@@ -189,6 +214,16 @@ class TerraformGenResponse(BaseModel):
     files: Optional[list] = None
     readme: Optional[str] = None
     source: Optional[str] = None
+    requested_renderer: Optional[str] = None
+    actual_renderer: Optional[str] = None
+    unsupported_reason: Optional[str] = None
+    renderer: Optional[str] = None
+    component_catalog_version: Optional[str] = None
+    execution_kind: Optional[str] = None
+    llm_iac_calls: Optional[int] = None
+    llm_iac_disabled: Optional[bool] = None
+    decision_applied: Optional[bool] = None
+    decision_drift: Optional[list[dict[str, Any]]] = None
     details: Optional[dict] = None
     error: Optional[str] = None
 
@@ -214,16 +249,21 @@ class TerraformApplyRequest(BaseModel):
     files: list[TerraformApplyFile] = Field(default_factory=list)
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
+    aws_session_token: Optional[str] = None
     aws_region: Optional[str] = None
     enforce_free_tier_ec2: Optional[bool] = True
+    confirm_plan_summary: Optional[bool] = False
 
 
 class TerraformApplyResponse(BaseModel):
     success: bool
     provider: str = ""
     project_name: str = ""
+    status: Optional[str] = None
     outputs: Optional[dict] = None
     cloudfront_url: Optional[str] = None
+    plan_summary: Optional[dict] = None
+    requires_plan_confirmation: Optional[bool] = None
     details: Optional[dict] = None
     error: Optional[str] = None
 

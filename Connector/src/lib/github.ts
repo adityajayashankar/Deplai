@@ -378,8 +378,17 @@ export class GitHubService {
     try {
       const { data } = await this.app.apps.getUserInstallation({ username: githubLogin });
       const installation = data;
-      const accountLogin = installation.account?.login;
-      const accountType = installation.account?.type || 'User';
+      const account = installation.account;
+      const accountLogin = !account
+        ? null
+        : 'login' in account
+          ? account.login
+          : account.slug;
+      const accountType = !account
+        ? 'User'
+        : 'type' in account
+          ? account.type
+          : 'Enterprise';
       const installationId = installation.id;
 
       if (!accountLogin || !installationId) return false;

@@ -3,13 +3,18 @@ from __future__ import annotations
 import json
 import os
 import sys
+from copy import deepcopy
 from math import ceil
 from pathlib import Path
 from typing import Any, Callable
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from anthropic import Anthropic
+try:
+    from anthropic import Anthropic
+except ImportError:
+    Anthropic = None
+
 from dotenv import load_dotenv
 
 for dotenv_path in (
@@ -19,7 +24,12 @@ for dotenv_path in (
     if dotenv_path.exists():
         load_dotenv(dotenv_path=dotenv_path, override=False)
 
-for candidate in (Path(__file__).resolve().parents[1], Path("/app")):
+for candidate in (
+    Path(__file__).resolve().parent,
+    Path(__file__).resolve().parents[1],
+    Path(__file__).resolve().parents[1] / "Terraform Agent",
+    Path("/app"),
+):
     if candidate.exists() and str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
 
@@ -50,7 +60,12 @@ from planning_runtime import (
 )
 from repository_sources import resolve_repository_source
 from stage7_bridge import run_stage7_approval_payload
-from terraform_agent.agent.engine.deployment_profile import build_profile_bundle, build_profile_manifest
+from terraform_agent.agent.engine.cloudposse_atmos import normalize_terraform_renderer, should_use_cloudposse_renderer
+from terraform_agent.agent.engine.deployment_profile import (
+    build_cloudposse_profile_bundle,
+    build_profile_bundle,
+    build_profile_manifest,
+)
 from terraform_agent.agent.engine.runtime import DEFAULT_PROVIDER_CONSTRAINT
 
 
@@ -652,6 +667,10 @@ def _resolve_terraform_llm_config(
     llm_model: str | None,
     llm_api_base_url: str | None,
 ) -> dict[str, str] | None:
+    # LLM-backed Terraform generation is intentionally disabled. Keep this
+    # compatibility hook returning no provider so legacy callers fall through
+    # to deterministic renderers without touching LLM APIs.
+    return None
     explicit_provider = str(llm_provider or "").strip().lower()
     explicit_key = str(llm_api_key or "").strip()
     explicit_model = str(llm_model or "").strip()
@@ -897,6 +916,316 @@ def _string_list(value: Any) -> list[str]:
         seen.add(text)
         items.append(text)
     return items
+
+
+def _merge_string_lists(*values: Any) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for item in _string_list(value):
+            lowered = item.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            merged.append(item)
+    return merged
+
+
+def _append_profile_warning(profile_payload: dict[str, Any], warning: str) -> None:
+    text = str(warning or "").strip()
+    if not text:
+        return
+    warnings = [str(item).strip() for item in list(profile_payload.get("warnings") or []) if str(item).strip()]
+    if text not in warnings:
+        warnings.append(text)
+    profile_payload["warnings"] = warnings
+
+
+def _as_record(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_records(value: Any) -> list[dict[str, Any]]:
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _positive_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _approval_budget_context(approval_payload: dict[str, Any] | None) -> tuple[float | None, float | None, str]:
+    approval = _as_record(approval_payload)
+    budget_gate = _as_record(approval.get("budget_gate"))
+    cost_estimate = _as_record(approval.get("cost_estimate"))
+    cap = (
+        _positive_float(budget_gate.get("cap_usd"))
+        or _positive_float(approval.get("budget_cap_usd"))
+        or _positive_float(approval.get("budget_limit_usd"))
+    )
+    total = (
+        _positive_float(cost_estimate.get("total_monthly_usd"))
+        or _positive_float(budget_gate.get("total_usd"))
+        or _positive_float(approval.get("estimated_monthly_usd"))
+    )
+    status = str(budget_gate.get("status") or approval.get("budget_status") or "").strip().lower()
+    return cap, total, status
+
+
+def _security_has_major_findings(security_context: dict[str, Any] | None) -> bool:
+    security = _as_record(security_context)
+    for key in ("critical", "high", "critical_findings", "high_findings", "criticalOrHighSupply"):
+        value = security.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return True
+    high_cwe = security.get("highCwe")
+    if isinstance(high_cwe, list) and high_cwe:
+        return True
+    for key in ("supply_chain", "code_security", "findings", "vulnerabilities"):
+        for item in _as_records(security.get(key)):
+            severity = str(item.get("severity") or "").strip().lower()
+            count = int(item.get("count") or 1)
+            if severity in {"critical", "high"} and count > 0:
+                return True
+    return False
+
+
+def _is_static_frontend_candidate(
+    *,
+    profile_payload: dict[str, Any],
+    repository_context_json: dict[str, Any] | None,
+    frontend_entrypoint_detection_json: dict[str, Any] | None,
+    website_asset_stats_json: dict[str, Any] | None,
+) -> bool:
+    if _compute_strategy(profile_payload) == "s3_cloudfront":
+        return True
+    if _as_records(profile_payload.get("data_layer")):
+        return False
+    compute = _as_record(profile_payload.get("compute"))
+    services = _as_records(compute.get("services"))
+    if any(str(service.get("process_type") or "").strip().lower() == "worker" for service in services):
+        return False
+
+    repo_frontend = _as_record(_as_record(repository_context_json).get("frontend"))
+    if bool(repo_frontend.get("static_site_candidate")) and not bool(repo_frontend.get("hybrid")):
+        return True
+
+    detection = _as_record(frontend_entrypoint_detection_json)
+    framework = str(detection.get("framework") or repo_frontend.get("framework") or "").strip().lower()
+    static_frameworks = {"vite", "react", "vue", "svelte", "unknown", ""}
+    entry_candidates = _string_list(detection.get("entry_candidates")) or _string_list(repo_frontend.get("entry_candidates"))
+    has_build_output = bool(detection.get("has_build_output"))
+    has_site_assets = bool(_positive_float(_as_record(website_asset_stats_json).get("asset_count")))
+    if bool(detection.get("detected")) and framework in static_frameworks and (entry_candidates or has_build_output or has_site_assets):
+        return True
+    return False
+
+
+def _enrich_deployment_profile_for_deterministic_rendering(
+    *,
+    profile_payload: dict[str, Any],
+    approval_payload_json: dict[str, Any] | None,
+    security_context_json: dict[str, Any] | None,
+    website_asset_stats_json: dict[str, Any] | None,
+    frontend_entrypoint_detection_json: dict[str, Any] | None,
+    repository_context_json: dict[str, Any] | None,
+) -> dict[str, Any]:
+    enriched = deepcopy(profile_payload)
+    enriched["compute"] = _as_record(enriched.get("compute")) or {"strategy": "ec2", "services": []}
+    enriched["networking"] = _as_record(enriched.get("networking")) or {}
+    compute = _as_record(enriched["compute"])
+    networking = _as_record(enriched["networking"])
+    repository_context = _as_record(repository_context_json)
+    repo_build = _as_record(repository_context.get("build"))
+    repo_env = _as_record(repository_context.get("environment_variables"))
+    repo_health = _as_record(repository_context.get("health"))
+    build_pipeline = _as_record(enriched.get("build_pipeline"))
+    runtime_config = _as_record(enriched.get("runtime_config"))
+    operational = _as_record(enriched.get("operational"))
+
+    repo_build_applied = False
+    for field in ("build_command", "start_command"):
+        if not str(build_pipeline.get(field) or "").strip() and str(repo_build.get(field) or "").strip():
+            build_pipeline[field] = str(repo_build.get(field)).strip()
+            repo_build_applied = True
+    if repo_build_applied:
+        _append_profile_warning(enriched, "Repository analysis supplied missing build_pipeline commands for deterministic rendering.")
+
+    required_secrets = _merge_string_lists(runtime_config.get("required_secrets"), repo_env.get("required_secrets"))
+    if required_secrets != _string_list(runtime_config.get("required_secrets")):
+        runtime_config["required_secrets"] = required_secrets
+        _append_profile_warning(enriched, "Repository analysis supplemented runtime_config.required_secrets for deterministic rendering.")
+
+    config_values = _merge_string_lists(runtime_config.get("config_values"), repo_env.get("config_values"))
+    if config_values != _string_list(runtime_config.get("config_values")):
+        runtime_config["config_values"] = config_values
+        _append_profile_warning(enriched, "Repository analysis supplemented runtime_config.config_values for deterministic rendering.")
+
+    if not str(operational.get("health_check_path") or "").strip() and str(repo_health.get("endpoint") or "").strip():
+        operational["health_check_path"] = str(repo_health.get("endpoint")).strip()
+        _append_profile_warning(enriched, "Repository analysis supplied operational.health_check_path for deterministic rendering.")
+
+    repo_port = repo_build.get("dockerfile_port")
+    repo_port_value = int(repo_port) if isinstance(repo_port, (int, float)) and int(repo_port) > 0 else None
+    services = _as_records(compute.get("services"))
+    service_defaults_applied = False
+    for service in services:
+        if str(service.get("process_type") or "").strip().lower() != "web":
+            continue
+        if service.get("port") in {None, ""} and repo_port_value:
+            service["port"] = repo_port_value
+            service_defaults_applied = True
+        if not str(service.get("command") or "").strip() and str(build_pipeline.get("start_command") or "").strip():
+            service["command"] = str(build_pipeline.get("start_command")).strip()
+            service_defaults_applied = True
+    if service_defaults_applied:
+        compute["services"] = services
+        _append_profile_warning(enriched, "Repository analysis supplied missing web service defaults for deterministic rendering.")
+
+    if _is_static_frontend_candidate(
+        profile_payload=enriched,
+        repository_context_json=repository_context_json,
+        frontend_entrypoint_detection_json=frontend_entrypoint_detection_json,
+        website_asset_stats_json=website_asset_stats_json,
+    ):
+        if str(compute.get("strategy") or "").strip() != "s3_cloudfront":
+            compute["strategy"] = "s3_cloudfront"
+            compute["services"] = []
+            enriched["application_type"] = "static_site"
+            networking["load_balancer"] = {}
+            networking["ports_exposed"] = [443, 80]
+            dns_tls = _as_record(enriched.get("dns_and_tls"))
+            dns_tls["cloudfront"] = True
+            enriched["dns_and_tls"] = dns_tls
+            _append_profile_warning(enriched, "Frontend detection selected s3_cloudfront for deterministic Terraform rendering.")
+
+    cap, total, budget_status = _approval_budget_context(approval_payload_json)
+    budget_constrained = bool(cap and (cap <= 25 or (total and total > cap) or budget_status == "fail"))
+    if budget_constrained and str(compute.get("strategy") or "").strip() != "s3_cloudfront":
+        for service in _as_records(compute.get("services")):
+            service["desired_count"] = 1
+            service["cpu"] = min(int(service.get("cpu") or 512), 512)
+            service["memory"] = min(int(service.get("memory") or 1024), 1024)
+            autoscaling = _as_record(service.get("autoscaling"))
+            if autoscaling:
+                autoscaling["min"] = min(int(autoscaling.get("min") or 1), 1)
+                autoscaling["max"] = min(int(autoscaling.get("max") or 2), 2)
+                service["autoscaling"] = autoscaling
+        for item in _as_records(enriched.get("data_layer")):
+            data_type = str(item.get("type") or "").strip().lower()
+            if data_type == "postgresql":
+                item["instance_class"] = "db.t3.micro"
+                item["multi_az"] = False
+                item["backup_retention_days"] = min(int(item.get("backup_retention_days") or 7), 7)
+            elif data_type == "redis":
+                item["node_type"] = "cache.t3.micro"
+        networking["nat_gateway"] = False
+        _append_profile_warning(enriched, f"Stage7 budget gate constrained deterministic sizing to minimum viable resources (cap ${cap:.2f}).")
+
+    if _security_has_major_findings(security_context_json) and str(compute.get("strategy") or "").strip() != "s3_cloudfront":
+        load_balancer = _as_record(networking.get("load_balancer"))
+        if load_balancer:
+            load_balancer["public"] = False
+            networking["load_balancer"] = load_balancer
+        networking["ports_exposed"] = []
+        networking["layout"] = "private_subnets"
+        networking["nat_gateway"] = True
+        _append_profile_warning(enriched, "Security context contains critical/high findings; deterministic Terraform disables public load balancer exposure by default.")
+
+    enriched["compute"] = compute
+    enriched["networking"] = networking
+    enriched["build_pipeline"] = build_pipeline
+    enriched["runtime_config"] = runtime_config
+    enriched["operational"] = operational
+    return enriched
+
+
+def _build_generation_context_summary(
+    *,
+    qa_summary: str,
+    repository_context_json: dict[str, Any] | None,
+    approval_payload_json: dict[str, Any] | None,
+    security_context_json: dict[str, Any] | None,
+    website_asset_stats_json: dict[str, Any] | None,
+    frontend_entrypoint_detection_json: dict[str, Any] | None,
+    profile_payload: dict[str, Any],
+) -> str:
+    repository_context = _as_record(repository_context_json)
+    repo_build = _as_record(repository_context.get("build"))
+    repo_env = _as_record(repository_context.get("environment_variables"))
+    repo_health = _as_record(repository_context.get("health"))
+    asset_stats = _as_record(website_asset_stats_json)
+    frontend_detection = _as_record(frontend_entrypoint_detection_json)
+    runtime_config = _as_record(profile_payload.get("runtime_config"))
+    cap, total, budget_status = _approval_budget_context(approval_payload_json)
+    security = _as_record(security_context_json)
+
+    summary_lines = [
+        f"Repository Summary: {str(repository_context.get('summary') or '').strip()}" if str(repository_context.get("summary") or "").strip() else "",
+        f"Operator Q/A: {qa_summary.strip()}" if qa_summary.strip() else "",
+        f"Build Command: {str(repo_build.get('build_command') or '').strip()}" if str(repo_build.get("build_command") or "").strip() else "",
+        f"Start Command: {str(repo_build.get('start_command') or '').strip()}" if str(repo_build.get("start_command") or "").strip() else "",
+        f"Health Endpoint: {str(repo_health.get('endpoint') or '').strip()}" if str(repo_health.get("endpoint") or "").strip() else "",
+        f"Frontend Detection: {str(frontend_detection.get('framework') or '').strip()}" if str(frontend_detection.get("framework") or "").strip() else "",
+        f"Website Asset Root: {str(asset_stats.get('selected_root') or '').strip()}" if str(asset_stats.get("selected_root") or "").strip() else "",
+        f"Website Asset Count: {int(asset_stats.get('asset_count') or 0)}" if asset_stats.get("asset_count") else "",
+        f"Resolved Entrypoint: {str(asset_stats.get('entrypoint') or '').strip()}" if str(asset_stats.get("entrypoint") or "").strip() else "",
+        f"Required Secrets: {', '.join(_merge_string_lists(runtime_config.get('required_secrets'), repo_env.get('required_secrets')))}"
+        if _merge_string_lists(runtime_config.get("required_secrets"), repo_env.get("required_secrets"))
+        else "",
+        (
+            f"Budget Context: cap=${cap:.2f}, estimate=${total:.2f}, status={budget_status}"
+            if cap is not None and total is not None
+            else f"Budget Context: cap=${cap:.2f}, status={budget_status}"
+            if cap is not None
+            else ""
+        ),
+        f"Critical/High Supply Findings: {int(security.get('criticalOrHighSupply') or 0)}" if security else "",
+    ]
+    return "\n".join(item for item in summary_lines if item)
+
+
+def _cloudposse_compatible_profile_payload(profile_payload: dict[str, Any], requested_renderer: str) -> tuple[dict[str, Any], list[str]]:
+    adapted = deepcopy(profile_payload)
+    warnings: list[str] = []
+    renderer = normalize_terraform_renderer(requested_renderer)
+    if renderer == "deplai_deterministic":
+        return adapted, warnings
+    compute = _as_record(adapted.get("compute"))
+    strategy = str(compute.get("strategy") or "").strip().lower()
+    if strategy == "ec2":
+        compute["strategy"] = "ecs_fargate"
+        services = _as_records(compute.get("services"))
+        if not services:
+            services = [{"id": "api", "process_type": "web", "image_source": "placeholder", "port": 3000, "desired_count": 1}]
+        for service in services:
+            service.setdefault("id", "api")
+            service.setdefault("process_type", "web")
+            service.setdefault("image_source", "placeholder")
+            service.setdefault("desired_count", 1)
+            if service.get("port") in {None, ""} and str(service.get("process_type") or "") == "web":
+                service["port"] = 3000
+        compute["services"] = services
+        adapted["compute"] = compute
+        warnings.append("Cloud Posse/Atmos adapter mapped ec2 strategy to ecs_fargate for V1 compatibility.")
+
+    networking = _as_record(adapted.get("networking"))
+    load_balancer = _as_record(networking.get("load_balancer"))
+    if load_balancer:
+        stripped_keys = sorted(set(load_balancer) - {"public"})
+        networking["load_balancer"] = {"public": bool(load_balancer.get("public", True))}
+        if stripped_keys:
+            warnings.append(f"Cloud Posse/Atmos adapter stripped unsupported load_balancer fields: {', '.join(stripped_keys)}.")
+    adapted["networking"] = networking
+
+    dns_tls = _as_record(adapted.get("dns_and_tls"))
+    if any(str(value or "").strip() for value in dns_tls.values()):
+        adapted["dns_and_tls"] = {}
+        warnings.append("Cloud Posse/Atmos adapter omitted custom dns_and_tls fields because V1 does not render them.")
+    return adapted, warnings
 
 
 def _module_paths(module_name: str) -> list[str]:
@@ -1642,8 +1971,8 @@ JSON
   source                = "./modules/networking"
   project_name          = var.project_name
   create_nat_gateway    = try(local.networking.nat_gateway, true)
-  load_balancer_enabled = true
-  ports_exposed         = [for svc in local.services : try(svc.port, 0) if try(svc.port, 0) > 0]
+  load_balancer_enabled = try(local.networking.load_balancer.public, true)
+  ports_exposed         = try(local.networking.load_balancer.public, true) ? [for svc in local.services : try(svc.port, 0) if try(svc.port, 0) > 0] : []
   common_tags           = local.common_tags
 }
 
@@ -1681,7 +2010,7 @@ module "compute" {
   desired_log_group_name = try(local.runtime_config.log_group_name, null)
   log_group_override    = null
   log_retention_days    = 30
-  load_balancer_enabled = true
+  load_balancer_enabled = try(local.networking.load_balancer.public, true)
   common_tags           = local.common_tags
 }
 """
@@ -2222,6 +2551,8 @@ def _legacy_generate_terraform_bundle_superseded(
     project_name: str,
     workspace: str,
     aws_region: str,
+    state_bucket: str = "",
+    lock_table: str = "",
     iac_mode: str | None = None,
     qa_summary: str = "",
     website_index_html: str = "",
@@ -2646,6 +2977,8 @@ def generate_terraform_bundle(
     project_name: str,
     workspace: str,
     aws_region: str,
+    state_bucket: str = "",
+    lock_table: str = "",
     iac_mode: str | None = None,
     qa_summary: str = "",
     website_index_html: str = "",
@@ -2655,21 +2988,24 @@ def generate_terraform_bundle(
     security_context_json: dict[str, Any] | None = None,
     website_asset_stats_json: dict[str, Any] | None = None,
     frontend_entrypoint_detection_json: dict[str, Any] | None = None,
+    detected_json: dict[str, Any] | None = None,
+    user_answers_json: dict[str, Any] | None = None,
+    consultant_decision_json: dict[str, Any] | None = None,
     llm_provider: str | None = None,
     llm_api_key: str | None = None,
     llm_model: str | None = None,
     llm_api_base_url: str | None = None,
+    terraform_renderer: str | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    resolved_iac_mode = "llm" if str(iac_mode or "").strip().lower() == "llm" else "deterministic"
-    terraform_llm = _resolve_terraform_llm_config(
-        llm_provider=llm_provider,
-        llm_api_key=llm_api_key,
-        llm_model=llm_model,
-        llm_api_base_url=llm_api_base_url,
-    ) if resolved_iac_mode == "llm" else None
-    terraform_llm_enabled = _terraform_llm_available(terraform_llm)
-    worker_model = str((terraform_llm or {}).get("model") or "deterministic-fallback")
+    requested_iac_mode = "llm" if str(iac_mode or "").strip().lower() == "llm" else "deterministic"
+    resolved_iac_mode = "deterministic"
+    terraform_llm: dict[str, str] | None = None
+    terraform_llm_enabled = False
+    worker_model = "deterministic-fallback"
+    preflight_warnings: list[str] = []
+    if requested_iac_mode == "llm" or any(str(value or "").strip() for value in (llm_provider, llm_api_key, llm_model, llm_api_base_url)):
+        preflight_warnings.append("LLM IaC generation is disabled; Terraform generation used deterministic renderers only.")
     _emit_worker(
         progress_callback,
         msg_type="info",
@@ -2683,6 +3019,160 @@ def generate_terraform_bundle(
     approved_source = deployment_profile_json if isinstance(deployment_profile_json, dict) and deployment_profile_json else architecture_json
     approved_profile = parse_deployment_profile(approved_source)
     approved_profile_payload = approved_profile.model_dump(exclude_none=True)
+    approved_profile_payload = _enrich_deployment_profile_for_deterministic_rendering(
+        profile_payload=approved_profile_payload,
+        approval_payload_json=approval_payload_json,
+        security_context_json=security_context_json,
+        website_asset_stats_json=website_asset_stats_json,
+        frontend_entrypoint_detection_json=frontend_entrypoint_detection_json,
+        repository_context_json=repository_context_json,
+    )
+    approved_profile = parse_deployment_profile(approved_profile_payload)
+    approved_profile_payload = approved_profile.model_dump(exclude_none=True)
+    generation_context_summary = _build_generation_context_summary(
+        qa_summary=qa_summary,
+        repository_context_json=repository_context_json,
+        approval_payload_json=approval_payload_json,
+        security_context_json=security_context_json,
+        website_asset_stats_json=website_asset_stats_json,
+        frontend_entrypoint_detection_json=frontend_entrypoint_detection_json,
+        profile_payload=approved_profile_payload,
+    )
+    requested_renderer = normalize_terraform_renderer(terraform_renderer)
+    cloudposse_profile_payload, cloudposse_adapter_warnings = _cloudposse_compatible_profile_payload(
+        approved_profile_payload,
+        requested_renderer,
+    )
+    if isinstance(detected_json, dict) and detected_json:
+        cloudposse_profile_payload["detected"] = dict(detected_json)
+    if isinstance(user_answers_json, dict) and user_answers_json:
+        cloudposse_profile_payload["user_answers"] = dict(user_answers_json)
+    if isinstance(consultant_decision_json, dict) and consultant_decision_json:
+        cloudposse_profile_payload["consultant_decision"] = dict(consultant_decision_json)
+    preflight_warnings.extend(cloudposse_adapter_warnings)
+    use_cloudposse, cloudposse_support = should_use_cloudposse_renderer(
+        cloudposse_profile_payload,
+        requested_renderer,
+        workspace_has_prior_state=bool(cloudposse_profile_payload.get("has_existing_terraform_state")),
+    )
+    if use_cloudposse:
+        manifest, dag_order = build_profile_manifest(cloudposse_profile_payload)
+        files_by_path, renderer_warnings, lock_payload = build_cloudposse_profile_bundle(
+            payload=cloudposse_profile_payload,
+            aws_region=aws_region,
+            state_bucket=state_bucket,
+            lock_table=lock_table,
+            context_summary=generation_context_summary,
+            website_index_html=website_index_html,
+            requested_renderer=requested_renderer,
+        )
+        ordered_files = [{"path": path, "content": content} for path, content in files_by_path.items()]
+        deploy_sequence = [str(item) for item in lock_payload.get("deploy_sequence") or []]
+        _emit_worker(
+            progress_callback,
+            msg_type="success",
+            content=f"Cloud Posse/Atmos renderer completed with {len(ordered_files)} surfaced file(s).",
+            worker_id="cloudposse-atmos-renderer",
+            worker_role="Cloud Posse Atmos Renderer",
+            worker_status="completed",
+            extra={"compute_strategy": str((cloudposse_profile_payload.get("compute") or {}).get("strategy") or ""), "service_count": len(deploy_sequence)},
+        )
+        return {
+            "success": True,
+            "provider": "aws",
+            "project_name": project_name,
+            "run_id": None,
+            "workspace": str(cloudposse_profile_payload.get("workspace") or workspace or "default"),
+            "provider_version": DEFAULT_PROVIDER_CONSTRAINT,
+            "state_bucket": None,
+            "lock_table": None,
+            "manifest": manifest,
+            "dag_order": deploy_sequence or dag_order,
+            "warnings": [
+                *preflight_warnings,
+                *[str(item) for item in list(cloudposse_profile_payload.get("warnings") or []) if str(item).strip()],
+                *renderer_warnings,
+            ],
+            "files": ordered_files,
+            "readme": files_by_path.get("README.md"),
+            "source": "cloudposse_atmos",
+            "requested_renderer": requested_renderer,
+            "actual_renderer": "cloudposse_atmos",
+            "unsupported_reason": "",
+            "renderer": "cloudposse_atmos",
+            "component_catalog_version": lock_payload.get("component_catalog_version"),
+            "execution_kind": "atmos",
+            "llm_iac_calls": 0,
+            "llm_iac_disabled": True,
+            "decision_applied": bool(lock_payload.get("decision_applied")),
+            "decision_drift": list(lock_payload.get("decision_drift") or []),
+            "details": {
+                "execution_kind": "atmos",
+                "renderer": "cloudposse_atmos",
+                "requested_renderer": requested_renderer,
+                "actual_renderer": "cloudposse_atmos",
+                "component_catalog_version": lock_payload.get("component_catalog_version"),
+                "component_lock": lock_payload,
+                "deploy_sequence": deploy_sequence,
+                "llm_workers_enabled": False,
+                "requested_iac_mode": requested_iac_mode,
+                "effective_iac_mode": resolved_iac_mode,
+                "llm_iac_calls": 0,
+                "llm_iac_disabled": True,
+                "decision_applied": bool(lock_payload.get("decision_applied")),
+                "decision_drift": list(lock_payload.get("decision_drift") or []),
+            },
+        }
+
+    unsupported_reason = "; ".join([str(item) for item in cloudposse_support.get("reasons") or []])
+    if requested_renderer in {"auto", "cloudposse_atmos"}:
+        failure_reason = unsupported_reason or "Cloud Posse/Atmos renderer support checks did not pass."
+        _emit_worker(
+            progress_callback,
+            msg_type="error",
+            content=f"Cloud Posse/Atmos renderer unavailable: {failure_reason}",
+            worker_id="cloudposse-atmos-renderer",
+            worker_role="Cloud Posse Atmos Renderer",
+            worker_status="failed",
+            extra={"requested_renderer": requested_renderer},
+        )
+        return {
+            "success": False,
+            "provider": "aws",
+            "project_name": project_name,
+            "run_id": None,
+            "workspace": str(cloudposse_profile_payload.get("workspace") or workspace or "default"),
+            "warnings": [
+                *preflight_warnings,
+                f"Cloud Posse/Atmos renderer not used: {failure_reason}",
+            ],
+            "error": f"Cloud Posse/Atmos-only mode requires a supported deployment profile: {failure_reason}",
+            "source": "cloudposse_atmos",
+            "requested_renderer": requested_renderer,
+            "actual_renderer": "deplai_deterministic",
+            "unsupported_reason": failure_reason,
+            "renderer": "deplai_deterministic",
+            "component_catalog_version": None,
+            "execution_kind": "atmos",
+            "llm_iac_calls": 0,
+            "llm_iac_disabled": True,
+            "decision_applied": False,
+            "decision_drift": [],
+            "details": {
+                "execution_kind": "atmos",
+                "renderer": "cloudposse_atmos",
+                "requested_renderer": requested_renderer,
+                "actual_renderer": "deplai_deterministic",
+                "unsupported_reason": failure_reason,
+                "llm_workers_enabled": False,
+                "requested_iac_mode": requested_iac_mode,
+                "effective_iac_mode": resolved_iac_mode,
+                "llm_iac_calls": 0,
+                "llm_iac_disabled": True,
+                "decision_applied": False,
+                "decision_drift": [],
+            },
+        }
 
     fallback_bundle_cache: dict[str, str] | None = None
     fallback_bundle_warnings: list[str] = []
@@ -2699,10 +3189,10 @@ def generate_terraform_bundle(
             fallback_bundle_cache, fallback_bundle_warnings = _render_curated_fallback_bundle(
                 payload=current_payload,
                 provider_version=DEFAULT_PROVIDER_CONSTRAINT,
-                state_bucket="",
-                lock_table="",
+                state_bucket=state_bucket,
+                lock_table=lock_table,
                 aws_region=aws_region,
-                context_summary=qa_summary,
+                context_summary=generation_context_summary,
                 website_index_html=website_index_html,
             )
         return fallback_bundle_cache, fallback_bundle_warnings
@@ -3085,6 +3575,7 @@ def generate_terraform_bundle(
     )
 
     all_warnings = [
+        *preflight_warnings,
         *[str(item) for item in list(profile_payload.get("warnings") or []) if str(item).strip()],
         *[str(item) for item in render_warnings if str(item).strip()],
         *[str(item) for item in fallback_bundle_warnings if str(item).strip()],
@@ -3111,7 +3602,15 @@ def generate_terraform_bundle(
         "warnings": all_warnings,
         "files": ordered_files,
         "readme": files_by_path.get("README.md"),
-        "source": source,
+            "source": source,
+            "requested_renderer": requested_renderer,
+            "actual_renderer": "deplai_deterministic",
+            "unsupported_reason": unsupported_reason,
+            "renderer": "deplai_deterministic",
+            "component_catalog_version": None,
+            "execution_kind": "terraform",
+            "llm_iac_calls": 0,
+            "llm_iac_disabled": True,
         "details": {
             "bundle_strategy": str(bundle_plan.get("bundle_strategy") or ""),
             "file_tree": _string_list(bundle_plan.get("file_tree")),
@@ -3125,7 +3624,15 @@ def generate_terraform_bundle(
             "service_count": service_count,
             "resolved_workspace": resolved_workspace,
             "llm_workers_enabled": terraform_llm_enabled,
-            "requested_iac_mode": resolved_iac_mode,
+            "requested_iac_mode": requested_iac_mode,
+            "effective_iac_mode": resolved_iac_mode,
             "llm_provider": str((terraform_llm or {}).get("provider") or "deterministic"),
+            "requested_renderer": requested_renderer,
+            "actual_renderer": "deplai_deterministic",
+            "unsupported_reason": unsupported_reason,
+            "renderer": "deplai_deterministic",
+            "execution_kind": "terraform",
+            "llm_iac_calls": 0,
+            "llm_iac_disabled": True,
         },
     }

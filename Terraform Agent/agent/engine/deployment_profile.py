@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from .bundle import build_manifest_bundle
+from .cloudposse_atmos import build_cloudposse_atmos_bundle
 from .enterprise_bundle import build_enterprise_profile_bundle
 from .runtime import DEFAULT_PROVIDER_CONSTRAINT, slugify
 
@@ -867,3 +868,24 @@ def build_profile_bundle(
         )
         warnings.insert(0, f"Enterprise renderer failed and fell back to the legacy EC2-oriented bundle: {exc}")
         return files, warnings
+
+
+def build_cloudposse_profile_bundle(
+    *,
+    payload: dict[str, Any],
+    aws_region: str,
+    state_bucket: str,
+    lock_table: str,
+    context_summary: str,
+    website_index_html: str,
+    requested_renderer: str = "auto",
+) -> tuple[dict[str, str], list[str], dict[str, Any]]:
+    return build_cloudposse_atmos_bundle(
+        payload=payload,
+        aws_region=aws_region,
+        state_bucket=state_bucket,
+        lock_table=lock_table,
+        context_summary=context_summary,
+        website_index_html=website_index_html,
+        requested_renderer=requested_renderer,
+    )

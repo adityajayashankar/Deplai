@@ -9,7 +9,7 @@ import path from 'path';
 
 type Provider = 'aws' | 'azure' | 'gcp';
 type IacMode = 'deterministic' | 'llm';
-type LlmProvider = 'groq' | 'openrouter' | 'ollama' | 'opencode' | 'openai';
+type TerraformRenderer = 'auto' | 'cloudposse_atmos' | 'deplai_deterministic';
 
 interface ScanResultsData {
   supply_chain?: Array<{ cve_id?: string; severity?: string; fix_version?: string }>;
@@ -44,6 +44,12 @@ interface IacGenerateBody {
   llm_api_key?: string;
   llm_model?: string;
   llm_api_base_url?: string;
+  terraform_renderer?: string;
+  user_answers?: Record<string, unknown>;
+  consultant_action?: 'start' | 'reply' | 'force_decision';
+  consultant_history?: Array<{ role?: string; content?: string }>;
+  consultant_turn_count?: number;
+  consultant_decision?: Record<string, unknown>;
 }
 
 interface GeneratedFile {
@@ -52,23 +58,20 @@ interface GeneratedFile {
   encoding?: 'utf-8' | 'base64';
 }
 
-interface LlmResolvedConfig {
-  provider: LlmProvider;
-  model: string;
-  apiBaseUrl: string;
-}
-
 function classifyAgenticRouteError(err: unknown, action: string): { message: string; status: number } {
   const raw = err instanceof Error ? err.message : String(err || 'unknown upstream error');
   const lowered = raw.toLowerCase();
   if (
     lowered.includes('fetch failed') ||
+    lowered.includes('aborted') ||
+    lowered.includes('timeout') ||
     lowered.includes('econnrefused') ||
     lowered.includes('enotfound') ||
     lowered.includes('network')
   ) {
+    const targets = getAgenticBaseUrls().join(', ');
     return {
-      message: `Agentic Layer is unavailable while trying to ${action}. Start the service at ${AGENTIC_URL} and retry.`,
+      message: `Agentic Layer is unavailable while trying to ${action}. Checked: ${targets}.`,
       status: 502,
     };
   }
@@ -76,6 +79,83 @@ function classifyAgenticRouteError(err: unknown, action: string): { message: str
     message: raw || `${action} failed.`,
     status: 500,
   };
+}
+
+function normalizeAgenticBaseUrl(raw: string): string {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return 'http://127.0.0.1:8000';
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  return withScheme.replace(/\/+$/, '');
+}
+
+function getAgenticBaseUrls(): string[] {
+  const primary = normalizeAgenticBaseUrl(AGENTIC_URL);
+  const urls: string[] = [primary];
+  try {
+    const parsed = new URL(primary);
+    if (parsed.hostname === 'localhost') {
+      const alt = new URL(primary);
+      alt.hostname = '127.0.0.1';
+      urls.push(alt.toString().replace(/\/+$/, ''));
+    } else if (parsed.hostname === '127.0.0.1') {
+      const alt = new URL(primary);
+      alt.hostname = 'localhost';
+      urls.push(alt.toString().replace(/\/+$/, ''));
+    }
+  } catch {
+    // Keep primary URL only when parsing fails.
+  }
+  return Array.from(new Set(urls));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function fetchAgentic(
+  path: string,
+  init: RequestInit,
+  options?: {
+    timeoutMs?: number;
+    retriesPerUrl?: number;
+    retryDelayMs?: number;
+  },
+): Promise<Response> {
+  const timeoutMs = Number(options?.timeoutMs || 30_000);
+  const retriesPerUrl = Math.max(1, Number(options?.retriesPerUrl || 2));
+  const retryDelayMs = Math.max(100, Number(options?.retryDelayMs || 900));
+  const retryableStatuses = new Set([408, 425, 429, 500, 502, 503, 504]);
+  const errors: string[] = [];
+
+  for (const baseUrl of getAgenticBaseUrls()) {
+    const requestUrl = `${baseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+    for (let attempt = 1; attempt <= retriesPerUrl; attempt += 1) {
+      try {
+        const response = await fetch(requestUrl, {
+          ...init,
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+
+        if (!retryableStatuses.has(response.status) || attempt >= retriesPerUrl) {
+          return response;
+        }
+
+        errors.push(`${requestUrl} -> HTTP ${response.status}`);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err || 'unknown fetch error');
+        errors.push(`${requestUrl} -> ${reason}`);
+      }
+
+      if (attempt < retriesPerUrl) {
+        await sleep(retryDelayMs * attempt);
+      }
+    }
+  }
+
+  const compact = errors.filter(Boolean).slice(0, 6).join(' | ');
+  throw new Error(`fetch failed${compact ? ` (${compact})` : ''}`);
 }
 
 const INDEX_HTML_CANDIDATES = [
@@ -122,6 +202,7 @@ interface WebsiteAssetCollection {
 
 interface WebsiteEntrypointSelection {
   relativePath: string | null;
+  sourceRelativePath: string | null;
   html: string | null;
   reason: string;
 }
@@ -133,6 +214,20 @@ interface FrontendEntrypointDetection {
   build_command: string | null;
   has_build_output: boolean;
   detected: boolean;
+}
+
+interface RepoDetectionSummary {
+  [key: string]: unknown;
+  language: string;
+  framework: string;
+  has_database: boolean;
+  database_type: string;
+  has_web_server: boolean;
+  has_workers: boolean;
+  has_static_assets: boolean;
+  has_dockerfile: boolean;
+  has_redis: boolean;
+  has_queue: boolean;
 }
 
 const SKIP_DIR_NAMES = new Set([
@@ -157,6 +252,190 @@ const SKIP_FILE_NAMES = new Set([
 const MAX_SITE_FILES = 2500;
 const MAX_SITE_FILE_BYTES = 8_000_000;
 const MAX_SITE_TOTAL_BYTES = 20_000_000;
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function asRecords(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(item => asRecord(item))
+    .filter(item => Object.keys(item).length > 0);
+}
+
+function readText(value: unknown): string {
+  return String(value || '').trim();
+}
+
+function readBoolLike(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'true' || normalized === 'yes' || normalized === 'y') return true;
+  if (normalized === 'false' || normalized === 'no' || normalized === 'n') return false;
+  return null;
+}
+
+function inferRepositoryDetection(params: {
+  architectureJson: Record<string, unknown>;
+  frontendDetection: FrontendEntrypointDetection | null;
+  repositoryContext: Record<string, unknown> | null;
+}): RepoDetectionSummary {
+  const architecture = asRecord(params.architectureJson);
+  const metadata = asRecord(architecture.metadata);
+  const repositoryContext = asRecord(params.repositoryContext);
+  const repoLanguage = asRecord(repositoryContext.language);
+  const frameworks = asRecords(repositoryContext.frameworks);
+  const repoBuild = asRecord(repositoryContext.build);
+  const repoFrontend = asRecord(repositoryContext.frontend);
+  const nodes = asRecords(architecture.nodes);
+
+  const nodeCorpus = nodes
+    .map((node) => {
+      const type = readText(node.type).toLowerCase();
+      const label = readText(node.label).toLowerCase();
+      const attrs = JSON.stringify(asRecord(node.attributes)).toLowerCase();
+      return `${type} ${label} ${attrs}`;
+    })
+    .join('\n');
+
+  const compute = asRecord(architecture.compute);
+  const services = asRecords(compute.services);
+  const dataLayer = asRecords(architecture.data_layer);
+
+  const language =
+    readText(repoLanguage.primary)
+    || readText(repoLanguage.detected)
+    || readText(metadata.language)
+    || (params.frontendDetection?.runtime === 'node' ? 'javascript' : params.frontendDetection?.runtime === 'python' ? 'python' : '')
+    || 'unknown';
+
+  const framework =
+    readText(params.frontendDetection?.framework)
+    || readText(frameworks[0]?.name)
+    || readText(repoFrontend.framework)
+    || readText(metadata.framework)
+    || 'unknown';
+
+  const dataTypes = dataLayer
+    .map(item => readText(item.type).toLowerCase())
+    .filter(Boolean);
+  const nodeHas = (re: RegExp) => re.test(nodeCorpus);
+
+  const hasRedis = dataTypes.includes('redis') || nodeHas(/redis|elasticache/);
+  const databaseType = dataTypes.find((t) => ['postgres', 'postgresql', 'mysql', 'mariadb', 'mongodb', 'dynamodb'].includes(t))
+    || (nodeHas(/postgres|rds/) ? 'postgres'
+      : nodeHas(/mysql|mariadb/) ? 'mysql'
+        : nodeHas(/mongodb|documentdb/) ? 'mongodb'
+          : nodeHas(/dynamodb/) ? 'dynamodb'
+            : 'unknown');
+  const hasDatabase = databaseType !== 'unknown';
+
+  const hasWebServer =
+    services.some((service) => readText(service.process_type).toLowerCase() === 'web')
+    || nodeHas(/alb|load[_ -]?balancer|api[_ -]?gateway|web|nginx|ecs|ec2|fargate|service/);
+
+  const hasWorkers =
+    services.some((service) => readText(service.process_type).toLowerCase() === 'worker')
+    || nodeHas(/worker|celery|sidekiq|consumer|batch|cron|job/);
+
+  const hasStaticAssets =
+    Boolean(params.frontendDetection?.has_build_output)
+    || nodeHas(/cloudfront|static|cdn|s3/)
+    || readText(repoBuild.output_dir).length > 0;
+
+  const hasDockerfile =
+    readBoolLike(repoBuild.has_dockerfile) === true
+    || readBoolLike(metadata.has_dockerfile) === true
+    || readText(repoBuild.dockerfile_path).length > 0;
+
+  const hasQueue = nodeHas(/queue|sqs|rabbitmq|kafka|pubsub/);
+
+  return {
+    language: language.toLowerCase(),
+    framework: framework.toLowerCase(),
+    has_database: hasDatabase,
+    database_type: databaseType.toLowerCase(),
+    has_web_server: hasWebServer,
+    has_workers: hasWorkers,
+    has_static_assets: hasStaticAssets,
+    has_dockerfile: hasDockerfile,
+    has_redis: hasRedis,
+    has_queue: hasQueue,
+  };
+}
+
+function normalizeConsultantHistory(value: unknown): Array<{ role: 'user' | 'assistant'; content: string }> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      const entry = asRecord(item);
+      const role = String(entry.role || '').trim().toLowerCase();
+      const content = String(entry.content || '').trim();
+      if ((role !== 'user' && role !== 'assistant') || !content) return null;
+      return { role: role as 'user' | 'assistant', content };
+    })
+    .filter((item): item is { role: 'user' | 'assistant'; content: string } => item !== null);
+}
+
+function summarizeConsultantDecision(
+  decisionInput: Record<string, unknown>,
+  detected: RepoDetectionSummary,
+  awsRegion: string,
+): string {
+  const decision = asRecord(decisionInput);
+  const components = Array.isArray(decision.components)
+    ? decision.components.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const deploySequence = Array.isArray(decision.deploy_sequence)
+    ? decision.deploy_sequence.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const stackConfig = asRecord(decision.stack_config);
+  const notes = Array.isArray(decision.consultant_notes)
+    ? decision.consultant_notes.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+
+  const lines: string[] = [];
+  lines.push(`AWS region: ${awsRegion || 'unknown'}`);
+  lines.push(`Components: ${components.join(', ') || 'none'}`);
+  lines.push(`Deploy order: ${deploySequence.join(' -> ') || 'none'}`);
+
+  const ecs = asRecord(stackConfig.ecs);
+  if (Object.keys(ecs).length > 0) {
+    lines.push(
+      `ECS: desired=${String(ecs.desired_count || '?')}, min=${String(ecs.min_count || '?')}, max=${String(ecs.max_count || '?')}, cpu=${String(ecs.cpu || '?')}, memory=${String(ecs.memory || '?')}`,
+    );
+  }
+
+  const rds = asRecord(stackConfig.rds);
+  if (Object.keys(rds).length > 0) {
+    lines.push(
+      `RDS: ${String(rds.engine || 'db')} ${String(rds.instance_class || '').trim() || ''}`.trim()
+      + `, multi-AZ=${String(Boolean(rds.multi_az))}, backups=${String(rds.backup_retention_period || 0)} day(s)`,
+    );
+  } else if (detected.has_database) {
+    lines.push('Database: repo indicates a datastore, but no DB component was selected.');
+  }
+
+  const elasticache = asRecord(stackConfig.elasticache);
+  if (Object.keys(elasticache).length > 0) {
+    lines.push(`Cache: ${String(elasticache.engine || 'redis')} ${String(elasticache.node_type || '').trim() || ''}`.trim());
+  } else if (detected.has_redis) {
+    lines.push('Cache: repo indicates Redis, but no cache component was selected.');
+  }
+
+  if (components.includes('s3_cloudfront')) {
+    lines.push(detected.has_static_assets ? 'CDN/static hosting is included.' : 'CloudFront/static hosting is included.');
+  }
+
+  if (notes.length > 0) {
+    lines.push(`Notes: ${notes.join(' | ')}`);
+  }
+
+  return lines.join('\n');
+}
 
 function defaultWebsiteHtml(projectName: string, hintMessage?: string): string {
   const safeHint = String(hintMessage || '').trim();
@@ -497,6 +776,7 @@ function resolvePrimaryWebsiteHtmlFromAssets(assets: WebsiteAsset[]): WebsiteEnt
   if (!assets.length) {
     return {
       relativePath: null,
+      sourceRelativePath: null,
       html: null,
       reason: 'no assets were available',
     };
@@ -512,8 +792,10 @@ function resolvePrimaryWebsiteHtmlFromAssets(assets: WebsiteAsset[]): WebsiteEnt
     if (!hit) continue;
     const decoded = decodeAssetContent(hit);
     if (decoded.trim()) {
+      const normalizedPath = normalizeWebsiteObjectKey(hit.relativePath);
       return {
-        relativePath: hit.relativePath,
+        relativePath: normalizedPath,
+        sourceRelativePath: hit.relativePath,
         html: decoded,
         reason: `matched preferred candidate (${candidate})`,
       };
@@ -544,8 +826,10 @@ function resolvePrimaryWebsiteHtmlFromAssets(assets: WebsiteAsset[]): WebsiteEnt
 
   const fallbackDecoded = decodeAssetContent(best?.asset);
   if (best && fallbackDecoded.trim()) {
+    const normalizedPath = normalizeWebsiteObjectKey(best.asset.relativePath);
     return {
-      relativePath: best.asset.relativePath,
+      relativePath: normalizedPath,
+      sourceRelativePath: best.asset.relativePath,
       html: fallbackDecoded,
       reason: 'selected highest-scoring HTML candidate',
     };
@@ -553,6 +837,7 @@ function resolvePrimaryWebsiteHtmlFromAssets(assets: WebsiteAsset[]): WebsiteEnt
 
   return {
     relativePath: null,
+    sourceRelativePath: null,
     html: null,
     reason: 'no non-empty HTML file detected in collected assets',
   };
@@ -575,61 +860,24 @@ function clampIacMode(value: string | undefined): IacMode {
   return String(value || '').trim().toLowerCase() === 'llm' ? 'llm' : 'deterministic';
 }
 
-function clampLlmProvider(value: string | undefined): LlmProvider {
-  const provider = String(value || '').trim().toLowerCase();
-  if (provider === 'groq' || provider === 'openrouter' || provider === 'ollama' || provider === 'opencode' || provider === 'openai') {
-    return provider;
-  }
-  return 'groq';
+function clampTerraformRenderer(value: string | undefined): TerraformRenderer {
+  const renderer = String(value || '').trim().toLowerCase();
+  if (renderer === 'deplai_deterministic') return 'deplai_deterministic';
+  if (renderer === 'cloudposse_atmos') return 'cloudposse_atmos';
+  return 'deplai_deterministic';
 }
 
-function normalizeApiBaseUrl(value: string | undefined): string {
-  return String(value || '').trim().replace(/\/+$/, '');
-}
-
-function extractTextContent(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (!Array.isArray(value)) return '';
-  return value
-    .map((item) => {
-      if (!item || typeof item !== 'object') return '';
-      const text = (item as { text?: unknown }).text;
-      return typeof text === 'string' ? text : '';
-    })
-    .filter(Boolean)
-    .join('\n');
-}
-
-function parseJsonDocument(rawText: string): unknown | null {
-  const trimmed = String(rawText || '').trim();
-  if (!trimmed) return null;
-
-  const unfenced = trimmed
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/\s*```$/, '')
-    .trim();
-
-  const candidates: string[] = [unfenced];
-  const firstObjectStart = unfenced.indexOf('{');
-  const lastObjectEnd = unfenced.lastIndexOf('}');
-  if (firstObjectStart >= 0 && lastObjectEnd > firstObjectStart) {
-    candidates.push(unfenced.slice(firstObjectStart, lastObjectEnd + 1));
-  }
-
-  const firstArrayStart = unfenced.indexOf('[');
-  const lastArrayEnd = unfenced.lastIndexOf(']');
-  if (firstArrayStart >= 0 && lastArrayEnd > firstArrayStart) {
-    candidates.push(unfenced.slice(firstArrayStart, lastArrayEnd + 1));
-  }
-
-  for (const candidate of candidates) {
-    try {
-      return JSON.parse(candidate);
-    } catch {
-      continue;
-    }
-  }
-  return null;
+function isAllowedGeneratedIacPath(safePath: string): boolean {
+  return (
+    safePath.startsWith('terraform/')
+    || safePath.startsWith('ansible/')
+    || safePath.startsWith('stacks/')
+    || safePath.startsWith('components/terraform/')
+    || safePath === 'atmos.yaml'
+    || safePath === 'vendor.yaml'
+    || safePath === '.deplai/cloudposse-component-lock.json'
+    || safePath === 'README.md'
+  );
 }
 
 function dedupeGeneratedFiles(files: GeneratedFile[]): GeneratedFile[] {
@@ -637,7 +885,7 @@ function dedupeGeneratedFiles(files: GeneratedFile[]): GeneratedFile[] {
   for (const file of files) {
     const safePath = normalizeRepoWritePath(file.path);
     if (!safePath) continue;
-    if (!safePath.startsWith('terraform/') && !safePath.startsWith('ansible/') && safePath !== 'README.md') continue;
+    if (!isAllowedGeneratedIacPath(safePath)) continue;
     const content = String(file.content || '');
     if (!content) continue;
     if (content.length > 900_000) continue;
@@ -649,36 +897,6 @@ function dedupeGeneratedFiles(files: GeneratedFile[]): GeneratedFile[] {
     if (byPath.size >= 300) break;
   }
   return Array.from(byPath.values());
-}
-
-function parseLlmGeneratedFiles(payload: unknown): GeneratedFile[] {
-  let rawFiles: unknown[] = [];
-
-  if (Array.isArray(payload)) {
-    rawFiles = payload;
-  } else if (payload && typeof payload === 'object') {
-    const fromFiles = (payload as { files?: unknown }).files;
-    if (Array.isArray(fromFiles)) {
-      rawFiles = fromFiles;
-    } else if (fromFiles && typeof fromFiles === 'object') {
-      rawFiles = Object.entries(fromFiles as Record<string, unknown>).map(([path, content]) => ({ path, content }));
-    }
-  }
-
-  const normalized = dedupeGeneratedFiles(
-    rawFiles
-      .filter((entry) => entry && typeof entry === 'object')
-      .map((entry) => {
-        const row = entry as { path?: unknown; content?: unknown; encoding?: unknown };
-        return {
-          path: String(row.path || '').trim(),
-          content: String(row.content || ''),
-          encoding: row.encoding === 'base64' ? 'base64' : 'utf-8',
-        } as GeneratedFile;
-      }),
-  );
-
-  return normalized;
 }
 
 function hasRequiredAwsCoreFiles(files: GeneratedFile[]): boolean {
@@ -698,8 +916,29 @@ function hasRequiredAwsCoreFiles(files: GeneratedFile[]): boolean {
   return required.size === 0;
 }
 
+function isCloudPosseAtmosBundle(files: GeneratedFile[]): boolean {
+  const paths = new Set(files.map((file) => normalizeRepoWritePath(file.path)));
+  return paths.has('atmos.yaml') && paths.has('vendor.yaml') && paths.has('.deplai/cloudposse-component-lock.json');
+}
+
 function validateAwsTerraformBundle(files: GeneratedFile[]): { valid: boolean; errors: string[] } {
   const errors: string[] = [];
+  if (isCloudPosseAtmosBundle(files)) {
+    const lock = files.find((file) => normalizeRepoWritePath(file.path) === '.deplai/cloudposse-component-lock.json');
+    try {
+      const parsed = JSON.parse(String(lock?.content || '{}')) as { deploy_sequence?: unknown; stack?: unknown };
+      if (!Array.isArray(parsed.deploy_sequence) || parsed.deploy_sequence.length === 0) {
+        errors.push('Cloud Posse component lock is missing deploy_sequence');
+      }
+      if (typeof parsed.stack !== 'string' || !parsed.stack.trim()) {
+        errors.push('Cloud Posse component lock is missing stack');
+      }
+    } catch {
+      errors.push('Cloud Posse component lock is not valid JSON');
+    }
+    return { valid: errors.length === 0, errors };
+  }
+
   if (!hasRequiredAwsCoreFiles(files)) {
     errors.push('bundle is missing one or more required Terraform root files');
   }
@@ -751,174 +990,6 @@ function mergeGeneratedFiles(primary: GeneratedFile[], secondary: GeneratedFile[
   return Array.from(merged.values());
 }
 
-function resolveLlmConfig(provider: LlmProvider, modelOverride: string, apiBaseOverride: string): LlmResolvedConfig {
-  const defaults: Record<LlmProvider, { model: string; base: string }> = {
-    groq: {
-      model: 'llama-3.1-8b-instant',
-      base: 'https://api.groq.com/openai/v1',
-    },
-    openrouter: {
-      model: 'meta-llama/llama-3.3-70b-instruct:free',
-      base: 'https://openrouter.ai/api/v1',
-    },
-    ollama: {
-      model: 'llama3.1:8b',
-      base: 'https://api.ollama.com/v1',
-    },
-    opencode: {
-      model: 'openai/gpt-oss-20b',
-      base: process.env.OPENCODE_API_BASE_URL || 'https://api.opencode.ai/v1',
-    },
-    openai: {
-      model: 'gpt-4o-mini',
-      base: 'https://api.openai.com/v1',
-    },
-  };
-
-  return {
-    provider,
-    model: String(modelOverride || '').trim() || defaults[provider].model,
-    apiBaseUrl: normalizeApiBaseUrl(apiBaseOverride || defaults[provider].base),
-  };
-}
-
-async function generateIacBundleWithLlm(params: {
-  provider: Provider;
-  projectName: string;
-  qaSummary: string;
-  architectureContext: string;
-  architectureJson: Record<string, unknown> | null;
-  contextBlock: string;
-  websiteIndexHtml: string;
-  llmProvider: LlmProvider;
-  llmModel: string;
-  llmApiKey: string;
-  llmApiBaseUrl: string;
-}): Promise<{ files: GeneratedFile[]; provider: LlmProvider; model: string; summary: string }> {
-  const resolved = resolveLlmConfig(params.llmProvider, params.llmModel, params.llmApiBaseUrl);
-  const endpoint = `${resolved.apiBaseUrl}/chat/completions`;
-  const architectureSnippet = params.architectureJson
-    ? JSON.stringify(params.architectureJson, null, 2).slice(0, 24_000)
-    : '{}';
-
-  const requiredFiles = params.provider === 'aws'
-    ? [
-      'terraform/providers.tf',
-      'terraform/backend.tf',
-      'terraform/main.tf',
-      'terraform/variables.tf',
-      'terraform/terraform.tfvars',
-      'terraform/outputs.tf',
-    ]
-    : [
-      'terraform/main.tf',
-      'terraform/variables.tf',
-      'terraform/outputs.tf',
-    ];
-
-  const systemPrompt = [
-    'You generate production-ready Terraform IaC bundles.',
-    'Respond with strict JSON only. No markdown fences.',
-    'JSON schema:',
-    '{"summary":"string","files":[{"path":"terraform/main.tf","content":"..."}]}',
-    'Every file object must have path and content as strings.',
-    `Include required files: ${requiredFiles.join(', ')}`,
-    'You may include ansible files and README.md.',
-    'Keep output deterministic and valid Terraform syntax.',
-  ].join('\n');
-
-  const userPrompt = [
-    `Cloud provider: ${params.provider}`,
-    `Project: ${params.projectName}`,
-    '',
-    'Operator Q/A summary:',
-    params.qaSummary || 'n/a',
-    '',
-    'Architecture context:',
-    params.architectureContext || 'n/a',
-    '',
-    'Architecture JSON (trimmed):',
-    architectureSnippet,
-    '',
-    'Security and repository context:',
-    params.contextBlock || 'n/a',
-    '',
-    'Static website index html to host/use where relevant:',
-    params.websiteIndexHtml || '<html><body>deplai</body></html>',
-    '',
-    'Return only JSON. No prose outside the JSON object.',
-  ].join('\n');
-
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-  if (params.llmApiKey) {
-    headers.Authorization = `Bearer ${params.llmApiKey}`;
-  }
-  if (resolved.provider === 'openrouter') {
-    headers['HTTP-Referer'] = 'https://deplai.local';
-    headers['X-Title'] = 'DeplAI IaC Generator';
-  }
-
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model: resolved.model,
-      temperature: 0.15,
-      max_tokens: 3200,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-    }),
-    signal: AbortSignal.timeout(90_000),
-  });
-
-  const raw = await response.text();
-  let parsedResponse: unknown;
-  try {
-    parsedResponse = JSON.parse(raw);
-  } catch {
-    parsedResponse = null;
-  }
-
-  if (!response.ok) {
-    const message = parsedResponse && typeof parsedResponse === 'object'
-      ? String((parsedResponse as { error?: { message?: unknown } }).error?.message || '').trim()
-      : '';
-    const fallbackMessage = String(raw || '').slice(0, 280).trim();
-    throw new Error(message || fallbackMessage || `LLM provider returned HTTP ${response.status}.`);
-  }
-
-  const content = extractTextContent(
-    parsedResponse && typeof parsedResponse === 'object'
-      ? (parsedResponse as { choices?: Array<{ message?: { content?: unknown } }> }).choices?.[0]?.message?.content
-      : '',
-  );
-
-  const parsedPayload = parseJsonDocument(content);
-  if (!parsedPayload) {
-    throw new Error('LLM output was not valid JSON.');
-  }
-
-  const files = parseLlmGeneratedFiles(parsedPayload);
-  if (files.length === 0) {
-    throw new Error('LLM response did not include usable files.');
-  }
-
-  const summary = parsedPayload && typeof parsedPayload === 'object'
-    ? String((parsedPayload as { summary?: unknown }).summary || '').trim()
-    : '';
-
-  return {
-    files,
-    provider: resolved.provider,
-    model: resolved.model,
-    summary,
-  };
-}
-
 async function generateIacBundleWithTerraformAgent(params: {
   projectId: string;
   projectName: string;
@@ -930,15 +1001,17 @@ async function generateIacBundleWithTerraformAgent(params: {
   approvalPayload?: Record<string, unknown> | null;
   repositoryContext?: Record<string, unknown> | null;
   awsRegion: string;
+  stateBucket?: string;
+  lockTable?: string;
   qaSummary: string;
   websiteIndexHtml: string;
   securityContext?: Record<string, unknown> | null;
   websiteAssetStats?: Record<string, unknown> | null;
   frontendEntrypointDetection?: Record<string, unknown> | null;
-  llmProvider?: string;
-  llmApiKey?: string;
-  llmModel?: string;
-  llmApiBaseUrl?: string;
+  detected?: Record<string, unknown> | null;
+  userAnswers?: Record<string, unknown> | null;
+  consultantDecision?: Record<string, unknown> | null;
+  terraformRenderer?: TerraformRenderer;
 }): Promise<{
   files: GeneratedFile[];
   source: string;
@@ -952,8 +1025,22 @@ async function generateIacBundleWithTerraformAgent(params: {
   manifest: unknown[];
   dagOrder: string[];
   details: Record<string, unknown> | null;
+  requestedRenderer: string | null;
+  actualRenderer: string | null;
+  unsupportedReason: string | null;
+  componentCatalogVersion: string | null;
+  executionKind: string | null;
+  llmIacCalls: number;
+  llmIacDisabled: boolean;
+  decisionApplied: boolean;
+  decisionDrift: Array<{
+    component: string;
+    key: string;
+    expected: unknown;
+    got: unknown;
+  }>;
 }> {
-  const response = await fetch(`${AGENTIC_URL}/api/terraform/generate`, {
+  const response = await fetchAgentic('/api/terraform/generate', {
     method: 'POST',
     headers: {
       ...agenticHeaders(),
@@ -970,18 +1057,24 @@ async function generateIacBundleWithTerraformAgent(params: {
       approval_payload: params.approvalPayload || undefined,
       repository_context: params.repositoryContext || undefined,
       aws_region: params.awsRegion,
+      state_bucket: params.stateBucket || '',
+      lock_table: params.lockTable || '',
       qa_summary: params.qaSummary,
       security_context: params.securityContext || undefined,
       website_asset_stats: params.websiteAssetStats || undefined,
       frontend_entrypoint_detection: params.frontendEntrypointDetection || undefined,
-      llm_provider: params.llmProvider || undefined,
-      llm_api_key: params.llmApiKey || undefined,
-      llm_model: params.llmModel || undefined,
-      llm_api_base_url: params.llmApiBaseUrl || undefined,
+      detected: params.detected || undefined,
+      user_answers: params.userAnswers || undefined,
+      consultant_decision: params.consultantDecision || undefined,
+      terraform_renderer: params.terraformRenderer || 'auto',
       website_index_html: params.websiteIndexHtml,
     }),
-    signal: AbortSignal.timeout(120_000),
+  }, {
+    timeoutMs: 600_000,
+    retriesPerUrl: 2,
+    retryDelayMs: 1_200,
   });
+  const rawBody = await response.clone().text().catch(() => '');
 
   const data = await response.json().catch(() => ({})) as {
     success?: boolean;
@@ -989,6 +1082,8 @@ async function generateIacBundleWithTerraformAgent(params: {
     warnings?: string[];
     source?: string;
     error?: string;
+    detail?: string;
+    details?: unknown;
     run_id?: string | null;
     workspace?: string | null;
     provider_version?: string | null;
@@ -996,11 +1091,32 @@ async function generateIacBundleWithTerraformAgent(params: {
     lock_table?: string | null;
     manifest?: unknown[];
     dag_order?: string[];
-    details?: Record<string, unknown> | null;
+    requested_renderer?: string | null;
+    actual_renderer?: string | null;
+    unsupported_reason?: string | null;
+    component_catalog_version?: string | null;
+    execution_kind?: string | null;
+    llm_iac_calls?: number;
+    llm_iac_disabled?: boolean;
+    decision_applied?: boolean;
+    decision_drift?: Array<{
+      component?: unknown;
+      key?: unknown;
+      expected?: unknown;
+      got?: unknown;
+    }>;
   };
 
   if (!response.ok || !data.success) {
-    throw new Error(data.error || 'Terraform agent generation failed.');
+    const detailText = typeof data.details === 'string'
+      ? data.details
+      : data.details && typeof data.details === 'object'
+        ? JSON.stringify(data.details)
+        : '';
+    const compactRaw = String(rawBody || '').replace(/\s+/g, ' ').trim();
+    const nonHtmlRaw = compactRaw && !compactRaw.startsWith('<!DOCTYPE') ? compactRaw.slice(0, 320) : '';
+    const resolvedError = String(data.error || data.detail || detailText || nonHtmlRaw || '').trim();
+    throw new Error(resolvedError || `Terraform agent generation failed (HTTP ${response.status}).`);
   }
 
   const files = dedupeGeneratedFiles(Array.isArray(data.files) ? data.files : []);
@@ -1016,21 +1132,26 @@ async function generateIacBundleWithTerraformAgent(params: {
     lockTable: typeof data.lock_table === 'string' ? data.lock_table : null,
     manifest: Array.isArray(data.manifest) ? data.manifest : [],
     dagOrder: Array.isArray(data.dag_order) ? data.dag_order.map((item) => String(item)) : [],
-    details: data.details && typeof data.details === 'object' ? data.details : null,
+    details: data.details && typeof data.details === 'object' ? data.details as Record<string, unknown> : null,
+    requestedRenderer: typeof data.requested_renderer === 'string' ? data.requested_renderer : null,
+    actualRenderer: typeof data.actual_renderer === 'string' ? data.actual_renderer : null,
+    unsupportedReason: typeof data.unsupported_reason === 'string' ? data.unsupported_reason : null,
+    componentCatalogVersion: typeof data.component_catalog_version === 'string' ? data.component_catalog_version : null,
+    executionKind: typeof data.execution_kind === 'string' ? data.execution_kind : null,
+    llmIacCalls: Number.isFinite(Number(data.llm_iac_calls)) ? Number(data.llm_iac_calls) : 0,
+    llmIacDisabled: data.llm_iac_disabled !== false,
+    decisionApplied: data.decision_applied === true,
+    decisionDrift: Array.isArray(data.decision_drift)
+      ? data.decision_drift
+        .map((item) => ({
+          component: String(item?.component || '').trim(),
+          key: String(item?.key || '').trim(),
+          expected: item?.expected,
+          got: item?.got,
+        }))
+        .filter((item) => item.component.length > 0 && item.key.length > 0)
+      : [],
   };
-}
-
-function toAwsProjectSlug(value: string): string {
-  const normalized = String(value || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-+/, '')
-    .replace(/-+$/, '');
-
-  const capped = normalized.slice(0, 40).replace(/-+$/, '');
-  return capped || 'deplai-project';
 }
 
 function summarizeSecurity(data: ScanResultsData): {
@@ -1085,19 +1206,133 @@ function buildWebsiteSiteFiles(siteAssets: WebsiteAsset[], siteIndexHtml: string
   }));
 }
 
-// Retained as a local fallback template while the deployment track transitions to
-// the Agentic Layer Terraform agent for deterministic AWS generation.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function buildAwsSixFileBundle(
-  projectName: string,
-  safeProjectSlug: string,
-  contextBlock: string,
-  sec: ReturnType<typeof summarizeSecurity>,
-  websiteIndexHtml: string,
-  lowCostMode: boolean,
-): GeneratedFile[] {
-  const safeContext = contextBlock.replace(/\r/g, '');
-  const ec2HtmlBase64 = Buffer.from(String(websiteIndexHtml || ''), 'utf-8').toString('base64');
+// Keep the Atmos helper path available while the default AWS renderer uses the EC2 root bundle.
+void mergeGeneratedFiles;
+void generateIacBundleWithTerraformAgent;
+void buildWebsiteSiteFiles;
+
+function terraformSafeProjectSlug(value: string): string {
+  const slug = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return slug || 'deplai-project';
+}
+
+function hclString(value: string): string {
+  return JSON.stringify(String(value || ''));
+}
+
+function hclStringList(values: string[]): string {
+  return `[${values.map(hclString).join(', ')}]`;
+}
+
+function numericAnswer(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.floor(value);
+  const match = String(value || '').match(/\d+/);
+  if (!match) return null;
+  const parsed = Number(match[0]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+}
+
+function findAnswerValue(answers: Record<string, unknown>, patterns: RegExp[]): unknown {
+  for (const [key, value] of Object.entries(answers)) {
+    if (patterns.some((pattern) => pattern.test(key))) return value;
+  }
+  for (const value of Object.values(answers)) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const nested = findAnswerValue(value as Record<string, unknown>, patterns);
+      if (nested !== undefined) return nested;
+    }
+  }
+  return undefined;
+}
+
+function inferAwsEc2BundleInputs(params: {
+  projectName: string;
+  awsRegion: string;
+  contextBlock: string;
+  websiteIndexHtml: string;
+  userAnswers: Record<string, unknown>;
+  deploymentProfile: Record<string, unknown> | null;
+  architectureJson: Record<string, unknown> | null;
+  detected: RepoDetectionSummary;
+}): {
+  projectSlug: string;
+  awsRegion: string;
+  environment: string;
+  instanceType: string;
+  appPort: number;
+  preferredAzs: string[];
+  contextSummary: string;
+  websiteIndexHtml: string;
+} {
+  const answers = asRecord(params.userAnswers);
+  const deployment = asRecord(params.deploymentProfile);
+  const architecture = asRecord(params.architectureJson);
+  const compute = asRecord(deployment.compute || architecture.compute);
+  const services = asRecords(compute.services);
+  const firstService = services[0] || {};
+  const appPort =
+    numericAnswer(findAnswerValue(answers, [/app.*port/i, /service.*port/i, /port/i]))
+    || numericAnswer(firstService.port)
+    || (params.detected.framework === 'nextjs' || params.detected.language === 'javascript' || params.detected.language === 'typescript' ? 3000 : 80);
+  const concurrentUsers =
+    numericAnswer(findAnswerValue(answers, [/concurrent/i, /peak.*users?/i, /max.*users?/i, /traffic/i]))
+    || 200;
+  const explicitInstance = String(
+    findAnswerValue(answers, [/instance.*type/i, /ec2.*type/i])
+    || firstService.instance_type
+    || '',
+  ).trim();
+  const instanceType = explicitInstance || (concurrentUsers > 1000 ? 't3.medium' : concurrentUsers > 250 ? 't3.small' : 't3.micro');
+  const environment = String(
+    findAnswerValue(answers, [/environment/i, /stage/i])
+    || deployment.environment
+    || architecture.environment
+    || 'production',
+  ).trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-') || 'production';
+  const awsRegion = String(params.awsRegion || 'eu-north-1').trim() || 'eu-north-1';
+  const preferredAzs = ['a', 'b', 'c'].map((suffix) => `${awsRegion}${suffix}`);
+  return {
+    projectSlug: terraformSafeProjectSlug(params.projectName),
+    awsRegion,
+    environment,
+    instanceType,
+    appPort: Math.max(1, Math.min(65535, appPort)),
+    preferredAzs,
+    contextSummary: params.contextBlock,
+    websiteIndexHtml: params.websiteIndexHtml,
+  };
+}
+
+function buildAwsEc2RootBundle(params: {
+  projectName: string;
+  awsRegion: string;
+  contextBlock: string;
+  sec: ReturnType<typeof summarizeSecurity>;
+  websiteIndexHtml: string;
+  userAnswers: Record<string, unknown>;
+  deploymentProfile: Record<string, unknown> | null;
+  architectureJson: Record<string, unknown> | null;
+  detected: RepoDetectionSummary;
+}): GeneratedFile[] {
+  const inputs = inferAwsEc2BundleInputs({
+    projectName: params.projectName,
+    awsRegion: params.awsRegion,
+    contextBlock: params.contextBlock,
+    websiteIndexHtml: params.websiteIndexHtml,
+    userAnswers: params.userAnswers,
+    deploymentProfile: params.deploymentProfile,
+    architectureJson: params.architectureJson,
+    detected: params.detected,
+  });
+  const ec2HtmlBase64 = Buffer.from(String(inputs.websiteIndexHtml || ''), 'utf-8').toString('base64');
+  const contextSummary = inputs.contextSummary.replace(/\r/g, '');
+  const preferredAzsHcl = hclStringList(inputs.preferredAzs);
 
   const providersTf = `terraform {
   required_version = ">= 1.5.0"
@@ -1129,32 +1364,37 @@ provider "aws" {
 
   const variablesTf = `variable "project_name" {
   type    = string
-  default = "${safeProjectSlug}"
+  default = ${hclString(inputs.projectSlug)}
 }
 
 variable "aws_region" {
   type    = string
-  default = "eu-north-1"
+  default = ${hclString(inputs.awsRegion)}
 }
 
 variable "environment" {
   type    = string
-  default = "dev"
+  default = ${hclString(inputs.environment)}
 }
 
 variable "instance_type" {
   type    = string
-  default = "t3.micro"
+  default = ${hclString(inputs.instanceType)}
 }
 
 variable "enable_ec2" {
   type    = bool
-  default = ${lowCostMode ? 'false' : 'true'}
+  default = true
 }
 
 variable "existing_ec2_key_pair_name" {
   type    = string
   default = ""
+}
+
+variable "app_port" {
+  type    = number
+  default = ${inputs.appPort}
 }
 
 variable "ingress_cidr_blocks" {
@@ -1169,7 +1409,7 @@ variable "ssh_ingress_cidr_blocks" {
 
 variable "preferred_availability_zones" {
   type    = list(string)
-  default = ["eu-north-1a", "eu-north-1b", "eu-north-1c"]
+  default = ${preferredAzsHcl}
 }
 
 variable "use_default_vpc" {
@@ -1187,19 +1427,14 @@ variable "public_subnet_cidr" {
   default = "10.42.1.0/24"
 }
 
-variable "force_destroy_site_bucket" {
-  type    = bool
-  default = false
-}
-
 variable "ec2_root_volume_size" {
   type    = number
-  default = 8
+  default = 12
 }
 
 variable "bootstrap_index_html_base64" {
   type      = string
-  default   = "${ec2HtmlBase64}"
+  default   = ${hclString(ec2HtmlBase64)}
   sensitive = true
 }
 
@@ -1209,23 +1444,23 @@ variable "context_summary" {
 }
 `;
 
-  const tfvars = `project_name = "${safeProjectSlug}"
-aws_region = "eu-north-1"
-environment = "dev"
-instance_type = "t3.micro"
-enable_ec2 = ${lowCostMode ? 'false' : 'true'}
+  const tfvars = `project_name = ${hclString(inputs.projectSlug)}
+aws_region = ${hclString(inputs.awsRegion)}
+environment = ${hclString(inputs.environment)}
+instance_type = ${hclString(inputs.instanceType)}
+enable_ec2 = true
 existing_ec2_key_pair_name = ""
+app_port = ${inputs.appPort}
 ingress_cidr_blocks = ["0.0.0.0/0"]
 ssh_ingress_cidr_blocks = []
-preferred_availability_zones = ["eu-north-1a", "eu-north-1b", "eu-north-1c"]
+preferred_availability_zones = ${preferredAzsHcl}
 use_default_vpc = true
 vpc_cidr_block = "10.42.0.0/16"
 public_subnet_cidr = "10.42.1.0/24"
-force_destroy_site_bucket = false
-ec2_root_volume_size = 8
-bootstrap_index_html_base64 = "${ec2HtmlBase64}"
+ec2_root_volume_size = 12
+bootstrap_index_html_base64 = ${hclString(ec2HtmlBase64)}
 context_summary = <<-EOT
-${safeContext}
+${contextSummary}
 EOT
 `;
 
@@ -1255,8 +1490,8 @@ data "aws_subnets" "default" {
 }
 
 locals {
-  preferred_azs = length(var.preferred_availability_zones) > 0 ? [for az in var.preferred_availability_zones : az if contains(data.aws_availability_zones.available.names, az)] : data.aws_availability_zones.available.names
-  selected_az   = length(local.preferred_azs) > 0 ? local.preferred_azs[0] : data.aws_availability_zones.available.names[0]
+  preferred_azs     = length(var.preferred_availability_zones) > 0 ? [for az in var.preferred_availability_zones : az if contains(data.aws_availability_zones.available.names, az)] : data.aws_availability_zones.available.names
+  selected_az       = length(local.preferred_azs) > 0 ? local.preferred_azs[0] : data.aws_availability_zones.available.names[0]
   default_subnet_ids = try(data.aws_subnets.default[0].ids, [])
 }
 
@@ -1266,7 +1501,7 @@ data "aws_subnet" "default_details" {
 }
 
 locals {
-  preferred_default_subnet_ids = [for s in values(data.aws_subnet.default_details) : s.id if contains(local.preferred_azs, s.availability_zone)]
+  preferred_default_subnet_ids = [for subnet in values(data.aws_subnet.default_details) : subnet.id if contains(local.preferred_azs, subnet.availability_zone)]
   selected_default_subnet_id   = length(local.preferred_default_subnet_ids) > 0 ? local.preferred_default_subnet_ids[0] : (length(local.default_subnet_ids) > 0 ? local.default_subnet_ids[0] : null)
 }
 
@@ -1313,7 +1548,7 @@ resource "aws_route_table_association" "public" {
 }
 
 locals {
-  selected_vpc_id        = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
+  selected_vpc_id             = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
   selected_instance_subnet_id = var.use_default_vpc ? local.selected_default_subnet_id : aws_subnet.public[0].id
 }
 
@@ -1336,23 +1571,43 @@ resource "aws_security_group" "web" {
       cidr_blocks = [ingress.value]
     }
   }
+
   ingress {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
     cidr_blocks = var.ingress_cidr_blocks
   }
+
   ingress {
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
     cidr_blocks = var.ingress_cidr_blocks
   }
+
+  dynamic "ingress" {
+    for_each = contains([80, 443], var.app_port) ? [] : [var.app_port]
+    content {
+      from_port   = ingress.value
+      to_port     = ingress.value
+      protocol    = "tcp"
+      cidr_blocks = var.ingress_cidr_blocks
+    }
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "random_id" "key_suffix" {
+  byte_length = 4
+  keepers = {
+    project_name = var.project_name
   }
 }
 
@@ -1364,8 +1619,9 @@ resource "tls_private_key" "generated" {
 
 resource "aws_key_pair" "generated" {
   count      = var.enable_ec2 && trimspace(var.existing_ec2_key_pair_name) == "" ? 1 : 0
-  key_name   = "\${var.project_name}-key"
+  key_name   = "\${var.project_name}-\${random_id.key_suffix.hex}"
   public_key = tls_private_key.generated[0].public_key_openssh
+  tags       = local.tags
 }
 
 locals {
@@ -1382,6 +1638,10 @@ data "aws_ami" "al2023" {
   filter {
     name   = "name"
     values = ["al2023-ami-2023*-x86_64"]
+  }
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
   }
   filter {
     name   = "virtualization-type"
@@ -1409,6 +1669,7 @@ resource "aws_instance" "app" {
     encrypted   = true
   }
 
+  user_data_replace_on_change = true
   user_data = join("\\n", [
     "#!/bin/bash",
     "set -euxo pipefail",
@@ -1421,118 +1682,9 @@ resource "aws_instance" "app" {
     "systemctl restart nginx",
   ])
 }
-
-resource "random_id" "bucket_suffix" {
-  byte_length = 4
-  keepers = {
-    project_name = var.project_name
-  }
-}
-
-resource "aws_s3_bucket" "website" {
-  bucket        = "\${var.project_name}-site-\${random_id.bucket_suffix.hex}"
-  force_destroy = var.force_destroy_site_bucket
-  tags          = local.tags
-}
-
-resource "aws_s3_bucket_public_access_block" "website" {
-  bucket                  = aws_s3_bucket.website.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_ownership_controls" "website" {
-  bucket = aws_s3_bucket.website.id
-  rule { object_ownership = "BucketOwnerEnforced" }
-}
-
-resource "aws_s3_object" "index" {
-  bucket       = aws_s3_bucket.website.id
-  key          = "index.html"
-  content      = base64decode(var.bootstrap_index_html_base64)
-  content_type = "text/html"
-}
-
-resource "aws_cloudfront_origin_access_control" "oac" {
-  name                              = "\${var.project_name}-oac-\${random_id.bucket_suffix.hex}"
-  description                       = "OAC for website bucket"
-  origin_access_control_origin_type = "s3"
-  signing_behavior                  = "always"
-  signing_protocol                  = "sigv4"
-}
-
-resource "aws_cloudfront_distribution" "website" {
-  enabled             = true
-  default_root_object = "index.html"
-  tags                = local.tags
-
-  origin {
-    domain_name              = aws_s3_bucket.website.bucket_regional_domain_name
-    origin_id                = "s3-website-origin"
-    origin_access_control_id = aws_cloudfront_origin_access_control.oac.id
-  }
-
-  default_cache_behavior {
-    target_origin_id       = "s3-website-origin"
-    viewer_protocol_policy = "redirect-to-https"
-    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
-    cached_methods         = ["GET", "HEAD", "OPTIONS"]
-    compress               = true
-
-    forwarded_values {
-      query_string = false
-      cookies { forward = "none" }
-    }
-  }
-
-  custom_error_response {
-    error_code         = 403
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
-
-  custom_error_response {
-    error_code         = 404
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
-
-  restrictions {
-    geo_restriction {
-      restriction_type = "none"
-    }
-  }
-
-  viewer_certificate {
-    cloudfront_default_certificate = true
-  }
-}
-
-resource "aws_s3_bucket_policy" "website" {
-  bucket = aws_s3_bucket.website.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Principal = { Service = "cloudfront.amazonaws.com" }
-      Action = ["s3:GetObject"]
-      Resource = ["\${aws_s3_bucket.website.arn}/*"]
-      Condition = {
-        StringEquals = {
-          "AWS:SourceArn" = aws_cloudfront_distribution.website.arn
-        }
-      }
-    }]
-  })
-}
 `;
 
-  const outputsTf = `output "cloudfront_url" { value = "https://\${aws_cloudfront_distribution.website.domain_name}" }
-output "cloudfront_domain" { value = aws_cloudfront_distribution.website.domain_name }
-output "website_bucket_name" { value = aws_s3_bucket.website.id }
-output "ec2_instance_id" { value = try(aws_instance.app[0].id, null) }
+  const outputsTf = `output "ec2_instance_id" { value = try(aws_instance.app[0].id, null) }
 output "ec2_instance_arn" { value = try(aws_instance.app[0].arn, null) }
 output "ec2_instance_state" { value = try(aws_instance.app[0].instance_state, null) }
 output "ec2_instance_type" { value = var.instance_type }
@@ -1543,8 +1695,9 @@ output "ec2_private_dns" { value = try(aws_instance.app[0].private_dns, null) }
 output "ec2_vpc_id" { value = local.selected_vpc_id }
 output "ec2_subnet_id" { value = local.selected_instance_subnet_id }
 output "ec2_key_name" { value = local.selected_ec2_key_name }
+output "app_url" { value = try("http://\${aws_instance.app[0].public_dns}", null) }
 output "availability_warning" {
-  value = var.environment == "production" && var.enable_ec2 ? "Single-AZ EC2 deployment detected. Consider multi-AZ architecture for HA." : ""
+  value = var.environment == "production" && var.enable_ec2 ? "Single-AZ EC2 deployment detected. Add a load balancer and autoscaling group before high-availability production traffic." : ""
 }
 output "generated_ec2_private_key_pem" {
   value     = try(tls_private_key.generated[0].private_key_pem, null)
@@ -1552,10 +1705,10 @@ output "generated_ec2_private_key_pem" {
 }
 output "security_summary" {
   value = {
-    code_findings = ${sec.totalCodeFindings}
-    supply_findings = ${sec.totalSupplyFindings}
-    critical_or_high_supply = ${sec.criticalOrHighSupply}
-    high_cwe = "${sec.highCwe.join(', ') || 'none'}"
+    code_findings = ${params.sec.totalCodeFindings}
+    supply_findings = ${params.sec.totalSupplyFindings}
+    critical_or_high_supply = ${params.sec.criticalOrHighSupply}
+    high_cwe = ${hclString(params.sec.highCwe.join(', ') || 'none')}
   }
 }
 `;
@@ -1573,15 +1726,15 @@ output "security_summary" {
 `;
 
   const inventory = `[all]
-# replace with your hosts
-example-host ansible_host=127.0.0.1 ansible_user=ubuntu
+# replace with the EC2 public DNS or IP from Terraform outputs
+example-host ansible_host=127.0.0.1 ansible_user=ec2-user
 `;
 
-  const readme = `# IaC Bundle - ${projectName}
+  const readme = `# IaC Bundle - ${params.projectName}
 
-Standard 6-file Terraform fallback bundle generated by DeplAI.
+Deterministic AWS EC2 Terraform bundle generated by DeplAI.
 
-Budget mode: ${lowCostMode ? 'strict <= $1 target (EC2 disabled by default)' : 'standard'}
+This bundle is the primary runtime deploy path for AWS. Terraform manages resource dependencies inside one root module so deploys do not depend on Atmos component sequencing.
 
 Terraform files:
 - terraform/providers.tf
@@ -1806,10 +1959,10 @@ export async function POST(req: NextRequest) {
 
     const provider = clampProvider(body.provider);
     const iacMode = clampIacMode(body.iac_mode);
-    const llmProvider = clampLlmProvider(body.llm_provider);
     const llmApiKey = String(body.llm_api_key || body.openai_api_key || '').trim();
     const llmModel = String(body.llm_model || '').trim();
-    const llmApiBaseUrl = normalizeApiBaseUrl(body.llm_api_base_url);
+    const llmApiBaseUrl = String(body.llm_api_base_url || '').trim().replace(/\/+$/, '');
+    const terraformRenderer = clampTerraformRenderer(body.terraform_renderer);
     const requestedBudgetCap = Number(body.budget_cap_usd);
     const budgetCapUsd = Number.isFinite(requestedBudgetCap) && requestedBudgetCap > 0
       ? requestedBudgetCap
@@ -1847,9 +2000,11 @@ export async function POST(req: NextRequest) {
     let scanStatus = 'not_initiated';
     const scanContextWarnings: string[] = [];
     try {
-      const scanStatusRes = await fetch(`${AGENTIC_URL}/api/scan/status/${projectId}`, {
+      const scanStatusRes = await fetchAgentic(`/api/scan/status/${projectId}`, {
         headers: agenticHeaders(),
-        signal: AbortSignal.timeout(30_000),
+      }, {
+        timeoutMs: 30_000,
+        retriesPerUrl: 2,
       });
       if (scanStatusRes.ok) {
         const payload = await scanStatusRes.json() as { status?: string };
@@ -1870,9 +2025,11 @@ export async function POST(req: NextRequest) {
       scanContextWarnings.push('Security scan status could not be determined; proceeding without attached security context.');
     } else {
       try {
-        const scanRes = await fetch(`${AGENTIC_URL}/api/scan/results/${projectId}`, {
+        const scanRes = await fetchAgentic(`/api/scan/results/${projectId}`, {
           headers: agenticHeaders(),
-          signal: AbortSignal.timeout(30_000),
+        }, {
+          timeoutMs: 30_000,
+          retriesPerUrl: 2,
         });
         if (scanRes.ok) {
           const payload = await scanRes.json() as { data?: ScanResultsData };
@@ -1933,7 +2090,7 @@ export async function POST(req: NextRequest) {
         iacWarnings.push(`Website assets were collected from '${websiteCollection.selectedRoot}'.`);
       }
       if (lowCostMode) {
-        iacWarnings.push('Strict low-cost mode enabled (<= $1). EC2 defaults are disabled and bulk website asset mirroring is skipped.');
+        iacWarnings.push('Strict low-cost mode requested (<= $1), but EC2 remains enabled because AWS runtime deploy requires a running instance.');
       }
       if ((websiteCollection?.assets.length || 0) === 0) {
         iacWarnings.push('No deployable web asset directory was found; using a generated index.html fallback.');
@@ -1961,112 +2118,132 @@ export async function POST(req: NextRequest) {
         iacWarnings.push(`Skipped ${websiteCollection?.skippedLargeFiles} file(s) larger than ${MAX_SITE_FILE_BYTES} bytes.`);
       }
       if (websiteEntrypoint.relativePath) {
-        iacWarnings.push(`Primary website entrypoint resolved to '${websiteEntrypoint.relativePath}' (${websiteEntrypoint.reason}).`);
+        const sourceHint = websiteEntrypoint.sourceRelativePath && websiteEntrypoint.sourceRelativePath !== websiteEntrypoint.relativePath
+          ? ` from source '${websiteEntrypoint.sourceRelativePath}'`
+          : '';
+        iacWarnings.push(`Primary website entrypoint resolved to '${websiteEntrypoint.relativePath}'${sourceHint} (${websiteEntrypoint.reason}).`);
       } else {
         iacWarnings.push(`No HTML entrypoint was detected (${websiteEntrypoint.reason}); using a generated index.html.`);
       }
     }
 
     if (provider === 'aws') {
-      if (!hasArchitectureJson) {
-        return NextResponse.json(
-          { error: 'AWS Terraform generation requires architecture_json.' },
-          { status: 400 },
-        );
-      }
       const normalizedArchitecture = (architectureValidation?.normalized || {}) as Record<string, unknown>;
       const normalizedDeploymentProfile = (body.deployment_profile || architectureValidation?.normalized || null) as Record<string, unknown> | null;
-      const normalizedFrontendDetection = (body.frontend_entrypoint_detection || frontendDetection || undefined) as Record<string, unknown> | undefined;
-
-      let files: GeneratedFile[] = [];
-      let source = 'terraform_agent_multi_worker_dynamic';
-      let llmSummary = '';
-      let runId: string | null = null;
-      let workspace: string | null = null;
-      let providerVersion: string | null = null;
-      let stateBucket: string | null = null;
-      let lockTable: string | null = null;
-      let manifest: unknown[] = [];
-      let dagOrder: string[] = [];
-      let agentDetails: Record<string, unknown> | null = null;
-
-      if (iacMode === 'llm' && !llmApiKey && llmProvider !== 'ollama') {
-        return NextResponse.json(
-          { error: `LLM mode requires llm_api_key for provider '${llmProvider}'.` },
-          { status: 400 },
-        );
+      const repositoryContext = (body.repository_context || null) as Record<string, unknown> | null;
+      const detectedSummary = inferRepositoryDetection({
+        architectureJson: normalizedArchitecture,
+        frontendDetection,
+        repositoryContext,
+      });
+      const consultantAction = String(body.consultant_action || '').trim().toLowerCase();
+      const consultantHistory = normalizeConsultantHistory(body.consultant_history);
+      const consultantTurnCount = Number(body.consultant_turn_count || 0);
+      if (consultantAction === 'start' || consultantAction === 'reply' || consultantAction === 'force_decision') {
+        try {
+          const consultRes = await fetchAgentic('/api/terraform/cloudposse/consult', {
+            method: 'POST',
+            headers: {
+              ...agenticHeaders(),
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              architecture_json: normalizedArchitecture,
+              repository_context: repositoryContext || undefined,
+              deployment_profile: normalizedDeploymentProfile || undefined,
+              detected: detectedSummary,
+              aws_region: body.aws_region?.trim() || 'eu-north-1',
+              conversation_history: consultantHistory,
+              turn_count: Number.isFinite(consultantTurnCount) ? consultantTurnCount : 0,
+              force_decision: consultantAction === 'force_decision' || consultantTurnCount >= 20,
+            }),
+          }, {
+            timeoutMs: 180_000,
+            retriesPerUrl: 2,
+            retryDelayMs: 1_000,
+          });
+          const consultData = await consultRes.json().catch(() => ({})) as {
+            success?: boolean;
+            assistant_message?: string;
+            ready?: boolean;
+            decision?: Record<string, unknown>;
+            repo_detection_summary?: string;
+            turn_count?: number;
+            error?: string;
+          };
+          if (!consultRes.ok || consultData.success !== true) {
+            throw new Error(String(consultData.error || 'Infra consultant conversation failed.'));
+          }
+          const consultantDecision = asRecord(consultData.decision);
+          return NextResponse.json({
+            success: true,
+            detected: detectedSummary,
+            consultant_response: String(consultData.assistant_message || ''),
+            consultant_ready: Boolean(consultData.ready && Object.keys(consultantDecision).length > 0),
+            consultant_turn_count: Number(consultData.turn_count || (consultantTurnCount + 1)),
+            repo_detection_summary: String(consultData.repo_detection_summary || ''),
+            consultant_decision: Object.keys(consultantDecision).length > 0 ? consultantDecision : null,
+            consultant_summary: Object.keys(consultantDecision).length > 0
+              ? summarizeConsultantDecision(consultantDecision, detectedSummary, body.aws_region?.trim() || 'eu-north-1')
+              : null,
+          });
+        } catch (consultErr) {
+          const classified = classifyAgenticRouteError(consultErr, 'run the infra consultant');
+          return NextResponse.json(
+            { error: classified.message },
+            { status: classified.status },
+          );
+        }
       }
 
-      try {
-        const agentResult = await generateIacBundleWithTerraformAgent({
-          projectId,
-          projectName,
-          workspace: String((architectureValidation?.normalized as { workspace?: unknown } | null)?.workspace || projectId),
-          provider,
-          iacMode,
-          architectureJson: normalizedArchitecture,
-          deploymentProfile: normalizedDeploymentProfile,
-          approvalPayload: body.approval_payload || null,
-          repositoryContext: body.repository_context || undefined,
-          awsRegion: body.aws_region?.trim() || 'eu-north-1',
-          qaSummary: qa,
-          websiteIndexHtml,
-          securityContext: body.security_context || sec,
-          websiteAssetStats: body.website_asset_stats || {
-            selected_root: websiteCollection?.selectedRoot || '',
-            asset_count: websiteAssets.length,
-            mirrored_asset_count: effectiveWebsiteAssets.length,
-            total_bytes: websiteCollection?.totalBytes || 0,
-            truncated: Boolean(websiteCollection?.truncated),
-            skipped_large_files: websiteCollection?.skippedLargeFiles || 0,
-            entrypoint: websiteEntrypoint.relativePath,
-          },
-          frontendEntrypointDetection: normalizedFrontendDetection,
-          llmProvider: iacMode === 'llm' ? llmProvider : undefined,
-          llmApiKey: iacMode === 'llm' ? llmApiKey : undefined,
-          llmModel: iacMode === 'llm' ? llmModel : undefined,
-          llmApiBaseUrl: iacMode === 'llm' ? llmApiBaseUrl : undefined,
-        });
-        files = mergeGeneratedFiles(agentResult.files, buildWebsiteSiteFiles(effectiveWebsiteAssets, websiteIndexHtml));
-        const generatedBundleValidation = validateAwsTerraformBundle(files);
-        if (!generatedBundleValidation.valid) {
-          throw new Error(`Generated Terraform bundle failed validation: ${generatedBundleValidation.errors.join('; ')}`);
-        }
-        source = agentResult.source;
-        llmSummary = agentResult.summary;
-        runId = agentResult.runId;
-        workspace = agentResult.workspace;
-        providerVersion = agentResult.providerVersion;
-        stateBucket = agentResult.stateBucket;
-        lockTable = agentResult.lockTable;
-        manifest = agentResult.manifest;
-        dagOrder = agentResult.dagOrder;
-        agentDetails = agentResult.details;
-        iacWarnings.push(...agentResult.warnings);
-      } catch (agentErr) {
-        const safeProjectSlug = toAwsProjectSlug(projectName);
-        files = mergeGeneratedFiles(
-          buildAwsSixFileBundle(projectName, safeProjectSlug, contextBlock, sec, websiteIndexHtml, lowCostMode),
-          buildWebsiteSiteFiles(effectiveWebsiteAssets, websiteIndexHtml),
-        );
-        source = 'connector_aws_bundle_fallback';
-        llmSummary = `Generated ${files.length} files through the local AWS fallback bundle.`;
-        runId = null;
-        workspace = String((architectureValidation?.normalized as { workspace?: unknown } | null)?.workspace || projectId);
-        providerVersion = null;
-        stateBucket = null;
-        lockTable = null;
-        manifest = [];
-        dagOrder = [];
-        agentDetails = {
-          fallback_reason: agentErr instanceof Error ? agentErr.message : 'unknown error',
-          fallback_mode: 'local_connector_aws_bundle',
-        };
-        iacWarnings.push(
-          `Agentic Terraform generator failed or timed out; used local AWS fallback bundle instead. Reason: ${
-            agentErr instanceof Error ? agentErr.message : 'unknown error'
-          }`,
-        );
+      const consultantDecision = asRecord(body.consultant_decision);
+      const awsRegion = body.aws_region?.trim() || 'eu-north-1';
+      const files = buildAwsEc2RootBundle({
+        projectName,
+        awsRegion,
+        contextBlock,
+        sec,
+        websiteIndexHtml,
+        userAnswers: asRecord(body.user_answers),
+        deploymentProfile: {
+          ...(normalizedDeploymentProfile || {}),
+          detected: detectedSummary,
+          user_answers: asRecord(body.user_answers),
+          consultant_decision: consultantDecision,
+        },
+        architectureJson: normalizedArchitecture,
+        detected: detectedSummary,
+      });
+      const source = 'deplai_deterministic_ec2';
+      const llmSummary = 'Generated deterministic AWS EC2 Terraform root bundle. Terraform will manage VPC/subnet/security-group/key/instance dependencies inside one root module.';
+      const runId: string | null = null;
+      const workspace: string | null = null;
+      const providerVersion = '~> 5.54';
+      const stateBucket: string | null = null;
+      const lockTable: string | null = null;
+      const manifest: unknown[] = [];
+      const dagOrder = ['terraform'];
+      const agentDetails: Record<string, unknown> = {
+        execution_kind: 'terraform',
+        renderer: source,
+        terraform_root: 'terraform',
+        default_runtime_target: 'ec2',
+        atmos_bypassed: true,
+      };
+      const rendererMetadata: Record<string, unknown> = {
+        requested_renderer: terraformRenderer,
+        actual_renderer: source,
+        unsupported_reason: null,
+        component_catalog_version: null,
+        execution_kind: 'terraform',
+        llm_iac_calls: 0,
+        llm_iac_disabled: true,
+        decision_applied: Object.keys(consultantDecision).length > 0,
+        decision_drift: [],
+      };
+      iacWarnings.push('AWS generation is using the deterministic EC2 root bundle path; Cloud Posse/Atmos is bypassed for first-success runtime deploys.');
+      if (effectiveWebsiteAssets.length > 0) {
+        iacWarnings.push('Website context is embedded into EC2 nginx bootstrap HTML; bulk static asset mirroring is not used in the default EC2 deploy path.');
       }
 
       const finalBundleValidation = validateAwsTerraformBundle(files);
@@ -2082,13 +2259,12 @@ export async function POST(req: NextRequest) {
       const allWarnings = [
         ...scanContextWarnings,
         ...iacWarnings,
-        source === 'connector_aws_bundle_fallback'
-          ? 'Generated Terraform bundle locally in Connector after Agentic Terraform generation failed.'
-          : `AWS Terraform worker backend: ${iacMode === 'llm' ? 'agentic-llm' : 'agentic-deterministic-rescue'}.`,
-        source === 'connector_aws_bundle_fallback'
-          ? 'This fallback is the lightweight AWS bundle that previously powered successful deploys.'
-          : 'Generated Terraform bundle through the Agentic Layer multi-worker pipeline using repository analysis, approved architecture, and deployment Q&A context.',
+        `AWS Terraform worker backend: ${rendererMetadata.actual_renderer || 'deplai_deterministic_ec2'}.`,
+        'Generated Terraform bundle through the deterministic EC2 root pipeline using repository analysis, approved architecture, and deployment Q&A context.',
         'Terraform files use a local backend by default. AWS credentials are only needed later for apply/deploy.',
+        ...(iacMode === 'llm' || llmApiKey || llmModel || llmApiBaseUrl || body.llm_provider
+          ? ['LLM IaC generation is disabled; LLM provider fields were ignored for Terraform generation.']
+          : []),
       ];
       const iacRepoPr: RepoPersistenceResult = {
         attempted: false,
@@ -2114,8 +2290,12 @@ export async function POST(req: NextRequest) {
         manifest,
         dag_order: dagOrder,
         details: agentDetails,
+        ...rendererMetadata,
         iac_repo_pr: iacRepoPr,
         warnings: allWarnings,
+        detected: detectedSummary,
+        user_answers: asRecord(body.user_answers),
+        consultant_decision: consultantDecision,
         website_asset_stats: {
           selected_root: websiteCollection?.selectedRoot || '',
           asset_count: websiteAssets.length,
@@ -2132,39 +2312,13 @@ export async function POST(req: NextRequest) {
     const deterministicFiles = provider === 'azure'
       ? buildAzureBundle(projectName, contextBlock, sec)
       : buildGcpBundle(projectName, contextBlock, sec);
-    let files = deterministicFiles;
+    const files = deterministicFiles;
     let source = 'template';
-    let llmSummary = '';
+    const llmSummary = '';
 
-    if (iacMode === 'llm') {
-      if (!llmApiKey && llmProvider !== 'ollama') {
-        return NextResponse.json(
-          { error: `LLM mode requires llm_api_key for provider '${llmProvider}'.` },
-          { status: 400 },
-        );
-      }
-      try {
-        const llmResult = await generateIacBundleWithLlm({
-          provider,
-          projectName,
-          qaSummary: qa,
-          architectureContext: arch,
-          architectureJson: (architectureValidation?.normalized || null) as Record<string, unknown> | null,
-          contextBlock,
-          websiteIndexHtml,
-          llmProvider,
-          llmModel,
-          llmApiKey,
-          llmApiBaseUrl,
-        });
-        files = llmResult.files;
-        source = `llm_${llmResult.provider}`;
-        llmSummary = llmResult.summary;
-        iacWarnings.push(`IaC generated via ${llmResult.provider} using model '${llmResult.model}'.`);
-      } catch (llmErr) {
-        source = 'template_fallback';
-        iacWarnings.push(`LLM IaC generation failed; using deterministic provider template. Reason: ${llmErr instanceof Error ? llmErr.message : 'unknown error'}`);
-      }
+    if (iacMode === 'llm' || llmApiKey || llmModel || llmApiBaseUrl || body.llm_provider) {
+      source = iacMode === 'llm' ? 'template_fallback' : source;
+      iacWarnings.push('LLM IaC generation is disabled; using deterministic provider template and ignoring LLM provider fields.');
     }
 
     const iacRepoPr: RepoPersistenceResult = {
@@ -2192,6 +2346,15 @@ export async function POST(req: NextRequest) {
       source,
       iac_repo_pr: iacRepoPr,
       warnings: combinedWarnings,
+      requested_renderer: terraformRenderer,
+      actual_renderer: source,
+      unsupported_reason: null,
+      component_catalog_version: null,
+      execution_kind: 'terraform',
+      llm_iac_calls: 0,
+      llm_iac_disabled: true,
+      decision_applied: false,
+      decision_drift: [],
       website_asset_stats: null,
       frontend_entrypoint_detection: null,
     });

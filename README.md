@@ -1,280 +1,322 @@
 # DeplAI
-> End-to-end AI-assisted deployment pipeline that scans code, proposes remediations, derives infrastructure plans, estimates cloud cost, generates IaC, and executes deployment.
+Enterprise AI platform for repository security analysis, remediation, deployment planning, infrastructure generation, runtime deployment, tenant customization, and operator-facing workflow control.
 
-**Stack**: Next.js 16.1.1 + React 19.2.3 + TypeScript 5 (Connector), FastAPI 0.115+ + Uvicorn 0.34+ + Python 3.13 (Agentic Layer), MySQL 8 (Connector persistence), Docker Engine (scan/runtime execution)
-**Status**: Internal
-**Owner**: adityajayashankar (latest commit author)
+DeplAI is not a single agent. It is a platform made of:
+- a user-facing control plane in `Connector/`
+- an execution plane in `Agentic Layer/`
+- specialized engines for security remediation, knowledge-graph enrichment, Terraform generation, Stage 7 cost/diagram approval, and tenant customization
 
-## Table of Contents
-- Overview
-- Repository Layout
-- Architecture Summary
-- Prerequisites
-- Installation
-- Configuration
-- Running
-- Testing
-- Troubleshooting
-- Additional Documentation
+The system is organized around product tracks rather than one monolithic pipeline.
 
-## Overview
-DeplAI is a two-tier system:
-- Connector (Next.js) is the authenticated user-facing control plane.
-- Agentic Layer (FastAPI) is the execution plane for scan, remediation, architecture planning, costing, Terraform generation, Terraform apply, and AWS runtime actions.
+## Executive Summary
+DeplAI takes a repository from intake to action across three major workstreams:
 
-Core execution flow implemented in code:
-1. User authenticates with GitHub OAuth in Connector API auth routes.
-2. User starts scan from Connector; Connector validates ownership and forwards request to Agentic Layer.
-3. Agentic Layer scans repository content in Docker volumes using Bearer and Syft/Grype.
-4. User starts remediation; Agentic Layer runs remediation rounds, optional PR creation, and re-scan.
-5. Connector runs repository analysis and architecture review Q/A against Agentic Layer planning endpoints.
-6. Connector requests Stage 7 approval payload (diagram + cost + budget gate).
-7. Connector generates IaC (AWS locally generated six-file bundle in Connector route, or Azure/GCP local bundles).
-8. Connector deploys via:
-   - Runtime apply mode: Agentic Layer /api/terraform/apply
-   - GitOps mode: creates/updates a GitHub repo, pushes files, and injects workflow variables
+| Track | Outcome | Primary Components |
+|---|---|---|
+| Security Track | Scan code and dependencies, enrich findings with KG context, generate validated fixes, raise a PR | `Connector`, `Agentic Layer`, `remediation_pipeline`, `KGagent` |
+| Deployment Track | Infer runtime architecture, ask deployment questions, produce a deployment profile, estimate cost, generate IaC, deploy to AWS | `Connector`, `Agentic Layer`, `Terraform Agent`, `Diagram-Cost-Agent` |
+| Customization Track | Capture tenant requirements, build a manifest, modify tenant-specific frontend/backend code, preview changes | `Customization Agent`, `Connector` proxy routes |
 
-## Repository Layout
-- Agentic Layer: FastAPI backend and orchestration runners.
-- Connector: Next.js application, authenticated API facade, dashboard UI.
-- Diagram-Cost-Agent: LangGraph Stage 7 implementation.
-- Terraform Agent: LangGraph Terraform planner/generator implementation.
-- KGagent: Knowledge graph assistant modules (Neo4j/Qdrant-based).
-- runtime: Persisted planning outputs (repo-analyzer and architecture decision artifacts).
+Shared platform capabilities include:
+- GitHub OAuth and GitHub App integration
+- project registry for local and GitHub repositories
+- operator dashboards for pipeline progress, documentation, settings, runtime inventory, and deployment history
+- websocket progress streaming plus REST recovery/status endpoints
+- contract validation between UI, planning services, and execution services
 
-## Architecture Summary
+## Platform Architecture
 ```mermaid
 graph TD
-  U[Browser User] --> C[Connector Next.js 16.1.1]
-  C -->|Cookie session via iron-session| DB[(MySQL deplai)]
-  C -->|X-API-Key + REST| A[Agentic Layer FastAPI :8000]
-  C -->|WS token request| C
-  C -->|WebSocket token| AWS[WS /ws/* on Agentic Layer]
+  U[Engineer] --> C[Connector<br/>Next.js control plane]
+  C --> DB[(MySQL)]
+  C --> A[Agentic Layer<br/>FastAPI execution plane]
+  C --> GH[GitHub APIs]
+  C --> CA[Customization Backend]
 
   A --> D[(Docker Engine)]
-  D --> V1[(codebase_deplai volume)]
-  D --> V2[(security_reports volume)]
-  D --> V3[(LLM_Output volume)]
+  D --> V1[(codebase_deplai)]
+  D --> V2[(security_reports)]
+  D --> V3[(LLM_Output)]
 
-  A --> S7[Stage7 Bridge]
-  S7 --> DC[diagram_cost-estimation_agent subprocess]
-  A --> TF[Terraform Apply Runtime]
-  TF --> AWSAPI[AWS APIs via boto3]
+  A --> RP[Repository Analysis]
+  A --> AD[Architecture Decision]
+  A --> S7[Stage 7 Bridge]
+  A --> RA[Remediation Pipeline]
+  A --> TA[Terraform Apply Runtime]
 
-  C --> GH[GitHub APIs]
-  C --> CUST[Customization backend proxy]
+  RA --> KG[KGagent]
+  S7 --> DC[Diagram-Cost-Agent]
+  A --> TF[Terraform Agent Engine]
+  TA --> AWS[AWS APIs]
 ```
 
-## Prerequisites
-Required runtimes and services for a full local stack:
-- Docker Desktop with Docker Engine reachable from host and containers.
-- Node.js 20+ for Connector development.
-- npm (ships with Node.js).
-- Python 3.13 (Dockerfile uses python:3.13-slim; local development should match closely).
-- MySQL 8+ for Connector data model in database.sql.
-- GitHub OAuth App + GitHub App credentials if GitHub repository mode is used.
+### Control Plane
+`Connector/` is the authenticated product surface. It owns:
+- session auth and project ownership checks
+- GitHub installations, repository syncing, webhook handling, and repo CRUD
+- dashboard experiences for security, deployment, customization, documentation, settings, and instance management
+- API facade routes that normalize requests before forwarding to the execution plane
+- browser-side pipeline state, approval state, deployment history snapshots, and runtime UI persistence
 
-Optional but used by specific features:
-- AWS credentials for runtime deployment and runtime details endpoints.
-- Anthropic/OpenRouter/Groq/Ollama keys for model backends.
-- Neo4j for KG-enhanced remediation path and health checks.
-- PuTTYgen executable on Windows for PEM to PPK conversion route.
+### Execution Plane
+`Agentic Layer/` is the long-running workflow service. It owns:
+- scan orchestration through Docker-isolated workspaces
+- remediation workflow execution and websocket streaming
+- repository analysis and deployment decision generation
+- Stage 7 approval payload generation
+- Terraform runtime apply, stop, status, destroy, and runtime inspection
+- AWS runtime lifecycle actions
 
-## Installation
-### 1. Clone and initialize frontend dependencies
-```bash
-cd Connector
-npm install
-```
+## Product Tracks
+### 1. Security Track
+Security is implemented as an operator-visible pipeline:
 
-### 2. Initialize Python dependencies for Agentic Layer
-```bash
-cd "../Agentic Layer"
-python -m venv .venv
-# PowerShell
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+1. Preflight checks
+2. `run_scan (SAST/SCA)`
+3. `KG Agent analysis`
+4. `Remediate vulnerabilities`
+5. `Create PR`
+6. `Merge gate`
+7. `Post-merge actions`
 
-### 3. Initialize Connector database
-Use the SQL schema in Connector/database.sql against your MySQL server:
-```sql
-SOURCE Connector/database.sql;
-```
+How it works:
+- `EnvironmentInitializer` copies or clones the selected repository into project-scoped Docker volumes.
+- Bearer handles SAST, Syft builds the SBOM, and Grype performs dependency vulnerability analysis.
+- Results are parsed into normalized `code_security` and `supply_chain` structures.
+- `KGagent` can enrich significant CVEs and CWEs with direct and inferred graph correlations.
+- `RemediationTrackRunner` drives the interactive websocket flow.
+- `RemediationOrchestrator` runs ingestion, grouping, snippet extraction, fix generation, and diff validation.
+- Approved fixes can be committed into a GitHub branch and raised as a PR.
 
-### 4. Configure environment variables
-Create env files and populate variables documented below.
+Security design characteristics:
+- project-level isolation in Docker volumes
+- websocket streaming for live progress, with REST fallback for status/results
+- approval gates before PR creation
+- severity-based throttling for large repositories
+- optional Claude-forced mode for staged large-repo remediation
+
+### 2. Deployment Track
+Deployment is implemented as a second, separate decision-and-execution pipeline:
+
+1. Repository analysis
+2. Q/A context gathering
+3. Architecture review questions
+4. Deployment profile generation
+5. Stage 7 diagram and cost approval
+6. IaC generation
+7. Runtime deployment or GitOps export
+8. Runtime verification, inspection, and destroy actions
+
+How it works:
+- `repository_analysis/service.py` scans the repository and emits a structured `repository_context`.
+- `architecture_decision/service.py` converts that context into targeted deployment questions and default answers.
+- Completed answers are compiled into a canonical `deployment_profile` plus a derived `architecture_view`.
+- `stage7_bridge.py` invokes `Diagram-Cost-Agent` to build a diagram, estimate cost, and evaluate the budget gate.
+- IaC can then be generated and either:
+  - applied directly through `Agentic Layer` runtime apply endpoints, or
+  - pushed into GitHub through the Connector GitOps path
+
+Deployment design characteristics:
+- the `deployment_profile` is the intended source of truth for Terraform generation
+- contract validation exists on both Python and TypeScript sides
+- Stage 7 has a deterministic fallback if the specialized graph runner is unavailable
+- runtime apply, status, stop, destroy, and runtime-details routes are AWS-first
+
+### 3. Customization Track
+Customization is a distinct tenant-builder workflow rather than an extension of the security/deployment paths.
+
+How it works:
+- `Customization Agent/tenant_builder_app/backend/` exposes a dedicated FastAPI service.
+- `conversation_graph.py` handles the conversational manifest-building loop.
+- `customization_graph.py` runs repository scanners, planners, modifiers, validation, and final reporting.
+- The backend can store branding assets, keep per-tenant manifests, create tenant working copies, compute diffs, and reset tenant repos.
+- `Connector/src/app/api/customization/[...path]/route.ts` proxies authenticated preview and customization operations into the tenant builder backend.
+
+Customization graph flow:
+- `frontend_scanner -> backend_scanner -> frontend_planner -> frontend_modifier -> backend_planner -> backend_modifier -> validator -> reporter`
+
+## Agentic Orchestration
+DeplAI contains multiple orchestration styles because each track solves a different class of problem.
+
+### Workflow Runners
+These are imperative runners with websocket streaming:
+- `EnvironmentInitializer` for scan setup and execution
+- `RemediationTrackRunner` for the security remediation experience
+- Terraform apply execution in `terraform_apply.py`
+
+### Structured Document Pipelines
+These transform repository signals into machine-validated planning artifacts:
+- `repository_context`
+- `architecture_answers`
+- `deployment_profile`
+- `architecture_view`
+- `approval_payload`
+
+These artifacts are persisted under:
+- `runtime/repo-analyzer/<workspace>/`
+- `runtime/arch-decision/<workspace>/`
+
+### LangGraph-Based Engines
+Several specialized engines use LangGraph:
+- `Terraform Agent/agent/graph.py`
+  - `repo_parser -> infra_planner -> terraform_generator -> validator -> refiner -> final_output`
+- `Diagram-Cost-Agent/graph.py`
+  - `diagram_builder -> cost_estimator -> budget_gate -> approval_packager`
+- `KGagent/pipeline/langgraph_agent.py`
+  - hybrid graph/vector retrieval for vulnerability intelligence
+- `Customization Agent/.../graph/*.py`
+  - conversation and code-customization flows
+
+### UI Chat Orchestrator
+The Connector also contains a separate conversational orchestration layer in `Connector/src/chat-agent/`.
+
+It is intentionally multi-agent and stepwise:
+1. Memory Forensics Keeper
+2. Signal Warden
+3. Tool Contract Sentinel
+4. Chain Choreographer
+5. Adversarial Verifier
+6. Action-UI Binder
+7. Recovery Marshall
+8. Narrative Blacksmith
+
+This is not the same as the deployment/security execution pipeline. It is the UI-side intent router for workspace chat interactions.
+
+## Repository Map
+| Path | Responsibility |
+|---|---|
+| `Connector/` | Next.js control plane, dashboard UI, authenticated API facade, GitHub integration, deployment/customization workspaces |
+| `Agentic Layer/` | FastAPI execution plane for scan, remediation, planning, cost, Terraform apply, AWS runtime operations |
+| `remediation_pipeline/` | Modular remediation pipeline: ingester, grouper, extractor, generator, validator, router, track runner |
+| `Terraform Agent/` | Terraform generation engine, renderer selection, bundle building, execution helpers, CloudPosse/Atmos support |
+| `Diagram-Cost-Agent/` | Stage 7 engine for diagram creation, cost estimation, budget gate packaging |
+| `KGagent/` | Knowledge graph and GraphRAG engine for vulnerability intelligence |
+| `Customization Agent/` | Tenant customization backend, manifest workflows, repo mutation pipeline, preview support |
+| `docs/` | Secondary architecture and API documentation |
+| `runtime/` | Generated planning artifacts created at runtime, not core source code |
+
+## Source-of-Truth Contracts
+DeplAI is strongest where it uses contracts instead of free-form JSON.
+
+Key contracts implemented in both backend and Connector:
+- `architecture_contract` / `architecture-contract.ts`
+- `deployment_planning_contract` / `deployment-planning-contract.ts`
+- request and response models in `Agentic Layer/models.py`
+
+This contract-first approach is what lets the platform separate:
+- repository understanding
+- operator answers
+- deployment intent
+- approval state
+- Terraform rendering
+- runtime execution
+
+## Terraform Strategy
+### Intended Architecture
+The intended Terraform architecture is more ambitious than a simple HCL template generator.
+
+The intended flow is:
+1. derive a canonical `deployment_profile`
+2. optionally run the CloudPosse consultant to choose catalog components and stack configuration
+3. select a renderer:
+   - `cloudposse_atmos`
+   - `deplai_deterministic`
+4. emit a bundle plus metadata such as deploy sequence and lock payload
+5. run `atmos vendor pull`, `validate`, `terraform init/plan/apply` when the bundle is Atmos-based
+
+The CloudPosse path already exists in code:
+- component catalog in `Terraform Agent/agent/engine/cloudposse_component_catalog.json`
+- renderer support classification in `cloudposse_atmos.py`
+- bundle generation in `build_cloudposse_profile_bundle`
+- execution support in `Agentic Layer/terraform_apply.py`
+- consultant conversation endpoint through `/api/terraform/cloudposse/consult`
+
+### What We Intended To Use CloudPosse For
+CloudPosse/Atmos was meant to be the enterprise IaC lane:
+- reusable, version-pinned infrastructure components
+- stack composition instead of one-off handcrafted root modules
+- clearer deployment sequences and component lock metadata
+- safer upgrades through catalog versioning
+- a path toward more standardized Terraform across projects
+
+### Where We Failed
+We did not finish CloudPosse as the default end-to-end Terraform path.
+
+Current reality in the shipped Connector flow:
+- `Connector/src/app/api/pipeline/iac/route.ts` still generates the default AWS bundle through a deterministic EC2 root path
+- that route explicitly notes that Cloud Posse/Atmos is bypassed for first-success runtime deploys
+- website assets are reduced to a bootstrap HTML strategy in the default EC2 path, not a full enterprise CloudPosse component composition path
+
+Current CloudPosse limitations visible in code:
+- V1 only supports `deployment_profile` input and AWS
+- V1 rejects workspaces with existing non-CloudPosse Terraform state
+- custom `dns_and_tls` is not supported in Cloud Posse V1
+- unsupported compute and networking shapes are rejected by the support classifier
+- there is still decision drift risk between consultant output and generated stack variables
+
+In short:
+- the backend contains a serious CloudPosse/Atmos foundation
+- the runtime apply path can execute Atmos bundles
+- but the primary product path still falls back to deterministic Terraform because that was the more reliable route to a working AWS deployment
+
+That is the main architecture gap in the current platform.
+
+## Operational Model
+Core dependencies:
+- Node.js for `Connector/`
+- Python for `Agentic Layer/`, `Terraform Agent/`, `KGagent/`, and `Customization Agent/`
+- Docker for scan isolation and runtime Terraform execution
+- MySQL for Connector persistence
+
+Optional dependencies by capability:
+- Neo4j and Qdrant for KG-enhanced security analysis
+- AWS credentials for runtime deployment and inspection
+- GitHub OAuth App and GitHub App credentials for repo-connected flows
+- Anthropic, Groq, OpenRouter, or Ollama depending on the selected LLM path
+
+## Running Locally
+Minimal local bring-up:
 
 ```powershell
-Copy-Item .env.template .env
-```
+cd Connector
+npm install
 
-## Configuration
-The tables below come directly from environment variable reads in Connector and Agentic Layer code.
+cd "..\\Agentic Layer"
+python -m venv .venv
+.\\.venv\\Scripts\\Activate.ps1
+pip install -r requirements.txt
 
-### Connector variables
-| Variable | Required | Default | Effect |
-|---|---|---|---|
-| SESSION_SECRET | Yes | none | Required by iron-session for signed auth cookie. |
-| NEXT_PUBLIC_APP_URL | Yes | none | OAuth redirect base and post-login redirects. |
-| WS_TOKEN_SECRET | Yes | none | Required by /api/scan/ws-token to sign WebSocket tokens. |
-| GITHUB_CLIENT_ID | Yes (OAuth login) | none | GitHub OAuth authorization code flow. |
-| GITHUB_CLIENT_SECRET | Yes (OAuth login) | none | GitHub OAuth token exchange in auth callback route. |
-| GITHUB_APP_ID | Yes (GitHub App features) | none | Installation token issuance via Octokit auth-app. |
-| GITHUB_PRIVATE_KEY | Yes (GitHub App features) | none | GitHub App private key for installation auth. |
-| GITHUB_WEBHOOK_SECRET | Yes (webhook route) | none | Signature verification of GitHub webhook payloads. |
-| DEPLAI_SERVICE_KEY | Required in practice | none | Forwarded as X-API-Key to Agentic Layer; backend startup fails without matching DEPLAI_SERVICE_KEY. |
-| AGENTIC_LAYER_URL | No | http://localhost:8000 | Upstream URL for all Agentic Layer API calls. |
-| DB_HOST | No | localhost | MySQL host for Connector pool. |
-| DB_PORT | No | 3306 | MySQL port for Connector pool. |
-| DB_USER | No | root | MySQL user for Connector pool. |
-| DB_PASSWORD | No | empty | MySQL password for Connector pool. |
-| DB_NAME | No | deplai | MySQL database name for Connector pool. |
-| ADMIN_EMAILS | No | none | Comma-separated allowlist for admin workspace controls (settings workspace tabs, cleanup endpoint). |
-| ADMIN_EMAIL | No | none | Single-email fallback for admin workspace controls when ADMIN_EMAILS is not set. |
-| ADMIN_ACCESS_KEY | No | none | Alternate secret key for workspace admin unlock when email allowlist is unavailable. |
-| CLEANUP_SCAN_VOLUMES_ON_LOGOUT | No | false | If true, logout route calls Agentic /api/cleanup. |
-| ALLOW_GLOBAL_CLEANUP | No | false | Used by settings UI snapshot to surface cleanup capability state. |
-| AWS_ACCESS_KEY_ID | No | none | Used for runtime deploy health and some deployment defaults. |
-| AWS_SECRET_ACCESS_KEY | No | none | Used for runtime deploy health and some deployment defaults. |
-| GROQ_API_KEY | No | none | Chat route Groq provider auth. |
-| GROQ_MODEL | No | llama-3.3-70b-versatile | Chat route Groq model selection. |
-| OPENROUTER_API_KEY | No | none | Chat route OpenRouter provider auth. |
-| OPENROUTER_MODEL | No | openai/gpt-oss-120b | Chat route OpenRouter model selection. |
-| OLLAMA_API_KEY | No | none | Chat route Ollama cloud provider auth. |
-| OLLAMA_MODEL | No | qwen2.5-coder:7b | Chat route Ollama model selection. |
-| PUTTYGEN_PATH | No | auto-detected candidates | Optional explicit PuTTYgen path for /api/pipeline/keypair/ppk conversion. |
-| NEXT_PUBLIC_AGENTIC_WS_URL | No | derived from AGENTIC_LAYER_URL | Optional explicit websocket URL in frontend. |
-| CUSTOMIZATION_AGENT_BASE_URL | No | http://127.0.0.1:8010 | Upstream customization backend base URL. |
-| CUSTOMIZATION_BACKEND_URL | No | http://127.0.0.1:8010 | Fallback alias for customization backend base URL. |
-
-Workspace admin unlock accepts one of: allowlisted admin email, `ADMIN_ACCESS_KEY`, `DEPLAI_SERVICE_KEY`, or a workspace `serviceKey` saved in settings.
-
-### Agentic Layer variables
-| Variable | Required | Default | Effect |
-|---|---|---|---|
-| DEPLAI_SERVICE_KEY | Yes | none | Required at startup; validates X-API-Key headers from Connector. |
-| WS_TOKEN_SECRET | No | falls back to DEPLAI_SERVICE_KEY | HMAC key for websocket token verification. |
-| CORS_ORIGINS | No | http://localhost:3000 | Comma-separated CORS allowlist. |
-| ALLOW_GLOBAL_CLEANUP | No | false | Enables destructive /api/cleanup endpoint when true. |
-| DEPLAI_LOCAL_PROJECTS_ROOT | No | Connector/tmp/local-projects and /local-projects fallback | Root for resolving local project source path. |
-| DEPLAI_GITHUB_REPOS_ROOT | No | Connector/tmp/repos and /repos fallback | Root for resolving mirrored GitHub repos. |
-| HOST_PROJECTS_DIR | No | none | Fallback host mount source for local project copy path resolution. |
-| CONTAINER_OP_TIMEOUT | No | 120 | Timeout for Docker volume and clone operations. |
-| SCANNER_TIMEOUT_SECONDS | No | 1800 in Bearer path, 1200 in Syft path | Scan timeout budget. |
-| GRYPE_TIMEOUT_SECONDS | No | 900 | Grype execution timeout. |
-| NEO4J_URI | No | none | Health check connectivity and optional KG path dependency. |
-| NEO4J_USER | No | none | Neo4j auth username. |
-| NEO4J_PASSWORD | No | none | Neo4j auth password. |
-| AWS_ACCESS_KEY_ID | No | none | Optional fallback for AWS cost estimator if credentials omitted in request. |
-| AWS_SECRET_ACCESS_KEY | No | none | Optional fallback for AWS cost estimator if credentials omitted in request. |
-| CLAUDE_API_KEY / ANTHROPIC_API_KEY | Required for Claude-backed flows | none | Architecture generation, remediation, and Claude deployment planning calls. |
-| CLAUDE_MODEL | No | claude-3-7-sonnet-latest | Default Claude model fallback in multiple flows. |
-| CLAUDE_REPO_ANALYZER_MODEL | No | claude-3-5-haiku-20241022 | Repository analysis model override. |
-| CLAUDE_REVIEW_QUESTION_MODEL | No | claude-3-5-haiku-20241022 | Review question generation model override. |
-| CLAUDE_INFRA_PLANNER_MODEL | No | CLAUDE_MODEL fallback | Infra planner model override. |
-| DEPLAI_CLAUDE_MAX_PIPELINE_COST_USD | No | 3.0 | Upper spend guardrail for Claude deployment planning pipeline. |
-| DEPLAI_MAX_REMEDIATION_COST_USD | No | 1.0 | Spend guardrail for remediation loop model calls. |
-| GROQ_API_KEY | No | none | Optional Groq backend for architecture/remediation model calls. |
-| GROQ_BASE_URL | No | https://api.groq.com/openai/v1 | Optional Groq API base override. |
-| OPENROUTER_API_KEY | No | none | Optional OpenRouter backend API key. |
-| OPENROUTER_MODEL | No | none | Default OpenRouter model fallback in backend model loaders. |
-| OPENROUTER_BASE_URL | No | https://openrouter.ai/api/v1 | OpenRouter API base URL. |
-| OPENROUTER_APP_NAME | No | deplai-agentic | OpenRouter app attribution header value. |
-| OLLAMA_API_KEY | No | none | Optional Ollama cloud API key. |
-| OLLAMA_MODEL | No | qwen2.5-coder:7b | Default Ollama model fallback. |
-| REMEDIATION_* tuning variables | No | code defaults | Control remediation loop limits, token budgets, patch safety, and retry behavior. |
-| DEPLAI_FREE_TIER_EC2_TYPES | No | t3.micro,t2.micro | Ordered fallback list for runtime apply EC2 instance type substitution. |
-| DEPLAI_ALLOW_EC2_DISABLE_FALLBACK | No | 1 | Allows runtime apply to continue with EC2 fallback behavior when capacity/quota constraints occur. |
-| DEPLAI_EC2_INSTANCE_TYPE | No | empty | Optional forced EC2 instance type override in runtime apply logic. |
-
-## Running
-### Option A: Docker Compose (recommended for integrated backend)
-```bash
-docker compose up --build
-```
-This starts Agentic Layer on port 8000 with live source mounts defined in docker-compose.yml.
-
-### Option B: Split local dev (frontend + backend)
-Terminal 1 (Agentic Layer):
-```bash
-cd "Agentic Layer"
-.\.venv\Scripts\Activate.ps1
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Terminal 2 (Connector):
-```bash
+In another terminal:
+
+```powershell
 cd Connector
 npm run dev
 ```
-Connector defaults to port 3000.
 
-### Production build (Connector)
-```bash
-cd Connector
-npm run build
-npm run start
-```
+Optional services:
+- start the customization backend if you need tenant customization flows
+- provision Neo4j and Qdrant if you want live KG enrichment instead of degraded fallback behavior
 
-## Testing
-Available tests in repository:
-- Agentic Layer test file: Agentic Layer/test_repository_sources.py
-- Terraform Agent tests: Terraform Agent/agent/tests
+## Documentation
+- [docs/architecture.md](docs/architecture.md)
+- [docs/api-reference.md](docs/api-reference.md)
+- [CHANGELOG.md](CHANGELOG.md)
 
-Example:
-```bash
-cd "Agentic Layer"
-pytest -q
-```
+## Current State
+DeplAI is already a capable multi-track orchestration platform.
 
-## Troubleshooting
-### 1) Backend fails at startup with DEPLAI_SERVICE_KEY error
-Symptom:
-- Agentic Layer raises RuntimeError: DEPLAI_SERVICE_KEY environment variable is not set.
+What is production-shaped:
+- control plane and execution plane separation
+- security scan and remediation loop
+- deployment planning contracts and approval flow
+- AWS runtime apply and runtime inspection
+- tenant customization backend and preview path
 
-Fix:
-- Define DEPLAI_SERVICE_KEY in backend env and pass the same value to Connector.
-
-### 2) WebSocket closes immediately with code 1008
-Symptom:
-- /ws/scan/{project_id} or /ws/remediate/{project_id} closes with Invalid or missing token.
-
-Fix:
-- Ensure Connector /api/scan/ws-token can read WS_TOKEN_SECRET and that project ownership check passes.
-- Verify project_id is included when requesting ws token.
-
-### 3) Connector returns 502 for scan/remediation/planning
-Symptom:
-- Errors such as Agentic Layer is unreachable at AGENTIC_LAYER_URL.
-
-Fix:
-- Confirm AGENTIC_LAYER_URL points to reachable FastAPI service.
-- Verify Docker and Agentic Layer process are running.
-
-### 4) /api/cleanup returns 403
-Symptom:
-- Global cleanup is disabled message.
-
-Fix:
-- Set ALLOW_GLOBAL_CLEANUP=true for Agentic Layer process only when intentional.
-
-### 5) Deployment blocked by budget guardrail
-Symptom:
-- Connector /api/pipeline/deploy returns 422 with blocked=true.
-
-Fix:
-- Increase budget_limit_usd, reduce architecture estimate, or pass budget_override=true explicitly.
-
-### 6) Stage 7 always returns fallback approval payload
-Symptom:
-- warning states Stage7 agent runner not found.
-
-Fix:
-- Agentic Layer currently looks for repo-root/diagram_cost-estimation_agent/run_stage7.py.
-- In this workspace, implemented code exists in Diagram-Cost-Agent, so either align pathing or add expected runtime folder.
-
-## Additional Documentation
-- Architecture deep-dive: docs/architecture.md
-- API reference: docs/api-reference.md
-- Changelog: CHANGELOG.md
+What is still transitional:
+- CloudPosse/Atmos as the primary Terraform renderer
+- multi-cloud runtime execution
+- durable backend persistence for every long-running workflow state
+- full convergence between the experimental Terraform engine and the Connector's default AWS deploy path

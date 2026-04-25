@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 from pathlib import Path
 
 # Add the agent directory to the path
-sys.path.append(str(Path(__file__).parent / "agent"))
+agent_dir = str(Path(__file__).parent / "agent")
+sys.path.insert(0, agent_dir)
 
 # Load environment variables
 load_dotenv()

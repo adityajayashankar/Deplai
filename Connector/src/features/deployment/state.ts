@@ -58,8 +58,35 @@ export interface ArchitectureReviewPayload {
   low_confidence_items: Array<{ field?: string; reason?: string }>;
 }
 
+export interface InfraConsultantMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface InfraConsultantDecision {
+  components: string[];
+  deploy_sequence: string[];
+  stack_config: Record<string, unknown>;
+  outputs_to_capture: string[];
+  consultant_notes?: string[];
+}
+
+export interface InfraConsultantState {
+  workspace: string;
+  history: InfraConsultantMessage[];
+  repo_detection_summary: string;
+  turn_count: number;
+  decision: InfraConsultantDecision | null;
+  summary: string;
+  confirmed: boolean;
+}
+
 export interface DeployApiResult {
   success?: boolean;
+  status?: string;
+  requires_plan_confirmation?: boolean;
+  plan_summary?: Record<string, unknown> | null;
+  deployment_summary?: Record<string, unknown> | null;
   deployment_verified?: boolean;
   verification_checks?: Array<{
     label?: string;
@@ -148,12 +175,31 @@ export interface SavedIacMeta {
   source?: string;
   generated_at?: string;
   has_run?: boolean;
+  requested_renderer?: string;
+  actual_renderer?: string;
+  execution_kind?: string;
+  component_catalog_version?: string;
+  unsupported_reason?: string;
+  decision_applied?: boolean;
+  decision_drift?: Array<{
+    component: string;
+    key: string;
+    expected: unknown;
+    got: unknown;
+  }>;
 }
 
 export interface AwsSessionConfig {
   aws_access_key_id: string;
   aws_secret_access_key: string;
+  aws_session_token: string;
   aws_region: string;
+}
+
+export interface TerraformRuntimeConfig {
+  aws_region: string;
+  state_bucket: string;
+  lock_table: string;
 }
 
 export interface DeploymentInstanceSummary {
@@ -193,16 +239,26 @@ export const DEPLOYMENT_PROFILE_KEY = 'deplai.pipeline.deploymentProfile';
 export const ARCHITECTURE_VIEW_KEY = 'deplai.pipeline.architectureJson';
 export const APPROVAL_PAYLOAD_KEY = 'deplai.pipeline.approvalPayload';
 export const COST_ESTIMATE_KEY = 'deplai.pipeline.costEstimate';
+export const INFRA_CONSULTANT_KEY = 'deplai.pipeline.infraConsultant';
 export const IAC_FILES_KEY = 'deplai.pipeline.iacFiles';
 export const IAC_RUN_KEY = 'deplai.pipeline.iacRun';
 export const IAC_META_KEY = 'deplai.pipeline.iacMeta';
 export const QA_CONTEXT_KEY = 'deplai.pipeline.qaContext';
 export const DEPLOY_STATE_STORAGE_PREFIX = 'deplai.pipeline.deployState.';
 export const DEPLOY_UI_STAGE_STORAGE_PREFIX = 'deplai.deploy.stage.';
+export const TERRAFORM_RUNTIME_STORAGE_PREFIX = 'deplai.pipeline.terraformRuntime.';
 export const DEPLOY_HISTORY_MAX = 20;
+export const DEFAULT_AWS_REGION = 'eu-north-1';
 const IAC_SESSION_MAX_TOTAL_CHARS = 400000;
 const IAC_SESSION_MAX_FILE_CHARS = 80000;
 const IAC_TRUNCATION_NOTE = '\n\n# [truncated in browser session cache]';
+const OBSOLETE_IAC_UI_STORAGE_KEYS = [
+  'deplai.pipeline.iacMode',
+  'deplai.pipeline.iacLlmProvider',
+  'deplai.pipeline.iacLlmModel',
+  'deplai.pipeline.iacLlmApiKey',
+  'deplai.pipeline.iacLlmBaseUrl',
+];
 
 export function hasTruncatedIacFiles(value: unknown): boolean {
   return normalizeIacFileList(value).some((entry) => String(entry.content || '').includes(IAC_TRUNCATION_NOTE));
@@ -303,6 +359,7 @@ export function clearPlanningState(): void {
     ARCHITECTURE_VIEW_KEY,
     APPROVAL_PAYLOAD_KEY,
     COST_ESTIMATE_KEY,
+    INFRA_CONSULTANT_KEY,
     IAC_FILES_KEY,
     IAC_RUN_KEY,
     IAC_META_KEY,
@@ -312,25 +369,84 @@ export function clearPlanningState(): void {
 
 export function readSavedAws(): AwsSessionConfig {
   if (typeof window === 'undefined') {
-    return { aws_access_key_id: '', aws_secret_access_key: '', aws_region: 'eu-north-1' };
+    return { aws_access_key_id: '', aws_secret_access_key: '', aws_session_token: '', aws_region: DEFAULT_AWS_REGION };
   }
   try {
     const raw = sessionStorage.getItem('pipeline.aws');
-    if (!raw) return { aws_access_key_id: '', aws_secret_access_key: '', aws_region: 'eu-north-1' };
+    if (!raw) return { aws_access_key_id: '', aws_secret_access_key: '', aws_session_token: '', aws_region: DEFAULT_AWS_REGION };
     const parsed = JSON.parse(raw) as Partial<AwsSessionConfig>;
     return {
       aws_access_key_id: String(parsed.aws_access_key_id || ''),
       aws_secret_access_key: String(parsed.aws_secret_access_key || ''),
-      aws_region: String(parsed.aws_region || 'eu-north-1'),
+      aws_session_token: String(parsed.aws_session_token || ''),
+      aws_region: String(parsed.aws_region || DEFAULT_AWS_REGION),
     };
   } catch {
-    return { aws_access_key_id: '', aws_secret_access_key: '', aws_region: 'eu-north-1' };
+    return { aws_access_key_id: '', aws_secret_access_key: '', aws_session_token: '', aws_region: DEFAULT_AWS_REGION };
   }
 }
 
 export function writeSavedAws(config: AwsSessionConfig): void {
   if (typeof window === 'undefined') return;
   sessionStorage.setItem('pipeline.aws', JSON.stringify(config));
+}
+
+function normalizeTerraformRuntimeConfig(
+  value: Partial<TerraformRuntimeConfig> | null | undefined,
+  fallbackRegion = DEFAULT_AWS_REGION,
+): TerraformRuntimeConfig {
+  return {
+    aws_region: String(value?.aws_region || fallbackRegion).trim() || fallbackRegion,
+    state_bucket: String(value?.state_bucket || '').trim(),
+    lock_table: String(value?.lock_table || '').trim(),
+  };
+}
+
+export function readSavedTerraformRuntimeConfig(projectId: string): TerraformRuntimeConfig | null {
+  if (typeof window === 'undefined') return null;
+  const normalizedProjectId = String(projectId || '').trim();
+  if (!normalizedProjectId) return null;
+  try {
+    const raw = sessionStorage.getItem(`${TERRAFORM_RUNTIME_STORAGE_PREFIX}${normalizedProjectId}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<TerraformRuntimeConfig>;
+    return normalizeTerraformRuntimeConfig(parsed);
+  } catch {
+    return null;
+  }
+}
+
+export function resolveTerraformRuntimeConfig(
+  projectId: string,
+  options?: {
+    aws?: Partial<AwsSessionConfig> | null;
+    savedRun?: SavedIacRun | null;
+  },
+): TerraformRuntimeConfig {
+  const existing = readSavedTerraformRuntimeConfig(projectId);
+  if (existing) return existing;
+  return normalizeTerraformRuntimeConfig({
+    aws_region: String(options?.aws?.aws_region || DEFAULT_AWS_REGION).trim() || DEFAULT_AWS_REGION,
+    state_bucket: String(options?.savedRun?.state_bucket || '').trim(),
+    lock_table: String(options?.savedRun?.lock_table || '').trim(),
+  });
+}
+
+export function writeSavedTerraformRuntimeConfig(projectId: string, config: TerraformRuntimeConfig): void {
+  if (typeof window === 'undefined') return;
+  const normalizedProjectId = String(projectId || '').trim();
+  if (!normalizedProjectId) return;
+  sessionStorage.setItem(
+    `${TERRAFORM_RUNTIME_STORAGE_PREFIX}${normalizedProjectId}`,
+    JSON.stringify(normalizeTerraformRuntimeConfig(config)),
+  );
+}
+
+export function clearObsoleteTerraformUiState(): void {
+  if (typeof window === 'undefined') return;
+  for (const key of OBSOLETE_IAC_UI_STORAGE_KEYS) {
+    localStorage.removeItem(key);
+  }
 }
 
 export function readSavedIacRun(): SavedIacRun | null {
@@ -368,6 +484,26 @@ export function readSavedIacMeta(): SavedIacMeta | null {
       source: String(parsed.source || '').trim() || undefined,
       generated_at: String(parsed.generated_at || '').trim() || undefined,
       has_run: parsed.has_run === true,
+      requested_renderer: String(parsed.requested_renderer || '').trim() || undefined,
+      actual_renderer: String(parsed.actual_renderer || '').trim() || undefined,
+      execution_kind: String(parsed.execution_kind || '').trim() || undefined,
+      component_catalog_version: String(parsed.component_catalog_version || '').trim() || undefined,
+      unsupported_reason: String(parsed.unsupported_reason || '').trim() || undefined,
+      decision_applied: typeof parsed.decision_applied === 'boolean' ? parsed.decision_applied : undefined,
+      decision_drift: Array.isArray(parsed.decision_drift)
+        ? parsed.decision_drift
+          .filter((item) => item && typeof item === 'object')
+          .map((item) => {
+            const row = item as Record<string, unknown>;
+            return {
+              component: String(row.component || '').trim(),
+              key: String(row.key || '').trim(),
+              expected: row.expected,
+              got: row.got,
+            };
+          })
+          .filter((item) => item.component.length > 0 && item.key.length > 0)
+        : undefined,
     };
   } catch {
     return null;

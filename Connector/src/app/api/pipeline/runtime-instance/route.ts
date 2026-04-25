@@ -6,6 +6,7 @@ interface RuntimeInstanceBody {
   project_id?: string;
   aws_access_key_id?: string;
   aws_secret_access_key?: string;
+  aws_session_token?: string;
   aws_region?: string;
   instance_id?: string;
   action?: string;
@@ -27,6 +28,7 @@ export async function POST(req: NextRequest) {
 
     const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
     const awsSecretAccessKey = String(body.aws_secret_access_key || '').trim();
+    const awsSessionToken = String(body.aws_session_token || '').trim();
     const awsRegion = String(body.aws_region || 'eu-north-1').trim() || 'eu-north-1';
     const instanceId = String(body.instance_id || '').trim();
     const action = String(body.action || '').trim().toLowerCase();
@@ -53,6 +55,7 @@ export async function POST(req: NextRequest) {
         project_name: projectName,
         aws_access_key_id: awsAccessKeyId,
         aws_secret_access_key: awsSecretAccessKey,
+        aws_session_token: awsSessionToken || undefined,
         aws_region: awsRegion,
         instance_id: instanceId,
         action,

@@ -23,10 +23,10 @@ export async function POST(request: NextRequest) {
     const owned = await verifyProjectOwnership(user.id, projectId);
     if ('error' in owned) return owned.error;
 
-    const files = Array.isArray(body.files)
+    const files: IacRepoFile[] = Array.isArray(body.files)
       ? body.files
         .filter((file) => file && typeof file === 'object')
-        .map((file) => ({
+        .map<IacRepoFile>((file) => ({
           path: String(file.path || '').trim(),
           content: String(file.content || ''),
           encoding: file.encoding === 'base64' ? 'base64' : 'utf-8',

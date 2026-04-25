@@ -79,6 +79,8 @@ Customization Agent/tenant_builder_app/backend/tenants/
 # KGagent data and config files — needed as Neo4j fallback and for agent config
 !KGagent/**/*.json
 !KGagent/**/*.jsonl
+!Terraform Agent/agent/engine/cloudposse_component_catalog.json
 
 #IDEA IDE
 .idea/
+.kiro/

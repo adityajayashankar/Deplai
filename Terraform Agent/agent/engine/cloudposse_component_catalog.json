@@ -1,0 +1,52 @@
+{
+  "catalog_version": "2026.04.16-v1",
+  "mapping_version": "cloudposse-atmos-v1",
+  "owner": "@senior-infra-team",
+  "upgrade_policy": {
+    "scheduled_review": "monthly",
+    "security_patch_review_sla": "2 business days",
+    "breaking_changes": "Require a new renderer mapping version and regression tests before becoming default."
+  },
+  "components": {
+    "account-map": {
+      "source": "github.com/cloudposse-terraform-components/aws-account-map.git",
+      "version": "v1.535.1",
+      "commit": "a69b47ecca8dabcdeccd54a60febee3fd92d430b",
+      "expected_inputs": ["namespace", "tenant", "stage", "region"]
+    },
+    "vpc": {
+      "source": "github.com/cloudposse-terraform-components/aws-vpc.git",
+      "version": "1.6.0",
+      "commit": "f2438208dcac537c96475e3d2c4df96ed6d1fabf",
+      "expected_inputs": ["region", "namespace", "stage", "name", "cidr_block"]
+    },
+    "s3_cloudfront": {
+      "source": "github.com/cloudposse-terraform-components/aws-spa-s3-cloudfront.git",
+      "version": "v1.535.1",
+      "commit": "d2752b0f39345db83fafe53aad051ab0bc690128",
+      "expected_inputs": ["region", "namespace", "stage", "name"]
+    },
+    "ecs": {
+      "source": "github.com/cloudposse-terraform-components/aws-ecs-service.git",
+      "version": "v1.535.1",
+      "commit": "f4585c99bbf9cfc3b81f679dbc8c13f4c95e7b14",
+      "expected_inputs": ["region", "namespace", "stage", "name", "container_port"]
+    },
+    "rds": {
+      "source": "github.com/cloudposse-terraform-components/aws-rds.git",
+      "version": "v1.535.1",
+      "commit": "274e351915b95be3f37da3ed0a621d01da21c6c9",
+      "expected_inputs": ["region", "namespace", "stage", "name", "engine"]
+    },
+    "elasticache": {
+      "source": "github.com/cloudposse-terraform-components/aws-elasticache-redis.git",
+      "version": "v1.535.1",
+      "commit": "2e7cedc71a56d4b5b7c916b2ef9dca8f9488d202",
+      "expected_inputs": ["region", "namespace", "stage", "name", "engine"]
+    }
+  },
+  "deploy_sequences": {
+    "s3_cloudfront": ["s3_cloudfront"],
+    "ecs_fargate": ["account-map", "vpc", "rds", "elasticache", "ecs"]
+  }
+}

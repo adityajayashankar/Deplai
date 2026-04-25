@@ -48,6 +48,45 @@ def get_model() -> str:
         return "gpt-3.5-turbo"
 
 
+def has_llm_credentials() -> bool:
+    return any(
+        str(os.environ.get(name, "")).strip()
+        for name in ("OPENAI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "CLAUDE_API_KEY", "XAI_API_KEY")
+    )
+
+
+def chat_text(
+    *,
+    system_prompt: str,
+    messages: list[dict[str, str]] | None = None,
+    user_prompt: str | None = None,
+    temperature: float = 0.2,
+) -> str:
+    client = get_llm_client()
+    model = get_model()
+    request_messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    if messages:
+        for message in messages:
+            role = str(message.get("role") or "").strip().lower()
+            content = str(message.get("content") or "").strip()
+            if role not in {"user", "assistant"} or not content:
+                continue
+            request_messages.append({"role": role, "content": content})
+    elif user_prompt is not None:
+        request_messages.append({"role": "user", "content": user_prompt})
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            messages=request_messages,
+        )
+        return str(response.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"Error calling LLM API: {str(e)}")
+        return ""
+
+
 def chat_json(system_prompt: str, user_prompt: str) -> dict[str, Any]:
     client = get_llm_client()
     model = get_model()

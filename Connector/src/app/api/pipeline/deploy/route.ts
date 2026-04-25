@@ -30,7 +30,10 @@ interface DeployBody {
   files?: GeneratedFile[];
   aws_access_key_id?: string;
   aws_secret_access_key?: string;
+  aws_session_token?: string;
   aws_region?: string;
+  confirm_plan_summary?: boolean;
+  user_answers?: Record<string, unknown>;
   enforce_free_tier_ec2?: boolean;
   estimated_monthly_usd?: number;
   budget_limit_usd?: number;
@@ -371,6 +374,44 @@ function normalizeScalar(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function buildDeploymentSummary(params: {
+  outputs: Record<string, unknown> | null | undefined;
+  normalizedRuntime: ReturnType<typeof normalizeDeploymentRuntime>;
+}): {
+  status: 'deployed';
+  resources: Record<string, string | null>;
+  next_steps: string[];
+} {
+  const outputs = params.outputs || {};
+  const cloudfrontDomain = extractOutputString(outputs, ['cloudfront_domain', 'cloudfront_domain_name']);
+  const cloudfrontUrl = params.normalizedRuntime.cdn.cloudfront_url
+    || extractOutputString(outputs, ['cloudfront_url'])
+    || (cloudfrontDomain ? `https://${cloudfrontDomain}` : null);
+  const albDns = extractOutputString(outputs, ['alb_dns_name', 'alb_url']);
+  const albUrl = albDns
+    ? (albDns.startsWith('http://') || albDns.startsWith('https://') ? albDns : `http://${albDns}`)
+    : null;
+  const rdsEndpoint = extractOutputString(outputs, ['rds_endpoint', 'postgres_endpoint', 'db_endpoint']);
+  const vpcId = extractOutputString(outputs, ['vpc_id', 'ec2_vpc_id']) || params.normalizedRuntime.network.vpc_id;
+  const ecsCluster = extractOutputString(outputs, ['ecs_cluster_name', 'ecs_cluster']);
+
+  return {
+    status: 'deployed',
+    resources: {
+      app_url: cloudfrontUrl || albUrl,
+      alb_url: albUrl,
+      rds_endpoint: rdsEndpoint,
+      vpc_id: vpcId,
+      ecs_cluster: ecsCluster,
+    },
+    next_steps: [
+      'Point your domain DNS to the ALB URL',
+      'Add your app environment variables to ECS task definition',
+      'RDS is in private subnet - connect via bastion or VPN',
+    ],
+  };
+}
+
 function extractInstanceIdFromRuntimeDetails(runtimeDetails: Record<string, unknown> | null | undefined): string | null {
   if (!runtimeDetails || typeof runtimeDetails !== 'object') return null;
   const instance = runtimeDetails.instance;
@@ -620,6 +661,12 @@ function containsAwsInstanceResource(files: GeneratedFile[]): boolean {
 }
 
 function detectStaleAwsTerraformBundle(files: GeneratedFile[]): string[] {
+  const normalizedPaths = new Set(files.map((file) => normalizePath(String(file.path || ''))));
+  const isCloudPosseAtmosBundle = normalizedPaths.has('atmos.yaml')
+    && normalizedPaths.has('vendor.yaml')
+    && normalizedPaths.has('.deplai/cloudposse-component-lock.json');
+  if (isCloudPosseAtmosBundle) return [];
+
   const tfFiles = files
     .filter((file) => normalizePath(String(file.path || '')).toLowerCase().endsWith('.tf'))
     .map((file) => String(file.content || ''));
@@ -769,8 +816,25 @@ export async function POST(req: NextRequest) {
 
       const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
       const awsSecretAccessKey = String(body.aws_secret_access_key || '').trim();
-      const awsRegion = String(body.aws_region || 'eu-north-1').trim() || 'eu-north-1';
+      const awsSessionToken = String(body.aws_session_token || '').trim();
+      const answerRegion = Array.isArray(body.user_answers?.regions)
+        ? String(body.user_answers?.regions?.[0] || '').trim()
+        : '';
+      const awsRegion = String(body.aws_region || answerRegion || 'eu-north-1').trim() || 'eu-north-1';
       const enforceFreeTierEc2 = body.enforce_free_tier_ec2 !== false;
+      if (!awsAccessKeyId || !awsSecretAccessKey) {
+        return NextResponse.json(
+          {
+            error: 'AWS credentials are required before runtime deployment can start.',
+            requires_credentials: true,
+            missing: [
+              ...(!awsAccessKeyId ? ['AWS_ACCESS_KEY_ID'] : []),
+              ...(!awsSecretAccessKey ? ['AWS_SECRET_ACCESS_KEY'] : []),
+            ],
+          },
+          { status: 400 },
+        );
+      }
 
       const applyRequest = {
         project_id: projectId,
@@ -783,8 +847,10 @@ export async function POST(req: NextRequest) {
         files: baseFiles,
         aws_access_key_id: awsAccessKeyId,
         aws_secret_access_key: awsSecretAccessKey,
+        aws_session_token: awsSessionToken,
         aws_region: awsRegion,
         enforce_free_tier_ec2: enforceFreeTierEc2,
+        confirm_plan_summary: body.confirm_plan_summary === true,
       };
       let agenticRes: Response | null = null;
       let recoveredApplyResult: Record<string, unknown> | null = null;
@@ -833,9 +899,39 @@ export async function POST(req: NextRequest) {
         ...((applyData.details as Record<string, unknown> | null | undefined) ?? {}),
         ...(applyTransportRecovered ? { apply_transport_recovered: true } : {}),
       };
+      const applyStatus = String(applyData.status || '').trim().toLowerCase();
       const runtimeOutputPayload = (applyData.outputs as Record<string, unknown> | null | undefined) ?? undefined;
+      if (applyStatus === 'awaiting_plan_confirmation') {
+        return NextResponse.json({
+          success: true,
+          provider,
+          project_id: projectId,
+          mode: 'runtime_apply',
+          status: 'awaiting_plan_confirmation',
+          requires_plan_confirmation: true,
+          plan_summary: applyData.plan_summary || applyDetails.plan_summary || null,
+          details: applyDetails,
+          ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
+        });
+      }
       if ((agenticRes && !agenticRes.ok) || applyData.success !== true) {
         const upstreamError = String(applyData.error || 'Runtime Terraform apply failed.');
+        const missingPolicies = Array.isArray(applyDetails.missing_policies)
+          ? applyDetails.missing_policies.map((item) => String(item)).filter(Boolean)
+          : [];
+        if (missingPolicies.length > 0 || /IAM pre-flight failed/i.test(upstreamError)) {
+          return NextResponse.json(
+            {
+              error: 'IAM pre-flight failed. Attach the listed policies before deployment.',
+              missing_policies: missingPolicies,
+              required_policies: Array.isArray(applyDetails.required_policies)
+                ? applyDetails.required_policies
+                : missingPolicies,
+              details: applyDetails,
+            },
+            { status: 400 },
+          );
+        }
         if (provider === 'aws' && awsAccessKeyId && awsSecretAccessKey && isRecoverableEc2StateFailure(upstreamError)) {
           const recoveredRuntimeDetails = await fetchAwsRuntimeDetails({
             projectName,
@@ -894,6 +990,11 @@ export async function POST(req: NextRequest) {
               ec2: normalizedRuntime.ec2,
               network: normalizedRuntime.network,
               cdn: normalizedRuntime.cdn,
+              status: 'deployed',
+              deployment_summary: buildDeploymentSummary({
+                outputs: runtimeOutputPayload ?? {},
+                normalizedRuntime,
+              }),
               deployment_verified: true,
               verification_checks: verification.checks,
               recovered_from_apply_error: true,
@@ -1000,6 +1101,11 @@ export async function POST(req: NextRequest) {
         ec2: normalizedRuntime.ec2,
         network: normalizedRuntime.network,
         cdn: normalizedRuntime.cdn,
+        status: 'deployed',
+        deployment_summary: buildDeploymentSummary({
+          outputs: runtimeOutputPayload ?? {},
+          normalizedRuntime,
+        }),
         deployment_verified: true,
         verification_checks: verification.checks,
         ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
