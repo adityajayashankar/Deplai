@@ -757,7 +757,7 @@ export async function POST(req: NextRequest) {
     const runId = String(body.run_id || '').trim();
     const workspace = String(body.workspace || '').trim();
     const baseFiles = Array.isArray(body.files) ? body.files : [];
-    const useRunReference = runtimeMode && baseFiles.length === 0 && Boolean(runId && workspace);
+    const useRunReference = runtimeMode && Boolean(runId && workspace);
     if (baseFiles.length === 0 && !useRunReference) {
       return NextResponse.json(
         { error: 'No generated IaC files provided. Generate Terraform/Ansible first.' },
@@ -765,7 +765,7 @@ export async function POST(req: NextRequest) {
       );
     }
     const MAX_FILES = runtimeMode ? 3000 : 120;
-    const MAX_FILE_BYTES = runtimeMode ? 8_000_000 : 700_000;
+    const MAX_FILE_BYTES = runtimeMode ? 12_000_000 : 700_000;
     const MAX_TOTAL_BYTES = runtimeMode ? 35_000_000 : 8_000_000;
 
     if (baseFiles.length > MAX_FILES) {
@@ -844,7 +844,7 @@ export async function POST(req: NextRequest) {
         workspace: useRunReference ? workspace || undefined : undefined,
         state_bucket: String(body.state_bucket || '').trim() || undefined,
         lock_table: String(body.lock_table || '').trim() || undefined,
-        files: baseFiles,
+        files: useRunReference ? [] : baseFiles,
         aws_access_key_id: awsAccessKeyId,
         aws_secret_access_key: awsSecretAccessKey,
         aws_session_token: awsSessionToken,

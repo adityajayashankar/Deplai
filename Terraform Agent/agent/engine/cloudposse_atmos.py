@@ -502,6 +502,41 @@ def _should_force_best_guess_decision(conversation_history: list[dict[str, str]]
     return repeated_loop_questions >= 2
 
 
+def _consultant_fallback_result(
+    payload: dict[str, Any],
+    *,
+    aws_region: str,
+    repo_detection_summary: str,
+    turn_count: int,
+    reason: str,
+) -> dict[str, Any]:
+    catalog = load_component_catalog()
+    fallback = _fallback_component_decision(payload, aws_region=aws_region)
+    normalized = _normalize_component_decision(fallback, catalog=catalog, aws_region=aws_region)
+    components = ", ".join(_string_list(normalized.get("components"))) or "ec2-instance"
+    sequence = " -> ".join(_string_list(normalized.get("deploy_sequence"))) or components
+    notes = _string_list(normalized.get("consultant_notes"))
+    note_line = f"\nNotes: {' | '.join(notes)}" if notes else ""
+    reason_text = str(reason or "LLM consultant unavailable").strip()
+    assistant_message = (
+        f"I could not use the live consultant response ({reason_text}), so I generated a deterministic AWS deployment decision from repository analysis.\n\n"
+        f"AWS region: {aws_region or 'unknown'}\n"
+        f"Components: {components}\n"
+        f"Deploy order: {sequence}"
+        f"{note_line}\n\n"
+        "Review this plan. Choose Build this to continue, or ask for a change if you want a different component set."
+    )
+    return {
+        "success": True,
+        "assistant_message": assistant_message,
+        "ready": True,
+        "decision": normalized,
+        "repo_detection_summary": repo_detection_summary,
+        "turn_count": max(0, int(turn_count or 0)) + 1,
+        "fallback_reason": reason_text,
+    }
+
+
 def consultant_conversation_turn(
     payload: dict[str, Any],
     *,
@@ -510,18 +545,31 @@ def consultant_conversation_turn(
     turn_count: int = 0,
     force_decision: bool = False,
 ) -> dict[str, Any]:
+    repo_detection_summary = _build_repo_detection_summary(payload, aws_region=aws_region)
+    effective_turn_count = max(0, int(turn_count or 0))
     try:
         from models.llm_config import chat_text, has_llm_credentials  # type: ignore
     except Exception:
         try:
             from terraform_agent.agent.models.llm_config import chat_text, has_llm_credentials  # type: ignore
         except Exception:
-            return {"success": False, "error": "Infra consultant LLM helpers are unavailable."}
+            return _consultant_fallback_result(
+                payload,
+                aws_region=aws_region,
+                repo_detection_summary=repo_detection_summary,
+                turn_count=effective_turn_count,
+                reason="LLM helpers are unavailable",
+            )
 
     if not has_llm_credentials():
-        return {"success": False, "error": "Infra consultant requires a configured LLM backend."}
+        return _consultant_fallback_result(
+            payload,
+            aws_region=aws_region,
+            repo_detection_summary=repo_detection_summary,
+            turn_count=effective_turn_count,
+            reason="LLM backend is not configured",
+        )
 
-    repo_detection_summary = _build_repo_detection_summary(payload, aws_region=aws_region)
     system_prompt = _consultant_system_prompt(repo_detection_summary)
     messages: list[dict[str, str]] = []
     for item in conversation_history or []:
@@ -529,7 +577,6 @@ def consultant_conversation_turn(
         content = str(item.get("content") or "").strip()
         if role in {"user", "assistant"} and content:
             messages.append({"role": role, "content": content})
-    effective_turn_count = max(0, int(turn_count or 0))
     auto_force_best_guess = _should_force_best_guess_decision(conversation_history)
     if force_decision or auto_force_best_guess or effective_turn_count >= MAX_CONSULTANT_TURNS:
         if auto_force_best_guess and not force_decision:
@@ -542,7 +589,13 @@ def consultant_conversation_turn(
         messages.append({"role": "user", "content": "You have enough context. Output your decision now."})
     response_text = chat_text(system_prompt=system_prompt, messages=messages, temperature=0.2)
     if not response_text:
-        return {"success": False, "error": "Infra consultant returned an empty response."}
+        return _consultant_fallback_result(
+            payload,
+            aws_region=aws_region,
+            repo_detection_summary=repo_detection_summary,
+            turn_count=effective_turn_count,
+            reason="empty response",
+        )
 
     assistant_message, decision = _extract_marked_decision(response_text)
     result: dict[str, Any] = {

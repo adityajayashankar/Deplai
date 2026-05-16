@@ -3,13 +3,16 @@ import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { validateTerraformArchitectureInput } from '@/lib/deployment-planning-contract';
 import { type RepoPersistenceResult } from '@/lib/iac-pr';
-import { resolveProjectSourceRoot as resolveSharedProjectSourceRoot } from '@/lib/project-meta';
+import {
+  resolveProjectMeta,
+  resolveProjectSourceRoot as resolveSharedProjectSourceRoot,
+} from '@/lib/project-meta';
 import fs from 'fs';
 import path from 'path';
 
 type Provider = 'aws' | 'azure' | 'gcp';
 type IacMode = 'deterministic' | 'llm';
-type TerraformRenderer = 'auto' | 'cloudposse_atmos' | 'deplai_deterministic';
+type TerraformRenderer = 'auto' | 'cloudposse_atmos' | 'deplai_deterministic' | 'deplai_ec2_app';
 
 interface ScanResultsData {
   supply_chain?: Array<{ cve_id?: string; severity?: string; fix_version?: string }>;
@@ -367,19 +370,6 @@ function inferRepositoryDetection(params: {
   };
 }
 
-function normalizeConsultantHistory(value: unknown): Array<{ role: 'user' | 'assistant'; content: string }> {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((item) => {
-      const entry = asRecord(item);
-      const role = String(entry.role || '').trim().toLowerCase();
-      const content = String(entry.content || '').trim();
-      if ((role !== 'user' && role !== 'assistant') || !content) return null;
-      return { role: role as 'user' | 'assistant', content };
-    })
-    .filter((item): item is { role: 'user' | 'assistant'; content: string } => item !== null);
-}
-
 function summarizeConsultantDecision(
   decisionInput: Record<string, unknown>,
   detected: RepoDetectionSummary,
@@ -435,6 +425,133 @@ function summarizeConsultantDecision(
   }
 
   return lines.join('\n');
+}
+
+function buildRepoDetectionSummaryText(detected: RepoDetectionSummary): string {
+  const database = detected.has_database
+    ? `${detected.database_type || 'database'} required`
+    : 'not detected';
+  return [
+    `Language: ${detected.language || 'unknown'}`,
+    `Framework: ${detected.framework || 'unknown'}`,
+    `Compute strategy: ec2-instance`,
+    `Database: ${database}`,
+    `Redis/cache: ${detected.has_redis ? 'required' : 'not detected'}`,
+    `Workers: ${detected.has_workers ? 'detected' : 'not detected'}`,
+    `Static assets: ${detected.has_static_assets ? 'detected' : 'not detected'}`,
+    `Dockerfile: ${detected.has_dockerfile ? 'detected' : 'not detected'}`,
+    `Queue: ${detected.has_queue ? 'detected' : 'not detected'}`,
+  ].join('\n');
+}
+
+function buildDeterministicConsultantDecision(params: {
+  detected: RepoDetectionSummary;
+  deploymentProfile: Record<string, unknown> | null;
+  userAnswers: Record<string, unknown>;
+  awsRegion: string;
+}): Record<string, unknown> {
+  const deployment = asRecord(params.deploymentProfile);
+  const compute = asRecord(deployment.compute);
+  const services = asRecords(compute.services);
+  const primaryService = services[0] || {};
+  const dataLayer = asRecords(deployment.data_layer);
+  const userAnswers = asRecord(params.userAnswers);
+  const requestedInstanceType = String(
+    userAnswers.instance_type
+    || userAnswers.ec2_instance_type
+    || userAnswers.compute_instance_type
+    || 't3.micro',
+  ).trim().toLowerCase();
+  const instanceType = ['t3.micro', 't3.small', 't3.medium', 't3.large'].includes(requestedInstanceType)
+    ? requestedInstanceType
+    : 't3.micro';
+  const appPort = Number(primaryService.port || userAnswers.app_port || 3000);
+  const safeAppPort = Number.isFinite(appPort) && appPort > 0 ? Math.round(appPort) : 3000;
+  const hasRds = params.detected.has_database || dataLayer.some((item) => {
+    const type = String(item.type || '').trim().toLowerCase();
+    return ['postgresql', 'postgres', 'mysql', 'mariadb'].includes(type);
+  });
+  const hasRedis = params.detected.has_redis || dataLayer.some((item) => String(item.type || '').trim().toLowerCase() === 'redis');
+  const databaseType = String(params.detected.database_type || '').trim().toLowerCase();
+  const databaseEngine = ['mysql', 'mariadb'].includes(databaseType) ? databaseType : 'postgres';
+  const components = ['ec2-instance'];
+  if (hasRds) components.push('rds');
+  if (hasRedis) components.push('elasticache');
+
+  const stackConfig: Record<string, unknown> = {
+    'ec2-instance': {
+      instance_type: instanceType,
+      app_port: safeAppPort,
+      aws_region: params.awsRegion || 'eu-north-1',
+      public_http: true,
+      ssh_access: true,
+      security_group_rules: [
+        { type: 'ingress', from_port: 80, to_port: 80, protocol: 'tcp', cidr_blocks: ['0.0.0.0/0'] },
+        { type: 'ingress', from_port: 443, to_port: 443, protocol: 'tcp', cidr_blocks: ['0.0.0.0/0'] },
+        { type: 'ingress', from_port: 22, to_port: 22, protocol: 'tcp', cidr_blocks: ['0.0.0.0/0'] },
+        { type: 'egress', from_port: 0, to_port: 0, protocol: '-1', cidr_blocks: ['0.0.0.0/0'] },
+      ],
+    },
+  };
+
+  if (hasRds) {
+    stackConfig.rds = {
+      engine: databaseEngine,
+      engine_version: databaseEngine === 'mysql' ? '8.0' : databaseEngine === 'mariadb' ? '10.11' : '15.3',
+      instance_class: 'db.t3.micro',
+      multi_az: false,
+      backup_retention_period: 7,
+      deletion_protection: false,
+      publicly_accessible: false,
+    };
+  }
+
+  if (hasRedis) {
+    stackConfig.elasticache = {
+      engine: 'redis',
+      node_type: 'cache.t4g.micro',
+    };
+  }
+
+  return {
+    components,
+    deploy_sequence: [...components],
+    stack_config: stackConfig,
+    outputs_to_capture: [
+      'ec2_instance_id',
+      'ec2_public_ip',
+      'ec2_public_dns',
+      'ec2_key_name',
+      'generated_ec2_private_key_pem',
+      ...(hasRds ? ['rds_endpoint'] : []),
+      ...(hasRedis ? ['redis_endpoint'] : []),
+    ],
+    consultant_notes: [
+      'Deterministic consultant fallback selected an EC2-first runtime deploy plan.',
+      params.detected.has_static_assets
+        ? 'Static assets were detected, but the first-success deploy path serves them from EC2/nginx.'
+        : 'No static asset bundle was required for the infrastructure decision.',
+      params.detected.has_workers
+        ? 'Worker processes were detected; run them on the EC2 host until a dedicated queue/worker tier is explicitly added.'
+        : 'No dedicated worker tier was detected.',
+    ],
+  };
+}
+
+function buildDeterministicConsultantMessage(params: {
+  decision: Record<string, unknown>;
+  detected: RepoDetectionSummary;
+  awsRegion: string;
+  fallbackReason?: string;
+}): string {
+  const reason = String(params.fallbackReason || '').trim();
+  return [
+    reason ? `I could not use the live consultant response (${reason}), so I generated a deterministic deployment decision from the repository analysis.` : 'I generated a deterministic deployment decision from the repository analysis.',
+    '',
+    summarizeConsultantDecision(params.decision, params.detected, params.awsRegion),
+    '',
+    'Review this plan. Choose Build this to continue, or ask for a change if you want a different component set.',
+  ].join('\n');
 }
 
 function defaultWebsiteHtml(projectName: string, hintMessage?: string): string {
@@ -843,11 +960,40 @@ function resolvePrimaryWebsiteHtmlFromAssets(assets: WebsiteAsset[]): WebsiteEnt
   };
 }
 
-async function resolveProjectSourceRoot(
+interface ProjectSourceRoots {
+  connectorRoot: string;
+  agenticRoot: string;
+}
+
+async function resolveProjectSourceRoots(
   userId: string,
   projectId: string,
-): Promise<string | null> {
-  return resolveSharedProjectSourceRoot(userId, projectId);
+): Promise<ProjectSourceRoots | null> {
+  const connectorRoot = await resolveSharedProjectSourceRoot(userId, projectId);
+  if (!connectorRoot) return null;
+
+  const meta = await resolveProjectMeta(userId, projectId);
+  if (meta?.project_type === 'github' && meta.repo_full_name) {
+    const [owner, repo] = meta.repo_full_name.split('/');
+    if (owner && repo) {
+      return {
+        connectorRoot,
+        agenticRoot: `/repos/${owner}/${repo}`,
+      };
+    }
+  }
+
+  if (meta?.project_type === 'local') {
+    return {
+      connectorRoot,
+      agenticRoot: `/local-projects/${userId}/${projectId}`,
+    };
+  }
+
+  return {
+    connectorRoot,
+    agenticRoot: connectorRoot,
+  };
 }
 
 function clampProvider(value: string | undefined): Provider {
@@ -862,9 +1008,11 @@ function clampIacMode(value: string | undefined): IacMode {
 
 function clampTerraformRenderer(value: string | undefined): TerraformRenderer {
   const renderer = String(value || '').trim().toLowerCase();
+  if (renderer === 'deplai_ec2_app') return 'deplai_ec2_app';
   if (renderer === 'deplai_deterministic') return 'deplai_deterministic';
   if (renderer === 'cloudposse_atmos') return 'cloudposse_atmos';
-  return 'deplai_deterministic';
+  if (renderer === 'auto') return 'auto';
+  return 'deplai_ec2_app';
 }
 
 function isAllowedGeneratedIacPath(safePath: string): boolean {
@@ -888,7 +1036,7 @@ function dedupeGeneratedFiles(files: GeneratedFile[]): GeneratedFile[] {
     if (!isAllowedGeneratedIacPath(safePath)) continue;
     const content = String(file.content || '');
     if (!content) continue;
-    if (content.length > 900_000) continue;
+    if (content.length > 12_000_000) continue;
     byPath.set(safePath, {
       path: safePath,
       content,
@@ -1012,6 +1160,8 @@ async function generateIacBundleWithTerraformAgent(params: {
   userAnswers?: Record<string, unknown> | null;
   consultantDecision?: Record<string, unknown> | null;
   terraformRenderer?: TerraformRenderer;
+  sourceRoot?: string | null;
+  sourceRootCandidates?: string[];
 }): Promise<{
   files: GeneratedFile[];
   source: string;
@@ -1032,6 +1182,7 @@ async function generateIacBundleWithTerraformAgent(params: {
   executionKind: string | null;
   llmIacCalls: number;
   llmIacDisabled: boolean;
+  deploymentPackageId: string | null;
   decisionApplied: boolean;
   decisionDrift: Array<{
     component: string;
@@ -1068,6 +1219,8 @@ async function generateIacBundleWithTerraformAgent(params: {
       consultant_decision: params.consultantDecision || undefined,
       terraform_renderer: params.terraformRenderer || 'auto',
       website_index_html: params.websiteIndexHtml,
+      source_root: params.sourceRoot || undefined,
+      source_root_candidates: params.sourceRootCandidates || undefined,
     }),
   }, {
     timeoutMs: 600_000,
@@ -1098,6 +1251,7 @@ async function generateIacBundleWithTerraformAgent(params: {
     execution_kind?: string | null;
     llm_iac_calls?: number;
     llm_iac_disabled?: boolean;
+    deployment_package_id?: string | null;
     decision_applied?: boolean;
     decision_drift?: Array<{
       component?: unknown;
@@ -1140,6 +1294,7 @@ async function generateIacBundleWithTerraformAgent(params: {
     executionKind: typeof data.execution_kind === 'string' ? data.execution_kind : null,
     llmIacCalls: Number.isFinite(Number(data.llm_iac_calls)) ? Number(data.llm_iac_calls) : 0,
     llmIacDisabled: data.llm_iac_disabled !== false,
+    deploymentPackageId: typeof data.deployment_package_id === 'string' ? data.deployment_package_id : null,
     decisionApplied: data.decision_applied === true,
     decisionDrift: Array.isArray(data.decision_drift)
       ? data.decision_drift
@@ -1206,7 +1361,8 @@ function buildWebsiteSiteFiles(siteAssets: WebsiteAsset[], siteIndexHtml: string
   }));
 }
 
-// Keep the Atmos helper path available while the default AWS renderer uses the EC2 root bundle.
+// Keep helper references explicit; AWS production generation always goes through
+// the Agentic Layer deterministic EC2 app renderer.
 void mergeGeneratedFiles;
 void generateIacBundleWithTerraformAgent;
 void buildWebsiteSiteFiles;
@@ -1220,542 +1376,6 @@ function terraformSafeProjectSlug(value: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 40);
   return slug || 'deplai-project';
-}
-
-function hclString(value: string): string {
-  return JSON.stringify(String(value || ''));
-}
-
-function hclStringList(values: string[]): string {
-  return `[${values.map(hclString).join(', ')}]`;
-}
-
-function numericAnswer(value: unknown): number | null {
-  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.floor(value);
-  const match = String(value || '').match(/\d+/);
-  if (!match) return null;
-  const parsed = Number(match[0]);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
-}
-
-function findAnswerValue(answers: Record<string, unknown>, patterns: RegExp[]): unknown {
-  for (const [key, value] of Object.entries(answers)) {
-    if (patterns.some((pattern) => pattern.test(key))) return value;
-  }
-  for (const value of Object.values(answers)) {
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      const nested = findAnswerValue(value as Record<string, unknown>, patterns);
-      if (nested !== undefined) return nested;
-    }
-  }
-  return undefined;
-}
-
-function inferAwsEc2BundleInputs(params: {
-  projectName: string;
-  awsRegion: string;
-  contextBlock: string;
-  websiteIndexHtml: string;
-  userAnswers: Record<string, unknown>;
-  deploymentProfile: Record<string, unknown> | null;
-  architectureJson: Record<string, unknown> | null;
-  detected: RepoDetectionSummary;
-}): {
-  projectSlug: string;
-  awsRegion: string;
-  environment: string;
-  instanceType: string;
-  appPort: number;
-  preferredAzs: string[];
-  contextSummary: string;
-  websiteIndexHtml: string;
-} {
-  const answers = asRecord(params.userAnswers);
-  const deployment = asRecord(params.deploymentProfile);
-  const architecture = asRecord(params.architectureJson);
-  const compute = asRecord(deployment.compute || architecture.compute);
-  const services = asRecords(compute.services);
-  const firstService = services[0] || {};
-  const appPort =
-    numericAnswer(findAnswerValue(answers, [/app.*port/i, /service.*port/i, /port/i]))
-    || numericAnswer(firstService.port)
-    || (params.detected.framework === 'nextjs' || params.detected.language === 'javascript' || params.detected.language === 'typescript' ? 3000 : 80);
-  const concurrentUsers =
-    numericAnswer(findAnswerValue(answers, [/concurrent/i, /peak.*users?/i, /max.*users?/i, /traffic/i]))
-    || 200;
-  const explicitInstance = String(
-    findAnswerValue(answers, [/instance.*type/i, /ec2.*type/i])
-    || firstService.instance_type
-    || '',
-  ).trim();
-  const instanceType = explicitInstance || (concurrentUsers > 1000 ? 't3.medium' : concurrentUsers > 250 ? 't3.small' : 't3.micro');
-  const environment = String(
-    findAnswerValue(answers, [/environment/i, /stage/i])
-    || deployment.environment
-    || architecture.environment
-    || 'production',
-  ).trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-') || 'production';
-  const awsRegion = String(params.awsRegion || 'eu-north-1').trim() || 'eu-north-1';
-  const preferredAzs = ['a', 'b', 'c'].map((suffix) => `${awsRegion}${suffix}`);
-  return {
-    projectSlug: terraformSafeProjectSlug(params.projectName),
-    awsRegion,
-    environment,
-    instanceType,
-    appPort: Math.max(1, Math.min(65535, appPort)),
-    preferredAzs,
-    contextSummary: params.contextBlock,
-    websiteIndexHtml: params.websiteIndexHtml,
-  };
-}
-
-function buildAwsEc2RootBundle(params: {
-  projectName: string;
-  awsRegion: string;
-  contextBlock: string;
-  sec: ReturnType<typeof summarizeSecurity>;
-  websiteIndexHtml: string;
-  userAnswers: Record<string, unknown>;
-  deploymentProfile: Record<string, unknown> | null;
-  architectureJson: Record<string, unknown> | null;
-  detected: RepoDetectionSummary;
-}): GeneratedFile[] {
-  const inputs = inferAwsEc2BundleInputs({
-    projectName: params.projectName,
-    awsRegion: params.awsRegion,
-    contextBlock: params.contextBlock,
-    websiteIndexHtml: params.websiteIndexHtml,
-    userAnswers: params.userAnswers,
-    deploymentProfile: params.deploymentProfile,
-    architectureJson: params.architectureJson,
-    detected: params.detected,
-  });
-  const ec2HtmlBase64 = Buffer.from(String(inputs.websiteIndexHtml || ''), 'utf-8').toString('base64');
-  const contextSummary = inputs.contextSummary.replace(/\r/g, '');
-  const preferredAzsHcl = hclStringList(inputs.preferredAzs);
-
-  const providersTf = `terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.54"
-    }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.6"
-    }
-    tls = {
-      source  = "hashicorp/tls"
-      version = "~> 4.0"
-    }
-  }
-}
-
-provider "aws" {
-  region = var.aws_region
-}
-`;
-
-  const backendTf = `terraform {
-  backend "local" {}
-}
-`;
-
-  const variablesTf = `variable "project_name" {
-  type    = string
-  default = ${hclString(inputs.projectSlug)}
-}
-
-variable "aws_region" {
-  type    = string
-  default = ${hclString(inputs.awsRegion)}
-}
-
-variable "environment" {
-  type    = string
-  default = ${hclString(inputs.environment)}
-}
-
-variable "instance_type" {
-  type    = string
-  default = ${hclString(inputs.instanceType)}
-}
-
-variable "enable_ec2" {
-  type    = bool
-  default = true
-}
-
-variable "existing_ec2_key_pair_name" {
-  type    = string
-  default = ""
-}
-
-variable "app_port" {
-  type    = number
-  default = ${inputs.appPort}
-}
-
-variable "ingress_cidr_blocks" {
-  type    = list(string)
-  default = ["0.0.0.0/0"]
-}
-
-variable "ssh_ingress_cidr_blocks" {
-  type    = list(string)
-  default = []
-}
-
-variable "preferred_availability_zones" {
-  type    = list(string)
-  default = ${preferredAzsHcl}
-}
-
-variable "use_default_vpc" {
-  type    = bool
-  default = true
-}
-
-variable "vpc_cidr_block" {
-  type    = string
-  default = "10.42.0.0/16"
-}
-
-variable "public_subnet_cidr" {
-  type    = string
-  default = "10.42.1.0/24"
-}
-
-variable "ec2_root_volume_size" {
-  type    = number
-  default = 12
-}
-
-variable "bootstrap_index_html_base64" {
-  type      = string
-  default   = ${hclString(ec2HtmlBase64)}
-  sensitive = true
-}
-
-variable "context_summary" {
-  type    = string
-  default = ""
-}
-`;
-
-  const tfvars = `project_name = ${hclString(inputs.projectSlug)}
-aws_region = ${hclString(inputs.awsRegion)}
-environment = ${hclString(inputs.environment)}
-instance_type = ${hclString(inputs.instanceType)}
-enable_ec2 = true
-existing_ec2_key_pair_name = ""
-app_port = ${inputs.appPort}
-ingress_cidr_blocks = ["0.0.0.0/0"]
-ssh_ingress_cidr_blocks = []
-preferred_availability_zones = ${preferredAzsHcl}
-use_default_vpc = true
-vpc_cidr_block = "10.42.0.0/16"
-public_subnet_cidr = "10.42.1.0/24"
-ec2_root_volume_size = 12
-bootstrap_index_html_base64 = ${hclString(ec2HtmlBase64)}
-context_summary = <<-EOT
-${contextSummary}
-EOT
-`;
-
-  const mainTf = `locals {
-  tags = {
-    Project     = var.project_name
-    Environment = var.environment
-    ManagedBy   = "deplai"
-  }
-}
-
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
-data "aws_vpc" "default" {
-  count   = var.use_default_vpc ? 1 : 0
-  default = true
-}
-
-data "aws_subnets" "default" {
-  count = var.use_default_vpc ? 1 : 0
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default[0].id]
-  }
-}
-
-locals {
-  preferred_azs     = length(var.preferred_availability_zones) > 0 ? [for az in var.preferred_availability_zones : az if contains(data.aws_availability_zones.available.names, az)] : data.aws_availability_zones.available.names
-  selected_az       = length(local.preferred_azs) > 0 ? local.preferred_azs[0] : data.aws_availability_zones.available.names[0]
-  default_subnet_ids = try(data.aws_subnets.default[0].ids, [])
-}
-
-data "aws_subnet" "default_details" {
-  for_each = var.use_default_vpc ? toset(local.default_subnet_ids) : toset([])
-  id       = each.value
-}
-
-locals {
-  preferred_default_subnet_ids = [for subnet in values(data.aws_subnet.default_details) : subnet.id if contains(local.preferred_azs, subnet.availability_zone)]
-  selected_default_subnet_id   = length(local.preferred_default_subnet_ids) > 0 ? local.preferred_default_subnet_ids[0] : (length(local.default_subnet_ids) > 0 ? local.default_subnet_ids[0] : null)
-}
-
-resource "aws_vpc" "main" {
-  count                = var.use_default_vpc ? 0 : 1
-  cidr_block           = var.vpc_cidr_block
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-  tags                 = merge(local.tags, { Name = "\${var.project_name}-vpc" })
-}
-
-resource "aws_internet_gateway" "main" {
-  count  = var.use_default_vpc ? 0 : 1
-  vpc_id = aws_vpc.main[0].id
-  tags   = merge(local.tags, { Name = "\${var.project_name}-igw" })
-}
-
-resource "aws_subnet" "public" {
-  count                   = var.use_default_vpc ? 0 : 1
-  vpc_id                  = aws_vpc.main[0].id
-  cidr_block              = var.public_subnet_cidr
-  availability_zone       = local.selected_az
-  map_public_ip_on_launch = true
-  tags                    = merge(local.tags, { Name = "\${var.project_name}-public-subnet" })
-}
-
-resource "aws_route_table" "public" {
-  count  = var.use_default_vpc ? 0 : 1
-  vpc_id = aws_vpc.main[0].id
-  tags   = merge(local.tags, { Name = "\${var.project_name}-public-rt" })
-}
-
-resource "aws_route" "internet_access" {
-  count                  = var.use_default_vpc ? 0 : 1
-  route_table_id         = aws_route_table.public[0].id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.main[0].id
-}
-
-resource "aws_route_table_association" "public" {
-  count          = var.use_default_vpc ? 0 : 1
-  subnet_id      = aws_subnet.public[0].id
-  route_table_id = aws_route_table.public[0].id
-}
-
-locals {
-  selected_vpc_id             = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
-  selected_instance_subnet_id = var.use_default_vpc ? local.selected_default_subnet_id : aws_subnet.public[0].id
-}
-
-resource "aws_security_group" "web" {
-  name_prefix = "\${var.project_name}-web-"
-  description = "Web access for DeplAI deployment"
-  vpc_id      = local.selected_vpc_id
-  tags        = local.tags
-
-  lifecycle {
-    create_before_destroy = true
-  }
-
-  dynamic "ingress" {
-    for_each = var.ssh_ingress_cidr_blocks
-    content {
-      from_port   = 22
-      to_port     = 22
-      protocol    = "tcp"
-      cidr_blocks = [ingress.value]
-    }
-  }
-
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = var.ingress_cidr_blocks
-  }
-
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = var.ingress_cidr_blocks
-  }
-
-  dynamic "ingress" {
-    for_each = contains([80, 443], var.app_port) ? [] : [var.app_port]
-    content {
-      from_port   = ingress.value
-      to_port     = ingress.value
-      protocol    = "tcp"
-      cidr_blocks = var.ingress_cidr_blocks
-    }
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-resource "random_id" "key_suffix" {
-  byte_length = 4
-  keepers = {
-    project_name = var.project_name
-  }
-}
-
-resource "tls_private_key" "generated" {
-  count     = var.enable_ec2 && trimspace(var.existing_ec2_key_pair_name) == "" ? 1 : 0
-  algorithm = "RSA"
-  rsa_bits  = 4096
-}
-
-resource "aws_key_pair" "generated" {
-  count      = var.enable_ec2 && trimspace(var.existing_ec2_key_pair_name) == "" ? 1 : 0
-  key_name   = "\${var.project_name}-\${random_id.key_suffix.hex}"
-  public_key = tls_private_key.generated[0].public_key_openssh
-  tags       = local.tags
-}
-
-locals {
-  selected_ec2_key_name = !var.enable_ec2 ? null : (
-    trimspace(var.existing_ec2_key_pair_name) != ""
-    ? trimspace(var.existing_ec2_key_pair_name)
-    : try(aws_key_pair.generated[0].key_name, null)
-  )
-}
-
-data "aws_ami" "al2023" {
-  most_recent = true
-  owners      = ["amazon"]
-  filter {
-    name   = "name"
-    values = ["al2023-ami-2023*-x86_64"]
-  }
-  filter {
-    name   = "architecture"
-    values = ["x86_64"]
-  }
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
-resource "aws_instance" "app" {
-  count                       = var.enable_ec2 ? 1 : 0
-  ami                         = data.aws_ami.al2023.id
-  instance_type               = var.instance_type
-  subnet_id                   = local.selected_instance_subnet_id
-  vpc_security_group_ids      = [aws_security_group.web.id]
-  key_name                    = local.selected_ec2_key_name
-  associate_public_ip_address = true
-  tags                        = merge(local.tags, { Name = "\${var.project_name}-app" })
-
-  metadata_options {
-    http_tokens = "required"
-  }
-
-  root_block_device {
-    volume_type = "gp3"
-    volume_size = var.ec2_root_volume_size
-    encrypted   = true
-  }
-
-  user_data_replace_on_change = true
-  user_data = join("\\n", [
-    "#!/bin/bash",
-    "set -euxo pipefail",
-    "dnf install -y nginx",
-    "mkdir -p /usr/share/nginx/html",
-    "cat <<'HTML' > /usr/share/nginx/html/index.html",
-    "\${base64decode(var.bootstrap_index_html_base64)}",
-    "HTML",
-    "systemctl enable nginx",
-    "systemctl restart nginx",
-  ])
-}
-`;
-
-  const outputsTf = `output "ec2_instance_id" { value = try(aws_instance.app[0].id, null) }
-output "ec2_instance_arn" { value = try(aws_instance.app[0].arn, null) }
-output "ec2_instance_state" { value = try(aws_instance.app[0].instance_state, null) }
-output "ec2_instance_type" { value = var.instance_type }
-output "ec2_public_ip" { value = try(aws_instance.app[0].public_ip, null) }
-output "ec2_private_ip" { value = try(aws_instance.app[0].private_ip, null) }
-output "ec2_public_dns" { value = try(aws_instance.app[0].public_dns, null) }
-output "ec2_private_dns" { value = try(aws_instance.app[0].private_dns, null) }
-output "ec2_vpc_id" { value = local.selected_vpc_id }
-output "ec2_subnet_id" { value = local.selected_instance_subnet_id }
-output "ec2_key_name" { value = local.selected_ec2_key_name }
-output "app_url" { value = try("http://\${aws_instance.app[0].public_dns}", null) }
-output "availability_warning" {
-  value = var.environment == "production" && var.enable_ec2 ? "Single-AZ EC2 deployment detected. Add a load balancer and autoscaling group before high-availability production traffic." : ""
-}
-output "generated_ec2_private_key_pem" {
-  value     = try(tls_private_key.generated[0].private_key_pem, null)
-  sensitive = true
-}
-output "security_summary" {
-  value = {
-    code_findings = ${params.sec.totalCodeFindings}
-    supply_findings = ${params.sec.totalSupplyFindings}
-    critical_or_high_supply = ${params.sec.criticalOrHighSupply}
-    high_cwe = ${hclString(params.sec.highCwe.join(', ') || 'none')}
-  }
-}
-`;
-
-  const ansiblePlaybook = `---
-- name: Baseline security hardening
-  hosts: all
-  become: true
-  tasks:
-    - name: Ensure unattended upgrades package is present (Debian/Ubuntu)
-      apt:
-        name: unattended-upgrades
-        state: present
-      when: ansible_os_family == "Debian"
-`;
-
-  const inventory = `[all]
-# replace with the EC2 public DNS or IP from Terraform outputs
-example-host ansible_host=127.0.0.1 ansible_user=ec2-user
-`;
-
-  const readme = `# IaC Bundle - ${params.projectName}
-
-Deterministic AWS EC2 Terraform bundle generated by DeplAI.
-
-This bundle is the primary runtime deploy path for AWS. Terraform manages resource dependencies inside one root module so deploys do not depend on Atmos component sequencing.
-
-Terraform files:
-- terraform/providers.tf
-- terraform/backend.tf
-- terraform/main.tf
-- terraform/variables.tf
-- terraform/terraform.tfvars
-- terraform/outputs.tf
-`;
-
-  return [
-    { path: 'terraform/providers.tf', content: providersTf },
-    { path: 'terraform/backend.tf', content: backendTf },
-    { path: 'terraform/main.tf', content: mainTf },
-    { path: 'terraform/variables.tf', content: variablesTf },
-    { path: 'terraform/terraform.tfvars', content: tfvars },
-    { path: 'terraform/outputs.tf', content: outputsTf },
-    { path: 'ansible/inventory.ini', content: inventory },
-    { path: 'ansible/playbooks/security-hardening.yml', content: ansiblePlaybook },
-    { path: 'README.md', content: readme },
-  ];
 }
 
 function buildAzureBundle(projectName: string, contextBlock: string, sec: ReturnType<typeof summarizeSecurity>): GeneratedFile[] {
@@ -2054,10 +1674,10 @@ export async function POST(req: NextRequest) {
     ].filter(Boolean).join('\n');
 
     const iacWarnings: string[] = [];
-    const sourceRoot = provider === 'aws'
-      ? await resolveProjectSourceRoot(String(user.id), projectId)
+    const sourceRoots = provider === 'aws'
+      ? await resolveProjectSourceRoots(String(user.id), projectId)
       : null;
-    if (provider === 'aws' && !sourceRoot) {
+    if (provider === 'aws' && !sourceRoots) {
       return NextResponse.json(
         {
           error: 'Could not resolve repository source files for AWS website packaging. Re-sync the project repository and retry.',
@@ -2066,15 +1686,16 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
+    const connectorSourceRoot = sourceRoots?.connectorRoot || null;
+    const agenticSourceRoot = sourceRoots?.agenticRoot || connectorSourceRoot;
 
-    const websiteCollection = provider === 'aws' && sourceRoot
-      ? collectWebsiteAssets(sourceRoot)
+    const websiteCollection = provider === 'aws' && connectorSourceRoot
+      ? collectWebsiteAssets(connectorSourceRoot)
       : null;
-    const frontendDetection = provider === 'aws' && sourceRoot
-      ? detectFrontendEntrypoint(sourceRoot)
+    const frontendDetection = provider === 'aws' && connectorSourceRoot
+      ? detectFrontendEntrypoint(connectorSourceRoot)
       : null;
     const websiteAssets = websiteCollection?.assets || [];
-    const effectiveWebsiteAssets = lowCostMode ? [] : websiteAssets;
     const websiteEntrypoint = provider === 'aws'
       ? resolvePrimaryWebsiteHtmlFromAssets(websiteAssets)
       : { relativePath: null, html: null, reason: 'provider is not aws' };
@@ -2137,114 +1758,131 @@ export async function POST(req: NextRequest) {
         repositoryContext,
       });
       const consultantAction = String(body.consultant_action || '').trim().toLowerCase();
-      const consultantHistory = normalizeConsultantHistory(body.consultant_history);
       const consultantTurnCount = Number(body.consultant_turn_count || 0);
       if (consultantAction === 'start' || consultantAction === 'reply' || consultantAction === 'force_decision') {
-        try {
-          const consultRes = await fetchAgentic('/api/terraform/cloudposse/consult', {
-            method: 'POST',
-            headers: {
-              ...agenticHeaders(),
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              architecture_json: normalizedArchitecture,
-              repository_context: repositoryContext || undefined,
-              deployment_profile: normalizedDeploymentProfile || undefined,
-              detected: detectedSummary,
-              aws_region: body.aws_region?.trim() || 'eu-north-1',
-              conversation_history: consultantHistory,
-              turn_count: Number.isFinite(consultantTurnCount) ? consultantTurnCount : 0,
-              force_decision: consultantAction === 'force_decision' || consultantTurnCount >= 20,
-            }),
-          }, {
-            timeoutMs: 180_000,
-            retriesPerUrl: 2,
-            retryDelayMs: 1_000,
-          });
-          const consultData = await consultRes.json().catch(() => ({})) as {
-            success?: boolean;
-            assistant_message?: string;
-            ready?: boolean;
-            decision?: Record<string, unknown>;
-            repo_detection_summary?: string;
-            turn_count?: number;
-            error?: string;
-          };
-          if (!consultRes.ok || consultData.success !== true) {
-            throw new Error(String(consultData.error || 'Infra consultant conversation failed.'));
-          }
-          const consultantDecision = asRecord(consultData.decision);
-          return NextResponse.json({
-            success: true,
+        const fallbackDecision = buildDeterministicConsultantDecision({
+          detected: detectedSummary,
+          deploymentProfile: normalizedDeploymentProfile,
+          userAnswers: asRecord(body.user_answers),
+          awsRegion: body.aws_region?.trim() || 'eu-north-1',
+        });
+        const fallbackSummary = summarizeConsultantDecision(
+          fallbackDecision,
+          detectedSummary,
+          body.aws_region?.trim() || 'eu-north-1',
+        );
+        const fallbackRepoSummary = buildRepoDetectionSummaryText(detectedSummary);
+        return NextResponse.json({
+          success: true,
+          detected: detectedSummary,
+          consultant_response: buildDeterministicConsultantMessage({
+            decision: fallbackDecision,
             detected: detectedSummary,
-            consultant_response: String(consultData.assistant_message || ''),
-            consultant_ready: Boolean(consultData.ready && Object.keys(consultantDecision).length > 0),
-            consultant_turn_count: Number(consultData.turn_count || (consultantTurnCount + 1)),
-            repo_detection_summary: String(consultData.repo_detection_summary || ''),
-            consultant_decision: Object.keys(consultantDecision).length > 0 ? consultantDecision : null,
-            consultant_summary: Object.keys(consultantDecision).length > 0
-              ? summarizeConsultantDecision(consultantDecision, detectedSummary, body.aws_region?.trim() || 'eu-north-1')
-              : null,
-          });
-        } catch (consultErr) {
-          const classified = classifyAgenticRouteError(consultErr, 'run the infra consultant');
-          return NextResponse.json(
-            { error: classified.message },
-            { status: classified.status },
-          );
-        }
+            awsRegion: body.aws_region?.trim() || 'eu-north-1',
+          }),
+          consultant_ready: true,
+          consultant_turn_count: Number.isFinite(consultantTurnCount) ? consultantTurnCount + 1 : 1,
+          repo_detection_summary: fallbackRepoSummary,
+          consultant_decision: fallbackDecision,
+          consultant_summary: fallbackSummary,
+          consultant_fallback_reason: 'cloudposse_consult_disabled',
+          actual_renderer: 'deplai_ec2_app',
+          llm_iac_disabled: true,
+        });
       }
 
       const consultantDecision = asRecord(body.consultant_decision);
       const awsRegion = body.aws_region?.trim() || 'eu-north-1';
-      const files = buildAwsEc2RootBundle({
-        projectName,
-        awsRegion,
-        contextBlock,
-        sec,
-        websiteIndexHtml,
-        userAnswers: asRecord(body.user_answers),
-        deploymentProfile: {
-          ...(normalizedDeploymentProfile || {}),
+      const effectiveTerraformRenderer: TerraformRenderer = 'deplai_ec2_app';
+      if (terraformRenderer !== 'deplai_ec2_app') {
+        iacWarnings.push(`Requested Terraform renderer '${terraformRenderer}' was replaced with 'deplai_ec2_app' for the production EC2 app deployment path.`);
+      }
+
+      let agentBundle: Awaited<ReturnType<typeof generateIacBundleWithTerraformAgent>>;
+      try {
+        agentBundle = await generateIacBundleWithTerraformAgent({
+          projectId,
+          projectName,
+          workspace: terraformSafeProjectSlug(projectName),
+          provider,
+          iacMode: 'deterministic',
+          architectureJson: normalizedArchitecture,
+          deploymentProfile: {
+            ...(normalizedDeploymentProfile || {}),
+            detected: detectedSummary,
+            user_answers: asRecord(body.user_answers),
+            consultant_decision: consultantDecision,
+          },
+          approvalPayload: asRecord(body.approval_payload),
+          repositoryContext,
+          securityContext: sec,
+          websiteAssetStats: {
+            selected_root: websiteCollection?.selectedRoot || '',
+            asset_count: websiteAssets.length,
+            total_bytes: websiteCollection?.totalBytes || 0,
+            truncated: Boolean(websiteCollection?.truncated),
+            skipped_large_files: websiteCollection?.skippedLargeFiles || 0,
+            entrypoint: websiteEntrypoint.relativePath,
+          },
+          frontendEntrypointDetection: frontendDetection ? { ...frontendDetection } : null,
           detected: detectedSummary,
-          user_answers: asRecord(body.user_answers),
-          consultant_decision: consultantDecision,
-        },
-        architectureJson: normalizedArchitecture,
-        detected: detectedSummary,
-      });
-      const source = 'deplai_deterministic_ec2';
-      const llmSummary = 'Generated deterministic AWS EC2 Terraform root bundle. Terraform will manage VPC/subnet/security-group/key/instance dependencies inside one root module.';
-      const runId: string | null = null;
-      const workspace: string | null = null;
-      const providerVersion = '~> 5.54';
-      const stateBucket: string | null = null;
-      const lockTable: string | null = null;
-      const manifest: unknown[] = [];
-      const dagOrder = ['terraform'];
+          userAnswers: asRecord(body.user_answers),
+          consultantDecision,
+          awsRegion,
+          stateBucket: String(body.state_bucket || '').trim(),
+          lockTable: String(body.lock_table || '').trim(),
+          qaSummary: contextBlock,
+          websiteIndexHtml,
+          terraformRenderer: effectiveTerraformRenderer,
+          sourceRoot: agenticSourceRoot,
+          sourceRootCandidates: [
+            ...(agenticSourceRoot ? [agenticSourceRoot] : []),
+            ...(connectorSourceRoot && connectorSourceRoot !== agenticSourceRoot ? [connectorSourceRoot] : []),
+          ],
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err || 'Terraform agent generation failed.');
+        const status = message.includes('unsupported_deployment_shape') ? 400 : 502;
+        return NextResponse.json(
+          {
+            error: message,
+            unsupported_reason: message.includes('unsupported_deployment_shape') ? message : null,
+            actual_renderer: 'deplai_ec2_app',
+            llm_iac_disabled: true,
+          },
+          { status },
+        );
+      }
+
+      const files = agentBundle.files;
+      const source = agentBundle.actualRenderer || agentBundle.source || 'deplai_ec2_app';
+      const runId = agentBundle.runId;
+      const workspace = agentBundle.workspace;
+      const providerVersion = agentBundle.providerVersion;
+      const stateBucket = agentBundle.stateBucket;
+      const lockTable = agentBundle.lockTable;
+      const manifest = agentBundle.manifest;
+      const dagOrder = agentBundle.dagOrder.length > 0 ? agentBundle.dagOrder : ['ec2_app'];
       const agentDetails: Record<string, unknown> = {
-        execution_kind: 'terraform',
+        ...(agentBundle.details || {}),
+        execution_kind: agentBundle.executionKind || 'terraform',
         renderer: source,
         terraform_root: 'terraform',
         default_runtime_target: 'ec2',
-        atmos_bypassed: true,
       };
       const rendererMetadata: Record<string, unknown> = {
-        requested_renderer: terraformRenderer,
+        requested_renderer: effectiveTerraformRenderer,
         actual_renderer: source,
-        unsupported_reason: null,
-        component_catalog_version: null,
-        execution_kind: 'terraform',
-        llm_iac_calls: 0,
-        llm_iac_disabled: true,
-        decision_applied: Object.keys(consultantDecision).length > 0,
-        decision_drift: [],
+        unsupported_reason: agentBundle.unsupportedReason || null,
+        component_catalog_version: agentBundle.componentCatalogVersion,
+        execution_kind: agentBundle.executionKind || 'terraform',
+        llm_iac_calls: agentBundle.llmIacCalls,
+        llm_iac_disabled: agentBundle.llmIacDisabled,
+        deployment_package_id: agentBundle.deploymentPackageId,
+        decision_applied: Object.keys(consultantDecision).length > 0 || agentBundle.decisionApplied,
+        decision_drift: agentBundle.decisionDrift,
       };
-      iacWarnings.push('AWS generation is using the deterministic EC2 root bundle path; Cloud Posse/Atmos is bypassed for first-success runtime deploys.');
-      if (effectiveWebsiteAssets.length > 0) {
-        iacWarnings.push('Website context is embedded into EC2 nginx bootstrap HTML; bulk static asset mirroring is not used in the default EC2 deploy path.');
-      }
+      iacWarnings.push('AWS generation is using the deterministic EC2 app renderer. Cloud Posse/Atmos and LLM-generated HCL are disabled for this production path.');
 
       const finalBundleValidation = validateAwsTerraformBundle(files);
       if (!finalBundleValidation.valid) {
@@ -2259,9 +1897,10 @@ export async function POST(req: NextRequest) {
       const allWarnings = [
         ...scanContextWarnings,
         ...iacWarnings,
-        `AWS Terraform worker backend: ${rendererMetadata.actual_renderer || 'deplai_deterministic_ec2'}.`,
-        'Generated Terraform bundle through the deterministic EC2 root pipeline using repository analysis, approved architecture, and deployment Q&A context.',
-        'Terraform files use a local backend by default. AWS credentials are only needed later for apply/deploy.',
+        ...agentBundle.warnings,
+        `AWS Terraform worker backend: ${rendererMetadata.actual_renderer || 'deplai_ec2_app'}.`,
+        'Generated Terraform bundle through the deterministic EC2 app pipeline using repository analysis, approved architecture, and deployment Q/A context.',
+        'Terraform files use a local backend unless state_bucket and lock_table are provided.',
         ...(iacMode === 'llm' || llmApiKey || llmModel || llmApiBaseUrl || body.llm_provider
           ? ['LLM IaC generation is disabled; LLM provider fields were ignored for Terraform generation.']
           : []),
@@ -2278,7 +1917,7 @@ export async function POST(req: NextRequest) {
         provider,
         project_id: projectId,
         project_name: projectName,
-        summary: llmSummary || `Generated ${files.length} Terraform files from repository analysis and operator context.`,
+        summary: agentBundle.summary || `Generated ${files.length} Terraform files through the deterministic EC2 app renderer.`,
         files,
         security_context: sec,
         source,
@@ -2299,7 +1938,7 @@ export async function POST(req: NextRequest) {
         website_asset_stats: {
           selected_root: websiteCollection?.selectedRoot || '',
           asset_count: websiteAssets.length,
-          mirrored_asset_count: effectiveWebsiteAssets.length,
+          mirrored_asset_count: 0,
           total_bytes: websiteCollection?.totalBytes || 0,
           truncated: Boolean(websiteCollection?.truncated),
           skipped_large_files: websiteCollection?.skippedLargeFiles || 0,
@@ -2307,6 +1946,7 @@ export async function POST(req: NextRequest) {
         },
         frontend_entrypoint_detection: frontendDetection,
       });
+
     }
 
     const deterministicFiles = provider === 'azure'

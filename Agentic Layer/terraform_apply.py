@@ -2633,7 +2633,9 @@ def apply_terraform_bundle(
     volume_name = f"deplai_tf_apply_{uuid.uuid4().hex[:12]}"
     volume = docker.volumes.create(name=volume_name)
 
+    fmt_log = ""
     init_log = ""
+    validate_log = ""
     plan_log = ""
     apply_log = ""
     backend_bootstrap: dict[str, Any] = {}
@@ -2791,6 +2793,26 @@ def apply_terraform_bundle(
                 }
 
         try:
+            fmt_log = _run_terraform_with_tracking(
+                volume_name,
+                tf_root,
+                ["fmt", "-check", "-recursive", "-no-color"],
+                env,
+                apply_context=apply_context,
+            )
+        except Exception as fmt_exc:
+            return {
+                "success": False,
+                "error": f"terraform fmt -check failed: {fmt_exc}",
+                "details": {
+                    "terraform_root": tf_root,
+                    "fmt_log_tail": _tail(str(fmt_exc)),
+                    "backend_bootstrap": backend_bootstrap,
+                    "bundle_remediation": bundle_remediation,
+                },
+            }
+
+        try:
             init_log = _run_terraform_with_tracking(
                 volume_name,
                 tf_root,
@@ -2834,7 +2856,28 @@ def apply_terraform_bundle(
                 "error": "Deployment stopped by user.",
                 "details": {
                     "terraform_root": tf_root,
+                    "fmt_log_tail": _tail(fmt_log),
                     "init_log_tail": _tail(init_log),
+                },
+            }
+
+        validate_log = _run_terraform_with_tracking(
+            volume_name,
+            tf_root,
+            ["validate", "-no-color"],
+            env,
+            apply_context=apply_context,
+        )
+        if apply_context and apply_context.get("cancel_requested"):
+            _emit_progress(apply_context, "error", "Terraform apply cancelled during validate.")
+            return {
+                "success": False,
+                "error": "Deployment stopped by user.",
+                "details": {
+                    "terraform_root": tf_root,
+                    "fmt_log_tail": _tail(fmt_log),
+                    "init_log_tail": _tail(init_log),
+                    "validate_log_tail": _tail(validate_log),
                 },
             }
 
@@ -3029,6 +3072,37 @@ def apply_terraform_bundle(
                 env,
                 apply_context=apply_context,
             )
+            plan_counts = _parse_plan_change_counts(plan_log)
+            plan_summary = {
+                "total_resources": plan_counts,
+                "terraform_root": tf_root,
+                "selected_instance_type": selected_instance_type,
+                "ec2_disabled": precheck_disable_ec2,
+                "state_bucket": state_bucket_name or None,
+                "lock_table": lock_table_name or None,
+                "requires_confirmation": True,
+            }
+            if not confirm_apply:
+                _emit_progress(apply_context, "info", "Terraform plan completed and is awaiting confirmation before apply.")
+                return {
+                    "success": True,
+                    "status": "awaiting_plan_confirmation",
+                    "outputs": {},
+                    "cloudfront_url": None,
+                    "plan_summary": plan_summary,
+                    "details": {
+                        "terraform_root": tf_root,
+                        "fmt_log_tail": _tail(fmt_log),
+                        "init_log_tail": _tail(init_log),
+                        "validate_log_tail": _tail(validate_log),
+                        "plan_log_tail": _tail(plan_log),
+                        "backend_bootstrap": backend_bootstrap,
+                        "bundle_remediation": bundle_remediation,
+                        "selected_instance_type": selected_instance_type,
+                        "existing_ec2_key_pair_name": existing_key_name_override,
+                        "key_pair_reused": bool(existing_key_name_override),
+                    },
+                }
             args = _build_apply_args(
                 selected_instance_type,
                 disable_ec2=precheck_disable_ec2,
@@ -3429,6 +3503,7 @@ def apply_terraform_bundle(
             "project_name": project_name,
             "outputs": outputs,
             "cloudfront_url": cloudfront_url,
+            "plan_summary": plan_summary,
             "details": {
                 "apply_mode": apply_mode,
                 "ec2_fallback_applied": ec2_fallback_applied,
@@ -3444,7 +3519,9 @@ def apply_terraform_bundle(
                 "output_read_error": output_read_error,
                 "live_ec2_reconciliation": live_ec2_reconciliation,
                 "terraform_root": tf_root,
+                "fmt_log_tail": _tail(fmt_log),
                 "init_log_tail": _tail(init_log),
+                "validate_log_tail": _tail(validate_log),
                 "plan_log_tail": _tail(plan_log),
                 "apply_log_tail": _tail(apply_log),
                 "website_bucket_inspection": website_inspection,
@@ -3467,7 +3544,9 @@ def apply_terraform_bundle(
             "details": {
                 "stderr_tail": _tail(stderr),
                 "stdout_tail": _tail(stdout),
+                "fmt_log_tail": _tail(fmt_log),
                 "init_log_tail": _tail(init_log),
+                "validate_log_tail": _tail(validate_log),
                 "plan_log_tail": _tail(plan_log),
                 "apply_log_tail": _tail(apply_log),
             },
@@ -3478,7 +3557,9 @@ def apply_terraform_bundle(
             "success": False,
             "error": f"Terraform runtime apply failed: {str(exc)}",
             "details": {
+                "fmt_log_tail": _tail(fmt_log),
                 "init_log_tail": _tail(init_log),
+                "validate_log_tail": _tail(validate_log),
                 "plan_log_tail": _tail(plan_log),
                 "apply_log_tail": _tail(apply_log),
                 "backend_bootstrap": backend_bootstrap,
@@ -3502,8 +3583,35 @@ def apply_saved_terraform_run(
     aws_access_key_id: str,
     aws_secret_access_key: str,
     aws_region: str,
+    lock_table: str = "",
+    aws_session_token: str = "",
+    enforce_free_tier_ec2: bool = True,
+    confirm_apply: bool = False,
     apply_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from deployment_run_store import load_terraform_run
+
+    saved_run = load_terraform_run(workspace=workspace, run_id=run_id)
+    if saved_run is not None:
+        files = saved_run.get("files")
+        if not isinstance(files, list) or not files:
+            return {"success": False, "error": f"Saved Terraform run {run_id} has no files."}
+        metadata = saved_run.get("metadata") if isinstance(saved_run.get("metadata"), dict) else {}
+        return apply_terraform_bundle(
+            files=[item for item in files if isinstance(item, dict)],
+            project_name=project_name,
+            provider=provider,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            aws_region=aws_region,
+            state_bucket=state_bucket or str(metadata.get("state_bucket") or ""),
+            lock_table=lock_table or str(metadata.get("lock_table") or ""),
+            enforce_free_tier_ec2=enforce_free_tier_ec2,
+            confirm_apply=confirm_apply,
+            apply_context=apply_context,
+        )
+
     _ensure_agent_import_path()
     from terraform_agent.agent.engine import apply_terraform_run
 

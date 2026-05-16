@@ -19,6 +19,7 @@ from services.asset_service import (
     store_asset,
 )
 from services.manifest_validator import ManifestValidationError
+from services.preview_manager import preview_status, start_preview, stop_preview
 from services.repo_service import get_tenant_repo_path, reset_tenant_repo
 
 
@@ -32,6 +33,9 @@ class ImplementRequest(BaseModel):
     base_repo_path: str | None = None
     app_targets: list[str] | None = None
     validator_issues: list[str] | None = None
+    pipeline_mode: str | None = None
+    run_quality_gates: bool = True
+    start_preview: bool = True
 
 
 class TenantRequest(BaseModel):
@@ -41,6 +45,12 @@ class TenantRequest(BaseModel):
 class AdminRepoResetRequest(BaseModel):
     tenant_id: str
     base_repo_path: str | None = None
+
+
+class PreviewRequest(BaseModel):
+    tenant_id: str
+    base_repo_path: str | None = None
+    app_targets: list[str] | None = None
 
 
 app = FastAPI(title="Tenant Builder API", version="0.1.0")
@@ -190,6 +200,19 @@ def _build_modified_file_diffs(base_repo_path: Path, tenant_repo_path: Path, mod
     return entries
 
 
+def _source_by_file(change_sources: object) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    if not isinstance(change_sources, list):
+        return lookup
+    for entry in change_sources:
+        if not isinstance(entry, dict):
+            continue
+        file_path = entry.get("file")
+        if isinstance(file_path, str) and file_path not in lookup:
+            lookup[file_path] = entry
+    return lookup
+
+
 def _snapshot_repo_files(repo_root: Path) -> dict[str, str]:
     """
     Build a stable file hash snapshot for a repo tree, excluding heavyweight build dirs.
@@ -322,6 +345,9 @@ def implement_tenant(request: ImplementRequest) -> dict:
             base_repo_path=str(resolved_base_repo_path),
             app_targets=app_targets,
             validator_issues=request.validator_issues,
+            pipeline_mode=request.pipeline_mode,
+            run_quality_gates_enabled=request.run_quality_gates,
+            start_preview_enabled=request.start_preview,
         )
     except ManifestValidationError as exc:
         raise HTTPException(
@@ -331,6 +357,8 @@ def implement_tenant(request: ImplementRequest) -> dict:
                 "errors": exc.errors,
             },
         ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     tenant_repo_path = Path(str(result.get("repo_path", ""))).resolve()
     snapshot_after = _snapshot_repo_files(tenant_repo_path)
     snapshot_modified_files = _derive_snapshot_modified_files(snapshot_before, snapshot_after) if tenant_repo_existed_before else []
@@ -350,18 +378,63 @@ def implement_tenant(request: ImplementRequest) -> dict:
             tenant_repo_path=tenant_repo_path,
             modified_files=normalized_modified_files,
         )
+        source_lookup = _source_by_file(result.get("change_sources", []))
+        for entry in modified_file_diffs:
+            source = source_lookup.get(entry.get("file", ""))
+            if source:
+                entry["source"] = source.get("source")
+                if source.get("operation"):
+                    entry["operation"] = source.get("operation")
 
     return {
         "status": "implementation_complete" if normalized_modified_files else "no_changes",
+        "run_id": result.get("run_id", ""),
+        "pipeline_mode": result.get("pipeline_mode", request.pipeline_mode or "hybrid"),
         "tenant_id": result["tenant_id"],
         "app_targets": result.get("app_targets", app_targets),
         "repo_path": result["repo_path"],
         "base_repo_path": str(resolved_base_repo_path),
         "modified_files": normalized_modified_files,
         "modified_file_diffs": modified_file_diffs,
+        "change_sources": result.get("change_sources", []),
+        "quality_report": result.get("quality_report", {"status": "not_run", "checks": []}),
+        "preview": result.get("preview"),
+        "diagnostic": result.get("diagnostic"),
         "errors": errors,
         "plan_markdown_path": result.get("plan_markdown_path", ""),
     }
+
+
+@app.post("/api/tenant/preview/start")
+def start_tenant_preview(request: PreviewRequest) -> dict:
+    tenant_id = state.ensure_tenant(request.tenant_id.strip())
+    resolved_base_repo_path = _resolve_base_repo_path(request.base_repo_path)
+    app_targets = _normalize_app_targets(request.app_targets)
+    return start_preview(
+        tenant_id=tenant_id,
+        base_repo_path=str(resolved_base_repo_path),
+        app_targets=app_targets,
+    )
+
+
+@app.get("/api/tenant/preview/status")
+def get_tenant_preview_status(tenant_id: str, base_repo_path: str | None = None) -> dict:
+    normalized_tenant_id = state.ensure_tenant(tenant_id.strip())
+    resolved_base_repo_path = _resolve_base_repo_path(base_repo_path)
+    return preview_status(
+        tenant_id=normalized_tenant_id,
+        base_repo_path=str(resolved_base_repo_path),
+    )
+
+
+@app.post("/api/tenant/preview/stop")
+def stop_tenant_preview(request: PreviewRequest) -> dict:
+    tenant_id = state.ensure_tenant(request.tenant_id.strip())
+    resolved_base_repo_path = _resolve_base_repo_path(request.base_repo_path)
+    return stop_preview(
+        tenant_id=tenant_id,
+        base_repo_path=str(resolved_base_repo_path),
+    )
 
 
 @app.post("/api/admin/tenant/reset-repo")

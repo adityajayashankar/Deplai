@@ -19,8 +19,15 @@ import { runChainChoreographer } from './agents/chain-choreographer';
 import { runAdversarialVerifier } from './agents/adversarial-verifier';
 import { runActionUIBinder } from './agents/action-ui-binder';
 import { runRecoveryMarshall } from './agents/recovery-marshall';
-import { runNarrativeBlacksmith } from './agents/narrative-blacksmith';
+import { runNarrativeBlacksmithAsync } from './agents/narrative-blacksmith';
 import { runMemoryForensicsKeeper } from './agents/memory-forensics-keeper';
+
+type LLMCaller = (
+  messages: Array<{ role: string; content: string }>,
+  system: string,
+  maxTokens: number,
+  temperature: number,
+) => Promise<string | null>;
 
 export interface OrchestratorInput {
   session_id: string | null;
@@ -34,6 +41,8 @@ export interface OrchestratorInput {
   tool_error?: { error: unknown; attempt_count: number } | null;
   /** Direct answer text (for direct_answer mode) */
   direct_answer?: string;
+  /** LLM caller injected from the route handler so the blacksmith can produce natural responses */
+  callLLM?: LLMCaller;
 }
 
 export async function runOrchestrator(input: OrchestratorInput): Promise<OrchestratorResult> {
@@ -134,15 +143,18 @@ export async function runOrchestrator(input: OrchestratorInput): Promise<Orchest
   }
 
   // ── Step 8: Narrative Blacksmith ───────────────────────────────────────────
-  const narrative = runNarrativeBlacksmith({
-    ctx: cleanCtx,
-    signal: signal_warden,
-    tool_contract,
-    adversarial,
-    action_ui,
-    recovery,
-    direct_answer: input.direct_answer,
-  });
+  const narrative = await runNarrativeBlacksmithAsync(
+    {
+      ctx: cleanCtx,
+      signal: signal_warden,
+      tool_contract,
+      adversarial,
+      action_ui,
+      recovery,
+      direct_answer: input.direct_answer,
+    },
+    input.callLLM ?? (() => Promise.resolve(null)),
+  );
 
   return {
     signal_warden,

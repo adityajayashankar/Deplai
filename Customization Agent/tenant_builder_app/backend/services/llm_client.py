@@ -2,28 +2,30 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import re
 import time
 from typing import Any
 from urllib import error, request
 
-from dotenv import load_dotenv
-
-
-BACKEND_DIR = Path(__file__).resolve().parents[1]
-load_dotenv(BACKEND_DIR / ".env")
+from services.llm_provider_config import (
+    DEFAULT_HF_MODEL,
+    HF_API_URL,
+    infer_provider,
+    resolve_llm_provider_configs,
+)
 
 
 class ProjectLLMClient:
-    DEFAULT_API_URL = "https://router.huggingface.co/v1/chat/completions"
-    DEFAULT_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct"
+    DEFAULT_API_URL = HF_API_URL
+    DEFAULT_MODEL = DEFAULT_HF_MODEL
 
     def __init__(self) -> None:
-        self.api_url = os.getenv("LLM_API_URL", os.getenv("HF_API_URL", self.DEFAULT_API_URL)).strip()
-        self.model = os.getenv("LLM_MODEL_ID", os.getenv("HF_MODEL_ID", self.DEFAULT_MODEL)).strip()
-        self.api_key = os.getenv("LLM_API_KEY", os.getenv("HF_API_KEY", "")).strip()
-        self.provider = os.getenv("LLM_PROVIDER", "").strip().lower() or self._infer_provider()
+        self.provider_configs = resolve_llm_provider_configs()
+        first_config = self.provider_configs[0]
+        self.api_url = first_config.api_url
+        self.model = first_config.model
+        self.api_key = first_config.api_key
+        self.provider = first_config.provider
         self.use_response_format = os.getenv("LLM_USE_RESPONSE_FORMAT", "true").strip().lower() in {
             "1",
             "true",
@@ -37,14 +39,13 @@ class ProjectLLMClient:
         )
 
     def _infer_provider(self) -> str:
-        lowered = self.api_url.lower()
-        if "anthropic" in lowered:
-            return "anthropic"
-        if "127.0.0.1" in lowered or "localhost" in lowered:
-            return "local"
-        if "huggingface" in lowered:
-            return "huggingface"
-        return "generic"
+        return infer_provider(self.api_url)
+
+    def _use_provider_config(self, config: Any) -> None:
+        self.api_url = config.api_url
+        self.model = config.model
+        self.api_key = config.api_key
+        self.provider = config.provider
 
     def is_configured(self) -> bool:
         return bool(self.api_url and self.model)
@@ -118,6 +119,13 @@ class ProjectLLMClient:
                 pass
         return self.retry_base_delay_seconds * (2 ** (attempt - 1))
 
+    def _format_http_error_details(self, details: str) -> str:
+        compact = re.sub(r"<[^>]+>", " ", details or "")
+        compact = re.sub(r"\s+", " ", compact).strip()
+        if not compact:
+            return "no response body"
+        return compact[:500] + ("..." if len(compact) > 500 else "")
+
     def complete_json(
         self,
         *,
@@ -129,6 +137,31 @@ class ProjectLLMClient:
         if not self.is_configured():
             raise RuntimeError("LLM client is not configured: set LLM_API_URL and LLM_MODEL_ID.")
 
+        failures: list[str] = []
+        for config in self.provider_configs:
+            self._use_provider_config(config)
+            try:
+                return self._complete_json_current_provider(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            except RuntimeError as exc:
+                failures.append(str(exc))
+                continue
+
+        joined = " | ".join(failures[-3:]) if failures else "no provider attempts were made"
+        raise RuntimeError(f"All configured LLM providers failed: {joined}")
+
+    def _complete_json_current_provider(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        temperature: float,
+    ) -> Any:
         payload = self._build_payload(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -165,7 +198,9 @@ class ProjectLLMClient:
                             time.sleep(self._retry_delay_seconds(attempt, retry_exc))
                             continue
                         raise RuntimeError(
-                            f"LLM API returned HTTP {retry_exc.code} on retry (provider={self.provider}, url={self.api_url}): {retry_details}"
+                            f"LLM API returned HTTP {retry_exc.code} on retry "
+                            f"(provider={self.provider}, url={self.api_url}): "
+                            f"{self._format_http_error_details(retry_details)}"
                         ) from retry_exc
                     except error.URLError as retry_exc:
                         raise RuntimeError(
@@ -177,7 +212,9 @@ class ProjectLLMClient:
                     continue
 
                 raise RuntimeError(
-                    f"LLM API returned HTTP {exc.code} (provider={self.provider}, url={self.api_url}): {details}"
+                    f"LLM API returned HTTP {exc.code} "
+                    f"(provider={self.provider}, url={self.api_url}): "
+                    f"{self._format_http_error_details(details)}"
                 ) from exc
             except error.URLError as exc:
                 raise RuntimeError(

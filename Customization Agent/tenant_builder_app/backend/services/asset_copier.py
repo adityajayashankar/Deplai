@@ -128,6 +128,169 @@ def _track(modified: list[str], rel_path: str, changed: bool) -> None:
         modified.append(rel_path)
 
 
+def _find_static_entry(repo: Path) -> Path | None:
+    for candidate in ("index.html", "index.htm", "index.html.html"):
+        path = repo / candidate
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+def _copy_static_asset(source: Path, repo: Path, modified: list[str]) -> str:
+    dest = repo / source.name
+    shutil.copy2(source, dest)
+    _track(modified, source.name, True)
+    _log(f"Copied static asset {source.name} -> {dest.name}")
+    return source.name
+
+
+def _ensure_static_asset_css(repo: Path, modified: list[str]) -> None:
+    css_path = repo / "styles.css"
+    if not css_path.exists() or not css_path.is_file():
+        css_path = repo / "tenant-assets.css"
+        entry = _find_static_entry(repo)
+        if entry:
+            original = entry.read_text(encoding="utf-8")
+            if "tenant-assets.css" not in original:
+                updated = original.replace("</head>", '  <link rel="stylesheet" href="tenant-assets.css" />\n</head>', 1)
+                if updated != original:
+                    entry.write_text(updated, encoding="utf-8")
+                    _track(modified, entry.name, True)
+
+    original_css = css_path.read_text(encoding="utf-8") if css_path.exists() else ""
+    marker = "/* tenant static asset styles */"
+    if marker in original_css:
+        return
+
+    addition = (
+        "\n\n"
+        f"{marker}\n"
+        ".brand { display: flex; align-items: center; gap: 0.65rem; }\n"
+        ".tenant-logo { width: 2.4rem; height: 2.4rem; object-fit: contain; flex: 0 0 auto; }\n"
+        ".tenant-hero-image { display: block; max-width: min(520px, 100%); margin: 1.5rem auto 0; border-radius: 18px; box-shadow: var(--shadow); }\n"
+        ".tenant-footer-image { display: block; max-width: 180px; max-height: 80px; object-fit: contain; margin: 0 0 1rem; }\n"
+    )
+    css_path.write_text(original_css.rstrip() + addition, encoding="utf-8")
+    _track(modified, css_path.relative_to(repo).as_posix(), True)
+
+
+def _set_or_insert_head_link(entry: Path, rel: str, *, rel_name: str, attr_name: str = "href") -> bool:
+    original = entry.read_text(encoding="utf-8")
+    pattern = rf'(<link\s[^>]*rel="{re.escape(rel_name)}"[^>]*\b{attr_name}=")([^"]*?)(")'
+    updated, count = re.subn(pattern, rf"\g<1>{rel}\g<3>", original, count=1)
+    if not count:
+        tag = f'  <link rel="{rel_name}" {attr_name}="{rel}" />\n'
+        updated = original.replace("</head>", tag + "</head>", 1)
+    if updated != original:
+        entry.write_text(updated, encoding="utf-8")
+        return True
+    return False
+
+
+def _patch_static_logo(entry: Path, logo_rel: str) -> bool:
+    original = entry.read_text(encoding="utf-8")
+    logo_tag = f'<img class="tenant-logo" src="{logo_rel}" alt="" />'
+
+    if "tenant-logo" in original:
+        updated = re.sub(r'(<img\b[^>]*class="tenant-logo"[^>]*\bsrc=")[^"]*(")', rf"\g<1>{logo_rel}\g<2>", original, count=1)
+    else:
+        updated = re.sub(
+            r'(<div\s+class="brand"\s*>)',
+            rf"\g<1>{logo_tag}",
+            original,
+            count=1,
+        )
+
+    if updated != original:
+        entry.write_text(updated, encoding="utf-8")
+        return True
+    return False
+
+
+def _patch_static_hero_image(entry: Path, image_rel: str) -> bool:
+    original = entry.read_text(encoding="utf-8")
+    image_tag = f'\n      <img class="tenant-hero-image" src="{image_rel}" alt="" />'
+    if "tenant-hero-image" in original:
+        updated = re.sub(r'(<img\b[^>]*class="tenant-hero-image"[^>]*\bsrc=")[^"]*(")', rf"\g<1>{image_rel}\g<2>", original, count=1)
+    else:
+        updated = re.sub(
+            r'(<section\b[^>]*class="[^"]*\bhero\b[^"]*"[^>]*>[\s\S]*?)(\n\s*</section>)',
+            rf"\g<1>{image_tag}\g<2>",
+            original,
+            count=1,
+        )
+    if updated != original:
+        entry.write_text(updated, encoding="utf-8")
+        return True
+    return False
+
+
+def _patch_static_footer_image(entry: Path, image_rel: str) -> bool:
+    original = entry.read_text(encoding="utf-8")
+    image_tag = f'\n    <img class="tenant-footer-image" src="{image_rel}" alt="" />'
+    if "tenant-footer-image" in original:
+        updated = re.sub(r'(<img\b[^>]*class="tenant-footer-image"[^>]*\bsrc=")[^"]*(")', rf"\g<1>{image_rel}\g<2>", original, count=1)
+    else:
+        updated = re.sub(r'(<footer\b[^>]*>)', rf"\g<1>{image_tag}", original, count=1)
+    if updated != original:
+        entry.write_text(updated, encoding="utf-8")
+        return True
+    return False
+
+
+def _apply_static_assets(repo: Path, branding: dict[str, Any], backend_dir: Path) -> list[str]:
+    entry = _find_static_entry(repo)
+    if entry is None:
+        return []
+
+    modified: list[str] = []
+
+    def fetch(asset_type: str) -> str | None:
+        src = _resolve_asset_source(backend_dir, branding.get(asset_type, ""))
+        if src is None:
+            return None
+        return _copy_static_asset(src, repo, modified)
+
+    if not any(branding.get(t) for t in (
+        "logo_light", "logo_dark", "favicon", "og_image",
+        "hero_illustration", "why_background", "activities_background", "curated_image",
+    )):
+        return []
+
+    logo_rel = fetch("logo_light")
+    if logo_rel:
+        _ensure_static_asset_css(repo, modified)
+        _track(modified, entry.name, _patch_static_logo(entry, logo_rel))
+        _track(modified, entry.name, _set_or_insert_head_link(entry, logo_rel, rel_name="apple-touch-icon"))
+
+    favicon_rel = fetch("favicon")
+    if favicon_rel:
+        _track(modified, entry.name, _set_or_insert_head_link(entry, favicon_rel, rel_name="icon"))
+
+    og_rel = fetch("og_image")
+    if og_rel:
+        original = entry.read_text(encoding="utf-8")
+        if 'property="og:image"' in original:
+            updated = re.sub(r'(property="og:image"\s+content=")([^"]*?)(")', rf"\g<1>{og_rel}\g<3>", original, count=1)
+        else:
+            updated = original.replace("</head>", f'  <meta property="og:image" content="{og_rel}" />\n</head>', 1)
+        if updated != original:
+            entry.write_text(updated, encoding="utf-8")
+            _track(modified, entry.name, True)
+
+    hero_rel = fetch("hero_illustration")
+    if hero_rel:
+        _ensure_static_asset_css(repo, modified)
+        _track(modified, entry.name, _patch_static_hero_image(entry, hero_rel))
+
+    footer_rel = fetch("curated_image") or fetch("activities_background") or fetch("why_background") or fetch("logo_dark")
+    if footer_rel:
+        _ensure_static_asset_css(repo, modified)
+        _track(modified, entry.name, _patch_static_footer_image(entry, footer_rel))
+
+    return modified
+
+
 def _set_or_insert_data_property(data_js: Path, property_name: str, value: str) -> bool:
     """Set object property in data.js, or insert it after `logo` when absent."""
     if not data_js.exists():
@@ -180,6 +343,8 @@ def apply_tenant_assets(
 
     repo = Path(repo_path).resolve()
     modified: list[str] = []
+    for static_path in _apply_static_assets(repo, branding, backend_dir):
+        _track(modified, static_path, True)
 
     # ------------------------------------------------------------------
     # Helper: resolve + copy + return public URL

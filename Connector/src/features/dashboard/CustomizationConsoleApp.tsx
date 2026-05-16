@@ -8,15 +8,20 @@ import {
   Bot,
   CheckCircle2,
   FileJson,
+  GitCompareArrows,
   Image as ImageIcon,
   Key,
   Lock,
   MessageSquare,
+  Monitor,
   Play,
   RefreshCcw,
   RefreshCw,
   Send,
   ShieldAlert,
+  Smartphone,
+  Sparkles,
+  Tablet,
   TerminalSquare,
   Upload,
   User,
@@ -66,10 +71,13 @@ type AssetPreview = {
   storedPath?: string;
 };
 
+type PipelineMode = 'hybrid' | 'llm_only' | 'deterministic_only' | 'diagnostic';
+
 type ImplementRunState = {
   appTargets: string[];
   validatorIssues: string[];
   repairPassUsed: boolean;
+  pipelineMode: PipelineMode;
 };
 
 type LoadingState = {
@@ -104,6 +112,8 @@ type ConfirmResponse = {
 
 type ImplementResponse = {
   status?: 'implementation_complete' | 'no_changes';
+  run_id?: string;
+  pipeline_mode?: PipelineMode;
   tenant_id: string;
   app_targets?: string[];
   base_repo_path?: string;
@@ -113,7 +123,12 @@ type ImplementResponse = {
     file: string;
     diff: string;
     truncated?: boolean;
+    source?: string;
+    operation?: string;
   }>;
+  change_sources?: Array<{ file: string; source: string; operation?: string }>;
+  quality_report?: QualityReport;
+  preview?: PreviewPayload;
   plan_markdown_path?: string;
 };
 
@@ -129,6 +144,22 @@ type PreviewMetaResponse = {
   tenant_repo_exists?: boolean;
   preview_root_path?: string;
   preview_entry?: string | null;
+  preview_kind?: 'live_server' | 'static_file';
+  preview_url?: string | null;
+  preview_status?: 'ready' | 'unavailable' | 'failed' | 'stopped';
+  preview_error?: string | null;
+};
+
+type QualityReport = {
+  status?: 'passed' | 'failed' | 'warning' | 'not_run';
+  checks?: Array<{ name?: string; status?: string; detail?: string }>;
+};
+
+type PreviewPayload = {
+  kind?: 'live_server' | 'static_file';
+  status?: 'ready' | 'unavailable' | 'failed' | 'stopped';
+  url?: string;
+  detail?: string;
 };
 
 type AssetsListResponse = {
@@ -143,10 +174,29 @@ type UploadAssetResponse = {
   confirmation?: ConfirmationState;
 };
 
+type PreviewDevice = 'desktop' | 'tablet' | 'mobile';
+
 const TENANT_STORAGE_KEY = 'deplai.customization.tenant-id';
 const DEFAULT_APP_TARGETS = ['frontend', 'admin-frontend', 'expert', 'corporates'];
+const PIPELINE_MODE_OPTIONS: Array<{ value: PipelineMode; label: string }> = [
+  { value: 'hybrid', label: 'Hybrid' },
+  { value: 'llm_only', label: 'LLM only' },
+  { value: 'deterministic_only', label: 'Deterministic' },
+  { value: 'diagnostic', label: 'Diagnostic' },
+];
 const REVERT_TO_BASE_CHAT_PATTERN = /(revert|reset|restore|undo).*(original|base|default).*(ui|theme|frontend|site|design)/i;
 const INITIAL_CHAT_TIMESTAMP = '--:--:--';
+const CHAT_COMMAND_PRESETS = [
+  'Change the landing headline to ',
+  'Replace "Neural Atlas" with ',
+  'Set primary theme color to #14b8a6',
+  'Remove landing parts 6 to 10',
+];
+const PREVIEW_DEVICE_OPTIONS: Array<{ value: PreviewDevice; label: string; icon: typeof Monitor; widthClass: string }> = [
+  { value: 'desktop', label: 'Desktop', icon: Monitor, widthClass: 'w-full' },
+  { value: 'tablet', label: 'Tablet', icon: Tablet, widthClass: 'w-[760px] max-w-full' },
+  { value: 'mobile', label: 'Mobile', icon: Smartphone, widthClass: 'w-[390px] max-w-full' },
+];
 
 const ASSET_OPTIONS: AssetOption[] = [
   { value: 'logo_light', label: 'Logo (Light)' },
@@ -270,7 +320,7 @@ function PixelCard({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const pixelsRef = useRef<Pixel[]>([]);
   const animationRef = useRef<number | null>(null);
-  const timePreviousRef = useRef(performance.now());
+  const timePreviousRef = useRef(0);
 
   const initPixels = useCallback(() => {
     if (!containerRef.current || !canvasRef.current) return;
@@ -299,36 +349,38 @@ function PixelCard({
     pixelsRef.current = nextPixels;
   }, [colors, gap, speed]);
 
-  const doAnimate = useCallback((fnName: 'appear' | 'disappear') => {
-    animationRef.current = requestAnimationFrame(() => doAnimate(fnName));
-
-    const timeNow = performance.now();
-    const timePassed = timeNow - timePreviousRef.current;
-    if (timePassed < 1000 / 60) return;
-    timePreviousRef.current = timeNow - (timePassed % (1000 / 60));
-
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d');
-    if (!ctx || !canvas) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
-
-    let allIdle = true;
-    pixelsRef.current.forEach((pixel) => {
-      pixel[fnName]();
-      if (!pixel.isIdle) allIdle = false;
-    });
-
-    if (allIdle && animationRef.current !== null) {
-      cancelAnimationFrame(animationRef.current);
-    }
-  }, []);
-
   const handleAnimation = useCallback((name: 'appear' | 'disappear') => {
     if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
-    animationRef.current = requestAnimationFrame(() => doAnimate(name));
-  }, [doAnimate]);
+    timePreviousRef.current = performance.now();
+
+    function animateFrame() {
+      animationRef.current = requestAnimationFrame(animateFrame);
+
+      const timeNow = performance.now();
+      const timePassed = timeNow - timePreviousRef.current;
+      if (timePassed < 1000 / 60) return;
+      timePreviousRef.current = timeNow - (timePassed % (1000 / 60));
+
+      const canvas = canvasRef.current;
+      const ctx = canvas?.getContext('2d');
+      if (!ctx || !canvas) return;
+
+      const dpr = window.devicePixelRatio || 1;
+      ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+
+      let allIdle = true;
+      pixelsRef.current.forEach((pixel) => {
+        pixel[name]();
+        if (!pixel.isIdle) allIdle = false;
+      });
+
+      if (allIdle && animationRef.current !== null) {
+        cancelAnimationFrame(animationRef.current);
+      }
+    }
+
+    animationRef.current = requestAnimationFrame(animateFrame);
+  }, []);
 
   useEffect(() => {
     initPixels();
@@ -406,6 +458,51 @@ function getErrorMessage(payload: unknown, fallback: string): string {
   return fallback;
 }
 
+function formatUiText(value: string): string {
+  return value
+    .replace(/Tenant Customization Operator/gi, 'Customization Operator')
+    .replace(/\bTenant ID\b/gi, 'Workspace ID')
+    .replace(/\bTenant key\b/gi, 'Workspace')
+    .replace(/\btenant key\b/gi, 'workspace')
+    .replace(/\bTenant repository\b/gi, 'Workspace copy')
+    .replace(/\btenant repository\b/gi, 'workspace copy')
+    .replace(/\bTenant repo\b/gi, 'Workspace copy')
+    .replace(/\btenant repo\b/gi, 'workspace copy')
+    .replace(/\bTenant required\b/gi, 'Workspace required')
+    .replace(/\btenant assets\b/gi, 'workspace assets')
+    .replace(/\bTenant\b/g, 'Workspace')
+    .replace(/\btenant\b/g, 'workspace')
+    .replace(/SubSpace-/g, 'Edited-')
+    .replace(/\bSubSpace\b/g, 'Edited Copy');
+}
+
+function sanitizeManifestForDisplay(manifest: Record<string, unknown>): Record<string, unknown> {
+  const clone = JSON.parse(JSON.stringify(manifest)) as Record<string, unknown>;
+
+  if ('tenant_id' in clone) {
+    clone.workspace_id = clone.tenant_id;
+    delete clone.tenant_id;
+  }
+  if ('tenant_name' in clone) {
+    clone.workspace_name = clone.tenant_name;
+    delete clone.tenant_name;
+  }
+
+  const categories = clone.categories;
+  if (categories && typeof categories === 'object') {
+    const branding = (categories as { branding?: unknown }).branding;
+    if (branding && typeof branding === 'object') {
+      for (const [key, value] of Object.entries(branding as Record<string, unknown>)) {
+        if (typeof value === 'string') {
+          (branding as Record<string, unknown>)[key] = formatUiText(value);
+        }
+      }
+    }
+  }
+
+  return clone;
+}
+
 async function parseJsonSafe<T>(response: Response): Promise<T | null> {
   try {
     return (await response.json()) as T;
@@ -434,12 +531,14 @@ export default function CustomizationConsoleApp() {
   const [manifestJson, setManifestJson] = useState<Record<string, unknown> | null>(null);
   const [isManifestViewerOpen, setIsManifestViewerOpen] = useState(false);
   const [isCodeDiffViewerOpen, setIsCodeDiffViewerOpen] = useState(false);
-  const [codeDiffEntries, setCodeDiffEntries] = useState<Array<{ file: string; diff: string; truncated?: boolean }>>([]);
+  const [codeDiffEntries, setCodeDiffEntries] = useState<Array<{ file: string; diff: string; truncated?: boolean; source?: string; operation?: string }>>([]);
   const [lastImplementErrors, setLastImplementErrors] = useState<string[]>([]);
+  const [lastQualityReport, setLastQualityReport] = useState<QualityReport | null>(null);
+  const [lastPreviewPayload, setLastPreviewPayload] = useState<PreviewPayload | null>(null);
 
   const [chatInput, setChatInput] = useState('');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
-    { role: 'agent', content: 'Operator console initialized. Enter a tenant key or open from a repository card.', timestamp: INITIAL_CHAT_TIMESTAMP },
+    { role: 'agent', content: 'Operator console initialized. Open from a repository card or enter a workspace ID.', timestamp: INITIAL_CHAT_TIMESTAMP },
   ]);
 
   const [assetType, setAssetType] = useState<AssetType>('logo_light');
@@ -449,16 +548,18 @@ export default function CustomizationConsoleApp() {
     appTargets: [...DEFAULT_APP_TARGETS],
     validatorIssues: [],
     repairPassUsed: false,
+    pipelineMode: 'hybrid',
   });
 
   const [status, setStatus] = useState<StatusState>({
     level: 'info',
-    text: 'Enter Tenant ID to continue.',
+    text: 'Enter workspace ID to continue.',
   });
   const [resolvedRepoPath, setResolvedRepoPath] = useState('');
   const [previewNonce, setPreviewNonce] = useState(0);
   const [previewMeta, setPreviewMeta] = useState<PreviewMetaResponse | null>(null);
   const [previewMetaLoading, setPreviewMetaLoading] = useState(false);
+  const [previewDevice, setPreviewDevice] = useState<PreviewDevice>('desktop');
 
   const [loading, setLoading] = useState<LoadingState>({
     chat: false,
@@ -470,6 +571,11 @@ export default function CustomizationConsoleApp() {
     resetSession: false,
     resetRepo: false,
   });
+
+  const activePreviewDevice = useMemo(
+    () => PREVIEW_DEVICE_OPTIONS.find((option) => option.value === previewDevice) || PREVIEW_DEVICE_OPTIONS[0],
+    [previewDevice],
+  );
 
   const effectiveTenantId = useMemo(
     () => sanitizeTenantId(tenantId || tenantFromQuery || projectNameFromQuery || ''),
@@ -487,6 +593,16 @@ export default function CustomizationConsoleApp() {
     const tenantSegment = effectiveTenantId ? `_tenant/${encodeURIComponent(effectiveTenantId)}/` : '';
     return `/api/customization/preview/${encodeURIComponent(projectIdFromQuery)}/${tenantSegment}?meta=1&v=${previewNonce}`;
   }, [effectiveTenantId, previewNonce, projectIdFromQuery]);
+
+  const effectivePreviewUrl = useMemo(() => {
+    if (previewMeta?.preview_kind === 'live_server' && previewMeta.preview_status === 'ready' && previewMeta.preview_url) {
+      return previewMeta.preview_url;
+    }
+    if (lastPreviewPayload?.kind === 'live_server' && lastPreviewPayload.status === 'ready' && lastPreviewPayload.url) {
+      return lastPreviewPayload.url;
+    }
+    return previewUrl;
+  }, [lastPreviewPayload, previewMeta, previewUrl]);
 
   const refreshPreview = useCallback(() => {
     setPreviewNonce(Date.now());
@@ -548,11 +664,13 @@ export default function CustomizationConsoleApp() {
     if (!previewMeta?.source) return 'Preview Source: Unknown';
 
     if (previewMeta.source === 'subspace') {
-      return `Preview Source: SubSpace-${effectiveTenantId || 'tenant'}`;
+      return previewMeta.preview_kind === 'live_server'
+        ? 'Preview Source: Live Edited Copy'
+        : 'Preview Source: Static Edited Copy';
     }
 
     if (effectiveTenantId && previewMeta.tenant_repo_exists === false) {
-      return `Preview Source: Base (SubSpace-${effectiveTenantId} not found)`;
+      return 'Preview Source: Base (edited copy not found)';
     }
 
     return 'Preview Source: Base';
@@ -561,10 +679,11 @@ export default function CustomizationConsoleApp() {
   const previewSourceChipLabel = useMemo(() => {
     if (!projectIdFromQuery) return 'Source: Unavailable';
     if (previewMetaLoading) return 'Source: Resolving';
-    if (previewMeta?.source === 'subspace') return 'Source: SubSpace';
+    if (previewMeta?.preview_kind === 'live_server' && previewMeta.preview_status === 'ready') return 'Preview: Live server';
+    if (previewMeta?.source === 'subspace') return 'Preview: Static fallback';
     if (previewMeta?.source === 'base') return 'Source: Base';
     return 'Source: Unknown';
-  }, [previewMeta?.source, previewMetaLoading, projectIdFromQuery]);
+  }, [previewMeta?.preview_kind, previewMeta?.preview_status, previewMeta?.source, previewMetaLoading, projectIdFromQuery]);
 
   const syncConfirmationState = useCallback((confirmation?: ConfirmationState) => {
     const isManifestConfirmed = Boolean(confirmation?.is_confirmed) && !confirmation?.has_unconfirmed_changes;
@@ -578,7 +697,7 @@ export default function CustomizationConsoleApp() {
     });
     const payload = await parseJsonSafe<AssetsListResponse>(response);
     if (!response.ok) {
-      throw new Error(getErrorMessage(payload, 'Failed to load tenant assets.'));
+      throw new Error(getErrorMessage(payload, 'Failed to load workspace assets.'));
     }
 
     const assetsMap = payload?.assets || {};
@@ -601,7 +720,7 @@ export default function CustomizationConsoleApp() {
   const fetchManifest = useCallback(async (overrideTenantId?: string, silent = false) => {
     const activeTenantId = sanitizeTenantId(overrideTenantId || tenantId);
     if (!activeTenantId) {
-      setStatus({ level: 'warning', text: 'Tenant required: Enter Tenant ID before fetching manifest.' });
+      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID before fetching manifest.' });
       return;
     }
 
@@ -646,11 +765,11 @@ export default function CustomizationConsoleApp() {
     setChatMessages([
       {
         role: 'agent',
-        content: `Tenant key loaded: ${initialTenant}. You can start chatting now.`,
+        content: `Workspace loaded: ${initialTenant}. You can start chatting now.`,
         timestamp: nowStamp(),
       },
     ]);
-    setStatus({ level: 'info', text: `Restored session for Tenant ID: ${initialTenant}` });
+    setStatus({ level: 'info', text: `Restored session for workspace: ${initialTenant}` });
   }, [fetchManifest, projectNameFromQuery, tenantFromQuery]);
 
   useEffect(() => {
@@ -709,39 +828,41 @@ export default function CustomizationConsoleApp() {
     setManifestJson(null);
     setCodeDiffEntries([]);
     setLastImplementErrors([]);
+    setLastQualityReport(null);
+    setLastPreviewPayload(null);
     setIsCodeDiffViewerOpen(false);
     setUploadedAssetsSession([]);
-    setImplementRun({ appTargets: [...DEFAULT_APP_TARGETS], validatorIssues: [], repairPassUsed: false });
+    setImplementRun({ appTargets: [...DEFAULT_APP_TARGETS], validatorIssues: [], repairPassUsed: false, pipelineMode: 'hybrid' });
 
     if (!nextTenantId) {
-      setStatus({ level: 'warning', text: 'Tenant required: Enter Tenant ID to continue.' });
+      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID to continue.' });
       return;
     }
 
     setChatMessages([
       {
         role: 'agent',
-        content: `Tenant key set to ${nextTenantId}. You can start chatting now.`,
+        content: `Workspace set to ${nextTenantId}. You can start chatting now.`,
         timestamp: nowStamp(),
       },
     ]);
-    setStatus({ level: 'info', text: 'Tenant ID updated. Fetch manifest to begin.' });
+    setStatus({ level: 'info', text: 'Workspace updated. Fetch manifest to begin.' });
   }, []);
 
   const performRepoReset = useCallback(async (options?: { suppressPrompt?: boolean; preserveChatHistory?: boolean }) => {
     const activeTenantId = sanitizeTenantId(tenantId);
     if (!activeTenantId) {
-      setStatus({ level: 'warning', text: 'Tenant required: Enter Tenant ID before repo reset.' });
+      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID before repo reset.' });
       return false;
     }
 
     const shouldPrompt = !(options?.suppressPrompt ?? false);
-    if (shouldPrompt && !window.confirm('This will reset tenant repo state entirely. Continue?')) {
+    if (shouldPrompt && !window.confirm('This will reset the workspace copy entirely. Continue?')) {
       return false;
     }
 
     setLoading((prev) => ({ ...prev, resetRepo: true }));
-    setStatus({ level: 'warning', text: 'Resetting tenant repository...' });
+    setStatus({ level: 'warning', text: 'Resetting workspace copy...' });
 
     try {
       const response = await fetch('/api/customization/reset-repo', {
@@ -770,13 +891,15 @@ export default function CustomizationConsoleApp() {
 
       setCodeDiffEntries([]);
       setLastImplementErrors([]);
+      setLastQualityReport(null);
+      setLastPreviewPayload(null);
       setIsCodeDiffViewerOpen(false);
       setPreviewNonce(Date.now());
 
       if (options?.preserveChatHistory) {
         setChatMessages((prev) => [
           ...prev,
-          { role: 'agent', content: 'Reverted to original UI. Tenant repository was reset to base state.', timestamp: nowStamp() },
+          { role: 'agent', content: 'Reverted to original UI. Workspace copy was reset to base state.', timestamp: nowStamp() },
         ]);
       } else {
         setChatMessages([
@@ -784,13 +907,13 @@ export default function CustomizationConsoleApp() {
         ]);
       }
 
-      setImplementRun({ appTargets: [...DEFAULT_APP_TARGETS], validatorIssues: [], repairPassUsed: false });
+      setImplementRun({ appTargets: [...DEFAULT_APP_TARGETS], validatorIssues: [], repairPassUsed: false, pipelineMode: 'hybrid' });
       syncConfirmationState(payload.confirmation);
       await loadAssets(activeTenantId);
 
       setStatus({
         level: 'success',
-        text: `Reset repo success: Tenant repo reset complete for ${payload.tenant_id}.`,
+        text: `Reset repo success: Workspace copy reset complete for ${payload.tenant_id}.`,
         details: payload.repo_path,
       });
 
@@ -868,7 +991,7 @@ export default function CustomizationConsoleApp() {
   const handleConfirm = useCallback(async () => {
     const activeTenantId = sanitizeTenantId(tenantId);
     if (!activeTenantId) {
-      setStatus({ level: 'warning', text: 'Tenant required: Enter Tenant ID before confirming.' });
+      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID before confirming.' });
       return;
     }
 
@@ -903,7 +1026,7 @@ export default function CustomizationConsoleApp() {
   const runImplementation = useCallback(async (options?: { isRepairPass?: boolean; validatorIssues?: string[] }) => {
     const activeTenantId = sanitizeTenantId(confirmedTenantId || tenantId);
     if (!activeTenantId) {
-      setStatus({ level: 'warning', text: 'Tenant required: Enter Tenant ID before implementation.' });
+      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID before implementation.' });
       return;
     }
 
@@ -939,6 +1062,9 @@ export default function CustomizationConsoleApp() {
           project_id: projectIdFromQuery || undefined,
           app_targets: implementRun.appTargets,
           validator_issues: validatorIssues.length > 0 ? validatorIssues : undefined,
+          pipeline_mode: implementRun.pipelineMode,
+          run_quality_gates: true,
+          start_preview: true,
         }),
       });
 
@@ -949,7 +1075,7 @@ export default function CustomizationConsoleApp() {
 
       const nextDiffEntries = Array.isArray(payload.modified_file_diffs)
         ? payload.modified_file_diffs.filter(
-          (entry): entry is { file: string; diff: string; truncated?: boolean } => (
+          (entry): entry is { file: string; diff: string; truncated?: boolean; source?: string; operation?: string } => (
             Boolean(entry)
             && typeof entry.file === 'string'
             && typeof entry.diff === 'string'
@@ -963,6 +1089,8 @@ export default function CustomizationConsoleApp() {
 
       setCodeDiffEntries(nextDiffEntries);
       setLastImplementErrors(errors);
+      setLastQualityReport(payload.quality_report || null);
+      setLastPreviewPayload(payload.preview || null);
       // Always open diff panel after implement so users can inspect either
       // concrete diffs or explicit reasons why no diff was produced.
       setIsCodeDiffViewerOpen(true);
@@ -989,10 +1117,13 @@ export default function CustomizationConsoleApp() {
       if (errors.length > 0) {
         setStatus({
           level: 'error',
-          text: isRepairPass
-            ? 'Repair completed with remaining issues.'
-            : 'Implementation completed with issues.',
-          details: errors.join(' | '),
+        text: isRepairPass
+          ? 'Repair completed with remaining issues.'
+          : 'Implementation completed with issues.',
+          details: [
+            errors.join(' | '),
+            payload.quality_report?.status ? `Quality: ${payload.quality_report.status}` : '',
+          ].filter(Boolean).join(' | '),
         });
         return;
       }
@@ -1025,7 +1156,11 @@ export default function CustomizationConsoleApp() {
         text: isRepairPass
           ? `Implementation success (post-repair): Rolled out to ${(payload.app_targets || implementRun.appTargets).join(', ')}.`
           : `Implementation success: Rolled out to ${(payload.app_targets || implementRun.appTargets).join(', ')}.`,
-        details: payload.base_repo_path || undefined,
+        details: [
+          payload.base_repo_path,
+          payload.pipeline_mode ? `mode=${payload.pipeline_mode}` : '',
+          payload.quality_report?.status ? `quality=${payload.quality_report.status}` : '',
+        ].filter(Boolean).join(' | ') || undefined,
       });
 
       setLastImplementErrors([]);
@@ -1040,7 +1175,7 @@ export default function CustomizationConsoleApp() {
         repair: false,
       }));
     }
-  }, [confirmedTenantId, fetchManifest, implementRun.appTargets, isConfirmed, projectIdFromQuery, tenantId]);
+  }, [confirmedTenantId, fetchManifest, implementRun.appTargets, implementRun.pipelineMode, isConfirmed, projectIdFromQuery, tenantId]);
 
   const handleRepair = useCallback(async () => {
     if (implementRun.validatorIssues.length === 0) return;
@@ -1108,7 +1243,7 @@ export default function CustomizationConsoleApp() {
   const handleResetSession = useCallback(async () => {
     const activeTenantId = sanitizeTenantId(tenantId);
     if (!activeTenantId) {
-      setStatus({ level: 'warning', text: 'Tenant required: Enter Tenant ID before reset.' });
+      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID before reset.' });
       return;
     }
 
@@ -1133,8 +1268,10 @@ export default function CustomizationConsoleApp() {
       setManifestJson(payload.manifest);
       setCodeDiffEntries([]);
       setLastImplementErrors([]);
+      setLastQualityReport(null);
+      setLastPreviewPayload(null);
       setIsCodeDiffViewerOpen(false);
-      setImplementRun({ appTargets: [...DEFAULT_APP_TARGETS], validatorIssues: [], repairPassUsed: false });
+      setImplementRun({ appTargets: [...DEFAULT_APP_TARGETS], validatorIssues: [], repairPassUsed: false, pipelineMode: 'hybrid' });
       syncConfirmationState(payload.confirmation);
       await loadAssets(activeTenantId);
       setStatus({ level: 'success', text: 'Reset session success: Session reset complete.' });
@@ -1151,6 +1288,24 @@ export default function CustomizationConsoleApp() {
 
   const isGlobalDisabled = !tenantId.trim();
 
+  const handleCommandPreset = useCallback((preset: string) => {
+    setChatInput(preset);
+  }, []);
+
+  const toggleAppTarget = useCallback((target: string) => {
+    setImplementRun((prev) => {
+      const isActive = prev.appTargets.includes(target);
+      const nextTargets = isActive
+        ? prev.appTargets.filter((item) => item !== target)
+        : [...prev.appTargets, target];
+
+      return {
+        ...prev,
+        appTargets: nextTargets.length > 0 ? nextTargets : prev.appTargets,
+      };
+    });
+  }, []);
+
   const statusIcon = useMemo(() => {
     if (status.level === 'success') return <CheckCircle2 className="h-4 w-4 shrink-0 text-white" />;
     if (status.level === 'error') return <XCircle className="h-4 w-4 shrink-0 text-rose-500" />;
@@ -1158,8 +1313,42 @@ export default function CustomizationConsoleApp() {
     return <TerminalSquare className="h-4 w-4 shrink-0 text-zinc-500" />;
   }, [status.level]);
 
+  const displayManifestJson = useMemo(
+    () => (manifestJson ? sanitizeManifestForDisplay(manifestJson) : null),
+    [manifestJson],
+  );
+
+  const pipelineCards = useMemo(() => [
+    {
+      label: 'Manifest',
+      value: manifestJson ? 'Loaded' : 'Draft',
+      active: Boolean(manifestJson),
+      icon: FileJson,
+    },
+    {
+      label: 'Confirm',
+      value: isConfirmed ? 'Ready' : 'Open',
+      active: isConfirmed,
+      icon: CheckCircle2,
+    },
+    {
+      label: 'Preview',
+      value: previewMeta?.preview_kind === 'live_server' && previewMeta.preview_status === 'ready'
+        ? 'Live'
+        : previewMeta?.source === 'subspace' ? 'Static' : previewMeta?.source === 'base' ? 'Base' : 'Pending',
+      active: previewMeta?.source === 'subspace',
+      icon: Monitor,
+    },
+    {
+      label: 'Diffs',
+      value: `${codeDiffEntries.length}`,
+      active: codeDiffEntries.length > 0,
+      icon: GitCompareArrows,
+    },
+  ], [codeDiffEntries.length, isConfirmed, manifestJson, previewMeta?.preview_kind, previewMeta?.preview_status, previewMeta?.source]);
+
   return (
-    <div className="flex h-screen flex-col overflow-y-auto bg-[#000000] font-sans text-zinc-300 selection:bg-white selection:text-black">
+    <div className="relative flex h-screen flex-col overflow-y-auto bg-[#000000] font-sans text-zinc-300 selection:bg-white selection:text-black">
       <style
         dangerouslySetInnerHTML={{
           __html: `
@@ -1168,11 +1357,30 @@ export default function CustomizationConsoleApp() {
             .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
             .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #262626; border-radius: 10px; }
             .custom-scrollbar::-webkit-scrollbar-thumb:hover { background-color: #3f3f46; }
+            @keyframes operatorSweep {
+              0% { transform: translateX(-110%); opacity: 0; }
+              15% { opacity: 1; }
+              85% { opacity: 1; }
+              100% { transform: translateX(110%); opacity: 0; }
+            }
+            @keyframes softPulse {
+              0%, 100% { opacity: .45; }
+              50% { opacity: 1; }
+            }
+            .operator-grid {
+              background-image:
+                linear-gradient(rgba(255,255,255,.045) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,.045) 1px, transparent 1px);
+              background-size: 28px 28px;
+            }
           `,
         }}
       />
+      <div className="pointer-events-none absolute inset-0 overflow-hidden">
+        <div className="operator-grid absolute inset-0 opacity-25" />
+      </div>
 
-      <header className="z-20 flex h-14 shrink-0 items-center justify-between border-b border-[#1A1A1A] bg-[#050505] px-6">
+      <header className="z-20 flex h-14 shrink-0 items-center justify-between border-b border-[#1A1A1A] bg-[#050505]/90 px-6 backdrop-blur-xl">
         <div className="flex items-center gap-3">
           <button
             onClick={() => router.push('/dashboard')}
@@ -1180,9 +1388,9 @@ export default function CustomizationConsoleApp() {
           >
             <ArrowLeft className="h-3 w-3" /> Back
           </button>
-          <div className="flex h-6 w-6 items-center justify-center rounded bg-white text-[10px] font-bold tracking-tighter text-black">TC</div>
+          <div className="flex h-6 w-6 items-center justify-center rounded bg-white text-[10px] font-bold tracking-tighter text-black">UI</div>
           <div className="flex flex-col">
-            <h1 className="text-[11px] font-bold tracking-widest text-white uppercase">Tenant Customization Operator</h1>
+            <h1 className="text-[11px] font-bold tracking-widest text-white uppercase">Customization Operator</h1>
             {(projectNameFromQuery || projectIdFromQuery) && (
               <p className="text-[10px] text-zinc-500">
                 {projectNameFromQuery || 'Project'}
@@ -1208,14 +1416,14 @@ export default function CustomizationConsoleApp() {
               type="text"
               value={tenantId}
               onChange={handleTenantChange}
-              placeholder="tenant-id"
+              placeholder="workspace-id"
               className="w-48 bg-transparent text-[12px] font-mono text-white placeholder:text-zinc-600 transition-colors focus:outline-none"
             />
           </div>
         </div>
       </header>
 
-      <main className="relative grid h-[calc(100vh-56px)] min-h-0 flex-1 grid-cols-12 overflow-visible">
+      <main className="relative z-10 grid h-[calc(100vh-56px)] min-h-0 flex-1 grid-cols-12 overflow-visible">
         {isGlobalDisabled && (
           <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#000000]/80 backdrop-blur-sm">
             <div className="flex max-w-sm flex-col items-center gap-4 rounded-lg border border-[#262626] bg-[#050505] p-6 text-center">
@@ -1224,7 +1432,7 @@ export default function CustomizationConsoleApp() {
               </div>
               <div>
                 <h3 className="mb-1 font-bold text-white">Workspace Locked</h3>
-                <p className="text-xs leading-relaxed text-zinc-400">Please enter a valid Tenant ID in the header bar to load customization controls.</p>
+                <p className="text-xs leading-relaxed text-zinc-400">Please enter a valid workspace ID in the header bar to load customization controls.</p>
               </div>
             </div>
           </div>
@@ -1236,7 +1444,7 @@ export default function CustomizationConsoleApp() {
             <span className="text-[10px] font-bold tracking-widest text-zinc-300 uppercase">Agent Chat</span>
           </div>
 
-          <div className="shrink-0 border-b border-[#1A1A1A] bg-[#050505] p-3">
+          <div className="shrink-0 border-b border-[#1A1A1A] bg-[#050505]/95 p-3">
             <form onSubmit={handleChatSubmit} className="relative flex items-center">
               <input
                 type="text"
@@ -1255,6 +1463,20 @@ export default function CustomizationConsoleApp() {
                 Send
               </button>
             </form>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              {CHAT_COMMAND_PRESETS.map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => handleCommandPreset(preset)}
+                  disabled={isGlobalDisabled}
+                  className="group flex min-h-9 items-center gap-2 rounded border border-[#1A1A1A] bg-[#0A0A0A] px-2 text-left text-[10px] leading-tight text-zinc-500 transition-all hover:border-cyan-400/50 hover:bg-cyan-400/5 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Sparkles className="h-3 w-3 shrink-0 text-cyan-400/70 transition-transform group-hover:scale-110" />
+                  <span className="overflow-hidden text-ellipsis">{preset}</span>
+                </button>
+              ))}
+            </div>
           </div>
 
           <div className="custom-scrollbar min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
@@ -1269,8 +1491,8 @@ export default function CustomizationConsoleApp() {
                   <span className="text-[10px] font-bold text-zinc-500 uppercase">{message.role === 'agent' ? 'Agent' : 'You'}</span>
                   <span className="ml-auto font-mono text-[9px] text-zinc-600">{message.timestamp}</span>
                 </div>
-                <div className={`rounded-md border p-3 text-[12px] leading-relaxed ${message.role === 'agent' ? 'border-[#1A1A1A] bg-[#050505] text-zinc-300' : 'border-[#262626] bg-[#111111] text-white'}`}>
-                  {message.content}
+                <div className={`rounded-md border p-3 text-[12px] leading-relaxed shadow-[0_12px_40px_rgba(0,0,0,0.22)] transition-all hover:-translate-y-0.5 hover:border-zinc-500/60 ${message.role === 'agent' ? 'border-[#1A1A1A] bg-[#050505] text-zinc-300' : 'border-cyan-400/25 bg-cyan-400/10 text-white'}`}>
+                  {formatUiText(message.content)}
                 </div>
               </div>
             ))}
@@ -1306,6 +1528,23 @@ export default function CustomizationConsoleApp() {
                 </span>
               </div>
               <div className="flex items-center gap-2">
+                <div className="flex rounded border border-[#262626] bg-[#000000] p-0.5">
+                  {PREVIEW_DEVICE_OPTIONS.map((option) => {
+                    const Icon = option.icon;
+                    const isActive = previewDevice === option.value;
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        title={option.label}
+                        onClick={() => setPreviewDevice(option.value)}
+                        className={`flex h-7 w-8 items-center justify-center rounded-sm transition-all ${isActive ? 'bg-white text-black' : 'text-zinc-500 hover:bg-[#111111] hover:text-white'}`}
+                      >
+                        <Icon className="h-3.5 w-3.5" />
+                      </button>
+                    );
+                  })}
+                </div>
                 <button
                   onClick={refreshPreview}
                   disabled={!projectIdFromQuery || isGlobalDisabled}
@@ -1314,7 +1553,7 @@ export default function CustomizationConsoleApp() {
                   <RefreshCw className="h-3 w-3" /> Refresh
                 </button>
                 <a
-                  href={previewUrl || '#'}
+                  href={effectivePreviewUrl || '#'}
                   target="_blank"
                   rel="noreferrer"
                   className={`inline-flex items-center rounded border border-[#262626] bg-[#111111] px-2 py-1 text-[10px] font-semibold tracking-wider text-zinc-300 uppercase transition-colors hover:border-zinc-500 hover:text-white ${!projectIdFromQuery || isGlobalDisabled ? 'pointer-events-none opacity-50' : ''}`}
@@ -1324,15 +1563,31 @@ export default function CustomizationConsoleApp() {
               </div>
             </div>
 
-            <div className="flex min-h-0 flex-1 bg-[#000000] p-4">
+            <div className="flex min-h-0 flex-1 items-center justify-center bg-[#000000] p-4">
               {projectIdFromQuery ? (
-                <div className="h-full w-full overflow-hidden rounded border border-[#262626] bg-white">
-                  <iframe
-                    key={previewUrl}
-                    src={previewUrl}
-                    title="Repository UI preview"
-                    className="h-full w-full border-0"
-                  />
+                <div className={`flex h-full ${activePreviewDevice.widthClass} flex-col overflow-hidden rounded-lg border border-[#262626] bg-[#070707] shadow-[0_24px_80px_rgba(0,0,0,0.45)] transition-all duration-300`}>
+                  <div className="flex h-9 shrink-0 items-center gap-2 border-b border-[#1A1A1A] bg-[#0A0A0A] px-3">
+                    <div className="flex gap-1.5">
+                      <span className="h-2.5 w-2.5 rounded-full bg-rose-500/80" />
+                      <span className="h-2.5 w-2.5 rounded-full bg-amber-400/80" />
+                      <span className="h-2.5 w-2.5 rounded-full bg-emerald-400/80" />
+                    </div>
+                    <div className="min-w-0 flex-1 rounded border border-[#1A1A1A] bg-black px-2 py-1 font-mono text-[10px] text-zinc-500">
+                    <span className="block truncate">{previewMeta?.preview_entry || effectivePreviewUrl || 'preview'}</span>
+                    </div>
+                    <span className="rounded bg-[#111111] px-2 py-1 text-[9px] font-bold tracking-widest text-zinc-400 uppercase">
+                      {activePreviewDevice.label}
+                    </span>
+                  </div>
+                  <div className="relative min-h-0 flex-1 bg-white">
+                    <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-px bg-gradient-to-r from-transparent via-cyan-300/70 to-transparent" />
+                    <iframe
+                      key={effectivePreviewUrl}
+                      src={effectivePreviewUrl}
+                      title="Repository UI preview"
+                      className="h-full w-full border-0"
+                    />
+                  </div>
                 </div>
               ) : (
                 <div className="flex h-full flex-col items-center justify-center space-y-3 text-zinc-600">
@@ -1399,7 +1654,11 @@ export default function CustomizationConsoleApp() {
         <section className="col-span-4 flex min-h-0 flex-col bg-[#050505]">
           <div className="border-b border-[#1A1A1A] p-4">
             <BorderGlow active className="h-32">
-              <div className="flex h-full flex-col overflow-hidden rounded-[inherit] bg-black p-3">
+              <div className="relative flex h-full flex-col overflow-hidden rounded-[inherit] bg-black p-3">
+                <div className={`absolute inset-x-0 top-0 h-px ${status.level === 'error' ? 'bg-rose-500' : status.level === 'warning' ? 'bg-amber-300' : status.level === 'success' ? 'bg-emerald-300' : 'bg-cyan-300'}`} />
+                {(loading.chat || loading.manifest || loading.confirm || loading.implement || loading.repair || loading.upload || loading.resetRepo || loading.resetSession || previewMetaLoading) && (
+                  <div className="absolute top-0 left-0 h-px w-1/2 bg-white/80 shadow-[0_0_20px_rgba(255,255,255,0.7)] [animation:operatorSweep_1.4s_ease-in-out_infinite]" />
+                )}
                 <div className="mb-2 flex items-center gap-2 border-b border-[#1A1A1A] pb-2 text-zinc-500">
                   <TerminalSquare className="h-3.5 w-3.5" />
                   <span className="text-[9px] font-bold tracking-widest uppercase">System Output</span>
@@ -1408,8 +1667,8 @@ export default function CustomizationConsoleApp() {
                 <div className="custom-scrollbar flex flex-1 gap-3 overflow-y-auto font-mono text-[12px] leading-relaxed">
                   {statusIcon}
                   <div className="flex flex-col">
-                    <span className={status.level === 'error' ? 'text-rose-400' : 'text-zinc-200'}>{status.text}</span>
-                    {status.details ? <span className="mt-1 text-zinc-500">{status.details}</span> : null}
+                    <span className={status.level === 'error' ? 'text-rose-400' : 'text-zinc-200'}>{formatUiText(status.text)}</span>
+                    {status.details ? <span className="mt-1 text-zinc-500">{formatUiText(status.details)}</span> : null}
                   </div>
                 </div>
               </div>
@@ -1417,6 +1676,23 @@ export default function CustomizationConsoleApp() {
           </div>
 
           <div className="custom-scrollbar min-h-0 flex-1 space-y-6 overflow-y-auto p-5">
+            <div className="grid grid-cols-4 gap-2">
+              {pipelineCards.map((card) => {
+                const Icon = card.icon;
+                return (
+                  <div
+                    key={card.label}
+                    className={`group relative overflow-hidden rounded border p-3 transition-all hover:-translate-y-0.5 ${card.active ? 'border-cyan-400/40 bg-cyan-400/10 text-white' : 'border-[#262626] bg-[#000000] text-zinc-400 hover:border-zinc-500/70'}`}
+                  >
+                    <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/40 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
+                    <Icon className={`mb-2 h-4 w-4 ${card.active ? 'text-cyan-300' : 'text-zinc-600'}`} />
+                    <div className="text-[9px] font-bold tracking-widest text-zinc-500 uppercase">{card.label}</div>
+                    <div className="mt-1 truncate font-mono text-[11px]">{card.value}</div>
+                  </div>
+                );
+              })}
+            </div>
+
             <div className="space-y-3">
               <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Pipeline Controls</span>
 
@@ -1431,7 +1707,7 @@ export default function CustomizationConsoleApp() {
                 <button
                   onClick={() => void fetchManifest()}
                   disabled={loading.manifest || isGlobalDisabled}
-                  className="flex flex-col items-center justify-center gap-2 rounded border border-[#262626] bg-[#000000] p-3 transition-all hover:border-zinc-500 hover:bg-[#111111] disabled:opacity-50"
+                  className="flex flex-col items-center justify-center gap-2 rounded border border-[#262626] bg-[#000000] p-3 transition-all hover:-translate-y-0.5 hover:border-cyan-400/50 hover:bg-cyan-400/5 disabled:translate-y-0 disabled:opacity-50"
                 >
                   <RefreshCw className={`h-4 w-4 text-zinc-300 ${loading.manifest ? 'animate-spin' : ''}`} />
                   <span className="text-[11px] font-bold tracking-wider text-white uppercase">Fetch</span>
@@ -1440,7 +1716,7 @@ export default function CustomizationConsoleApp() {
                 <button
                   onClick={() => void handleConfirm()}
                   disabled={loading.confirm || isConfirmed || isGlobalDisabled}
-                  className={`flex flex-col items-center justify-center gap-2 rounded border p-3 transition-all disabled:opacity-50 ${isConfirmed ? 'border-white bg-white text-black' : 'border-[#262626] bg-[#000000] text-white hover:border-zinc-500 hover:bg-[#111111]'}`}
+                  className={`flex flex-col items-center justify-center gap-2 rounded border p-3 transition-all hover:-translate-y-0.5 disabled:translate-y-0 disabled:opacity-50 ${isConfirmed ? 'border-emerald-300 bg-emerald-300 text-black' : 'border-[#262626] bg-[#000000] text-white hover:border-emerald-400/50 hover:bg-emerald-400/5'}`}
                 >
                   <CheckCircle2 className="h-4 w-4" />
                   <span className="text-[11px] font-bold tracking-wider uppercase">{isConfirmed ? 'Confirmed' : 'Confirm'}</span>
@@ -1478,12 +1754,41 @@ export default function CustomizationConsoleApp() {
             </div>
 
             <div className="space-y-3 border-t border-[#1A1A1A] pt-4">
-              <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Implementation Scope</span>
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Pipeline Mode</span>
+                <span className="font-mono text-[10px] text-zinc-600">{implementRun.pipelineMode}</span>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {PIPELINE_MODE_OPTIONS.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    onClick={() => setImplementRun((prev) => ({ ...prev, pipelineMode: option.value }))}
+                    disabled={loading.implement || loading.repair || isGlobalDisabled}
+                    className={`rounded border px-2 py-1.5 text-[10px] font-semibold tracking-wide transition-all disabled:cursor-not-allowed disabled:opacity-50 ${implementRun.pipelineMode === option.value ? 'border-white bg-white text-black' : 'border-[#262626] bg-[#111111] text-zinc-500 hover:border-zinc-500 hover:text-zinc-200'}`}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-3 border-t border-[#1A1A1A] pt-4">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Implementation Scope</span>
+                <span className="font-mono text-[10px] text-zinc-600">{implementRun.appTargets.length}/{DEFAULT_APP_TARGETS.length}</span>
+              </div>
               <div className="flex flex-wrap gap-2">
-                {implementRun.appTargets.map((target) => (
-                  <span key={target} className="rounded border border-[#262626] bg-[#111111] px-2 py-1 font-mono text-[10px] text-zinc-400">
+                {DEFAULT_APP_TARGETS.map((target) => (
+                  <button
+                    key={target}
+                    type="button"
+                    onClick={() => toggleAppTarget(target)}
+                    disabled={loading.implement || loading.repair || isGlobalDisabled}
+                    className={`rounded border px-2 py-1 font-mono text-[10px] transition-all disabled:cursor-not-allowed disabled:opacity-50 ${implementRun.appTargets.includes(target) ? 'border-cyan-400/40 bg-cyan-400/10 text-cyan-100 shadow-[0_0_18px_rgba(34,211,238,0.08)]' : 'border-[#262626] bg-[#111111] text-zinc-600 hover:border-zinc-500 hover:text-zinc-300'}`}
+                  >
                     {target}
-                  </span>
+                  </button>
                 ))}
               </div>
             </div>
@@ -1503,7 +1808,7 @@ export default function CustomizationConsoleApp() {
 
                 <div className="custom-scrollbar max-h-56 overflow-y-auto rounded border border-[#262626] bg-[#000000] p-3 font-mono text-[11px] leading-relaxed text-zinc-300">
                   {manifestJson ? (
-                    <pre className="whitespace-pre-wrap break-all text-zinc-300">{JSON.stringify(manifestJson, null, 2)}</pre>
+                    <pre className="whitespace-pre-wrap break-all text-zinc-300">{JSON.stringify(displayManifestJson, null, 2)}</pre>
                   ) : (
                     <p className="text-zinc-500">No manifest loaded yet. Click Refresh to fetch latest manifest.</p>
                   )}
@@ -1522,7 +1827,14 @@ export default function CustomizationConsoleApp() {
                   {codeDiffEntries.length > 0 ? (
                     codeDiffEntries.map((entry) => (
                       <div key={`${entry.file}-${entry.diff.length}`} className="rounded border border-[#1A1A1A] bg-[#050505] p-2">
-                        <div className="mb-2 font-mono text-[10px] font-bold tracking-wide text-zinc-400 uppercase">{entry.file}</div>
+                        <div className="mb-2 flex items-center justify-between gap-2">
+                          <div className="min-w-0 truncate font-mono text-[10px] font-bold tracking-wide text-zinc-400 uppercase">{entry.file}</div>
+                          {entry.source && (
+                            <span className="shrink-0 rounded border border-cyan-400/30 bg-cyan-400/10 px-1.5 py-0.5 font-mono text-[9px] text-cyan-100">
+                              {entry.source}{entry.operation ? `:${entry.operation}` : ''}
+                            </span>
+                          )}
+                        </div>
                         <pre className="custom-scrollbar max-h-52 overflow-auto whitespace-pre-wrap break-all rounded border border-[#262626] bg-black p-2 font-mono text-[10px] leading-relaxed text-zinc-300">
                           {entry.diff}
                         </pre>
@@ -1541,6 +1853,28 @@ export default function CustomizationConsoleApp() {
                       )}
                     </div>
                   )}
+                </div>
+              </div>
+            )}
+
+            {lastQualityReport && (
+              <div className="space-y-2 border-t border-[#1A1A1A] pt-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Quality Gates</span>
+                  <span className={`rounded border px-2 py-0.5 font-mono text-[10px] ${lastQualityReport.status === 'failed' ? 'border-rose-500/30 bg-rose-500/10 text-rose-200' : lastQualityReport.status === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'}`}>
+                    {lastQualityReport.status || 'not_run'}
+                  </span>
+                </div>
+                <div className="custom-scrollbar max-h-44 space-y-2 overflow-y-auto rounded border border-[#262626] bg-[#000000] p-3">
+                  {(lastQualityReport.checks || []).map((check, index) => (
+                    <div key={`${check.name || 'check'}-${index}`} className="rounded border border-[#1A1A1A] bg-[#050505] p-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="truncate font-mono text-[10px] text-zinc-300">{check.name || 'check'}</span>
+                        <span className="font-mono text-[10px] text-zinc-500">{check.status || 'unknown'}</span>
+                      </div>
+                      {check.detail && <p className="mt-1 break-all text-[10px] leading-relaxed text-zinc-500">{check.detail}</p>}
+                    </div>
+                  ))}
                 </div>
               </div>
             )}

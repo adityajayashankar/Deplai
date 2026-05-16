@@ -59,7 +59,7 @@ import {
   writeStoredJson,
 } from './state';
 
-type PipelineStageId = 'analysis' | 'qa' | 'architecture' | 'cost_estimation' | 'approval' | 'terraform' | 'aws_config' | 'deploy' | 'outputs';
+type PipelineStageId = 'analysis' | 'qa' | 'architecture' | 'cost_estimation' | 'terraform' | 'aws_config' | 'deploy' | 'outputs';
 
 type IacPrResponse = {
   attempted?: boolean;
@@ -78,12 +78,17 @@ const SIDEBAR_STAGES: Array<{ id: PipelineStageId; label: string; details: strin
   { id: 'qa', label: 'Questions', details: 'Interactive Q&A' },
   { id: 'architecture', label: 'Architecture Diagram', details: 'Stage 3' },
   { id: 'cost_estimation', label: 'Cost Estimation', details: 'Stage 4' },
-  { id: 'approval', label: 'Approval', details: 'Stage 5 Gate' },
   { id: 'terraform', label: 'Infrastructure Generation', details: 'Generator' },
   { id: 'aws_config', label: 'AWS Config', details: 'Runtime Inputs' },
   { id: 'deploy', label: 'Deploy', details: 'Execution' },
   { id: 'outputs', label: 'Outputs', details: 'Credentials & URLs' },
 ];
+
+function normalizeDeployUiStage(value: unknown): PipelineStageId {
+  const stage = String(value || '').trim();
+  if (stage === 'approval') return 'terraform';
+  return SIDEBAR_STAGES.some((entry) => entry.id === stage) ? stage as PipelineStageId : 'analysis';
+}
 
 function timestampLabel(date = new Date()) {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -297,21 +302,19 @@ function hasSuccessfulTerraformGeneration(
 
 function describeTerraformRenderer(meta: SavedIacMeta | null): TerraformRendererSummary {
   const actualRenderer = String(meta?.actual_renderer || '').trim().toLowerCase();
-  if (actualRenderer === 'cloudposse_atmos') {
+  if (actualRenderer === 'deplai_ec2_app') {
     return {
-      primary: 'Cloud Posse / Atmos',
-      runtime: 'Atmos runtime',
-      secondary: meta?.component_catalog_version
-        ? `Catalog ${meta.component_catalog_version}`
-        : 'Renderer confirmed',
+      primary: 'DeplAI EC2 App',
+      runtime: 'Terraform runtime',
+      secondary: String(meta?.deployment_package_id || '').trim() || 'Deterministic app package renderer',
       warning: null,
     };
   }
-  if (actualRenderer === 'deplai_deterministic' || actualRenderer === 'deplai_deterministic_ec2' || actualRenderer === 'connector_aws_bundle_fallback') {
+  if (actualRenderer === 'deplai_deterministic') {
     return {
       primary: 'DeplAI Terraform',
       runtime: 'Terraform runtime',
-      secondary: String(meta?.unsupported_reason || '').trim() || 'Deterministic EC2 root bundle',
+      secondary: String(meta?.unsupported_reason || '').trim() || 'Legacy deterministic renderer',
       warning: null,
     };
   }
@@ -1345,7 +1348,7 @@ export default function DeploymentTrackApp() {
   );
   const sessionIacTruncated = useMemo(() => hasTruncatedIacFiles(iacFiles), [iacFiles]);
   const deployableIacFiles = useMemo(() => getDeployableIacFiles(iacFiles), [iacFiles]);
-  const shouldUseSavedRunForDeploy = Boolean(activeSavedRun?.run_id) && deployableIacFiles.length === 0;
+  const shouldUseSavedRunForDeploy = Boolean(activeSavedRun?.run_id);
   const deployStartBlockers = useMemo(() => {
     const blockers: string[] = [];
     if (deployStatus === 'running') {
@@ -1363,21 +1366,17 @@ export default function DeploymentTrackApp() {
     if (sessionIacTruncated && !activeSavedRun) {
       blockers.push('Session Terraform files are truncated. Regenerate infrastructure first.');
     }
+    if (costEstimate.total > costEstimate.cap && !budgetOverride) {
+      blockers.push('Estimated monthly cost exceeds the budget cap. Approve the budget override to deploy.');
+    }
     return blockers;
-  }, [activeSavedRun, deployStatus, deployableIacFiles.length, hasAwsSecrets, selectedProject, sessionIacTruncated]);
-  const canStartDeploy = true;
+  }, [activeSavedRun, budgetOverride, costEstimate.cap, costEstimate.total, deployStatus, deployableIacFiles.length, hasAwsSecrets, selectedProject, sessionIacTruncated]);
+  const canStartDeploy = deployStartBlockers.length === 0;
   const activeIacFilePath = selectedFile || iacFiles[0]?.path || '';
   const hasCurrentIacMeta = useMemo(
     () => matchesCurrentIacWorkspace(savedIacMeta, selectedProjectId, expectedWorkspace),
     [expectedWorkspace, savedIacMeta, selectedProjectId],
   );
-  const decisionDriftRows = useMemo(
-    () => (hasCurrentIacMeta && Array.isArray(savedIacMeta?.decision_drift)
-      ? savedIacMeta.decision_drift
-      : []),
-    [hasCurrentIacMeta, savedIacMeta?.decision_drift],
-  );
-  const hasDecisionDriftWarning = Boolean(hasCurrentIacMeta && savedIacMeta?.decision_applied === false);
   const hasSuccessfulGeneration = useMemo(
     () => hasSuccessfulTerraformGeneration(selectedProjectId, expectedWorkspace, savedIacMeta, activeSavedRun, iacFiles),
     [activeSavedRun, expectedWorkspace, iacFiles, savedIacMeta, selectedProjectId],
@@ -1629,7 +1628,7 @@ export default function DeploymentTrackApp() {
     setTerraformRuntimeConfig(existingRuntimeConfig || seededRuntimeConfig);
     localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, nextProjectId);
     sessionStorage.setItem(PLANNING_PROJECT_KEY, nextProjectId);
-    setActiveStage(freshLaunch ? 'analysis' : ((loadDeployUiStage(nextProjectId) as PipelineStageId | null) || 'analysis'));
+    setActiveStage(freshLaunch ? 'analysis' : normalizeDeployUiStage(loadDeployUiStage(nextProjectId)));
     const snapshot = loadDeploySnapshot(nextProjectId);
     const existing = activeDeployments.get(nextProjectId);
     const nextState = existing?.state || toDeployState(snapshot || undefined);
@@ -1844,21 +1843,22 @@ export default function DeploymentTrackApp() {
     };
   }, [appendLog, appendSocketNotice, selectedProject, shouldConnectPipelineSocket]);
 
-  const setAndPersistStage = useCallback((stage: PipelineStageId) => {
+  const setAndPersistStage = useCallback((stage: PipelineStageId, options?: { force?: boolean }) => {
+    const nextStage = normalizeDeployUiStage(stage);
     if (!selectedProjectId) {
       setActiveStage('analysis');
       return;
     }
-    if (stage === 'aws_config' && !canContinueToAwsConfig) {
+    if (nextStage === 'aws_config' && !canContinueToAwsConfig && !options?.force) {
       return;
     }
-    if (stage === 'terraform' && !approvedConsultantDecision && !hasSuccessfulGeneration) {
+    if (nextStage === 'terraform' && !approvedConsultantDecision && !hasSuccessfulGeneration) {
       return;
     }
-    setActiveStage(stage);
+    setActiveStage(nextStage);
     if (selectedProjectId) {
-      saveDeployUiStage(selectedProjectId, stage);
-      localStorage.setItem(`${CURRENT_STAGE_STORAGE_PREFIX}${selectedProjectId}`, stage);
+      saveDeployUiStage(selectedProjectId, nextStage);
+      localStorage.setItem(`${CURRENT_STAGE_STORAGE_PREFIX}${selectedProjectId}`, nextStage);
     }
   }, [approvedConsultantDecision, canContinueToAwsConfig, hasSuccessfulGeneration, selectedProjectId]);
 
@@ -2023,6 +2023,7 @@ export default function DeploymentTrackApp() {
           architecture_json: deploymentProfile || architectureView || consultantArchitectureSeed,
           deployment_profile: deploymentProfile || consultantArchitectureSeed,
           repository_context: repoContext || undefined,
+          user_answers: infraUserAnswers,
           aws_region: terraformRuntimeConfig.aws_region.trim() || DEFAULT_AWS_REGION,
           qa_summary: qaSummary,
         }),
@@ -2048,6 +2049,15 @@ export default function DeploymentTrackApp() {
       }
       const nextDecision = data.consultant_decision || null;
       const nextSummary = String(data.consultant_summary || '').trim() || summarizeInfraConsultantDecision(nextDecision);
+      if (!assistantMessage && nextDecision) {
+        nextHistory.push({
+          role: 'assistant',
+          content: nextSummary || 'I produced an infrastructure decision from the available repository context. Review and confirm it to continue.',
+        });
+      }
+      if (!assistantMessage && !nextDecision) {
+        throw new Error('Infra consultant returned no question or decision.');
+      }
 
       persistInfraConsultant({
         workspace: expectedWorkspace,
@@ -2068,6 +2078,7 @@ export default function DeploymentTrackApp() {
     currentInfraConsultant?.turn_count,
     deploymentProfile,
     expectedWorkspace,
+    infraUserAnswers,
     persistInfraConsultant,
     qaSummary,
     repoContext,
@@ -2079,17 +2090,27 @@ export default function DeploymentTrackApp() {
     if (activeStage !== 'qa' || !selectedProject) return;
     if (!repoContext || repoContext.workspace !== expectedWorkspace) return;
     if (infraConsultantLoading) return;
-    if (currentInfraConsultant) return;
+    const hasStartedConsultant = Boolean(
+      currentInfraConsultant
+      && (
+        (currentInfraConsultant.history?.length || 0) > 0
+        || (currentInfraConsultant.turn_count || 0) > 0
+        || currentInfraConsultant.decision
+      ),
+    );
+    if (hasStartedConsultant) return;
 
-    persistInfraConsultant({
-      workspace: expectedWorkspace,
-      history: [],
-      repo_detection_summary: '',
-      turn_count: 0,
-      decision: null,
-      summary: '',
-      confirmed: false,
-    });
+    if (!currentInfraConsultant) {
+      persistInfraConsultant({
+        workspace: expectedWorkspace,
+        history: [],
+        repo_detection_summary: '',
+        turn_count: 0,
+        decision: null,
+        summary: '',
+        confirmed: false,
+      });
+    }
     void runInfraConsultantTurn('start', []).catch((reason: unknown) => {
       setError(reason instanceof Error ? reason.message : 'Failed to start infra consultant.');
     });
@@ -2141,7 +2162,7 @@ export default function DeploymentTrackApp() {
 
   useEffect(() => {
     if (!decisionForVisualization || !selectedProject) return;
-    if (!['architecture', 'cost_estimation', 'approval'].includes(activeStage)) return;
+    if (!['architecture', 'cost_estimation'].includes(activeStage)) return;
     if (!currentInfraConsultant?.confirmed && !approvedConsultantDecision) return;
 
     const requestKey = `${selectedProject.id}:${expectedWorkspace}:${decisionSignature}`;
@@ -2164,12 +2185,12 @@ export default function DeploymentTrackApp() {
     selectedProject,
   ]);
 
-  const generateTerraform = useCallback(async () => {
-    if (!selectedProject) return;
+  const generateTerraform = useCallback(async (): Promise<boolean> => {
+    if (!selectedProject) return false;
     setError(null);
     setIacPrUrl(null);
     setTerraformGenerating(true);
-    appendLog('Starting infrastructure generation from the approved deployment profile.', 'info', { stage: 'terraform_generation' });
+    appendLog('Starting infrastructure generation from the confirmed deployment profile.', 'info', { stage: 'terraform_generation' });
     try {
       const response = await fetch('/api/pipeline/iac', {
         method: 'POST',
@@ -2177,7 +2198,7 @@ export default function DeploymentTrackApp() {
         body: JSON.stringify({
           project_id: selectedProject.id,
           provider: 'aws',
-          terraform_renderer: 'deplai_deterministic',
+          terraform_renderer: 'deplai_ec2_app',
           qa_summary: qaSummary,
           architecture_context: String(repoContext?.summary || ''),
           repository_context: repoContext || undefined,
@@ -2205,6 +2226,7 @@ export default function DeploymentTrackApp() {
         execution_kind?: string;
         component_catalog_version?: string;
         unsupported_reason?: string;
+        deployment_package_id?: string;
         decision_applied?: boolean;
         decision_drift?: Array<{
           component?: unknown;
@@ -2250,6 +2272,7 @@ export default function DeploymentTrackApp() {
         execution_kind: String(data.execution_kind || '').trim() || undefined,
         component_catalog_version: String(data.component_catalog_version || '').trim() || undefined,
         unsupported_reason: String(data.unsupported_reason || '').trim() || undefined,
+        deployment_package_id: String(data.deployment_package_id || '').trim() || undefined,
         decision_applied: typeof data.decision_applied === 'boolean' ? data.decision_applied : undefined,
         decision_drift: Array.isArray(data.decision_drift)
           ? data.decision_drift.map((item) => ({
@@ -2272,6 +2295,7 @@ export default function DeploymentTrackApp() {
       for (const warning of Array.isArray(data.warnings) ? data.warnings : []) {
         appendLog(String(warning), 'info', { stage: 'terraform_generation' });
       }
+      return true;
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : 'Infrastructure generation failed.';
       appendLog(message, 'error', { stage: 'terraform_generation' });
@@ -2373,7 +2397,12 @@ export default function DeploymentTrackApp() {
       ...currentInfraConsultant,
       confirmed: true,
     });
-  }, [currentInfraConsultant, persistInfraConsultant]);
+    persistApprovedDecision({
+      workspace: expectedWorkspace,
+      decision: JSON.parse(JSON.stringify(currentInfraConsultant.decision)) as InfraConsultantDecision,
+      locked_at: new Date().toISOString(),
+    });
+  }, [currentInfraConsultant, expectedWorkspace, persistApprovedDecision, persistInfraConsultant]);
 
   const rejectInfraConsultantDecision = useCallback(async () => {
     if (!currentInfraConsultant) return;
@@ -3047,9 +3076,6 @@ export default function DeploymentTrackApp() {
               {normalizeRepoDetectionSummaryText(currentInfraConsultant?.repo_detection_summary) || 'Waiting for consultant context.'}
             </pre>
           </div>
-          <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5 text-xs text-zinc-400">
-            Architecture, Approval, and Terraform stages remain available. The consultant output is now the gate for infrastructure generation.
-          </div>
         </div>
       </div>
     </div>
@@ -3201,19 +3227,12 @@ export default function DeploymentTrackApp() {
                       <div className="mt-1 text-xl font-semibold text-zinc-100">{answeredRequiredCount}/{requiredQuestions.length || 0}</div>
                     </div>
                     <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] px-4 py-3">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Progress</div>
-                      <div className="mt-1 text-xl font-semibold text-zinc-100">{reviewCompletionPercent}%</div>
-                    </div>
-                    <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] px-4 py-3 sm:col-span-1 col-span-2">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Next Up</div>
-                      <div className="mt-1 text-sm font-medium text-zinc-200">{nextRequiredQuestion ? formatQuestionCategory(nextRequiredQuestion.category) : 'Ready to generate'}</div>
                     </div>
                   </div>
                 </div>
               </div>
-
               {reviewLoading ? (
-                <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
+                <>
                   <div className="space-y-4">
                     {Array.from({ length: 4 }).map((_, index) => (
                       <div key={index} className="animate-pulse rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
@@ -3226,7 +3245,7 @@ export default function DeploymentTrackApp() {
                   <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6 text-sm text-zinc-400">
                     Building the deployment questionnaire from repository analysis...
                   </div>
-                </div>
+                </>
               ) : review ? (
                 <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
                   <div className="space-y-6">
@@ -3417,7 +3436,7 @@ export default function DeploymentTrackApp() {
                       <div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">What Happens Next</div>
                       <div className="space-y-2 text-sm text-zinc-400">
                         <div>1. Generate AWS architecture and cost estimate.</div>
-                        <div>2. Review and approve the plan.</div>
+                        <div>2. Review architecture and cost.</div>
                         <div>3. Generate Terraform and continue to deployment.</div>
                       </div>
                       <button
@@ -3471,7 +3490,7 @@ export default function DeploymentTrackApp() {
                     <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Selected Components</div>
                     <div className="space-y-2 text-sm text-zinc-300">
                       {decisionDiagram.components.length > 0 ? decisionDiagram.components.map((item) => (
-                        <div key={item} className="rounded-md border border-[#1A1A1A] bg-black px-3 py-2 font-mono text-xs text-zinc-300">{item}</div>
+                        <div key={item} className="rounded-md border border-[#1A1A1A] bg-black px-3 py-2 font-mono text-xs text-zinc-300">{formatComponentName(item)}</div>
                       )) : <div className="text-zinc-500">No components selected yet.</div>}
                     </div>
                   </div>
@@ -3557,84 +3576,11 @@ export default function DeploymentTrackApp() {
                     </div>
                   </div>
                   <button
-                    onClick={() => setAndPersistStage('approval')}
-                    disabled={!decisionForVisualization}
+                    onClick={() => setAndPersistStage('terraform')}
+                    disabled={!approvedConsultantDecision}
                     className="w-full rounded-md bg-zinc-100 py-3 text-sm font-semibold text-black hover:bg-white disabled:bg-[#111111] disabled:text-zinc-500"
                   >
-                    Continue to Approval Gate
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-          {activeStage === 'approval' && (
-            <div className="mx-auto max-w-6xl space-y-6">
-              <div>
-                <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Approval Gate</h1>
-                <p className="text-sm text-zinc-400">Stage 5: review diagram, cost, and consultant notes before locking the decision for Atmos generation.</p>
-                {hasDecisionDriftWarning ? (
-                  <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
-                    Generated stack variables previously drifted from the consultant decision. Regenerate Terraform after revising the decision.
-                    {decisionDriftRows.length > 0 ? ` Drift fields detected: ${decisionDriftRows.map((item) => `${item.component}.${item.key}`).slice(0, 5).join(', ')}.` : ''}
-                  </div>
-                ) : null}
-              </div>
-              <div className="grid grid-cols-3 gap-6">
-                <div className="col-span-2 overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]">
-                  <div className="border-b border-[#1A1A1A] px-5 py-4 text-sm font-semibold text-zinc-100">Architecture Diagram</div>
-                  <div className="p-5">{decisionDiagram.nodes.length > 0 ? decisionDiagramCanvas : <div className="text-sm text-zinc-500">No diagram available.</div>}</div>
-                </div>
-                <div className="space-y-6">
-                  <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
-                    <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Monthly Subtotal</div>
-                    <div className="text-3xl font-semibold text-zinc-100">${decisionCostSubtotal.toFixed(2)}</div>
-                    <div className="mt-2 text-xs text-zinc-500">{decisionCostVariance}</div>
-                  </div>
-                  <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
-                    <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Consultant Notes</div>
-                    <div className="space-y-2 text-xs leading-relaxed text-zinc-400">
-                      {consultantNotesList.length > 0 ? consultantNotesList.map((note, index) => (
-                        <div key={`${index}-${note}`} className="rounded-md border border-[#1A1A1A] bg-black px-3 py-2">{note}</div>
-                      )) : <div className="text-zinc-500">No consultant notes were provided.</div>}
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => {
-                      if (currentInfraConsultant?.decision) {
-                        const historyWithContext = [
-                          ...currentInfraConsultant.history,
-                          {
-                            role: 'assistant' as const,
-                            content: `Current approved decision context:\n${JSON.stringify(approvedConsultantDecision || currentInfraConsultant.decision, null, 2)}`,
-                          },
-                        ];
-                        persistInfraConsultant({
-                          ...currentInfraConsultant,
-                          history: historyWithContext,
-                          confirmed: false,
-                        });
-                      }
-                      persistApprovedDecision(null);
-                      setAndPersistStage('qa');
-                    }}
-                    className="w-full rounded-md border border-[#262626] bg-[#111111] py-3 text-sm font-semibold text-zinc-200 hover:bg-[#181818]"
-                  >
-                    Edit in Chat
-                  </button>
-                  <button
-                    onClick={() => {
-                      if (!currentInfraConsultant?.decision) return;
-                      persistApprovedDecision({
-                        workspace: expectedWorkspace,
-                        decision: JSON.parse(JSON.stringify(currentInfraConsultant.decision)) as InfraConsultantDecision,
-                        locked_at: new Date().toISOString(),
-                      });
-                      setAndPersistStage('terraform');
-                    }}
-                    disabled={!currentInfraConsultant?.decision}
-                    className="w-full rounded-md bg-indigo-600 py-3 text-sm font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500"
-                  >
-                    Approve & Generate Terraform
+                    Continue to Infrastructure Generation
                   </button>
                 </div>
               </div>
@@ -3645,7 +3591,7 @@ export default function DeploymentTrackApp() {
               <div className="flex items-center justify-between">
                 <div>
                   <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Infrastructure Generation</h1>
-                  <p className="text-sm text-zinc-400">Approved deterministic EC2 Terraform generation runs here. Infra consultant chat stays in the earlier Questions and Approval stages.</p>
+                  <p className="text-sm text-zinc-400">Deterministic EC2 Terraform generation runs here from the confirmed consultant decision.</p>
                 </div>
                 <div className="flex items-center gap-3">
                   <button
@@ -3675,17 +3621,23 @@ export default function DeploymentTrackApp() {
                     </button>
                   ) : null}
                   <button
-                    onClick={() => setAndPersistStage('aws_config')}
-                    disabled={!canContinueToAwsConfig}
+                    onClick={async () => {
+                      if (!approvedConsultantDecision) return;
+                      if (!hasSuccessfulGeneration) {
+                        await generateTerraform();
+                      }
+                      setAndPersistStage('aws_config', { force: true });
+                    }}
+                    disabled={terraformGenerating || !approvedConsultantDecision}
                     className="rounded-md bg-zinc-100 px-5 py-2 text-sm font-semibold text-black hover:bg-white disabled:bg-[#111111] disabled:text-zinc-500"
                   >
-                    Continue
+                    {terraformGenerating ? 'Generating...' : hasSuccessfulGeneration ? 'Continue' : 'Generate & Continue'}
                   </button>
                 </div>
               </div>
               {!hasSuccessfulGeneration ? (
                 <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-3 text-xs text-cyan-200">
-                  Terraform stage only shows generation status and artifacts. Use the Questions or Approval stage to refine consultant decisions.
+                  Terraform stage only shows generation status and artifacts. Use Questions to refine consultant decisions.
                 </div>
               ) : null}
               <div className="grid grid-cols-3 gap-6">
@@ -3832,6 +3784,11 @@ export default function DeploymentTrackApp() {
                     <input value={terraformRuntimeConfig.state_bucket} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, state_bucket: event.target.value }))} placeholder="STATE_BUCKET (optional)" className="w-full rounded-md border border-[#262626] bg-black px-4 py-2.5 font-mono text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none" />
                     <input value={terraformRuntimeConfig.lock_table} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, lock_table: event.target.value }))} placeholder="LOCK_TABLE (optional)" className="w-full rounded-md border border-[#262626] bg-black px-4 py-2.5 font-mono text-sm text-zinc-200 focus:border-indigo-500/50 focus:outline-none" />
                   </div>
+                  {hasAwsSecrets && !canContinueToAwsConfig && (
+                    <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                      Infrastructure generation is required before deploying. Go back to the Infrastructure Generation step and generate your Terraform files first.
+                    </div>
+                  )}
                   <button onClick={() => setAndPersistStage('deploy')} disabled={!hasAwsSecrets || !canContinueToAwsConfig} className="flex w-full items-center justify-center gap-2 rounded-md bg-indigo-600 py-3 font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500">
                     <Rocket className="h-4 w-4" /> Continue to Deploy
                   </button>
@@ -3849,8 +3806,12 @@ export default function DeploymentTrackApp() {
                       <div>Budget cap: <span className="font-mono text-zinc-200">${costEstimate.cap.toFixed(2)}</span></div>
                     </div>
                   </div>
-                  <div className={`rounded-md border px-3 py-2 text-xs ${hasAwsSecrets ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300' : 'border-amber-500/20 bg-amber-500/10 text-amber-300'}`}>
-                    {hasAwsSecrets ? 'AWS credentials are ready. Add AWS_SESSION_TOKEN if you are using temporary STS credentials.' : 'Enter AWS access key and secret key to unlock deployment.'}
+                  <div className={`rounded-md border px-3 py-2 text-xs ${hasAwsSecrets && canContinueToAwsConfig ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300' : hasAwsSecrets ? 'border-zinc-700 bg-[#111111] text-zinc-400' : 'border-amber-500/20 bg-amber-500/10 text-amber-300'}`}>
+                    {hasAwsSecrets && canContinueToAwsConfig
+                      ? 'AWS credentials are ready. Add AWS_SESSION_TOKEN if you are using temporary STS credentials.'
+                      : hasAwsSecrets
+                        ? 'Credentials saved. Complete infrastructure generation to unlock deploy.'
+                        : 'Enter AWS access key and secret key to unlock deployment.'}
                   </div>
                   {sessionIacTruncated && !activeSavedRun && (
                     <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">

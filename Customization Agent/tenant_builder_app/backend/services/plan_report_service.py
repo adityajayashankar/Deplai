@@ -29,6 +29,11 @@ def build_plan_markdown(
     modified_files: list[str],
     errors: list[str],
     use_llm_graph: bool,
+    pipeline_mode: str = "hybrid",
+    run_id: str = "",
+    change_sources: list[dict[str, Any]] | None = None,
+    quality_report: dict[str, Any] | None = None,
+    preview: dict[str, Any] | None = None,
 ) -> str:
     now = datetime.now(timezone.utc).isoformat()
     categories = _safe_dict(manifest.get("categories"))
@@ -42,6 +47,8 @@ def build_plan_markdown(
     lines.append(_section("Run Context"))
     lines.append(f"- Tenant: {tenant_id}\n")
     lines.append(f"- Repo: {repo_path}\n")
+    lines.append(f"- Run ID: {run_id}\n")
+    lines.append(f"- Pipeline Mode: {pipeline_mode}\n")
     lines.append(f"- LLM Graph Enabled: {str(use_llm_graph).lower()}\n")
     lines.append(f"- Planned Changes Count: {len(planned_changes)}\n")
     lines.append(f"- Modified Files Count: {len(modified_files)}\n")
@@ -94,6 +101,40 @@ def build_plan_markdown(
     lines.append(_bullet_list(modified_files))
     lines.append("\n")
 
+    lines.append(_section("Change Attribution"))
+    sources = change_sources or []
+    if not sources:
+        lines.append("- None\n\n")
+    else:
+        for entry in sources:
+            file_path = str(entry.get("file", ""))
+            source = str(entry.get("source", ""))
+            operation = str(entry.get("operation", ""))
+            suffix = f" ({operation})" if operation else ""
+            lines.append(f"- {file_path}: {source}{suffix}\n")
+        lines.append("\n")
+
+    lines.append(_section("Quality Gates"))
+    quality = quality_report or {"status": "not_run", "checks": []}
+    lines.append(f"- Status: {quality.get('status', 'not_run')}\n")
+    for check in quality.get("checks", []) if isinstance(quality.get("checks"), list) else []:
+        if not isinstance(check, dict):
+            continue
+        detail = str(check.get("detail", ""))
+        detail_suffix = f" - {detail}" if detail else ""
+        lines.append(f"- {check.get('name', 'check')}: {check.get('status', 'unknown')}{detail_suffix}\n")
+    lines.append("\n")
+
+    lines.append(_section("Preview"))
+    preview_payload = preview or {"kind": "static_file", "status": "unavailable"}
+    lines.append(f"- Kind: {preview_payload.get('kind', 'unknown')}\n")
+    lines.append(f"- Status: {preview_payload.get('status', 'unknown')}\n")
+    if preview_payload.get("url"):
+        lines.append(f"- URL: {preview_payload.get('url')}\n")
+    if preview_payload.get("detail"):
+        lines.append(f"- Detail: {preview_payload.get('detail')}\n")
+    lines.append("\n")
+
     lines.append(_section("Errors"))
     lines.append(_bullet_list(errors))
     lines.append("\n")
@@ -112,6 +153,11 @@ def write_plan_markdown(
     modified_files: list[str],
     errors: list[str],
     use_llm_graph: bool,
+    pipeline_mode: str = "hybrid",
+    run_id: str = "",
+    change_sources: list[dict[str, Any]] | None = None,
+    quality_report: dict[str, Any] | None = None,
+    preview: dict[str, Any] | None = None,
 ) -> Path:
     tenant_dir = (backend_dir / "tenants" / tenant_id).resolve()
     tenant_dir.mkdir(parents=True, exist_ok=True)
@@ -125,6 +171,11 @@ def write_plan_markdown(
         modified_files=modified_files,
         errors=errors,
         use_llm_graph=use_llm_graph,
+        pipeline_mode=pipeline_mode,
+        run_id=run_id,
+        change_sources=change_sources,
+        quality_report=quality_report,
+        preview=preview,
     )
     plan_path.write_text(markdown, encoding="utf-8")
     return plan_path

@@ -67,6 +67,9 @@ from terraform_agent.agent.engine.deployment_profile import (
     build_profile_manifest,
 )
 from terraform_agent.agent.engine.runtime import DEFAULT_PROVIDER_CONSTRAINT
+from deployment_packager import build_deployment_package
+from deployment_run_store import save_terraform_run
+from ec2_app_renderer import render_ec2_app_bundle
 
 
 SKIP_DIRS = {
@@ -2991,6 +2994,8 @@ def generate_terraform_bundle(
     detected_json: dict[str, Any] | None = None,
     user_answers_json: dict[str, Any] | None = None,
     consultant_decision_json: dict[str, Any] | None = None,
+    source_root: str = "",
+    source_root_candidates: list[str] | None = None,
     llm_provider: str | None = None,
     llm_api_key: str | None = None,
     llm_model: str | None = None,
@@ -3038,6 +3043,130 @@ def generate_terraform_bundle(
         frontend_entrypoint_detection_json=frontend_entrypoint_detection_json,
         profile_payload=approved_profile_payload,
     )
+    raw_renderer = str(terraform_renderer or "").strip().lower()
+    if raw_renderer == "deplai_ec2_app":
+        try:
+            deployment_package = build_deployment_package(
+                source_root=source_root,
+                source_roots=source_root_candidates or [],
+                project_name=project_name,
+                repository_context=repository_context_json or {},
+                deployment_profile=approved_profile_payload,
+                user_answers=user_answers_json or {},
+            )
+            rendered = render_ec2_app_bundle(
+                project_name=project_name,
+                aws_region=aws_region,
+                deployment_package=deployment_package,
+                deployment_profile=approved_profile_payload,
+                user_answers=user_answers_json or {},
+                context_summary=generation_context_summary,
+                state_bucket=state_bucket,
+                lock_table=lock_table,
+            )
+        except Exception as exc:
+            reason = str(exc)
+            _emit_worker(
+                progress_callback,
+                msg_type="error",
+                content=f"EC2 app renderer blocked deployment: {reason}",
+                worker_id="deplai-ec2-app-renderer",
+                worker_role="Deterministic EC2 App Renderer",
+                worker_status="failed",
+                extra={"workspace": workspace, "aws_region": aws_region},
+            )
+            return {
+                "success": False,
+                "provider": "aws",
+                "project_name": project_name,
+                "run_id": None,
+                "workspace": workspace,
+                "warnings": [*preflight_warnings],
+                "error": reason,
+                "source": "deplai_ec2_app",
+                "requested_renderer": "deplai_ec2_app",
+                "actual_renderer": "deplai_ec2_app",
+                "unsupported_reason": reason if "unsupported_deployment_shape" in reason else "",
+                "renderer": "deplai_ec2_app",
+                "component_catalog_version": None,
+                "execution_kind": "terraform",
+                "llm_iac_calls": 0,
+                "llm_iac_disabled": True,
+                "decision_applied": bool(consultant_decision_json),
+                "decision_drift": [],
+                "details": {
+                    "execution_kind": "terraform",
+                    "renderer": "deplai_ec2_app",
+                    "source_root": source_root,
+                },
+            }
+
+        package_manifest = rendered["package_manifest"]
+        files = list(rendered["files"])
+        run_id = save_terraform_run(
+            workspace=workspace,
+            files=files,
+            metadata={
+                "renderer": "deplai_ec2_app",
+                "deployment_package": package_manifest,
+                "project_name": project_name,
+                "aws_region": aws_region,
+                "state_bucket": state_bucket or None,
+                "lock_table": lock_table or None,
+            },
+        )
+        _emit_worker(
+            progress_callback,
+            msg_type="success",
+            content=f"Deterministic EC2 app renderer completed with {len(files)} Terraform file(s).",
+            worker_id="deplai-ec2-app-renderer",
+            worker_role="Deterministic EC2 App Renderer",
+            worker_status="completed",
+            extra={"workspace": workspace, "aws_region": aws_region},
+        )
+        return {
+            "success": True,
+            "provider": "aws",
+            "project_name": project_name,
+            "run_id": run_id,
+            "workspace": workspace,
+            "provider_version": rendered.get("provider_version") or DEFAULT_PROVIDER_CONSTRAINT,
+            "state_bucket": state_bucket or None,
+            "lock_table": lock_table or None,
+            "manifest": rendered.get("manifest") or [],
+            "dag_order": rendered.get("dag_order") or ["ec2_app"],
+            "warnings": [
+                *preflight_warnings,
+                *list(package_manifest.get("warnings") or []),
+                "Generated Terraform through deterministic EC2 app renderer. No LLM-generated HCL was used.",
+            ],
+            "files": files,
+            "readme": next((str(item.get("content") or "") for item in files if item.get("path") == "README.md"), None),
+            "source": "deplai_ec2_app",
+            "requested_renderer": "deplai_ec2_app",
+            "actual_renderer": "deplai_ec2_app",
+            "unsupported_reason": "",
+            "renderer": "deplai_ec2_app",
+            "component_catalog_version": None,
+            "execution_kind": "terraform",
+            "llm_iac_calls": 0,
+            "llm_iac_disabled": True,
+            "decision_applied": bool(consultant_decision_json),
+            "decision_drift": [],
+            "deployment_package_id": package_manifest.get("package_id"),
+            "details": {
+                "execution_kind": "terraform",
+                "renderer": "deplai_ec2_app",
+                "deployment_package": package_manifest,
+                "source_root": source_root,
+                "llm_workers_enabled": False,
+                "requested_iac_mode": requested_iac_mode,
+                "effective_iac_mode": resolved_iac_mode,
+                "llm_iac_calls": 0,
+                "llm_iac_disabled": True,
+            },
+        }
+
     requested_renderer = normalize_terraform_renderer(terraform_renderer)
     cloudposse_profile_payload, cloudposse_adapter_warnings = _cloudposse_compatible_profile_payload(
         approved_profile_payload,

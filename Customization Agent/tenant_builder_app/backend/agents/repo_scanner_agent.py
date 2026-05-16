@@ -379,8 +379,7 @@ def scan_repo(state: dict) -> dict:
 
     client = ProjectLLMClient()
     if not client.is_configured():
-        errors.append("Scanner LLM client is not configured")
-        log_agent("Scanner", "LLM client is not configured. Returning empty repo map.")
+        log_agent("Scanner", "LLM client is not configured. Using deterministic repo map.")
         state["repo_map"] = repo_map
         state["errors"] = errors
         return state
@@ -466,7 +465,6 @@ def scan_repo(state: dict) -> dict:
         repo_map["theme_targets"] = _normalize_paths(result.get("theme_targets"), allowed_paths)
         repo_map["api_targets"] = _normalize_paths(result.get("api_targets"), allowed_paths)
     except Exception as exc:
-        errors.append(f"Scanner LLM failed: {exc}")
         log_agent("Scanner", f"LLM scan failed: {exc}")
 
     state["repo_map"] = repo_map

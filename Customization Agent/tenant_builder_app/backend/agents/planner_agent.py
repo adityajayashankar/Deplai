@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -741,6 +742,25 @@ def _build_deterministic_changes(
     return planned_changes
 
 
+def _change_conflicts_with_literal_replacement(change: dict[str, Any], literal_replacements: list[dict[str, Any]]) -> bool:
+    if change.get("operation") not in {"replace_text", "replace_all_text"}:
+        return False
+
+    target = str(change.get("target", ""))
+    replacement_value = str(change.get("replacement", ""))
+    if not target or not replacement_value:
+        return False
+
+    for replacement in literal_replacements:
+        find_text = str(replacement.get("find", ""))
+        replace_text = str(replacement.get("replace", ""))
+        if not find_text or not replace_text:
+            continue
+        if find_text in target and replace_text not in replacement_value:
+            return True
+    return False
+
+
 def plan_frontend_changes(state: dict) -> dict:
     manifest = state["manifest"]
     app_targets = _normalize_app_targets(state.get("app_targets", ["frontend", "admin-frontend", "expert", "corporates"]))
@@ -784,6 +804,7 @@ def plan_frontend_changes(state: dict) -> dict:
             app_targets,
         )
         state["planned_changes"] = planned_changes
+        state["planner_source"] = "deterministic_planner_fallback"
         state["errors"] = errors
         return state
 
@@ -847,6 +868,7 @@ def plan_frontend_changes(state: dict) -> dict:
 
     try:
         result = client.complete_json(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=1800)
+        state["planner_source"] = "llm_planner"
         reasoning = result.get("reasoning", []) if isinstance(result, dict) else []
         for line in reasoning if isinstance(reasoning, list) else []:
             if isinstance(line, str) and line.strip():
@@ -868,16 +890,32 @@ def plan_frontend_changes(state: dict) -> dict:
             deterministic_file_content_by_path,
             app_targets,
         )
+        state["planner_source"] = "deterministic_planner_fallback"
 
-    # Always merge deterministic safety-net changes so static repositories
-    # (for example root index.html + styles.css) are not skipped when LLM
-    # planning succeeds but misses key nl_key_value intents.
+    literal_replacements = _get_literal_replace_extensions(manifest)
+    if literal_replacements and planned_changes:
+        filtered_changes: list[dict[str, Any]] = []
+        removed_count = 0
+        for change in planned_changes:
+            if _change_conflicts_with_literal_replacement(change, literal_replacements):
+                removed_count += 1
+                log_planner(f"Removed conflicting auto-branding change because exact user replacement wins: {change}")
+                continue
+            filtered_changes.append(change)
+        planned_changes = filtered_changes
+        if removed_count:
+            log_planner(f"Exact replacement priority removed {removed_count} conflicting change(s).")
+
+    # Keep deterministic safety-net changes attributable by default. Legacy
+    # merging can be re-enabled for debugging but normal runs apply the
+    # deterministic phase separately in runner.py.
+    merge_safety_net = os.getenv("CUSTOMIZATION_PLANNER_MERGE_DETERMINISTIC_SAFETY_NET", "false").lower() in {"1", "true", "yes"}
     deterministic_safety_net = _build_deterministic_changes(
         manifest,
         deterministic_allowed_paths,
         deterministic_file_content_by_path,
         app_targets,
-    )
+    ) if merge_safety_net else []
     if deterministic_safety_net:
         existing_signatures = {
             json.dumps(change, sort_keys=True, default=str)

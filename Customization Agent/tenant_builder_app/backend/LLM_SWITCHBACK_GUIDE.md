@@ -1,11 +1,35 @@
-# Local LLM <-> Hugging Face Switchback Guide
+# Customization LLM Provider Guide
 
 This repository now supports a configurable LLM endpoint via environment variables.
 
 ## Files Involved
 
-1. `tenant_builder_app/backend/.env`
-2. `tenant_builder_app/backend/services/llm_client.py`
+1. Repo-root `.env`
+2. `tenant_builder_app/backend/.env` (optional override)
+3. `tenant_builder_app/backend/services/llm_client.py`
+4. `tenant_builder_app/backend/services/llm_provider_config.py`
+
+The backend loads `tenant_builder_app/backend/.env` first, then the repo-root `.env`.
+
+## Groq / OpenRouter Mode
+
+The customization backend now resolves providers in this order:
+
+1. Explicit `LLM_PROVIDER`, `AGENT_LLM_BACKEND`, or `CUSTOMIZATION_LLM_PROVIDER`
+2. Groq when `GROQ_API_KEY` is available
+3. OpenRouter when `OPENROUTER_API_KEY` is available
+4. Legacy Hugging Face / local endpoint fallback
+
+If the selected OpenRouter model has no active endpoint, the client falls through to Groq and then a small list of current OpenRouter fallback models.
+
+```env
+AGENT_LLM_BACKEND=openrouter
+OPENROUTER_API_KEY=<your_openrouter_key>
+OPENROUTER_MODEL=qwen/qwen3-coder:free
+
+GROQ_API_KEY=<your_groq_key>
+GROQ_MODEL=llama-3.1-8b-instant
+```
 
 ## Current Mode (Local LM Studio)
 

@@ -6,16 +6,19 @@ import time
 from typing import Any
 from urllib import error, request
 
-from dotenv import load_dotenv
-
-
 BACKEND_DIR = Path(__file__).resolve().parent
-load_dotenv(BACKEND_DIR / ".env")
+
+from services.llm_provider_config import (
+    DEFAULT_HF_MODEL,
+    HF_API_URL,
+    infer_provider,
+    resolve_llm_provider_configs,
+)
 
 
 class LLMInterpreter:
-    MODEL = os.getenv("LLM_MODEL_ID", os.getenv("HF_MODEL_ID", "Qwen/Qwen2.5-Coder-32B-Instruct"))
-    API_URL = os.getenv("LLM_API_URL", os.getenv("HF_API_URL", "https://router.huggingface.co/v1/chat/completions"))
+    MODEL = DEFAULT_HF_MODEL
+    API_URL = HF_API_URL
     NO_CHANGE_PATTERNS = (
         r"\bno change\b",
         r"\bno changes\b",
@@ -55,14 +58,7 @@ class LLMInterpreter:
         )
 
     def _infer_provider(self, api_url: str) -> str:
-        lowered = (api_url or "").lower()
-        if "anthropic" in lowered:
-            return "anthropic"
-        if "huggingface" in lowered:
-            return "huggingface"
-        if "127.0.0.1" in lowered or "localhost" in lowered:
-            return "local"
-        return "generic"
+        return infer_provider(api_url)
 
     def _is_transient_http_error(self, code: int, details: str) -> bool:
         if code in {429, 500, 502, 503, 504}:
@@ -157,7 +153,12 @@ class LLMInterpreter:
                     "questions": [],
                 }
             return {
-                "response": f"The LLM interpreter could not process the request safely: {exc}",
+                "response": (
+                    "The LLM interpreter is unavailable, and I could not derive a safe "
+                    "deterministic manifest change from that message. Try an explicit "
+                    "command such as: change hero 1 to \"New headline\" or "
+                    "replace \"Old text\" with \"New text\"."
+                ),
                 "manifest_patch": {},
                 "questions": [],
             }
@@ -169,21 +170,53 @@ class LLMInterpreter:
     ) -> dict[str, Any]:
         combined: dict[str, Any] = {}
 
-        landing_patch = self._parse_landing_part_removal_request(
+        inline_patch = self._parse_inline_frontend_request(
             message=message,
             current_manifest=current_manifest,
+        )
+        if self._has_actionable_deterministic_patch(inline_patch):
+            self._deep_merge(combined, inline_patch)
+
+        ui_copy_patch = self._parse_ui_copy_commands_from_message(
+            message=message,
+            current_manifest=self._deep_merge(self._copy_dict(current_manifest), combined),
+        )
+        if ui_copy_patch and isinstance(ui_copy_patch.get("manifest_patch"), dict):
+            self._deep_merge(combined, ui_copy_patch["manifest_patch"])
+
+        landing_patch = self._parse_landing_part_removal_request(
+            message=message,
+            current_manifest=self._deep_merge(self._copy_dict(current_manifest), combined),
         )
         if landing_patch and isinstance(landing_patch.get("manifest_patch"), dict):
             self._deep_merge(combined, landing_patch["manifest_patch"])
 
         welcome_removal_patch = self._parse_remove_welcome_request(
             message=message,
-            current_manifest=current_manifest,
+            current_manifest=self._deep_merge(self._copy_dict(current_manifest), combined),
         )
         if welcome_removal_patch:
             self._deep_merge(combined, welcome_removal_patch)
 
         return self._prune_empty(combined) if isinstance(combined, dict) else {}
+
+    def _has_actionable_deterministic_patch(self, patch: dict[str, Any] | None) -> bool:
+        if not isinstance(patch, dict) or not patch:
+            return False
+
+        categories = patch.get("categories")
+        if isinstance(categories, dict) and self._prune_empty(categories):
+            return True
+
+        extensions = patch.get("extensions")
+        if isinstance(extensions, list):
+            return any(
+                isinstance(item, dict)
+                and str(item.get("type", "")).strip().lower() != "nl_instruction"
+                for item in extensions
+            )
+
+        return False
 
     def _parse_exact_text_replace_command(
         self,
@@ -287,6 +320,10 @@ class LLMInterpreter:
             ("hero_2", r"hero\s*2\s*(?:to\s*say|should\s*be|is|=|:)\s*([^,\n]+)"),
             ("hero_3", r"hero\s*3\s*(?:to\s*say|should\s*be|is|=|:)\s*([^,\n]+)"),
             ("hero_description", r"hero\s*description\s*(?:to\s*say|should\s*be|is|=|:)\s*([^,\n]+)"),
+            ("hero_1", r"(?:landing|home(?:page)?|main|hero)\s+headline\s*(?:to\s*say|should\s*be|is|=|:|to|as)\s*([^,\n]+)"),
+            ("hero_1", r"(?:change|set|update)\s+(?:the\s+)?(?:landing|home(?:page)?|main|hero)\s+headline\s+(?:to|as)\s*([^,\n]+)"),
+            ("hero_description", r"(?:landing|home(?:page)?|hero)\s+(?:subheadline|subtitle|description)\s*(?:to\s*say|should\s*be|is|=|:|to|as)\s*([^,\n]+)"),
+            ("hero_description", r"(?:change|set|update)\s+(?:the\s+)?(?:landing|home(?:page)?|hero)\s+(?:subheadline|subtitle|description)\s+(?:to|as)\s*([^,\n]+)"),
         ]
 
         landing_part_patterns = [
@@ -365,6 +402,8 @@ class LLMInterpreter:
             lowered_target = raw_target.lower()
             # Skip targets already covered by structured parsers in this method.
             if re.search(r"\b(hero\s*[123]|hero\s*description)\b", lowered_target):
+                continue
+            if re.search(r"\b(?:landing|home(?:page)?|main|hero)\s+(?:headline|subheadline|subtitle|description)\b", lowered_target):
                 continue
             if re.search(r"\blanding(?:[\s\._-]*)part\b|\bpart[\s\._-]*\d+\b", lowered_target):
                 continue
@@ -456,8 +495,8 @@ class LLMInterpreter:
             if secondary:
                 theme_patch["secondary"] = secondary
         else:
-            primary_match = re.search(r"primary(?:\s+theme\s+color)?\s*(?:is|=|:)\s*([#a-zA-Z0-9_\-]+)", message, flags=re.IGNORECASE)
-            secondary_match = re.search(r"secondary(?:\s+theme\s+color)?\s*(?:is|=|:)\s*([#a-zA-Z0-9_\-]+)", message, flags=re.IGNORECASE)
+            primary_match = re.search(r"primary(?:\s+theme\s+color)?\s*(?:is|to|as|=|:)\s*([#a-zA-Z0-9_\-]+)", message, flags=re.IGNORECASE)
+            secondary_match = re.search(r"secondary(?:\s+theme\s+color)?\s*(?:is|to|as|=|:)\s*([#a-zA-Z0-9_\-]+)", message, flags=re.IGNORECASE)
             if primary_match:
                 primary = clean_value(primary_match.group(1))
                 if primary:
@@ -770,10 +809,22 @@ class LLMInterpreter:
         )
 
     def _call_llm(self, prompt: str) -> str:
-        api_key = os.getenv("LLM_API_KEY", os.getenv("HF_API_KEY", "")).strip()
-        model = os.getenv("LLM_MODEL_ID", os.getenv("HF_MODEL_ID", self.MODEL)).strip() or self.MODEL
-        api_url = os.getenv("LLM_API_URL", os.getenv("HF_API_URL", self.API_URL)).strip() or self.API_URL
-        provider = os.getenv("LLM_PROVIDER", "").strip().lower() or self._infer_provider(api_url)
+        failures: list[str] = []
+        for config in resolve_llm_provider_configs():
+            try:
+                return self._call_llm_with_config(prompt=prompt, config=config)
+            except RuntimeError as exc:
+                failures.append(str(exc))
+                continue
+
+        joined = " | ".join(failures[-3:]) if failures else "no provider attempts were made"
+        raise RuntimeError(f"All configured LLM providers failed: {joined}")
+
+    def _call_llm_with_config(self, *, prompt: str, config: Any) -> str:
+        api_key = config.api_key
+        model = config.model or self.MODEL
+        api_url = config.api_url or self.API_URL
+        provider = config.provider or self._infer_provider(api_url)
         is_anthropic = provider == "anthropic"
 
         if is_anthropic:

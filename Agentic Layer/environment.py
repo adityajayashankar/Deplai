@@ -236,6 +236,15 @@ class EnvironmentInitializer(RunnerBase):
                 return await self._terminate(f"Error: Terminating workflow — {error_msg}")
             await self._send_message("info", "Docker volumes created successfully")
 
+            # Newly created volumes may contain leftover project directories
+            # (e.g., from a previous host-mounted volume). Ensure the project's
+            # code subdirectory is cleared so `git clone` can target an empty
+            # directory. This mirrors the behaviour when volumes already exist.
+            success, error_msg = await self._run_step(self._clear_codebase_volume)
+            if not success:
+                return await self._terminate(f"Error: Terminating workflow — {error_msg}")
+            await self._send_message("info", "Clearing out old content")
+
             success, error_msg = await self._run_step(self._clear_project_reports)
             if not success:
                 return await self._terminate(f"Error: Terminating workflow — {error_msg}")

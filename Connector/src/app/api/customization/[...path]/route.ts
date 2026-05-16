@@ -36,6 +36,13 @@ type GitHubRepoPathRow = {
   linked_user_id: string | null;
 };
 
+type BackendPreviewStatus = {
+  kind?: 'live_server' | 'static_file';
+  status?: 'ready' | 'unavailable' | 'failed' | 'stopped';
+  url?: string;
+  detail?: string;
+};
+
 class ProxyResolutionError extends Error {
   status: number;
 
@@ -89,6 +96,24 @@ function detectPreviewEntry(repoPath: string): string | null {
     }
   }
   return null;
+}
+
+async function getBackendPreviewStatus(tenantId: string, baseRepoPath: string): Promise<BackendPreviewStatus | null> {
+  if (!tenantId) return null;
+  const params = new URLSearchParams({
+    tenant_id: tenantId,
+    base_repo_path: baseRepoPath,
+  });
+  try {
+    const response = await fetch(`${getBackendBaseUrl()}/api/tenant/preview/status?${params.toString()}`, {
+      cache: 'no-store',
+    });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    return payload && typeof payload === 'object' ? payload as BackendPreviewStatus : null;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeRelativeFilePath(rawPath: string): string {
@@ -151,7 +176,12 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
     }
   }
 
+  const backendPreviewStatus = requestedTenantId
+    ? await getBackendPreviewStatus(requestedTenantId, baseRepoPath)
+    : null;
+
   if (metaOnly) {
+    const liveReady = backendPreviewStatus?.kind === 'live_server' && backendPreviewStatus.status === 'ready' && backendPreviewStatus.url;
     return NextResponse.json({
       project_id: normalizedProjectId,
       requested_tenant_id: requestedTenantId || null,
@@ -161,6 +191,10 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
       tenant_repo_exists: tenantRepoExists,
       preview_root_path: previewRootPath,
       preview_entry: detectPreviewEntry(previewRootPath),
+      preview_kind: liveReady ? 'live_server' : 'static_file',
+      preview_url: liveReady ? backendPreviewStatus?.url : null,
+      preview_status: liveReady ? 'ready' : (backendPreviewStatus?.status || 'unavailable'),
+      preview_error: liveReady ? null : (backendPreviewStatus?.detail || null),
     }, { status: 200 });
   }
 
@@ -169,6 +203,13 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
     relativeFilePath = normalizeRelativeFilePath(request.nextUrl.searchParams.get('file') || '');
   }
   if (!relativeFilePath) {
+    if (
+      backendPreviewStatus?.kind === 'live_server'
+      && backendPreviewStatus.status === 'ready'
+      && backendPreviewStatus.url
+    ) {
+      return NextResponse.redirect(backendPreviewStatus.url, 307);
+    }
     const entry = detectPreviewEntry(previewRootPath);
     if (!entry) {
       return NextResponse.json({
@@ -468,7 +509,7 @@ async function proxyRequest(request: NextRequest, pathSegments: string[] = []) {
   let upstream: Response;
   try {
     upstream = await fetch(targetUrl, init);
-  } catch (error) {
+  } catch {
     const message = `Customization backend is unreachable at ${getBackendBaseUrl()}. Start the tenant builder backend or set CUSTOMIZATION_AGENT_BASE_URL.`;
     return NextResponse.json({ error: message }, { status: 502 });
   }

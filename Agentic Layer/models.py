@@ -176,6 +176,8 @@ class TerraformGenRequest(BaseModel):
     llm_api_base_url: Optional[str] = None
     website_index_html: Optional[str] = None
     terraform_renderer: Optional[str] = None
+    source_root: Optional[str] = None
+    source_root_candidates: Optional[list[str]] = None
 
 
 class TerraformConsultRequest(BaseModel):
@@ -224,6 +226,7 @@ class TerraformGenResponse(BaseModel):
     llm_iac_disabled: Optional[bool] = None
     decision_applied: Optional[bool] = None
     decision_drift: Optional[list[dict[str, Any]]] = None
+    deployment_package_id: Optional[str] = None
     details: Optional[dict] = None
     error: Optional[str] = None
 

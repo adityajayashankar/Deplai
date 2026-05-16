@@ -23,6 +23,7 @@ class CustomizationState(TypedDict, total=False):
     repo_map: dict[str, Any]
     backend_repo_map: dict[str, Any]
     planned_changes: list[dict[str, Any]]
+    planner_source: str
     modified_files: list[str]
     modification_records: list[dict[str, Any]]
     errors: list[str]

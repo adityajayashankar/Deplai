@@ -1314,6 +1314,107 @@ def _patch_static_root_headline(repo_root: Path, manifest: dict[str, Any], modif
             break
 
 
+def _patch_static_root_theme(repo_root: Path, manifest: dict[str, Any], modified: list[str]) -> None:
+    categories = _as_dict(manifest.get("categories"))
+    theme = _as_dict(categories.get("theme"))
+
+    has_theme_override = any(
+        isinstance(theme.get(key), str) and str(theme.get(key)).strip()
+        for key in ("primary", "secondary", "accent", "font_heading", "font_body", "border_radius")
+    )
+    if not has_theme_override:
+        return
+
+    primary = _safe_css_value(_string_or_default(theme.get("primary"), "#3b82f6"), "#3b82f6")
+    secondary = _safe_css_value(_string_or_default(theme.get("secondary"), "#111827"), "#111827")
+    accent = _safe_css_value(_string_or_default(theme.get("accent"), primary), primary)
+    border_radius_raw = _string_or_default(theme.get("border_radius"), "md").lower()
+    border_radius = {
+        "none": "0",
+        "sm": "4px",
+        "md": "8px",
+        "lg": "14px",
+        "xl": "20px",
+        "full": "999px",
+    }.get(border_radius_raw, border_radius_raw if border_radius_raw.endswith(("px", "rem", "%")) else "8px")
+
+    theme_css = (
+        ":root {\n"
+        f"  --tenant-primary: {primary};\n"
+        f"  --tenant-secondary: {secondary};\n"
+        f"  --tenant-accent: {accent};\n"
+        f"  --tenant-radius: {border_radius};\n"
+        "}\n\n"
+        "a, .brand, .kicker, .section-head h2, .card h3 {\n"
+        "  color: var(--tenant-primary) !important;\n"
+        "}\n\n"
+        ".button.prime, button, .meter span, .resource-card::before {\n"
+        "  background: var(--tenant-primary) !important;\n"
+        "}\n\n"
+        ".button, .card, .panel, input, select, textarea {\n"
+        "  border-radius: var(--tenant-radius) !important;\n"
+        "}\n\n"
+        ".button.ghost {\n"
+        "  color: var(--tenant-secondary) !important;\n"
+        "}\n\n"
+        ".hero-chip-row span, .tag, .badge {\n"
+        "  border-color: var(--tenant-primary) !important;\n"
+        "  color: var(--tenant-primary) !important;\n"
+        "}\n"
+    )
+    _write_text(repo_root / "tenant-theme.css", theme_css, modified, repo_root)
+
+    entry_candidates = [
+        repo_root / "index.html",
+        repo_root / "index.htm",
+        repo_root / "index.html.html",
+    ]
+    link_tag = '<link rel="stylesheet" href="tenant-theme.css" />'
+    for entry_path in entry_candidates:
+        if not entry_path.exists() or not entry_path.is_file():
+            continue
+        original = _read_text(entry_path)
+        if not original or "tenant-theme.css" in original:
+            continue
+        if "</head>" in original:
+            updated = original.replace("</head>", f"  {link_tag}\n</head>", 1)
+        else:
+            updated = f"{link_tag}\n{original}"
+        if updated != original:
+            _write_text(entry_path, updated, modified, repo_root)
+            break
+
+
+def _patch_static_root_literal_replacements(repo_root: Path, manifest: dict[str, Any], modified: list[str]) -> None:
+    replacements = _iter_literal_replace_extensions(manifest)
+    if not replacements:
+        return
+
+    candidate_files: list[Path] = []
+    for file_path in sorted(repo_root.iterdir(), key=lambda item: item.name):
+        if not file_path.is_file() or file_path.suffix.lower() not in {".html", ".htm", ".js", ".css"}:
+            continue
+        candidate_files.append(file_path)
+
+    for file_path in candidate_files:
+        original = _read_text(file_path)
+        if not original:
+            continue
+
+        updated = original
+        total_changed = 0
+        for replacement in replacements:
+            updated, changed = _replace_literal_in_content(
+                updated,
+                replacement["find"],
+                replacement["replace"],
+            )
+            total_changed += changed
+
+        if total_changed and updated != original:
+            _write_text(file_path, updated, modified, repo_root)
+
+
 def apply_deterministic_customizations(
     manifest: dict[str, Any],
     repo_path: str,
@@ -1326,6 +1427,8 @@ def apply_deterministic_customizations(
 
     # Static repositories keep landing copy in root HTML instead of app-root folders.
     _patch_static_root_headline(repo_root, manifest, modified)
+    _patch_static_root_theme(repo_root, manifest, modified)
+    _patch_static_root_literal_replacements(repo_root, manifest, modified)
 
     for app_root in _normalize_app_targets(app_targets):
         if not (repo_root / app_root).exists():

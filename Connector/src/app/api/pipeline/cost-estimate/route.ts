@@ -56,6 +56,10 @@ const FALLBACK: Record<string, number> = {
   account_map_hourly: 0.001,
   vpc_nat_hourly: 0.062,
   vpc_baseline_hourly: 0.006,
+  ec2_t3_micro_hourly: 0.0104,
+  ec2_t3_small_hourly: 0.0208,
+  ec2_t3_medium_hourly: 0.0416,
+  ec2_t3_large_hourly: 0.0832,
   fargate_vcpu_hourly: 0.04656,
   fargate_gb_hourly: 0.00511,
   rds_db_t3_micro_hourly: 0.026,
@@ -76,6 +80,9 @@ function canonicalComponentId(value: unknown): string {
   const compact = raw.replace(/[\s\-]+/g, '_');
   if (compact === 'account_map' || compact === 'accountmap' || (compact.includes('account') && compact.includes('map'))) {
     return 'account-map';
+  }
+  if (compact === 'ec2' || compact === 'ec2_instance' || compact === 'ec2instance' || compact.includes('ec2')) {
+    return 'ec2-instance';
   }
   if (compact === 's3_cloudfront' || compact === 'cloudfront' || compact === 's3cloudfront') {
     return 's3_cloudfront';
@@ -237,6 +244,26 @@ function fallbackRedisHourly(nodeType: string): { hourly: number; fallbackReason
   };
 }
 
+function fallbackEc2Hourly(instanceType: string): { hourly: number; fallbackReason?: string; nearestType?: string } {
+  const key = instanceType.toLowerCase();
+  if (key.includes('t3.micro')) return { hourly: FALLBACK.ec2_t3_micro_hourly };
+  if (key.includes('t3.small')) return { hourly: FALLBACK.ec2_t3_small_hourly };
+  if (key.includes('t3.medium')) return { hourly: FALLBACK.ec2_t3_medium_hourly };
+  if (key.includes('t3.large')) return { hourly: FALLBACK.ec2_t3_large_hourly };
+  if (key.includes('t3.')) {
+    return {
+      hourly: FALLBACK.ec2_t3_medium_hourly,
+      nearestType: 't3.medium',
+      fallbackReason: `EC2 instance type ${instanceType} is not in static table; nearest fallback t3.medium was used.`,
+    };
+  }
+  return {
+    hourly: FALLBACK.ec2_t3_micro_hourly,
+    nearestType: 't3.micro',
+    fallbackReason: `EC2 instance type ${instanceType} is not in static table; fallback t3.micro was used.`,
+  };
+}
+
 function buildOptimizationTips(params: {
   components: string[];
   stackConfig: Record<string, unknown>;
@@ -310,6 +337,37 @@ async function estimateDecisionCost(params: {
         hourly: FALLBACK.account_map_hourly,
         note: 'Control-plane baseline estimate for Atmos account-map orchestration.',
         source: 'fallback',
+      });
+      continue;
+    }
+
+    if (component === 'ec2-instance') {
+      const ec2Cfg = asRecord(stackConfig['ec2-instance'] || stackConfig.ec2);
+      const instanceType = String(ec2Cfg.instance_type || 't3.micro').trim().toLowerCase();
+
+      let ec2Rate: number | null = null;
+      const ec2Payload = await fetchPricingBlob('AmazonEC2', params.awsRegion);
+      if (ec2Payload && location) {
+        ec2Rate = extractOnDemandHourly(ec2Payload, (attrs) => {
+          const tenancy = String(attrs.tenancy || '').toLowerCase();
+          const operatingSystem = String(attrs.operatingSystem || '').toLowerCase();
+          const preInstalledSw = String(attrs.preInstalledSw || '').toLowerCase();
+          return String(attrs.location || '') === location
+            && String(attrs.instanceType || '').toLowerCase() === instanceType
+            && tenancy === 'shared'
+            && (operatingSystem.includes('linux') || !operatingSystem)
+            && (preInstalledSw === 'na' || !preInstalledSw);
+        });
+      }
+
+      const fallback = fallbackEc2Hourly(instanceType);
+      if (!ec2Rate && fallback.fallbackReason) fallbackReasons.push(fallback.fallbackReason);
+      pushItem({
+        component,
+        label: 'ec2-instance',
+        hourly: ec2Rate || fallback.hourly,
+        note: `${instanceType}${fallback.nearestType ? `, nearest=${fallback.nearestType}` : ''}`,
+        source: ec2Rate ? 'pricing_api' : 'fallback',
       });
       continue;
     }

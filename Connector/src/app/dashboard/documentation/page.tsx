@@ -1,5 +1,5 @@
-import DocumentationApp from '@/features/dashboard/DocumentationApp';
+import DocumentationClient from './DocumentationClient';
 
 export default function DashboardDocumentationPage() {
-  return <DocumentationApp />;
+  return <DocumentationClient />;
 }

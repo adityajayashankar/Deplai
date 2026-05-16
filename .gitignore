@@ -13,6 +13,7 @@ Connector/.yarn/*
 !Connector/.yarn/releases
 !Connector/.yarn/versions
 Connector/package-lock.json
+terraforge/
 
 # testing
 Connector/coverage
@@ -35,6 +36,8 @@ yarn-error.log*
 .pnpm-debug.log*
 runtime/
 Agentic Layer/runtime/
+.deplai_runtime/
+Agentic Layer/.deplai_runtime/
 
 # vercel
 Connector/.vercel
@@ -48,6 +51,7 @@ Connector/tmp/repos/*
 !Connector/tmp/repos/.gitkeep
 Connector/tmp/local-projects/*
 !Connector/tmp/local-projects/.gitkeep
+tmp_inspect/
 
 # Python
 __pycache__/
@@ -64,6 +68,7 @@ Terraform-generation-plan.md
 *.json
 *.jsonl
 *.mjs
+*.map
 
 # Allow tracked config/source artifacts in Customization Agent
 !Customization Agent/**/*.json

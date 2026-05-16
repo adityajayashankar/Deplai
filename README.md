@@ -947,7 +947,6 @@ Connector routes should be treated as the public application API. Agentic Layer 
 | `docs/` | architecture and API reference |
 | `frontend-designs/` | design references for major UI surfaces |
 | `runtime/` | generated runtime artifacts, not core source |
-| `tmp_inspect/` | inspected external Terraform/module examples |
 
 ## Existing Gaps and Roadmap
 

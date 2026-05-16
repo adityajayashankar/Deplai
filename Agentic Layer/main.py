@@ -841,6 +841,8 @@ async def terraform_generate(request: TerraformGenRequest):
             detected_json=dict(request.detected or {}),
             user_answers_json=dict(request.user_answers or {}),
             consultant_decision_json=dict(request.consultant_decision or {}),
+            source_root=request.source_root or "",
+            source_root_candidates=list(request.source_root_candidates or []),
             llm_provider=None,
             llm_api_key=None,
             llm_model=None,
@@ -888,6 +890,7 @@ async def terraform_generate(request: TerraformGenRequest):
             llm_iac_disabled=agent_result.get("llm_iac_disabled"),
             decision_applied=agent_result.get("decision_applied"),
             decision_drift=agent_result.get("decision_drift"),
+            deployment_package_id=agent_result.get("deployment_package_id"),
             details=agent_result.get("details"),
         )
 
@@ -930,6 +933,7 @@ async def terraform_generate(request: TerraformGenRequest):
         llm_iac_disabled=agent_result.get("llm_iac_disabled") if isinstance(agent_result, dict) else None,
         decision_applied=agent_result.get("decision_applied") if isinstance(agent_result, dict) else None,
         decision_drift=agent_result.get("decision_drift") if isinstance(agent_result, dict) else None,
+        deployment_package_id=agent_result.get("deployment_package_id") if isinstance(agent_result, dict) else None,
         details=agent_result.get("details") if isinstance(agent_result, dict) else None,
     )
 
@@ -1001,9 +1005,13 @@ async def terraform_apply(request: TerraformApplyRequest):
                     project_name=request.project_name,
                     provider=request.provider,
                     state_bucket=request.state_bucket or "",
+                    lock_table=request.lock_table or "",
                     aws_access_key_id=request.aws_access_key_id or "",
                     aws_secret_access_key=request.aws_secret_access_key or "",
+                    aws_session_token=request.aws_session_token or "",
                     aws_region=request.aws_region or "eu-north-1",
+                    enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
+                    confirm_apply=request.confirm_plan_summary is True,
                     apply_context=apply_ctx,
                 ),
             )
@@ -1031,11 +1039,14 @@ async def terraform_apply(request: TerraformApplyRequest):
     finally:
         active_terraform_applies.pop(apply_key, None)
         if result is not None:
+            result_status = str(result.get("status") or "").strip()
             terraform_apply_results[apply_key] = {
-                "status": "completed" if bool(result.get("success")) else "error",
+                "status": result_status if result_status == "awaiting_plan_confirmation" else ("completed" if bool(result.get("success")) else "error"),
                 "result": result,
             }
-        if result and result.get("success"):
+        if result and result.get("status") == "awaiting_plan_confirmation":
+            emit_apply_event("info", "Terraform plan is awaiting confirmation before apply.")
+        elif result and result.get("success"):
             emit_apply_event("success", "Terraform runtime apply completed successfully.")
         elif result:
             emit_apply_event("error", str(result.get("error") or "Terraform runtime apply failed."))

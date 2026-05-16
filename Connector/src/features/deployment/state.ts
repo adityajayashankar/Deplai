@@ -180,6 +180,7 @@ export interface SavedIacMeta {
   execution_kind?: string;
   component_catalog_version?: string;
   unsupported_reason?: string;
+  deployment_package_id?: string;
   decision_applied?: boolean;
   decision_drift?: Array<{
     component: string;
@@ -489,6 +490,7 @@ export function readSavedIacMeta(): SavedIacMeta | null {
       execution_kind: String(parsed.execution_kind || '').trim() || undefined,
       component_catalog_version: String(parsed.component_catalog_version || '').trim() || undefined,
       unsupported_reason: String(parsed.unsupported_reason || '').trim() || undefined,
+      deployment_package_id: String(parsed.deployment_package_id || '').trim() || undefined,
       decision_applied: typeof parsed.decision_applied === 'boolean' ? parsed.decision_applied : undefined,
       decision_drift: Array.isArray(parsed.decision_drift)
         ? parsed.decision_drift
