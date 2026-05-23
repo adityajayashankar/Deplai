@@ -7,7 +7,7 @@ import os
 from fastapi import WebSocket
 
 from models import RemediationRequest, StreamStatus, WebSocketCommand
-from remediation_pipeline.models import RemediationPRRequest
+from remediation_pipeline.models import Fix, RemediationPRRequest
 from remediation_pipeline.orchestrator import RemediationOrchestrator
 from runner_base import RunnerBase
 from utils import set_current_project_id
@@ -28,7 +28,100 @@ class RemediationTrackRunner(RunnerBase):
         self._pending_action: str | None = None
         self._decision_requested = False
         self._approval_requested = False
-        self._latest_fixes = []
+        self._latest_fixes: list[Fix] = []
+        self._accepted_fixes: list[Fix] = []
+
+    @staticmethod
+    def _accepted_filepaths(fixes: list[Fix]) -> list[str]:
+        accepted = [fix.filepath for fix in fixes if fix.diff and fix.status == "auto"]
+        if not accepted:
+            accepted = [fix.filepath for fix in fixes if fix.diff]
+        return accepted
+
+    @staticmethod
+    def _select_fixes(fixes: list[Fix], accepted_filepaths: list[str]) -> list[Fix]:
+        accepted = set(accepted_filepaths)
+        return [fix for fix in fixes if fix.diff and (not accepted or fix.filepath in accepted)]
+
+    def _remember_accepted_fixes(self, fixes: list[Fix]) -> None:
+        seen = {(fix.filepath, fix.diff) for fix in self._accepted_fixes}
+        for fix in fixes:
+            key = (fix.filepath, fix.diff)
+            if key in seen:
+                continue
+            self._accepted_fixes.append(fix)
+            seen.add(key)
+
+    async def _apply_fixes_to_volume(self, fixes: list[Fix], purpose: str) -> bool:
+        candidate_fixes = [fix for fix in fixes if fix.diff]
+        accepted_paths = self._accepted_filepaths(candidate_fixes)
+        selected_fixes = self._select_fixes(candidate_fixes, accepted_paths)
+        if not selected_fixes:
+            await self._send_message("warning", f"No approved patchable fixes were available to apply for {purpose}.")
+            return False
+
+        try:
+            updated_files = await self._run_step(
+                lambda: self.orchestrator.apply_fixes_to_volume(
+                    project_id=self.context.project_id,
+                    fixes=candidate_fixes,
+                    accepted_filepaths=accepted_paths,
+                )
+            )
+        except Exception as exc:
+            await self._terminate(f"Failed to apply remediation fixes to the working tree for {purpose}: {exc}")
+            return False
+
+        if not updated_files:
+            await self._send_message("warning", f"No files were updated while applying fixes for {purpose}.")
+            return False
+
+        self._remember_accepted_fixes(selected_fixes)
+        await self._send_message(
+            "success",
+            f"Applied {len(updated_files)} file(s) to the remediation working tree for {purpose}.",
+        )
+        return True
+
+    async def _run_verification_rescan(self) -> bool:
+        from bearer import run_bearer_scan
+        from result_parser import invalidate_cache
+        from sbom import run_grype_scan, run_syft_scan
+
+        await self._send_message("phase", "Running verification security scan")
+        await self._run_step(lambda: invalidate_cache(self.context.project_id))
+
+        scan_steps = [
+            ("Bearer", lambda: run_bearer_scan(self.context.project_name, self.context.project_id)),
+            ("Syft", lambda: run_syft_scan(self.context.project_name, self.context.project_id)),
+            ("Grype", lambda: run_grype_scan(self.context.project_name, self.context.project_id)),
+        ]
+        for label, scan_step in scan_steps:
+            ok, message = await self._run_step(scan_step)
+            if not ok:
+                return await self._terminate(f"{label} verification scan failed: {message}")
+            await self._send_message("success", f"{label} verification scan completed.")
+
+        await self._run_step(lambda: invalidate_cache(self.context.project_id))
+        try:
+            snapshot = await self._run_step(
+                lambda: self.orchestrator.refresh(
+                    self.context.project_id,
+                    remediation_scope=self.context.remediation_scope,
+                )
+            )
+            await self._send_message(
+                "success",
+                (
+                    "Verification scan refreshed results "
+                    f"(critical={snapshot.get('critical', 0)}, high={snapshot.get('high', 0)}, "
+                    f"medium={snapshot.get('medium', 0)}, low={snapshot.get('low', 0)})."
+                ),
+            )
+        except Exception as exc:
+            return await self._terminate(f"Verification scan completed, but refreshed results could not be loaded: {exc}")
+
+        return True
 
     async def handle_command(self, command: WebSocketCommand):
         if command.action == "continue_round":
@@ -87,6 +180,9 @@ class RemediationTrackRunner(RunnerBase):
                     "success",
                     "Critical and high findings are already cleared. Stopping remediation before medium/low severities.",
                 )
+                if self._accepted_fixes:
+                    approved_for_push = True
+                    break
                 return True
             if snapshot.get("strategy_mode") in {"critical_only", "high_only"}:
                 stage = str(snapshot.get("selected_severity") or "major").upper()
@@ -141,11 +237,17 @@ class RemediationTrackRunner(RunnerBase):
                     await self._send_message("success", f"Validated fix for {fix.filepath}")
 
             if not fixes:
-                await self._send_message(
-                    "warning",
-                    "No candidate fixes were generated. Current scan artifacts may have no actionable vulnerabilities.",
+                if self._accepted_fixes:
+                    await self._send_message(
+                        "warning",
+                        "No additional candidate fixes were generated. Continuing with previously accepted fixes.",
+                    )
+                    approved_for_push = True
+                    break
+                return await self._terminate(
+                    "No candidate fixes were generated for the selected large-repository slice. "
+                    "The run stopped without changes instead of opening an empty approval gate."
                 )
-                return True
 
             actionable_fixes = [fix for fix in fixes if fix.diff]
             if not actionable_fixes:
@@ -158,7 +260,13 @@ class RemediationTrackRunner(RunnerBase):
                     await self._send_message("warning", f"No patchable unified diff was produced. Primary reason: {reasons[0]}")
                 else:
                     await self._send_message("warning", "No patchable unified diff was produced by the remediation pipeline.")
-                return True
+                if self._accepted_fixes:
+                    approved_for_push = True
+                    break
+                return await self._terminate(
+                    "The remediation model did not return any patchable unified diffs for the selected slice. "
+                    "No files were changed, so the approval step was not opened."
+                )
 
             changed = [
                 {
@@ -180,12 +288,17 @@ class RemediationTrackRunner(RunnerBase):
             self._decision_requested = True
             await self._send_status(StreamStatus.waiting_decision)
             action = await self._wait_for_action()
+            await self._send_status(StreamStatus.running)
 
             if action == "continue_round":
                 if current_round >= MAX_ROUNDS:
                     await self._send_message("warning", "Maximum remediation rounds reached; continuing with current fixes.")
                     approved_for_push = True
                     break
+                if not await self._apply_fixes_to_volume(actionable_fixes, f"round {current_round} continuation"):
+                    return False
+                if not await self._run_verification_rescan():
+                    return False
                 current_round += 1
                 continue
 
@@ -201,40 +314,62 @@ class RemediationTrackRunner(RunnerBase):
         if action != "approve_push":
             await self._send_message("error", "Final approval was not provided.")
             return False
+        await self._send_status(StreamStatus.running)
+        await self._send_message(
+            "success",
+            "Final approval received. Persisting approved remediation changes and running verification.",
+        )
+
+        candidate_fixes = [fix for fix in self._latest_fixes if fix.diff]
+        pending_keys = {(fix.filepath, fix.diff) for fix in self._accepted_fixes}
+        pending_fixes = [fix for fix in candidate_fixes if (fix.filepath, fix.diff) not in pending_keys]
+        if pending_fixes and not await self._apply_fixes_to_volume(pending_fixes, "final approval"):
+            return False
+
+        accepted_fixes = list(self._accepted_fixes)
+        accepted_paths = [fix.filepath for fix in accepted_fixes]
+        if not accepted_fixes:
+            return await self._terminate("No approved remediation fixes were available to persist.")
 
         if self.context.project_type != "github":
-            await self._send_message("success", "Remediation completed for local project. PR creation is skipped.")
-            return True
+            try:
+                await self._run_step(
+                    lambda: self.orchestrator.sync_project_volume_to_local_host(
+                        self.context.project_id,
+                        self.context.user_id,
+                    )
+                )
+                await self._send_message("success", "Remediation changes persisted locally.")
+            except Exception as exc:
+                return await self._terminate(f"Failed to persist local remediation changes: {exc}")
+            return await self._run_verification_rescan()
 
         github_token = (self.context.github_token or "").strip()
         repository_url = (self.context.repository_url or "").strip()
         if not github_token or not repository_url:
             await self._send_message("warning", "Missing GitHub token or repository URL. Skipping PR creation.")
-            return True
-
-        candidate_fixes = [fix for fix in self._latest_fixes if fix.diff]
-        accepted_paths = [fix.filepath for fix in candidate_fixes if fix.status == "auto"]
-        if not accepted_paths:
-            accepted_paths = [fix.filepath for fix in candidate_fixes]
+            return await self._run_verification_rescan()
 
         try:
-            pr = self.orchestrator.create_pr(
-                RemediationPRRequest(
-                    project_id=self.context.project_id,
-                    repository_url=repository_url,
-                    github_token=github_token,
-                    fixes=candidate_fixes,
-                    accepted_filepaths=accepted_paths,
+            pr = await self._run_step(
+                lambda: self.orchestrator.create_pr(
+                    RemediationPRRequest(
+                        project_id=self.context.project_id,
+                        repository_url=repository_url,
+                        github_token=github_token,
+                        fixes=accepted_fixes,
+                        accepted_filepaths=accepted_paths,
+                    )
                 )
             )
             if pr.success:
-                await self._send_message("success", f"PR created: {pr.pr_url}")
+                await self._send_message("success", f"Remediation PR created: {pr.pr_url}")
             else:
                 await self._send_message("warning", pr.message)
         except Exception as exc:
             await self._send_message("warning", f"PR creation failed: {exc}")
 
-        return True
+        return await self._run_verification_rescan()
 
     async def _wait_for_action(self) -> str:
         self._pending_action = None

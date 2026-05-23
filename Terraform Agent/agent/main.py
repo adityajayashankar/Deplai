@@ -17,8 +17,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from graph import build_graph
-from state import AgentState
+if __package__:
+    from .graph import build_graph
+    from .state import AgentState
+else:
+    from graph import build_graph
+    from state import AgentState
 
 
 # ──────────────────────────────────────────────────────────────────────────────

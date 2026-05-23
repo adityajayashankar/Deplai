@@ -66,6 +66,13 @@ export async function GET(request: NextRequest) {
     // GitHub App setup callback can reuse this URL and does not guarantee OAuth state.
     // Route these callbacks directly back to dashboard and bind installation ownership when possible.
     if (installationIdParam && setupAction) {
+      if (!session.isLoggedIn || !session.user) {
+        session.oauthState = undefined;
+        session.oauthStateExpiresAt = undefined;
+        await session.save();
+        return NextResponse.redirect(`${process.env.NEXT_PUBLIC_APP_URL}/api/auth/login?force=1`, 302);
+      }
+
       if (session.isLoggedIn && session.user) {
         await query(
           `UPDATE github_installations

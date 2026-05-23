@@ -1057,7 +1057,7 @@ export default function DashboardHomeApp() {
   const [search, setSearch] = useState('');
   const [repositories, setRepositories] = useState<DashboardRepository[]>([]);
   const [projectsById, setProjectsById] = useState<Record<string, ProjectRecord>>({});
-  const [userName, setUserName] = useState('adityajayashankar');
+  const [userName, setUserName] = useState('Signed out');
   const [userAvatarUrl, setUserAvatarUrl] = useState('');
   const [loggingOut, setLoggingOut] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -1067,23 +1067,30 @@ export default function DashboardHomeApp() {
   const loadDashboardData = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [sessionRes, projectsRes] = await Promise.all([
-        fetch('/api/auth/session', { cache: 'no-store' }),
-        fetch('/api/projects', { cache: 'no-store' }),
-      ]);
+      const sessionRes = await fetch('/api/auth/session', { cache: 'no-store' });
 
       if (sessionRes.ok) {
         const session = await sessionRes.json() as SessionResponse;
-        const nextUser = session.user?.login || session.user?.name;
-        if (nextUser) setUserName(nextUser);
-        setUserAvatarUrl(session.user?.avatarUrl || '');
+        if (!session.isLoggedIn || !session.user) {
+          window.location.assign('/api/auth/login?force=1');
+          return;
+        }
+        const nextUser = session.user.login || session.user.name;
+        setUserName(nextUser || 'Signed in');
+        setUserAvatarUrl(session.user.avatarUrl || '');
+      } else {
+        window.location.assign('/api/auth/login?force=1');
+        return;
       }
 
+      const projectsRes = await fetch('/api/projects', { cache: 'no-store' });
       if (projectsRes.ok) {
         const payload = await projectsRes.json() as ProjectsResponse;
         const projects = Array.isArray(payload.projects) ? payload.projects : [];
         setRepositories(mapProjectsToRepositories(projects));
         setProjectsById(Object.fromEntries(projects.map((project) => [project.id, project])));
+      } else if (projectsRes.status === 401) {
+        window.location.assign('/api/auth/login?force=1');
       }
     } finally {
       setRefreshing(false);

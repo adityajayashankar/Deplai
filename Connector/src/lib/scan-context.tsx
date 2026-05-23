@@ -6,6 +6,8 @@ const WS_BASE_URL = (process.env.NEXT_PUBLIC_AGENTIC_WS_URL || '').trim();
 const SCAN_CONTEXT_STORAGE_KEY = 'deplai.scan-context.v1';
 const MAX_PROJECT_ENTRIES = 40;
 const MAX_MESSAGES_PER_PROJECT = 500;
+const MAX_STORED_REMEDIATION_MESSAGES = 160;
+const MAX_STORED_MESSAGE_CONTENT_CHARS = 2_000;
 
 type OperationState = 'idle' | 'running' | 'waiting_decision' | 'waiting_approval' | 'completed' | 'error';
 export type ScanState = OperationState;
@@ -23,6 +25,13 @@ export interface ScanMessage {
   type: string;
   content: string;
   timestamp: string;
+}
+
+interface SocketPayload {
+  type?: string;
+  data?: ScanMessage;
+  status?: string;
+  error?: string;
 }
 
 interface ProjectScanState {
@@ -78,14 +87,19 @@ export function useScan() {
 }
 
 async function fetchWsToken(projectId: string): Promise<string> {
-  try {
-    const res = await fetch(`/api/scan/ws-token?project_id=${encodeURIComponent(projectId)}`);
-    if (!res.ok) return '';
-    const data = await res.json();
-    return data.token || '';
-  } catch {
-    return '';
+  const res = await fetch(`/api/scan/ws-token?project_id=${encodeURIComponent(projectId)}`, { cache: 'no-store' });
+  const data = await res.json().catch(() => ({})) as { token?: string; error?: string };
+  if (!res.ok) {
+    const fallback = res.status === 401
+      ? 'Your session is not authorized to stream remediation logs. Sign in again and reopen the project from the dashboard.'
+      : 'Failed to issue remediation WebSocket token.';
+    throw new Error(String(data.error || fallback));
   }
+  const token = String(data.token || '').trim();
+  if (!token) {
+    throw new Error('Remediation WebSocket token response was empty.');
+  }
+  return token;
 }
 
 let resolvedWsBaseCache: string | null = null;
@@ -152,9 +166,11 @@ function connectWebSocket(
   };
 
   ws.onmessage = (event) => {
-    let data: any;
+    let data: SocketPayload;
     try {
-      data = JSON.parse(event.data);
+      const parsed = JSON.parse(event.data) as unknown;
+      if (!parsed || typeof parsed !== 'object') throw new Error('Invalid websocket payload');
+      data = parsed as SocketPayload;
     } catch {
       onMessage(projectId, {
         index: Date.now(),
@@ -200,6 +216,46 @@ function trimMessageList(messages: ScanMessage[]): ScanMessage[] {
   return messages.slice(-MAX_MESSAGES_PER_PROJECT);
 }
 
+function truncateStoredContent(content: string): string {
+  if (content.length <= MAX_STORED_MESSAGE_CONTENT_CHARS) return content;
+  return `${content.slice(0, MAX_STORED_MESSAGE_CONTENT_CHARS)}\n[truncated for browser storage]`;
+}
+
+function sanitizeRemediationMessageForStorage(message: ScanMessage): ScanMessage {
+  const content = String(message.content || '');
+  if (message.type !== 'changed_files') {
+    return { ...message, content: truncateStoredContent(content) };
+  }
+  if (content.length > MAX_STORED_MESSAGE_CONTENT_CHARS) {
+    return { ...message, content: '[]' };
+  }
+
+  try {
+    const payload = JSON.parse(content) as unknown;
+    if (!Array.isArray(payload)) {
+      return { ...message, content: '[]' };
+    }
+    const lightweight = payload
+      .map((item) => {
+        const entry = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+        const path = String(entry.path || '').trim();
+        if (!path) return null;
+        const reason = typeof entry.reason === 'string' ? entry.reason : undefined;
+        return { path, reason, diff_omitted: true };
+      })
+      .filter(Boolean);
+    return { ...message, content: JSON.stringify(lightweight) };
+  } catch {
+    return { ...message, content: '[]' };
+  }
+}
+
+function sanitizeRemediationMessagesForStorage(messages: ScanMessage[]): ScanMessage[] {
+  return trimMessageList(messages)
+    .slice(-MAX_STORED_REMEDIATION_MESSAGES)
+    .map(sanitizeRemediationMessageForStorage);
+}
+
 function clampRecordSize<T>(input: Record<string, T>): Record<string, T> {
   const entries = Object.entries(input || {});
   if (entries.length <= MAX_PROJECT_ENTRIES) return input || {};
@@ -231,6 +287,18 @@ function normalizeStoredRemediationStates(input: Record<string, ProjectRemediati
   return clampRecordSize(out);
 }
 
+function normalizeRemediationStatesForStorage(input: Record<string, ProjectRemediationState> | undefined): Record<string, ProjectRemediationState> {
+  const out: Record<string, ProjectRemediationState> = {};
+  for (const [projectId, state] of Object.entries(input || {})) {
+    if (!projectId || !state) continue;
+    out[projectId] = {
+      state: state.state || 'idle',
+      messages: sanitizeRemediationMessagesForStorage(Array.isArray(state.messages) ? state.messages : []),
+    };
+  }
+  return clampRecordSize(out);
+}
+
 function normalizeStoredResultsCache(input: Record<string, CachedScanResults> | undefined): Record<string, CachedScanResults> {
   const out: Record<string, CachedScanResults> = {};
   for (const [projectId, cached] of Object.entries(input || {})) {
@@ -255,10 +323,10 @@ function readPersistedSnapshot(): PersistedScanContextSnapshot | null {
 }
 
 export function ScanProvider({ children }: { children: React.ReactNode }) {
-  const [scanStates, setScanStates] = useState<Record<string, ProjectScanState>>({});
-  const [remediationStates, setRemediationStates] = useState<Record<string, ProjectRemediationState>>({});
-  const [resultsCache, setResultsCache] = useState<Record<string, CachedScanResults>>({});
-  const [storageHydrated, setStorageHydrated] = useState(false);
+  const [scanStates, setScanStates] = useState<Record<string, ProjectScanState>>(() => normalizeStoredScanStates(readPersistedSnapshot()?.scanStates));
+  const [remediationStates, setRemediationStates] = useState<Record<string, ProjectRemediationState>>(() => normalizeStoredRemediationStates(readPersistedSnapshot()?.remediationStates));
+  const [resultsCache, setResultsCache] = useState<Record<string, CachedScanResults>>(() => normalizeStoredResultsCache(readPersistedSnapshot()?.resultsCache));
+  const [storageHydrated] = useState(true);
   const wsRefs = useRef<Record<string, WebSocket>>({});
   const remWsRefs = useRef<Record<string, WebSocket>>({});
 
@@ -308,16 +376,6 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
   }, [clampMapSize]);
 
   useEffect(() => {
-    const snapshot = readPersistedSnapshot();
-    if (snapshot) {
-      setScanStates(normalizeStoredScanStates(snapshot.scanStates));
-      setRemediationStates(normalizeStoredRemediationStates(snapshot.remediationStates));
-      setResultsCache(normalizeStoredResultsCache(snapshot.resultsCache));
-    }
-    setStorageHydrated(true);
-  }, []);
-
-  useEffect(() => {
     if (!storageHydrated) return;
     const handleStorage = (event: StorageEvent) => {
       if (event.key !== SCAN_CONTEXT_STORAGE_KEY) return;
@@ -344,7 +402,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     if (!storageHydrated) return;
     const snapshot: PersistedScanContextSnapshot = {
       scanStates: normalizeScanStates(scanStates),
-      remediationStates: normalizeRemediationStates(remediationStates),
+      remediationStates: normalizeRemediationStatesForStorage(remediationStates),
       resultsCache: normalizeResultsCache(resultsCache),
     };
 
@@ -567,61 +625,72 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    const wsBaseUrl = await resolveWsBaseUrl();
-    const wsToken = await fetchWsToken(projectId);
-    remWsRefs.current[projectId] = connectWebSocket(
-      wsBaseUrl,
-      '/ws/remediate', projectId,
-      appendRemediationMessage,
-      updateRemediationStatus,
-      (id, detail) => {
-        if (detail) {
-          appendRemediationMessage(id, {
-            index: Date.now(),
-            total: Date.now(),
-            type: 'error',
-            content: detail,
-            timestamp: new Date().toISOString(),
-          });
-        }
-        updateRemediationStatus(id, 'error');
-      },
-      (id, detail) => {
-        // If WS closes while remediation is still running, mark as error
-        setRemediationStates(prev => {
-          const cur = prev[id];
-          if (cur && !['completed', 'error', 'idle'].includes(cur.state)) {
-            const reason = detail?.reason?.trim();
-            const message = reason
-              ? `WebSocket closed unexpectedly (${detail?.code || 1006}): ${reason}`
-              : `WebSocket closed unexpectedly (${detail?.code || 1006}).`;
-            const alreadyLogged = cur.messages.some((entry) => entry.type === 'error' && entry.content === message);
-            return {
-              ...prev,
-              [id]: {
-                ...cur,
-                state: 'error',
-                messages: alreadyLogged
-                  ? cur.messages
-                  : trimMessages([
-                      ...cur.messages,
-                      {
-                        index: Date.now(),
-                        total: Date.now(),
-                        type: 'error',
-                        content: message,
-                        timestamp: new Date().toISOString(),
-                      },
-                    ]),
-              },
-            };
+    try {
+      const wsBaseUrl = await resolveWsBaseUrl();
+      const wsToken = await fetchWsToken(projectId);
+      remWsRefs.current[projectId] = connectWebSocket(
+        wsBaseUrl,
+        '/ws/remediate', projectId,
+        appendRemediationMessage,
+        updateRemediationStatus,
+        (id, detail) => {
+          if (detail) {
+            appendRemediationMessage(id, {
+              index: Date.now(),
+              total: Date.now(),
+              type: 'error',
+              content: detail,
+              timestamp: new Date().toISOString(),
+            });
           }
-          return prev;
-        });
-        delete remWsRefs.current[id];
-      },
-      wsToken,
-    );
+          updateRemediationStatus(id, 'error');
+        },
+        (id, detail) => {
+          // If WS closes while remediation is still running, mark as error
+          setRemediationStates(prev => {
+            const cur = prev[id];
+            if (cur && !['completed', 'error', 'idle'].includes(cur.state)) {
+              const reason = detail?.reason?.trim();
+              const message = reason
+                ? `WebSocket closed unexpectedly (${detail?.code || 1006}): ${reason}`
+                : `WebSocket closed unexpectedly (${detail?.code || 1006}).`;
+              const alreadyLogged = cur.messages.some((entry) => entry.type === 'error' && entry.content === message);
+              return {
+                ...prev,
+                [id]: {
+                  ...cur,
+                  state: 'error',
+                  messages: alreadyLogged
+                    ? cur.messages
+                    : trimMessages([
+                        ...cur.messages,
+                        {
+                          index: Date.now(),
+                          total: Date.now(),
+                          type: 'error',
+                          content: message,
+                          timestamp: new Date().toISOString(),
+                        },
+                      ]),
+                },
+              };
+            }
+            return prev;
+          });
+          delete remWsRefs.current[id];
+        },
+        wsToken,
+      );
+    } catch (error) {
+      appendRemediationMessage(projectId, {
+        index: Date.now(),
+        total: Date.now(),
+        type: 'error',
+        content: error instanceof Error ? error.message : 'Failed to connect remediation log stream.',
+        timestamp: new Date().toISOString(),
+      });
+      updateRemediationStatus(projectId, 'error');
+    }
   }, [appendRemediationMessage, trimMessages, updateRemediationStatus]);
 
   const continueRemediationRound = useCallback((projectId: string) => {

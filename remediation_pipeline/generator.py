@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import difflib
+import json
+import re
+
 from remediation_pipeline.models import Fix, SnippetBundle, Vulnerability
 from remediation_pipeline.router import LLMRouter
 
@@ -23,6 +27,19 @@ class FixGenerator:
         force_claude: bool = False,
     ) -> Fix:
         ordered_vulns = [vuln_lookup[s.vuln_id] for s in bundle.snippets if s.vuln_id in vuln_lookup]
+        deterministic_vulns = self._deterministic_sca_vulnerabilities(ordered_vulns)
+        deterministic_diff = self._build_deterministic_sca_diff(bundle, deterministic_vulns)
+        if deterministic_diff:
+            return Fix(
+                filepath=bundle.filepath,
+                diff=deterministic_diff,
+                vulns_addressed=[vuln.id for vuln in deterministic_vulns],
+                provider_used="deterministic",
+                tokens_used=0,
+                status="auto",
+                raw_response="deterministic-sca-fix",
+                warnings=[] if len(deterministic_vulns) == len(ordered_vulns) else ["Some SCA findings had no direct deterministic manifest update"],
+            )
         prompt = self._build_prompt(bundle, ordered_vulns)
 
         try:
@@ -95,6 +112,160 @@ Imports:
 Code:
 {snippets}
 """
+
+    @classmethod
+    def _build_deterministic_sca_diff(cls, bundle: SnippetBundle, vulnerabilities: list[Vulnerability]) -> str:
+        if not vulnerabilities:
+            return ""
+
+        original = bundle.source_text
+        lower_path = bundle.filepath.lower()
+        if lower_path.endswith("requirements.txt"):
+            updated = cls._patch_requirements_txt(original, vulnerabilities)
+        elif lower_path.endswith("package.json"):
+            updated = cls._patch_package_json(original, vulnerabilities)
+        elif lower_path.endswith("go.mod"):
+            updated = cls._patch_go_mod(original, vulnerabilities)
+        else:
+            return ""
+
+        if not updated or updated == original:
+            return ""
+        return "\n".join(
+            difflib.unified_diff(
+                original.splitlines(),
+                updated.splitlines(),
+                fromfile=f"a/{bundle.filepath}",
+                tofile=f"b/{bundle.filepath}",
+                lineterm="",
+            )
+        ).strip()
+
+    @staticmethod
+    def _deterministic_sca_vulnerabilities(vulnerabilities: list[Vulnerability]) -> list[Vulnerability]:
+        if not vulnerabilities or any(v.type != "sca" for v in vulnerabilities):
+            return []
+        return [
+            vuln
+            for vuln in vulnerabilities
+            if str(vuln.package_name or "").strip() and str(vuln.fix_version or "").strip()
+        ]
+
+    @classmethod
+    def _patch_requirements_txt(cls, source: str, vulnerabilities: list[Vulnerability]) -> str:
+        updates = cls._dependency_updates(vulnerabilities)
+        if not updates:
+            return source
+
+        changed = False
+        lines: list[str] = []
+        for line in source.splitlines():
+            next_line = line
+            for package_name, fix_version in updates.items():
+                name_pattern = re.escape(package_name) + r"(?:\[[^\]]+\])?"
+                pattern = re.compile(
+                    rf"^(\s*{name_pattern}\s*)(===|==|~=|>=|<=|>|<)\s*([^#;\s]+)(.*)$",
+                    re.IGNORECASE,
+                )
+                match = pattern.match(next_line)
+                if not match:
+                    continue
+                prefix, operator, current_version, suffix = match.groups()
+                if current_version == fix_version:
+                    break
+                next_line = f"{prefix}{operator}{fix_version}{suffix}"
+                changed = True
+                break
+            lines.append(next_line)
+
+        if not changed:
+            return source
+        updated = "\n".join(lines)
+        return updated + ("\n" if source.endswith("\n") else "")
+
+    @classmethod
+    def _patch_package_json(cls, source: str, vulnerabilities: list[Vulnerability]) -> str:
+        try:
+            data = json.loads(source)
+        except Exception:
+            return source
+        if not isinstance(data, dict):
+            return source
+
+        updates = cls._dependency_updates(vulnerabilities)
+        changed = False
+        for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+            deps = data.get(section)
+            if not isinstance(deps, dict):
+                continue
+            for package_name, fix_version in updates.items():
+                current = deps.get(package_name)
+                if not isinstance(current, str):
+                    continue
+                current_trimmed = current.strip()
+                if current_trimmed.startswith(("file:", "link:", "workspace:", "git+", "github:", "http://", "https://")):
+                    continue
+                prefix = "^" if current_trimmed.startswith("^") else "~" if current_trimmed.startswith("~") else ""
+                next_value = f"{prefix}{fix_version}"
+                if deps[package_name] == next_value:
+                    continue
+                deps[package_name] = next_value
+                changed = True
+
+        if not changed:
+            return source
+        return json.dumps(data, indent=2) + "\n"
+
+    @classmethod
+    def _patch_go_mod(cls, source: str, vulnerabilities: list[Vulnerability]) -> str:
+        updates = cls._dependency_updates(vulnerabilities)
+        if not updates:
+            return source
+
+        changed = False
+        lines: list[str] = []
+        for line in source.splitlines():
+            next_line = line
+            for package_name, fix_version in updates.items():
+                pattern = re.compile(rf"^(\s*{re.escape(package_name)}\s+)v?([^\s]+)(.*)$")
+                match = pattern.match(next_line)
+                if not match:
+                    continue
+                prefix, current_version, suffix = match.groups()
+                target = fix_version if fix_version.startswith("v") else f"v{fix_version}"
+                if current_version == target.lstrip("v") or f"v{current_version}" == target:
+                    break
+                next_line = f"{prefix}{target}{suffix}"
+                changed = True
+                break
+            lines.append(next_line)
+
+        if not changed:
+            return source
+        updated = "\n".join(lines)
+        return updated + ("\n" if source.endswith("\n") else "")
+
+    @classmethod
+    def _dependency_updates(cls, vulnerabilities: list[Vulnerability]) -> dict[str, str]:
+        updates: dict[str, str] = {}
+        for vuln in vulnerabilities:
+            package_name = str(vuln.package_name or "").strip()
+            fix_version = str(vuln.fix_version or "").strip()
+            if not package_name or not fix_version:
+                continue
+            current = updates.get(package_name)
+            if current is None or cls._version_key(fix_version) > cls._version_key(current):
+                updates[package_name] = fix_version
+        return updates
+
+    @staticmethod
+    def _version_key(version: str) -> tuple[tuple[int | str, ...], str]:
+        parts: list[int | str] = []
+        for token in re.split(r"([0-9]+)", str(version).lower()):
+            if not token:
+                continue
+            parts.append(int(token) if token.isdigit() else token)
+        return tuple(parts), str(version)
 
     @staticmethod
     def _extract_unified_diff(raw: str, bundle: SnippetBundle) -> str:

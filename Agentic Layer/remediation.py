@@ -843,6 +843,19 @@ echo "PUSHED"
         success, scan_data = await self._run_step(partial(get_scan_results, self.project_id))
         if not success:
             return await self._terminate(f"Failed to ingest scan data: {scan_data}")
+        if not isinstance(scan_data, dict) or not scan_data:
+            return await self._terminate(
+                "Security scan data is empty or malformed; expected scan results with code_security and supply_chain lists."
+            )
+        code_findings = scan_data.get("code_security")
+        supply_findings = scan_data.get("supply_chain")
+        if not isinstance(code_findings, list) or not isinstance(supply_findings, list):
+            return await self._terminate(
+                "Security scan data is malformed; code_security and supply_chain must both be lists."
+            )
+        if not code_findings and not supply_findings:
+            await self._send_message("success", "Scan data contains no vulnerabilities to remediate.")
+            return True
         await self._send_message("success", "Scan data loaded successfully")
 
         # Step 2: Ensure output volume exists
@@ -1371,30 +1384,40 @@ echo "PUSHED"
             if remaining_vulns < cycle_remaining_baseline:
                 no_progress_cycles = 0
 
-            await self._send_message(
-                "info",
-                "Approved remediation changes have been verified. Ending the remediation loop before any additional PR rounds.",
-            )
-            break
+            if budget_exhausted:
+                await self._send_message(
+                    "warning",
+                    "Ending remediation after the current approval/rescan cycle because the Claude budget cap has been reached.",
+                )
+                break
+
+            _, next_cycle_strategy = _select_cycle_scan_strategy(rescan_data, remediation_scope)
+            if overall_remaining == 0 or next_cycle_strategy.get("mode") == "large_repo_major_complete":
+                await self._send_message(
+                    "info",
+                    "Approved remediation changes have been verified. Ending the remediation loop.",
+                )
+                break
+
+            if no_progress_cycles >= REMEDIATION_NO_PROGRESS_LIMIT:
+                await self._send_message(
+                    "warning",
+                    "Ending remediation because the latest verification scan did not show enough progress for another cycle.",
+                )
+                break
 
             if cycle + 1 < MAX_REMEDIATION_CYCLES:
                 await self._send_message(
                     "info",
                     f"Starting next remediation cycle ({cycle + 2}/{MAX_REMEDIATION_CYCLES})...",
                 )
-                # Use fresh scan data for next cycle
                 scan_data = rescan_data
+                continue
             else:
                 await self._send_message(
                     "warning",
                     f"Maximum remediation cycles ({MAX_REMEDIATION_CYCLES}) reached. "
-                    f"{remaining_vulns} finding(s) may still remain in scope ({remediation_scope}).",
-                )
-
-            if budget_exhausted:
-                await self._send_message(
-                    "warning",
-                    "Ending remediation after the current approval/rescan cycle because the Claude budget cap has been reached.",
+                    f"{overall_remaining} finding(s) may still remain in scope ({remediation_scope}).",
                 )
                 break
 

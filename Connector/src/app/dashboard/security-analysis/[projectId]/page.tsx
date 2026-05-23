@@ -915,7 +915,6 @@ export default function SecurityAnalysisPage() {
     getCachedResults,
     setCachedResults,
     resetRemediation,
-    isAnyRemediating,
   } = useScan();
   const { provider, setProvider, currentConfig, apiKeys, setApiKey, selectedModels, setModel } = useLLM();
 
@@ -925,6 +924,7 @@ export default function SecurityAnalysisPage() {
   const [projectName, setProjectName] = useState<string>(scanProjectName || projectId);
   const [projectMeta, setProjectMeta] = useState<ProjectMeta | null>(null);
   const [loadingProject, setLoadingProject] = useState(true);
+  const [projectAuthError, setProjectAuthError] = useState<string | null>(null);
 
   const [vulnStatus, setVulnStatus] = useState<VulnStatus>('not_initiated');
   const [results, setResults] = useState<ScanResults | null>(null);
@@ -973,12 +973,27 @@ export default function SecurityAnalysisPage() {
     let cancelled = false;
     async function fetchProject() {
       setLoadingProject(true);
+      setProjectMeta(null);
+      setProjectAuthError(null);
       try {
         const res = await fetch(`/api/projects/${projectId}`, { cache: 'no-store' });
-        if (!res.ok || cancelled) return;
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!res.ok) {
+          const message = res.status === 401
+            ? 'Your session is not authorized for this project. Sign in again from the dashboard, then retry remediation.'
+            : res.status === 403 || res.status === 404
+              ? 'This project could not be verified for your account. Reopen it from the dashboard before running remediation.'
+              : String(data?.error || 'Failed to load project metadata.');
+          setProjectAuthError(message);
+          setProjectName(scanProjectName || projectId);
+          return;
+        }
         const project = data?.project;
-        if (!project || cancelled) return;
+        if (!project) {
+          setProjectAuthError('Project metadata response was empty. Reopen the project from the dashboard before running remediation.');
+          return;
+        }
         setProjectName(project.name || project.full_name || project.id || projectId);
         setProjectMeta({
           type: project.type === 'github' ? 'github' : 'local',
@@ -987,8 +1002,12 @@ export default function SecurityAnalysisPage() {
           repo: project.repo,
           branch: project.branch,
         });
+        setProjectAuthError(null);
       } catch {
-        if (!cancelled) setProjectName(scanProjectName || projectId);
+        if (!cancelled) {
+          setProjectName(scanProjectName || projectId);
+          setProjectAuthError('Project metadata could not be loaded. Check your session and reopen the project from the dashboard.');
+        }
       } finally {
         if (!cancelled) setLoadingProject(false);
       }
@@ -1269,7 +1288,10 @@ export default function SecurityAnalysisPage() {
   const visibleCodeFindings = useMemo(() => filteredCodeFindings.slice(0, resultsLimit), [filteredCodeFindings, resultsLimit]);
   const remediatingThisProject = remediationState === 'running';
   const remediationFinished = remediationState === 'completed';
-  const canLaunchRemediation = hasVulnerabilities && scanState !== 'running' && remediationState === 'idle' && !isAnyRemediating;
+  const remediationCanStart = !['running', 'waiting_decision', 'waiting_approval'].includes(remediationState);
+  const projectAccessReady = Boolean(projectMeta) && !loadingProject && !projectAuthError;
+  const canOpenRemediationSetup = projectAccessReady && hasVulnerabilities && scanState !== 'running' && remediationCanStart;
+  const canLaunchRemediation = canOpenRemediationSetup;
 
   useEffect(() => {
     setResultsLimit(100);
@@ -1291,7 +1313,10 @@ export default function SecurityAnalysisPage() {
     hasVulnerabilities,
     scanState,
   });
-  const maxUnlockedIndex = STAGE_INDEX[baseStage];
+  const maxUnlockedIndex = Math.max(
+    STAGE_INDEX[baseStage],
+    canOpenRemediationSetup ? STAGE_INDEX.remediate_setup : STAGE_INDEX.scan,
+  );
 
   useEffect(() => {
     const previousBase = previousBaseStageRef.current;
@@ -1316,7 +1341,14 @@ export default function SecurityAnalysisPage() {
   }, [maxUnlockedIndex]);
 
   const handleStartScan = useCallback(async () => {
-    if (!projectMeta || loadingProject) return;
+    if (loadingProject) {
+      setError('Project metadata is still loading. Wait a moment, then retry.');
+      return;
+    }
+    if (!projectMeta || projectAuthError) {
+      setError(projectAuthError || 'Project access could not be verified. Reopen it from the dashboard, then retry.');
+      return;
+    }
     if (scanState === 'running' || rerunInProgress) return;
     setRerunInProgress(true);
     setError(null);
@@ -1346,7 +1378,7 @@ export default function SecurityAnalysisPage() {
     } finally {
       setRerunInProgress(false);
     }
-  }, [loadingProject, projectId, projectMeta, projectName, rerunInProgress, resetRemediation, scanState, startScan]);
+  }, [loadingProject, projectAuthError, projectId, projectMeta, projectName, rerunInProgress, resetRemediation, scanState, startScan]);
 
   const handleStartRemediation = useCallback(async () => {
     const trimmedKey = keyInput.trim();
@@ -1355,6 +1387,19 @@ export default function SecurityAnalysisPage() {
 
     if (trimmedKey && trimmedKey !== apiKeys[provider]) setApiKey(provider, trimmedKey);
     if (trimmedModel && trimmedModel !== selectedModels[provider]) setModel(provider, trimmedModel);
+
+    if (loadingProject) {
+      setError('Project metadata is still loading. Wait a moment, then retry remediation.');
+      return;
+    }
+    if (!projectMeta || projectAuthError) {
+      setError(projectAuthError || 'Project access could not be verified. Reopen it from the dashboard, then retry remediation.');
+      return;
+    }
+    if (!canLaunchRemediation) {
+      setError('Run a successful scan with current project access before starting remediation.');
+      return;
+    }
 
     setError(null);
     setSetupOpen(false);
@@ -1376,7 +1421,7 @@ export default function SecurityAnalysisPage() {
     } catch (remediationError) {
       setError(remediationError instanceof Error ? remediationError.message : 'Failed to start remediation');
     }
-  }, [apiKeys, currentConfig.flagship, githubToken, keyInput, modelInput, projectId, provider, selectedModels, setApiKey, setModel, startRemediation]);
+  }, [apiKeys, canLaunchRemediation, currentConfig.flagship, githubToken, keyInput, loadingProject, modelInput, projectAuthError, projectId, projectMeta, provider, selectedModels, setApiKey, setModel, startRemediation]);
 
   const handleContinueRound = useCallback(() => {
     continueRemediationRound(projectId);
@@ -1537,6 +1582,13 @@ export default function SecurityAnalysisPage() {
           />
         ) : (
           <>
+            {projectAuthError ? (
+              <AlertCard
+                tone="error"
+                title="Project Access Required"
+                message={projectAuthError}
+              />
+            ) : null}
             <div className="overflow-hidden rounded-xl border border-[#1A1A1A] bg-[#050505] shadow-xl">
               <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[#1A1A1A] bg-[#000000] px-6 py-4">
                 <div>
@@ -1691,7 +1743,7 @@ export default function SecurityAnalysisPage() {
           </>
         )}
 
-        {runAll ? (
+        {runAll && cleanState ? (
           <div className="flex justify-center pt-2">
             <RunButton className="max-w-65" disabled={!canProceedToDeployment} onClick={() => router.push(deploymentPath)}>
               Proceed to Deployment
@@ -1708,6 +1760,7 @@ export default function SecurityAnalysisPage() {
         <h1 className="mb-2 text-2xl font-semibold text-zinc-100">Configure AI Agent</h1>
         <p className="text-sm text-zinc-400">Initialize the remediation agent to automatically fix identified vulnerabilities.</p>
       </div>
+      {projectAuthError ? <AlertCard tone="error" title="Project Access Required" message={projectAuthError} /> : null}
       {error && remediationState === 'error' ? <AlertCard tone="error" title="Remediation Error" message={error} /> : null}
         <div className="space-y-6 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6 shadow-xl">
         <div className="space-y-4">
@@ -1756,7 +1809,7 @@ export default function SecurityAnalysisPage() {
           </div>
         </div>
         <div className="pt-6">
-          <RunButton onClick={() => void handleStartRemediation()} disabled={remediatingThisProject || (isAnyRemediating && remediationState === 'idle')}>
+          <RunButton onClick={() => void handleStartRemediation()} disabled={remediatingThisProject || !canLaunchRemediation}>
             <Sparkles className="h-4 w-4" />
             <span>Start Remediation Engine</span>
           </RunButton>

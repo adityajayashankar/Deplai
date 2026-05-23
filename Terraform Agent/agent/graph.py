@@ -8,7 +8,10 @@ from nodes.refiner import run_refiner
 from nodes.repo_parser import run_repo_parser
 from nodes.terraform_generator import run_terraform_generator
 from nodes.validator import run_validator
-from state import AgentState
+if __package__:
+    from .state import AgentState
+else:
+    from state import AgentState
 
 
 MAX_REFINEMENT_LOOPS = 3

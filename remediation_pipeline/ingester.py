@@ -15,6 +15,20 @@ _SEVERITY_MAP = {
     "low": "low",
 }
 
+_EDITABLE_MANIFEST_BY_LOCKFILE = {
+    "package-lock.json": ("package.json",),
+    "npm-shrinkwrap.json": ("package.json",),
+    "yarn.lock": ("package.json",),
+    "pnpm-lock.yaml": ("package.json",),
+    "go.sum": ("go.mod",),
+}
+
+_DIRECTLY_EDITABLE_MANIFESTS = {
+    "package.json",
+    "requirements.txt",
+    "go.mod",
+}
+
 
 class VulnIngester:
     """Read scanner artifacts from Docker volumes and normalize into Vulnerability records."""
@@ -90,6 +104,9 @@ class VulnIngester:
             severity = self._normalize_severity(str(vuln.get("severity") or "")) or "medium"
             cve = str(vuln.get("id") or "").strip() or f"SCA-{idx}"
             package_name = str(artifact.get("name") or "").strip()
+            installed_version = str(artifact.get("version") or "").strip() or None
+            fix_versions = vuln.get("fix", {}).get("versions") if isinstance(vuln.get("fix"), dict) else []
+            fix_version = str(fix_versions[0]).strip() if isinstance(fix_versions, list) and fix_versions else None
             file_path, line_number = self._infer_manifest_location(project_id, match, package_name)
             if not file_path:
                 file_path = self._fallback_manifest_for_package(artifact)
@@ -112,6 +129,9 @@ class VulnIngester:
                     severity=severity,
                     description=description,
                     cwe=cwe,
+                    package_name=package_name or None,
+                    installed_version=installed_version,
+                    fix_version=fix_version,
                     type="sca",
                 )
             )
@@ -135,6 +155,15 @@ class VulnIngester:
             line_number = self._safe_int(location.get("lineNumber"), 1)
             if path.endswith(("package.json", "requirements.txt", "go.mod", "pom.xml", "Pipfile", "pyproject.toml")):
                 break
+
+        if candidate_path:
+            remapped_path, remapped_line = self._remap_lockfile_to_editable_manifest(
+                project_id,
+                candidate_path,
+                package_name,
+            )
+            if remapped_path:
+                return remapped_path, max(1, remapped_line)
 
         if candidate_path and line_number > 0:
             if line_number == 1 and package_name:
@@ -161,6 +190,27 @@ class VulnIngester:
         if "maven" in purl or kind in {"java-archive", "java"}:
             return "pom.xml"
         return ""
+
+    def _remap_lockfile_to_editable_manifest(self, project_id: str, rel_path: str, package_name: str) -> tuple[str, int]:
+        normalized = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+        basename = normalized.rsplit("/", 1)[-1]
+        if basename in _DIRECTLY_EDITABLE_MANIFESTS:
+            return normalized, max(1, self._find_dependency_line(project_id, normalized, package_name) or 1)
+        candidates = _EDITABLE_MANIFEST_BY_LOCKFILE.get(basename)
+        if not candidates:
+            return "", 1
+
+        prefix = normalized.rsplit("/", 1)[0] if "/" in normalized else ""
+        for candidate_name in candidates:
+            candidate = f"{prefix}/{candidate_name}" if prefix else candidate_name
+            content = self._read_repo_file(project_id, candidate)
+            if not content:
+                continue
+            line = self._find_dependency_line(project_id, candidate, package_name) if package_name else 1
+            if package_name and line <= 1 and package_name.lower() not in content.lower():
+                continue
+            return candidate, max(1, line or 1)
+        return "", 1
 
     def _find_dependency_line(self, project_id: str, rel_path: str, package_name: str) -> int:
         text = self._read_repo_file(project_id, rel_path)

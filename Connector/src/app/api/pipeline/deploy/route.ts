@@ -3,6 +3,8 @@ import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { readLegacyCicdTemplate } from '@/lib/legacy-assets';
 
+const AGENTIC_KEY = process.env.DEPLAI_SERVICE_KEY ?? '';
+
 export const runtime = 'nodejs';
 export const maxDuration = 3600;
 export const dynamic = 'force-dynamic';
@@ -18,6 +20,10 @@ interface GeneratedFile {
 interface DeployBody {
   project_id: string;
   provider?: Provider;
+  service_type?: string;
+  repo_context?: Record<string, unknown>;
+  user_customizations?: Record<string, unknown>;
+  customizations?: Record<string, unknown>;
   github_pat?: string;
   runtime_apply?: boolean;
   run_id?: string;
@@ -701,6 +707,22 @@ function detectStaleAwsTerraformBundle(files: GeneratedFile[]): string[] {
   return reasons;
 }
 
+// Suffixes produced by the architecture consultant that the Terraform Agent template
+// registry does not accept — strip them to get the canonical service_type token.
+const SERVICE_TYPE_SUFFIXES = [
+  '-instance', '-cluster', '-function', '-bucket',
+  '-database', '-cache', '-balancer', '-gateway',
+] as const;
+
+export function normalizeServiceType(raw: string): string {
+  const lower = raw.trim().toLowerCase();
+  const stripped = SERVICE_TYPE_SUFFIXES.reduce(
+    (s, suffix) => s.endsWith(suffix) ? s.slice(0, -suffix.length) : s,
+    lower,
+  );
+  return stripped || 'ec2';
+}
+
 async function fetchFileSha(owner: string, repo: string, filePath: string, pat: string): Promise<string | null> {
   const readRes = await ghFetch(
     `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`,
@@ -754,6 +776,53 @@ export async function POST(req: NextRequest) {
     }
 
     const runtimeMode = body.runtime_apply === true;
+    if (provider === 'aws') {
+      let agenticRes: Response;
+      try {
+        agenticRes = await fetch(`${AGENTIC_URL}/api/iac/generate-and-apply`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': AGENTIC_KEY,
+          },
+          body: JSON.stringify({
+            project_id: projectId,
+            service_type: body.service_type,
+            repo_context: body.repo_context ?? {},
+            user_customizations: body.customizations ?? body.user_customizations ?? {},
+            aws_credentials: {
+              access_key_id: body.aws_access_key_id,
+              secret_access_key: body.aws_secret_access_key,
+              region: body.aws_region ?? 'us-east-1',
+            },
+          }),
+        });
+      } catch (err) {
+        return NextResponse.json(
+          { error: 'Agentic Layer unreachable', detail: String(err) },
+          { status: 502 },
+        );
+      }
+
+      if (!agenticRes.ok) {
+        const detail = await agenticRes.text();
+        return NextResponse.json(
+          { error: 'IaC pipeline failed to start', detail },
+          { status: agenticRes.status },
+        );
+      }
+
+      const { run_id, status } = await agenticRes.json();
+      return NextResponse.json({
+        success: true,
+        mode: 'iac_pipeline',
+        provider: 'aws',
+        run_id,
+        service_type: normalizeServiceType(String(body.service_type || 'ec2')),
+        status,
+      });
+    }
+
     const runId = String(body.run_id || '').trim();
     const workspace = String(body.workspace || '').trim();
     const baseFiles = Array.isArray(body.files) ? body.files : [];

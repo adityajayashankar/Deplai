@@ -1,1 +1,1 @@
-"""Terraform agent package."""
+"""DeplAI Terraform Agent package."""

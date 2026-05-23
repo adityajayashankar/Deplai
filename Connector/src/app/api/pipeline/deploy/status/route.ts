@@ -28,7 +28,7 @@ export async function POST(req: NextRequest) {
     const { user, error } = await requireAuth();
     if (error) return error;
 
-    const body = await req.json().catch(() => ({})) as { project_id?: string; project_name?: string };
+    const body = await req.json().catch(() => ({})) as { project_id?: string; project_name?: string; run_id?: string };
     const projectId = String(body.project_id || '').trim();
     if (!projectId) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
@@ -38,6 +38,51 @@ export async function POST(req: NextRequest) {
     if ('error' in owned) return owned.error;
 
     const projectName = String(body.project_name || owned.project?.name || projectId).trim();
+    const runId = String(body.run_id || '').trim();
+    if (runId) {
+      const res = await fetch(`${AGENTIC_URL}/api/iac/status/${encodeURIComponent(runId)}`, {
+        method: 'GET',
+        headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(30_000),
+      });
+      const data = await res.json().catch(() => ({})) as {
+        status?: string;
+        outputs?: Record<string, unknown>;
+        error?: string | null;
+        service_type?: string;
+        plan_summary?: string;
+      };
+      if (!res.ok) {
+        return NextResponse.json(
+          {
+            success: false,
+            status: 'idle',
+            result: null,
+            error: String(data.error || 'Failed to fetch IaC pipeline status.'),
+          },
+          { status: res.status },
+        );
+      }
+      const rawStatus = String(data.status || 'pending');
+      const terminalSuccess = rawStatus === 'completed' || rawStatus === 'destroyed';
+      const terminalFailure = rawStatus === 'failed';
+      const status = terminalSuccess ? 'completed' : terminalFailure ? 'error' : rawStatus;
+      return NextResponse.json({
+        success: true,
+        status,
+        result: {
+          success: !terminalFailure,
+          mode: 'iac_pipeline',
+          run_id: runId,
+          service_type: data.service_type,
+          status: rawStatus,
+          plan_summary: data.plan_summary ? { summary: data.plan_summary } : null,
+          outputs: data.outputs || {},
+          raw_outputs: data.outputs || {},
+          error: data.error || undefined,
+        },
+      });
+    }
 
     const res = await fetch(`${AGENTIC_URL}/api/terraform/apply/status`, {
       method: 'POST',

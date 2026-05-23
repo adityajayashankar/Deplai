@@ -22,6 +22,9 @@ class Vulnerability(BaseModel):
     severity: Severity
     description: str
     cwe: Optional[str] = None
+    package_name: Optional[str] = None
+    installed_version: Optional[str] = None
+    fix_version: Optional[str] = None
     type: VulnType
 
 
@@ -48,6 +51,7 @@ class SnippetBundle(BaseModel):
 
     filepath: str
     language: str
+    source_text: str = ""
     imports_block: str
     snippets: list[Snippet]
     token_estimate: int = Field(ge=0)

@@ -83,6 +83,9 @@ export interface InfraConsultantState {
 
 export interface DeployApiResult {
   success?: boolean;
+  mode?: string;
+  run_id?: string;
+  service_type?: string;
   status?: string;
   requires_plan_confirmation?: boolean;
   plan_summary?: Record<string, unknown> | null;
@@ -172,6 +175,7 @@ export interface SavedIacRun {
 export interface SavedIacMeta {
   project_id: string;
   workspace?: string;
+  runtime_workspace?: string;
   source?: string;
   generated_at?: string;
   has_run?: boolean;

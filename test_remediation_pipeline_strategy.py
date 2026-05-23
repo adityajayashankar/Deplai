@@ -11,13 +11,24 @@ claude_stub = types.ModuleType("claude_remediator")
 claude_stub._call_claude_sdk = lambda *args, **kwargs: (True, "--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-a\n+b")
 sys.modules.setdefault("claude_remediator", claude_stub)
 
+utils_stub = types.ModuleType("utils")
+utils_stub.CODEBASE_VOLUME = "codebase"
+utils_stub.decode_output = lambda value: value.decode() if isinstance(value, bytes) else str(value)
+utils_stub.find_volume_file = lambda *args, **kwargs: None
+utils_stub.get_docker_client = lambda *args, **kwargs: None
+utils_stub.read_volume_file = lambda *args, **kwargs: None
+utils_stub.resolve_host_projects_dir = lambda: None
+utils_stub.set_current_project_id = lambda *args, **kwargs: None
+sys.modules.setdefault("utils", utils_stub)
+
 sys.path.insert(0, os.path.join(os.getcwd(), "Agentic Layer"))
 
 from remediation_pipeline.models import FileGroup, Vulnerability
+from remediation_pipeline.ingester import VulnIngester
 from remediation_pipeline.orchestrator import RemediationOrchestrator
 
 
-def make_vuln(vuln_id: str, severity: str, filepath: str, line: int) -> Vulnerability:
+def make_vuln(vuln_id: str, severity: str, filepath: str, line: int, vuln_type: str = "sast") -> Vulnerability:
     return Vulnerability(
         id=vuln_id,
         file=filepath,
@@ -26,7 +37,9 @@ def make_vuln(vuln_id: str, severity: str, filepath: str, line: int) -> Vulnerab
         rule_id=f"RULE-{vuln_id}",
         severity=severity,
         description=f"{severity} finding",
-        type="sast",
+        package_name="lodash" if vuln_type == "sca" else None,
+        fix_version="4.17.21" if vuln_type == "sca" else None,
+        type=vuln_type,
     )
 
 
@@ -126,6 +139,63 @@ class RemediationPipelineStrategyTests(unittest.TestCase):
         self.assertEqual([group.filepath for group in critical_selected], ["a.py"])
         self.assertEqual([group.filepath for group in high_selected], ["b.py"])
         self.assertEqual([group.filepath for group in default_selected], ["a.py", "b.py", "c.py"])
+
+    def test_large_repo_selection_skips_unsupported_lockfiles_and_caps_work(self) -> None:
+        package_json = make_group(
+            "package.json",
+            "critical",
+            [make_vuln(f"pkg-{idx}", "critical", "package.json", idx + 1) for idx in range(12)],
+        )
+        lockfile = make_group(
+            "package-lock.json",
+            "critical",
+            [make_vuln(f"lock-{idx}", "critical", "package-lock.json", idx + 1, "sca") for idx in range(12)],
+        )
+        code_a = make_group(
+            "src/a.py",
+            "critical",
+            [make_vuln(f"a-{idx}", "critical", "src/a.py", idx + 1) for idx in range(12)],
+        )
+        code_b = make_group(
+            "src/b.py",
+            "critical",
+            [make_vuln(f"b-{idx}", "critical", "src/b.py", idx + 1) for idx in range(12)],
+        )
+
+        with patch.dict(os.environ, {
+            "REMEDIATION_PIPELINE_MAX_GROUPS_LARGE": "2",
+            "REMEDIATION_PIPELINE_MAX_VULNS_PER_GROUP_LARGE": "3",
+        }, clear=False):
+            selected = self.orchestrator._select_groups_for_run(
+                [lockfile, code_b, package_json, code_a],
+                {"strategy_mode": "critical_only", "strategy_reason": "large_repo"},
+            )
+
+        self.assertEqual([group.filepath for group in selected], ["package.json", "src/a.py"])
+        self.assertEqual([len(group.vulns) for group in selected], [3, 3])
+
+    def test_sca_lockfile_location_remaps_to_editable_package_manifest(self) -> None:
+        ingester = VulnIngester()
+        files = {
+            "web/package.json": '{\n  "dependencies": {\n    "lodash": "^4.17.20"\n  }\n}\n',
+            "web/package-lock.json": "{}\n",
+        }
+        ingester._read_repo_file = lambda _project_id, rel_path: files.get(rel_path, "")  # type: ignore[method-assign]
+
+        path, line = ingester._infer_manifest_location(
+            "project",
+            {
+                "artifact": {
+                    "name": "lodash",
+                    "type": "npm",
+                    "locations": [{"path": "/repo/project/web/package-lock.json", "lineNumber": 1}],
+                },
+            },
+            "lodash",
+        )
+
+        self.assertEqual(path, "web/package.json")
+        self.assertEqual(line, 3)
 
 
 if __name__ == "__main__":

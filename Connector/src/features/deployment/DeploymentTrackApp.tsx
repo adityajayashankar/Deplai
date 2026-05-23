@@ -3,6 +3,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { ArrowRight, CheckCircle2, ChevronRight, CircleDashed, Download, ExternalLink, RefreshCw, Rocket, Server, Terminal } from 'lucide-react';
+import { ResourceCard } from '@/components/pipeline/ResourceCard';
+import { ApplyLogViewer } from '@/components/pipeline/ApplyLogViewer';
 import { buildDeploymentWorkspace } from '@/lib/deployment-planning-contract';
 import {
   APPROVAL_PAYLOAD_KEY,
@@ -67,6 +69,23 @@ type IacPrResponse = {
   pr_url?: string | null;
   reason?: string;
   error?: string;
+};
+
+type IacResourceOutputEntry = {
+  key: string;
+  label: string;
+  value: string | string[] | number | boolean;
+};
+
+type IacResourceOutputs = {
+  service_type: string;
+  deployed_at: string;
+  outputs: IacResourceOutputEntry[];
+};
+
+type IacKeypair = {
+  private_key_pem: string;
+  keypair_name: string;
 };
 
 const PIPELINE_SOCKET_RETRY_DELAYS_MS = [1000, 2000, 5000, 5000];
@@ -274,7 +293,12 @@ function matchesCurrentIacWorkspace(
 ): boolean {
   if (!meta || !projectId) return false;
   if (meta.project_id !== projectId) return false;
-  if (meta.workspace && workspace && meta.workspace !== workspace) return false;
+  if (meta.workspace && workspace && meta.workspace !== workspace) {
+    const legacyGeneratedWorkspace =
+      !meta.workspace.startsWith('deploy-') &&
+      workspace.startsWith('deploy-');
+    if (!legacyGeneratedWorkspace) return false;
+  }
   return true;
 }
 
@@ -794,6 +818,22 @@ function normalizeDecisionSequence(decision: InfraConsultantDecision | null | un
   return ordered;
 }
 
+function inferIacServiceType(decision: InfraConsultantDecision | null | undefined, repoContext: RepositoryContextJson | null): string {
+  const components = normalizeDecisionSequence(decision);
+  const priority = ['ecs', 'lambda', 'ec2', 's3', 'rds', 'elasticache', 'alb', 'vpc'];
+  for (const service of priority) {
+    if (components.includes(service)) return service;
+    if (service === 's3' && components.includes('s3_cloudfront')) return 's3';
+  }
+  const frameworkNames = Array.isArray(repoContext?.frameworks)
+    ? repoContext.frameworks.map((item) => String(item.name || '').toLowerCase()).join(' ')
+    : '';
+  const hasStaticFrontend = Boolean((repoContext?.frontend as Record<string, unknown> | undefined)?.static_site_candidate);
+  if (hasStaticFrontend || frameworkNames.includes('static')) return 's3';
+  if (frameworkNames.includes('next') || frameworkNames.includes('express') || frameworkNames.includes('fastapi')) return 'ecs';
+  return 'ec2';
+}
+
 function formatComponentName(component: string): string {
   const value = String(component || '').trim();
   if (!value) return 'Component';
@@ -1217,6 +1257,27 @@ export default function DeploymentTrackApp() {
   }, [patchState]);
   const deploySummary = useMemo(() => extractDeploymentSummary(deployResult), [deployResult]);
   const liveRuntimeDetails = useMemo(() => extractLiveRuntimeDetails(deployResult), [deployResult]);
+  const iacResourceOutputs = useMemo<IacResourceOutputs | null>(() => {
+    if (deployResult?.mode !== 'iac_pipeline') return null;
+    const outputs = deployResult?.outputs;
+    if (!outputs || typeof outputs !== 'object') return null;
+    const candidate = outputs as Partial<IacResourceOutputs>;
+    if (!Array.isArray(candidate.outputs)) return null;
+    return {
+      service_type: String(candidate.service_type || deployResult.service_type || 'aws'),
+      deployed_at: String(candidate.deployed_at || new Date().toISOString()),
+      outputs: candidate.outputs as IacResourceOutputEntry[],
+    };
+  }, [deployResult?.mode, deployResult?.outputs, deployResult?.service_type]);
+  const iacKeypair = useMemo<IacKeypair | null>(() => {
+    const keypair = deployResult?.keypair;
+    if (!keypair?.private_key_pem) return null;
+    const name = String(keypair.key_name || deployResult?.ec2_key_name || '').trim();
+    return {
+      private_key_pem: keypair.private_key_pem,
+      keypair_name: name || 'deplai-keypair',
+    };
+  }, [deployResult?.ec2_key_name, deployResult?.keypair]);
   const keyPairDownloadMessage = useMemo(() => {
     const details = deployResult?.details as Record<string, unknown> | null | undefined;
     const reusedKey = Boolean(details?.key_pair_reused);
@@ -1360,17 +1421,11 @@ export default function DeploymentTrackApp() {
     if (!hasAwsSecrets) {
       blockers.push('Add AWS credentials in AWS Config (access key + secret key).');
     }
-    if (!activeSavedRun && deployableIacFiles.length === 0) {
-      blockers.push('Generate infrastructure files before deploy.');
-    }
-    if (sessionIacTruncated && !activeSavedRun) {
-      blockers.push('Session Terraform files are truncated. Regenerate infrastructure first.');
-    }
     if (costEstimate.total > costEstimate.cap && !budgetOverride) {
       blockers.push('Estimated monthly cost exceeds the budget cap. Approve the budget override to deploy.');
     }
     return blockers;
-  }, [activeSavedRun, budgetOverride, costEstimate.cap, costEstimate.total, deployStatus, deployableIacFiles.length, hasAwsSecrets, selectedProject, sessionIacTruncated]);
+  }, [budgetOverride, costEstimate.cap, costEstimate.total, deployStatus, hasAwsSecrets, selectedProject]);
   const canStartDeploy = deployStartBlockers.length === 0;
   const activeIacFilePath = selectedFile || iacFiles[0]?.path || '';
   const hasCurrentIacMeta = useMemo(
@@ -1403,6 +1458,54 @@ export default function DeploymentTrackApp() {
     )
   );
   const canFetchRuntimeDetails = Boolean(selectedProject && hasAwsSecrets);
+  const onIacPipelineComplete = useCallback((
+    outputs: object,
+    keypair?: object | null,
+  ) => {
+    patchState((prev) => {
+      const nextResult: DeployApiResult = {
+        ...((prev.deployResult || {}) as DeployApiResult),
+        success: true,
+        outputs: outputs as Record<string, unknown>,
+      };
+      const mappedKeypair = keypair as IacKeypair | null | undefined;
+      if (mappedKeypair?.private_key_pem) {
+        nextResult.keypair = {
+          key_name: mappedKeypair.keypair_name,
+          private_key_pem: mappedKeypair.private_key_pem,
+        };
+      }
+      return {
+        ...prev,
+        status: 'done',
+        progress: 100,
+        deployResult: nextResult,
+      };
+    });
+  }, [patchState]);
+  const onIacPipelineError = useCallback((message: string) => {
+    setError(message);
+    appendLog(message, 'error', { stage: 'iac_pipeline' });
+    patchState((prev) => ({
+      ...prev,
+      status: 'error',
+      progress: 100,
+      deployResult: {
+        ...((prev.deployResult || {}) as DeployApiResult),
+        success: false,
+        error: message,
+      },
+    }));
+  }, [appendLog, patchState]);
+  const handleIacDestroyed = useCallback(() => {
+    appendLog('IaC pipeline destroy requested.', 'info', { stage: 'iac_pipeline' });
+    patchState((prev) => ({
+      ...prev,
+      deployResult: prev.deployResult
+        ? { ...prev.deployResult, outputs: undefined, status: 'destroyed' }
+        : prev.deployResult,
+    }));
+  }, [appendLog, patchState]);
   const canVerifyLiveEndpoints = Boolean(
     selectedProject &&
     deployStatus !== 'running' &&
@@ -1412,7 +1515,7 @@ export default function DeploymentTrackApp() {
     !backendErrorMessage,
   );
   const canOpenCloudfront = Boolean(hasLiveRuntimeDetails && deploySummary.cloudfrontUrl !== 'n/a');
-  const canContinueToAwsConfig = hasSuccessfulGeneration;
+  const canContinueToAwsConfig = Boolean(approvedConsultantDecision || hasSuccessfulGeneration);
   const qaSummary = useMemo(() => buildQaSummary(review, answers, repoContext, repoContextMd), [answers, repoContext, repoContextMd, review]);
   const infraUserAnswers = useMemo(() => buildInfraUserAnswers({
     review,
@@ -2263,7 +2366,8 @@ export default function DeploymentTrackApp() {
       }
       sessionStorage.setItem(IAC_META_KEY, JSON.stringify({
         project_id: selectedProject.id,
-        workspace: data.workspace || expectedWorkspace,
+        workspace: expectedWorkspace,
+        runtime_workspace: data.workspace || undefined,
         source: String(data.source || ''),
         generated_at: new Date().toISOString(),
         has_run: Boolean(data.run_id && data.workspace),
@@ -2424,6 +2528,9 @@ export default function DeploymentTrackApp() {
     if (!baseResult?.success || String(baseResult.error || '').trim()) {
       throw new Error(String(baseResult?.error || 'Deployment runtime returned an error.'));
     }
+    if (baseResult.mode === 'iac_pipeline') {
+      return baseResult;
+    }
     const existingInstanceId = getLiveRuntimeInstanceId(baseResult);
     if (existingInstanceId && existingInstanceId !== 'n/a') {
       return baseResult;
@@ -2452,12 +2559,12 @@ export default function DeploymentTrackApp() {
     return mergeDeployResultWithRuntimeDetails(baseResult, data.details);
   }, [aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, hasAwsSecrets, selectedProject, terraformRuntimeConfig.aws_region]);
 
-  const reconcileDeploymentStatus = useCallback(async () => {
+  const reconcileDeploymentStatus = useCallback(async (runIdOverride?: string) => {
     if (!selectedProject) return;
     const response = await fetch('/api/pipeline/deploy/status', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project_id: selectedProject.id, project_name: selectedProject.name }),
+      body: JSON.stringify({ project_id: selectedProject.id, project_name: selectedProject.name, run_id: runIdOverride || deployResult?.run_id }),
     });
     const data = await response.json().catch(() => ({})) as DeployStatusResponse;
     if (!response.ok || data.success !== true) {
@@ -2469,7 +2576,7 @@ export default function DeploymentTrackApp() {
       ? data.result as DeployApiResult
       : null;
 
-    if (runtimeStatus === 'running') {
+    if (['pending', 'selecting_params', 'validating', 'planning', 'applying', 'running'].includes(runtimeStatus)) {
       patchState((prev) => ({
         ...prev,
         status: 'running',
@@ -2537,7 +2644,7 @@ export default function DeploymentTrackApp() {
     }));
     getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
     appendLog('No active deployment process found. Marking stale UI run as stopped.', 'error');
-  }, [appendLog, hydrateTerminalDeployResult, patchState, pushDeploymentHistory, selectedProject]);
+  }, [appendLog, deployResult?.run_id, hydrateTerminalDeployResult, patchState, pushDeploymentHistory, selectedProject]);
 
   const startDeploy = useCallback(async () => {
     if (!selectedProject) {
@@ -2593,20 +2700,6 @@ export default function DeploymentTrackApp() {
       activeDeployment.inFlight = false;
       return;
     }
-    if (!activeSavedRun && deployableIacFiles.length === 0) {
-      const message = sessionIacTruncated
-        ? 'Session-cached Terraform files were truncated. Regenerate Terraform or reuse a saved run before deployment.'
-        : 'No generated Terraform bundle found. Generate Terraform first.';
-      setError(message);
-      patchState({
-        status: 'error',
-        progress: 100,
-        deployResult: { success: false, error: message },
-      });
-      appendLog(message, 'error');
-      activeDeployment.inFlight = false;
-      return;
-    }
     deployRequestRef.current = selectedProject.id;
     setError(null);
     patchState((prev) => ({
@@ -2631,6 +2724,13 @@ export default function DeploymentTrackApp() {
           project_id: selectedProject.id,
           provider: 'aws',
           runtime_apply: true,
+          service_type: inferIacServiceType(approvedConsultantDecision, repoContext),
+          repo_context: repoContext || {},
+          user_customizations: {
+            ...infraUserAnswers,
+            consultant_decision: approvedConsultantDecision || undefined,
+            deployment_profile: deploymentProfile || undefined,
+          },
           run_id: shouldUseSavedRunForDeploy ? activeSavedRun?.run_id : undefined,
           workspace: shouldUseSavedRunForDeploy ? activeSavedRun?.workspace : undefined,
           state_bucket: terraformRuntimeConfig.state_bucket.trim() || undefined,
@@ -2690,7 +2790,25 @@ export default function DeploymentTrackApp() {
       }));
       appendLog('Runtime apply request returned. Waiting for backend runtime to reach a terminal state...');
       try {
-        await reconcileDeploymentStatus();
+        if (data.mode === 'iac_pipeline' && data.run_id) {
+          appendLog('IaC pipeline started. Polling for completion...');
+          const POLL_INTERVAL_MS = 3_000;
+          const MAX_POLL_MS = 30 * 60 * 1_000; // 30 minutes
+          const pollStart = Date.now();
+          while (Date.now() - pollStart < MAX_POLL_MS) {
+            await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+            try {
+              await reconcileDeploymentStatus(data.run_id);
+            } catch {
+              // transient error — keep polling
+            }
+            if (!getOrCreateActiveDeployment(selectedProject.id).inFlight) break;
+          }
+        } else if (data.run_id) {
+          await reconcileDeploymentStatus(data.run_id);
+        } else {
+          appendLog('Backend accepted the deploy request, but no run identifier was returned yet. Use Reconcile Backend Status if this state persists.', 'info');
+        }
       } catch {
         patchState((prev) => ({
           ...prev,
@@ -2716,7 +2834,7 @@ export default function DeploymentTrackApp() {
       }
       activeDeployment.inFlight = false;
     }
-  }, [activeSavedRun, appendLog, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, costEstimate.cap, costEstimate.total, deployLogs, deployProgress, deployResult, deployStatus, deployableIacFiles, deploymentHistory, hasAwsSecrets, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, requiresPlanConfirmation, selectedProject, sessionIacTruncated, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
+  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, costEstimate.cap, costEstimate.total, deployLogs, deployProgress, deployResult, deployStatus, deployableIacFiles, deploymentHistory, deploymentProfile, hasAwsSecrets, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, repoContext, requiresPlanConfirmation, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
 
   const stopDeployment = useCallback(async () => {
     if (!selectedProject || stopLoading || deployStatus !== 'running') return;
@@ -3823,10 +3941,252 @@ export default function DeploymentTrackApp() {
             </div>
           )}
           {activeStage === 'deploy' && (
-            <div className="mx-auto max-w-5xl space-y-6"><div className="mb-2 flex items-center justify-between"><div><h1 className="text-2xl font-semibold text-zinc-100">{deployStatus === 'done' ? 'Deployment Complete' : deployStatus === 'running' ? 'Deployment In Progress' : deployStatus === 'error' ? 'Deployment Failed' : 'Ready to Deploy'}</h1><p className="mt-1 text-sm text-zinc-400">Live deployment console backed by pipeline WebSocket events and backend status reconciliation.</p></div><div className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-widest ${deploySocketState === 'connected' ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : deploySocketState === 'connecting' ? 'border-cyan-500/20 bg-cyan-500/10 text-cyan-400' : deploySocketState === 'error' ? 'border-amber-500/20 bg-amber-500/10 text-amber-400' : 'border-zinc-700 bg-[#111111] text-zinc-500'}`}>WS {deploySocketState}</div></div><div className="grid grid-cols-3 gap-6"><div className="col-span-2 flex h-125 flex-col overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]"><div className="flex items-center justify-between border-b border-[#1A1A1A] bg-black px-4 py-2.5 font-mono text-xs text-zinc-500"><div className="flex items-center gap-2"><Terminal className="h-4 w-4 text-zinc-400" /> STDOUT</div><div>{deployLogs.length} events</div></div><div className="custom-scrollbar flex-1 overflow-y-auto bg-black p-6 font-mono text-[13px]">{deployLogs.map((log, index) => <div key={`${log.ts}-${index}`} className="mb-1 flex gap-4"><span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span><span className={log.type === 'success' ? 'font-medium text-emerald-400' : log.type === 'error' ? 'text-red-400' : 'text-zinc-300'}>{log.text}</span></div>)}<div ref={logEndRef} /></div></div><div className="space-y-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div><div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Execution</div><div className="mt-3 text-3xl font-semibold text-zinc-100">{deployProgress}%</div><div className="mt-2 h-2 overflow-hidden rounded-full bg-[#111111]"><div className={`h-full rounded-full ${deployStatus === 'done' ? 'bg-emerald-500' : deployStatus === 'error' ? 'bg-red-500' : 'bg-indigo-500'}`} style={{ width: `${deployProgress}%` }} /></div><div className="mt-3 text-xs text-zinc-500">Status: <span className="font-mono text-zinc-300">{deployStatus}</span></div></div>{costEstimate.total > costEstimate.cap && <div className="rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200"><div className="font-semibold text-amber-300">Budget guardrail</div><div className="mt-1">Estimated monthly cost ${costEstimate.total.toFixed(2)} exceeds cap ${costEstimate.cap.toFixed(2)}.</div><label className="mt-3 flex items-start gap-3 text-left"><input type="checkbox" checked={budgetOverride} onChange={(event) => setBudgetOverride(event.target.checked)} disabled={deployStatus === 'running'} className="mt-0.5 h-4 w-4 rounded border-[#3f3f46] bg-black text-indigo-500 focus:ring-indigo-500/40" /><span><span className="block font-medium text-amber-100">Override budget guardrail for this deploy</span><span className="mt-1 block text-[11px] text-amber-200/80">Use only when you intentionally approve costs above the configured cap.</span></span></label></div>}<div className="space-y-3"><button onClick={() => void startDeploy()} disabled={!canStartDeploy} className="flex w-full items-center justify-center gap-2 rounded-md bg-indigo-600 px-6 py-2.5 font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500"><Rocket className="h-4 w-4" /> {requiresPlanConfirmation ? 'Confirm Plan & Deploy' : deployStatus === 'done' ? 'Re-run Deploy' : 'Start Deploy'}</button>{deployStartBlockers.length > 0 && <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">{deployStartBlockers[0]}</div>}<button onClick={() => void stopDeployment()} disabled={deployStatus !== 'running' || stopLoading} className="w-full rounded-md border border-red-500/20 bg-red-500/10 px-6 py-2.5 font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">{stopLoading ? 'Stopping...' : 'Stop Deployment'}</button><button onClick={() => void reconcileDeploymentStatus().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to reconcile deployment status.'))} className="w-full rounded-md border border-[#262626] bg-[#111111] px-6 py-2.5 font-semibold text-zinc-300 hover:bg-[#181818]">Reconcile Backend Status</button>{deployStatus !== 'running' && deployResult && <button onClick={() => setAndPersistStage('outputs')} className="flex w-full items-center justify-center gap-2 rounded-md bg-zinc-100 px-6 py-2.5 font-semibold text-black hover:bg-white">{deployStatus === 'error' ? 'View Results' : 'View Outputs'} <ArrowRight className="h-4 w-4" /></button>}</div></div></div></div>
+            <div className="mx-auto max-w-5xl space-y-6">
+              <div className="mb-2 flex items-center justify-between">
+                <div>
+                  <h1 className="text-2xl font-semibold text-zinc-100">
+                    {deployStatus === 'done'
+                      ? 'Deployment Complete'
+                      : deployStatus === 'running'
+                        ? 'Deployment In Progress'
+                        : deployStatus === 'error'
+                          ? 'Deployment Failed'
+                          : 'Ready to Deploy'}
+                  </h1>
+                  <p className="mt-1 text-sm text-zinc-400">
+                    Live deployment console backed by pipeline WebSocket events and backend status reconciliation.
+                  </p>
+                </div>
+                <div
+                  className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-widest ${deploySocketState === 'connected'
+                    ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400'
+                    : deploySocketState === 'connecting'
+                      ? 'border-cyan-500/20 bg-cyan-500/10 text-cyan-400'
+                      : deploySocketState === 'error'
+                        ? 'border-amber-500/20 bg-amber-500/10 text-amber-400'
+                        : 'border-zinc-700 bg-[#111111] text-zinc-500'
+                  }`}
+                >
+                  WS {deploySocketState}
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-6">
+                <div className="col-span-2 flex h-125 flex-col overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]">
+                  <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-black px-4 py-2.5 font-mono text-xs text-zinc-500">
+                    <div className="flex items-center gap-2">
+                      <Terminal className="h-4 w-4 text-zinc-400" /> STDOUT
+                    </div>
+                    <div>{deployLogs.length} events</div>
+                  </div>
+                  <div className="custom-scrollbar flex-1 overflow-y-auto bg-black p-6 font-mono text-[13px]">
+                    {deployLogs.map((log, index) => (
+                      <div key={`${log.ts}-${index}`} className="mb-1 flex gap-4">
+                        <span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span>
+                        <span className={log.type === 'success' ? 'font-medium text-emerald-400' : log.type === 'error' ? 'text-red-400' : 'text-zinc-300'}>
+                          {log.text}
+                        </span>
+                      </div>
+                    ))}
+                    <div ref={logEndRef} />
+                  </div>
+                </div>
+                <div className="space-y-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
+                  <div>
+                    <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Execution</div>
+                    <div className="mt-3 text-3xl font-semibold text-zinc-100">{deployProgress}%</div>
+                    <div className="mt-2 h-2 overflow-hidden rounded-full bg-[#111111]">
+                      <div
+                        className={`h-full rounded-full ${deployStatus === 'done'
+                          ? 'bg-emerald-500'
+                          : deployStatus === 'error'
+                            ? 'bg-red-500'
+                            : 'bg-indigo-500'
+                        }`}
+                        style={{ width: `${deployProgress}%` }}
+                      />
+                    </div>
+                    <div className="mt-3 text-xs text-zinc-500">Status: <span className="font-mono text-zinc-300">{deployStatus}</span></div>
+                  </div>
+                  {costEstimate.total > costEstimate.cap && (
+                    <div className="rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
+                      <div className="font-semibold text-amber-300">Budget guardrail</div>
+                      <div className="mt-1">Estimated monthly cost ${costEstimate.total.toFixed(2)} exceeds cap ${costEstimate.cap.toFixed(2)}.</div>
+                      <label className="mt-3 flex items-start gap-3 text-left">
+                        <input
+                          type="checkbox"
+                          checked={budgetOverride}
+                          onChange={(event) => setBudgetOverride(event.target.checked)}
+                          disabled={deployStatus === 'running'}
+                          className="mt-0.5 h-4 w-4 rounded border-[#3f3f46] bg-black text-indigo-500 focus:ring-indigo-500/40"
+                        />
+                        <span>
+                          <span className="block font-medium text-amber-100">Override budget guardrail for this deploy</span>
+                          <span className="mt-1 block text-[11px] text-amber-200/80">Use only when you intentionally approve costs above the configured cap.</span>
+                        </span>
+                      </label>
+                    </div>
+                  )}
+                  <div className="space-y-3">
+                    <button onClick={() => void startDeploy()} disabled={!canStartDeploy} className="flex w-full items-center justify-center gap-2 rounded-md bg-indigo-600 px-6 py-2.5 font-semibold text-white hover:bg-indigo-500 disabled:bg-[#111111] disabled:text-zinc-500">
+                      <Rocket className="h-4 w-4" /> {requiresPlanConfirmation ? 'Confirm Plan & Deploy' : deployStatus === 'done' ? 'Re-run Deploy' : 'Start Deploy'}
+                    </button>
+                    {deployStartBlockers.length > 0 && (
+                      <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                        {deployStartBlockers[0]}
+                      </div>
+                    )}
+                    <button onClick={() => void stopDeployment()} disabled={deployStatus !== 'running' || stopLoading} className="w-full rounded-md border border-red-500/20 bg-red-500/10 px-6 py-2.5 font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">
+                      {stopLoading ? 'Stopping...' : 'Stop Deployment'}
+                    </button>
+                    <button onClick={() => void reconcileDeploymentStatus().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to reconcile deployment status.'))} className="w-full rounded-md border border-[#262626] bg-[#111111] px-6 py-2.5 font-semibold text-zinc-300 hover:bg-[#181818]">
+                      Reconcile Backend Status
+                    </button>
+                    {deployStatus !== 'running' && deployResult && (
+                      <button onClick={() => setAndPersistStage('outputs')} className="flex w-full items-center justify-center gap-2 rounded-md bg-zinc-100 px-6 py-2.5 font-semibold text-black hover:bg-white">
+                        {deployStatus === 'error' ? 'View Results' : 'View Outputs'} <ArrowRight className="h-4 w-4" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+              {deployResult?.mode === 'iac_pipeline' && deployResult?.run_id ? (
+                <ApplyLogViewer runId={deployResult.run_id} onComplete={onIacPipelineComplete} onError={onIacPipelineError} />
+              ) : null}
+            </div>
           )}
           {activeStage === 'outputs' && (
-            <div className="mx-auto max-w-5xl space-y-6"><div className="mt-4 mb-8 border-b border-[#1A1A1A] pb-6"><div className={`mb-4 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-bold uppercase ${outputBannerClassName}`}><CheckCircle2 className="h-3.5 w-3.5" /> {outputBanner.label}</div><h1 className="mb-2 text-2xl font-semibold text-zinc-100">{outputBanner.title}</h1><p className="text-sm text-zinc-400">{outputBanner.description}</p>{backendErrorMessage && <div className="mt-4 rounded-md border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">{backendErrorMessage}</div>}{!backendErrorMessage && !hasLiveRuntimeDetails && deployResult?.success && <div className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-200">Live runtime details are missing for this repo. Fetch the latest runtime details to hydrate outputs before treating this deploy as successful.</div>}</div><div className="grid grid-cols-2 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-6 text-[10px] font-bold uppercase text-zinc-500">Security</div><div className="flex gap-2"><button onClick={() => deploySummary.generatedPem && downloadTextFile(`${deploySummary.keyName}.pem`, deploySummary.generatedPem.endsWith('\n') ? deploySummary.generatedPem : `${deploySummary.generatedPem}\n`)} disabled={!deploySummary.generatedPem} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-[#262626] bg-[#111111] py-2 text-[12px] font-medium text-zinc-200 hover:bg-[#1A1A1A] disabled:cursor-not-allowed disabled:text-zinc-500"><Download className="h-4 w-4" /> Download .PEM</button><button onClick={() => void downloadPpk().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'PPK conversion failed.'))} disabled={!deploySummary.generatedPem} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-[#262626] bg-[#111111] py-2 text-[12px] font-medium text-zinc-200 hover:bg-[#1A1A1A] disabled:cursor-not-allowed disabled:text-zinc-500"><Download className="h-4 w-4" /> Download .PPK</button></div>{!deploySummary.generatedPem && <div className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">{keyPairDownloadMessage}</div>}</div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-4 text-[10px] font-bold uppercase text-zinc-500">Endpoints</div><div className="space-y-3 text-sm"><div className="flex justify-between"><span className="text-zinc-400">Public IP</span><span className="font-mono text-zinc-200">{deploySummary.publicIp}</span></div><div className="flex justify-between"><span className="text-zinc-400">Instance</span><span className="font-mono text-zinc-200">{deploySummary.instanceId}</span></div><div className="flex justify-between"><span className="text-zinc-400">CloudFront</span><div className="flex items-center gap-2"><span className="font-mono text-zinc-200">{deploySummary.cloudfrontUrl}</span>{canOpenCloudfront && <button onClick={() => window.open(deploySummary.cloudfrontUrl.startsWith('http') ? deploySummary.cloudfrontUrl : `https://${deploySummary.cloudfrontUrl}`, '_blank', 'noopener,noreferrer')} className="text-zinc-500 hover:text-zinc-200"><ExternalLink className="h-4 w-4" /></button>}</div></div><div className="flex justify-between"><span className="text-zinc-400">Verification</span><span className={`font-medium ${outputBanner.tone === 'success' ? 'text-emerald-400' : outputBanner.tone === 'error' ? 'text-red-300' : 'text-amber-300'}`}>{outputBanner.label}</span></div></div></div></div><div className="flex gap-3"><button onClick={() => void fetchRuntimeDetails().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to fetch runtime details.'))} disabled={!canFetchRuntimeDetails} className="flex items-center gap-2 rounded-md border border-[#262626] bg-[#111111] px-4 py-2 text-sm font-semibold text-zinc-300 hover:bg-[#181818] disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><RefreshCw className="h-4 w-4" /> Fetch Latest Runtime Details</button><button onClick={() => void verifyLiveEndpoints()} disabled={verifyLoading || !canVerifyLiveEndpoints} className="flex items-center gap-2 rounded-md border border-cyan-500/20 bg-cyan-500/10 px-4 py-2 text-sm font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><ExternalLink className="h-4 w-4" /> {verifyLoading ? 'Verifying...' : 'Verify Live Endpoints'}</button><button onClick={() => void destroyDeployment().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Destroy failed.'))} disabled={destroyLoading || !hasAwsSecrets} className="flex items-center gap-2 rounded-md border border-red-500/20 bg-red-500/10 px-4 py-2 text-sm font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"><Server className="h-4 w-4" /> {destroyLoading ? 'Destroying...' : 'Destroy Infrastructure'}</button></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><h3 className="mb-4 text-sm font-semibold text-zinc-200">Endpoint Verification</h3>{effectiveEndpointChecks.length > 0 ? <div className="space-y-3">{effectiveEndpointChecks.map((check) => <div key={`${check.label}-${check.url || 'empty'}`} className="rounded-md border border-[#1A1A1A] bg-black p-4"><div className="flex items-center justify-between"><div><div className="text-sm font-medium text-zinc-200">{check.label}</div><div className="mt-1 font-mono text-[11px] text-zinc-500">{check.url || 'n/a'}</div></div><span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${check.ok ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-300'}`}>{check.ok ? `HTTP ${check.status ?? 200}` : (check.status ? `HTTP ${check.status}` : 'Unreachable')}</span></div><div className="mt-3 text-xs leading-relaxed text-zinc-400">{check.detail}</div></div>)}</div> : <div className="rounded-md border border-dashed border-[#262626] bg-black px-4 py-6 text-sm text-zinc-500">{canVerifyLiveEndpoints ? 'No live verification has been recorded yet. Run `Verify Live Endpoints` to test the deployed URLs.' : 'Verification is unavailable until the current repo has a successful deploy payload and live runtime details.'}</div>}</div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><h3 className="mb-4 text-sm font-semibold text-zinc-200">Deployment History</h3><div className="space-y-3">{deploymentHistory.map((entry) => <div key={entry.id} className="rounded-md border border-[#1A1A1A] bg-black p-4"><div className="flex items-center justify-between"><div><p className="text-sm font-medium text-zinc-200">{new Date(entry.createdAt).toLocaleString()}</p><p className="mt-1 font-mono text-[11px] text-zinc-400">EC2: {entry.instanceId}</p></div><span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${entry.status === 'done' ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-400'}`}>{entry.status === 'done' ? 'Success' : 'Error'}</span></div></div>)}</div></div></div>
+            <div className="mx-auto max-w-5xl space-y-6">
+              {deployResult?.mode === 'iac_pipeline' && deployResult.run_id && iacResourceOutputs ? (
+                <ResourceCard
+                  runId={deployResult.run_id}
+                  serviceType={deployResult.service_type || 'aws'}
+                  outputs={iacResourceOutputs}
+                  keypair={iacKeypair}
+                  awsCredentials={{
+                    access_key_id: aws.aws_access_key_id,
+                    secret_access_key: aws.aws_secret_access_key,
+                    region: terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION,
+                  }}
+                  onDestroyed={handleIacDestroyed}
+                />
+              ) : null}
+              <div className="mt-4 mb-8 border-b border-[#1A1A1A] pb-6">
+                <div className={`mb-4 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-bold uppercase ${outputBannerClassName}`}>
+                  <CheckCircle2 className="h-3.5 w-3.5" /> {outputBanner.label}
+                </div>
+                <h1 className="mb-2 text-2xl font-semibold text-zinc-100">{outputBanner.title}</h1>
+                <p className="text-sm text-zinc-400">{outputBanner.description}</p>
+                {backendErrorMessage && (
+                  <div className="mt-4 rounded-md border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">
+                    {backendErrorMessage}
+                  </div>
+                )}
+                {!backendErrorMessage && !hasLiveRuntimeDetails && deployResult?.success && deployResult.mode !== 'iac_pipeline' && (
+                  <div className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-200">
+                    Live runtime details are missing for this repo. Fetch the latest runtime details to hydrate outputs before treating this deploy as successful.
+                  </div>
+                )}
+              </div>
+              <div className="grid grid-cols-2 gap-6">
+                <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
+                  <div className="mb-6 text-[10px] font-bold uppercase text-zinc-500">Security</div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => deploySummary.generatedPem && downloadTextFile(`${deploySummary.keyName}.pem`, deploySummary.generatedPem.endsWith('\n') ? deploySummary.generatedPem : `${deploySummary.generatedPem}\n`)}
+                      disabled={!deploySummary.generatedPem}
+                      className="flex flex-1 items-center justify-center gap-2 rounded-md border border-[#262626] bg-[#111111] py-2 text-[12px] font-medium text-zinc-200 hover:bg-[#1A1A1A] disabled:cursor-not-allowed disabled:text-zinc-500"
+                    >
+                      <Download className="h-4 w-4" /> Download .PEM
+                    </button>
+                    <button
+                      onClick={() => void downloadPpk().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'PPK conversion failed.'))}
+                      disabled={!deploySummary.generatedPem}
+                      className="flex flex-1 items-center justify-center gap-2 rounded-md border border-[#262626] bg-[#111111] py-2 text-[12px] font-medium text-zinc-200 hover:bg-[#1A1A1A] disabled:cursor-not-allowed disabled:text-zinc-500"
+                    >
+                      <Download className="h-4 w-4" /> Download .PPK
+                    </button>
+                  </div>
+                  {!deploySummary.generatedPem && (
+                    <div className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
+                      {keyPairDownloadMessage}
+                    </div>
+                  )}
+                </div>
+                <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
+                  <div className="mb-4 text-[10px] font-bold uppercase text-zinc-500">Endpoints</div>
+                  <div className="space-y-3 text-sm">
+                    <div className="flex justify-between"><span className="text-zinc-400">Public IP</span><span className="font-mono text-zinc-200">{deploySummary.publicIp}</span></div>
+                    <div className="flex justify-between"><span className="text-zinc-400">Instance</span><span className="font-mono text-zinc-200">{deploySummary.instanceId}</span></div>
+                    <div className="flex justify-between">
+                      <span className="text-zinc-400">CloudFront</span>
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono text-zinc-200">{deploySummary.cloudfrontUrl}</span>
+                        {canOpenCloudfront && (
+                          <button onClick={() => window.open(deploySummary.cloudfrontUrl.startsWith('http') ? deploySummary.cloudfrontUrl : `https://${deploySummary.cloudfrontUrl}`, '_blank', 'noopener,noreferrer')} className="text-zinc-500 hover:text-zinc-200">
+                            <ExternalLink className="h-4 w-4" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex justify-between"><span className="text-zinc-400">Verification</span><span className={`font-medium ${outputBanner.tone === 'success' ? 'text-emerald-400' : outputBanner.tone === 'error' ? 'text-red-300' : 'text-amber-300'}`}>{outputBanner.label}</span></div>
+                  </div>
+                </div>
+              </div>
+              <div className="flex gap-3">
+                <button onClick={() => void fetchRuntimeDetails().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to fetch runtime details.'))} disabled={!canFetchRuntimeDetails} className="flex items-center gap-2 rounded-md border border-[#262626] bg-[#111111] px-4 py-2 text-sm font-semibold text-zinc-300 hover:bg-[#181818] disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">
+                  <RefreshCw className="h-4 w-4" /> Fetch Latest Runtime Details
+                </button>
+                <button onClick={() => void verifyLiveEndpoints()} disabled={verifyLoading || !canVerifyLiveEndpoints} className="flex items-center gap-2 rounded-md border border-cyan-500/20 bg-cyan-500/10 px-4 py-2 text-sm font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">
+                  <ExternalLink className="h-4 w-4" /> {verifyLoading ? 'Verifying...' : 'Verify Live Endpoints'}
+                </button>
+                <button onClick={() => void destroyDeployment().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Destroy failed.'))} disabled={destroyLoading || !hasAwsSecrets} className="flex items-center gap-2 rounded-md border border-red-500/20 bg-red-500/10 px-4 py-2 text-sm font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">
+                  <Server className="h-4 w-4" /> {destroyLoading ? 'Destroying...' : 'Destroy Infrastructure'}
+                </button>
+              </div>
+              <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
+                <h3 className="mb-4 text-sm font-semibold text-zinc-200">Endpoint Verification</h3>
+                {effectiveEndpointChecks.length > 0 ? (
+                  <div className="space-y-3">
+                    {effectiveEndpointChecks.map((check) => (
+                      <div key={`${check.label}-${check.url || 'empty'}`} className="rounded-md border border-[#1A1A1A] bg-black p-4">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <div className="text-sm font-medium text-zinc-200">{check.label}</div>
+                            <div className="mt-1 font-mono text-[11px] text-zinc-500">{check.url || 'n/a'}</div>
+                          </div>
+                          <span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${check.ok ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-300'}`}>
+                            {check.ok ? `HTTP ${check.status ?? 200}` : (check.status ? `HTTP ${check.status}` : 'Unreachable')}
+                          </span>
+                        </div>
+                        <div className="mt-3 text-xs leading-relaxed text-zinc-400">{check.detail}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-md border border-dashed border-[#262626] bg-black px-4 py-6 text-sm text-zinc-500">
+                    {canVerifyLiveEndpoints ? 'No live verification has been recorded yet. Run `Verify Live Endpoints` to test the deployed URLs.' : 'Verification is unavailable until the current repo has a successful deploy payload and live runtime details.'}
+                  </div>
+                )}
+              </div>
+              <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
+                <h3 className="mb-4 text-sm font-semibold text-zinc-200">Deployment History</h3>
+                <div className="space-y-3">
+                  {deploymentHistory.map((entry) => (
+                    <div key={entry.id} className="rounded-md border border-[#1A1A1A] bg-black p-4">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-sm font-medium text-zinc-200">{new Date(entry.createdAt).toLocaleString()}</p>
+                          <p className="mt-1 font-mono text-[11px] text-zinc-400">EC2: {entry.instanceId}</p>
+                        </div>
+                        <span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${entry.status === 'done' ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-400'}`}>
+                          {entry.status === 'done' ? 'Success' : 'Error'}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
           )}
         </div>
       </div>

@@ -10,15 +10,37 @@ export default function DashboardProjectsRedirectPage() {
   const [popupBlocked, setPopupBlocked] = useState(false);
 
   useEffect(() => {
-    const opened = window.open(GITHUB_APP_INSTALL_URL, '_blank', 'noopener,noreferrer');
-    if (opened) {
-      router.replace('/dashboard');
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      setPopupBlocked(true);
-    }, 0);
-    return () => window.clearTimeout(timer);
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const openInstallSettings = async () => {
+      const sessionRes = await fetch('/api/auth/session', { cache: 'no-store' }).catch(() => null);
+      const session = await sessionRes?.json().catch(() => ({})) as { isLoggedIn?: boolean; user?: unknown };
+
+      if (cancelled) return;
+
+      if (!session?.isLoggedIn || !session.user) {
+        window.location.assign('/api/auth/login?force=1');
+        return;
+      }
+
+      const opened = window.open(GITHUB_APP_INSTALL_URL, '_blank', 'noopener,noreferrer');
+      if (opened) {
+        router.replace('/dashboard');
+        return;
+      }
+      timer = window.setTimeout(() => {
+        setPopupBlocked(true);
+      }, 0);
+    };
+
+    void openInstallSettings();
+    return () => {
+      cancelled = true;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
   }, [router]);
 
   return (

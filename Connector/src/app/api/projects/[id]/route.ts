@@ -168,10 +168,16 @@ export async function GET(
     }
 
     if (ghRepo.user_id !== user.id) {
-      return NextResponse.json(
-        { error: 'Forbidden: You do not own this project' },
-        { status: 403 }
+      const [linkedProject] = await query<any[]>(
+        `SELECT id, user_id FROM projects WHERE repository_id = ? LIMIT 1`,
+        [projectId]
       );
+      if (!linkedProject || linkedProject.user_id !== user.id) {
+        return NextResponse.json(
+          { error: 'Forbidden: You do not own this project' },
+          { status: 403 }
+        );
+      }
     }
 
     const [owner, repoName] = ghRepo.full_name.split('/');

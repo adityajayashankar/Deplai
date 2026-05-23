@@ -75,6 +75,12 @@ from utils import get_docker_client
 
 logger = logging.getLogger(__name__)
 
+try:
+    from routers.iac_apply import router as iac_router
+except Exception as exc:
+    iac_router = None
+    logger.warning("IaC router disabled during startup: %s", exc)
+
 
 def _project_slug(value: str) -> str:
     slug = re.sub(r"[^a-z0-9-]+", "-", str(value or "").strip().lower())
@@ -167,6 +173,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if iac_router is not None:
+    app.include_router(iac_router)
+
+
+# Startup event handler
+@app.on_event("startup")
+async def on_startup():
+    """Initialize services and clean up stale resources on startup."""
+    try:
+        from terraform_agent.agent.executor import cleanup_old_workspaces
+    except Exception as exc:
+        logger.warning("Skipping IaC workspace cleanup during startup: %s", exc)
+        return
+
+    # Clean up stale IaC workspaces from previous runs
+    deleted = await cleanup_old_workspaces()
+    if deleted:
+        print(f"[startup] Cleaned up {deleted} stale IaC workspace(s)")
+
 
 # In-memory stores
 active_scans: dict[str, EnvironmentInitializer] = {}
@@ -267,6 +293,19 @@ async def _handle_websocket(
 
     await websocket.accept()
 
+    def _context_matches_token(context) -> bool:
+        if token_sub is None:
+            return True
+        return str(getattr(context, "user_id", "")) == str(token_sub)
+
+    async def _send_unauthorized() -> None:
+        await websocket.send_json({
+            "type": "status",
+            "status": StreamStatus.error.value,
+            "error": "Unauthorized",
+        })
+        await websocket.close(code=1008, reason="Unauthorized")
+
     async def run_workflow(runner: RunnerBase):
         try:
             success = await runner.run()
@@ -311,16 +350,35 @@ async def _handle_websocket(
             command = WebSocketCommand(**data)
 
             if command.action == "start":
-                # Cancel existing runner and WAIT for its task to finish before
-                # starting a new one — prevents two pipelines racing on shared volumes.
+                # Rebind reconnecting clients to active workflows instead of
+                # restarting long runs and racing on shared volumes.
                 if project_id in active:
                     old_runner = active[project_id]
-                    old_runner.cancel()
                     if old_runner._task is not None and not old_runner._task.done():
-                        try:
-                            await asyncio.wait_for(asyncio.shield(old_runner._task), timeout=10)
-                        except (asyncio.CancelledError, asyncio.TimeoutError):
-                            pass
+                        active_context = (
+                            contexts.get(project_id)
+                            or getattr(old_runner, "context", None)
+                            or getattr(old_runner, "scan_context", None)
+                        )
+                        if not _context_matches_token(active_context):
+                            await _send_unauthorized()
+                            return
+                        old_runner.websocket = websocket
+                        if getattr(old_runner, "_approval_requested", False):
+                            current_status = StreamStatus.waiting_approval
+                        elif getattr(old_runner, "_decision_requested", False):
+                            current_status = StreamStatus.waiting_decision
+                        else:
+                            current_status = StreamStatus.running
+                        await websocket.send_json({
+                            "type": "status",
+                            "status": current_status.value,
+                        })
+                        await old_runner._send_message(
+                            "info",
+                            "Reconnected to the active workflow without restarting it.",
+                        )
+                        continue
                     active.pop(project_id, None)
 
                 context = contexts.get(project_id)
@@ -338,12 +396,7 @@ async def _handle_websocket(
                 # Both sides are normalised to str because the JWT sub claim may be
                 # decoded as an int (from JSON) while Pydantic coerces user_id to str.
                 if token_sub is not None and str(getattr(context, "user_id", "")) != str(token_sub):
-                    await websocket.send_json({
-                        "type": "status",
-                        "status": StreamStatus.error.value,
-                        "error": "Unauthorized",
-                    })
-                    await websocket.close(code=1008, reason="Unauthorized")
+                    await _send_unauthorized()
                     return
 
                 runner = create_runner(websocket, project_id, context)
