@@ -573,6 +573,8 @@ async function sleep(ms: number): Promise<void> {
 
 async function waitForRuntimeVerification(params: {
   cloudfrontUrl?: string | null;
+  appUrl?: string | null;
+  healthCheckUrl?: string | null;
   publicIp?: string | null;
   timeoutMs?: number;
   intervalMs?: number;
@@ -663,6 +665,19 @@ function containsAwsInstanceResource(files: GeneratedFile[]): boolean {
     if (!path.endsWith('.tf')) return false;
     const content = String(file.content || '');
     return /resource\s+"aws_instance"\s+"[^"]+"/i.test(content);
+  });
+}
+
+function containsRdsOrElasticacheResource(files: GeneratedFile[]): boolean {
+  return files.some((file) => {
+    const path = normalizePath(String(file.path || '')).toLowerCase();
+    if (!path.endsWith('.tf')) return false;
+    const content = String(file.content || '');
+    return /resource\s+"aws_db_instance"/i.test(content)
+      || /source\s*=\s*"terraform-aws-modules\/rds\//i.test(content)
+      || /resource\s+"aws_elasticache/i.test(content)
+      || /module\s+"db"\s*\{/i.test(content)
+      || /module\s+"rds"\s*\{/i.test(content);
   });
 }
 
@@ -857,7 +872,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (body.runtime_apply === true) {
-      if (provider !== 'aws') {
+      if ((provider as string) !== 'aws') {
         return NextResponse.json(
           { error: 'runtime_apply currently supports AWS only.' },
           { status: 400 },
@@ -1001,7 +1016,7 @@ export async function POST(req: NextRequest) {
             { status: 400 },
           );
         }
-        if (provider === 'aws' && awsAccessKeyId && awsSecretAccessKey && isRecoverableEc2StateFailure(upstreamError)) {
+        if ((provider as string) === 'aws' && awsAccessKeyId && awsSecretAccessKey && isRecoverableEc2StateFailure(upstreamError)) {
           const recoveredRuntimeDetails = await fetchAwsRuntimeDetails({
             projectName,
             awsAccessKeyId,
@@ -1092,7 +1107,9 @@ export async function POST(req: NextRequest) {
       }
 
       const expectedEc2 = containsAwsInstanceResource(baseFiles);
+      const hasDbResources = containsRdsOrElasticacheResource(baseFiles);
       const ec2FallbackApplied = Boolean(applyDetails?.ec2_fallback_applied);
+      const provisioningReport = applyData.provisioning_report || applyDetails?.provisioning_report;
       const runtimeDetails = awsAccessKeyId && awsSecretAccessKey
         ? await fetchAwsRuntimeDetails({
           projectName,
@@ -1105,7 +1122,7 @@ export async function POST(req: NextRequest) {
       const ec2InstanceId = extractInstanceIdFromRuntimeDetails(runtimeDetails)
         || extractOutputString(runtimeOutputPayload, ['ec2_instance_id', 'instance_id']);
 
-      if (expectedEc2 && (ec2FallbackApplied || !ec2InstanceId)) {
+      if (expectedEc2 && (ec2FallbackApplied || !ec2InstanceId) && !hasDbResources) {
         return NextResponse.json(
           {
             error: ec2FallbackApplied
@@ -1136,9 +1153,11 @@ export async function POST(req: NextRequest) {
       });
       const verification = await waitForRuntimeVerification({
         cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
+        appUrl: extractOutputString(runtimeOutputPayload, ['app_url', 'application_url', 'site_url']),
+        healthCheckUrl: extractOutputString(runtimeOutputPayload, ['health_check_url', 'health_url']),
         publicIp: normalizedRuntime.ec2.public_ip,
       });
-      if (!verification.verified) {
+      if (!verification.verified && !hasDbResources) {
         return NextResponse.json(
           {
             error: 'Deployment provisioned infrastructure but no live endpoint became reachable after apply.',
@@ -1158,12 +1177,13 @@ export async function POST(req: NextRequest) {
         provider,
         project_id: projectId,
         mode: 'runtime_apply',
+        app_url: normalizedRuntime.ec2.public_ip ? `http://${normalizedRuntime.ec2.public_ip}` : null,
         cloudfront_url: normalizedRuntime.cdn.cloudfront_url,
         outputs: runtimeOutputPayload ?? {},
         raw_outputs: runtimeOutputPayload ?? {},
         details: mergedDetails,
         sensitive_output_arns:
-          applyDetails?.sensitive_output_arns ?? null,
+          (applyDetails as Record<string, unknown> | undefined)?.sensitive_output_arns ?? null,
         ec2_key_name: normalizedRuntime.keypair.key_name,
         generated_ec2_private_key_pem: normalizedRuntime.keypair.private_key_pem,
         keypair: normalizedRuntime.keypair,
@@ -1171,11 +1191,14 @@ export async function POST(req: NextRequest) {
         network: normalizedRuntime.network,
         cdn: normalizedRuntime.cdn,
         status: 'deployed',
+        provisioning_report: provisioningReport,
+        has_database_resources: hasDbResources,
         deployment_summary: buildDeploymentSummary({
           outputs: runtimeOutputPayload ?? {},
           normalizedRuntime,
         }),
-        deployment_verified: true,
+        deployment_verified: verification.verified,
+        partial_deployment: hasDbResources ? !verification.verified : false,
         verification_checks: verification.checks,
         ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
       });
@@ -1296,7 +1319,7 @@ export async function POST(req: NextRequest) {
     }
 
     const configuredVars: string[] = [];
-    if (provider === 'aws') {
+    if ((provider as string) === 'aws') {
       const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
       const awsSecretAccessKey = String(body.aws_secret_access_key || '').trim();
       const awsRegion = String(body.aws_region || 'eu-north-1').trim() || 'eu-north-1';

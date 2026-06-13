@@ -1391,7 +1391,7 @@ const RunButton: React.FC<RunButtonProps> = ({ onClick, disabled = false, classN
 // LANDING PAGE APP COMPONENT
 // ==========================================
 
-export default function App() {
+function AppContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [booting, setBooting] = useState(true);
@@ -1547,5 +1547,15 @@ export default function App() {
         <p>Built for developers, by developers.</p>
       </footer>
     </div>
+  );
+}
+
+import { Suspense } from 'react';
+
+export default function App() {
+  return (
+    <Suspense fallback={<LoadingScreen invert />}>
+      <AppContent />
+    </Suspense>
   );
 }
