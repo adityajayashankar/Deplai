@@ -153,6 +153,61 @@ def _parse_plan_change_counts(plan_output: str) -> dict[str, int]:
     }
 
 
+def _summarize_ec2_plan_changes(plan_payload: Any) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "resources": [],
+        "add": 0,
+        "change": 0,
+        "destroy": 0,
+        "replace": 0,
+        "no_op": 0,
+        "has_managed_ec2": False,
+        "expects_ec2_create_or_replace": False,
+    }
+    if not isinstance(plan_payload, dict):
+        return summary
+
+    resources: list[dict[str, Any]] = []
+    for item in plan_payload.get("resource_changes") or []:
+        if not isinstance(item, dict):
+            continue
+        resource_type = str(item.get("type") or "").strip()
+        address = str(item.get("address") or "").strip()
+        if resource_type != "aws_instance" and "aws_instance." not in address:
+            continue
+
+        change = item.get("change") if isinstance(item.get("change"), dict) else {}
+        actions = [
+            str(action or "").strip()
+            for action in (change.get("actions") if isinstance(change, dict) else []) or []
+            if str(action or "").strip()
+        ]
+        if not actions:
+            actions = ["unknown"]
+
+        action_set = set(actions)
+        if action_set == {"no-op"}:
+            summary["no_op"] += 1
+        if "create" in action_set and "delete" in action_set:
+            summary["replace"] += 1
+        elif "create" in action_set:
+            summary["add"] += 1
+        elif "update" in action_set:
+            summary["change"] += 1
+        elif "delete" in action_set:
+            summary["destroy"] += 1
+
+        resources.append({"address": address, "actions": actions})
+
+    summary["resources"] = resources
+    summary["has_managed_ec2"] = bool(resources)
+    summary["expects_ec2_create_or_replace"] = any(
+        "create" in set(resource.get("actions") or [])
+        for resource in resources
+    )
+    return summary
+
+
 def _policy_source_arn(identity_arn: str) -> str:
     arn = str(identity_arn or "").strip()
     assumed = re.match(r"^arn:aws:sts::(\d+):assumed-role/([^/]+)/[^/]+$", arn)
@@ -269,8 +324,7 @@ def _atmos_image() -> str:
 
 
 def _is_cloudposse_atmos_bundle(files: list[dict[str, Any]]) -> bool:
-    paths = {_normalize_rel_path(str(item.get("path", ""))) for item in files if str(item.get("path", "")).strip()}
-    return "atmos.yaml" in paths and ".deplai/cloudposse-component-lock.json" in paths
+    return False
 
 
 def _cloudposse_lock_payload(files: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1412,6 +1466,12 @@ def _legacy_runtime_bundle_needs_remediation(files: list[dict[str, Any]]) -> boo
     has_aws_region_var = False
     has_region_var = False
     has_var_region_reference = False
+    has_al2023_ami_reference = False
+    has_al2023_ami_data = False
+    tfvars_environment_alias = re.compile(r'(?mi)^\s*environment\s*=\s*"?(production|development)"?\s*$')
+    tfvars_compute_strategy_alias = re.compile(
+        r'(?mi)^\s*compute_strategy\s*=\s*"?(ec2-instance|cloudfront|s3cloudfront)"?\s*$'
+    )
     single_line_variable_block = re.compile(
         r'variable\s+"[^"]+"\s*\{\s*type\s*=\s*[^{}\n]+,\s*default\s*=\s*[^{}\n]+\s*\}'
     )
@@ -1419,9 +1479,13 @@ def _legacy_runtime_bundle_needs_remediation(files: list[dict[str, Any]]) -> boo
 
     for item in files:
         path = _normalize_rel_path(str(item.get("path", ""))).lower()
+        text = _extract_text_payload(item)
+        if path.endswith(".tfvars") and (
+            tfvars_environment_alias.search(text) or tfvars_compute_strategy_alias.search(text)
+        ):
+            return True
         if not path.endswith(".tf"):
             continue
-        text = _extract_text_payload(item)
         if _terraform_has_variable(text, "aws_region"):
             has_aws_region_var = True
         if _terraform_has_variable(text, "region"):
@@ -1432,6 +1496,10 @@ def _legacy_runtime_bundle_needs_remediation(files: list[dict[str, Any]]) -> boo
             providers_provider = True
         if "var.region" in text:
             has_var_region_reference = True
+        if "data.aws_ami.al2023.id" in text:
+            has_al2023_ami_reference = True
+        if 'data "aws_ami" "al2023"' in text:
+            has_al2023_ami_data = True
         if 'variable "desired_log_group_name" {{' in text or 'variable "log_group_override" {{' in text:
             return True
         if single_line_variable_block.search(text):
@@ -1439,6 +1507,8 @@ def _legacy_runtime_bundle_needs_remediation(files: list[dict[str, Any]]) -> boo
         if conditional_depends_on.search(text):
             return True
 
+    if has_al2023_ami_reference and not has_al2023_ami_data:
+        return True
     if has_var_region_reference and has_aws_region_var and not has_region_var:
         return True
     return versions_provider and providers_provider
@@ -1479,6 +1549,9 @@ def _remediate_legacy_runtime_bundle(
         "legacy_conditional_depends_on_rewritten": False,
         "legacy_single_line_variable_blocks_rewritten": False,
         "legacy_provider_region_var_rewritten": False,
+        "legacy_tfvars_environment_canonicalized": False,
+        "legacy_tfvars_compute_strategy_canonicalized": False,
+        "legacy_nginx_ingress_port_fixed": False,
     }
 
     normalized_paths = {
@@ -1498,6 +1571,30 @@ def _remediate_legacy_runtime_bundle(
             "content": content,
             "encoding": encoding,
         })
+
+    def _normalize_tfvars_aliases(text: str) -> str:
+        updated = text
+        env_rewrites = (
+            (r'(?mi)^(\s*environment\s*=\s*)"production"(\s*)$', r'\1"prod"\2'),
+            (r'(?mi)^(\s*environment\s*=\s*)"development"(\s*)$', r'\1"dev"\2'),
+        )
+        for pattern, replacement in env_rewrites:
+            rewritten = re.sub(pattern, replacement, updated)
+            if rewritten != updated:
+                updated = rewritten
+                remediation["legacy_tfvars_environment_canonicalized"] = True
+
+        strategy_rewrites = (
+            (r'(?mi)^(\s*compute_strategy\s*=\s*)"ec2-instance"(\s*)$', r'\1"ec2"\2'),
+            (r'(?mi)^(\s*compute_strategy\s*=\s*)"cloudfront"(\s*)$', r'\1"s3_cloudfront"\2'),
+            (r'(?mi)^(\s*compute_strategy\s*=\s*)"s3cloudfront"(\s*)$', r'\1"s3_cloudfront"\2'),
+        )
+        for pattern, replacement in strategy_rewrites:
+            rewritten = re.sub(pattern, replacement, updated)
+            if rewritten != updated:
+                updated = rewritten
+                remediation["legacy_tfvars_compute_strategy_canonicalized"] = True
+        return updated
 
     def _rewrite_bootstrap_default(text: str) -> str:
         pattern = re.compile(
@@ -1578,15 +1675,27 @@ def _remediate_legacy_runtime_bundle(
         iam_replacements = (
             (
                 r'(?ms)(resource\s+"aws_iam_role"\s+"ec2"\s*\{[\s\S]*?^\s*)name\s*=\s*"\$\{var\.project_name\}-\$\{var\.environment\}-ec2-role"\s*$',
-                r'\1name_prefix        = "${var.project_name}-${var.environment}-ec2-role-"',
+                r'\1name_prefix        = substr("${var.project_name}-${var.environment}-ec2-role-", 0, 38)',
             ),
             (
                 r'(?ms)(resource\s+"aws_iam_instance_profile"\s+"ec2"\s*\{[\s\S]*?^\s*)name\s*=\s*"\$\{var\.project_name\}-\$\{var\.environment\}-instance-profile"\s*$',
-                r'\1name_prefix = "${var.project_name}-${var.environment}-instance-profile-"',
+                r'\1name_prefix = substr("${var.project_name}-${var.environment}-instance-profile-", 0, 38)',
             ),
             (
                 r'(?ms)(resource\s+"aws_iam_role_policy"\s+"app"\s*\{[\s\S]*?^\s*)name\s*=\s*"\$\{var\.project_name\}-\$\{var\.environment\}-app"\s*$',
-                r'\1name_prefix = "${var.project_name}-${var.environment}-app-"',
+                r'\1name_prefix = substr("${var.project_name}-${var.environment}-app-", 0, 38)',
+            ),
+            (
+                r'(?ms)(resource\s+"aws_iam_role"\s+"ec2"\s*\{[\s\S]*?^\s*)name_prefix\s*=\s*"\$\{var\.project_name\}-\$\{var\.environment\}-ec2-role-"\s*$',
+                r'\1name_prefix        = substr("${var.project_name}-${var.environment}-ec2-role-", 0, 38)',
+            ),
+            (
+                r'(?ms)(resource\s+"aws_iam_instance_profile"\s+"ec2"\s*\{[\s\S]*?^\s*)name_prefix\s*=\s*"\$\{var\.project_name\}-\$\{var\.environment\}-instance-profile-"\s*$',
+                r'\1name_prefix = substr("${var.project_name}-${var.environment}-instance-profile-", 0, 38)',
+            ),
+            (
+                r'(?ms)(resource\s+"aws_iam_role_policy"\s+"app"\s*\{[\s\S]*?^\s*)name_prefix\s*=\s*"\$\{var\.project_name\}-\$\{var\.environment\}-app-"\s*$',
+                r'\1name_prefix = substr("${var.project_name}-${var.environment}-app-", 0, 38)',
             ),
         )
         for pattern, replacement in iam_replacements:
@@ -1595,6 +1704,18 @@ def _remediate_legacy_runtime_bundle(
                 updated = rewritten
                 remediation["legacy_iam_name_collision_rewritten"] = True
         return updated
+
+    def _rewrite_nginx_ingress_port(text: str) -> str:
+        if "dnf install -y nginx" not in text:
+            return text
+        rewritten = re.sub(
+            r'(?ms)(resource\s+"aws_security_group"\s+"app"\s*\{[\s\S]*?ingress\s*\{[\s\S]*?from_port\s*=\s*)var\.app_port(\s*[\r\n]+\s*to_port\s*=\s*)var\.app_port',
+            r"\g<1>80\g<2>80",
+            text,
+        )
+        if rewritten != text:
+            remediation["legacy_nginx_ingress_port_fixed"] = True
+        return rewritten
 
     def _rewrite_single_line_variable_blocks(text: str) -> str:
         updated = text
@@ -1656,6 +1777,7 @@ def _remediate_legacy_runtime_bundle(
         text = _rewrite_bootstrap_default(text)
         text = _rewrite_known_inline_blocks(text)
         text = _rewrite_fixed_iam_names(text)
+        text = _rewrite_nginx_ingress_port(text)
         text = _rewrite_single_line_variable_blocks(text)
         text = _rewrite_conditional_depends_on(text)
         if bundle_has_aws_region_var and not bundle_has_region_var and "var.region" in text:
@@ -1777,8 +1899,8 @@ def _remediate_legacy_runtime_bundle(
             needs_subnet_clone = True
 
     post_patch_combined = "\n".join(tf_texts[idx] for idx in tf_indexes)
+    target_idx: int | None = None
     if needs_subnet_clone and 'resource "aws_subnet" "main_b"' not in post_patch_combined:
-        target_idx: int | None = None
         for idx in tf_indexes:
             if re.search(r'(?is)resource\s+"aws_subnet"\s+"main"\s*\{', tf_texts[idx]):
                 target_idx = idx
@@ -1799,16 +1921,30 @@ def _remediate_legacy_runtime_bundle(
             )
             remediation["legacy_subnet_clone_added"] = True
 
-            if 'resource "aws_route_table_association" "main"' in post_patch_combined and 'resource "aws_route_table_association" "main_b"' not in post_patch_combined:
-                tf_texts[target_idx] = (
-                    tf_texts[target_idx]
-                    + "\n"
-                    + "resource \"aws_route_table_association\" \"main_b\" {\n"
-                    + "  subnet_id      = aws_subnet.main_b.id\n"
-                    + "  route_table_id = aws_route_table_association.main.route_table_id\n"
-                    + "}\n"
-                )
-                remediation["legacy_route_assoc_clone_added"] = True
+    for idx, item in enumerate(patched_files):
+        path = _normalize_rel_path(str(item.get("path", ""))).lower()
+        if not path.endswith(".tfvars"):
+            continue
+        text = _extract_text_payload(item)
+        normalized_text = _normalize_tfvars_aliases(text)
+        if normalized_text != text:
+            patched_files[idx] = _set_text_payload(item, normalized_text)
+
+    if (
+        needs_subnet_clone
+        and target_idx is not None
+        and 'resource "aws_route_table_association" "main"' in post_patch_combined
+        and 'resource "aws_route_table_association" "main_b"' not in post_patch_combined
+    ):
+        tf_texts[target_idx] = (
+            tf_texts[target_idx]
+            + "\n"
+            + "resource \"aws_route_table_association\" \"main_b\" {\n"
+            + "  subnet_id      = aws_subnet.main_b.id\n"
+            + "  route_table_id = aws_route_table_association.main.route_table_id\n"
+            + "}\n"
+        )
+        remediation["legacy_route_assoc_clone_added"] = True
 
     changed = any(bool(value) for value in remediation.values())
     normalized_tf_paths = set(normalized_paths.values())
@@ -1991,6 +2127,47 @@ output "redis_endpoint" {
         "Applied runtime compatibility fixes for legacy Terraform bundle (AMI, ALB subnet safety, user_data syntax, bootstrap interpolation quoting, EC2 key-pair reuse support, IAM name collision avoidance, duplicate provider cleanup, conditional depends_on rewrites, and variable block normalization).",
     )
     return patched_files, remediation
+
+
+def _normalize_rds_elasticache_provider_versions(
+    files: list[dict[str, Any]],
+    apply_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize AWS provider version constraints in RDS/ElastiCache templates.
+
+    The new RDS and ElastiCache templates declare ``version = "~> 5.0"`` for the
+    AWS provider, but the EC2 runtime patcher targets hashicorp/aws 6.41.0.
+    When both are in the same bundle Terraform picks the most restrictive
+    constraint and can refuse to download a compatible provider version.
+
+    This function rewrites any ``~> 5.x`` / ``~> 4.x`` AWS provider version
+    constraints inside ``.tf`` files to ``~> 6.0`` so they're compatible with
+    the runtime patcher.
+    """
+    patched: list[dict[str, Any]] = []
+    provider_version_pattern = re.compile(
+        r'(source\s*=\s*"hashicorp/aws"[^}]*?version\s*=\s*")~>\s*[45]\.[0-9.]+(")' ,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    changed = False
+    for item in files:
+        path = str(item.get("path", "")).replace("\\", "/").lower()
+        if not path.endswith(".tf"):
+            patched.append(item)
+            continue
+        text = _extract_text_payload(item)
+        rewritten = provider_version_pattern.sub(r'\1~> 6.0\2', text)
+        if rewritten != text:
+            item = _set_text_payload(dict(item), rewritten)
+            changed = True
+        patched.append(item)
+    if changed:
+        _emit_progress(
+            apply_context,
+            "info",
+            "Normalized AWS provider version constraints in RDS/ElastiCache files to ~> 6.0 for EC2 runtime compatibility.",
+        )
+    return patched
 
 
 def _collect_terraform_text(files: list[dict[str, Any]]) -> str:
@@ -2190,6 +2367,166 @@ def _discover_existing_ec2_key_pair_name(
 
 def _terraform_has_aws_instance(tf_text: str) -> bool:
     return re.search(r'resource\s+"aws_instance"\s+"[^"]+"', tf_text or "", flags=re.IGNORECASE) is not None
+
+
+def _terraform_has_rds_or_elasticache(tf_text: str) -> bool:
+    """Return True if the bundle contains RDS or ElastiCache resources (including module-based)."""
+    patterns = [
+        r'resource\s+"aws_db_instance"',
+        r'resource\s+"aws_elasticache_replication_group"',
+        r'resource\s+"aws_elasticache_cluster"',
+        r'source\s*=\s*"terraform-aws-modules/rds/',
+        r'source\s*=\s*"terraform-aws-modules/elasticache/',
+        r'module\s+"db"\s*\{',
+        r'module\s+"rds"\s*\{',
+        r'module\s+"cache"\s*\{',
+        r'module\s+"redis"\s*\{',
+    ]
+    text = tf_text or ""
+    return any(re.search(p, text, flags=re.IGNORECASE) is not None for p in patterns)
+
+
+def _terraform_has_registry_module(tf_text: str) -> bool:
+    """Return True if any file uses a Terraform registry module source (not local or git)."""
+    return re.search(
+        r'source\s*=\s*"[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+"',
+        tf_text or "",
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _build_provisioning_report(
+    state_list_output: str,
+    outputs: dict[str, Any],
+    apply_log: str,
+    tf_text: str,
+    has_ec2_resource: bool,
+    has_rds_or_elasticache: bool,
+) -> dict[str, Any]:
+    """Build a per-resource-category provisioning report from terraform state.
+
+    Returns a dict with a ``resources`` list where each entry describes a
+    resource category (vpc, ec2, rds, elasticache, …) and whether it was
+    planned, provisioned, and any relevant resource IDs or error information.
+    """
+    state_lines = [line.strip() for line in (state_list_output or "").splitlines() if line.strip()]
+
+    # ---- resource category definitions ----
+    _CATEGORIES: list[tuple[str, str, list[str], list[str]]] = [
+        # (display_name, key, state_prefixes, tf_resource_patterns)
+        ("VPC", "vpc", ["aws_vpc.", "aws_subnet.", "aws_internet_gateway.", "aws_route_table.", "aws_nat_gateway."],
+         [r'resource\s+"aws_vpc"', r'resource\s+"aws_subnet"']),
+        ("EC2 Instance", "ec2", ["aws_instance.", "aws_key_pair."],
+         [r'resource\s+"aws_instance"']),
+        ("Security Group", "security_group", ["aws_security_group."],
+         [r'resource\s+"aws_security_group"']),
+        ("RDS Database", "rds", ["aws_db_instance.", "aws_db_subnet_group.", "module.db.", "module.rds."],
+         [r'resource\s+"aws_db_instance"', r'module\s+"db"', r'module\s+"rds"', r'terraform-aws-modules/rds/']),
+        ("ElastiCache / Redis", "elasticache", [
+            "aws_elasticache_replication_group.", "aws_elasticache_cluster.",
+            "aws_elasticache_subnet_group.", "module.cache.", "module.redis.",
+        ], [r'resource\s+"aws_elasticache', r'module\s+"cache"', r'module\s+"redis"']),
+        ("S3 Bucket", "s3", ["aws_s3_bucket."],
+         [r'resource\s+"aws_s3_bucket"']),
+        ("CloudFront", "cloudfront", ["aws_cloudfront_distribution.", "aws_cloudfront_origin_access_control."],
+         [r'resource\s+"aws_cloudfront_distribution"']),
+        ("IAM", "iam", ["aws_iam_role.", "aws_iam_policy.", "aws_iam_instance_profile.", "aws_iam_role_policy."],
+         [r'resource\s+"aws_iam_role"', r'resource\s+"aws_iam_policy"']),
+        ("Load Balancer", "alb", ["aws_lb.", "aws_lb_listener.", "aws_lb_target_group.", "aws_alb."],
+         [r'resource\s+"aws_lb"', r'resource\s+"aws_alb"']),
+    ]
+
+    resources: list[dict[str, Any]] = []
+    total_planned = 0
+    total_provisioned = 0
+    total_failed = 0
+
+    for display_name, key, state_prefixes, tf_patterns in _CATEGORIES:
+        # Was this category planned (present in the .tf files)?
+        planned = any(
+            re.search(p, tf_text, flags=re.IGNORECASE)
+            for p in tf_patterns
+        )
+        # Was this category provisioned (appears in terraform state)?
+        matched_state_lines = [
+            s for s in state_lines
+            if any(s.startswith(prefix) or f".{prefix}" in s for prefix in state_prefixes)
+        ]
+        provisioned = len(matched_state_lines) > 0
+
+        # Extract resource IDs from outputs
+        resource_ids: list[str] = matched_state_lines[:5]  # cap at 5
+
+        # Detect errors in apply log specific to this category
+        error_hint: str | None = None
+        if planned and not provisioned:
+            # Search apply log for error lines mentioning this resource type
+            error_keywords = state_prefixes[:2]
+            for log_line in (apply_log or "").splitlines():
+                lowered = log_line.lower()
+                if "error" in lowered and any(kw.rstrip(".").lower() in lowered for kw in error_keywords):
+                    error_hint = log_line.strip()[:300]
+                    break
+
+        if planned:
+            total_planned += 1
+            if provisioned:
+                total_provisioned += 1
+            else:
+                total_failed += 1
+
+        status = "not_planned"
+        if planned and provisioned:
+            status = "provisioned"
+        elif planned and not provisioned:
+            status = "failed"
+
+        entry: dict[str, Any] = {
+            "name": display_name,
+            "key": key,
+            "status": status,
+            "planned": planned,
+            "provisioned": provisioned,
+            "resource_count": len(matched_state_lines),
+            "resource_ids": resource_ids,
+        }
+        if error_hint:
+            entry["error_hint"] = error_hint
+
+        # Enrich with output values
+        if key == "ec2" and provisioned:
+            entry["instance_id"] = outputs.get("ec2_instance_id")
+            entry["public_ip"] = outputs.get("ec2_public_ip")
+        elif key == "rds" and provisioned:
+            entry["endpoint"] = (
+                outputs.get("rds_endpoint")
+                or outputs.get("db_endpoint")
+                or outputs.get("postgres_endpoint")
+            )
+        elif key == "elasticache" and provisioned:
+            entry["endpoint"] = (
+                outputs.get("redis_endpoint")
+                or outputs.get("elasticache_endpoint")
+                or outputs.get("cache_endpoint")
+            )
+        elif key == "vpc" and provisioned:
+            entry["vpc_id"] = outputs.get("vpc_id") or outputs.get("ec2_vpc_id")
+        elif key == "s3" and provisioned:
+            entry["bucket_name"] = outputs.get("website_bucket") or outputs.get("s3_bucket_name")
+        elif key == "cloudfront" and provisioned:
+            entry["url"] = outputs.get("cloudfront_url") or outputs.get("cloudfront_domain_name")
+
+        if planned:
+            resources.append(entry)
+
+    return {
+        "resources": resources,
+        "total_planned": total_planned,
+        "total_provisioned": total_provisioned,
+        "total_failed": total_failed,
+        "all_succeeded": total_failed == 0,
+        "partial": total_provisioned > 0 and total_failed > 0,
+    }
 
 
 def _terraform_default_instance_type(tf_text: str) -> str | None:
@@ -2597,8 +2934,10 @@ def _ensure_remote_state_backend(
     return result
 
 
-def _terraform_init_args(backend_region_override: str | None) -> list[str]:
+def _terraform_init_args(backend_region_override: str | None, upgrade: bool = False) -> list[str]:
     args = ["init", "-input=false", "-no-color"]
+    if upgrade:
+        args.append("-upgrade")
     if str(backend_region_override or "").strip():
         args.append(f"-backend-config=region={str(backend_region_override).strip()}")
     return args
@@ -2637,6 +2976,7 @@ def apply_terraform_bundle(
     init_log = ""
     validate_log = ""
     plan_log = ""
+    plan_json_log = ""
     apply_log = ""
     backend_bootstrap: dict[str, Any] = {}
     backend_region_override: str | None = None
@@ -2645,110 +2985,30 @@ def apply_terraform_bundle(
     try:
         normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
         _write_files_to_volume(volume_name, files)
-        if _is_cloudposse_atmos_bundle(files):
-            _emit_progress(apply_context, "info", "Cloud Posse/Atmos files staged into runtime workspace.")
-            lock_payload = _cloudposse_lock_payload(files)
-            stack = str(lock_payload.get("stack") or "").strip()
-            deploy_sequence = _atmos_sequence([str(item).strip() for item in lock_payload.get("deploy_sequence") or [] if str(item).strip()])
-            includes_rds = "rds" in deploy_sequence
-
-            permission_preflight = _run_iam_permission_preflight(
-                aws_access_key_id=aws_access_key_id,
-                aws_secret_access_key=aws_secret_access_key,
-                aws_session_token=aws_session_token,
-                aws_region=aws_region,
-                include_rds=includes_rds,
-            )
-            if str(permission_preflight.get("warning") or "").strip():
-                _emit_progress(apply_context, "warning", str(permission_preflight.get("warning")))
-            if not permission_preflight.get("ok"):
-                # IAM preflight is advisory; continue and let real apply output
-                # report definitive AccessDenied failures if permissions are insufficient.
-                advisory_missing = permission_preflight.get("missing_policies") or _required_policy_hints(include_rds=includes_rds)
-                advisory_reason = str(permission_preflight.get("reason") or "Some required actions were not allowed by IAM simulation.")
-                _emit_progress(
-                    apply_context,
-                    "warning",
-                    f"IAM pre-flight warning (continuing deploy): {advisory_reason}",
-                )
-                permission_preflight["advisory_only"] = True
-                permission_preflight["preflight_warning"] = advisory_reason
-                permission_preflight["missing_policies"] = advisory_missing
-                permission_preflight["required_policies"] = permission_preflight.get("required_policies") or _required_policy_hints(include_rds=includes_rds)
-
-            account_id = str(permission_preflight.get("account_id") or "").strip()
-            state_bucket_name, lock_table_name = _state_backend_names(
-                project_name=project_name,
-                account_id=account_id,
-                state_bucket_override=str(state_bucket or "").strip(),
-                lock_table_override=str(lock_table or "").strip(),
-            )
-
-            try:
-                backend_bootstrap = _ensure_remote_state_backend(
-                    state_bucket=state_bucket_name,
-                    lock_table=lock_table_name,
-                    aws_access_key_id=aws_access_key_id,
-                    aws_secret_access_key=aws_secret_access_key,
-                    aws_session_token=aws_session_token,
-                    aws_region=aws_region,
-                    apply_context=apply_context,
-                )
-            except Exception as exc:
-                return {
-                    "success": False,
-                    "error": f"State backend bootstrap failed: {exc}",
-                    "details": {
-                        "execution_kind": "atmos",
-                        "state_bucket": state_bucket_name,
-                        "lock_table": lock_table_name,
-                        "deploy_sequence": deploy_sequence,
-                    },
-                }
-
-            files = _inject_atmos_backend_vars(
-                files,
-                stack=stack,
-                state_bucket=state_bucket_name,
-                lock_table=lock_table_name,
-                aws_region=aws_region,
-            )
-            _write_files_to_volume(volume_name, files)
-
-            env = {
-                "AWS_ACCESS_KEY_ID": aws_access_key_id,
-                "AWS_SECRET_ACCESS_KEY": aws_secret_access_key,
-                "AWS_SESSION_TOKEN": aws_session_token,
-                "AWS_DEFAULT_REGION": aws_region,
-                "TF_IN_AUTOMATION": "1",
-                "TF_CLI_ARGS_init": (
-                    f"-backend-config=bucket={state_bucket_name} "
-                    f"-backend-config=key={stack}/terraform.tfstate "
-                    f"-backend-config=region={str(backend_bootstrap.get('state_bucket_region') or aws_region)} "
-                    f"-backend-config=dynamodb_table={lock_table_name}"
-                ),
-            }
-            atmos_result = _apply_cloudposse_atmos_bundle(
-                volume_name=volume_name,
-                files=files,
-                project_name=project_name,
-                provider=provider,
-                env=env,
-                apply_context=apply_context,
-                confirm_apply=confirm_apply,
-            )
-            if isinstance(atmos_result.get("details"), dict):
-                atmos_result["details"]["permission_preflight"] = permission_preflight
-                atmos_result["details"]["backend_bootstrap"] = backend_bootstrap
-                atmos_result["details"]["state_bucket"] = state_bucket_name
-                atmos_result["details"]["lock_table"] = lock_table_name
-            return atmos_result
-
         if _legacy_runtime_bundle_needs_remediation(files):
             files, bundle_remediation = _remediate_legacy_runtime_bundle(files, apply_context)
             normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
             _write_files_to_volume(volume_name, files)
+        # Normalize AWS provider version constraints when bundle mixes EC2 and
+        # RDS/ElastiCache templates (which use ~> 5.0 while EC2 patcher targets 6.x).
+        tf_text_preflight = _collect_terraform_text(files)
+        bundle_has_rds_or_elasticache = _terraform_has_rds_or_elasticache(tf_text_preflight)
+        bundle_has_registry_module = _terraform_has_registry_module(tf_text_preflight)
+        if bundle_has_rds_or_elasticache:
+            files = _normalize_rds_elasticache_provider_versions(files, apply_context)
+            normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
+            _write_files_to_volume(volume_name, files)
         _emit_progress(apply_context, "info", "Terraform files staged into runtime workspace.")
+
+        if not any(path.endswith(".tf") for path in normalized_paths):
+            return {
+                "success": False,
+                "error": "Standard Terraform bundle is missing .tf configuration files.",
+                "details": {
+                    "terraform_root": "/workspace/terraform",
+                    "received_paths": normalized_paths[:50],
+                },
+            }
 
         has_terraform_dir = any(path == "terraform" or path.startswith("terraform/") for path in normalized_paths)
         tf_root = "/workspace/terraform" if has_terraform_dir else "/workspace"
@@ -2796,14 +3056,14 @@ def apply_terraform_bundle(
             fmt_log = _run_terraform_with_tracking(
                 volume_name,
                 tf_root,
-                ["fmt", "-check", "-recursive", "-no-color"],
+                ["fmt", "-recursive", "-no-color"],
                 env,
                 apply_context=apply_context,
             )
         except Exception as fmt_exc:
             return {
                 "success": False,
-                "error": f"terraform fmt -check failed: {fmt_exc}",
+                "error": f"terraform fmt failed: {fmt_exc}",
                 "details": {
                     "terraform_root": tf_root,
                     "fmt_log_tail": _tail(str(fmt_exc)),
@@ -2812,11 +3072,15 @@ def apply_terraform_bundle(
                 },
             }
 
+        # Use -upgrade when the bundle contains registry modules (e.g. terraform-aws-modules/rds)
+        # so that provider version conflicts between EC2 and RDS/ElastiCache constraints are
+        # resolved automatically by Terraform rather than causing an init failure.
+        use_upgrade_init = bundle_has_registry_module
         try:
             init_log = _run_terraform_with_tracking(
                 volume_name,
                 tf_root,
-                _terraform_init_args(backend_region_override),
+                _terraform_init_args(backend_region_override, upgrade=use_upgrade_init),
                 env,
                 apply_context=apply_context,
             )
@@ -2824,30 +3088,52 @@ def apply_terraform_bundle(
             init_error = str(init_exc)
             actual_region_from_error = _extract_actual_bucket_region(init_error)
             needs_retry = _is_missing_remote_state_error(init_error) or _is_backend_region_mismatch_error(init_error)
-            if auto_bootstrap_backend and needs_retry:
-                backend_bootstrap = _ensure_remote_state_backend(
-                    state_bucket=state_bucket_name,
-                    lock_table=lock_table_name,
-                    aws_access_key_id=aws_access_key_id,
-                    aws_secret_access_key=aws_secret_access_key,
-                    aws_session_token=aws_session_token,
-                    aws_region=aws_region,
-                    apply_context=apply_context,
-                )
-                backend_region_override = (
-                    actual_region_from_error
-                    or str(backend_bootstrap.get("state_bucket_region") or "").strip()
-                    or backend_region_override
-                )
-                _emit_progress(apply_context, "info", "Retrying terraform init after backend bootstrap.")
-                init_log = _run_terraform_with_tracking(
-                    volume_name,
-                    tf_root,
-                    _terraform_init_args(backend_region_override),
-                    env,
-                    apply_context=apply_context,
-                )
-            else:
+            # If init failed and we haven't tried -upgrade yet, retry with -upgrade
+            # (registry module version constraint conflicts require this).
+            if not use_upgrade_init and bundle_has_registry_module:
+                _emit_progress(apply_context, "info", "Retrying terraform init with -upgrade to resolve registry module constraints.")
+                try:
+                    init_log = _run_terraform_with_tracking(
+                        volume_name,
+                        tf_root,
+                        _terraform_init_args(backend_region_override, upgrade=True),
+                        env,
+                        apply_context=apply_context,
+                    )
+                    needs_retry = False
+                    init_error = ""
+                except Exception as upgrade_exc:
+                    init_error = str(upgrade_exc)
+                    needs_retry = _is_missing_remote_state_error(init_error) or _is_backend_region_mismatch_error(init_error)
+                    if not needs_retry:
+                        raise
+            if needs_retry:
+                if auto_bootstrap_backend:
+                    backend_bootstrap = _ensure_remote_state_backend(
+                        state_bucket=state_bucket_name,
+                        lock_table=lock_table_name,
+                        aws_access_key_id=aws_access_key_id,
+                        aws_secret_access_key=aws_secret_access_key,
+                        aws_session_token=aws_session_token,
+                        aws_region=aws_region,
+                        apply_context=apply_context,
+                    )
+                    backend_region_override = (
+                        actual_region_from_error
+                        or str(backend_bootstrap.get("state_bucket_region") or "").strip()
+                        or backend_region_override
+                    )
+                    _emit_progress(apply_context, "info", "Retrying terraform init after backend bootstrap.")
+                    init_log = _run_terraform_with_tracking(
+                        volume_name,
+                        tf_root,
+                        _terraform_init_args(backend_region_override, upgrade=use_upgrade_init),
+                        env,
+                        apply_context=apply_context,
+                    )
+                else:
+                    raise
+            elif init_error:
                 raise
         if apply_context and apply_context.get("cancel_requested"):
             _emit_progress(apply_context, "error", "Terraform apply cancelled during init.")
@@ -2883,6 +3169,7 @@ def apply_terraform_bundle(
 
         tf_text = _collect_terraform_text(files)
         has_ec2_resource = _terraform_has_aws_instance(tf_text)
+        has_rds_or_elasticache = _terraform_has_rds_or_elasticache(tf_text)
         has_instance_type_var = _terraform_has_variable(tf_text, "instance_type")
         has_enable_ec2_var = _terraform_has_variable(tf_text, "enable_ec2")
         has_aws_region_var = _terraform_has_variable(tf_text, "aws_region")
@@ -2904,6 +3191,7 @@ def apply_terraform_bundle(
         attempted_instance_types: list[str] = []
         plan_args_base = ["plan", "-input=false", "-no-color", "-parallelism=20"]
         apply_args_base = ["apply", "-auto-approve", "-input=false", "-no-color", "-parallelism=20"]
+        saved_plan_path = "deplai-runtime.tfplan"
         allow_disable_fallback = str(
             os.getenv("DEPLAI_ALLOW_EC2_DISABLE_FALLBACK", "1")
         ).strip().lower() in {"1", "true", "yes"}
@@ -3041,6 +3329,7 @@ def apply_terraform_bundle(
             preferred_azs_override: list[str] | None = None,
             existing_key_name: str | None = None,
             force_default_vpc: bool = False,
+            output_path: str | None = None,
         ) -> list[str]:
             args = [*plan_args_base]
             if has_enable_ec2_var and has_ec2_resource:
@@ -3056,8 +3345,12 @@ def apply_terraform_bundle(
                 args.append(f"-var=existing_ec2_key_pair_name={existing_key_name}")
             if instance_type_override:
                 args.append(f"-var=instance_type={instance_type_override}")
+            if output_path:
+                args.append(f"-out={output_path}")
             return args
 
+        ec2_plan_changes: dict[str, Any] = _summarize_ec2_plan_changes(None)
+        plan_json_error: str | None = None
         try:
             plan_log = _run_terraform_with_tracking(
                 volume_name,
@@ -3067,17 +3360,31 @@ def apply_terraform_bundle(
                     disable_ec2=precheck_disable_ec2,
                     preferred_azs_override=selected_az_order,
                     existing_key_name=existing_key_name_override,
-                    force_default_vpc=True,
+                    force_default_vpc=False,
+                    output_path=saved_plan_path,
                 ),
                 env,
                 apply_context=apply_context,
             )
+            try:
+                plan_json_log = _run_terraform_with_tracking(
+                    volume_name,
+                    tf_root,
+                    ["show", "-json", saved_plan_path],
+                    env,
+                    apply_context=apply_context,
+                )
+                ec2_plan_changes = _summarize_ec2_plan_changes(json.loads(plan_json_log or "{}"))
+            except Exception as plan_json_exc:
+                plan_json_error = str(plan_json_exc)
+                ec2_plan_changes = _summarize_ec2_plan_changes(None)
             plan_counts = _parse_plan_change_counts(plan_log)
             plan_summary = {
                 "total_resources": plan_counts,
                 "terraform_root": tf_root,
                 "selected_instance_type": selected_instance_type,
                 "ec2_disabled": precheck_disable_ec2,
+                "ec2_plan_changes": ec2_plan_changes,
                 "state_bucket": state_bucket_name or None,
                 "lock_table": lock_table_name or None,
                 "requires_confirmation": True,
@@ -3096,6 +3403,7 @@ def apply_terraform_bundle(
                         "init_log_tail": _tail(init_log),
                         "validate_log_tail": _tail(validate_log),
                         "plan_log_tail": _tail(plan_log),
+                        "plan_json_error": plan_json_error,
                         "backend_bootstrap": backend_bootstrap,
                         "bundle_remediation": bundle_remediation,
                         "selected_instance_type": selected_instance_type,
@@ -3108,8 +3416,10 @@ def apply_terraform_bundle(
                 disable_ec2=precheck_disable_ec2,
                 preferred_azs_override=selected_az_order,
                 existing_key_name=existing_key_name_override,
-                force_default_vpc=True,
+                force_default_vpc=False,
             )
+            if not precheck_disable_ec2:
+                args = ["apply", "-input=false", "-no-color", "-parallelism=20", saved_plan_path]
             if precheck_disable_ec2:
                 _emit_progress(apply_context, "info", "EC2 quota unavailable. Applying fallback with enable_ec2=false.")
                 apply_log = (
@@ -3212,7 +3522,7 @@ def apply_terraform_bundle(
                             _build_apply_args(
                                 candidate,
                                 existing_key_name=existing_key_name_override,
-                                force_default_vpc=True,
+                                force_default_vpc=False,
                             ),
                             env,
                             apply_context=apply_context,
@@ -3235,7 +3545,7 @@ def apply_terraform_bundle(
                             None,
                             disable_ec2=True,
                             existing_key_name=existing_key_name_override,
-                            force_default_vpc=True,
+                            force_default_vpc=False,
                         )
                         retry_log = _run_terraform_with_tracking(volume_name, tf_root, retry_args, env, apply_context=apply_context)
                         apply_log = (
@@ -3283,7 +3593,7 @@ def apply_terraform_bundle(
                                 selected_instance_type,
                                 preferred_azs_override=az_order,
                                 existing_key_name=existing_key_name_override,
-                                force_default_vpc=True,
+                                force_default_vpc=False,
                             ),
                             env,
                             apply_context=apply_context,
@@ -3369,23 +3679,26 @@ def apply_terraform_bundle(
         ec2_state_resources: list[str] = []
         ec2_state_list_error: str | None = None
         live_ec2_reconciliation: dict[str, str | None] | None = None
+        state_list_raw = ""
+
+        _emit_progress(apply_context, "info", "Fetching Terraform state to build provisioning report.")
+        try:
+            state_list_raw = _run_terraform_with_tracking(
+                volume_name,
+                tf_root,
+                ["state", "list"],
+                env,
+                apply_context=apply_context,
+            )
+            for line in state_list_raw.splitlines():
+                row = line.strip()
+                if "aws_instance." in row:
+                    ec2_state_resources.append(row)
+        except Exception as exc:
+            ec2_state_list_error = str(exc)
+            ec2_state_resources = []
+
         if has_ec2_resource and not ec2_fallback_applied:
-            _emit_progress(apply_context, "info", "Validating EC2 resources in Terraform state.")
-            try:
-                state_list_raw = _run_terraform_with_tracking(
-                    volume_name,
-                    tf_root,
-                    ["state", "list"],
-                    env,
-                    apply_context=apply_context,
-                )
-                for line in state_list_raw.splitlines():
-                    row = line.strip()
-                    if "aws_instance." in row:
-                        ec2_state_resources.append(row)
-            except Exception as exc:
-                ec2_state_list_error = str(exc)
-                ec2_state_resources = []
             if not ec2_state_resources and not ec2_output_evidence:
                 live_ec2_reconciliation = _lookup_live_ec2_instance_for_project(
                     aws_access_key_id=aws_access_key_id,
@@ -3422,26 +3735,69 @@ def apply_terraform_bundle(
                         "Live AWS reconciliation confirmed EC2 provisioning despite incomplete Terraform state/output evidence.",
                     )
             if not ec2_state_resources and not ec2_output_evidence:
-                return {
-                    "success": False,
-                    "error": (
-                        "Terraform apply finished but no EC2 instance resource was found in state. "
-                        "Deployment did not provision EC2."
-                    ),
-                    "details": {
-                        "terraform_root": tf_root,
-                        "selected_instance_type": selected_instance_type,
-                        "attempted_instance_types": attempted_instance_types,
-                        "attempted_preferred_az_orders": attempted_az_orders,
-                        "quota_info": quota_info,
-                        "ec2_output_evidence": ec2_output_evidence,
-                        "ec2_state_list_error": ec2_state_list_error,
-                        "output_read_error": output_read_error,
-                        "live_ec2_reconciliation": live_ec2_reconciliation,
-                        "init_log_tail": _tail(init_log),
-                        "apply_log_tail": _tail(apply_log),
-                    },
-                }
+                # When the bundle mixes EC2 with RDS or ElastiCache, Terraform may
+                # apply the database/cache tier successfully while EC2 creation is
+                # deferred or managed by a conditional variable. Do not treat this
+                # as a hard failure — emit an informational message and continue so
+                # the caller can surface whichever outputs are available.
+                if has_rds_or_elasticache and not ec2_plan_changes.get("expects_ec2_create_or_replace"):
+                    _emit_progress(
+                        apply_context,
+                        "info",
+                        "Terraform apply finished. Bundle contains RDS/ElastiCache resources; EC2 was not created or replaced in this run (may be managed separately or disabled via variable).",
+                    )
+                    ec2_error = None
+                elif ec2_plan_changes.get("expects_ec2_create_or_replace"):
+                    if has_rds_or_elasticache:
+                        # RDS/ElastiCache apply may have partially succeeded; EC2
+                        # may have been created but state tracking failed due to
+                        # the registry module init delay. Warn but do not block.
+                        _emit_progress(
+                            apply_context,
+                            "info",
+                            "Terraform planned EC2 creation alongside RDS/ElastiCache but EC2 was not found in state after apply. "
+                            "The database/cache tier may have applied successfully. Check the AWS console for EC2 instance status.",
+                        )
+                        ec2_error = None
+                    else:
+                        ec2_error = (
+                            "Terraform planned EC2 creation or replacement, but no EC2 instance resource "
+                            "was found in state or outputs after apply."
+                        )
+                elif ec2_plan_changes.get("has_managed_ec2"):
+                    ec2_error = (
+                        "Terraform apply finished but the plan did not create or replace EC2, and no "
+                        "EC2 instance resource was found in state. The saved state/config may have "
+                        "EC2 disabled or removed."
+                    )
+                else:
+                    ec2_error = None
+                    _emit_progress(
+                        apply_context,
+                        "info",
+                        "Terraform apply finished. The codebase contains 'aws_instance' but the plan did not manage any EC2 instances."
+                    )
+
+                if ec2_error:
+                    return {
+                        "success": False,
+                        "error": ec2_error,
+                        "details": {
+                            "terraform_root": tf_root,
+                            "selected_instance_type": selected_instance_type,
+                            "attempted_instance_types": attempted_instance_types,
+                            "attempted_preferred_az_orders": attempted_az_orders,
+                            "quota_info": quota_info,
+                            "ec2_plan_changes": ec2_plan_changes,
+                            "ec2_output_evidence": ec2_output_evidence,
+                            "ec2_state_list_error": ec2_state_list_error,
+                            "output_read_error": output_read_error,
+                            "plan_json_error": plan_json_error,
+                            "live_ec2_reconciliation": live_ec2_reconciliation,
+                            "init_log_tail": _tail(init_log),
+                            "apply_log_tail": _tail(apply_log),
+                        },
+                    }
             if ec2_output_evidence and not ec2_state_resources:
                 _emit_progress(
                     apply_context,
@@ -3497,6 +3853,15 @@ def apply_terraform_bundle(
                     },
                 }
 
+        provisioning_report = _build_provisioning_report(
+            state_list_output=state_list_raw,
+            outputs=outputs,
+            apply_log=apply_log,
+            tf_text=tf_text_preflight if "tf_text_preflight" in locals() else "",
+            has_ec2_resource=has_ec2_resource,
+            has_rds_or_elasticache=has_rds_or_elasticache,
+        )
+
         return {
             "success": True,
             "provider": provider,
@@ -3504,6 +3869,8 @@ def apply_terraform_bundle(
             "outputs": outputs,
             "cloudfront_url": cloudfront_url,
             "plan_summary": plan_summary,
+            "provisioning_report": provisioning_report,
+            "has_database_resources": has_rds_or_elasticache,
             "details": {
                 "apply_mode": apply_mode,
                 "ec2_fallback_applied": ec2_fallback_applied,
@@ -3513,10 +3880,12 @@ def apply_terraform_bundle(
                 "quota_info": quota_info,
                 "enforce_free_tier_ec2": enforce_free_tier,
                 "allowed_instance_types": allowed_instance_types,
+                "ec2_plan_changes": ec2_plan_changes,
                 "ec2_output_evidence": ec2_output_evidence,
                 "ec2_state_resources": ec2_state_resources,
                 "ec2_state_list_error": ec2_state_list_error,
                 "output_read_error": output_read_error,
+                "plan_json_error": plan_json_error,
                 "live_ec2_reconciliation": live_ec2_reconciliation,
                 "terraform_root": tf_root,
                 "fmt_log_tail": _tail(fmt_log),
@@ -3548,6 +3917,7 @@ def apply_terraform_bundle(
                 "init_log_tail": _tail(init_log),
                 "validate_log_tail": _tail(validate_log),
                 "plan_log_tail": _tail(plan_log),
+                "plan_json_error": plan_json_error if "plan_json_error" in locals() else None,
                 "apply_log_tail": _tail(apply_log),
             },
         }
@@ -3561,6 +3931,7 @@ def apply_terraform_bundle(
                 "init_log_tail": _tail(init_log),
                 "validate_log_tail": _tail(validate_log),
                 "plan_log_tail": _tail(plan_log),
+                "plan_json_error": plan_json_error if "plan_json_error" in locals() else None,
                 "apply_log_tail": _tail(apply_log),
                 "backend_bootstrap": backend_bootstrap,
                 "bundle_remediation": bundle_remediation,
