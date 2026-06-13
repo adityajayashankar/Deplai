@@ -10,7 +10,6 @@ from typing import Any
 
 
 TERRAFORM_IMAGE = "hashicorp/terraform:1.9.0"
-DEFAULT_ATMOS_IMAGE = "ghcr.io/cloudposse/atmos:1.185.0"
 
 
 def _command_timeout_seconds(args: list[str]) -> int:
@@ -194,62 +193,6 @@ def run_terraform_command(
                     pass
             _emit_progress(apply_context, "error", f"terraform {primary} failed or timed out.")
             raise RuntimeError(f"terraform {' '.join(args)} failed or timed out after {timeout_seconds}s: {stdout or exc}") from exc
-        finally:
-            if apply_context is not None:
-                apply_context["container_id"] = None
-            try:
-                container.remove(force=True)
-            except Exception:
-                pass
-    finally:
-        try:
-            volume.remove(force=True)
-        except Exception:
-            pass
-
-
-def run_atmos_command(
-    local_dir: Path,
-    args: list[str],
-    *,
-    env: dict[str, str],
-    apply_context: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    if apply_context and apply_context.get("cancel_requested"):
-        raise RuntimeError("Atmos apply cancelled by user.")
-
-    command_text = " ".join(args)
-    _emit_progress(apply_context, "info", f"Running atmos {command_text}...")
-
-    volume_name = f"deplai_atmos_exec_{uuid.uuid4().hex[:12]}"
-    docker_client = _docker_client()
-    volume = docker_client.volumes.create(name=volume_name)
-    image = os.getenv("DEPLAI_ATMOS_IMAGE", DEFAULT_ATMOS_IMAGE).strip() or DEFAULT_ATMOS_IMAGE
-    try:
-        _sync_local_to_volume(local_dir, volume_name)
-        container = docker_client.containers.create(
-            image,
-            command=["sh", "-lc", f"cd /workspace && atmos {command_text}"],
-            environment=env,
-            volumes={volume_name: {"bind": "/workspace", "mode": "rw"}},
-        )
-        if apply_context is not None:
-            apply_context["container_id"] = container.id
-        try:
-            container.start()
-            result = container.wait(timeout=_command_timeout_seconds(args))
-            stdout = _decode_output(container.logs(stdout=True, stderr=True))
-            raw_status = result.get("StatusCode") if isinstance(result, dict) else result
-            try:
-                status_code = int(raw_status)
-            except Exception:
-                status_code = 1
-            _sync_volume_to_local(local_dir, volume_name)
-            if status_code != 0:
-                _emit_progress(apply_context, "error", f"atmos {command_text} failed.")
-                raise RuntimeError(stdout or f"atmos command failed (exit {status_code})")
-            _emit_progress(apply_context, "success", f"atmos {command_text} completed.")
-            return {"stdout": stdout, "status_code": status_code}
         finally:
             if apply_context is not None:
                 apply_context["container_id"] = None

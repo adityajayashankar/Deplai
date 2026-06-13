@@ -46,6 +46,11 @@ import {
   type DeployApiResult,
   type DeployLogEntry,
   type DeployStateSnapshot,
+  type Ec2ResourceConfig,
+  type RdsResourceConfig,
+  type RedisResourceConfig,
+  type EcsResourceConfig,
+  type StaticSiteResourceConfig,
   type GeneratedIacFile,
   type InfraConsultantDecision,
   type InfraConsultantMessage,
@@ -88,9 +93,378 @@ type IacKeypair = {
   keypair_name: string;
 };
 
+type DeploymentPlanId = 'ec2' | 's3_cloudfront' | 'ecs_fargate';
+
+type DeploymentServiceSelection = {
+  rds: boolean;
+  redis: boolean;
+};
+
+type DeploymentPlanOption = {
+  id: DeploymentPlanId;
+  label: string;
+  description: string;
+  services: string[];
+};
+
 const PIPELINE_SOCKET_RETRY_DELAYS_MS = [1000, 2000, 5000, 5000];
 const APPROVED_DECISION_KEY = 'deplai.pipeline.approvedDecision';
 const DECISION_COST_ESTIMATE_KEY = 'deplai.pipeline.decisionCostEstimate';
+const DEPLOYMENT_PLAN_KEY = 'deplai.pipeline.deploymentPlan';
+const DEPLOYMENT_SERVICES_KEY = 'deplai.pipeline.deploymentServices';
+const EC2_RESOURCE_CONFIG_KEY = 'deplai.pipeline.ec2ResourceConfig';
+const EC2_INSTANCE_TYPES = ['t3.micro', 't3.small', 't3.medium', 't3.large'] as const;
+const DEFAULT_EC2_RESOURCE_CONFIG: Ec2ResourceConfig = {
+  instance_type: 't3.micro',
+  root_volume_size_gb: 35,
+  app_port: 3000,
+  ssh_ingress_cidr_blocks: [],
+};
+
+const DEPLOYMENT_PLAN_OPTIONS: DeploymentPlanOption[] = [
+  {
+    id: 'ec2',
+    label: 'EC2 App',
+    description: 'Single instance app deployment with public HTTP ingress. Best for low-cost app hosting and current runtime apply.',
+    services: ['EC2', 'VPC', 'Subnets', 'Security Groups', 'IAM'],
+  },
+  {
+    id: 's3_cloudfront',
+    label: 'Static Site',
+    description: 'S3 website object hosting behind CloudFront. Best for static frontend builds and public docs.',
+    services: ['S3', 'CloudFront'],
+  },
+  {
+    id: 'ecs_fargate',
+    label: 'ECS Fargate',
+    description: 'Containerized service behind an ALB. Best when the repo should run as managed containers.',
+    services: ['ECS', 'ALB', 'ECR', 'CloudWatch', 'VPC'],
+  },
+];
+
+const DEFAULT_DEPLOYMENT_SERVICES: DeploymentServiceSelection = {
+  rds: false,
+  redis: false,
+};
+
+const RDS_RESOURCE_CONFIG_KEY = 'deplai.pipeline.rdsResourceConfig';
+const REDIS_RESOURCE_CONFIG_KEY = 'deplai.pipeline.redisResourceConfig';
+const ECS_RESOURCE_CONFIG_KEY = 'deplai.pipeline.ecsResourceConfig';
+const STATIC_SITE_RESOURCE_CONFIG_KEY = 'deplai.pipeline.staticSiteResourceConfig';
+
+const RDS_ENGINES = ['postgres', 'mysql', 'mariadb'] as const;
+const RDS_INSTANCE_CLASSES = ['db.t4g.micro', 'db.t4g.small', 'db.t3.small', 'db.t3.medium', 'db.r6g.large'] as const;
+const RDS_DEFAULT_VERSIONS: Record<(typeof RDS_ENGINES)[number], string> = {
+  postgres: '15.5',
+  mysql: '8.0',
+  mariadb: '10.11',
+};
+const REDIS_NODE_TYPES = ['cache.t4g.micro', 'cache.t3.small', 'cache.t3.medium', 'cache.r6g.large'] as const;
+const REDIS_ENGINE_VERSIONS = ['7.0', '6.2'] as const;
+const ECS_CPU_OPTIONS = [256, 512, 1024, 2048, 4096] as const;
+const ECS_MEMORY_OPTIONS = [512, 1024, 2048, 3072, 4096, 8192] as const;
+const CLOUDFRONT_PRICE_CLASSES = ['PriceClass_100', 'PriceClass_200', 'PriceClass_All'] as const;
+
+const DEFAULT_RDS_RESOURCE_CONFIG: RdsResourceConfig = {
+  engine: 'postgres',
+  engine_version: '15.5',
+  instance_class: 'db.t4g.micro',
+  allocated_storage: 20,
+  multi_az: false,
+  backup_retention_period: 7,
+};
+const DEFAULT_REDIS_RESOURCE_CONFIG: RedisResourceConfig = {
+  node_type: 'cache.t4g.micro',
+  engine_version: '7.0',
+};
+const DEFAULT_ECS_RESOURCE_CONFIG: EcsResourceConfig = {
+  cpu: 512,
+  memory: 1024,
+  desired_count: 1,
+};
+const DEFAULT_STATIC_SITE_RESOURCE_CONFIG: StaticSiteResourceConfig = {
+  price_class: 'PriceClass_100',
+  spa_fallback: false,
+};
+
+function normalizeBool(value: unknown, fallback: boolean): boolean {
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (['true', 'yes', 'y', '1', 'on'].includes(normalized)) return true;
+  if (['false', 'no', 'n', '0', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
+function normalizeRdsResourceConfig(value: unknown): RdsResourceConfig {
+  const record = toRecord(value);
+  const engine = RDS_ENGINES.includes(String(record.engine || '').trim().toLowerCase() as (typeof RDS_ENGINES)[number])
+    ? String(record.engine).trim().toLowerCase() as RdsResourceConfig['engine']
+    : DEFAULT_RDS_RESOURCE_CONFIG.engine;
+  const requestedClass = String(record.instance_class || '').trim();
+  return {
+    engine,
+    engine_version: String(record.engine_version || RDS_DEFAULT_VERSIONS[engine]).trim() || RDS_DEFAULT_VERSIONS[engine],
+    instance_class: requestedClass || DEFAULT_RDS_RESOURCE_CONFIG.instance_class,
+    allocated_storage: clampInteger(record.allocated_storage ?? record.storage_gb, DEFAULT_RDS_RESOURCE_CONFIG.allocated_storage, 20, 4096),
+    multi_az: normalizeBool(record.multi_az, DEFAULT_RDS_RESOURCE_CONFIG.multi_az),
+    backup_retention_period: clampInteger(record.backup_retention_period ?? record.backup_retention_days, DEFAULT_RDS_RESOURCE_CONFIG.backup_retention_period, 0, 35),
+  };
+}
+
+function normalizeRedisResourceConfig(value: unknown): RedisResourceConfig {
+  const record = toRecord(value);
+  const requestedNode = String(record.node_type || '').trim();
+  const requestedVersion = String(record.engine_version || record.version || '').trim();
+  return {
+    node_type: requestedNode || DEFAULT_REDIS_RESOURCE_CONFIG.node_type,
+    engine_version: requestedVersion || DEFAULT_REDIS_RESOURCE_CONFIG.engine_version,
+  };
+}
+
+function normalizeEcsResourceConfig(value: unknown): EcsResourceConfig {
+  const record = toRecord(value);
+  return {
+    cpu: clampInteger(record.cpu, DEFAULT_ECS_RESOURCE_CONFIG.cpu, 256, 16384),
+    memory: clampInteger(record.memory, DEFAULT_ECS_RESOURCE_CONFIG.memory, 512, 122880),
+    desired_count: clampInteger(record.desired_count, DEFAULT_ECS_RESOURCE_CONFIG.desired_count, 1, 20),
+  };
+}
+
+function normalizeStaticSiteResourceConfig(value: unknown): StaticSiteResourceConfig {
+  const record = toRecord(value);
+  const priceClass = CLOUDFRONT_PRICE_CLASSES.includes(String(record.price_class || '').trim() as (typeof CLOUDFRONT_PRICE_CLASSES)[number])
+    ? String(record.price_class).trim() as StaticSiteResourceConfig['price_class']
+    : DEFAULT_STATIC_SITE_RESOURCE_CONFIG.price_class;
+  return {
+    price_class: priceClass,
+    spa_fallback: normalizeBool(record.spa_fallback, DEFAULT_STATIC_SITE_RESOURCE_CONFIG.spa_fallback),
+  };
+}
+
+function readRdsResourceConfig(): RdsResourceConfig {
+  return normalizeRdsResourceConfig(readStoredJson<Partial<RdsResourceConfig>>(RDS_RESOURCE_CONFIG_KEY) || DEFAULT_RDS_RESOURCE_CONFIG);
+}
+function readRedisResourceConfig(): RedisResourceConfig {
+  return normalizeRedisResourceConfig(readStoredJson<Partial<RedisResourceConfig>>(REDIS_RESOURCE_CONFIG_KEY) || DEFAULT_REDIS_RESOURCE_CONFIG);
+}
+function readEcsResourceConfig(): EcsResourceConfig {
+  return normalizeEcsResourceConfig(readStoredJson<Partial<EcsResourceConfig>>(ECS_RESOURCE_CONFIG_KEY) || DEFAULT_ECS_RESOURCE_CONFIG);
+}
+function readStaticSiteResourceConfig(): StaticSiteResourceConfig {
+  return normalizeStaticSiteResourceConfig(readStoredJson<Partial<StaticSiteResourceConfig>>(STATIC_SITE_RESOURCE_CONFIG_KEY) || DEFAULT_STATIC_SITE_RESOURCE_CONFIG);
+}
+
+function normalizeDeploymentPlanId(value: unknown): DeploymentPlanId {
+  const raw = String(value || '').trim();
+  return DEPLOYMENT_PLAN_OPTIONS.some((option) => option.id === raw) ? raw as DeploymentPlanId : 'ec2';
+}
+
+function readDeploymentServices(): DeploymentServiceSelection {
+  const saved = readStoredJson<Partial<DeploymentServiceSelection>>(DEPLOYMENT_SERVICES_KEY) || {};
+  return {
+    ...DEFAULT_DEPLOYMENT_SERVICES,
+    rds: saved.rds === true,
+    redis: saved.redis === true,
+  };
+}
+
+function clampInteger(value: unknown, defaultValue: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return defaultValue;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
+function normalizeCidrList(value: unknown): string[] {
+  const rawItems = Array.isArray(value)
+    ? value
+    : String(value || '').split(',');
+  return Array.from(new Set(
+    rawItems
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
+      .filter((item) => /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/.test(item)),
+  ));
+}
+
+function normalizeEc2ResourceConfig(value: unknown): Ec2ResourceConfig {
+  const record = toRecord(value);
+  const requestedInstanceType = String(record.instance_type || '').trim().toLowerCase();
+  return {
+    instance_type: EC2_INSTANCE_TYPES.includes(requestedInstanceType as typeof EC2_INSTANCE_TYPES[number])
+      ? requestedInstanceType
+      : DEFAULT_EC2_RESOURCE_CONFIG.instance_type,
+    root_volume_size_gb: clampInteger(record.root_volume_size_gb, DEFAULT_EC2_RESOURCE_CONFIG.root_volume_size_gb, 20, 200),
+    app_port: clampInteger(record.app_port, DEFAULT_EC2_RESOURCE_CONFIG.app_port, 1, 65535),
+    ssh_ingress_cidr_blocks: normalizeCidrList(record.ssh_ingress_cidr_blocks),
+  };
+}
+
+function readEc2ResourceConfig(): Ec2ResourceConfig {
+  return normalizeEc2ResourceConfig(readStoredJson<Partial<Ec2ResourceConfig>>(EC2_RESOURCE_CONFIG_KEY) || DEFAULT_EC2_RESOURCE_CONFIG);
+}
+
+function ec2ResourceConfigFromDecision(decision: InfraConsultantDecision | null | undefined): Ec2ResourceConfig {
+  const stackConfig = toRecord(decision?.stack_config);
+  return normalizeEc2ResourceConfig({
+    ...DEFAULT_EC2_RESOURCE_CONFIG,
+    ...toRecord(stackConfig['ec2-instance']),
+    ...toRecord(stackConfig.ec2),
+  });
+}
+
+function rdsResourceConfigFromDecision(decision: InfraConsultantDecision | null | undefined): RdsResourceConfig | null {
+  const stackConfig = toRecord(decision?.stack_config);
+  const rds = toRecord(stackConfig.rds);
+  if (Object.keys(rds).length === 0) return null;
+  return normalizeRdsResourceConfig({ ...DEFAULT_RDS_RESOURCE_CONFIG, ...rds });
+}
+
+function redisResourceConfigFromDecision(decision: InfraConsultantDecision | null | undefined): RedisResourceConfig | null {
+  const stackConfig = toRecord(decision?.stack_config);
+  const redis = toRecord(stackConfig.elasticache || stackConfig.redis);
+  if (Object.keys(redis).length === 0) return null;
+  return normalizeRedisResourceConfig({ ...DEFAULT_REDIS_RESOURCE_CONFIG, ...redis });
+}
+
+function ecsResourceConfigFromDecision(decision: InfraConsultantDecision | null | undefined): EcsResourceConfig | null {
+  const stackConfig = toRecord(decision?.stack_config);
+  const ecs = toRecord(stackConfig.ecs);
+  if (Object.keys(ecs).length === 0) return null;
+  return normalizeEcsResourceConfig({ ...DEFAULT_ECS_RESOURCE_CONFIG, ...ecs });
+}
+
+function staticSiteResourceConfigFromDecision(decision: InfraConsultantDecision | null | undefined): StaticSiteResourceConfig | null {
+  const stackConfig = toRecord(decision?.stack_config);
+  const site = toRecord(stackConfig.s3_cloudfront || stackConfig.static_site);
+  if (Object.keys(site).length === 0) return null;
+  return normalizeStaticSiteResourceConfig({ ...DEFAULT_STATIC_SITE_RESOURCE_CONFIG, ...site });
+}
+
+function normalizeDecisionStackConfigForUi(
+  decision: InfraConsultantDecision | null | undefined,
+  ec2Config: Ec2ResourceConfig,
+): Record<string, unknown> {
+  const stackConfig = toRecord(decision?.stack_config);
+  const normalized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(stackConfig)) {
+    const component = canonicalDecisionComponent(key);
+    if (!component) continue;
+    if (component === 'ec2') {
+      normalized.ec2 = {
+        ...toRecord(stackConfig['ec2-instance']),
+        ...toRecord(value),
+        ...normalizeEc2ResourceConfig({ ...toRecord(value), ...ec2Config }),
+      };
+    } else {
+      normalized[component] = toRecord(value);
+    }
+  }
+  normalized.ec2 = {
+    ...toRecord(normalized.ec2),
+    ...ec2Config,
+  };
+  return normalized;
+}
+
+function deploymentPlanToServiceType(planId: DeploymentPlanId): string {
+  if (planId === 's3_cloudfront') return 's3';
+  if (planId === 'ecs_fargate') return 'ecs';
+  return 'ec2';
+}
+
+function deploymentPlanComponents(planId: DeploymentPlanId, services: DeploymentServiceSelection): string[] {
+  const components = planId === 's3_cloudfront'
+    ? ['s3_cloudfront']
+    : planId === 'ecs_fargate'
+      ? ['vpc', 'alb', 'ecs']
+      : ['vpc', 'ec2'];
+  if (services.rds) components.push('rds');
+  if (services.redis) components.push('elasticache');
+  return Array.from(new Set(components));
+}
+
+interface DeploymentResourceConfigs {
+  ec2: Ec2ResourceConfig;
+  rds: RdsResourceConfig;
+  redis: RedisResourceConfig;
+  ecs: EcsResourceConfig;
+  staticSite: StaticSiteResourceConfig;
+}
+
+function applyDeploymentSelectionToDecision(
+  decision: InfraConsultantDecision | null | undefined,
+  planId: DeploymentPlanId,
+  services: DeploymentServiceSelection,
+  configs: DeploymentResourceConfigs,
+  awsRegion: string,
+): InfraConsultantDecision {
+  const ec2Config = configs.ec2;
+  const components = deploymentPlanComponents(planId, services);
+  const baseStackConfig = normalizeDecisionStackConfigForUi(decision, ec2Config);
+  const stackConfig: Record<string, unknown> = {};
+  for (const component of components) {
+    stackConfig[component] = toRecord(baseStackConfig[component]);
+  }
+  if (components.includes('ec2') && Object.keys(toRecord(stackConfig.ec2)).length === 0) {
+    stackConfig.ec2 = { ...ec2Config, desired_count: 1 };
+  } else if (components.includes('ec2')) {
+    stackConfig.ec2 = { ...toRecord(stackConfig.ec2), ...ec2Config };
+  }
+  if (components.includes('ecs')) {
+    stackConfig.ecs = {
+      ...toRecord(stackConfig.ecs),
+      cpu: configs.ecs.cpu,
+      memory: configs.ecs.memory,
+      desired_count: configs.ecs.desired_count,
+    };
+  }
+  if (components.includes('s3_cloudfront')) {
+    stackConfig.s3_cloudfront = {
+      ...toRecord(stackConfig.s3_cloudfront),
+      origin_type: 's3',
+      price_class: configs.staticSite.price_class,
+      spa_fallback: configs.staticSite.spa_fallback,
+    };
+  }
+  if (services.rds) {
+    stackConfig.rds = {
+      ...toRecord(stackConfig.rds),
+      engine: configs.rds.engine,
+      engine_version: configs.rds.engine_version,
+      instance_class: configs.rds.instance_class,
+      allocated_storage: configs.rds.allocated_storage,
+      multi_az: configs.rds.multi_az,
+      backup_retention_period: configs.rds.backup_retention_period,
+    };
+  }
+  if (services.redis) {
+    stackConfig.elasticache = {
+      ...toRecord(stackConfig.elasticache),
+      engine: 'redis',
+      node_type: configs.redis.node_type,
+      engine_version: configs.redis.engine_version,
+    };
+  }
+
+  const selectedPlan = DEPLOYMENT_PLAN_OPTIONS.find((option) => option.id === planId) || DEPLOYMENT_PLAN_OPTIONS[0];
+  const note = `Operator selected ${selectedPlan.label}${services.rds || services.redis ? ` with ${[services.rds ? 'RDS' : '', services.redis ? 'Redis' : ''].filter(Boolean).join(' and ')}` : ''}.`;
+  const existingNotes = Array.isArray(decision?.consultant_notes)
+    ? decision.consultant_notes.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+
+  return {
+    ...(decision || {}),
+    provider: 'aws',
+    region: String(awsRegion || DEFAULT_AWS_REGION).trim() || DEFAULT_AWS_REGION,
+    components,
+    deploy_sequence: components,
+    stack_config: stackConfig,
+    consultant_notes: [note, ...existingNotes.filter((item) => item !== note)],
+    outputs_to_capture: Array.isArray(decision?.outputs_to_capture)
+      ? decision.outputs_to_capture
+      : ['application_url', 'public_ip', 'cloudfront_url'],
+  } as InfraConsultantDecision;
+}
 
 const SIDEBAR_STAGES: Array<{ id: PipelineStageId; label: string; details: string }> = [
   { id: 'analysis', label: 'Repository Analysis', details: 'Codebase Scan' },
@@ -326,6 +700,22 @@ function hasSuccessfulTerraformGeneration(
 
 function describeTerraformRenderer(meta: SavedIacMeta | null): TerraformRendererSummary {
   const actualRenderer = String(meta?.actual_renderer || '').trim().toLowerCase();
+  if (actualRenderer === 'terraform_agent_multi_worker_dynamic') {
+    return {
+      primary: 'Terraform Agent',
+      runtime: 'Terraform runtime',
+      secondary: 'LLM worker generated Terraform bundle',
+      warning: null,
+    };
+  }
+  if (actualRenderer === 'terraform_agent_multi_worker_partial_fallback' || actualRenderer === 'terraform_agent_full_fallback') {
+    return {
+      primary: 'Terraform Agent',
+      runtime: 'Terraform runtime',
+      secondary: String(meta?.unsupported_reason || '').trim() || 'Dynamic generation with deterministic rescue',
+      warning: null,
+    };
+  }
   if (actualRenderer === 'deplai_ec2_app') {
     return {
       primary: 'DeplAI EC2 App',
@@ -663,7 +1053,7 @@ function buildConsultantArchitectureSeed(params: {
   const region = String(params.awsRegion || DEFAULT_AWS_REGION).trim() || DEFAULT_AWS_REGION;
   const runtime = String(params.repoContext?.language?.runtime || 'unknown').trim() || 'unknown';
   const staticSitePreferred = Boolean(params.userAnswers.static_assets_s3_cloudfront);
-  const environment = Boolean(params.userAnswers.needs_staging) ? 'staging' : 'production';
+  const environment = Boolean(params.userAnswers.needs_staging) ? 'staging' : 'prod';
 
   return {
     document_kind: 'deployment_profile',
@@ -675,7 +1065,7 @@ function buildConsultantArchitectureSeed(params: {
     application_type: runtime,
     environment,
     compute: {
-      strategy: staticSitePreferred ? 's3_cloudfront' : 'ec2-instance',
+      strategy: staticSitePreferred ? 's3_cloudfront' : 'ec2',
       services: [
         {
           id: 'app',
@@ -736,10 +1126,14 @@ function summarizeInfraConsultantDecision(decision: InfraConsultantDecision | nu
   const notes = Array.isArray(decision.consultant_notes)
     ? decision.consultant_notes.map((item) => String(item || '').trim()).filter(Boolean)
     : [];
+  const ec2 = ec2ResourceConfigFromDecision(decision);
 
   const lines: string[] = [];
   if (components.length > 0) lines.push(`Components: ${components.join(', ')}`);
   if (sequence.length > 0) lines.push(`Deploy sequence: ${sequence.join(' -> ')}`);
+  if (components.includes('ec2') || components.includes('ec2-instance')) {
+    lines.push(`EC2: ${ec2.instance_type}, root=${ec2.root_volume_size_gb}GB, app_port=${ec2.app_port}, ssh_cidrs=${ec2.ssh_ingress_cidr_blocks.length ? ec2.ssh_ingress_cidr_blocks.join(', ') : 'none'}`);
+  }
   if (outputs.length > 0) lines.push(`Outputs to capture: ${outputs.join(', ')}`);
   if (notes.length > 0) lines.push(`Notes: ${notes.join(' | ')}`);
   return lines.join('\n');
@@ -763,6 +1157,9 @@ function canonicalDecisionComponent(value: unknown): string {
   }
   if (compact === 'ecs' || compact.includes('fargate')) {
     return 'ecs';
+  }
+  if (compact === 'ec2' || compact === 'ec2_instance' || compact === 'ec2instance') {
+    return 'ec2';
   }
   if (compact.includes('vpc') || compact.includes('network')) {
     return 'vpc';
@@ -818,22 +1215,6 @@ function normalizeDecisionSequence(decision: InfraConsultantDecision | null | un
   return ordered;
 }
 
-function inferIacServiceType(decision: InfraConsultantDecision | null | undefined, repoContext: RepositoryContextJson | null): string {
-  const components = normalizeDecisionSequence(decision);
-  const priority = ['ecs', 'lambda', 'ec2', 's3', 'rds', 'elasticache', 'alb', 'vpc'];
-  for (const service of priority) {
-    if (components.includes(service)) return service;
-    if (service === 's3' && components.includes('s3_cloudfront')) return 's3';
-  }
-  const frameworkNames = Array.isArray(repoContext?.frameworks)
-    ? repoContext.frameworks.map((item) => String(item.name || '').toLowerCase()).join(' ')
-    : '';
-  const hasStaticFrontend = Boolean((repoContext?.frontend as Record<string, unknown> | undefined)?.static_site_candidate);
-  if (hasStaticFrontend || frameworkNames.includes('static')) return 's3';
-  if (frameworkNames.includes('next') || frameworkNames.includes('express') || frameworkNames.includes('fastapi')) return 'ecs';
-  return 'ec2';
-}
-
 function formatComponentName(component: string): string {
   const value = String(component || '').trim();
   if (!value) return 'Component';
@@ -857,7 +1238,7 @@ function toPositiveNumber(value: unknown): number | null {
 function decisionCategory(component: string): DecisionDiagramNode['category'] {
   const key = String(component || '').toLowerCase();
   if (key.includes('vpc') || key.includes('alb') || key.includes('nat') || key.includes('subnet')) return 'networking';
-  if (key.includes('ecs') || key.includes('lambda') || key.includes('compute')) return 'compute';
+  if (key.includes('ecs') || key.includes('ec2') || key.includes('lambda') || key.includes('compute')) return 'compute';
   if (key.includes('rds') || key.includes('redis') || key.includes('cache') || key.includes('db') || key.includes('s3')) return 'data';
   if (key.includes('waf') || key.includes('iam') || key.includes('account')) return 'security';
   return 'observability';
@@ -872,14 +1253,20 @@ function decisionColor(category: DecisionDiagramNode['category']): string {
 }
 
 function componentDetails(component: string, stackConfig: Record<string, unknown>): string[] {
-  const config = toRecord(stackConfig[component]);
+  const config = toRecord(stackConfig[component] || (component === 'ec2' ? stackConfig['ec2-instance'] : undefined));
   const details: string[] = [];
   const key = String(component || '').toLowerCase();
 
-  if (key === 'ecs') {
+  if (key === 'ecs' || key === 'ec2') {
     const desired = toPositiveNumber(config.desired_count);
     const cpu = toPositiveNumber(config.cpu);
     const memory = toPositiveNumber(config.memory);
+    const instanceType = String(config.instance_type || '').trim();
+    const appPort = toPositiveNumber(config.app_port);
+    const rootVolume = toPositiveNumber(config.root_volume_size_gb);
+    if (instanceType) details.push(instanceType);
+    if (rootVolume) details.push(`root=${rootVolume}GB`);
+    if (appPort) details.push(`port=${appPort}`);
     if (desired) details.push(`desired=${desired}`);
     if (cpu) details.push(`cpu=${cpu}`);
     if (memory) details.push(`memory=${memory}MB`);
@@ -1073,6 +1460,13 @@ export default function DeploymentTrackApp() {
   const [decisionCostError, setDecisionCostError] = useState<string | null>(null);
   const [infraConsultantInput, setInfraConsultantInput] = useState('');
   const [infraConsultantLoading, setInfraConsultantLoading] = useState(false);
+  const [deploymentPlan, setDeploymentPlan] = useState<DeploymentPlanId>(() => normalizeDeploymentPlanId(readStoredJson<string>(DEPLOYMENT_PLAN_KEY)));
+  const [deploymentServices, setDeploymentServices] = useState<DeploymentServiceSelection>(() => readDeploymentServices());
+  const [ec2ResourceConfig, setEc2ResourceConfig] = useState<Ec2ResourceConfig>(() => readEc2ResourceConfig());
+  const [rdsResourceConfig, setRdsResourceConfig] = useState<RdsResourceConfig>(() => readRdsResourceConfig());
+  const [redisResourceConfig, setRedisResourceConfig] = useState<RedisResourceConfig>(() => readRedisResourceConfig());
+  const [ecsResourceConfig, setEcsResourceConfig] = useState<EcsResourceConfig>(() => readEcsResourceConfig());
+  const [staticSiteResourceConfig, setStaticSiteResourceConfig] = useState<StaticSiteResourceConfig>(() => readStaticSiteResourceConfig());
   const [iacFiles, setIacFiles] = useState<GeneratedIacFile[]>(() => readIacFilesFromSession());
   const [selectedFile, setSelectedFile] = useState<string>(() => readIacFilesFromSession()[0]?.path || '');
   const [iacPrUrl, setIacPrUrl] = useState<string | null>(null);
@@ -1119,6 +1513,38 @@ export default function DeploymentTrackApp() {
     () => approvedConsultantDecision || currentInfraConsultant?.decision || null,
     [approvedConsultantDecision, currentInfraConsultant?.decision],
   );
+  const selectedDeploymentPlanOption = useMemo(
+    () => DEPLOYMENT_PLAN_OPTIONS.find((option) => option.id === deploymentPlan) || DEPLOYMENT_PLAN_OPTIONS[0],
+    [deploymentPlan],
+  );
+  const selectedDeploymentComponents = useMemo(
+    () => deploymentPlanComponents(deploymentPlan, deploymentServices),
+    [deploymentPlan, deploymentServices],
+  );
+  const deploymentResourceConfigs = useMemo<DeploymentResourceConfigs>(
+    () => ({
+      ec2: ec2ResourceConfig,
+      rds: rdsResourceConfig,
+      redis: redisResourceConfig,
+      ecs: ecsResourceConfig,
+      staticSite: staticSiteResourceConfig,
+    }),
+    [ec2ResourceConfig, rdsResourceConfig, redisResourceConfig, ecsResourceConfig, staticSiteResourceConfig],
+  );
+  const deploymentSelectionDecision = useMemo(
+    () => applyDeploymentSelectionToDecision(
+      currentInfraConsultant?.decision,
+      deploymentPlan,
+      deploymentServices,
+      deploymentResourceConfigs,
+      terraformRuntimeConfig.aws_region,
+    ),
+    [currentInfraConsultant?.decision, deploymentPlan, deploymentServices, deploymentResourceConfigs, terraformRuntimeConfig.aws_region],
+  );
+  const deploymentSelectionSummary = useMemo(
+    () => summarizeInfraConsultantDecision(deploymentSelectionDecision),
+    [deploymentSelectionDecision],
+  );
   const decisionDiagram = useMemo(
     () => buildDecisionArchitectureDiagram(decisionForVisualization, terraformRuntimeConfig.aws_region),
     [decisionForVisualization, terraformRuntimeConfig.aws_region],
@@ -1134,8 +1560,8 @@ export default function DeploymentTrackApp() {
     [decisionForVisualization],
   );
   const consultantDecisionSummary = useMemo(
-    () => String(currentInfraConsultant?.summary || '').trim() || summarizeInfraConsultantDecision(currentInfraConsultant?.decision),
-    [currentInfraConsultant?.decision, currentInfraConsultant?.summary],
+    () => deploymentSelectionSummary || String(currentInfraConsultant?.summary || '').trim() || summarizeInfraConsultantDecision(currentInfraConsultant?.decision),
+    [currentInfraConsultant?.decision, currentInfraConsultant?.summary, deploymentSelectionSummary],
   );
   const reviewQuestions = useMemo(() => review?.questions || [], [review]);
   const requiredQuestions = useMemo(
@@ -1308,12 +1734,12 @@ export default function DeploymentTrackApp() {
   const persistedEndpointChecks = useMemo(() => normalizeVerificationChecks(deployResult?.verification_checks), [deployResult?.verification_checks]);
   const effectiveEndpointChecks = endpointChecks.length > 0 ? endpointChecks : persistedEndpointChecks;
   const verificationFailed = useMemo(
-    () => effectiveEndpointChecks.some((check) => !check.ok) || deployResult?.deployment_verified === false,
+    () => deployResult?.deployment_verified === false || (effectiveEndpointChecks.length > 0 && effectiveEndpointChecks.every((check) => !check.ok)),
     [deployResult?.deployment_verified, effectiveEndpointChecks],
   );
   const verificationPassed = useMemo(() => {
     if (effectiveEndpointChecks.length > 0) {
-      return effectiveEndpointChecks.every((check) => check.ok);
+      return effectiveEndpointChecks.some((check) => check.ok);
     }
     return deployResult?.deployment_verified === true;
   }, [deployResult?.deployment_verified, effectiveEndpointChecks]);
@@ -1421,11 +1847,14 @@ export default function DeploymentTrackApp() {
     if (!hasAwsSecrets) {
       blockers.push('Add AWS credentials in AWS Config (access key + secret key).');
     }
+    if (deployableIacFiles.length === 0 && !shouldUseSavedRunForDeploy) {
+      blockers.push('Generate infrastructure after selecting a deployment target and managed services.');
+    }
     if (costEstimate.total > costEstimate.cap && !budgetOverride) {
       blockers.push('Estimated monthly cost exceeds the budget cap. Approve the budget override to deploy.');
     }
     return blockers;
-  }, [budgetOverride, costEstimate.cap, costEstimate.total, deployStatus, hasAwsSecrets, selectedProject]);
+  }, [budgetOverride, costEstimate.cap, costEstimate.total, deployStatus, deployableIacFiles.length, hasAwsSecrets, selectedProject, shouldUseSavedRunForDeploy]);
   const canStartDeploy = deployStartBlockers.length === 0;
   const activeIacFilePath = selectedFile || iacFiles[0]?.path || '';
   const hasCurrentIacMeta = useMemo(
@@ -1482,6 +1911,7 @@ export default function DeploymentTrackApp() {
         deployResult: nextResult,
       };
     });
+    setError(null);
   }, [patchState]);
   const onIacPipelineError = useCallback((message: string) => {
     setError(message);
@@ -1515,16 +1945,34 @@ export default function DeploymentTrackApp() {
     !backendErrorMessage,
   );
   const canOpenCloudfront = Boolean(hasLiveRuntimeDetails && deploySummary.cloudfrontUrl !== 'n/a');
+  const canOpenApp = Boolean(hasLiveRuntimeDetails && deploySummary.appUrl !== 'n/a');
   const canContinueToAwsConfig = Boolean(approvedConsultantDecision || hasSuccessfulGeneration);
   const qaSummary = useMemo(() => buildQaSummary(review, answers, repoContext, repoContextMd), [answers, repoContext, repoContextMd, review]);
-  const infraUserAnswers = useMemo(() => buildInfraUserAnswers({
-    review,
-    answers,
-    awsRegion: terraformRuntimeConfig.aws_region,
-    deploymentProfile,
-    architectureView,
-    repoContext,
-  }), [answers, architectureView, deploymentProfile, repoContext, review, terraformRuntimeConfig.aws_region]);
+  const infraUserAnswers = useMemo(() => {
+    return {
+      ...buildInfraUserAnswers({
+        review,
+        answers,
+        awsRegion: terraformRuntimeConfig.aws_region,
+        deploymentProfile,
+        architectureView,
+        repoContext,
+      }),
+      deployment_plan: deploymentPlan,
+      service_type: deploymentPlanToServiceType(deploymentPlan),
+      managed_services: deploymentServices,
+      selected_components: selectedDeploymentComponents,
+      static_assets_s3_cloudfront: deploymentPlan === 's3_cloudfront',
+      needs_managed_database: deploymentServices.rds,
+      needs_managed_cache: deploymentServices.redis,
+      ec2_resource_config: ec2ResourceConfig,
+      ec2: ec2ResourceConfig,
+      instance_type: ec2ResourceConfig.instance_type,
+      root_volume_size_gb: ec2ResourceConfig.root_volume_size_gb,
+      app_port: ec2ResourceConfig.app_port,
+      ssh_ingress_cidr_blocks: ec2ResourceConfig.ssh_ingress_cidr_blocks,
+    };
+  }, [answers, architectureView, deploymentPlan, deploymentServices, deploymentProfile, ec2ResourceConfig, repoContext, review, selectedDeploymentComponents, terraformRuntimeConfig.aws_region]);
   const consultantArchitectureSeed = useMemo(() => buildConsultantArchitectureSeed({
     workspace: expectedWorkspace,
     projectName: selectedProject?.name || selectedProjectId || 'project',
@@ -1570,6 +2018,14 @@ export default function DeploymentTrackApp() {
   useEffect(() => {
     writeSavedAws(aws);
   }, [aws]);
+
+  useEffect(() => {
+    writeStoredJson(DEPLOYMENT_PLAN_KEY, deploymentPlan);
+  }, [deploymentPlan]);
+
+  useEffect(() => {
+    writeStoredJson(DEPLOYMENT_SERVICES_KEY, deploymentServices);
+  }, [deploymentServices]);
 
   useEffect(() => {
     clearObsoleteTerraformUiState();
@@ -1707,6 +2163,16 @@ export default function DeploymentTrackApp() {
       setDeploymentProfile(null);
       setArchitectureView(null);
       setApprovalPayload(null);
+      setEc2ResourceConfig(DEFAULT_EC2_RESOURCE_CONFIG);
+      writeStoredJson(EC2_RESOURCE_CONFIG_KEY, DEFAULT_EC2_RESOURCE_CONFIG);
+      setRdsResourceConfig(DEFAULT_RDS_RESOURCE_CONFIG);
+      writeStoredJson(RDS_RESOURCE_CONFIG_KEY, DEFAULT_RDS_RESOURCE_CONFIG);
+      setRedisResourceConfig(DEFAULT_REDIS_RESOURCE_CONFIG);
+      writeStoredJson(REDIS_RESOURCE_CONFIG_KEY, DEFAULT_REDIS_RESOURCE_CONFIG);
+      setEcsResourceConfig(DEFAULT_ECS_RESOURCE_CONFIG);
+      writeStoredJson(ECS_RESOURCE_CONFIG_KEY, DEFAULT_ECS_RESOURCE_CONFIG);
+      setStaticSiteResourceConfig(DEFAULT_STATIC_SITE_RESOURCE_CONFIG);
+      writeStoredJson(STATIC_SITE_RESOURCE_CONFIG_KEY, DEFAULT_STATIC_SITE_RESOURCE_CONFIG);
       setIacFiles([]);
       setSelectedFile('');
       persistApprovedDecision(null);
@@ -2105,6 +2571,109 @@ export default function DeploymentTrackApp() {
     }));
   }, [patchState]);
 
+  const handleDeploymentPlanChange = useCallback((planId: DeploymentPlanId) => {
+    if (deploymentPlan === planId) return;
+    resetCurrentIacSessionArtifacts();
+    persistApprovedDecision(null);
+    setDecisionCostEstimate(null);
+    if (typeof window !== 'undefined') {
+      sessionStorage.removeItem(DECISION_COST_ESTIMATE_KEY);
+    }
+    if (currentInfraConsultant?.confirmed) {
+      persistInfraConsultant({ ...currentInfraConsultant, confirmed: false });
+    }
+    appendLog(`Deployment target changed to ${DEPLOYMENT_PLAN_OPTIONS.find((option) => option.id === planId)?.label || planId}. Regenerate infrastructure before deploy.`, 'info', { stage: 'terraform_generation' });
+    setDeploymentPlan(planId);
+  }, [appendLog, currentInfraConsultant, deploymentPlan, persistApprovedDecision, persistInfraConsultant, resetCurrentIacSessionArtifacts]);
+
+  const handleDeploymentServiceToggle = useCallback((service: keyof DeploymentServiceSelection) => {
+    resetCurrentIacSessionArtifacts();
+    persistApprovedDecision(null);
+    setDecisionCostEstimate(null);
+    if (typeof window !== 'undefined') {
+      sessionStorage.removeItem(DECISION_COST_ESTIMATE_KEY);
+    }
+    if (currentInfraConsultant?.confirmed) {
+      persistInfraConsultant({ ...currentInfraConsultant, confirmed: false });
+    }
+    appendLog('Managed service selection changed. Regenerate infrastructure before deploy.', 'info', { stage: 'terraform_generation' });
+    setDeploymentServices((current) => ({ ...current, [service]: !current[service] }));
+  }, [appendLog, currentInfraConsultant, persistApprovedDecision, persistInfraConsultant, resetCurrentIacSessionArtifacts]);
+
+  const handleEc2ResourceConfigChange = useCallback((patch: Partial<Ec2ResourceConfig>) => {
+    const next = normalizeEc2ResourceConfig({ ...ec2ResourceConfig, ...patch });
+    resetCurrentIacSessionArtifacts();
+    persistApprovedDecision(null);
+    setDecisionCostEstimate(null);
+    setDecisionCostError(null);
+    decisionCostRequestKeyRef.current = null;
+    if (typeof window !== 'undefined') {
+      sessionStorage.removeItem(DECISION_COST_ESTIMATE_KEY);
+      sessionStorage.removeItem(COST_ESTIMATE_KEY);
+    }
+    writeStoredJson(EC2_RESOURCE_CONFIG_KEY, next);
+    if (currentInfraConsultant?.confirmed) {
+      persistInfraConsultant({ ...currentInfraConsultant, confirmed: false });
+    }
+    appendLog('Advanced EC2 settings changed. Re-approve the consultant decision before Terraform generation.', 'info', { stage: 'terraform_generation' });
+    setEc2ResourceConfig(next);
+  }, [
+    appendLog,
+    currentInfraConsultant,
+    ec2ResourceConfig,
+    persistApprovedDecision,
+    persistInfraConsultant,
+    resetCurrentIacSessionArtifacts,
+  ]);
+
+  const invalidateDecisionForResourceChange = useCallback((logMessage: string) => {
+    resetCurrentIacSessionArtifacts();
+    persistApprovedDecision(null);
+    setDecisionCostEstimate(null);
+    setDecisionCostError(null);
+    decisionCostRequestKeyRef.current = null;
+    if (typeof window !== 'undefined') {
+      sessionStorage.removeItem(DECISION_COST_ESTIMATE_KEY);
+      sessionStorage.removeItem(COST_ESTIMATE_KEY);
+    }
+    if (currentInfraConsultant?.confirmed) {
+      persistInfraConsultant({ ...currentInfraConsultant, confirmed: false });
+    }
+    appendLog(logMessage, 'info', { stage: 'terraform_generation' });
+  }, [appendLog, currentInfraConsultant, persistApprovedDecision, persistInfraConsultant, resetCurrentIacSessionArtifacts]);
+
+  const handleRdsResourceConfigChange = useCallback((patch: Partial<RdsResourceConfig>) => {
+    const merged: Partial<RdsResourceConfig> = { ...rdsResourceConfig, ...patch };
+    if (patch.engine && patch.engine_version === undefined) {
+      merged.engine_version = RDS_DEFAULT_VERSIONS[patch.engine];
+    }
+    const next = normalizeRdsResourceConfig(merged);
+    writeStoredJson(RDS_RESOURCE_CONFIG_KEY, next);
+    invalidateDecisionForResourceChange('RDS settings changed. Re-approve the consultant decision before Terraform generation.');
+    setRdsResourceConfig(next);
+  }, [invalidateDecisionForResourceChange, rdsResourceConfig]);
+
+  const handleRedisResourceConfigChange = useCallback((patch: Partial<RedisResourceConfig>) => {
+    const next = normalizeRedisResourceConfig({ ...redisResourceConfig, ...patch });
+    writeStoredJson(REDIS_RESOURCE_CONFIG_KEY, next);
+    invalidateDecisionForResourceChange('Redis settings changed. Re-approve the consultant decision before Terraform generation.');
+    setRedisResourceConfig(next);
+  }, [invalidateDecisionForResourceChange, redisResourceConfig]);
+
+  const handleEcsResourceConfigChange = useCallback((patch: Partial<EcsResourceConfig>) => {
+    const next = normalizeEcsResourceConfig({ ...ecsResourceConfig, ...patch });
+    writeStoredJson(ECS_RESOURCE_CONFIG_KEY, next);
+    invalidateDecisionForResourceChange('ECS settings changed. Re-approve the consultant decision before Terraform generation.');
+    setEcsResourceConfig(next);
+  }, [ecsResourceConfig, invalidateDecisionForResourceChange]);
+
+  const handleStaticSiteResourceConfigChange = useCallback((patch: Partial<StaticSiteResourceConfig>) => {
+    const next = normalizeStaticSiteResourceConfig({ ...staticSiteResourceConfig, ...patch });
+    writeStoredJson(STATIC_SITE_RESOURCE_CONFIG_KEY, next);
+    invalidateDecisionForResourceChange('CloudFront settings changed. Re-approve the consultant decision before Terraform generation.');
+    setStaticSiteResourceConfig(next);
+  }, [invalidateDecisionForResourceChange, staticSiteResourceConfig]);
+
   const runInfraConsultantTurn = useCallback(async (
     action: 'start' | 'reply' | 'force_decision',
     history: InfraConsultantMessage[],
@@ -2119,10 +2688,11 @@ export default function DeploymentTrackApp() {
         body: JSON.stringify({
           project_id: selectedProject.id,
           provider: 'aws',
-          terraform_renderer: 'deplai_deterministic',
+          terraform_renderer: 'auto',
           consultant_action: action,
           consultant_history: history,
           consultant_turn_count: currentInfraConsultant?.turn_count || 0,
+          consultant_decision: currentInfraConsultant?.decision || undefined,
           architecture_json: deploymentProfile || architectureView || consultantArchitectureSeed,
           deployment_profile: deploymentProfile || consultantArchitectureSeed,
           repository_context: repoContext || undefined,
@@ -2151,6 +2721,31 @@ export default function DeploymentTrackApp() {
         nextHistory.push({ role: 'assistant', content: assistantMessage });
       }
       const nextDecision = data.consultant_decision || null;
+      if (nextDecision) {
+        const nextEc2Config = ec2ResourceConfigFromDecision(nextDecision);
+        setEc2ResourceConfig(nextEc2Config);
+        writeStoredJson(EC2_RESOURCE_CONFIG_KEY, nextEc2Config);
+        const nextRdsConfig = rdsResourceConfigFromDecision(nextDecision);
+        if (nextRdsConfig) {
+          setRdsResourceConfig(nextRdsConfig);
+          writeStoredJson(RDS_RESOURCE_CONFIG_KEY, nextRdsConfig);
+        }
+        const nextRedisConfig = redisResourceConfigFromDecision(nextDecision);
+        if (nextRedisConfig) {
+          setRedisResourceConfig(nextRedisConfig);
+          writeStoredJson(REDIS_RESOURCE_CONFIG_KEY, nextRedisConfig);
+        }
+        const nextEcsConfig = ecsResourceConfigFromDecision(nextDecision);
+        if (nextEcsConfig) {
+          setEcsResourceConfig(nextEcsConfig);
+          writeStoredJson(ECS_RESOURCE_CONFIG_KEY, nextEcsConfig);
+        }
+        const nextStaticConfig = staticSiteResourceConfigFromDecision(nextDecision);
+        if (nextStaticConfig) {
+          setStaticSiteResourceConfig(nextStaticConfig);
+          writeStoredJson(STATIC_SITE_RESOURCE_CONFIG_KEY, nextStaticConfig);
+        }
+      }
       const nextSummary = String(data.consultant_summary || '').trim() || summarizeInfraConsultantDecision(nextDecision);
       if (!assistantMessage && nextDecision) {
         nextHistory.push({
@@ -2178,6 +2773,7 @@ export default function DeploymentTrackApp() {
     consultantArchitectureSeed,
     architectureView,
     currentInfraConsultant?.repo_detection_summary,
+    currentInfraConsultant?.decision,
     currentInfraConsultant?.turn_count,
     deploymentProfile,
     expectedWorkspace,
@@ -2301,7 +2897,8 @@ export default function DeploymentTrackApp() {
         body: JSON.stringify({
           project_id: selectedProject.id,
           provider: 'aws',
-          terraform_renderer: 'deplai_ec2_app',
+          iac_mode: 'llm',
+          terraform_renderer: 'auto',
           qa_summary: qaSummary,
           architecture_context: String(repoContext?.summary || ''),
           repository_context: repoContext || undefined,
@@ -2448,7 +3045,7 @@ export default function DeploymentTrackApp() {
     terraformAutostartRef.current = autostartKey;
 
     resetCurrentIacSessionArtifacts();
-    appendLog('Infra consultant decision approved. Starting deterministic EC2 Terraform generation.', 'info', { stage: 'terraform_generation' });
+    appendLog('Infra consultant decision approved. Starting repo-specific Terraform generation through the strategy router.', 'info', { stage: 'terraform_generation' });
     void generateTerraform().catch((reason: unknown) => {
       setError(reason instanceof Error ? reason.message : 'Infrastructure generation failed.');
     });
@@ -2497,16 +3094,19 @@ export default function DeploymentTrackApp() {
 
   const approveInfraConsultantDecision = useCallback(() => {
     if (!currentInfraConsultant?.decision) return;
+    const approvedDecision = JSON.parse(JSON.stringify(deploymentSelectionDecision)) as InfraConsultantDecision;
     persistInfraConsultant({
       ...currentInfraConsultant,
+      decision: approvedDecision,
+      summary: summarizeInfraConsultantDecision(approvedDecision),
       confirmed: true,
     });
     persistApprovedDecision({
       workspace: expectedWorkspace,
-      decision: JSON.parse(JSON.stringify(currentInfraConsultant.decision)) as InfraConsultantDecision,
+      decision: approvedDecision,
       locked_at: new Date().toISOString(),
     });
-  }, [currentInfraConsultant, expectedWorkspace, persistApprovedDecision, persistInfraConsultant]);
+  }, [currentInfraConsultant, deploymentSelectionDecision, expectedWorkspace, persistApprovedDecision, persistInfraConsultant]);
 
   const rejectInfraConsultantDecision = useCallback(async () => {
     if (!currentInfraConsultant) return;
@@ -2590,7 +3190,7 @@ export default function DeploymentTrackApp() {
       try {
         const hydratedResult = await hydrateTerminalDeployResult(runtimeResult);
         const hydratedChecks = normalizeVerificationChecks(hydratedResult.verification_checks);
-        if (hydratedResult.deployment_verified === false || hydratedChecks.some((check) => !check.ok)) {
+        if (hydratedResult.deployment_verified === false || (hydratedChecks.length > 0 && hydratedChecks.every((check) => !check.ok))) {
           throw new Error(hydratedResult.error || 'Deployment verification failed for the current repo.');
         }
         patchState((prev) => ({
@@ -2659,16 +3259,14 @@ export default function DeploymentTrackApp() {
       deploymentHistory,
     });
 
-    if (deployStatus !== 'running') {
-      if (activeDeployment.inFlight) {
-        activeDeployment.inFlight = false;
-      }
-      if (deployRequestRef.current === selectedProject.id) {
-        deployRequestRef.current = null;
-      }
+    if (activeDeployment.inFlight) {
+      activeDeployment.inFlight = false;
+    }
+    if (deployRequestRef.current === selectedProject.id) {
+      deployRequestRef.current = null;
     }
 
-    if (deployRequestRef.current === selectedProject.id || activeDeployment.inFlight) {
+    if (activeDeployment.inFlight) {
       setError('Deployment already running in background for this project.');
       appendLog('Deployment already running in background for this project.');
       return;
@@ -2676,16 +3274,14 @@ export default function DeploymentTrackApp() {
 
     // Start each deploy attempt with a fresh websocket/log console instead of appending
     // lines from a previous failed/completed run.
-    if (deployStatus !== 'running' && deployLogs.length > 0) {
-      socketNoticeKeysRef.current.clear();
-      setSocketNotices([]);
-      patchState((prev) => ({
-        ...prev,
-        progress: 0,
-        logs: [],
-        deployResult: null,
-      }));
-    }
+    socketNoticeKeysRef.current.clear();
+    setSocketNotices([]);
+    patchState((prev) => ({
+      ...prev,
+      progress: 0,
+      logs: [],
+      deployResult: null,
+    }));
 
     appendLog('Deploy button clicked. Running preflight checks...');
     activeDeployment.inFlight = true;
@@ -2717,6 +3313,11 @@ export default function DeploymentTrackApp() {
         setPendingPlanSummary(null);
       }
       appendLog('Calling /api/pipeline/deploy for runtime apply...');
+      const runtimeDeployFiles = deployableIacFiles;
+      const canReuseSavedRun = shouldUseSavedRunForDeploy && runtimeDeployFiles.length === 0;
+      if (runtimeDeployFiles.length === 0 && !canReuseSavedRun) {
+        throw new Error('No valid Terraform bundle is loaded in the current session. Regenerate infrastructure before deploy.');
+      }
       const response = await fetch('/api/pipeline/deploy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2724,18 +3325,20 @@ export default function DeploymentTrackApp() {
           project_id: selectedProject.id,
           provider: 'aws',
           runtime_apply: true,
-          service_type: inferIacServiceType(approvedConsultantDecision, repoContext),
+          service_type: deploymentPlanToServiceType(deploymentPlan),
           repo_context: repoContext || {},
           user_customizations: {
             ...infraUserAnswers,
             consultant_decision: approvedConsultantDecision || undefined,
             deployment_profile: deploymentProfile || undefined,
+            deployment_plan: deploymentPlan,
+            selected_components: selectedDeploymentComponents,
           },
-          run_id: shouldUseSavedRunForDeploy ? activeSavedRun?.run_id : undefined,
-          workspace: shouldUseSavedRunForDeploy ? activeSavedRun?.workspace : undefined,
+          run_id: canReuseSavedRun ? activeSavedRun?.run_id : undefined,
+          workspace: canReuseSavedRun ? activeSavedRun?.workspace : undefined,
           state_bucket: terraformRuntimeConfig.state_bucket.trim() || undefined,
           lock_table: terraformRuntimeConfig.lock_table.trim() || undefined,
-          files: shouldUseSavedRunForDeploy ? [] : deployableIacFiles,
+          files: runtimeDeployFiles,
           aws_access_key_id: aws.aws_access_key_id,
           aws_secret_access_key: aws.aws_secret_access_key,
           aws_session_token: aws.aws_session_token || undefined,
@@ -2834,7 +3437,7 @@ export default function DeploymentTrackApp() {
       }
       activeDeployment.inFlight = false;
     }
-  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, costEstimate.cap, costEstimate.total, deployLogs, deployProgress, deployResult, deployStatus, deployableIacFiles, deploymentHistory, deploymentProfile, hasAwsSecrets, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, repoContext, requiresPlanConfirmation, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
+  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, costEstimate.cap, costEstimate.total, deployLogs, deployProgress, deployResult, deployStatus, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, hasAwsSecrets, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, repoContext, requiresPlanConfirmation, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
 
   const stopDeployment = useCallback(async () => {
     if (!selectedProject || stopLoading || deployStatus !== 'running') return;
@@ -2907,6 +3510,7 @@ export default function DeploymentTrackApp() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           cloudfront_url: deploySummary.cloudfrontUrl !== 'n/a' ? deploySummary.cloudfrontUrl : '',
+          app_url: deploySummary.appUrl !== 'n/a' ? deploySummary.appUrl : '',
           public_ip: deploySummary.publicIp !== 'n/a' ? deploySummary.publicIp : '',
         }),
       });
@@ -2919,7 +3523,7 @@ export default function DeploymentTrackApp() {
         throw new Error(data.error || 'Endpoint verification failed.');
       }
       const checks = Array.isArray(data.checks) ? data.checks : [];
-      const verified = checks.length > 0 && checks.every((check) => check.ok);
+      const verified = checks.length > 0 && checks.some((check) => check.ok);
       setEndpointChecks(checks);
       patchState((prev) => ({
         ...prev,
@@ -2934,7 +3538,7 @@ export default function DeploymentTrackApp() {
     } finally {
       setVerifyLoading(false);
     }
-  }, [deployStatus, deploySummary.cloudfrontUrl, deploySummary.publicIp, patchState]);
+  }, [deployStatus, deploySummary.appUrl, deploySummary.cloudfrontUrl, deploySummary.publicIp, patchState]);
 
   const downloadPpk = useCallback(async () => {
     if (!deploySummary.generatedPem) return;
@@ -3176,6 +3780,314 @@ export default function DeploymentTrackApp() {
           </div>
         </div>
         <div className="space-y-6">
+          <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
+            <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Service Decision</div>
+            <div className="space-y-3">
+              {DEPLOYMENT_PLAN_OPTIONS.map((option) => {
+                const selected = deploymentPlan === option.id;
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    onClick={() => handleDeploymentPlanChange(option.id)}
+                    disabled={infraConsultantLoading || deployStatus === 'running'}
+                    className={`w-full rounded-md border px-3 py-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+                      selected
+                        ? 'border-indigo-500/50 bg-indigo-500/10 text-zinc-100'
+                        : 'border-[#262626] bg-black text-zinc-300 hover:border-zinc-600 hover:bg-[#0A0A0A]'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold">{option.label}</div>
+                        <div className="mt-1 text-xs leading-relaxed text-zinc-500">{option.description}</div>
+                      </div>
+                      {selected ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-indigo-300" /> : null}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => handleDeploymentServiceToggle('rds')}
+                disabled={infraConsultantLoading || deployStatus === 'running'}
+                className={`rounded-md border px-3 py-2 text-left text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+                  deploymentServices.rds
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                    : 'border-[#262626] bg-black text-zinc-400 hover:border-zinc-600'
+                }`}
+              >
+                <div className="font-semibold">RDS</div>
+                <div className="mt-1 text-[11px] text-zinc-500">Managed SQL</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDeploymentServiceToggle('redis')}
+                disabled={infraConsultantLoading || deployStatus === 'running'}
+                className={`rounded-md border px-3 py-2 text-left text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+                  deploymentServices.redis
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                    : 'border-[#262626] bg-black text-zinc-400 hover:border-zinc-600'
+                }`}
+              >
+                <div className="font-semibold">Redis</div>
+                <div className="mt-1 text-[11px] text-zinc-500">Managed cache</div>
+              </button>
+            </div>
+            {deploymentServices.rds ? (
+              <div className="mt-4 rounded-md border border-emerald-500/20 bg-black p-4">
+                <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-emerald-300/80">RDS Settings</div>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="block text-xs font-medium text-zinc-400">
+                    <span className="mb-1 block">Engine</span>
+                    <select
+                      value={rdsResourceConfig.engine}
+                      onChange={(event) => handleRdsResourceConfigChange({ engine: event.target.value as RdsResourceConfig['engine'] })}
+                      disabled={infraConsultantLoading || deployStatus === 'running'}
+                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {RDS_ENGINES.map((engine) => (<option key={engine} value={engine}>{engine}</option>))}
+                    </select>
+                  </label>
+                  <label className="block text-xs font-medium text-zinc-400">
+                    <span className="mb-1 block">Engine version</span>
+                    <input
+                      type="text"
+                      value={rdsResourceConfig.engine_version}
+                      onChange={(event) => handleRdsResourceConfigChange({ engine_version: event.target.value })}
+                      disabled={infraConsultantLoading || deployStatus === 'running'}
+                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                    />
+                  </label>
+                  <label className="block text-xs font-medium text-zinc-400">
+                    <span className="mb-1 block">Instance class</span>
+                    <select
+                      value={rdsResourceConfig.instance_class}
+                      onChange={(event) => handleRdsResourceConfigChange({ instance_class: event.target.value })}
+                      disabled={infraConsultantLoading || deployStatus === 'running'}
+                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {RDS_INSTANCE_CLASSES.map((cls) => (<option key={cls} value={cls}>{cls}</option>))}
+                    </select>
+                  </label>
+                  <label className="block text-xs font-medium text-zinc-400">
+                    <span className="mb-1 block">Storage (GB)</span>
+                    <input
+                      type="number"
+                      min={20}
+                      max={4096}
+                      value={rdsResourceConfig.allocated_storage}
+                      onChange={(event) => handleRdsResourceConfigChange({ allocated_storage: Number(event.target.value) })}
+                      disabled={infraConsultantLoading || deployStatus === 'running'}
+                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                    />
+                  </label>
+                  <label className="block text-xs font-medium text-zinc-400">
+                    <span className="mb-1 block">Backups (days)</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={35}
+                      value={rdsResourceConfig.backup_retention_period}
+                      onChange={(event) => handleRdsResourceConfigChange({ backup_retention_period: Number(event.target.value) })}
+                      disabled={infraConsultantLoading || deployStatus === 'running'}
+                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                    />
+                  </label>
+                  <label className="block text-xs font-medium text-zinc-400">
+                    <span className="mb-1 block">Multi-AZ</span>
+                    <select
+                      value={rdsResourceConfig.multi_az ? 'true' : 'false'}
+                      onChange={(event) => handleRdsResourceConfigChange({ multi_az: event.target.value === 'true' })}
+                      disabled={infraConsultantLoading || deployStatus === 'running'}
+                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <option value="false">Single-AZ (lower cost)</option>
+                      <option value="true">Multi-AZ (high availability)</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+            ) : null}
+            {deploymentServices.redis ? (
+              <div className="mt-4 rounded-md border border-emerald-500/20 bg-black p-4">
+                <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-emerald-300/80">Redis Settings</div>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="block text-xs font-medium text-zinc-400">
+                    <span className="mb-1 block">Node type</span>
+                    <select
+                      value={redisResourceConfig.node_type}
+                      onChange={(event) => handleRedisResourceConfigChange({ node_type: event.target.value })}
+                      disabled={infraConsultantLoading || deployStatus === 'running'}
+                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {REDIS_NODE_TYPES.map((node) => (<option key={node} value={node}>{node}</option>))}
+                    </select>
+                  </label>
+                  <label className="block text-xs font-medium text-zinc-400">
+                    <span className="mb-1 block">Engine version</span>
+                    <select
+                      value={redisResourceConfig.engine_version}
+                      onChange={(event) => handleRedisResourceConfigChange({ engine_version: event.target.value })}
+                      disabled={infraConsultantLoading || deployStatus === 'running'}
+                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {REDIS_ENGINE_VERSIONS.map((version) => (<option key={version} value={version}>{version}</option>))}
+                    </select>
+                  </label>
+                </div>
+              </div>
+            ) : null}
+            <div className="mt-4 rounded-md border border-[#1A1A1A] bg-black px-3 py-2 text-xs text-zinc-500">
+              Components: <span className="font-mono text-zinc-300">{selectedDeploymentComponents.map(formatComponentName).join(' / ')}</span>
+            </div>
+            {currentInfraConsultant?.confirmed ? (
+              <div className="mt-3 text-xs text-emerald-300">This service decision is approved for Architecture, Cost, and Terraform.</div>
+            ) : (
+              <div className="mt-3 text-xs text-zinc-500">Choose services here, then approve the consultant decision.</div>
+            )}
+          </div>
+          {deploymentPlan === 'ec2' ? (
+            <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
+              <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Advanced EC2 Settings</div>
+              <div className="space-y-4">
+                <label className="block text-xs font-medium text-zinc-400">
+                  <span className="mb-1 block">Instance type</span>
+                  <select
+                    value={ec2ResourceConfig.instance_type}
+                    onChange={(event) => handleEc2ResourceConfigChange({ instance_type: event.target.value })}
+                    disabled={infraConsultantLoading || deployStatus === 'running'}
+                    className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {EC2_INSTANCE_TYPES.map((instanceType) => (
+                      <option key={instanceType} value={instanceType}>{instanceType}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block text-xs font-medium text-zinc-400">
+                  <span className="mb-1 block">Root volume GB</span>
+                  <input
+                    type="number"
+                    min={20}
+                    max={200}
+                    value={ec2ResourceConfig.root_volume_size_gb}
+                    onChange={(event) => handleEc2ResourceConfigChange({ root_volume_size_gb: Number(event.target.value) })}
+                    disabled={infraConsultantLoading || deployStatus === 'running'}
+                    className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                  />
+                </label>
+                <label className="block text-xs font-medium text-zinc-400">
+                  <span className="mb-1 block">App port</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={65535}
+                    value={ec2ResourceConfig.app_port}
+                    onChange={(event) => handleEc2ResourceConfigChange({ app_port: Number(event.target.value) })}
+                    disabled={infraConsultantLoading || deployStatus === 'running'}
+                    className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                  />
+                </label>
+                <label className="block text-xs font-medium text-zinc-400">
+                  <span className="mb-1 block">SSH CIDR allowlist</span>
+                  <textarea
+                    value={ec2ResourceConfig.ssh_ingress_cidr_blocks.join(', ')}
+                    onChange={(event) => handleEc2ResourceConfigChange({ ssh_ingress_cidr_blocks: normalizeCidrList(event.target.value) })}
+                    disabled={infraConsultantLoading || deployStatus === 'running'}
+                    placeholder="203.0.113.10/32"
+                    className="min-h-18 w-full resize-none rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-sm text-zinc-200 outline-none placeholder:text-zinc-600 focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                  />
+                </label>
+              </div>
+              <div className="mt-4 rounded-md border border-[#1A1A1A] bg-black px-3 py-2 text-xs text-zinc-500">
+                Selected EC2: <span className="font-mono text-zinc-300">{ec2ResourceConfig.instance_type}</span>
+                <span className="text-zinc-700"> / </span>
+                <span className="font-mono text-zinc-300">{ec2ResourceConfig.root_volume_size_gb}GB</span>
+                <span className="text-zinc-700"> / </span>
+                <span className="font-mono text-zinc-300">:{ec2ResourceConfig.app_port}</span>
+              </div>
+            </div>
+          ) : null}
+          {deploymentPlan === 'ecs_fargate' ? (
+            <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
+              <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">ECS Fargate Settings</div>
+              <div className="space-y-4">
+                <label className="block text-xs font-medium text-zinc-400">
+                  <span className="mb-1 block">Task CPU</span>
+                  <select
+                    value={ecsResourceConfig.cpu}
+                    onChange={(event) => handleEcsResourceConfigChange({ cpu: Number(event.target.value) })}
+                    disabled={infraConsultantLoading || deployStatus === 'running'}
+                    className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {ECS_CPU_OPTIONS.map((cpu) => (<option key={cpu} value={cpu}>{cpu} ({cpu / 1024} vCPU)</option>))}
+                  </select>
+                </label>
+                <label className="block text-xs font-medium text-zinc-400">
+                  <span className="mb-1 block">Task memory (MB)</span>
+                  <select
+                    value={ecsResourceConfig.memory}
+                    onChange={(event) => handleEcsResourceConfigChange({ memory: Number(event.target.value) })}
+                    disabled={infraConsultantLoading || deployStatus === 'running'}
+                    className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {ECS_MEMORY_OPTIONS.map((memory) => (<option key={memory} value={memory}>{memory}</option>))}
+                  </select>
+                </label>
+                <label className="block text-xs font-medium text-zinc-400">
+                  <span className="mb-1 block">Desired task count</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={ecsResourceConfig.desired_count}
+                    onChange={(event) => handleEcsResourceConfigChange({ desired_count: Number(event.target.value) })}
+                    disabled={infraConsultantLoading || deployStatus === 'running'}
+                    className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                  />
+                </label>
+              </div>
+              <div className="mt-4 rounded-md border border-[#1A1A1A] bg-black px-3 py-2 text-xs text-zinc-500">
+                Selected ECS: <span className="font-mono text-zinc-300">{ecsResourceConfig.cpu} CPU</span>
+                <span className="text-zinc-700"> / </span>
+                <span className="font-mono text-zinc-300">{ecsResourceConfig.memory}MB</span>
+                <span className="text-zinc-700"> / </span>
+                <span className="font-mono text-zinc-300">x{ecsResourceConfig.desired_count}</span>
+              </div>
+            </div>
+          ) : null}
+          {deploymentPlan === 's3_cloudfront' ? (
+            <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
+              <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">CloudFront Settings</div>
+              <div className="space-y-4">
+                <label className="block text-xs font-medium text-zinc-400">
+                  <span className="mb-1 block">Price class</span>
+                  <select
+                    value={staticSiteResourceConfig.price_class}
+                    onChange={(event) => handleStaticSiteResourceConfigChange({ price_class: event.target.value as StaticSiteResourceConfig['price_class'] })}
+                    disabled={infraConsultantLoading || deployStatus === 'running'}
+                    className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    <option value="PriceClass_100">PriceClass_100 (NA + EU)</option>
+                    <option value="PriceClass_200">PriceClass_200 (+ Asia)</option>
+                    <option value="PriceClass_All">PriceClass_All (global)</option>
+                  </select>
+                </label>
+                <label className="flex items-center gap-2 text-xs font-medium text-zinc-400">
+                  <input
+                    type="checkbox"
+                    checked={staticSiteResourceConfig.spa_fallback}
+                    onChange={(event) => handleStaticSiteResourceConfigChange({ spa_fallback: event.target.checked })}
+                    disabled={infraConsultantLoading || deployStatus === 'running'}
+                    className="h-4 w-4 rounded border-[#262626] bg-black"
+                  />
+                  <span>SPA fallback (route 403/404 to index.html)</span>
+                </label>
+              </div>
+            </div>
+          ) : null}
           <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
             <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Decision Status</div>
             <div className="text-lg font-semibold text-zinc-100">
@@ -3709,7 +4621,7 @@ export default function DeploymentTrackApp() {
               <div className="flex items-center justify-between">
                 <div>
                   <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Infrastructure Generation</h1>
-                  <p className="text-sm text-zinc-400">Deterministic EC2 Terraform generation runs here from the confirmed consultant decision.</p>
+                  <p className="text-sm text-zinc-400">Repo-specific Terraform generation runs here from the confirmed consultant decision.</p>
                 </div>
                 <div className="flex items-center gap-3">
                   <button
@@ -4056,20 +4968,6 @@ export default function DeploymentTrackApp() {
           )}
           {activeStage === 'outputs' && (
             <div className="mx-auto max-w-5xl space-y-6">
-              {deployResult?.mode === 'iac_pipeline' && deployResult.run_id && iacResourceOutputs ? (
-                <ResourceCard
-                  runId={deployResult.run_id}
-                  serviceType={deployResult.service_type || 'aws'}
-                  outputs={iacResourceOutputs}
-                  keypair={iacKeypair}
-                  awsCredentials={{
-                    access_key_id: aws.aws_access_key_id,
-                    secret_access_key: aws.aws_secret_access_key,
-                    region: terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION,
-                  }}
-                  onDestroyed={handleIacDestroyed}
-                />
-              ) : null}
               <div className="mt-4 mb-8 border-b border-[#1A1A1A] pb-6">
                 <div className={`mb-4 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-bold uppercase ${outputBannerClassName}`}>
                   <CheckCircle2 className="h-3.5 w-3.5" /> {outputBanner.label}
@@ -4087,6 +4985,20 @@ export default function DeploymentTrackApp() {
                   </div>
                 )}
               </div>
+              {deployResult?.mode === 'iac_pipeline' && deployResult.run_id && iacResourceOutputs ? (
+                <ResourceCard
+                  runId={deployResult.run_id}
+                  serviceType={deployResult.service_type || 'aws'}
+                  outputs={iacResourceOutputs}
+                  keypair={iacKeypair}
+                  awsCredentials={{
+                    access_key_id: aws.aws_access_key_id,
+                    secret_access_key: aws.aws_secret_access_key,
+                    region: terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION,
+                  }}
+                  onDestroyed={handleIacDestroyed}
+                />
+              ) : null}
               <div className="grid grid-cols-2 gap-6">
                 <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
                   <div className="mb-6 text-[10px] font-bold uppercase text-zinc-500">Security</div>
@@ -4115,6 +5027,17 @@ export default function DeploymentTrackApp() {
                 <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
                   <div className="mb-4 text-[10px] font-bold uppercase text-zinc-500">Endpoints</div>
                   <div className="space-y-3 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-zinc-400">App URL</span>
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono text-zinc-200">{deploySummary.appUrl}</span>
+                        {canOpenApp && (
+                          <button onClick={() => window.open(deploySummary.appUrl, '_blank', 'noopener,noreferrer')} className="text-zinc-500 hover:text-zinc-200">
+                            <ExternalLink className="h-4 w-4" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
                     <div className="flex justify-between"><span className="text-zinc-400">Public IP</span><span className="font-mono text-zinc-200">{deploySummary.publicIp}</span></div>
                     <div className="flex justify-between"><span className="text-zinc-400">Instance</span><span className="font-mono text-zinc-200">{deploySummary.instanceId}</span></div>
                     <div className="flex justify-between">

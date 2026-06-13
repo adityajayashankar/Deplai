@@ -38,9 +38,14 @@ type GitHubRepoPathRow = {
 
 type BackendPreviewStatus = {
   kind?: 'live_server' | 'static_file';
-  status?: 'ready' | 'unavailable' | 'failed' | 'stopped';
+  status?: 'ready' | 'unavailable' | 'failed' | 'stopped' | 'starting';
   url?: string;
   detail?: string;
+};
+
+type PreviewContext = {
+  normalizedProjectId: string;
+  requestedTenantId: string;
 };
 
 class ProxyResolutionError extends Error {
@@ -96,6 +101,97 @@ function detectPreviewEntry(repoPath: string): string | null {
     }
   }
   return null;
+}
+
+function buildPreviewRouteBase(context: PreviewContext, directoryPrefix = ''): string {
+  const tenantPathPrefix = context.requestedTenantId
+    ? `_tenant/${encodeURIComponent(context.requestedTenantId)}/`
+    : '';
+  const normalizedDirectoryPrefix = directoryPrefix.replace(/^\/+|\/+$/g, '');
+  return `/api/customization/preview/${encodeURIComponent(context.normalizedProjectId)}/${tenantPathPrefix}${normalizedDirectoryPrefix ? `${normalizedDirectoryPrefix}/` : ''}`;
+}
+
+function rewritePreviewHtmlBase(html: string, baseHref: string): string {
+  if (/<base\s+/i.test(html)) {
+    return html.replace(/<base\s+href=["'][^"']*["']\s*\/?\s*>/i, `<base href="${baseHref}">`);
+  }
+  return html.replace(/<head([^>]*)>/i, `<head$1><base href="${baseHref}">`);
+}
+
+function rewriteLivePreviewHtml(html: string, context: PreviewContext, servedRelativePath: string): string {
+  const relativeDirectory = path.posix.dirname(servedRelativePath.replace(/\\/g, '/'));
+  const directoryPrefix = relativeDirectory === '.' ? '' : relativeDirectory;
+  const baseHref = buildPreviewRouteBase(context, directoryPrefix);
+  const rootPreviewHref = buildPreviewRouteBase(context);
+
+  return rewritePreviewHtmlBase(html, baseHref)
+    .replace(/(["'])\/(_next\/)/g, `$1${rootPreviewHref}$2`)
+    .replace(/(["'])\/(@vite\/)/g, `$1${rootPreviewHref}$2`)
+    .replace(/(["'])\/(src\/)/g, `$1${rootPreviewHref}$2`)
+    .replace(/url\(\s*\/([^)'"]+)/g, `url(${rootPreviewHref}$1`);
+}
+
+async function proxyLivePreviewRequest(
+  request: NextRequest,
+  backendPreviewStatus: BackendPreviewStatus,
+  relativeFilePath: string,
+  context: PreviewContext,
+) {
+  if (!backendPreviewStatus.url) {
+    return NextResponse.json({ error: 'Live preview URL is missing.' }, { status: 502 });
+  }
+
+  const liveBaseUrl = backendPreviewStatus.url.replace(/\/+$/, '');
+  const liveUrl = new URL(`${liveBaseUrl}/${relativeFilePath.replace(/^\/+/, '')}`);
+  request.nextUrl.searchParams.forEach((value, key) => {
+    if (!['meta', 'v', 'tenant_id', 'tenantId', 'project_id', 'projectId'].includes(key)) {
+      liveUrl.searchParams.append(key, value);
+    }
+  });
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(liveUrl, {
+      method: 'GET',
+      cache: 'no-store',
+      redirect: 'manual',
+      headers: {
+        accept: request.headers.get('accept') || '*/*',
+        'user-agent': request.headers.get('user-agent') || 'DeplAI Preview Proxy',
+      },
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'Unknown proxy error.';
+    return NextResponse.json({ error: `Live preview proxy failed: ${detail}` }, { status: 502 });
+  }
+
+  if (upstream.status >= 300 && upstream.status < 400) {
+    const location = upstream.headers.get('location');
+    if (location) {
+      const redirected = new URL(location, liveBaseUrl);
+      const proxiedPath = redirected.pathname.replace(/^\/+/, '');
+      return NextResponse.redirect(`${buildPreviewRouteBase(context)}${proxiedPath}${redirected.search}`, upstream.status);
+    }
+  }
+
+  const responseHeaders = new Headers();
+  const upstreamContentType = upstream.headers.get('content-type') || '';
+  if (upstreamContentType) responseHeaders.set('content-type', upstreamContentType);
+  responseHeaders.set('cache-control', 'no-store, max-age=0');
+
+  const upstreamBody = await upstream.arrayBuffer();
+  if (upstreamContentType.startsWith('text/html')) {
+    const html = Buffer.from(upstreamBody).toString('utf-8');
+    return new NextResponse(
+      Buffer.from(rewriteLivePreviewHtml(html, context, relativeFilePath || 'index.html'), 'utf-8'),
+      { status: upstream.status, headers: responseHeaders },
+    );
+  }
+
+  return new NextResponse(upstreamBody, {
+    status: upstream.status,
+    headers: responseHeaders,
+  });
 }
 
 async function getBackendPreviewStatus(tenantId: string, baseRepoPath: string): Promise<BackendPreviewStatus | null> {
@@ -181,7 +277,11 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
     : null;
 
   if (metaOnly) {
-    const liveReady = backendPreviewStatus?.kind === 'live_server' && backendPreviewStatus.status === 'ready' && backendPreviewStatus.url;
+    const livePreviewKnown = backendPreviewStatus?.kind === 'live_server';
+    const liveReady = livePreviewKnown && backendPreviewStatus.status === 'ready' && backendPreviewStatus.url;
+    // "starting" means the dev server is installing deps / compiling — surface it
+    // as progress, not an error, so the UI can poll instead of showing a failure.
+    const liveStarting = livePreviewKnown && backendPreviewStatus.status === 'starting';
     return NextResponse.json({
       project_id: normalizedProjectId,
       requested_tenant_id: requestedTenantId || null,
@@ -191,10 +291,11 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
       tenant_repo_exists: tenantRepoExists,
       preview_root_path: previewRootPath,
       preview_entry: detectPreviewEntry(previewRootPath),
-      preview_kind: liveReady ? 'live_server' : 'static_file',
+      preview_kind: livePreviewKnown ? 'live_server' : 'static_file',
       preview_url: liveReady ? backendPreviewStatus?.url : null,
-      preview_status: liveReady ? 'ready' : (backendPreviewStatus?.status || 'unavailable'),
-      preview_error: liveReady ? null : (backendPreviewStatus?.detail || null),
+      preview_status: livePreviewKnown ? (backendPreviewStatus?.status || 'unavailable') : (backendPreviewStatus?.status || 'unavailable'),
+      preview_error: (liveReady || liveStarting) ? null : (backendPreviewStatus?.detail || null),
+      preview_detail: backendPreviewStatus?.detail || null,
     }, { status: 200 });
   }
 
@@ -208,19 +309,41 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
       && backendPreviewStatus.status === 'ready'
       && backendPreviewStatus.url
     ) {
-      return NextResponse.redirect(backendPreviewStatus.url, 307);
+      relativeFilePath = '';
+    } else {
+      const entry = detectPreviewEntry(previewRootPath);
+      if (!entry) {
+        return NextResponse.json({
+          error: 'No preview entry file found. Expected index.html (or similar) in the selected repository.',
+        }, { status: 404 });
+      }
+      relativeFilePath = entry;
     }
-    const entry = detectPreviewEntry(previewRootPath);
-    if (!entry) {
-      return NextResponse.json({
-        error: 'No preview entry file found. Expected index.html (or similar) in the selected repository.',
-      }, { status: 404 });
-    }
-    relativeFilePath = entry;
   }
 
   if (relativeFilePath.includes('..') || relativeFilePath.includes('\0')) {
     return NextResponse.json({ error: 'Invalid preview file path.' }, { status: 400 });
+  }
+
+  if (
+    backendPreviewStatus?.kind === 'live_server'
+    && backendPreviewStatus.status === 'ready'
+    && backendPreviewStatus.url
+  ) {
+    return proxyLivePreviewRequest(
+      request,
+      backendPreviewStatus,
+      relativeFilePath,
+      { normalizedProjectId, requestedTenantId },
+    );
+  }
+
+  if (backendPreviewStatus?.kind === 'live_server' && backendPreviewStatus.status !== 'ready') {
+    return NextResponse.json({
+      error: 'Live preview is not ready.',
+      detail: backendPreviewStatus.detail || 'Preview process is unavailable or failed healthcheck.',
+      status: backendPreviewStatus.status || 'unavailable',
+    }, { status: 503 });
   }
 
   const absoluteFilePath = path.resolve(previewRootPath, relativeFilePath);
@@ -253,18 +376,10 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
   const contentType = responseHeaders.get('content-type') || '';
   if (contentType.startsWith('text/html')) {
     const relativeDirectory = path.posix.dirname(servedRelativePath.replace(/\\/g, '/'));
-    const directoryPrefix = relativeDirectory === '.' ? '' : `${relativeDirectory.replace(/^\/+|\/+$/g, '')}/`;
-    const tenantPathPrefix = requestedTenantId
-      ? `_tenant/${encodeURIComponent(requestedTenantId)}/`
-      : '';
-    const baseHref = `/api/customization/preview/${encodeURIComponent(normalizedProjectId)}/${tenantPathPrefix}${directoryPrefix}`;
+    const directoryPrefix = relativeDirectory === '.' ? '' : relativeDirectory;
+    const baseHref = buildPreviewRouteBase({ normalizedProjectId, requestedTenantId }, directoryPrefix);
     let html = responseBody.toString('utf-8');
-
-    if (/<base\s+/i.test(html)) {
-      html = html.replace(/<base\s+href=["'][^"']*["']\s*\/?\s*>/i, `<base href="${baseHref}">`);
-    } else {
-      html = html.replace(/<head([^>]*)>/i, `<head$1><base href="${baseHref}">`);
-    }
+    html = rewritePreviewHtmlBase(html, baseHref);
 
     responseBody = Buffer.from(html, 'utf-8');
   }

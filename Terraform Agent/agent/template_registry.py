@@ -24,6 +24,7 @@ PARAM_SCHEMA: dict[str, list[dict]] = {
         {"name": "root_volume_size_gb", "type": "number", "default": 20},
         {"name": "environment", "type": "string", "default": "production"},
         {"name": "project_id", "type": "string", "required": True},
+        {"name": "user_data", "type": "string", "default": ""},
     ],
     "s3": [
         {"name": "bucket_name", "type": "string", "required": True},

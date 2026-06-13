@@ -178,6 +178,7 @@ class TerraformGenRequest(BaseModel):
     terraform_renderer: Optional[str] = None
     source_root: Optional[str] = None
     source_root_candidates: Optional[list[str]] = None
+    repository_url: Optional[str] = None
 
 
 class TerraformConsultRequest(BaseModel):

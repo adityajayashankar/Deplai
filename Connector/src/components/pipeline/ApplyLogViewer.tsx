@@ -53,16 +53,30 @@ export function ApplyLogViewer({ runId, onComplete, onError }: ApplyLogViewerPro
     let ws: WebSocket | null = null;
     let pollInterval: ReturnType<typeof setInterval> | null = null;
 
+    let consecutiveErrors = 0;
+
     function startPolling() {
       pollInterval = setInterval(async () => {
         try {
           const res = await fetch(`/api/pipeline/iac-status/${runId}`);
+          if (!res.ok) {
+            consecutiveErrors++;
+            if (consecutiveErrors >= 5) {
+              clearInterval(pollInterval!);
+              onError(`Backend status check failed repeatedly (${res.status}).`);
+            }
+            return;
+          }
+
+          consecutiveErrors = 0;
           const data = await res.json();
 
           if (data.logs) {
             setLogs(data.logs);
           }
-          setStatus(data.status as RunStatus);
+          if (data.status) {
+            setStatus(data.status as RunStatus);
+          }
 
           if (data.status === 'completed') {
             clearInterval(pollInterval!);
@@ -73,7 +87,11 @@ export function ApplyLogViewer({ runId, onComplete, onError }: ApplyLogViewerPro
             onError(data.error ?? 'Unknown error');
           }
         } catch {
-          // silently retry
+          consecutiveErrors++;
+          if (consecutiveErrors >= 5) {
+            clearInterval(pollInterval!);
+            onError('Network error checking status repeatedly.');
+          }
         }
       }, 3000);
     }

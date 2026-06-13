@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 from typing import Any
 
 
 QUALITY_TIMEOUT_SECONDS = 180
+RUN_BUILD_GATES = os.getenv("CUSTOMIZATION_RUN_BUILD_QUALITY_GATES", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 APP_ROOTS = ("frontend", "admin-frontend", "expert", "corporates")
 IGNORED_PARTS = {"node_modules", ".git", ".next", "dist", "build", "coverage", "__pycache__"}
 
@@ -147,9 +155,14 @@ def _package_has_script(package_json: Path, script_name: str) -> bool:
 
 
 def _build_checks(repo_path: Path, app_targets: list[str]) -> list[dict[str, str]]:
+    if not RUN_BUILD_GATES:
+        return [_check("build", "warning", "Framework build/lint gate skipped by default for fast customization preview.")]
+
     roots = _package_roots(repo_path, app_targets)
     if not roots:
         return [_check("build", "warning", "No package.json found; skipped framework build gate.")]
+    if shutil.which("npm") is None and shutil.which("npm.cmd") is None:
+        return [_check("build", "warning", "npm was not found on PATH; skipped framework build/lint gate.")]
 
     checks: list[dict[str, str]] = []
     for root in roots:

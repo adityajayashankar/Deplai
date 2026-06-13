@@ -5,9 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .bundle import build_fallback_bundle, build_manifest_bundle, decide_component_strategy
-from .cloudposse_atmos import normalize_terraform_renderer, should_use_cloudposse_renderer
 from .deployment_profile import (
-    build_cloudposse_profile_bundle,
     build_profile_bundle,
     build_profile_manifest,
     is_deployment_profile_payload,
@@ -56,22 +54,11 @@ def _project_name(payload: dict[str, Any]) -> str:
     return str(payload.get("project_name") or payload.get("workspace") or "deplai-project").strip()
 
 
-def _workspace_has_prior_non_cloudposse_state(workspace: str, current_run_id: str) -> bool:
-    root = workspace_root(workspace)
-    for state_file in sorted(root.glob("*/state.json")):
-        if state_file.parent.name == current_run_id:
-            continue
-        try:
-            payload = json.loads(state_file.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        renderer = str(payload.get("actual_renderer") or payload.get("source") or "").strip().lower()
-        phase = str(payload.get("phase") or "").strip().lower()
-        if not renderer or phase == "failed":
-            continue
-        if renderer != "cloudposse_atmos":
-            return True
-    return False
+def normalize_terraform_renderer(value: Any) -> str:
+    renderer = str(value or "auto").strip().lower()
+    if renderer in {"auto", "deplai_deterministic", "deplai_ec2_app"}:
+        return renderer
+    return "auto"
 
 
 def _apply_env(payload: dict[str, Any]) -> dict[str, str]:
@@ -295,43 +282,18 @@ def generate_terraform_run(request_payload: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"deployment_profile validation failed: {'; '.join(validation_errors)}")
             manifest, dag_order = build_profile_manifest(architecture_input)
             requested_renderer = normalize_terraform_renderer(request_payload.get("terraform_renderer"))
-            prior_non_cloudposse_state = bool(request_payload.get("has_existing_terraform_state")) or _workspace_has_prior_non_cloudposse_state(workspace, run_id)
-            use_cloudposse, support = should_use_cloudposse_renderer(
-                architecture_input,
-                requested_renderer,
-                workspace_has_prior_state=prior_non_cloudposse_state,
+            files, warnings = build_profile_bundle(
+                payload=architecture_input,
+                provider_version=state["provider_version"],
+                state_bucket=state["state_bucket"],
+                lock_table=state["lock_table"],
+                aws_region=state["aws_region"],
+                context_summary=_context_summary(request_payload),
+                website_index_html=_website_index_html(request_payload),
             )
-            if use_cloudposse:
-                files, warnings, lock_payload = build_cloudposse_profile_bundle(
-                    payload=architecture_input,
-                    state_bucket=state["state_bucket"],
-                    lock_table=state["lock_table"],
-                    aws_region=state["aws_region"],
-                    context_summary=_context_summary(request_payload),
-                    website_index_html=_website_index_html(request_payload),
-                    requested_renderer=requested_renderer,
-                )
-                state["source"] = "cloudposse_atmos"
-                state["actual_renderer"] = "cloudposse_atmos"
-                state["execution_kind"] = "atmos"
-                state["component_catalog_version"] = str(lock_payload.get("component_catalog_version") or "")
-                dag_order = [str(item) for item in lock_payload.get("deploy_sequence") or dag_order]
-            else:
-                files, warnings = build_profile_bundle(
-                    payload=architecture_input,
-                    provider_version=state["provider_version"],
-                    state_bucket=state["state_bucket"],
-                    lock_table=state["lock_table"],
-                    aws_region=state["aws_region"],
-                    context_summary=_context_summary(request_payload),
-                    website_index_html=_website_index_html(request_payload),
-                )
-                unsupported_reason = "; ".join([str(item) for item in support.get("reasons") or []])
-                if unsupported_reason and requested_renderer in {"auto", "cloudposse_atmos"}:
-                    warnings.append(f"Cloud Posse/Atmos renderer not used: {unsupported_reason}")
-                state["source"] = "deployment_profile"
-                state["actual_renderer"] = "deplai_deterministic"
-                state["unsupported_reason"] = unsupported_reason
+            state["source"] = "deployment_profile"
+            state["actual_renderer"] = "deplai_deterministic"
+            state["unsupported_reason"] = ""
             state["requested_renderer"] = requested_renderer
         else:
             manifest, dag_order = build_manifest(architecture_input)
@@ -370,7 +332,7 @@ def generate_terraform_run(request_payload: dict[str, Any]) -> dict[str, Any]:
         written_files = replace_tree(local_bundle_dir, files)
         final_files = dict(files)
         planned_ok = True
-        if not offline_generation and state.get("execution_kind") != "atmos":
+        if not offline_generation:
             planned_ok, final_files = _run_plan_loop(
                 local_bundle_dir=local_bundle_dir,
                 env=env,
@@ -378,8 +340,6 @@ def generate_terraform_run(request_payload: dict[str, Any]) -> dict[str, Any]:
                 request_payload=request_payload,
             )
             written_files = [{"path": path, "content": content} for path, content in final_files.items()]
-        elif state.get("execution_kind") == "atmos":
-            state["phase"] = "generated_atmos"
         else:
             state["phase"] = "generated_offline"
 
@@ -518,78 +478,6 @@ def _normalize_output_values(output_payload: dict[str, Any]) -> dict[str, Any]:
     return outputs
 
 
-def _apply_atmos_run(
-    *,
-    state: dict[str, Any],
-    local_bundle_dir: Path,
-    env: dict[str, str],
-    apply_context: dict[str, Any] | None,
-) -> dict[str, Any]:
-    from .execution import run_atmos_command
-
-    lock_path = local_bundle_dir / ".deplai" / "cloudposse-component-lock.json"
-    if not lock_path.exists():
-        raise FileNotFoundError("Cloud Posse component lock file not found.")
-    lock_payload = json.loads(lock_path.read_text(encoding="utf-8"))
-    deploy_sequence = [str(item).strip() for item in lock_payload.get("deploy_sequence") or [] if str(item).strip()]
-    stack = str(lock_payload.get("stack") or "").strip()
-    if not deploy_sequence or not stack:
-        raise ValueError("Cloud Posse component lock file must include deploy_sequence and stack.")
-
-    vendor_log = run_atmos_command(local_bundle_dir, ["vendor", "pull"], env=env, apply_context=apply_context)["stdout"]
-    validate_log = run_atmos_command(local_bundle_dir, ["validate", "stacks"], env=env, apply_context=apply_context)["stdout"]
-    outputs: dict[str, Any] = {}
-    apply_logs: dict[str, str] = {}
-    for component in deploy_sequence:
-        run_atmos_command(local_bundle_dir, ["terraform", "init", component, "-s", stack], env=env, apply_context=apply_context)
-        run_atmos_command(local_bundle_dir, ["terraform", "plan", component, "-s", stack], env=env, apply_context=apply_context)
-        apply_logs[component] = run_atmos_command(
-            local_bundle_dir,
-            ["terraform", "apply", component, "-s", stack, "-auto-approve"],
-            env=env,
-            apply_context=apply_context,
-        )["stdout"]
-        try:
-            raw_output = run_atmos_command(
-                local_bundle_dir,
-                ["terraform", "output", component, "-s", stack, "-json"],
-                env=env,
-                apply_context=apply_context,
-            )["stdout"]
-            parsed_output = json.loads(raw_output or "{}")
-            if isinstance(parsed_output, dict):
-                outputs.update(_normalize_output_values(parsed_output))
-        except Exception as exc:
-            outputs[f"{component}_output_error"] = str(exc)
-
-    cloudfront_url = None
-    if isinstance(outputs.get("cloudfront_url"), str):
-        cloudfront_url = outputs["cloudfront_url"]
-    elif isinstance(outputs.get("cloudfront_domain_name"), str):
-        cloudfront_url = f"https://{outputs['cloudfront_domain_name']}"
-    state["phase"] = "completed"
-    state["outputs"]["public"] = outputs
-    return {
-        "success": True,
-        "provider": "aws",
-        "project_name": str(state.get("project_name") or state.get("workspace") or "deplai-project"),
-        "outputs": outputs,
-        "cloudfront_url": cloudfront_url,
-        "details": {
-            "execution_kind": "atmos",
-            "renderer": "cloudposse_atmos",
-            "workspace": state.get("workspace"),
-            "run_id": state.get("run_id"),
-            "component_catalog_version": lock_payload.get("component_catalog_version"),
-            "deploy_sequence": deploy_sequence,
-            "stack": stack,
-            "vendor_log_tail": vendor_log[-2000:],
-            "validate_log_tail": validate_log[-2000:],
-            "apply_logs_tail": {key: value[-2000:] for key, value in apply_logs.items()},
-        },
-    }
-
-
 def apply_terraform_run(request_payload: dict[str, Any], *, apply_context: dict[str, Any] | None = None) -> dict[str, Any]:
     from .execution import (
         extract_apply_errors,
@@ -611,12 +499,6 @@ def apply_terraform_run(request_payload: dict[str, Any], *, apply_context: dict[
     apply_attempt = 0
     apply_events: list[dict[str, Any]] = []
     try:
-        if str(state.get("execution_kind") or "").strip() == "atmos":
-            result = _apply_atmos_run(state=state, local_bundle_dir=local_bundle_dir, env=env, apply_context=apply_context)
-            save_state(workspace, run_id, state)
-            upload_run_snapshot(env=env, state_bucket=str(state["state_bucket"]), workspace=workspace, run_id=run_id)
-            return result
-
         while apply_attempt < 2:
             apply_attempt += 1
             try:

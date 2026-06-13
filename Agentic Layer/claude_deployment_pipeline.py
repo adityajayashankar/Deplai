@@ -60,9 +60,7 @@ from planning_runtime import (
 )
 from repository_sources import resolve_repository_source
 from stage7_bridge import run_stage7_approval_payload
-from terraform_agent.agent.engine.cloudposse_atmos import normalize_terraform_renderer, should_use_cloudposse_renderer
 from terraform_agent.agent.engine.deployment_profile import (
-    build_cloudposse_profile_bundle,
     build_profile_bundle,
     build_profile_manifest,
 )
@@ -70,6 +68,13 @@ from terraform_agent.agent.engine.runtime import DEFAULT_PROVIDER_CONSTRAINT
 from deployment_packager import build_deployment_package
 from deployment_run_store import save_terraform_run
 from ec2_app_renderer import render_ec2_app_bundle
+
+
+def normalize_terraform_renderer(value: Any) -> str:
+    renderer = str(value or "auto").strip().lower()
+    if renderer in {"auto", "deplai_deterministic", "deplai_ec2_app"}:
+        return renderer
+    return "auto"
 
 
 SKIP_DIRS = {
@@ -670,10 +675,6 @@ def _resolve_terraform_llm_config(
     llm_model: str | None,
     llm_api_base_url: str | None,
 ) -> dict[str, str] | None:
-    # LLM-backed Terraform generation is intentionally disabled. Keep this
-    # compatibility hook returning no provider so legacy callers fall through
-    # to deterministic renderers without touching LLM APIs.
-    return None
     explicit_provider = str(llm_provider or "").strip().lower()
     explicit_key = str(llm_api_key or "").strip()
     explicit_model = str(llm_model or "").strip()
@@ -1146,6 +1147,192 @@ def _enrich_deployment_profile_for_deterministic_rendering(
     return enriched
 
 
+def _decision_int(value: Any) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _decision_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"true", "yes", "y", "1", "on"}:
+        return True
+    if text in {"false", "no", "n", "0", "off"}:
+        return False
+    return None
+
+
+def _canonical_rds_engine(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"mysql"}:
+        return "mysql"
+    if text in {"mariadb", "maria"}:
+        return "mariadb"
+    return "postgres"
+
+
+def _apply_consultant_decision_to_profile(
+    *,
+    profile_payload: dict[str, Any],
+    consultant_decision_json: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Fold the operator's UI service selections (consultant_decision.stack_config) into the
+    deployment profile so toggled/configured managed services actually reach the deterministic
+    Terraform renderers, which only read from profile.compute / profile.data_layer.
+    """
+    decision = _as_record(consultant_decision_json)
+    if not decision:
+        return profile_payload
+
+    stack_config = _as_record(decision.get("stack_config"))
+    components = [str(item or "").strip().lower() for item in (decision.get("components") or []) if str(item or "").strip()]
+    if not stack_config and not components:
+        return profile_payload
+
+    enriched = deepcopy(profile_payload)
+    compute = _as_record(enriched.get("compute")) or {"strategy": "ec2", "services": []}
+    data_layer = _as_records(enriched.get("data_layer"))
+
+    rds_cfg = _as_record(stack_config.get("rds"))
+    redis_cfg = _as_record(stack_config.get("elasticache") or stack_config.get("redis"))
+    ecs_cfg = _as_record(stack_config.get("ecs"))
+
+    # `components` is authoritative when the frontend sends an explicit set: a managed service
+    # that is neither listed nor configured is treated as turned off. Without an explicit set we
+    # stay additive so repo-detected datastores are never silently dropped.
+    authoritative = bool(components)
+    rds_selected = bool(rds_cfg) or any(token in components for token in ("rds", "postgres", "postgresql", "mysql", "mariadb"))
+    redis_selected = bool(redis_cfg) or any(token in components for token in ("elasticache", "redis"))
+
+    relational_item = next((item for item in data_layer if str(item.get("type") or "").strip().lower() in {"postgresql", "mysql", "mariadb", "rds"}), None)
+    redis_item = next((item for item in data_layer if str(item.get("type") or "").strip().lower() == "redis"), None)
+    other_items = [
+        item for item in data_layer
+        if str(item.get("type") or "").strip().lower() not in {"postgresql", "mysql", "mariadb", "rds", "redis"}
+    ]
+
+    new_data_layer: list[dict[str, Any]] = list(other_items)
+    applied: list[str] = []
+
+    if rds_selected or (relational_item is not None and not authoritative):
+        entry = deepcopy(relational_item) if relational_item else {"id": "primary_db", "type": "postgresql"}
+        # `type` stays "postgresql" (the relational marker the renderers detect); the concrete
+        # engine flavour rides on the `engine` field so MySQL/MariaDB render with the right port.
+        entry["type"] = "postgresql"
+        if rds_cfg.get("engine") or not entry.get("engine"):
+            entry["engine"] = _canonical_rds_engine(rds_cfg.get("engine") or entry.get("engine"))
+        if str(rds_cfg.get("engine_version") or "").strip():
+            entry["engine_version"] = str(rds_cfg.get("engine_version")).strip()
+        if str(rds_cfg.get("instance_class") or "").strip():
+            entry["instance_class"] = str(rds_cfg.get("instance_class")).strip()
+        storage = _decision_int(rds_cfg.get("allocated_storage"))
+        if storage is None:
+            storage = _decision_int(rds_cfg.get("storage_gb"))
+        if storage is not None and storage > 0:
+            entry["storage_gb"] = storage
+        multi_az = _decision_bool(rds_cfg.get("multi_az"))
+        if multi_az is not None:
+            entry["multi_az"] = multi_az
+        backup = _decision_int(rds_cfg.get("backup_retention_period"))
+        if backup is None:
+            backup = _decision_int(rds_cfg.get("backup_retention_days"))
+        if backup is not None:
+            entry["backup_retention_days"] = backup
+        new_data_layer.append(entry)
+        if rds_cfg or relational_item is None:
+            applied.append("rds")
+
+    if redis_selected or (redis_item is not None and not authoritative):
+        entry = deepcopy(redis_item) if redis_item else {"id": "cache", "type": "redis", "purpose": ["cache"]}
+        entry["type"] = "redis"
+        if str(redis_cfg.get("node_type") or "").strip():
+            entry["node_type"] = str(redis_cfg.get("node_type")).strip()
+        engine_version = str(redis_cfg.get("engine_version") or redis_cfg.get("version") or "").strip()
+        if engine_version:
+            entry["engine_version"] = engine_version
+        cluster_mode = _decision_bool(redis_cfg.get("cluster_mode"))
+        if cluster_mode is not None:
+            entry["cluster_mode"] = cluster_mode
+        new_data_layer.append(entry)
+        if redis_cfg or redis_item is None:
+            applied.append("redis")
+
+    enriched["data_layer"] = new_data_layer
+
+    static_cfg = _as_record(stack_config.get("s3_cloudfront") or stack_config.get("static_site"))
+
+    # Honor the operator's explicit compute strategy. We only ever switch *toward* the
+    # container/static strategies (never silently downgrade an enrich-detected static site back
+    # to EC2), so repo-driven detection stays authoritative for the EC2-vs-static decision.
+    desired_strategy = ""
+    if ecs_cfg or any(token in components for token in ("ecs", "ecs_fargate", "fargate")):
+        desired_strategy = "ecs_fargate"
+    elif static_cfg or any(token in components for token in ("s3_cloudfront", "cloudfront", "static")):
+        desired_strategy = "s3_cloudfront"
+    current_strategy = str(compute.get("strategy") or "").strip().lower()
+    if desired_strategy and desired_strategy != current_strategy:
+        compute["strategy"] = desired_strategy
+        if desired_strategy == "s3_cloudfront":
+            compute["services"] = []
+            enriched["application_type"] = "static_site"
+        applied.append(f"strategy:{desired_strategy}")
+
+    # ECS compute sizing rides on the web service definition that _ecs_bundle renders from.
+    if ecs_cfg or str(compute.get("strategy") or "").strip().lower() == "ecs_fargate":
+        services = _as_records(compute.get("services"))
+        web = next((service for service in services if str(service.get("process_type") or "").strip().lower() == "web"), None)
+        if web is None:
+            web = services[0] if services else {"id": "api", "process_type": "web"}
+            if web not in services:
+                services.append(web)
+        cpu = _decision_int(ecs_cfg.get("cpu"))
+        if cpu:
+            web["cpu"] = cpu
+        memory = _decision_int(ecs_cfg.get("memory"))
+        if memory:
+            web["memory"] = memory
+        desired = _decision_int(ecs_cfg.get("desired_count"))
+        if desired:
+            web["desired_count"] = desired
+        autoscaling = _as_record(web.get("autoscaling"))
+        min_count = _decision_int(ecs_cfg.get("min_count"))
+        max_count = _decision_int(ecs_cfg.get("max_count"))
+        if min_count:
+            autoscaling["min"] = min_count
+        if max_count:
+            autoscaling["max"] = max_count
+        if autoscaling:
+            web["autoscaling"] = autoscaling
+        compute["services"] = services
+        if ecs_cfg:
+            applied.append("ecs")
+
+    enriched["compute"] = compute
+
+    # Static-site (S3 + CloudFront) tunables ride on a top-level extra the storage renderer reads.
+    if static_cfg:
+        site = _as_record(enriched.get("static_site"))
+        price_class = str(static_cfg.get("price_class") or "").strip()
+        if price_class:
+            site["price_class"] = price_class
+        spa_fallback = _decision_bool(static_cfg.get("spa_fallback"))
+        if spa_fallback is not None:
+            site["spa_fallback"] = spa_fallback
+        if site:
+            enriched["static_site"] = site
+            applied.append("s3_cloudfront")
+
+    if applied:
+        _append_profile_warning(
+            enriched,
+            f"Applied operator service selections to deterministic profile: {', '.join(sorted(set(applied)))}.",
+        )
+    return enriched
+
+
 def _build_generation_context_summary(
     *,
     qa_summary: str,
@@ -1189,46 +1376,6 @@ def _build_generation_context_summary(
         f"Critical/High Supply Findings: {int(security.get('criticalOrHighSupply') or 0)}" if security else "",
     ]
     return "\n".join(item for item in summary_lines if item)
-
-
-def _cloudposse_compatible_profile_payload(profile_payload: dict[str, Any], requested_renderer: str) -> tuple[dict[str, Any], list[str]]:
-    adapted = deepcopy(profile_payload)
-    warnings: list[str] = []
-    renderer = normalize_terraform_renderer(requested_renderer)
-    if renderer == "deplai_deterministic":
-        return adapted, warnings
-    compute = _as_record(adapted.get("compute"))
-    strategy = str(compute.get("strategy") or "").strip().lower()
-    if strategy == "ec2":
-        compute["strategy"] = "ecs_fargate"
-        services = _as_records(compute.get("services"))
-        if not services:
-            services = [{"id": "api", "process_type": "web", "image_source": "placeholder", "port": 3000, "desired_count": 1}]
-        for service in services:
-            service.setdefault("id", "api")
-            service.setdefault("process_type", "web")
-            service.setdefault("image_source", "placeholder")
-            service.setdefault("desired_count", 1)
-            if service.get("port") in {None, ""} and str(service.get("process_type") or "") == "web":
-                service["port"] = 3000
-        compute["services"] = services
-        adapted["compute"] = compute
-        warnings.append("Cloud Posse/Atmos adapter mapped ec2 strategy to ecs_fargate for V1 compatibility.")
-
-    networking = _as_record(adapted.get("networking"))
-    load_balancer = _as_record(networking.get("load_balancer"))
-    if load_balancer:
-        stripped_keys = sorted(set(load_balancer) - {"public"})
-        networking["load_balancer"] = {"public": bool(load_balancer.get("public", True))}
-        if stripped_keys:
-            warnings.append(f"Cloud Posse/Atmos adapter stripped unsupported load_balancer fields: {', '.join(stripped_keys)}.")
-    adapted["networking"] = networking
-
-    dns_tls = _as_record(adapted.get("dns_and_tls"))
-    if any(str(value or "").strip() for value in dns_tls.values()):
-        adapted["dns_and_tls"] = {}
-        warnings.append("Cloud Posse/Atmos adapter omitted custom dns_and_tls fields because V1 does not render them.")
-    return adapted, warnings
 
 
 def _module_paths(module_name: str) -> list[str]:
@@ -2996,6 +3143,7 @@ def generate_terraform_bundle(
     consultant_decision_json: dict[str, Any] | None = None,
     source_root: str = "",
     source_root_candidates: list[str] | None = None,
+    repository_url: str = "",
     llm_provider: str | None = None,
     llm_api_key: str | None = None,
     llm_model: str | None = None,
@@ -3010,7 +3158,18 @@ def generate_terraform_bundle(
     worker_model = "deterministic-fallback"
     preflight_warnings: list[str] = []
     if requested_iac_mode == "llm" or any(str(value or "").strip() for value in (llm_provider, llm_api_key, llm_model, llm_api_base_url)):
-        preflight_warnings.append("LLM IaC generation is disabled; Terraform generation used deterministic renderers only.")
+        terraform_llm = _resolve_terraform_llm_config(
+            llm_provider=llm_provider,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
+            llm_api_base_url=llm_api_base_url,
+        )
+        terraform_llm_enabled = _terraform_llm_available(terraform_llm)
+        if terraform_llm_enabled:
+            resolved_iac_mode = "llm"
+            worker_model = str((terraform_llm or {}).get("model") or TERRAFORM_PROFILE_MODEL)
+        else:
+            preflight_warnings.append("LLM IaC generation was requested, but no Terraform worker LLM backend is configured. Deterministic rescue renderers were used.")
     _emit_worker(
         progress_callback,
         msg_type="info",
@@ -3031,6 +3190,10 @@ def generate_terraform_bundle(
         website_asset_stats_json=website_asset_stats_json,
         frontend_entrypoint_detection_json=frontend_entrypoint_detection_json,
         repository_context_json=repository_context_json,
+    )
+    approved_profile_payload = _apply_consultant_decision_to_profile(
+        profile_payload=approved_profile_payload,
+        consultant_decision_json=consultant_decision_json,
     )
     approved_profile = parse_deployment_profile(approved_profile_payload)
     approved_profile_payload = approved_profile.model_dump(exclude_none=True)
@@ -3063,6 +3226,7 @@ def generate_terraform_bundle(
                 context_summary=generation_context_summary,
                 state_bucket=state_bucket,
                 lock_table=lock_table,
+                repository_url=repository_url,
             )
         except Exception as exc:
             reason = str(exc)
@@ -3098,6 +3262,7 @@ def generate_terraform_bundle(
                     "execution_kind": "terraform",
                     "renderer": "deplai_ec2_app",
                     "source_root": source_root,
+                    "repository_url": repository_url,
                 },
             }
 
@@ -3159,6 +3324,7 @@ def generate_terraform_bundle(
                 "renderer": "deplai_ec2_app",
                 "deployment_package": package_manifest,
                 "source_root": source_root,
+                "repository_url": repository_url,
                 "llm_workers_enabled": False,
                 "requested_iac_mode": requested_iac_mode,
                 "effective_iac_mode": resolved_iac_mode,
@@ -3168,140 +3334,7 @@ def generate_terraform_bundle(
         }
 
     requested_renderer = normalize_terraform_renderer(terraform_renderer)
-    cloudposse_profile_payload, cloudposse_adapter_warnings = _cloudposse_compatible_profile_payload(
-        approved_profile_payload,
-        requested_renderer,
-    )
-    if isinstance(detected_json, dict) and detected_json:
-        cloudposse_profile_payload["detected"] = dict(detected_json)
-    if isinstance(user_answers_json, dict) and user_answers_json:
-        cloudposse_profile_payload["user_answers"] = dict(user_answers_json)
-    if isinstance(consultant_decision_json, dict) and consultant_decision_json:
-        cloudposse_profile_payload["consultant_decision"] = dict(consultant_decision_json)
-    preflight_warnings.extend(cloudposse_adapter_warnings)
-    use_cloudposse, cloudposse_support = should_use_cloudposse_renderer(
-        cloudposse_profile_payload,
-        requested_renderer,
-        workspace_has_prior_state=bool(cloudposse_profile_payload.get("has_existing_terraform_state")),
-    )
-    if use_cloudposse:
-        manifest, dag_order = build_profile_manifest(cloudposse_profile_payload)
-        files_by_path, renderer_warnings, lock_payload = build_cloudposse_profile_bundle(
-            payload=cloudposse_profile_payload,
-            aws_region=aws_region,
-            state_bucket=state_bucket,
-            lock_table=lock_table,
-            context_summary=generation_context_summary,
-            website_index_html=website_index_html,
-            requested_renderer=requested_renderer,
-        )
-        ordered_files = [{"path": path, "content": content} for path, content in files_by_path.items()]
-        deploy_sequence = [str(item) for item in lock_payload.get("deploy_sequence") or []]
-        _emit_worker(
-            progress_callback,
-            msg_type="success",
-            content=f"Cloud Posse/Atmos renderer completed with {len(ordered_files)} surfaced file(s).",
-            worker_id="cloudposse-atmos-renderer",
-            worker_role="Cloud Posse Atmos Renderer",
-            worker_status="completed",
-            extra={"compute_strategy": str((cloudposse_profile_payload.get("compute") or {}).get("strategy") or ""), "service_count": len(deploy_sequence)},
-        )
-        return {
-            "success": True,
-            "provider": "aws",
-            "project_name": project_name,
-            "run_id": None,
-            "workspace": str(cloudposse_profile_payload.get("workspace") or workspace or "default"),
-            "provider_version": DEFAULT_PROVIDER_CONSTRAINT,
-            "state_bucket": None,
-            "lock_table": None,
-            "manifest": manifest,
-            "dag_order": deploy_sequence or dag_order,
-            "warnings": [
-                *preflight_warnings,
-                *[str(item) for item in list(cloudposse_profile_payload.get("warnings") or []) if str(item).strip()],
-                *renderer_warnings,
-            ],
-            "files": ordered_files,
-            "readme": files_by_path.get("README.md"),
-            "source": "cloudposse_atmos",
-            "requested_renderer": requested_renderer,
-            "actual_renderer": "cloudposse_atmos",
-            "unsupported_reason": "",
-            "renderer": "cloudposse_atmos",
-            "component_catalog_version": lock_payload.get("component_catalog_version"),
-            "execution_kind": "atmos",
-            "llm_iac_calls": 0,
-            "llm_iac_disabled": True,
-            "decision_applied": bool(lock_payload.get("decision_applied")),
-            "decision_drift": list(lock_payload.get("decision_drift") or []),
-            "details": {
-                "execution_kind": "atmos",
-                "renderer": "cloudposse_atmos",
-                "requested_renderer": requested_renderer,
-                "actual_renderer": "cloudposse_atmos",
-                "component_catalog_version": lock_payload.get("component_catalog_version"),
-                "component_lock": lock_payload,
-                "deploy_sequence": deploy_sequence,
-                "llm_workers_enabled": False,
-                "requested_iac_mode": requested_iac_mode,
-                "effective_iac_mode": resolved_iac_mode,
-                "llm_iac_calls": 0,
-                "llm_iac_disabled": True,
-                "decision_applied": bool(lock_payload.get("decision_applied")),
-                "decision_drift": list(lock_payload.get("decision_drift") or []),
-            },
-        }
-
-    unsupported_reason = "; ".join([str(item) for item in cloudposse_support.get("reasons") or []])
-    if requested_renderer in {"auto", "cloudposse_atmos"}:
-        failure_reason = unsupported_reason or "Cloud Posse/Atmos renderer support checks did not pass."
-        _emit_worker(
-            progress_callback,
-            msg_type="error",
-            content=f"Cloud Posse/Atmos renderer unavailable: {failure_reason}",
-            worker_id="cloudposse-atmos-renderer",
-            worker_role="Cloud Posse Atmos Renderer",
-            worker_status="failed",
-            extra={"requested_renderer": requested_renderer},
-        )
-        return {
-            "success": False,
-            "provider": "aws",
-            "project_name": project_name,
-            "run_id": None,
-            "workspace": str(cloudposse_profile_payload.get("workspace") or workspace or "default"),
-            "warnings": [
-                *preflight_warnings,
-                f"Cloud Posse/Atmos renderer not used: {failure_reason}",
-            ],
-            "error": f"Cloud Posse/Atmos-only mode requires a supported deployment profile: {failure_reason}",
-            "source": "cloudposse_atmos",
-            "requested_renderer": requested_renderer,
-            "actual_renderer": "deplai_deterministic",
-            "unsupported_reason": failure_reason,
-            "renderer": "deplai_deterministic",
-            "component_catalog_version": None,
-            "execution_kind": "atmos",
-            "llm_iac_calls": 0,
-            "llm_iac_disabled": True,
-            "decision_applied": False,
-            "decision_drift": [],
-            "details": {
-                "execution_kind": "atmos",
-                "renderer": "cloudposse_atmos",
-                "requested_renderer": requested_renderer,
-                "actual_renderer": "deplai_deterministic",
-                "unsupported_reason": failure_reason,
-                "llm_workers_enabled": False,
-                "requested_iac_mode": requested_iac_mode,
-                "effective_iac_mode": resolved_iac_mode,
-                "llm_iac_calls": 0,
-                "llm_iac_disabled": True,
-                "decision_applied": False,
-                "decision_drift": [],
-            },
-        }
+    unsupported_reason = ""
 
     fallback_bundle_cache: dict[str, str] | None = None
     fallback_bundle_warnings: list[str] = []
@@ -3739,7 +3772,7 @@ def generate_terraform_bundle(
             "component_catalog_version": None,
             "execution_kind": "terraform",
             "llm_iac_calls": 0,
-            "llm_iac_disabled": True,
+            "llm_iac_disabled": not terraform_llm_enabled,
         "details": {
             "bundle_strategy": str(bundle_plan.get("bundle_strategy") or ""),
             "file_tree": _string_list(bundle_plan.get("file_tree")),
@@ -3762,6 +3795,6 @@ def generate_terraform_bundle(
             "renderer": "deplai_deterministic",
             "execution_kind": "terraform",
             "llm_iac_calls": 0,
-            "llm_iac_disabled": True,
+            "llm_iac_disabled": not terraform_llm_enabled,
         },
     }

@@ -63,6 +63,38 @@ export interface InfraConsultantMessage {
   content: string;
 }
 
+export interface Ec2ResourceConfig {
+  instance_type: string;
+  root_volume_size_gb: number;
+  app_port: number;
+  ssh_ingress_cidr_blocks: string[];
+}
+
+export interface RdsResourceConfig {
+  engine: 'postgres' | 'mysql' | 'mariadb';
+  engine_version: string;
+  instance_class: string;
+  allocated_storage: number;
+  multi_az: boolean;
+  backup_retention_period: number;
+}
+
+export interface RedisResourceConfig {
+  node_type: string;
+  engine_version: string;
+}
+
+export interface EcsResourceConfig {
+  cpu: number;
+  memory: number;
+  desired_count: number;
+}
+
+export interface StaticSiteResourceConfig {
+  price_class: 'PriceClass_100' | 'PriceClass_200' | 'PriceClass_All';
+  spa_fallback: boolean;
+}
+
 export interface InfraConsultantDecision {
   components: string[];
   deploy_sequence: string[];
@@ -123,6 +155,7 @@ export interface DeployApiResult {
     vpc_id?: string | null;
     subnet_id?: string | null;
   } | null;
+  app_url?: string | null;
   cdn?: {
     cloudfront_url?: string | null;
   } | null;
@@ -218,6 +251,7 @@ export interface DeploymentInstanceSummary {
   instanceState: string;
   instanceType: string;
   publicIp: string;
+  appUrl: string;
   privateIp: string;
   publicDns: string;
   privateDns: string;
@@ -269,10 +303,29 @@ export function hasTruncatedIacFiles(value: unknown): boolean {
   return normalizeIacFileList(value).some((entry) => String(entry.content || '').includes(IAC_TRUNCATION_NOTE));
 }
 
+function hasRequiredTerraformRootFiles(files: GeneratedIacFile[]): boolean {
+  const required = new Set([
+    'terraform/providers.tf',
+    'terraform/backend.tf',
+    'terraform/main.tf',
+    'terraform/variables.tf',
+    'terraform/terraform.tfvars',
+    'terraform/outputs.tf',
+  ]);
+
+  for (const file of files) {
+    required.delete(String(file.path || '').trim());
+    if (required.size === 0) return true;
+  }
+  return required.size === 0;
+}
+
 export function getDeployableIacFiles(value: unknown): GeneratedIacFile[] {
   const normalized = normalizeIacFileList(value);
   if (!normalized.length) return [];
-  return hasTruncatedIacFiles(normalized) ? [] : normalized;
+  if (hasTruncatedIacFiles(normalized)) return [];
+  if (!hasRequiredTerraformRootFiles(normalized)) return [];
+  return normalized;
 }
 
 function normalizeIacFileList(value: unknown): GeneratedIacFile[] {
@@ -699,6 +752,12 @@ export function extractDeploymentSummary(result: DeployApiResult | null): Deploy
   const details = result?.details as Record<string, unknown> | null | undefined;
   const liveRuntimeDetails = details?.live_runtime_details as { instance?: Record<string, unknown> } | undefined;
   const instance = liveRuntimeDetails?.instance as Record<string, unknown> | undefined;
+  const publicIp = String(instance?.public_ipv4_address || result?.ec2?.public_ip || pickOutput(runtimeOutputs, ['ec2_public_ip', 'public_ip', 'instance_public_ip']));
+  const explicitAppUrl = String(result?.app_url || pickOutputRaw(runtimeOutputs, ['app_url', 'application_url', 'site_url']) || '').trim();
+  const appUrl = String(
+    explicitAppUrl
+    || (publicIp !== 'n/a' ? `http://${publicIp}` : 'n/a'),
+  );
 
   return {
     cloudfrontUrl: String(result?.cdn?.cloudfront_url || result?.cloudfront_url || pickOutput(runtimeOutputs, ['cloudfront_url', 'cloudfront_domain_name'])),
@@ -719,7 +778,8 @@ export function extractDeploymentSummary(result: DeployApiResult | null): Deploy
     instanceArn: String(instance?.instance_arn || result?.ec2?.instance_arn || pickOutput(runtimeOutputs, ['ec2_instance_arn', 'instance_arn'])),
     instanceState: String(instance?.instance_state || result?.ec2?.state || pickOutput(runtimeOutputs, ['ec2_instance_state', 'instance_state'])),
     instanceType: String(instance?.instance_type || result?.ec2?.type || pickOutput(runtimeOutputs, ['ec2_instance_type', 'instance_type'])),
-    publicIp: String(instance?.public_ipv4_address || result?.ec2?.public_ip || pickOutput(runtimeOutputs, ['ec2_public_ip', 'public_ip', 'instance_public_ip'])),
+    publicIp,
+    appUrl,
     privateIp: String(instance?.private_ipv4_address || result?.ec2?.private_ip || pickOutput(runtimeOutputs, ['ec2_private_ip', 'private_ip', 'instance_private_ip'])),
     publicDns: String(instance?.public_dns || result?.ec2?.public_dns || pickOutput(runtimeOutputs, ['ec2_public_dns', 'instance_public_dns', 'public_dns'])),
     privateDns: String(instance?.private_dns || result?.ec2?.private_dns || pickOutput(runtimeOutputs, ['ec2_private_dns', 'private_dns', 'instance_private_dns'])),

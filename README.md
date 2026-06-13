@@ -30,7 +30,7 @@ DeplAI is not a single chatbot or a single pipeline. It is a multi-service platf
 - `Connector/`: Next.js control plane, dashboard UI, authenticated API facade, GitHub integration, project registry, settings, runtime views, and chat orchestration.
 - `Agentic Layer/`: FastAPI execution plane for long-running scan, remediation, repository analysis, deployment planning, Stage 7 approval, Terraform apply, AWS runtime inspection, and cleanup workflows.
 - `remediation_pipeline/`: modular remediation engine for ingestion, grouping, context extraction, fix generation, validation, routing, and PR handoff.
-- `Terraform Agent/`: Terraform generation and infrastructure bundle engine, including deterministic rendering and a Cloud Posse/Atmos foundation.
+- `Terraform Agent/`: Terraform generation and infrastructure bundle engine built around DeplAI deterministic and enterprise Terraform renderers.
 - `Diagram-Cost-Agent/`: Stage 7 diagram, cost estimation, budget gate, and approval packaging graph.
 - `KGagent/`: knowledge graph and GraphRAG layer for vulnerability intelligence and contextual security enrichment.
 - `Customization Agent/`: tenant-builder backend for conversational manifest authoring and code customization.
@@ -162,7 +162,7 @@ Connector does not directly execute scanners, Terraform, or cloud operations. It
 - repository analysis and architecture decision APIs
 - architecture generation and cost estimation APIs
 - Stage 7 approval payload generation
-- Terraform generation, Cloud Posse consultation, apply, status, stop, and output parsing
+- Terraform generation, apply, status, stop, and output parsing
 - AWS runtime details, instance action, and best-effort destroy endpoints
 - Docker volume management and scanner/runtime isolation
 
@@ -173,7 +173,7 @@ The platform delegates high-context work to specialized engines rather than one 
 - `remediation_pipeline/` for vulnerability-specific remediation.
 - `KGagent/` for graph and vector-backed vulnerability intelligence.
 - `Diagram-Cost-Agent/` for Stage 7 approval payloads.
-- `Terraform Agent/` for IaC generation and Cloud Posse/Atmos bundle creation.
+- `Terraform Agent/` for DeplAI Terraform bundle creation.
 - `Customization Agent/` for tenant-specific code mutation.
 
 ## Agentic Capabilities
@@ -366,7 +366,7 @@ Core files:
 - `Agentic Layer/stage7_bridge.py`: Stage 7 bridge and fallback.
 - `Diagram-Cost-Agent/graph.py`: Stage 7 LangGraph workflow.
 - `Terraform Agent/agent/graph.py`: Terraform generation graph.
-- `Terraform Agent/agent/engine/cloudposse_atmos.py`: Cloud Posse/Atmos bundle support.
+- `Terraform Agent/agent/engine/deployment_profile.py`: deployment-profile Terraform bundle rendering.
 - `Agentic Layer/terraform_apply.py`: Terraform runtime apply engine.
 - `Connector/src/app/api/pipeline/iac/route.ts`: Connector IaC generation route.
 - `Connector/src/app/api/pipeline/deploy/route.ts`: Connector deploy route.
@@ -386,50 +386,21 @@ Generated IaC and runtime metadata are also persisted through Connector session/
 
 ### IaC Strategy
 
-DeplAI currently has two IaC lanes.
+DeplAI uses a DeplAI Terraform lane for generated infrastructure.
 
-#### Deterministic DeplAI Terraform Lane
+#### DeplAI Terraform Lane
 
-This is the most reliable first-success path today.
+This is the default first-success path.
 
 Capabilities:
 
-- AWS-first EC2 root bundle.
+- AWS-first root bundle generation for EC2, S3/CloudFront, VPC, RDS, cache, and related deployment-profile components.
 - Runtime deploy through Agentic Layer.
 - generated key pair handling.
 - endpoint and runtime detail extraction.
 - free-tier EC2 guardrail support.
 - deploy status reconciliation.
 - destroy endpoint for DeplAI-tagged AWS resources.
-
-#### Cloud Posse/Atmos Lane
-
-This is the intended enterprise IaC lane.
-
-Capabilities already present in code:
-
-- component catalog loading
-- Cloud Posse component support classification
-- consultant conversation for component decisions
-- pinned component lock metadata
-- Atmos stack and vendor file generation
-- deploy sequence metadata
-- post-vendor patch script support
-- Atmos-aware execution support in runtime apply
-
-The Cloud Posse path is designed for:
-
-- reusable version-pinned infrastructure components
-- stack composition instead of ad hoc root modules
-- safer upgrades through component catalog metadata
-- clear deploy sequence and lock records
-- stronger enterprise governance over generated infrastructure
-
-Current status:
-
-- The Cloud Posse/Atmos foundation is substantial.
-- The default Connector deployment flow still prioritizes the deterministic AWS bundle for reliability.
-- Cloud Posse/Atmos is not yet the default end-to-end product path.
 
 ### Features
 
@@ -463,9 +434,6 @@ This design reduces hidden prompt coupling and makes each stage inspectable.
 ### Current Gaps
 
 - Runtime deployment is AWS-first; Azure and GCP runtime apply are not implemented as first-class deploy paths.
-- Cloud Posse/Atmos is not yet the primary default path in Connector.
-- Cloud Posse V1 only supports a subset of AWS shapes and rejects unsupported profiles.
-- Existing non-Cloud Posse Terraform state is not migrated into Cloud Posse/Atmos.
 - DNS/TLS and richer multi-service topologies are still limited.
 - Some deployment UI state is client/session persisted rather than durably stored in backend workflow tables.
 
@@ -712,7 +680,6 @@ These contracts define the boundary between:
 | Tool | Role |
 |---|---|
 | Terraform | runtime infrastructure provisioning |
-| Cloud Posse/Atmos | intended enterprise IaC composition path |
 | AWS EC2/S3/CloudFront/IAM APIs | current runtime deployment target |
 | Docker Compose | local service composition |
 
@@ -902,7 +869,6 @@ Key endpoints:
 | `POST /api/cost/estimate` | estimate infrastructure cost |
 | `POST /api/stage7/approval` | create Stage 7 approval payload |
 | `POST /api/terraform/generate` | generate Terraform |
-| `POST /api/terraform/cloudposse/consult` | Cloud Posse component consultation |
 | `POST /api/terraform/apply` | run Terraform apply |
 | `POST /api/terraform/apply/status` | reconcile apply status |
 | `POST /api/terraform/apply/stop` | stop apply |
@@ -940,7 +906,7 @@ Connector routes should be treated as the public application API. Agentic Layer 
 | `Connector/src/chat-agent/` | UI-side multi-agent chat orchestration |
 | `Agentic Layer/` | FastAPI execution plane, scan/remediation/planning/Terraform/AWS endpoints |
 | `remediation_pipeline/` | modular vulnerability remediation pipeline |
-| `Terraform Agent/` | Terraform generation, renderer selection, Cloud Posse/Atmos support |
+| `Terraform Agent/` | Terraform generation and DeplAI renderer selection |
 | `Diagram-Cost-Agent/` | Stage 7 diagram, cost, budget gate graph |
 | `KGagent/` | knowledge graph and GraphRAG vulnerability context |
 | `Customization Agent/` | tenant manifest and code customization backend |
@@ -956,7 +922,7 @@ Connector routes should be treated as the public application API. Agentic Layer 
 |---|---|---|
 | Workflow durability | several active workflow contexts are in process memory | durable job store, resumable workers, idempotent job state |
 | Runtime deployment | AWS-first | Azure/GCP runtime parity or explicit product scoping |
-| IaC governance | deterministic path is default; Cloud Posse path is partial | make Cloud Posse/Atmos the default enterprise renderer |
+| IaC governance | DeplAI Terraform path is default | harden module policy, validation, and approval metadata |
 | State management | UI/session/local state used for some deployment artifacts | backend persistence for approvals, runs, and generated bundles |
 | Observability | websocket logs and health endpoints | structured logs, traces, metrics, audit events |
 | Policy | budget and free-tier guardrails exist | richer policy-as-code gates for security, cost, region, IAM, network |
@@ -966,7 +932,6 @@ Connector routes should be treated as the public application API. Agentic Layer 
 
 ### Known Implementation Gaps
 
-- Cloud Posse/Atmos is implemented as a serious foundation but not the default Connector deploy path.
 - Some Docker Compose paths still reflect older naming conventions for the Stage 7 agent; verify mounted directory names before container-only runs.
 - Runtime destroy is best-effort and tag-based; it is not a full Terraform-state-backed destroy for every generated resource type.
 - KGagent can degrade when Neo4j or Qdrant are not configured.
@@ -974,7 +939,7 @@ Connector routes should be treated as the public application API. Agentic Layer 
 
 ### Recommended Next Work
 
-1. Promote Cloud Posse/Atmos to the default enterprise deployment renderer for supported AWS profiles.
+1. Harden the DeplAI Terraform renderer with stronger module policy, validation, and drift reporting.
 2. Add a durable workflow database for scan, remediation, planning, IaC generation, deploy, and customization runs.
 3. Add audit logs for every approval, PR creation, deploy, destroy, and instance action.
 4. Expand policy gates for IAM exposure, public ingress, state backend requirements, region allowlists, and cost caps.
@@ -999,4 +964,4 @@ Additional docs:
 
 DeplAI is already a capable multi-track AI engineering platform with a clear control-plane/execution-plane split, working security and deployment flows, tenant customization, GitHub integration, and AWS runtime operations.
 
-The most important architectural truth is that DeplAI is transitioning from a reliable prototype-to-runtime platform into an enterprise-governed platform. The core gaps are not conceptual; they are hardening work: durable workflow state, Cloud Posse defaulting, observability, policy controls, broader runtime support, and production-grade auditability.
+The most important architectural truth is that DeplAI is transitioning from a reliable prototype-to-runtime platform into an enterprise-governed platform. The core gaps are not conceptual; they are hardening work: durable workflow state, Terraform renderer governance, observability, policy controls, broader runtime support, and production-grade auditability.

@@ -44,3 +44,8 @@ variable "root_volume_size_gb" {
   default     = 20
 }
 
+variable "user_data" {
+  description = "User data script to run on instance boot."
+  type        = string
+  default     = ""
+}

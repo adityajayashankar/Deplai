@@ -4,6 +4,7 @@ import os
 import sys
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -182,15 +183,51 @@ class RemediationBatchingTests(unittest.TestCase):
             ],
         }
 
-        selected_scan, strategy = remediation._select_cycle_scan_strategy(scan_data, "all")
+        # Without a Groq key the large-repo stage falls back to the Claude SDK.
+        with mock.patch.dict(os.environ, {"GROQ_API_KEY": ""}, clear=False):
+            selected_scan, strategy = remediation._select_cycle_scan_strategy(scan_data, "all")
 
         self.assertEqual(strategy["mode"], "large_repo_severity_staged")
         self.assertEqual(strategy["stage_severity"], "critical")
+        self.assertTrue(strategy["lean_metadata"])
         self.assertTrue(strategy["forced_claude_sdk"])
+        self.assertEqual(strategy["preferred_provider"], "claude")
         self.assertEqual(len(selected_scan["code_security"]), 1)
         self.assertEqual(selected_scan["code_security"][0]["severity"], "critical")
         self.assertEqual(len(selected_scan["supply_chain"]), 1)
         self.assertEqual(selected_scan["supply_chain"][0]["severity"], "critical")
+
+    def test_large_repo_strategy_routes_to_groq_when_key_present(self) -> None:
+        remediation.REMEDIATION_LARGE_FINDING_THRESHOLD = 1000
+
+        scan_data = {
+            "code_security": [
+                {
+                    "cwe_id": "79",
+                    "severity": "critical",
+                    "count": 1200,
+                    "title": "XSS",
+                    "description": "x" * 500,
+                    "occurrences": [
+                        {"filename": "src/a.ts", "line_number": 10, "code": "danger"},
+                        {"filename": "src/a2.ts", "line_number": 20, "code": "danger2"},
+                    ],
+                },
+            ],
+            "supply_chain": [],
+        }
+
+        with mock.patch.dict(os.environ, {"GROQ_API_KEY": "test-key"}, clear=False):
+            _selected, strategy = remediation._select_cycle_scan_strategy(scan_data, "all")
+            lean = remediation._strip_metadata_for_lean(_selected)
+
+        self.assertTrue(strategy["lean_metadata"])
+        self.assertFalse(strategy["forced_claude_sdk"])
+        self.assertEqual(strategy["preferred_provider"], "groq")
+        # Lean trim keeps only one occurrence and drops verbose fields.
+        self.assertEqual(len(lean["code_security"][0]["occurrences"]), 1)
+        self.assertNotIn("description", lean["code_security"][0])
+        self.assertNotIn("code", lean["code_security"][0]["occurrences"][0])
 
     def test_large_repo_strategy_falls_through_to_high_when_no_criticals_remain(self) -> None:
         remediation.REMEDIATION_LARGE_FINDING_THRESHOLD = 1000

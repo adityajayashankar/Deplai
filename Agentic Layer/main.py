@@ -34,7 +34,6 @@ from models import (
     ArchitectureGenRequest, ArchitectureGenResponse,
     CostEstimateRequest, CostEstimateResponse,
     Stage7ApprovalRequest, Stage7ApprovalResponse,
-    TerraformConsultRequest, TerraformConsultResponse,
     TerraformGenRequest, TerraformGenResponse,
     TerraformApplyRequest, TerraformApplyResponse,
     TerraformApplyStopRequest, TerraformApplyStopResponse,
@@ -70,7 +69,6 @@ from deployment_planning_contract import (
 from claude_deployment_pipeline import generate_terraform_bundle
 from repository_analysis import run_repository_analysis
 from stage7_bridge import run_stage7_approval_payload
-from terraform_runner import consult_cloudposse_components
 from utils import get_docker_client
 
 logger = logging.getLogger(__name__)
@@ -896,10 +894,11 @@ async def terraform_generate(request: TerraformGenRequest):
             consultant_decision_json=dict(request.consultant_decision or {}),
             source_root=request.source_root or "",
             source_root_candidates=list(request.source_root_candidates or []),
-            llm_provider=None,
-            llm_api_key=None,
-            llm_model=None,
-            llm_api_base_url=None,
+            repository_url=request.repository_url or "",
+            llm_provider=request.llm_provider,
+            llm_api_key=request.llm_api_key,
+            llm_model=request.llm_model,
+            llm_api_base_url=request.llm_api_base_url,
             terraform_renderer=request.terraform_renderer,
             progress_callback=progress_callback,
         ),
@@ -988,33 +987,6 @@ async def terraform_generate(request: TerraformGenRequest):
         decision_drift=agent_result.get("decision_drift") if isinstance(agent_result, dict) else None,
         deployment_package_id=agent_result.get("deployment_package_id") if isinstance(agent_result, dict) else None,
         details=agent_result.get("details") if isinstance(agent_result, dict) else None,
-    )
-
-
-@app.post("/api/terraform/cloudposse/consult", response_model=TerraformConsultResponse, dependencies=[Depends(verify_api_key)])
-async def terraform_cloudposse_consult(request: TerraformConsultRequest):
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: consult_cloudposse_components(
-            architecture_json=dict(request.architecture_json or {}),
-            repository_context_json=dict(request.repository_context or {}),
-            deployment_profile_json=dict(request.deployment_profile or {}),
-            detected_json=dict(request.detected or {}),
-            aws_region=request.aws_region,
-            conversation_history=list(request.conversation_history or []),
-            turn_count=int(request.turn_count or 0),
-            force_decision=bool(request.force_decision),
-        ),
-    )
-    return TerraformConsultResponse(
-        success=bool(result.get("success")),
-        assistant_message=result.get("assistant_message"),
-        ready=bool(result.get("ready")),
-        decision=result.get("decision"),
-        repo_detection_summary=result.get("repo_detection_summary"),
-        turn_count=int(result.get("turn_count") or 0),
-        error=result.get("error"),
     )
 
 

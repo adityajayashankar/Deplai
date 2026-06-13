@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -261,27 +262,37 @@ def _iter_scannable_files(repo_root: Path) -> list[Path]:
         frontend = repo_root / app_root
         if frontend.exists() and frontend.is_dir():
             has_app_roots = True
-            for path in sorted(frontend.rglob("*")):
-                if any(part in IGNORED_SCAN_DIRECTORIES for part in path.parts):
-                    continue
+            for current_root, dir_names, file_names in os.walk(frontend):
+                dir_names[:] = [
+                    name for name in dir_names
+                    if name not in IGNORED_SCAN_DIRECTORIES
+                ]
+                current_path = Path(current_root)
+                for file_name in sorted(file_names):
+                    path = current_path / file_name
+                    if not path.is_file() or path.is_symlink():
+                        continue
+                    if not _is_within(repo_root, path):
+                        continue
+                    if path.suffix.lower() in _ALLOWED_SUFFIXES:
+                        files.append(path)
+
+    # Static-site fallback: index root/frontend-like files when app roots are absent.
+    if not has_app_roots:
+        for current_root, dir_names, file_names in os.walk(repo_root):
+            dir_names[:] = [
+                name for name in dir_names
+                if name not in IGNORED_SCAN_DIRECTORIES
+            ]
+            current_path = Path(current_root)
+            for file_name in sorted(file_names):
+                path = current_path / file_name
                 if not path.is_file() or path.is_symlink():
                     continue
                 if not _is_within(repo_root, path):
                     continue
                 if path.suffix.lower() in _ALLOWED_SUFFIXES:
                     files.append(path)
-
-    # Static-site fallback: index root/frontend-like files when app roots are absent.
-    if not has_app_roots:
-        for path in sorted(repo_root.rglob("*")):
-            if any(part in IGNORED_SCAN_DIRECTORIES for part in path.parts):
-                continue
-            if not path.is_file() or path.is_symlink():
-                continue
-            if not _is_within(repo_root, path):
-                continue
-            if path.suffix.lower() in _ALLOWED_SUFFIXES:
-                files.append(path)
 
     for filename in sorted(_ROOT_CONFIG_FILES):
         candidate = repo_root / filename

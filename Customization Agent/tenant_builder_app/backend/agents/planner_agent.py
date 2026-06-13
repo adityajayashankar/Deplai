@@ -19,6 +19,23 @@ ALLOWED_APP_TARGETS = {"frontend", "admin-frontend", "expert", "corporates"}
 
 ALL_APP_TARGETS = {"frontend", "admin-frontend", "expert", "corporates"}
 
+# Two-stage, request-aware target selection so the planner finds the right files
+# in large repos instead of relying on a fixed, request-agnostic priority list.
+PLANNER_TARGET_FILE_LIMIT = int(os.getenv("PLANNER_TARGET_FILE_LIMIT", "40") or "40")
+PLANNER_CANDIDATE_POOL_SIZE = int(os.getenv("PLANNER_CANDIDATE_POOL_SIZE", "160") or "160")
+PLANNER_LLM_FILE_SELECTION = os.getenv("PLANNER_LLM_FILE_SELECTION", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+_KEYWORD_STOPWORDS = {
+    "the", "and", "for", "with", "this", "that", "your", "you", "our", "are",
+    "https", "http", "www", "com", "org", "net", "true", "false", "null", "none",
+    "page", "pages", "src", "app", "components", "component",
+}
+
 
 def _normalize_extension_scope(scope: object) -> str:
     if not isinstance(scope, str):
@@ -334,15 +351,224 @@ def _read_file_content(repo_path: Path, relative_path: str) -> str:
         return ""
 
 
-def _collect_target_contexts(repo_path: Path, repo_map: dict[str, Any], limit: int = 36) -> list[dict[str, str]]:
-    ordered_paths: list[str] = []
-    for path in repo_map.get("priority_targets", []):
-        if path not in ordered_paths:
-            ordered_paths.append(path)
-    for category_name in ["branding_targets", "theme_targets", "api_targets"]:
-        for path in repo_map.get(category_name, []):
-            if path not in ordered_paths:
-                ordered_paths.append(path)
+def _tokenize_signal(value: object) -> list[str]:
+    return [
+        token
+        for token in re.split(r"[^a-z0-9]+", str(value or "").lower())
+        if len(token) >= 3 and token not in _KEYWORD_STOPWORDS
+    ]
+
+
+def _extract_request_signals(manifest: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """Derive request-specific keywords and UI scope tokens from the manifest.
+
+    keywords  — generic word tokens from branding/theme/domain values and
+                extension text (used for soft path matching).
+    scope_tokens — strong UI-area signals from extension target_raw scopes
+                (e.g. 'landing', 'footer', 'topbar') that map to directories.
+    """
+    keywords: set[str] = set()
+    scope_tokens: set[str] = set()
+    categories = manifest.get("categories", {}) if isinstance(manifest, dict) else {}
+    if isinstance(categories, dict):
+        for section_name in ["branding", "theme", "domains", "portals", "integrations"]:
+            section = categories.get(section_name, {})
+            if isinstance(section, dict):
+                for key, value in section.items():
+                    keywords.update(_tokenize_signal(key))
+                    if isinstance(value, str):
+                        keywords.update(_tokenize_signal(value))
+
+    extensions = manifest.get("extensions", []) if isinstance(manifest, dict) else []
+    if isinstance(extensions, list):
+        for item in extensions:
+            if not isinstance(item, dict):
+                continue
+            target_raw = str(item.get("target_raw", "")).strip().lower()
+            if target_raw:
+                if "." in target_raw:
+                    scope_tokens.update(_tokenize_signal(target_raw.split(".", 1)[0]))
+                keywords.update(_tokenize_signal(target_raw))
+            for field_name in ("value", "replacement", "label", "description"):
+                field_value = item.get(field_name)
+                if isinstance(field_value, str):
+                    keywords.update(_tokenize_signal(field_value))
+    return keywords, scope_tokens
+
+
+def _candidate_universe(repo_map: dict[str, Any], all_frontend_files: list[str]) -> list[str]:
+    universe: list[str] = [p for p in all_frontend_files if isinstance(p, str)]
+    seen = set(universe)
+    for category_name in ["priority_targets", "branding_targets", "theme_targets", "api_targets"]:
+        for path in repo_map.get(category_name, []) or []:
+            if isinstance(path, str) and path not in seen:
+                universe.append(path)
+                seen.add(path)
+    return universe
+
+
+_TARGET_FILE_ANCHORS = {
+    "data.js", "_app.js", "_app.jsx", "_app.tsx", "_document.js",
+    "index.js", "index.jsx", "index.tsx", "index.html",
+    "layout.js", "layout.jsx", "layout.tsx",
+}
+_AREA_TOKENS = ("navbar", "topbar", "header", "footer", "layout", "landing", "hero", "nav")
+_NOISE_TOKENS = (".test.", ".spec.", ".stories.", ".d.ts", "__tests__", "__mocks__", ".min.")
+
+
+def _score_candidate_path(
+    path: str,
+    keywords: set[str],
+    scope_tokens: set[str],
+    priority: set[str],
+    branding: set[str],
+    theme: set[str],
+    api: set[str],
+) -> float:
+    lower = path.lower()
+    parts = {p for p in re.split(r"[^a-z0-9]+", lower) if p}
+    score = 0.0
+
+    for keyword in keywords:
+        if keyword in parts:
+            score += 3.0
+        elif keyword in lower:
+            score += 1.0
+    for scope in scope_tokens:
+        if scope in parts:
+            score += 6.0
+        elif scope in lower:
+            score += 2.0
+
+    # Structural importance acts as a request-agnostic floor so well-known
+    # targets remain candidates even when the request has few keywords.
+    if path in priority:
+        score += 4.0
+    if path in branding:
+        score += 3.0
+    if path in theme:
+        score += 2.0
+    if path in api:
+        score += 2.0
+
+    base = lower.rsplit("/", 1)[-1]
+    if base in _TARGET_FILE_ANCHORS:
+        score += 1.5
+    if any(token in lower for token in _AREA_TOKENS):
+        score += 1.0
+    if any(token in lower for token in _NOISE_TOKENS):
+        score -= 5.0
+    return score
+
+
+def _rank_candidate_paths(
+    all_frontend_files: list[str],
+    repo_map: dict[str, Any],
+    manifest: dict[str, Any],
+) -> list[str]:
+    """Order candidate files by relevance to the specific change request."""
+    universe = _candidate_universe(repo_map, all_frontend_files)
+    if not universe:
+        return []
+    keywords, scope_tokens = _extract_request_signals(manifest)
+    priority = {p for p in repo_map.get("priority_targets", []) or [] if isinstance(p, str)}
+    branding = {p for p in repo_map.get("branding_targets", []) or [] if isinstance(p, str)}
+    theme = {p for p in repo_map.get("theme_targets", []) or [] if isinstance(p, str)}
+    api = {p for p in repo_map.get("api_targets", []) or [] if isinstance(p, str)}
+
+    scored: list[tuple[float, int, str]] = []
+    for index, path in enumerate(universe):
+        score = _score_candidate_path(path, keywords, scope_tokens, priority, branding, theme, api)
+        scored.append((score, index, path))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [path for _, _, path in scored]
+
+
+def _llm_select_target_paths(
+    client: ProjectLLMClient,
+    manifest: dict[str, Any],
+    ranked_paths: list[str],
+    limit: int,
+) -> list[str]:
+    """Second stage: a cheap LLM pass picks the real edit targets from the pool."""
+    pool = ranked_paths[:PLANNER_CANDIDATE_POOL_SIZE]
+    system_prompt = (
+        "You select which existing repository files must be edited to satisfy a frontend "
+        "customization request. Return strict JSON only."
+    )
+    user_prompt = (
+        "Customization manifest summary:\n"
+        f"{json.dumps(_manifest_summary(manifest), indent=2)}\n\n"
+        "Candidate files (relative paths, pre-ranked by relevance):\n"
+        f"{json.dumps(pool, indent=2)}\n\n"
+        f"Choose up to {limit} files from the candidate list that most likely need edits to implement "
+        "the manifest changes (visible text, branding, theme/colors, domains, layout/navigation). "
+        "Prefer page, component, and data files that render the affected UI. "
+        "Only return paths that appear verbatim in the candidate list.\n"
+        'Return a JSON object: {"files": ["path/from/repo/root", ...]}'
+    )
+    try:
+        result = client.complete_json(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=700)
+    except Exception as exc:
+        log_planner(f"LLM file selection failed; using heuristic ranking: {exc}")
+        return []
+
+    files = result.get("files", []) if isinstance(result, dict) else []
+    pool_set = set(pool)
+    selected: list[str] = []
+    for candidate in files if isinstance(files, list) else []:
+        if isinstance(candidate, str) and candidate in pool_set and candidate not in selected:
+            selected.append(candidate)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _select_target_files(
+    client: ProjectLLMClient | None,
+    manifest: dict[str, Any],
+    all_frontend_files: list[str],
+    repo_map: dict[str, Any],
+    limit: int = PLANNER_TARGET_FILE_LIMIT,
+) -> list[str]:
+    """Two-stage selection: heuristic request-aware ranking, then optional LLM narrowing."""
+    ranked = _rank_candidate_paths(all_frontend_files, repo_map, manifest)
+    if not ranked:
+        return []
+
+    selected: list[str] = []
+    if PLANNER_LLM_FILE_SELECTION and client is not None and client.is_configured() and len(ranked) > limit:
+        log_planner(f"Narrowing {len(ranked)} candidate files to <= {limit} via LLM file selection.")
+        selected = _llm_select_target_paths(client, manifest, ranked, limit)
+
+    if not selected:
+        return ranked[:limit]
+
+    # Keep the LLM's picks first, then backfill with top-ranked candidates so the
+    # planner still has nearby files available if the LLM missed one.
+    for path in ranked:
+        if len(selected) >= limit:
+            break
+        if path not in selected:
+            selected.append(path)
+    return selected[:limit]
+
+
+def _compact_repo_map(repo_map: dict[str, Any]) -> dict[str, Any]:
+    """Trim the repo map for the planner prompt so huge repos do not blow context."""
+    compact: dict[str, Any] = {}
+    for category_name in ["priority_targets", "branding_targets", "theme_targets", "api_targets"]:
+        values = [v for v in repo_map.get(category_name, []) or [] if isinstance(v, str)]
+        compact[category_name] = values[:40]
+    compact["all_frontend_files_count"] = len(repo_map.get("all_frontend_files", []) or [])
+    return compact
+
+
+def _collect_target_contexts(
+    repo_path: Path,
+    ordered_paths: list[str],
+    limit: int = PLANNER_TARGET_FILE_LIMIT,
+) -> list[dict[str, str]]:
     contexts: list[dict[str, str]] = []
     for relative_path in ordered_paths[:limit]:
         excerpt = _read_excerpt(repo_path, relative_path)
@@ -772,13 +998,6 @@ def plan_frontend_changes(state: dict) -> dict:
     validator_feedback = [
         item for item in errors if isinstance(item, str) and item.startswith("Validator issue")
     ]
-    target_contexts = _collect_target_contexts(repo_path, repo_map)
-    allowed_paths = {context["path"] for context in target_contexts}
-    file_content_by_path = {
-        relative_path: _read_file_content(repo_path, relative_path)
-        for relative_path in allowed_paths
-    }
-
     all_frontend_files_raw = repo_map.get("all_frontend_files", [])
     all_frontend_files = [
         path
@@ -786,6 +1005,27 @@ def plan_frontend_changes(state: dict) -> dict:
         if isinstance(path, str)
         and any(path.startswith(f"{app_root}/") for app_root in app_targets)
     ]
+
+    client = ProjectLLMClient()
+
+    # Two-stage, request-aware targeting: rank every candidate file by relevance
+    # to this manifest, then (on large repos) let a cheap LLM pass narrow it to the
+    # real edit targets. This replaces the fixed, request-agnostic priority list
+    # that missed the right file in big repositories.
+    selected_target_paths = _select_target_files(
+        client if client.is_configured() else None,
+        manifest,
+        all_frontend_files,
+        repo_map,
+        PLANNER_TARGET_FILE_LIMIT,
+    )
+    target_contexts = _collect_target_contexts(repo_path, selected_target_paths)
+    allowed_paths = {context["path"] for context in target_contexts}
+    file_content_by_path = {
+        relative_path: _read_file_content(repo_path, relative_path)
+        for relative_path in allowed_paths
+    }
+
     if not all_frontend_files:
         all_frontend_files = sorted(allowed_paths)
     deterministic_allowed_paths = set(all_frontend_files)
@@ -794,7 +1034,6 @@ def plan_frontend_changes(state: dict) -> dict:
         for relative_path in deterministic_allowed_paths
     }
 
-    client = ProjectLLMClient()
     if not client.is_configured():
         log_planner("Planner LLM client is not configured. Using deterministic fallback planner.")
         planned_changes = _build_deterministic_changes(
@@ -818,10 +1057,10 @@ def plan_frontend_changes(state: dict) -> dict:
     user_prompt = (
         "Manifest summary:\n"
         f"{json.dumps(_manifest_summary(manifest), indent=2)}\n\n"
-        "Repo map from scanner:\n"
-        f"{json.dumps(repo_map, indent=2)}\n\n"
-        "Complete frontend file inventory (selected app roots):\n"
-        f"{json.dumps(repo_map.get('all_frontend_files', []), indent=2)}\n\n"
+        "Repo map from scanner (trimmed):\n"
+        f"{json.dumps(_compact_repo_map(repo_map), indent=2)}\n\n"
+        "Editable frontend files for this request (only plan changes against these):\n"
+        f"{json.dumps(sorted(allowed_paths), indent=2)}\n\n"
         "Candidate file excerpts:\n"
         f"{json.dumps(target_contexts, indent=2)}\n\n"
         "Prior validator issues from previous pass:\n"

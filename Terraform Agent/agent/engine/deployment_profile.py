@@ -4,7 +4,6 @@ import json
 from typing import Any
 
 from .bundle import build_manifest_bundle
-from .cloudposse_atmos import build_cloudposse_atmos_bundle
 from .enterprise_bundle import build_enterprise_profile_bundle
 from .runtime import DEFAULT_PROVIDER_CONSTRAINT, slugify
 
@@ -507,8 +506,13 @@ resource "aws_security_group" "app" {{
 
     rds_tf = ""
     if postgres:
+        rds_engine = str(postgres.get("engine") or "postgres").strip().lower()
+        if rds_engine not in {"postgres", "mysql", "mariadb"}:
+            rds_engine = "postgres"
+        rds_port = 3306 if rds_engine in {"mysql", "mariadb"} else 5432
+        _default_db_versions = {"postgres": "15.4", "mysql": "8.0", "mariadb": "10.11"}
         rds_class = str(postgres.get("instance_class") or "db.t3.small")
-        rds_version = str(postgres.get("engine_version") or "15.4")
+        rds_version = str(postgres.get("engine_version") or _default_db_versions[rds_engine])
         rds_storage = int(postgres.get("storage_gb") or 20)
         rds_backup = int(postgres.get("backup_retention_days") or 7)
         rds_multi_az = str(bool(postgres.get("multi_az"))).lower()
@@ -518,8 +522,8 @@ resource "aws_security_group" "db" {{
   vpc_id      = local.vpc_id
 
   ingress {{
-    from_port       = 5432
-    to_port         = 5432
+    from_port       = {rds_port}
+    to_port         = {rds_port}
     protocol        = "tcp"
     security_groups = [aws_security_group.app.id]
   }}
@@ -538,8 +542,8 @@ resource "aws_db_subnet_group" "main" {{
 }}
 
 resource "aws_db_instance" "main" {{
-  identifier              = "${{var.project_name}}-postgres"
-  engine                  = "postgres"
+  identifier              = "${{var.project_name}}-{rds_engine}"
+  engine                  = "{rds_engine}"
   engine_version          = "{rds_version}"
   instance_class          = "{rds_class}"
   allocated_storage       = {rds_storage}
@@ -558,6 +562,7 @@ resource "aws_db_instance" "main" {{
     redis_tf = ""
     if redis:
         redis_node_type = str(redis.get("node_type") or "cache.t3.small")
+        redis_version = str(redis.get("engine_version") or "7.0")
         redis_tf = f"""
 resource "aws_security_group" "cache" {{
   name_prefix = "${{var.project_name}}-cache-"
@@ -586,6 +591,7 @@ resource "aws_elasticache_subnet_group" "main" {{
 resource "aws_elasticache_cluster" "main" {{
   cluster_id           = "${{var.project_name}}-redis"
   engine               = "redis"
+  engine_version       = "{redis_version}"
   node_type            = "{redis_node_type}"
   num_cache_nodes      = 1
   port                 = 6379
@@ -868,24 +874,3 @@ def build_profile_bundle(
         )
         warnings.insert(0, f"Enterprise renderer failed and fell back to the legacy EC2-oriented bundle: {exc}")
         return files, warnings
-
-
-def build_cloudposse_profile_bundle(
-    *,
-    payload: dict[str, Any],
-    aws_region: str,
-    state_bucket: str,
-    lock_table: str,
-    context_summary: str,
-    website_index_html: str,
-    requested_renderer: str = "auto",
-) -> tuple[dict[str, str], list[str], dict[str, Any]]:
-    return build_cloudposse_atmos_bundle(
-        payload=payload,
-        aws_region=aws_region,
-        state_bucket=state_bucket,
-        lock_table=lock_table,
-        context_summary=context_summary,
-        website_index_html=website_index_html,
-        requested_renderer=requested_renderer,
-    )

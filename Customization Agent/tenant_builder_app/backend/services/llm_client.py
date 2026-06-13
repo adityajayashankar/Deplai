@@ -33,6 +33,10 @@ class ProjectLLMClient:
             "on",
         }
         self.max_retries = max(0, int(os.getenv("LLM_MAX_RETRIES", "2") or "2"))
+        self.request_timeout_seconds = max(
+            5,
+            int(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "20") or "20"),
+        )
         self.retry_base_delay_seconds = max(
             0.1,
             float(os.getenv("LLM_RETRY_BASE_DELAY_SECONDS", "1.5") or "1.5"),
@@ -101,7 +105,7 @@ class ProjectLLMClient:
             method="POST",
         )
 
-        with request.urlopen(req, timeout=60) as response:
+        with request.urlopen(req, timeout=self.request_timeout_seconds) as response:
             return response.read().decode("utf-8")
 
     def _is_transient_http_error(self, code: int, details: str) -> bool:
@@ -221,7 +225,10 @@ class ProjectLLMClient:
                     f"Could not reach LLM API (provider={self.provider}, url={self.api_url}): {exc.reason}"
                 ) from exc
 
-        parsed_body = json.loads(body)
+        try:
+            parsed_body = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("LLM API returned non-JSON response") from exc
         if self.provider == "anthropic":
             content_blocks = parsed_body.get("content", []) if isinstance(parsed_body, dict) else []
             text_parts: list[str] = []
@@ -233,7 +240,19 @@ class ProjectLLMClient:
             if not raw_text:
                 raise RuntimeError("Unexpected response format from Anthropic API")
         else:
-            content = parsed_body["choices"][0]["message"]["content"]
+            if not isinstance(parsed_body, dict):
+                raise RuntimeError("Unexpected response format from LLM API: response body is not an object")
+            choices = parsed_body.get("choices")
+            if not isinstance(choices, list) or not choices:
+                detail = parsed_body.get("error") if isinstance(parsed_body.get("error"), (str, dict)) else parsed_body
+                raise RuntimeError(f"Unexpected response format from LLM API: missing choices ({str(detail)[:300]})")
+            first_choice = choices[0]
+            if not isinstance(first_choice, dict):
+                raise RuntimeError("Unexpected response format from LLM API: invalid choices[0]")
+            message = first_choice.get("message")
+            if not isinstance(message, dict) or "content" not in message:
+                raise RuntimeError("Unexpected response format from LLM API: missing message.content")
+            content = message["content"]
             raw_text = self._normalize_content(content)
         return self._parse_json(raw_text)
 

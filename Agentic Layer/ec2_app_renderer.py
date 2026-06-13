@@ -24,16 +24,16 @@ def _safe_slug(value: str) -> str:
     return (slug or "deplai-app")[:40]
 
 
-def _instance_type(user_answers: dict[str, Any] | None, deployment_profile: dict[str, Any] | None) -> str:
-    allowed = {"t3.micro", "t3.small", "t3.medium", "t3.large"}
-    for source in (user_answers or {}, deployment_profile or {}):
-        for key, value in source.items():
-            if "instance" not in str(key).lower():
-                continue
-            candidate = str(value or "").strip().lower()
-            if candidate in allowed:
-                return candidate
-    return "t3.micro"
+def _cidr_list(value: Any) -> list[str]:
+    raw_items = value if isinstance(value, list) else str(value or "").split(",")
+    result: list[str] = []
+    for item in raw_items:
+        cidr = str(item or "").strip()
+        if not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}/\d{1,2}", cidr):
+            continue
+        if cidr not in result:
+            result.append(cidr)
+    return result
 
 
 def _record(value: Any) -> dict[str, Any]:
@@ -67,11 +67,59 @@ def _int(value: Any, default: int, minimum: int | None = None, maximum: int | No
     return result
 
 
+def _ec2_config_from_source(source: dict[str, Any] | None) -> dict[str, Any]:
+    record = _record(source)
+    nested = _record(record.get("ec2_resource_config"))
+    ec2 = _record(record.get("ec2"))
+    return {
+        **nested,
+        **ec2,
+        "instance_type": record.get("instance_type") or record.get("ec2_instance_type") or record.get("compute_instance_type") or nested.get("instance_type") or ec2.get("instance_type"),
+        "root_volume_size_gb": record.get("root_volume_size_gb") or record.get("ec2_root_volume_size_gb") or nested.get("root_volume_size_gb") or ec2.get("root_volume_size_gb"),
+        "app_port": record.get("app_port") or nested.get("app_port") or ec2.get("app_port"),
+        "ssh_ingress_cidr_blocks": record.get("ssh_ingress_cidr_blocks") or nested.get("ssh_ingress_cidr_blocks") or ec2.get("ssh_ingress_cidr_blocks"),
+    }
+
+
+def _ec2_settings(
+    user_answers: dict[str, Any] | None,
+    deployment_profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    allowed = {"t3.micro", "t3.small", "t3.medium", "t3.large"}
+    profile = deployment_profile or {}
+    decision = _record(profile.get("consultant_decision"))
+    stack_config = _record(decision.get("stack_config"))
+    decision_ec2 = {
+        **_record(stack_config.get("ec2-instance")),
+        **_record(stack_config.get("ec2")),
+    }
+    merged = {
+        "instance_type": "t3.micro",
+        "root_volume_size_gb": 35,
+        "app_port": 3000,
+        "ssh_ingress_cidr_blocks": [],
+        **_ec2_config_from_source(user_answers),
+        **decision_ec2,
+    }
+    instance_type = str(merged.get("instance_type") or "").strip().lower()
+    if instance_type not in allowed:
+        instance_type = "t3.micro"
+    return {
+        "instance_type": instance_type,
+        "root_volume_size_gb": _int(merged.get("root_volume_size_gb"), 35, minimum=20, maximum=200),
+        "app_port": _int(merged.get("app_port"), 3000, minimum=1, maximum=65535),
+        "ssh_ingress_cidr_blocks": _cidr_list(merged.get("ssh_ingress_cidr_blocks")),
+    }
+
+
 def _component_config(deployment_profile: dict[str, Any] | None, name: str) -> dict[str, Any]:
     profile = deployment_profile or {}
     decision = _record(profile.get("consultant_decision"))
     stack_config = _record(decision.get("stack_config"))
-    config = _record(stack_config.get(name))
+    if name == "ec2":
+        config = {**_record(stack_config.get("ec2-instance")), **_record(stack_config.get("ec2"))}
+    else:
+        config = _record(stack_config.get(name))
     if config:
         return config
     return _record(profile.get(name))
@@ -127,10 +175,15 @@ def render_ec2_app_bundle(
     context_summary: str = "",
     state_bucket: str = "",
     lock_table: str = "",
+    repository_url: str = "",
 ) -> dict[str, Any]:
     project_slug = _safe_slug(project_name)
     environment = str((deployment_profile or {}).get("environment") or "production").strip().lower() or "production"
-    instance_type = _instance_type(user_answers, deployment_profile)
+    ec2_settings = _ec2_settings(user_answers, deployment_profile)
+    instance_type = str(ec2_settings["instance_type"])
+    app_port = int(ec2_settings["app_port"])
+    root_volume_size_gb = int(ec2_settings["root_volume_size_gb"])
+    ssh_ingress_cidr_blocks = list(ec2_settings["ssh_ingress_cidr_blocks"])
     database = _database_settings(deployment_profile)
     redis = _redis_settings(deployment_profile)
     backend_tf = 'terraform {\n  backend "local" {}\n}\n'
@@ -203,7 +256,7 @@ variable "app_kind" {{
 
 variable "app_port" {{
   type    = number
-  default = {deployment_package.app_port}
+  default = {app_port}
 }}
 
 variable "health_path" {{
@@ -226,6 +279,16 @@ variable "artifact_source" {{
   default = {_hcl_string(deployment_package.package_id)}
 }}
 
+variable "repository_url" {{
+  type    = string
+  default = {_hcl_string(repository_url)}
+}}
+
+variable "app_subdir" {{
+  type    = string
+  default = {_hcl_string(deployment_package.selected_root)}
+}}
+
 variable "state_bucket" {{
   type    = string
   default = {_hcl_string(state_bucket)}
@@ -239,6 +302,15 @@ variable "lock_table" {{
 variable "app_archive_base64" {{
   type      = string
   sensitive = true
+}}
+
+variable "root_volume_size_gb" {{
+  type    = number
+  default = {root_volume_size_gb}
+  validation {{
+    condition     = var.root_volume_size_gb >= 20 && var.root_volume_size_gb <= 200
+    error_message = "root_volume_size_gb must be between 20 and 200."
+  }}
 }}
 
 variable "ingress_cidr_blocks" {{
@@ -327,19 +399,22 @@ aws_region = {_hcl_string(aws_region)}
 environment = {_hcl_string(environment)}
 instance_type = {_hcl_string(instance_type)}
 app_kind = {_hcl_string(deployment_package.app_kind)}
-app_port = {deployment_package.app_port}
+app_port = {app_port}
 health_path = {_hcl_string(deployment_package.health_path)}
 build_command = {_hcl_string(deployment_package.build_command)}
 start_command = {_hcl_string(deployment_package.start_command)}
 artifact_source = {_hcl_string(deployment_package.package_id)}
+repository_url = {_hcl_string(repository_url)}
+app_subdir = {_hcl_string(deployment_package.selected_root)}
 state_bucket = {_hcl_string(state_bucket)}
 lock_table = {_hcl_string(lock_table)}
 ingress_cidr_blocks = {_hcl_string_list(["0.0.0.0/0"])}
-ssh_ingress_cidr_blocks = []
+ssh_ingress_cidr_blocks = {_hcl_string_list(ssh_ingress_cidr_blocks)}
 use_default_vpc = true
 enable_ec2 = true
 existing_ec2_key_pair_name = ""
 app_archive_base64 = {_hcl_string(deployment_package.package_base64)}
+root_volume_size_gb = {root_volume_size_gb}
 enable_rds = {str(bool(database["enabled"])).lower()}
 db_engine = {_hcl_string(database.get("engine"))}
 db_engine_version = {_hcl_string(database.get("engine_version"))}
@@ -672,46 +747,115 @@ resource "aws_instance" "app" {
   user_data_base64 = base64encode(<<-USERDATA
 #!/bin/bash
 set -euxo pipefail
+exec > >(tee -a /var/log/deplai-bootstrap.log) 2>&1
 
-APP_DIR="/opt/deplai-app"
+APP_ROOT="/opt/${var.project_name}"
+APP_SUBDIR=${jsonencode(var.app_subdir)}
+if [ -z "$APP_SUBDIR" ] || [ "$APP_SUBDIR" = "." ]; then
+  APP_DIR="$APP_ROOT"
+else
+  APP_DIR="$APP_ROOT/$APP_SUBDIR"
+fi
+APP_NAME="${var.project_name}-frontend"
 APP_PORT="${var.app_port}"
 APP_KIND="${var.app_kind}"
+REPOSITORY_URL=${jsonencode(var.repository_url)}
 BUILD_COMMAND=${jsonencode(var.build_command)}
 START_COMMAND=${jsonencode(var.start_command)}
 HEALTH_PATH=${jsonencode(var.health_path)}
+BOOTSTRAP_STATUS_FILE="/var/log/deplai-bootstrap-status.json"
+
+write_status() {
+  printf '{"phase":"%s","timestamp":"%s"}\n' "$1" "$(date -Is)" > "$BOOTSTRAP_STATUS_FILE"
+}
+
+write_status "starting"
 
 dnf update -y
-dnf install -y nginx tar gzip
+dnf install -y git nginx tar gzip cloud-utils-growpart xfsprogs
+growpart /dev/nvme0n1 1 || true
+xfs_growfs -d / || resize2fs /dev/nvme0n1p1 || true
+df -h || true
+
 if [ "$APP_KIND" = "node" ]; then
   dnf install -y nodejs npm
+  swapoff /swapfile || true
+  rm -f /swapfile
+  fallocate -l 6G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
 fi
 if [ "$APP_KIND" = "python" ]; then
   dnf install -y python3 python3-pip
 fi
+write_status "runtime_packages_installed"
 
-rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR"
-cat >/tmp/deplai-app.tgz.b64 <<'ARCHIVE'
+unpack_embedded_archive() {
+  rm -rf "$APP_ROOT"
+  mkdir -p "$APP_DIR"
+  cat >/tmp/deplai-app.tgz.b64 <<'ARCHIVE'
 ${var.app_archive_base64}
 ARCHIVE
-base64 -d /tmp/deplai-app.tgz.b64 >/tmp/deplai-app.tgz
-tar -xzf /tmp/deplai-app.tgz -C "$APP_DIR"
-chown -R ec2-user:ec2-user "$APP_DIR"
+  base64 -d /tmp/deplai-app.tgz.b64 >/tmp/deplai-app.tgz
+  tar -xzf /tmp/deplai-app.tgz -C "$APP_DIR"
+  chown -R ec2-user:ec2-user "$APP_ROOT"
+  write_status "application_unpacked_from_archive"
+}
+
+if [ -n "$REPOSITORY_URL" ]; then
+  mkdir -p "$(dirname "$APP_ROOT")"
+  if [ -d "$APP_ROOT/.git" ]; then
+    cd "$APP_ROOT"
+    git pull --ff-only || git pull
+  else
+    rm -rf "$APP_ROOT"
+    if ! git clone "$REPOSITORY_URL" "$APP_ROOT"; then
+      write_status "repository_clone_failed_archive_fallback"
+      unpack_embedded_archive
+    fi
+  fi
+  if [ -d "$APP_ROOT" ]; then
+    chown -R ec2-user:ec2-user "$APP_ROOT"
+  fi
+  if [ ! -d "$APP_DIR" ]; then
+    write_status "app_subdir_missing_archive_fallback"
+    unpack_embedded_archive
+  else
+    write_status "repository_synced"
+  fi
+else
+  unpack_embedded_archive
+fi
 
 cd "$APP_DIR"
 if [ "$APP_KIND" = "node" ]; then
-  if [ -f package-lock.json ]; then npm ci --omit=dev || npm install --omit=dev; else npm install --omit=dev; fi
-  if [ -n "$BUILD_COMMAND" ]; then su -s /bin/bash ec2-user -c "cd $APP_DIR && $BUILD_COMMAND"; fi
+  npm cache clean --force || true
+  if [ -f package-lock.json ]; then npm ci --legacy-peer-deps || npm install --legacy-peer-deps; else npm install --legacy-peer-deps; fi
+  if [ -n "$BUILD_COMMAND" ]; then export NODE_OPTIONS="--max-old-space-size=4096"; $BUILD_COMMAND; fi
 fi
 if [ "$APP_KIND" = "python" ] && [ -f requirements.txt ]; then
   python3 -m pip install -r requirements.txt
 fi
+write_status "application_dependencies_ready"
 
 if [ "$APP_KIND" = "static" ]; then
   rm -rf /usr/share/nginx/html/*
   cp -R "$APP_DIR"/. /usr/share/nginx/html/
+  write_status "static_site_staged"
 else
-  cat >/etc/systemd/system/deplai-app.service <<SERVICE
+  if [ "$APP_KIND" = "node" ]; then
+    npm install -g pm2
+    pm2 delete "$APP_NAME" || true
+    if [ -x node_modules/next/dist/bin/next ]; then
+      PORT="$APP_PORT" pm2 start node_modules/next/dist/bin/next --name "$APP_NAME" -- start -p "$APP_PORT"
+    else
+      PORT="$APP_PORT" pm2 start bash --name "$APP_NAME" -- -lc "cd '$APP_DIR' && PORT='$APP_PORT' $START_COMMAND"
+    fi
+    pm2 save
+  else
+    cat >/etc/systemd/system/deplai-app.service <<SERVICE
 [Unit]
 Description=DeplAI deployed application
 After=network.target
@@ -723,13 +867,14 @@ Environment=PORT=$APP_PORT
 ExecStart=/bin/bash -lc "$START_COMMAND"
 Restart=always
 RestartSec=5
-User=ec2-user
 
 [Install]
 WantedBy=multi-user.target
 SERVICE
-  systemctl daemon-reload
-  systemctl enable --now deplai-app
+    systemctl daemon-reload
+    systemctl enable --now deplai-app
+  fi
+  write_status "application_service_started"
   cat >/etc/nginx/conf.d/deplai-app.conf <<NGINX
 server {
   listen 80 default_server;
@@ -746,14 +891,31 @@ server {
 NGINX
 fi
 
+nginx -t
 systemctl enable --now nginx
 systemctl restart nginx
-curl -fsS "http://127.0.0.1$HEALTH_PATH" || curl -fsS "http://127.0.0.1/"
+write_status "nginx_started"
+for attempt in $(seq 1 30); do
+  if curl -fsS "http://127.0.0.1:$APP_PORT$HEALTH_PATH" || curl -fsS "http://127.0.0.1:$APP_PORT/"; then
+    write_status "ready"
+    exit 0
+  fi
+  sleep 5
+done
+write_status "health_check_failed"
+curl -v "http://127.0.0.1:$APP_PORT$HEALTH_PATH" || true
+curl -v "http://127.0.0.1:$APP_PORT/" || true
+curl -v "http://127.0.0.1/" || true
+systemctl status nginx --no-pager || true
+systemctl status deplai-app --no-pager || true
+journalctl -u deplai-app --no-pager -n 80 || true
+pm2 status || true
+exit 1
 USERDATA
   )
 
   root_block_device {
-    volume_size           = 12
+    volume_size           = var.root_volume_size_gb
     volume_type           = "gp3"
     delete_on_termination = true
   }
@@ -862,7 +1024,9 @@ Generated by the deterministic `deplai_ec2_app` renderer. No LLM generated Terra
 
 - Project: `{project_slug}`
 - App kind: `{deployment_package.app_kind}`
-- App port: `{deployment_package.app_port}`
+- EC2 instance type: `{instance_type}`
+- Root volume: `{root_volume_size_gb}GB`
+- App port: `{app_port}`
 - Health path: `{deployment_package.health_path}`
 - Package files: `{deployment_package.package_file_count}`
 - Package bytes: `{deployment_package.package_bytes}`

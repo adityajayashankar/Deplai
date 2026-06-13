@@ -1,6 +1,7 @@
 import json
 import difflib
 import hashlib
+import os
 from pathlib import Path
 from typing import Any
 
@@ -221,27 +222,31 @@ def _snapshot_repo_files(repo_root: Path) -> dict[str, str]:
     if not repo_root.exists() or not repo_root.is_dir():
         return snapshot
 
-    for absolute_path in repo_root.rglob("*"):
-        if not absolute_path.is_file():
-            continue
+    for current_root, dir_names, file_names in os.walk(repo_root):
+        dir_names[:] = [
+            name for name in dir_names
+            if name not in SNAPSHOT_IGNORED_DIR_NAMES
+        ]
+        current_path = Path(current_root)
+        for file_name in file_names:
+            absolute_path = current_path / file_name
+            if not absolute_path.is_file():
+                continue
 
-        try:
-            relative_path = absolute_path.relative_to(repo_root).as_posix()
-        except ValueError:
-            continue
+            try:
+                relative_path = absolute_path.relative_to(repo_root).as_posix()
+            except ValueError:
+                continue
 
-        if any(part in SNAPSHOT_IGNORED_DIR_NAMES for part in Path(relative_path).parts):
-            continue
+            hasher = hashlib.sha256()
+            try:
+                with absolute_path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+            except OSError:
+                continue
 
-        hasher = hashlib.sha256()
-        try:
-            with absolute_path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    hasher.update(chunk)
-        except OSError:
-            continue
-
-        snapshot[relative_path] = hasher.hexdigest()
+            snapshot[relative_path] = hasher.hexdigest()
 
     return snapshot
 
@@ -401,6 +406,7 @@ def implement_tenant(request: ImplementRequest) -> dict:
         "preview": result.get("preview"),
         "diagnostic": result.get("diagnostic"),
         "errors": errors,
+        "warnings": result.get("warnings", []),
         "plan_markdown_path": result.get("plan_markdown_path", ""),
     }
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -64,6 +65,22 @@ def _string_or_default(value: object, default: str) -> str:
 def _safe_css_value(value: str, fallback: str) -> str:
     cleaned = value.strip().replace("\n", " ").replace("\r", " ")
     cleaned = re.sub(r"[^#a-zA-Z0-9_\-\s,.'\"]", "", cleaned)
+    named_colors = {
+        "black": "#000000",
+        "white": "#ffffff",
+        "red": "#ef4444",
+        "blue": "#3b82f6",
+        "green": "#22c55e",
+        "yellow": "#eab308",
+        "orange": "#f97316",
+        "purple": "#a855f7",
+        "pink": "#ec4899",
+        "gray": "#6b7280",
+        "grey": "#6b7280",
+    }
+    normalized = cleaned.lower()
+    if normalized in named_colors:
+        return named_colors[normalized]
     return cleaned or fallback
 
 
@@ -102,6 +119,23 @@ def _extension_scope_targets(scope: object) -> set[str]:
 
 def _path_is_ignored(path: Path) -> bool:
     return any(part in IGNORED_WALK_DIRECTORIES for part in path.parts)
+
+
+def _iter_unignored_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    if not root.exists():
+        return files
+    for current_root, dir_names, file_names in os.walk(root):
+        dir_names[:] = [
+            name for name in dir_names
+            if name not in IGNORED_WALK_DIRECTORIES
+        ]
+        current_path = Path(current_root)
+        for file_name in sorted(file_names):
+            path = current_path / file_name
+            if path.is_file() and not path.is_symlink():
+                files.append(path)
+    return files
 
 
 def _tailwind_arbitrary_color(primary: str) -> str:
@@ -700,6 +734,11 @@ def _write_tenant_theme_css(repo_root: Path, manifest: dict[str, Any], modified:
         f"  --tenant-font-heading: '{font_heading}', sans-serif;\n"
         f"  --tenant-font-body: '{font_body}', sans-serif;\n"
         f"  --tenant-radius: {border_radius};\n"
+        f"  --primary-400: {primary};\n"
+        f"  --primary-500: {primary};\n"
+        f"  --primary-600: {primary};\n"
+        f"  --primary-main: {primary};\n"
+        f"  --secondary-main: {secondary};\n"
         "}\n\n"
         "* {\n"
         "  font-family: var(--tenant-font-body);\n"
@@ -750,6 +789,27 @@ def _write_tenant_theme_css(repo_root: Path, manifest: dict[str, Any], modified:
 
     theme_path = repo_root / app_root / "styles" / "tenant-theme.css"
     _write_text(theme_path, content, modified, repo_root)
+    _ensure_tenant_theme_import(repo_root, modified, app_root)
+
+
+def _ensure_tenant_theme_import(repo_root: Path, modified: list[str], app_root: str) -> None:
+    app_file = repo_root / app_root / "pages" / "_app.js"
+    if not app_file.exists():
+        return
+
+    original = _read_text(app_file)
+    if not original or "styles/tenant-theme.css" in original:
+        return
+
+    pattern = r"(import\s+['\"]\.\./styles/globals\.css['\"][ \t]*;?)"
+    updated, count = re.subn(
+        pattern,
+        "\\g<1>\nimport '../styles/tenant-theme.css';",
+        original,
+        count=1,
+    )
+    if count and updated != original:
+        _write_text(app_file, updated, modified, repo_root)
 
 
 def _patch_hardcoded_tailwind_primary(repo_root: Path, manifest: dict[str, Any], modified: list[str], app_root: str) -> None:
@@ -773,6 +833,11 @@ def _patch_hardcoded_tailwind_primary(repo_root: Path, manifest: dict[str, Any],
         "#3b82f6",
         "#2563eb",
         "#1d4ed8",
+        "#0c74d1",
+        "#0c74d4",
+        "#ff6b00",
+        "#ffa559",
+        "#0a66c2",
     ]
     old_primary_rgb_tokens = [
         (59, 130, 246),
@@ -810,6 +875,16 @@ def _patch_hardcoded_tailwind_primary(repo_root: Path, manifest: dict[str, Any],
         for token in old_primary_hex_tokens:
             updated, count = re.subn(re.escape(token), primary, updated, flags=re.IGNORECASE)
             changed += count
+
+        # Repair previous/custom literal named colors in theme objects; MUI
+        # requires parseable CSS color formats such as #000000.
+        updated, count = re.subn(
+            r"(\bmain\s*:\s*['\"])(black)(['\"])",
+            rf"\g<1>{primary}\g<3>",
+            updated,
+            flags=re.IGNORECASE,
+        )
+        changed += count
 
         # Replace rgb()/rgba() blue literals used in inline style attributes.
         for r, g, b in old_primary_rgb_tokens:
@@ -984,6 +1059,72 @@ def _write_tenant_branding_file(repo_root: Path, manifest: dict[str, Any], modif
 
     path = repo_root / app_root / "utils" / "tenantBranding.js"
     _write_text(path, content, modified, repo_root)
+
+
+def _set_nested_string_property(content: str, object_key: str, property_name: str, value: str) -> str:
+    object_match = re.search(rf"\b{re.escape(object_key)}\s*:\s*\{{", content)
+    if not object_match:
+        return content
+
+    object_open = content.find("{", object_match.start())
+    object_close = _find_matching_brace(content, object_open)
+    if object_open == -1 or object_close == -1:
+        return content
+
+    object_content = content[object_open: object_close + 1]
+    updated_object = _set_object_property(object_content, property_name, value)
+    if updated_object == object_content:
+        return content
+
+    return content[:object_open] + updated_object + content[object_close + 1:]
+
+
+def _patch_app_config_file(repo_root: Path, manifest: dict[str, Any], modified: list[str], app_root: str) -> None:
+    categories = _as_dict(manifest.get("categories"))
+    branding = _as_dict(categories.get("branding"))
+    theme = _as_dict(categories.get("theme"))
+    domains = _as_dict(categories.get("domains"))
+
+    path = repo_root / app_root / "config" / "appConfig.js"
+    if not path.exists():
+        return
+
+    original = _read_text(path)
+    updated = original
+
+    company_name = _string_or_default(branding.get("company_name"), "")
+    title = _string_or_default(branding.get("title"), "")
+    description = _string_or_default(branding.get("description"), "")
+    contact_email = _string_or_default(branding.get("contact_email"), "")
+    contact_phone = _string_or_default(branding.get("contact_phone"), "")
+    site_url = _string_or_default(domains.get("site_url"), "")
+    primary = _safe_css_value(_string_or_default(theme.get("primary"), ""), "")
+
+    if company_name:
+        updated = _set_object_property(updated, "companyName", company_name)
+        updated = _set_nested_string_property(updated, "seo", "siteName", company_name)
+        updated = _set_nested_string_property(updated, "seo", "defaultTitle", company_name)
+    if title:
+        updated = _set_nested_string_property(updated, "description", "title", title)
+    if description:
+        updated = _set_nested_string_property(updated, "description", "subtitle", description)
+        updated = _set_nested_string_property(updated, "seo", "defaultDescription", description)
+    if contact_email:
+        updated = _set_nested_string_property(updated, "contact", "email", contact_email)
+    if contact_phone:
+        updated = _set_nested_string_property(updated, "contact", "phone", contact_phone)
+    if site_url:
+        updated = _set_nested_string_property(updated, "contact", "url", site_url)
+    if primary:
+        updated = re.sub(
+            r'(primary\s*:\s*\{[\s\S]*?\b500\s*:\s*)"[^"]*"',
+            f'\\g<1>"{_safe_js_string(primary)}"',
+            updated,
+            count=1,
+        )
+
+    if updated != original:
+        _write_text(path, updated, modified, repo_root)
 
 
 def _patch_data_file(repo_root: Path, manifest: dict[str, Any], modified: list[str], app_root: str) -> None:
@@ -1415,6 +1556,27 @@ def _patch_static_root_literal_replacements(repo_root: Path, manifest: dict[str,
             _write_text(file_path, updated, modified, repo_root)
 
 
+def _patch_node_esm_import_compat(repo_root: Path, modified: list[str], app_root: str) -> None:
+    frontend_root = repo_root / app_root
+    if not frontend_root.exists():
+        return
+
+    for file_path in frontend_root.rglob("*"):
+        if _path_is_ignored(file_path):
+            continue
+        if not file_path.is_file() or file_path.suffix not in {".js", ".jsx", ".ts", ".tsx"}:
+            continue
+
+        original = _read_text(file_path)
+        if "react-icons/si" not in original:
+            continue
+
+        updated = original.replace('"react-icons/si"', '"react-icons/si/index.js"')
+        updated = updated.replace("'react-icons/si'", "'react-icons/si/index.js'")
+        if updated != original:
+            _write_text(file_path, updated, modified, repo_root)
+
+
 def apply_deterministic_customizations(
     manifest: dict[str, Any],
     repo_path: str,
@@ -1436,6 +1598,7 @@ def apply_deterministic_customizations(
         _write_tenant_theme_css(repo_root, manifest, modified, app_root)
         _write_tenant_feature_file(repo_root, manifest, modified, app_root)
         _write_tenant_branding_file(repo_root, manifest, modified, app_root)
+        _patch_app_config_file(repo_root, manifest, modified, app_root)
         _patch_data_file(repo_root, manifest, modified, app_root)
         _patch_domain_and_api_config(repo_root, manifest, modified, app_root)
         _patch_meta_and_titles(repo_root, manifest, modified, app_root)
@@ -1443,6 +1606,7 @@ def apply_deterministic_customizations(
         _patch_hardcoded_secondary_text(repo_root, manifest, modified, app_root)
         _patch_feature_toggles(repo_root, modified, app_root)
         _patch_frontend_literal_replacements(repo_root, manifest, modified, app_root)
+        _patch_node_esm_import_compat(repo_root, modified, app_root)
 
     _log(f"Deterministic customization complete. Files affected: {modified}")
     return modified

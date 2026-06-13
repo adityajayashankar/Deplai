@@ -335,7 +335,7 @@ async function estimateDecisionCost(params: {
         component,
         label: 'account-map',
         hourly: FALLBACK.account_map_hourly,
-        note: 'Control-plane baseline estimate for Atmos account-map orchestration.',
+        note: 'Control-plane baseline estimate for account mapping orchestration.',
         source: 'fallback',
       });
       continue;
@@ -344,6 +344,7 @@ async function estimateDecisionCost(params: {
     if (component === 'ec2-instance') {
       const ec2Cfg = asRecord(stackConfig['ec2-instance'] || stackConfig.ec2);
       const instanceType = String(ec2Cfg.instance_type || 't3.micro').trim().toLowerCase();
+      const rootVolumeSizeGb = toPositiveNumber(ec2Cfg.root_volume_size_gb, 35);
 
       let ec2Rate: number | null = null;
       const ec2Payload = await fetchPricingBlob('AmazonEC2', params.awsRegion);
@@ -366,7 +367,7 @@ async function estimateDecisionCost(params: {
         component,
         label: 'ec2-instance',
         hourly: ec2Rate || fallback.hourly,
-        note: `${instanceType}${fallback.nearestType ? `, nearest=${fallback.nearestType}` : ''}`,
+        note: `${instanceType}, root=${rootVolumeSizeGb}GB${fallback.nearestType ? `, nearest=${fallback.nearestType}` : ''}`,
         source: ec2Rate ? 'pricing_api' : 'fallback',
       });
       continue;

@@ -129,6 +129,7 @@ type ImplementResponse = {
   change_sources?: Array<{ file: string; source: string; operation?: string }>;
   quality_report?: QualityReport;
   preview?: PreviewPayload;
+  warnings?: string[];
   plan_markdown_path?: string;
 };
 
@@ -146,8 +147,9 @@ type PreviewMetaResponse = {
   preview_entry?: string | null;
   preview_kind?: 'live_server' | 'static_file';
   preview_url?: string | null;
-  preview_status?: 'ready' | 'unavailable' | 'failed' | 'stopped';
+  preview_status?: 'ready' | 'unavailable' | 'failed' | 'stopped' | 'starting';
   preview_error?: string | null;
+  preview_detail?: string | null;
 };
 
 type QualityReport = {
@@ -503,6 +505,14 @@ function sanitizeManifestForDisplay(manifest: Record<string, unknown>): Record<s
   return clone;
 }
 
+function diffLineClassName(line: string): string {
+  if (line.startsWith('+++') || line.startsWith('---')) return 'text-zinc-400';
+  if (line.startsWith('@@')) return 'bg-cyan-400/10 text-cyan-200';
+  if (line.startsWith('+')) return 'bg-emerald-400/10 text-emerald-200';
+  if (line.startsWith('-')) return 'bg-rose-400/10 text-rose-200';
+  return 'text-zinc-300';
+}
+
 async function parseJsonSafe<T>(response: Response): Promise<T | null> {
   try {
     return (await response.json()) as T;
@@ -595,14 +605,15 @@ export default function CustomizationConsoleApp() {
   }, [effectiveTenantId, previewNonce, projectIdFromQuery]);
 
   const effectivePreviewUrl = useMemo(() => {
-    if (previewMeta?.preview_kind === 'live_server' && previewMeta.preview_status === 'ready' && previewMeta.preview_url) {
-      return previewMeta.preview_url;
-    }
-    if (lastPreviewPayload?.kind === 'live_server' && lastPreviewPayload.status === 'ready' && lastPreviewPayload.url) {
-      return lastPreviewPayload.url;
-    }
     return previewUrl;
-  }, [lastPreviewPayload, previewMeta, previewUrl]);
+  }, [previewUrl]);
+
+  const previewAddressLabel = useMemo(() => {
+    if (previewMeta?.preview_kind === 'live_server' && previewMeta.preview_status === 'ready') {
+      return previewMeta.preview_url || lastPreviewPayload?.url || effectivePreviewUrl;
+    }
+    return previewMeta?.preview_entry || effectivePreviewUrl || 'preview';
+  }, [effectivePreviewUrl, lastPreviewPayload?.url, previewMeta?.preview_entry, previewMeta?.preview_kind, previewMeta?.preview_status, previewMeta?.preview_url]);
 
   const refreshPreview = useCallback(() => {
     setPreviewNonce(Date.now());
@@ -639,6 +650,17 @@ export default function CustomizationConsoleApp() {
         }
         if (!isCancelled) {
           setPreviewMeta(payload);
+          setStatus((prev) => {
+            if (prev.level === 'error' && /customization backend is unreachable/i.test(prev.text)) {
+              return {
+                level: 'success',
+                text: payload.preview_kind === 'live_server' && payload.preview_status === 'ready'
+                  ? 'Customization backend reachable. Live preview connected.'
+                  : 'Customization backend reachable. Preview status refreshed.',
+              };
+            }
+            return prev;
+          });
         }
       } catch {
         if (!isCancelled) {
@@ -657,6 +679,25 @@ export default function CustomizationConsoleApp() {
       isCancelled = true;
     };
   }, [previewMetaUrl]);
+
+  // The backend boots framework dev servers in the background and reports
+  // "starting" until deps install + first compile finish. Poll until it
+  // resolves so the live preview appears without a manual refresh.
+  const previewStarting =
+    previewMeta?.preview_kind === 'live_server' && previewMeta?.preview_status === 'starting';
+  const previewFailed =
+    previewMeta?.preview_kind === 'live_server' && previewMeta?.preview_status === 'failed';
+
+  useEffect(() => {
+    if (!previewStarting) return;
+    const timer = setTimeout(() => refreshPreview(), 4000);
+    return () => clearTimeout(timer);
+  }, [previewStarting, previewNonce, refreshPreview]);
+
+  // Hold the iframe blank while the live server is still starting (or while we
+  // don't yet know the status) so it never flashes the "not ready" error page.
+  const previewFrameHeld = previewStarting || previewFailed || (previewMetaLoading && !previewMeta);
+  const previewFrameSrc = previewFrameHeld ? '' : effectivePreviewUrl;
 
   const previewSourceLabel = useMemo(() => {
     if (!projectIdFromQuery) return 'Preview Source: Unavailable';
@@ -1086,6 +1127,9 @@ export default function CustomizationConsoleApp() {
       const errors = Array.isArray(payload.errors)
         ? payload.errors.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
         : [];
+      const warnings = Array.isArray(payload.warnings)
+        ? payload.warnings.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        : [];
 
       setCodeDiffEntries(nextDiffEntries);
       setLastImplementErrors(errors);
@@ -1138,7 +1182,11 @@ export default function CustomizationConsoleApp() {
         setStatus({
           level: 'warning',
           text: 'Implement completed with no file changes.',
-          details: 'No modifications were applied in this run.',
+          details: [
+            'No modifications were applied in this run.',
+            warnings.length > 0 ? `Warnings: ${warnings.join(' | ')}` : '',
+            payload.preview?.detail ? `Preview: ${payload.preview.detail}` : '',
+          ].filter(Boolean).join(' | '),
         });
         setPreviewNonce(Date.now());
         await fetchManifest(activeTenantId, true);
@@ -1152,14 +1200,18 @@ export default function CustomizationConsoleApp() {
       }));
 
       setStatus({
-        level: 'success',
-        text: isRepairPass
-          ? `Implementation success (post-repair): Rolled out to ${(payload.app_targets || implementRun.appTargets).join(', ')}.`
-          : `Implementation success: Rolled out to ${(payload.app_targets || implementRun.appTargets).join(', ')}.`,
+        level: warnings.length > 0 || payload.preview?.status === 'failed' ? 'warning' : 'success',
+        text: warnings.length > 0 || payload.preview?.status === 'failed'
+          ? 'Implementation completed with warnings.'
+          : isRepairPass
+            ? `Implementation success (post-repair): Rolled out to ${(payload.app_targets || implementRun.appTargets).join(', ')}.`
+            : `Implementation success: Rolled out to ${(payload.app_targets || implementRun.appTargets).join(', ')}.`,
         details: [
           payload.base_repo_path,
           payload.pipeline_mode ? `mode=${payload.pipeline_mode}` : '',
+          warnings.length > 0 ? `warnings=${warnings.join(' | ')}` : '',
           payload.quality_report?.status ? `quality=${payload.quality_report.status}` : '',
+          payload.preview?.status ? `preview=${payload.preview.status}${payload.preview.detail ? ` (${payload.preview.detail})` : ''}` : '',
         ].filter(Boolean).join(' | ') || undefined,
       });
 
@@ -1573,7 +1625,7 @@ export default function CustomizationConsoleApp() {
                       <span className="h-2.5 w-2.5 rounded-full bg-emerald-400/80" />
                     </div>
                     <div className="min-w-0 flex-1 rounded border border-[#1A1A1A] bg-black px-2 py-1 font-mono text-[10px] text-zinc-500">
-                    <span className="block truncate">{previewMeta?.preview_entry || effectivePreviewUrl || 'preview'}</span>
+                    <span className="block truncate">{previewAddressLabel}</span>
                     </div>
                     <span className="rounded bg-[#111111] px-2 py-1 text-[9px] font-bold tracking-widest text-zinc-400 uppercase">
                       {activePreviewDevice.label}
@@ -1581,12 +1633,30 @@ export default function CustomizationConsoleApp() {
                   </div>
                   <div className="relative min-h-0 flex-1 bg-white">
                     <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-px bg-gradient-to-r from-transparent via-cyan-300/70 to-transparent" />
-                    <iframe
-                      key={effectivePreviewUrl}
-                      src={effectivePreviewUrl}
-                      title="Repository UI preview"
-                      className="h-full w-full border-0"
-                    />
+                    {previewFrameHeld ? (
+                      <div className="flex h-full flex-col items-center justify-center gap-3 bg-[#050505] text-center">
+                        {previewFailed ? (
+                          <AlertTriangle className="h-6 w-6 text-amber-300" />
+                        ) : (
+                          <div className="h-6 w-6 animate-spin rounded-full border-2 border-zinc-700 border-t-cyan-300" />
+                        )}
+                        <p className="text-xs text-zinc-400">
+                          {previewStarting ? 'Starting live preview…' : 'Resolving preview…'}
+                        </p>
+                        {previewStarting ? (
+                          <p className="max-w-xs text-[10px] text-zinc-600">
+                            {previewMeta?.preview_detail || 'Installing dependencies and launching the dev server. This can take a minute on the first run.'}
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <iframe
+                        key={previewFrameSrc}
+                        src={previewFrameSrc}
+                        title="Repository UI preview"
+                        className="h-full w-full border-0"
+                      />
+                    )}
                   </div>
                 </div>
               ) : (
@@ -1835,9 +1905,13 @@ export default function CustomizationConsoleApp() {
                             </span>
                           )}
                         </div>
-                        <pre className="custom-scrollbar max-h-52 overflow-auto whitespace-pre-wrap break-all rounded border border-[#262626] bg-black p-2 font-mono text-[10px] leading-relaxed text-zinc-300">
-                          {entry.diff}
-                        </pre>
+                        <div className="custom-scrollbar max-h-52 overflow-auto rounded border border-[#262626] bg-black p-2 font-mono text-[10px] leading-relaxed">
+                          {entry.diff.split('\n').map((line, index) => (
+                            <div key={`${entry.file}-${index}`} className={`whitespace-pre-wrap break-all px-1 ${diffLineClassName(line)}`}>
+                              {line || ' '}
+                            </div>
+                          ))}
+                        </div>
                         {entry.truncated && <p className="mt-1 text-[10px] text-zinc-500">Diff truncated.</p>}
                       </div>
                     ))

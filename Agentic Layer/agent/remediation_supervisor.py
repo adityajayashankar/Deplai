@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from claude_remediator import (  # noqa: E402
     ClaudeBudgetTracker,
     _call_claude_sdk,
+    _call_groq,
     _collect_context_files,
     _extract_json,
     _normalize_changes_with_report,
@@ -125,29 +126,49 @@ def _dispatch_llm(
     budget_tracker: ClaudeBudgetTracker | None = None,
     stage: str = "remediation_supervisor",
 ) -> tuple[bool, str]:
-    """Route remediation supervisor calls through the Claude Agent SDK only."""
+    """Route remediation supervisor calls to the requested provider.
+
+    Groq is supported for cheap/fast remediation (used for large repos that send
+    only critical/high findings). Any other provider routes through the Claude
+    Agent SDK. The Claude SDK is also used as a safety fallback when Groq fails.
+    """
     provider = (provider or "").strip().lower()
     api_key = (api_key or "").strip()
     model = (model or "").strip()
+
+    def _claude(effective_key: str, effective_model: str) -> tuple[bool, str]:
+        return _call_with_backoff(
+            lambda: _call_claude_sdk(
+                prompt,
+                effective_key,
+                effective_model,
+                budget_tracker=budget_tracker,
+                stage=stage,
+            )
+        )
+
+    if provider == "groq":
+        ok, text = _call_with_backoff(lambda: _call_groq(prompt))
+        if ok:
+            return ok, text
+        # Fall back to the Claude SDK only if a Claude key is available.
+        if (os.getenv("ANTHROPIC_API_KEY", "").strip() or os.getenv("CLAUDE_API_KEY", "").strip()):
+            ok_fb, text_fb = _claude("", "")
+            if ok_fb:
+                return ok_fb, text_fb
+            return (False, f"Groq remediation failed ({text}); Claude fallback also failed: {text_fb}")
+        return (False, f"Groq remediation supervisor failed: {text}")
+
     effective_api_key = api_key if provider in ("", "claude") else ""
     effective_model = model if provider in ("", "claude") else ""
-
-    ok, text = _call_with_backoff(
-        lambda: _call_claude_sdk(
-            prompt,
-            effective_api_key,
-            effective_model,
-            budget_tracker=budget_tracker,
-            stage=stage,
-        )
-    )
+    ok, text = _claude(effective_api_key, effective_model)
     if ok:
         return ok, text
 
     if provider and provider != "claude":
         return (
             False,
-            f"Remediation only supports the Claude Agent SDK; ignored provider '{provider}'. Claude SDK error: {text}",
+            f"Remediation supports the Claude Agent SDK and Groq; ignored provider '{provider}'. Claude SDK error: {text}",
         )
     return (False, f"Claude SDK remediation supervisor failed: {text}")
 

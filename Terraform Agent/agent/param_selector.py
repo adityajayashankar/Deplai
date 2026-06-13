@@ -16,7 +16,7 @@ _ANTHROPIC_API_KEY = (
     or os.getenv("CLAUDE_API_KEY")
     or ""
 ).strip()
-_client = anthropic.Anthropic(api_key=_ANTHROPIC_API_KEY) if _ANTHROPIC_API_KEY else None
+_client = anthropic.AsyncAnthropic(api_key=_ANTHROPIC_API_KEY) if _ANTHROPIC_API_KEY else None
 
 _SYSTEM_PROMPT = """You are a Terraform parameter selector. Your ONLY output must be a valid JSON object.
 No markdown. No explanation. No code fences. No trailing commas. Pure JSON only.
@@ -225,6 +225,8 @@ def _deterministic_params(
             alias_value = _lookup_value(flat, "alb_name", "load_balancer_name", "name")
         elif name == "vpc_name":
             alias_value = _lookup_value(flat, "vpc_name", "name")
+        elif name == "user_data":
+            alias_value = _lookup_value(flat, "user_data", "build_script", "script", "startup_script")
 
         if alias_value:
             value = _coerce_value(alias_value, field_type)
@@ -269,10 +271,10 @@ def _deterministic_params(
     return params
 
 
-def _call_llm(prompt: str) -> dict:
+async def _call_llm(prompt: str) -> dict:
     if _client is None:
         raise RuntimeError("Anthropic client not configured")
-    response = _client.messages.create(
+    response = await _client.messages.create(
         model=MODEL,
         max_tokens=1000,
         system=_SYSTEM_PROMPT,
@@ -327,7 +329,7 @@ async def select_params(
         user_prompt = _build_user_prompt(
             service_type, schema, repo_context, enriched_customizations
         )
-        params = _call_llm(user_prompt)
+        params = await _call_llm(user_prompt)
     except Exception as exc:
         print(f"[param_selector] Falling back to deterministic params for {service_type}: {exc}")
         params = _deterministic_params(
@@ -372,7 +374,7 @@ PARAMETER SCHEMA (for reference):
 Return the complete corrected params JSON object. Same format, all fields, errors fixed."""
 
     try:
-        corrected = _call_llm(correction_prompt)
+        corrected = await _call_llm(correction_prompt)
     except Exception as exc:
         print(f"[param_selector] Falling back to current params during correction for {service_type}: {exc}")
         corrected = dict(current_params)

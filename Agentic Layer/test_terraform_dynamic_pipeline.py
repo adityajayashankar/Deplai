@@ -74,7 +74,6 @@ if "terraform_agent.agent.engine.deployment_profile" not in sys.modules:
     terraform_agent_engine_pkg = types.ModuleType("terraform_agent.agent.engine")
     terraform_agent_engine_pkg.__path__ = []
     deployment_profile_stub = types.ModuleType("terraform_agent.agent.engine.deployment_profile")
-    cloudposse_stub = types.ModuleType("terraform_agent.agent.engine.cloudposse_atmos")
     runtime_stub = types.ModuleType("terraform_agent.agent.engine.runtime")
 
     def _stub_build_profile_manifest(payload):
@@ -97,39 +96,16 @@ if "terraform_agent.agent.engine.deployment_profile" not in sys.modules:
         )
 
     deployment_profile_stub.build_profile_bundle = _stub_build_profile_bundle
-    deployment_profile_stub.build_cloudposse_profile_bundle = lambda **kwargs: (
-        {
-            "atmos.yaml": "{}\n",
-            "vendor.yaml": "{}\n",
-            ".deplai/cloudposse-component-lock.json": '{"deploy_sequence":["s3_cloudfront"],"stack":"unit-test-dev","component_catalog_version":"test"}\n',
-            "README.md": "# cloudposse\n",
-        },
-        ["Generated Cloud Posse/Atmos bundle without vendored component source; run atmos vendor pull before plan/apply."],
-        {"deploy_sequence": ["s3_cloudfront"], "stack": "unit-test-dev", "component_catalog_version": "test"},
-    )
     deployment_profile_stub.build_profile_manifest = _stub_build_profile_manifest
-    cloudposse_stub.normalize_terraform_renderer = lambda value: value if value in {"auto", "cloudposse_atmos", "deplai_deterministic"} else "auto"
-    cloudposse_stub.should_use_cloudposse_renderer = lambda payload, requested_renderer, workspace_has_prior_state=False: (
-        requested_renderer != "deplai_deterministic"
-        and payload.get("compute", {}).get("strategy") == "s3_cloudfront"
-        and not workspace_has_prior_state,
-        {
-            "supported": payload.get("compute", {}).get("strategy") == "s3_cloudfront",
-            "reasons": [] if payload.get("compute", {}).get("strategy") == "s3_cloudfront" else [f"unsupported compute.strategy '{payload.get('compute', {}).get('strategy')}'"],
-            "deploy_sequence": ["s3_cloudfront"],
-        },
-    )
     runtime_stub.DEFAULT_PROVIDER_CONSTRAINT = "~> 5.54"
     sys.modules["terraform_agent"] = terraform_agent_pkg
     sys.modules["terraform_agent.agent"] = terraform_agent_agent_pkg
     sys.modules["terraform_agent.agent.engine"] = terraform_agent_engine_pkg
     sys.modules["terraform_agent.agent.engine.deployment_profile"] = deployment_profile_stub
-    sys.modules["terraform_agent.agent.engine.cloudposse_atmos"] = cloudposse_stub
     sys.modules["terraform_agent.agent.engine.runtime"] = runtime_stub
 
 from claude_deployment_pipeline import (
     _build_generation_context_summary,
-    _cloudposse_compatible_profile_payload,
     _enrich_deployment_profile_for_deterministic_rendering,
     _fallback_structure_plan,
     _run_terraform_json_worker,
@@ -213,19 +189,6 @@ class TerraformDynamicPipelineTests(unittest.TestCase):
         self.assertEqual(enriched["compute"]["services"], [])
         self.assertEqual(enriched["networking"]["load_balancer"], {})
         self.assertEqual(enriched["application_type"], "static_site")
-
-    def test_cloudposse_adapter_strips_unsupported_fields_and_maps_ec2(self) -> None:
-        profile = _profile("ec2")
-        profile["networking"]["load_balancer"] = {"type": "alb", "public": True, "services": ["web"]}
-        profile["dns_and_tls"] = {"acm_certificate": "new", "cloudfront": True}
-
-        adapted, warnings = _cloudposse_compatible_profile_payload(profile, "cloudposse_atmos")
-
-        self.assertEqual(adapted["compute"]["strategy"], "ecs_fargate")
-        self.assertEqual(adapted["networking"]["load_balancer"], {"public": True})
-        self.assertEqual(adapted["dns_and_tls"], {})
-        self.assertTrue(any("mapped ec2 strategy to ecs_fargate" in item for item in warnings))
-        self.assertTrue(any("stripped unsupported load_balancer fields" in item for item in warnings))
 
     def test_deterministic_enrichment_merges_repository_context_into_profile(self) -> None:
         profile = _profile("ecs_fargate")
@@ -342,7 +305,7 @@ class TerraformDynamicPipelineTests(unittest.TestCase):
 
         self.assertEqual(result["details"]["compute_strategy"], "ecs_fargate")
 
-    def test_auto_renderer_uses_cloudposse_for_supported_new_profile(self) -> None:
+    def test_auto_renderer_uses_deplai_terraform_for_supported_new_profile(self) -> None:
         profile = _profile("s3_cloudfront")
         result = generate_terraform_bundle(
             architecture_json=profile,
@@ -350,32 +313,15 @@ class TerraformDynamicPipelineTests(unittest.TestCase):
             project_name="demo-app",
             workspace="unit-test",
             aws_region="us-east-1",
-            iac_mode="llm",
-            llm_provider="groq",
-            llm_api_key="test",
+            iac_mode="deterministic",
         )
 
-        self.assertEqual(result["source"], "cloudposse_atmos")
+        self.assertEqual(result["source"], "terraform_agent_multi_worker_partial_fallback")
         self.assertEqual(result["requested_renderer"], "auto")
-        self.assertEqual(result["actual_renderer"], "cloudposse_atmos")
+        self.assertEqual(result["actual_renderer"], "deplai_deterministic")
         self.assertEqual(result["llm_iac_calls"], 0)
         self.assertTrue(result["llm_iac_disabled"])
-        self.assertTrue(any(item["path"] == ".deplai/cloudposse-component-lock.json" for item in result["files"]))
-
-    def test_explicit_cloudposse_unsupported_reports_renderer_metadata(self) -> None:
-        profile = _profile("lambda")
-        result = generate_terraform_bundle(
-            architecture_json=profile,
-            deployment_profile_json=profile,
-            project_name="demo-app",
-            workspace="unit-test",
-            aws_region="us-east-1",
-            terraform_renderer="cloudposse_atmos",
-        )
-
-        self.assertEqual(result["requested_renderer"], "cloudposse_atmos")
-        self.assertEqual(result["actual_renderer"], "deplai_deterministic")
-        self.assertIn("unsupported compute.strategy", result["unsupported_reason"])
+        self.assertTrue(any(item["path"] == "terraform/main.tf" for item in result["files"]))
 
     def test_structure_plan_differs_by_strategy(self) -> None:
         ecs_plan = _fallback_structure_plan(_profile("ecs_fargate"))
@@ -521,9 +467,9 @@ class TerraformDynamicPipelineTests(unittest.TestCase):
                 terraform_renderer="deplai_deterministic",
             )
 
-        self.assertIn(result["source"], {"terraform_agent_multi_worker_partial_fallback", "terraform_agent_full_fallback"})
+        self.assertEqual(result["source"], "terraform_agent_multi_worker_dynamic")
         self.assertIn("terraform/modules/compute/main.tf", result["details"]["file_tree"])
-        self.assertFalse(result["details"]["llm_workers_enabled"])
+        self.assertTrue(result["details"]["llm_workers_enabled"])
         self.assertEqual(result["details"]["bundle_strategy"], "ecs_fargate_bundle")
 
     def test_partial_fallback_when_one_group_fails(self) -> None:
@@ -647,10 +593,10 @@ class TerraformDynamicPipelineTests(unittest.TestCase):
                 llm_provider="groq",
                 llm_api_key="test",
                 terraform_renderer="deplai_deterministic",
-            )
+        )
 
         self.assertEqual(result["source"], "terraform_agent_multi_worker_partial_fallback")
-        self.assertFalse(result["details"]["llm_workers_enabled"])
+        self.assertTrue(result["details"]["llm_workers_enabled"])
         self.assertEqual(result["llm_iac_calls"], 0)
         self.assertTrue(any(file["path"] == "terraform/modules/compute/main.tf" for file in result["files"]))
 

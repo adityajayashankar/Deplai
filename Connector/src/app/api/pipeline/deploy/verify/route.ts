@@ -4,6 +4,8 @@ import { requireAuth } from '@/lib/auth';
 
 interface VerifyBody {
   cloudfront_url?: string;
+  app_url?: string;
+  health_check_url?: string;
   public_ip?: string;
 }
 
@@ -40,12 +42,25 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => ({})) as VerifyBody;
   const cloudfrontUrl = String(body.cloudfront_url || '').trim();
+  const appUrl = String(body.app_url || '').trim();
+  const healthCheckUrl = String(body.health_check_url || '').trim();
   const publicIp = String(body.public_ip || '').trim();
 
-  const checks = await Promise.all([
-    probeUrl('cloudfront', cloudfrontUrl),
-    probeUrl('instance', publicIp ? `http://${publicIp}` : ''),
-  ]);
+  const targets = [
+    { label: 'cloudfront', url: cloudfrontUrl },
+    { label: 'health', url: healthCheckUrl },
+    { label: 'app', url: appUrl },
+    { label: 'instance', url: publicIp ? `http://${publicIp}` : '' },
+  ].filter((target, index, list) => (
+    target.url && list.findIndex((candidate) => candidate.url === target.url) === index
+  ));
+
+  const checks = targets.length > 0
+    ? await Promise.all(targets.map((target) => probeUrl(target.label, target.url)))
+    : [
+        await probeUrl('cloudfront', ''),
+        await probeUrl('instance', ''),
+      ];
 
   return NextResponse.json({
     success: true,

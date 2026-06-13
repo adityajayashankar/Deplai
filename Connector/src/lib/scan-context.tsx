@@ -187,7 +187,8 @@ function connectWebSocket(
         onMessage(projectId, data.data as ScanMessage);
         break;
       case 'status':
-        if (data.status === 'error' && typeof data.error === 'string' && data.error.trim()) {
+        const status = typeof data.status === 'string' ? data.status : '';
+        if (status === 'error' && typeof data.error === 'string' && data.error.trim()) {
           onMessage(projectId, {
             index: Date.now(),
             total: Date.now(),
@@ -196,8 +197,8 @@ function connectWebSocket(
             timestamp: new Date().toISOString(),
           });
         }
-        if (['running', 'waiting_decision', 'waiting_approval', 'completed', 'error'].includes(data.status)) {
-          onStatus(projectId, data.status);
+        if (['running', 'waiting_decision', 'waiting_approval', 'completed', 'error'].includes(status)) {
+          onStatus(projectId, status);
         }
         break;
     }

@@ -53,6 +53,7 @@ export default function Home() {
   const [status, setStatus] = useState<string>("");
   const [confirmedTenantId, setConfirmedTenantId] = useState<string>("");
   const [tenantId, setTenantId] = useState<string>("");
+  const [mounted, setMounted] = useState(false);
 
   // Asset upload state
   const [assetType, setAssetType] = useState<AssetType>("logo_light");
@@ -72,6 +73,10 @@ export default function Home() {
     if (storedTenantId) {
       setTenantId(storedTenantId);
     }
+  }, []);
+
+  useEffect(() => {
+    setMounted(true);
   }, []);
 
   useEffect(() => {
@@ -378,6 +383,10 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
+  }
+
+  if (!mounted) {
+    return null;
   }
 
   return (

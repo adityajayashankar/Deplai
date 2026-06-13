@@ -13,6 +13,7 @@ from agents.planner_agent import plan_frontend_changes
 from agents.repo_scanner_agent import scan_repo as scan_frontend_repo
 from graph.customization_graph import CustomizationState, run_graph
 from services.asset_copier import apply_tenant_assets
+from services.agent_logger import LOG_FILE_PATH
 from services.deterministic_customizer import apply_deterministic_customizations
 from services.manifest_validator import validate_manifest_for_implementation
 from services.plan_report_service import write_plan_markdown
@@ -37,6 +38,45 @@ def _normalize_pipeline_mode(raw_mode: str | None) -> str:
     if candidate not in PIPELINE_MODES:
         raise ValueError(f"pipeline_mode must be one of: {sorted(PIPELINE_MODES)}")
     return candidate
+
+
+def _deterministic_first_enabled() -> bool:
+    return os.getenv("CUSTOMIZATION_DETERMINISTIC_FIRST", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _log_cursor() -> int:
+    try:
+        return LOG_FILE_PATH.stat().st_size
+    except OSError:
+        return 0
+
+
+def _read_log_since(cursor: int) -> str:
+    try:
+        with LOG_FILE_PATH.open("rb") as handle:
+            handle.seek(cursor)
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _extract_llm_warnings(log_text: str) -> list[str]:
+    warnings: list[str] = []
+    for line in log_text.splitlines():
+        if "LLM" not in line:
+            continue
+        if not any(marker in line.lower() for marker in ("failed", "returned http", "unavailable", "no endpoints", "timed out", "timeout")):
+            continue
+        message = line.split("] ", maxsplit=2)[-1].strip()
+        message = message.replace("All configured LLM providers failed:", "LLM provider/model unavailable:")
+        if message and message not in warnings:
+            warnings.append(message[:1200])
+    return warnings
 
 
 def _is_frontend_only_mode() -> bool:
@@ -276,9 +316,38 @@ def run_customization(
     frontend_only_mode = _is_frontend_only_mode()
     change_sources: list[dict[str, Any]] = []
     diagnostic: dict[str, Any] | None = None
+    warnings: list[str] = []
+    deterministic_files: list[str] = []
+
+    if (
+        normalized_pipeline_mode == "hybrid"
+        and run_deterministic_phase
+        and _deterministic_first_enabled()
+        and not normalized_validator_issues
+    ):
+        deterministic_files = apply_deterministic_customizations(
+            manifest=manifest,
+            repo_path=repo_path,
+            app_targets=resolved_app_targets,
+        )
+        for path in deterministic_files:
+            _add_change_source(
+                change_sources,
+                file_path=path,
+                source="deterministic_customizer",
+                operation="fast_path",
+            )
+        if deterministic_files:
+            use_llm_graph = False
+            run_deterministic_phase = False
+            warnings.append(
+                "LLM graph skipped because deterministic customization applied changes successfully."
+            )
 
     if normalized_pipeline_mode == "diagnostic":
+        log_cursor = _log_cursor()
         diagnostic = _run_diagnostic_plans(initial_state, repo_path, manifest, resolved_app_targets)
+        warnings.extend(_extract_llm_warnings(_read_log_since(log_cursor)))
         final_state = {
             **initial_state,
             "planned_changes": diagnostic.get("llm_planned_changes", []),
@@ -289,7 +358,9 @@ def run_customization(
         }
     elif use_llm_graph:
         try:
+            log_cursor = _log_cursor()
             final_state = run_graph(initial_state, frontend_only=frontend_only_mode)
+            warnings.extend(_extract_llm_warnings(_read_log_since(log_cursor)))
             planner_source = str(final_state.get("planner_source") or "llm_planner")
             if normalized_validator_issues:
                 planner_source = "repair_pass"
@@ -308,17 +379,18 @@ def run_customization(
                     "errors": fallback_errors,
                 }
             else:
-                fallback_errors.append(f"LLM graph failed at runtime; switched to deterministic fallback: {exc}")
+                warnings.append(f"LLM graph failed at runtime; switched to deterministic fallback: {exc}")
                 final_state = {
                     **initial_state,
                     "errors": fallback_errors,
                 }
     else:
+        skipped_errors = [] if deterministic_files else [f"LLM graph skipped for pipeline_mode={normalized_pipeline_mode}."]
         final_state = {
             **initial_state,
             "errors": [
                 *list(initial_state.get("errors", [])),
-                f"LLM graph skipped for pipeline_mode={normalized_pipeline_mode}.",
+                *skipped_errors,
             ],
         }
 
@@ -328,7 +400,6 @@ def run_customization(
             "Customization scope is frontend-only (CUSTOMIZATION_SCOPE=frontend); backend scanner/modifier nodes were skipped.",
         ]
 
-    deterministic_files: list[str] = []
     if run_deterministic_phase:
         deterministic_files = apply_deterministic_customizations(
             manifest=manifest,
@@ -427,6 +498,7 @@ def run_customization(
         "preview": preview,
         "diagnostic": diagnostic,
         "errors": final_errors,
+        "warnings": warnings,
         "plan_markdown_path": str(plan_path),
     }
 

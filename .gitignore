@@ -89,3 +89,7 @@ Customization Agent/tenant_builder_app/backend/tenants/
 #IDEA IDE
 .idea/
 .kiro/
+
+# Temp folders
+tmp/
+temp_tf_fmt_check/

@@ -16,6 +16,34 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True)
 
 
+def _coerce_positive_int(value: Any, default: int, *, allow_zero: bool = False) -> int:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    if number < 0 or (number == 0 and not allow_zero):
+        return default
+    return number
+
+
+def _canonical_environment(value: str) -> str:
+    compact = str(value or "").strip().lower()
+    if compact == "production":
+        return "prod"
+    if compact == "development":
+        return "dev"
+    return compact or "dev"
+
+
+def _canonical_compute_strategy(value: str) -> str:
+    compact = str(value or "").strip().lower()
+    if compact == "ec2-instance":
+        return "ec2"
+    if compact in {"cloudfront", "s3cloudfront"}:
+        return "s3_cloudfront"
+    return compact or "ec2"
+
+
 def build_enterprise_profile_bundle(
     *,
     payload: dict[str, Any],
@@ -28,22 +56,40 @@ def build_enterprise_profile_bundle(
 ) -> tuple[dict[str, str], list[str]]:
     project_name = str(payload.get("project_name") or "deplai-project").strip() or "deplai-project"
     workspace = str(payload.get("workspace") or slugify(project_name)).strip() or slugify(project_name)
-    environment = str(payload.get("environment") or "dev").strip() or "dev"
+    environment = _canonical_environment(str(payload.get("environment") or "dev"))
     project_slug = slugify(project_name, "deplai-project")[:40]
     compute = payload.get("compute") if isinstance(payload.get("compute"), dict) else {}
     networking = payload.get("networking") if isinstance(payload.get("networking"), dict) else {}
     runtime_config = payload.get("runtime_config") if isinstance(runtime_config := payload.get("runtime_config"), dict) else {}
     data_layer = [item for item in payload.get("data_layer") or [] if isinstance(item, dict)]
-    strategy = str(compute.get("strategy") or "ec2").strip() or "ec2"
+    strategy = _canonical_compute_strategy(str(compute.get("strategy") or "ec2"))
     app_service = next((item for item in compute.get("services") or [] if isinstance(item, dict) and str(item.get("process_type") or "") == "web"), {})
     app_port = int(app_service.get("port") or 3000)
     secrets_prefix = str(runtime_config.get("secrets_manager_prefix") or f"/{project_slug}/{environment}").strip() or f"/{project_slug}/{environment}"
     required_secrets = [str(item).strip() for item in runtime_config.get("required_secrets") or [] if str(item).strip()]
     has_postgres = any(str(item.get("type") or "") == "postgresql" for item in data_layer)
     has_redis = any(str(item.get("type") or "") == "redis" for item in data_layer)
+    redis_item = next((item for item in data_layer if str(item.get("type") or "") == "redis"), {})
+    redis_node_type = str(redis_item.get("node_type") or "cache.t4g.micro").strip() or "cache.t4g.micro"
+    redis_engine_version = str(redis_item.get("engine_version") or "7.0").strip() or "7.0"
+    postgres_item = next((item for item in data_layer if str(item.get("type") or "") == "postgresql"), {})
+    postgres_engine = str(postgres_item.get("engine") or "postgres").strip().lower() or "postgres"
+    if postgres_engine not in {"postgres", "mysql", "mariadb"}:
+        postgres_engine = "postgres"
+    _default_db_version = {"postgres": "15.5", "mysql": "8.0", "mariadb": "10.11"}[postgres_engine]
+    postgres_engine_version = str(postgres_item.get("engine_version") or _default_db_version).strip() or _default_db_version
+    postgres_instance_class = str(postgres_item.get("instance_class") or "db.t4g.micro").strip() or "db.t4g.micro"
+    postgres_storage = _coerce_positive_int(postgres_item.get("storage_gb"), 20)
+    postgres_multi_az = bool(postgres_item.get("multi_az"))
+    postgres_backup = _coerce_positive_int(postgres_item.get("backup_retention_days"), 7, allow_zero=True)
     region = str(aws_region or "eu-north-1").strip() or "eu-north-1"
     provider_constraint = _provider_expr(provider_version)
     encoded_index = base64.b64encode((website_index_html or "").encode("utf-8")).decode("ascii")
+    static_site = payload.get("static_site") if isinstance(payload.get("static_site"), dict) else {}
+    cf_price_class = str(static_site.get("price_class") or "PriceClass_100").strip() or "PriceClass_100"
+    if cf_price_class not in {"PriceClass_100", "PriceClass_200", "PriceClass_All"}:
+        cf_price_class = "PriceClass_100"
+    spa_fallback = bool(static_site.get("spa_fallback"))
 
     versions_tf = f"""terraform {{
   required_version = ">= 1.6.0"
@@ -218,6 +264,50 @@ variable "enable_redis" {{
   type    = bool
   default = {str(has_redis).lower()}
 }}
+
+variable "redis_node_type" {{
+  type    = string
+  default = "{redis_node_type}"
+}}
+
+variable "redis_engine_version" {{
+  type    = string
+  default = "{redis_engine_version}"
+}}
+
+variable "postgres_engine" {{
+  type    = string
+  default = "{postgres_engine}"
+  validation {{
+    condition     = contains(["postgres", "mysql", "mariadb"], var.postgres_engine)
+    error_message = "postgres_engine must be postgres, mysql, or mariadb."
+  }}
+}}
+
+variable "postgres_engine_version" {{
+  type    = string
+  default = "{postgres_engine_version}"
+}}
+
+variable "postgres_instance_class" {{
+  type    = string
+  default = "{postgres_instance_class}"
+}}
+
+variable "postgres_allocated_storage" {{
+  type    = number
+  default = {postgres_storage}
+}}
+
+variable "postgres_multi_az" {{
+  type    = bool
+  default = {str(postgres_multi_az).lower()}
+}}
+
+variable "postgres_backup_retention" {{
+  type    = number
+  default = {postgres_backup}
+}}
 """
 
     data_tf = """data "aws_caller_identity" "current" {}
@@ -253,14 +343,16 @@ data "aws_ssm_parameter" "managed" {
 """
 
     if strategy == "s3_cloudfront":
-        main_tf = """module "storage" {
+        main_tf = f"""module "storage" {{
   source                      = "./modules/storage"
   enabled                     = true
   project_name                = var.project_name
   environment                 = var.environment
   bootstrap_index_html_base64 = var.bootstrap_index_html_base64
+  cloudfront_price_class      = "{cf_price_class}"
+  enable_spa_fallback         = {str(spa_fallback).lower()}
   common_tags                 = local.common_tags
-}
+}}
 """
         outputs_tf = """output "cloudfront_url" {
   value = module.storage.cloudfront_url
@@ -308,13 +400,21 @@ module "iam" {
 }
 
 module "data" {
-  source          = "./modules/data"
-  enable_postgres = local.enable_postgres
-  enable_redis    = local.enable_redis
-  vpc_id          = module.networking.vpc_id
-  subnet_ids      = module.networking.private_subnet_ids
-  allowed_cidrs   = [var.vpc_cidr]
-  common_tags     = local.common_tags
+  source                     = "./modules/data"
+  enable_postgres            = local.enable_postgres
+  enable_redis               = local.enable_redis
+  redis_node_type            = var.redis_node_type
+  redis_engine_version       = var.redis_engine_version
+  postgres_engine            = var.postgres_engine
+  postgres_engine_version    = var.postgres_engine_version
+  postgres_instance_class    = var.postgres_instance_class
+  postgres_allocated_storage = var.postgres_allocated_storage
+  postgres_multi_az          = var.postgres_multi_az
+  postgres_backup_retention  = var.postgres_backup_retention
+  vpc_id                     = module.networking.vpc_id
+  subnet_ids                 = module.networking.private_subnet_ids
+  allowed_cidrs              = [var.vpc_cidr]
+  common_tags                = local.common_tags
 }
 
 module "compute" {
@@ -509,13 +609,13 @@ data "aws_iam_policy_document" "ec2_assume" {
 }
 
 resource "aws_iam_role" "ec2" {
-  name_prefix        = "${var.project_name}-${var.environment}-ec2-role-"
+  name_prefix        = substr("${var.project_name}-${var.environment}-ec2-role-", 0, 38)
   assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
   tags               = var.common_tags
 }
 
 resource "aws_iam_role_policy" "app" {
-  name_prefix = "${var.project_name}-${var.environment}-app-"
+  name_prefix = substr("${var.project_name}-${var.environment}-app-", 0, 38)
   role        = aws_iam_role.ec2.id
   policy = jsonencode({
     Version = "2012-10-17"
@@ -528,7 +628,7 @@ resource "aws_iam_role_policy" "app" {
 }
 
 resource "aws_iam_instance_profile" "ec2" {
-  name_prefix = "${var.project_name}-${var.environment}-instance-profile-"
+  name_prefix = substr("${var.project_name}-${var.environment}-instance-profile-", 0, 38)
   role        = aws_iam_role.ec2.name
 }
 """
@@ -543,7 +643,11 @@ variable "common_tags" { type = map(string) }
     iam_outputs = """output "instance_profile_name" { value = aws_iam_instance_profile.ec2.name }
 """
 
-    database_main = """resource "aws_security_group" "database" {
+    database_main = """locals {
+  sql_port = contains(["mysql", "mariadb"], var.postgres_engine) ? 3306 : 5432
+}
+
+resource "aws_security_group" "database" {
   count       = var.enable_postgres || var.enable_redis ? 1 : 0
   name_prefix = "database-"
   description = "Database access"
@@ -551,8 +655,8 @@ variable "common_tags" { type = map(string) }
   tags        = var.common_tags
 
   ingress {
-    from_port   = 5432
-    to_port     = 5432
+    from_port   = local.sql_port
+    to_port     = local.sql_port
     protocol    = "tcp"
     cidr_blocks = var.allowed_cidrs
   }
@@ -580,11 +684,13 @@ resource "aws_db_subnet_group" "postgres" {
 
 resource "aws_db_instance" "postgres" {
   count                       = var.enable_postgres ? 1 : 0
-  identifier                  = "postgres-${substr(md5(join(",", var.subnet_ids)), 0, 8)}"
-  engine                      = "postgres"
-  engine_version              = "15.5"
-  instance_class              = "db.t4g.micro"
-  allocated_storage           = 20
+  identifier                  = "${var.postgres_engine}-${substr(md5(join(",", var.subnet_ids)), 0, 8)}"
+  engine                      = var.postgres_engine
+  engine_version              = var.postgres_engine_version
+  instance_class              = var.postgres_instance_class
+  allocated_storage           = var.postgres_allocated_storage
+  multi_az                    = var.postgres_multi_az
+  backup_retention_period     = var.postgres_backup_retention
   db_subnet_group_name        = aws_db_subnet_group.postgres[0].name
   vpc_security_group_ids      = [aws_security_group.database[0].id]
   publicly_accessible         = false
@@ -595,10 +701,62 @@ resource "aws_db_instance" "postgres" {
   db_name                     = "appdb"
   tags                        = var.common_tags
 }
+
+resource "aws_elasticache_subnet_group" "redis" {
+  count      = var.enable_redis ? 1 : 0
+  name       = "redis-${substr(md5(join(",", var.subnet_ids)), 0, 8)}"
+  subnet_ids = var.subnet_ids
+  tags       = var.common_tags
+}
+
+resource "aws_elasticache_cluster" "redis" {
+  count                = var.enable_redis ? 1 : 0
+  cluster_id           = "redis-${substr(md5(join(",", var.subnet_ids)), 0, 8)}"
+  engine               = "redis"
+  engine_version       = var.redis_engine_version
+  node_type            = var.redis_node_type
+  num_cache_nodes      = 1
+  port                 = 6379
+  subnet_group_name    = aws_elasticache_subnet_group.redis[0].name
+  security_group_ids   = [aws_security_group.database[0].id]
+  tags                 = var.common_tags
+}
 """
 
     database_variables = """variable "enable_postgres" { type = bool }
 variable "enable_redis" { type = bool }
+variable "redis_node_type" {
+  type    = string
+  default = "cache.t4g.micro"
+}
+variable "redis_engine_version" {
+  type    = string
+  default = "7.0"
+}
+variable "postgres_engine" {
+  type    = string
+  default = "postgres"
+}
+variable "postgres_engine_version" {
+  type    = string
+  default = "15.5"
+}
+variable "postgres_instance_class" {
+  type    = string
+  default = "db.t4g.micro"
+}
+variable "postgres_allocated_storage" {
+  type    = number
+  default = 20
+}
+variable "postgres_multi_az" {
+  type    = bool
+  default = false
+}
+variable "postgres_backup_retention" {
+  type    = number
+  default = 7
+}
 variable "vpc_id" { type = string }
 variable "subnet_ids" { type = list(string) }
 variable "allowed_cidrs" { type = list(string) }
@@ -606,7 +764,8 @@ variable "common_tags" { type = map(string) }
 """
 
     database_outputs = """output "rds_endpoint" { value = try(aws_db_instance.postgres[0].address, null) }
-output "redis_endpoint" { value = null }
+output "redis_endpoint" { value = try(aws_elasticache_cluster.redis[0].cache_nodes[0].address, null) }
+output "redis_port" { value = try(aws_elasticache_cluster.redis[0].cache_nodes[0].port, null) }
 """
 
     storage_main = """resource "random_id" "bucket_suffix" {
@@ -655,6 +814,7 @@ resource "aws_cloudfront_distribution" "website" {
   count               = var.enabled ? 1 : 0
   enabled             = true
   default_root_object = "index.html"
+  price_class         = var.cloudfront_price_class
   origin {
     domain_name = aws_s3_bucket.website[0].bucket_regional_domain_name
     origin_id   = "site-origin"
@@ -670,6 +830,15 @@ resource "aws_cloudfront_distribution" "website" {
       cookies {
         forward = "none"
       }
+    }
+  }
+
+  dynamic "custom_error_response" {
+    for_each = var.enable_spa_fallback ? [403, 404] : []
+    content {
+      error_code         = custom_error_response.value
+      response_code      = 200
+      response_page_path = "/index.html"
     }
   }
 
@@ -691,6 +860,14 @@ variable "environment" { type = string }
 variable "bootstrap_index_html_base64" {
   type      = string
   sensitive = true
+}
+variable "cloudfront_price_class" {
+  type    = string
+  default = "PriceClass_100"
+}
+variable "enable_spa_fallback" {
+  type    = bool
+  default = false
 }
 variable "common_tags" { type = map(string) }
 """
@@ -721,8 +898,8 @@ resource "aws_security_group" "app" {
   tags        = var.common_tags
 
   ingress {
-    from_port   = var.app_port
-    to_port     = var.app_port
+    from_port   = 80
+    to_port     = 80
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }

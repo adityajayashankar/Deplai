@@ -68,6 +68,69 @@ def _severity_for_scope(scope: str) -> set[str]:
     return ALL_SEVERITIES
 
 
+def _groq_available() -> bool:
+    """True when a Groq API key is configured for cheap/fast remediation."""
+    return bool(os.getenv("GROQ_API_KEY", "").strip())
+
+
+def _strip_metadata_for_lean(scan_data: dict) -> dict:
+    """Drop ~90% of finding metadata for the large-repo / Groq remediation path.
+
+    Keeps only the fields the remediation LLM actually needs to locate and fix a
+    vulnerability (id, severity, primary path, one representative occurrence,
+    package/fix version) and discards verbose descriptions, code extracts,
+    documentation URLs, and related-CVE lists that bloat the prompt.
+    """
+    lean: dict = dict(scan_data)
+
+    lean_code: list[dict] = []
+    for finding in scan_data.get("code_security", []) or []:
+        if not isinstance(finding, dict):
+            continue
+        occurrences = [occ for occ in (finding.get("occurrences") or []) if isinstance(occ, dict)]
+        primary_path = (
+            finding.get("primary_path")
+            or _representative_occurrence(occurrences)
+            or _normalize_rel_path(finding.get("filename", ""))
+        )
+        lean_occ: list[dict] = []
+        if occurrences:
+            first = occurrences[0]
+            lean_occ = [{
+                "filename": _normalize_rel_path(first.get("filename", "")) or primary_path,
+                "line_number": first.get("line_number"),
+            }]
+        lean_code.append({
+            "cwe_id": finding.get("cwe_id"),
+            "severity": str(finding.get("severity", "")).strip().lower(),
+            "count": finding.get("count"),
+            "title": str(finding.get("title") or finding.get("name") or "")[:80],
+            "primary_path": primary_path,
+            "occurrences": lean_occ,
+            "root_cause_key": finding.get("root_cause_key"),
+            "root_cause_kind": finding.get("root_cause_kind"),
+        })
+    lean["code_security"] = lean_code
+
+    lean_supply: list[dict] = []
+    for finding in scan_data.get("supply_chain", []) or []:
+        if not isinstance(finding, dict):
+            continue
+        lean_supply.append({
+            "cve_id": finding.get("cve_id"),
+            "severity": str(finding.get("severity", "")).strip().lower(),
+            "package": finding.get("package") or finding.get("name"),
+            "installed_version": finding.get("installed_version") or finding.get("version"),
+            "fix_version": finding.get("fix_version"),
+            "count": finding.get("count"),
+            "root_cause_key": finding.get("root_cause_key"),
+            "root_cause_kind": finding.get("root_cause_kind"),
+        })
+    lean["supply_chain"] = lean_supply
+
+    return lean
+
+
 def _iter_by_severity(findings: list[dict], allowed_severity: set[str]) -> list[dict]:
     out: list[dict] = []
     for sev in SEVERITY_ORDER:
@@ -329,6 +392,8 @@ def _select_cycle_scan_strategy(scan_data: dict, scope: str) -> tuple[dict, dict
         "stage_severity": None,
         "stage_findings": total_in_scope,
         "forced_claude_sdk": False,
+        "lean_metadata": False,
+        "preferred_provider": None,
         "stage_label": scope,
     }
     if total_in_scope <= REMEDIATION_LARGE_FINDING_THRESHOLD:
@@ -345,6 +410,9 @@ def _select_cycle_scan_strategy(scan_data: dict, scope: str) -> tuple[dict, dict
         )
         return _filter_scan_by_severities(scan_data, set()), strategy
 
+    # Large repo: remediate only critical/high, staged one severity at a time, and
+    # route to Groq (cheap/fast) with heavily trimmed metadata when available.
+    groq_ready = _groq_available()
     allowed = _severity_for_scope(scope)
     for severity in LARGE_REMEDIATION_SEVERITY_ORDER:
         if severity not in allowed:
@@ -357,7 +425,9 @@ def _select_cycle_scan_strategy(scan_data: dict, scope: str) -> tuple[dict, dict
                 "mode": "large_repo_severity_staged",
                 "stage_severity": severity,
                 "stage_findings": stage_count,
-                "forced_claude_sdk": True,
+                "lean_metadata": True,
+                "preferred_provider": "groq" if groq_ready else "claude",
+                "forced_claude_sdk": not groq_ready,
                 "stage_label": severity,
             }
         )
@@ -908,14 +978,43 @@ echo "PUSHED"
             effective_llm_api_key = self.context.llm_api_key or ""
             effective_llm_model = self.context.llm_model or ""
             requested_provider = str(self.context.llm_provider or "").strip().lower()
-            if cycle_strategy.get("forced_claude_sdk"):
+            lean_metadata = bool(cycle_strategy.get("lean_metadata"))
+            preferred_provider = str(cycle_strategy.get("preferred_provider") or "").strip().lower()
+
+            if preferred_provider == "groq":
+                # Large repo: send only critical/high findings to Groq with ~90%
+                # of finding metadata stripped out (handled below per batch).
+                effective_llm_provider = "groq"
+                effective_llm_api_key = ""
+                effective_llm_model = ""
                 await self._send_message(
                     "info",
                     (
                         f"{cycle_label} Large vulnerability set detected "
                         f"({cycle_strategy.get('total_in_scope', cycle_remaining_baseline)} > "
                         f"{REMEDIATION_LARGE_FINDING_THRESHOLD}). "
-                        f"Using Claude SDK staged mode: processing {str(cycle_strategy.get('stage_severity', '')).upper()} findings first in batches."
+                        f"Routing {str(cycle_strategy.get('stage_severity', '')).upper()} findings to Groq "
+                        "with trimmed metadata, in batches."
+                    ),
+                )
+                if requested_provider not in ("", "claude", "groq"):
+                    await self._send_message(
+                        "info",
+                        (
+                            f"{cycle_label} Ignoring remediation provider override '{requested_provider}' "
+                            "for this large-run stage and using Groq instead."
+                        ),
+                    )
+            elif cycle_strategy.get("forced_claude_sdk"):
+                # Large repo but no Groq key configured: stage on the Claude SDK.
+                await self._send_message(
+                    "info",
+                    (
+                        f"{cycle_label} Large vulnerability set detected "
+                        f"({cycle_strategy.get('total_in_scope', cycle_remaining_baseline)} > "
+                        f"{REMEDIATION_LARGE_FINDING_THRESHOLD}). "
+                        f"No GROQ_API_KEY configured; using Claude SDK staged mode: processing "
+                        f"{str(cycle_strategy.get('stage_severity', '')).upper()} findings first in batches."
                     ),
                 )
                 effective_llm_provider = "claude"
@@ -960,6 +1059,11 @@ echo "PUSHED"
             self._check_cancelled()
             for batch_scan_data, batch_queue_stats in remediation_batches:
                 processed_batches += 1
+                if lean_metadata:
+                    # Large-repo / Groq path: strip ~90% of finding metadata so the
+                    # payload stays small and within the cheaper model's context.
+                    batch_scan_data = _strip_metadata_for_lean(batch_scan_data)
+                    batch_queue_stats["lean_metadata"] = True
                 code_count = len(batch_scan_data.get("code_security", []) or [])
                 supply_count = len(batch_scan_data.get("supply_chain", []) or [])
                 batch_label = cycle_label

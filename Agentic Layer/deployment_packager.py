@@ -38,6 +38,14 @@ STATIC_DIR_CANDIDATES = (
     "client/build",
 )
 
+NODE_APP_DIR_CANDIDATES = (
+    ".",
+    "frontend",
+    "web",
+    "client",
+    "app",
+)
+
 MAX_PACKAGE_BYTES = int(os.getenv("DEPLAI_APP_PACKAGE_MAX_BYTES", "8000000"))
 MAX_PACKAGE_FILES = int(os.getenv("DEPLAI_APP_PACKAGE_MAX_FILES", "2500"))
 PACKAGE_STORE_ROOT = Path(__file__).resolve().parent / ".deplai_runtime" / "deployment_packages"
@@ -340,17 +348,24 @@ def build_deployment_package(
             warnings=warnings,
         ))
 
-    package_json = _read_package_json(root)
-    if package_json:
+    node_roots: list[Path] = []
+    for rel in NODE_APP_DIR_CANDIDATES:
+        candidate = root if rel == "." else root / rel
+        if candidate.is_dir() and (candidate / "package.json").exists():
+            node_roots.append(candidate)
+
+    for node_root in node_roots:
+        package_json = _read_package_json(node_root)
         build_command = _script_command(package_json, "build")
         start_command = _script_command(package_json, "start")
-        if not start_command and _has_file(root, "server.js", "app.js", "index.js"):
-            entry = next(name for name in ("server.js", "app.js", "index.js") if (root / name).exists())
+        if not start_command and _has_file(node_root, "server.js", "app.js", "index.js"):
+            entry = next(name for name in ("server.js", "app.js", "index.js") if (node_root / name).exists())
             start_command = f"node {entry}"
         if start_command:
-            package_base64, file_count, byte_count = _tar_directory(root)
+            package_base64, file_count, byte_count = _tar_directory(node_root)
             if not build_command:
                 warnings.append("No npm build script detected; EC2 bootstrap will skip build.")
+            selected_root = node_root.relative_to(root).as_posix() if node_root != root else "."
             return _persist_package(DeploymentPackage(
                 package_id=package_id,
                 source_root=str(root),
@@ -362,7 +377,7 @@ def build_deployment_package(
                 package_base64=package_base64,
                 package_file_count=file_count,
                 package_bytes=byte_count,
-                selected_root=".",
+                selected_root=selected_root,
                 package_tarball_path="",
                 manifest_path="",
                 warnings=warnings,

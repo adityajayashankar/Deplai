@@ -33,7 +33,7 @@ if "botocore.exceptions" not in sys.modules:
 
 if "docker" not in sys.modules:
     docker_stub = types.ModuleType("docker")
-    
+
     class DockerClient:  # pragma: no cover - import stub
         pass
 
@@ -54,10 +54,57 @@ from terraform_apply import (
     _discover_existing_ec2_key_pair_name,
     _legacy_runtime_bundle_needs_remediation,
     _remediate_legacy_runtime_bundle,
+    _summarize_ec2_plan_changes,
 )
 
 
 class TerraformApplyKeyPairDiscoveryTests(unittest.TestCase):
+    def test_summarizes_ec2_create_and_replace_plan_changes(self) -> None:
+        summary = _summarize_ec2_plan_changes(
+            {
+                "resource_changes": [
+                    {
+                        "address": "module.compute.aws_instance.app",
+                        "type": "aws_instance",
+                        "change": {"actions": ["create"]},
+                    },
+                    {
+                        "address": "module.compute.aws_instance.replaced",
+                        "type": "aws_instance",
+                        "change": {"actions": ["delete", "create"]},
+                    },
+                    {
+                        "address": "aws_security_group.app",
+                        "type": "aws_security_group",
+                        "change": {"actions": ["create"]},
+                    },
+                ]
+            }
+        )
+
+        self.assertTrue(summary["has_managed_ec2"])
+        self.assertTrue(summary["expects_ec2_create_or_replace"])
+        self.assertEqual(summary["add"], 1)
+        self.assertEqual(summary["replace"], 1)
+        self.assertEqual(len(summary["resources"]), 2)
+
+    def test_summarizes_ec2_noop_plan_changes_without_create_expectation(self) -> None:
+        summary = _summarize_ec2_plan_changes(
+            {
+                "resource_changes": [
+                    {
+                        "address": "aws_instance.app",
+                        "type": "aws_instance",
+                        "change": {"actions": ["no-op"]},
+                    },
+                ]
+            }
+        )
+
+        self.assertTrue(summary["has_managed_ec2"])
+        self.assertFalse(summary["expects_ec2_create_or_replace"])
+        self.assertEqual(summary["no_op"], 1)
+
     def test_discovers_project_environment_key_name_from_tfvars(self) -> None:
         files = [
             {
@@ -203,6 +250,123 @@ class TerraformApplyKeyPairDiscoveryTests(unittest.TestCase):
         self.assertTrue(remediation["legacy_provider_region_var_rewritten"])
         self.assertIn("var.aws_region", patched_by_path["terraform/providers.tf"])
         self.assertNotIn("var.region", patched_by_path["terraform/providers.tf"])
+
+    def test_detects_missing_al2023_ami_data_for_remediation(self) -> None:
+        files = [
+            {
+                "path": "terraform/main.tf",
+                "content": '\n'.join(
+                    [
+                        'module "compute" {',
+                        '  source = "./modules/compute"',
+                        "  ami_id = data.aws_ami.al2023.id",
+                        "}",
+                    ]
+                ),
+            },
+            {
+                "path": "terraform/providers.tf",
+                "content": 'provider "aws" {\n  region = var.aws_region\n}\n',
+            },
+        ]
+
+        self.assertTrue(_legacy_runtime_bundle_needs_remediation(files))
+
+        patched_files, remediation = _remediate_legacy_runtime_bundle(files, None)
+        patched_by_path = {item["path"]: item["content"] for item in patched_files}
+
+        self.assertTrue(remediation["legacy_al2023_ami_data_added"])
+        self.assertIn('data "aws_ami" "al2023"', patched_by_path["terraform/main.tf"])
+
+    def test_canonicalizes_tfvars_environment_and_compute_strategy_aliases(self) -> None:
+        files = [
+            {
+                "path": "terraform/main.tf",
+                "content": 'module "compute" {\n  source = "./modules/compute"\n}\n',
+            },
+            {
+                "path": "terraform/terraform.tfvars",
+                "content": '\n'.join(
+                    [
+                        'project_name = "demo"',
+                        'environment = "production"',
+                        'compute_strategy = "ec2-instance"',
+                    ]
+                ),
+            },
+        ]
+
+        self.assertTrue(_legacy_runtime_bundle_needs_remediation(files))
+
+        patched_files, remediation = _remediate_legacy_runtime_bundle(files, None)
+        patched_by_path = {item["path"]: item["content"] for item in patched_files}
+
+        self.assertTrue(remediation["legacy_tfvars_environment_canonicalized"])
+        self.assertTrue(remediation["legacy_tfvars_compute_strategy_canonicalized"])
+        self.assertIn('environment = "prod"', patched_by_path["terraform/terraform.tfvars"])
+        self.assertIn('compute_strategy = "ec2"', patched_by_path["terraform/terraform.tfvars"])
+
+    def test_rewrites_long_iam_name_prefixes_to_bounded_substr(self) -> None:
+        files = [
+            {
+                "path": "terraform/modules/iam/main.tf",
+                "content": '\n'.join(
+                    [
+                        'resource "aws_iam_role" "ec2" {',
+                        '  name_prefix        = "${var.project_name}-${var.environment}-ec2-role-"',
+                        "}",
+                        'resource "aws_iam_role_policy" "app" {',
+                        '  name_prefix = "${var.project_name}-${var.environment}-app-"',
+                        "}",
+                        'resource "aws_iam_instance_profile" "ec2" {',
+                        '  name_prefix = "${var.project_name}-${var.environment}-instance-profile-"',
+                        "}",
+                    ]
+                ),
+            },
+        ]
+
+        patched_files, remediation = _remediate_legacy_runtime_bundle(files, None)
+        patched = patched_files[0]["content"]
+
+        self.assertTrue(remediation["legacy_iam_name_collision_rewritten"])
+        self.assertIn('substr("${var.project_name}-${var.environment}-ec2-role-", 0, 38)', patched)
+        self.assertIn('substr("${var.project_name}-${var.environment}-app-", 0, 38)', patched)
+        self.assertIn('substr("${var.project_name}-${var.environment}-instance-profile-", 0, 38)', patched)
+
+    def test_rewrites_nginx_security_group_ingress_to_port_80(self) -> None:
+        files = [
+            {
+                "path": "terraform/modules/compute/main.tf",
+                "content": '\n'.join(
+                    [
+                        'resource "aws_security_group" "app" {',
+                        "  ingress {",
+                        "    from_port   = var.app_port",
+                        "    to_port     = var.app_port",
+                        '    protocol    = "tcp"',
+                        '    cidr_blocks = ["0.0.0.0/0"]',
+                        "  }",
+                        "}",
+                        'resource "aws_instance" "app" {',
+                        '  user_data = join("\\n", [',
+                        '    "#!/bin/bash",',
+                        '    "set -euxo pipefail",',
+                        '    "dnf install -y nginx"',
+                        "  ])",
+                        "}",
+                    ]
+                ),
+            },
+        ]
+
+        patched_files, remediation = _remediate_legacy_runtime_bundle(files, None)
+        patched = patched_files[0]["content"]
+
+        self.assertTrue(remediation["legacy_nginx_ingress_port_fixed"])
+        self.assertIn("from_port   = 80", patched)
+        self.assertIn("to_port     = 80", patched)
+        self.assertNotIn("from_port   = var.app_port", patched)
 
     def test_clean_bundle_skips_legacy_runtime_remediation(self) -> None:
         files = [

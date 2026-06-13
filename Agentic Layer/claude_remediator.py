@@ -1249,6 +1249,31 @@ def run_claude_remediation(
 
     def _run_chain(prompt: str) -> tuple[bool, str]:
         provider_lower = (llm_provider or "").strip().lower()
+
+        # Groq remediation path (cheap/fast; used for large repos with only
+        # critical/high findings). Falls back to the Claude Agent SDK on failure
+        # when a Claude key is available.
+        if provider_lower == "groq":
+            ok, raw_text = _call_groq(prompt)
+            if ok:
+                return (True, raw_text)
+            claude_key = (
+                os.getenv("ANTHROPIC_API_KEY", "").strip()
+                or os.getenv("CLAUDE_API_KEY", "").strip()
+            )
+            if not claude_key:
+                return (False, "Groq remediation failed and no Claude fallback key configured: " + raw_text)
+            ok_fb, raw_fb = _call_claude_sdk(
+                prompt,
+                None,
+                None,
+                budget_tracker=budget_tracker,
+                stage="fallback_remediation",
+            )
+            if ok_fb:
+                return (True, raw_fb)
+            return (False, f"Groq remediation failed ({raw_text}); Claude fallback also failed: {raw_fb}")
+
         effective_api_key = llm_api_key if provider_lower in ("", "claude") else None
         effective_model = llm_model if provider_lower in ("", "claude") else None
 
@@ -1265,7 +1290,7 @@ def run_claude_remediation(
         if provider_lower and provider_lower != "claude":
             return (
                 False,
-                f"Remediation only supports the Claude Agent SDK; ignored provider '{provider_lower}'. Claude SDK error: {raw_text}",
+                f"Remediation supports the Claude Agent SDK and Groq; ignored provider '{provider_lower}'. Claude SDK error: {raw_text}",
             )
         return (False, "Claude SDK remediation failed: " + raw_text)
 

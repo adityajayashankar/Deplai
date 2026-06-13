@@ -157,6 +157,7 @@ module "ec2" {
   subnet_id                   = aws_subnet.public.id
   vpc_security_group_ids      = [aws_security_group.instance.id]
   associate_public_ip_address = true
+  user_data                   = var.user_data != "" ? var.user_data : null
 
   root_block_device = [
     {
