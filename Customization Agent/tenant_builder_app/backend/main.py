@@ -24,9 +24,17 @@ from services.preview_manager import preview_status, start_preview, stop_preview
 from services.repo_service import get_tenant_repo_path, reset_tenant_repo
 
 
+class LlmConfig(BaseModel):
+    """Inbound BYOK config. api_key used in-memory only, never logged."""
+    provider: str
+    model: str
+    api_key: str
+
+
 class ChatRequest(BaseModel):
     tenant_id: str
     message: str
+    llm_config: LlmConfig | None = None  # Optional BYOK override
 
 
 class ImplementRequest(BaseModel):
@@ -37,6 +45,7 @@ class ImplementRequest(BaseModel):
     pipeline_mode: str | None = None
     run_quality_gates: bool = True
     start_preview: bool = True
+    llm_config: LlmConfig | None = None
 
 
 class TenantRequest(BaseModel):
@@ -281,7 +290,7 @@ def chat(request: ChatRequest) -> dict:
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id is required.")
     normalized_tenant_id = state.ensure_tenant(tenant_id)
-    result = agent.handle_message(normalized_tenant_id, request.message)
+    result = agent.handle_message(normalized_tenant_id, request.message, byok_config=request.llm_config)
     result["confirmation"] = state.get_confirmation_state(normalized_tenant_id)
     result["tenant_id"] = normalized_tenant_id
     return result
@@ -353,6 +362,7 @@ def implement_tenant(request: ImplementRequest) -> dict:
             pipeline_mode=request.pipeline_mode,
             run_quality_gates_enabled=request.run_quality_gates,
             start_preview_enabled=request.start_preview,
+            byok_config=request.llm_config,
         )
     except ManifestValidationError as exc:
         raise HTTPException(

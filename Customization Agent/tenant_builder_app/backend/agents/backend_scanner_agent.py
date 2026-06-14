@@ -134,7 +134,8 @@ def scan_backend_repo(state: dict) -> dict:
         state["errors"] = errors
         return state
 
-    client = ProjectLLMClient()
+    byok_config = state.get("byok_config")
+    client = ProjectLLMClient(byok_config=byok_config)
     if not client.is_configured():
         log_agent("BackendScanner", "LLM not configured; returning backend inventory without target classification.")
         state["backend_repo_map"] = backend_repo_map

@@ -451,11 +451,11 @@ const ArchNode = ({ title, subtitle, icon: Icon, highlight, highlightColor = 'in
   const isIndigo = highlightColor === 'indigo';
   
   const bg = highlight 
-    ? (isIndigo ? 'bg-indigo-500/10' : isEmerald ? 'bg-emerald-500/10' : 'bg-blue-500/10')
+    ? (isIndigo ? 'bg-white/10' : isEmerald ? 'bg-emerald-500/10' : 'bg-blue-500/10')
     : 'bg-[#111111]';
     
   const border = highlight
-    ? (isIndigo ? 'border-indigo-500/30' : isEmerald ? 'border-emerald-500/30' : 'border-blue-500/30')
+    ? (isIndigo ? 'border-white/30' : isEmerald ? 'border-emerald-500/30' : 'border-blue-500/30')
     : 'border-[#262626]';
     
   const titleCol = highlight
@@ -463,7 +463,7 @@ const ArchNode = ({ title, subtitle, icon: Icon, highlight, highlightColor = 'in
     : 'text-zinc-200';
     
   const iconCol = highlight
-    ? (isIndigo ? 'text-indigo-400' : isEmerald ? 'text-emerald-400' : 'text-blue-400')
+    ? (isIndigo ? 'text-zinc-300' : isEmerald ? 'text-emerald-400' : 'text-blue-400')
     : 'text-zinc-400';
 
   return (

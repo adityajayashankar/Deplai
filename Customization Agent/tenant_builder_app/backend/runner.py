@@ -278,6 +278,7 @@ def run_customization(
     pipeline_mode: str | None = None,
     run_quality_gates_enabled: bool = True,
     start_preview_enabled: bool = True,
+    byok_config: Any | None = None,
 ) -> dict[str, Any]:
     tenant_id = str(manifest.get("tenant_id") or manifest.get("tenant_name") or "draft-tenant")
     backend_dir = Path(__file__).resolve().parent
@@ -307,6 +308,7 @@ def run_customization(
         "planner_source": "",
         "modified_files": [],
         "errors": list(normalized_validator_issues),
+        "byok_config": byok_config,
     }
 
     # LLM graph is enabled by default. Explicit pipeline modes make attribution

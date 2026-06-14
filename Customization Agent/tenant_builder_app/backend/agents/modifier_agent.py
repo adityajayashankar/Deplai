@@ -240,7 +240,8 @@ def apply_changes(state: dict) -> dict:
     errors = list(state.get("errors", []))
     records = list(state.get("modification_records", []))
     manifest_summary = state.get("manifest", {})
-    client = ProjectLLMClient()
+    byok_config = state.get("byok_config")
+    client = ProjectLLMClient(byok_config=byok_config)
 
     for change in state.get("planned_changes", []):
         relative_path = change["file"]

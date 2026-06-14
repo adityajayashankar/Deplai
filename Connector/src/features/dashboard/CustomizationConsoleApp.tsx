@@ -101,6 +101,48 @@ const PIPELINE_MODE_OPTIONS = [
   { value: 'deterministic_only' as PipelineMode, label: 'Deterministic', description: 'Rule-based only', icon: Wrench },
   { value: 'diagnostic' as PipelineMode, label: 'Diagnostic', description: 'Dry run & report', icon: Microscope },
 ];
+
+/* Provider → Model map */
+type ByokProvider = 'Anthropic' | 'OpenAI' | 'OpenRouter' | 'Groq' | 'MiniMax';
+interface ByokModel { id: string; name: string; }
+interface ByokConfig { provider: ByokProvider; modelId: string; apiKey: string; }
+
+const PROVIDER_MODEL_MAP: Record<ByokProvider, ByokModel[]> = {
+  Anthropic: [
+    { id: 'claude-opus-4-5', name: 'Claude Opus 4.5 (Long-Context / Coding)' },
+    { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5 (Balanced / Default)' },
+    { id: 'claude-haiku-3-5', name: 'Claude Haiku 3.5 (Fast)' },
+  ],
+  OpenAI: [
+    { id: 'gpt-4o', name: 'GPT-4o (Flagship)' },
+    { id: 'gpt-4.1', name: 'GPT-4.1 (Latest)' },
+    { id: 'o3-mini', name: 'o3-mini (Reasoning)' },
+  ],
+  Groq: [
+    { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B (Versatile)' },
+    { id: 'meta-llama/llama-4-scout-17b-16e-instruct', name: 'Llama 4 Scout (10M Context)' },
+    { id: 'moonshotai/kimi-k2-instruct', name: 'Kimi K2 (Coding)' },
+  ],
+  OpenRouter: [
+    { id: 'anthropic/claude-opus-4-5', name: 'Claude Opus 4.5 (via OpenRouter)' },
+    { id: 'google/gemini-2.5-pro', name: 'Gemini 2.5 Pro (via OpenRouter)' },
+    { id: 'openai/gpt-4o', name: 'GPT-4o (via OpenRouter)' },
+  ],
+  MiniMax: [
+    { id: 'minimax-m3', name: 'MiniMax M3 (Latest / Agentic)' },
+    { id: 'minimax-m2.7', name: 'MiniMax M2.7' },
+    { id: 'minimax-m2.7-highspeed', name: 'MiniMax M2.7 Highspeed' },
+  ],
+};
+
+/* Map frontend provider name → backend provider id expected by callLLM */
+const PROVIDER_TO_BACKEND_ID: Record<ByokProvider, string> = {
+  Anthropic: 'claude',
+  OpenAI: 'openai',
+  Groq: 'groq',
+  OpenRouter: 'openrouter',
+  MiniMax: 'minimax',
+};
 const REVERT_TO_BASE_CHAT_PATTERN = /(revert|reset|restore|undo).*(original|base|default).*(ui|theme|frontend|site|design)/i;
 const INITIAL_CHAT_TIMESTAMP = '--:--:--';
 const CHAT_COMMAND_PRESETS = [
@@ -187,6 +229,8 @@ export default function CustomizationConsoleApp() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const diffRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   /* ── Query params ── */
   const tenantFromQuery = useMemo(() => sanitizeTenantId(searchParams.get('tenantId') || ''), [searchParams]);
@@ -241,8 +285,8 @@ export default function CustomizationConsoleApp() {
   const [showByokModal, setShowByokModal] = useState(false);
 
   /* ── BYOK State ── */
-  const [byokKey, setByokKey] = useState('');
-  const [byokProvider, setByokProvider] = useState('');
+  const [byokDraft, setByokDraft] = useState<{ provider: ByokProvider | ''; modelId: string; apiKey: string; }>({ provider: '', modelId: '', apiKey: '' });
+  const [byokConfig, setByokConfig] = useState<ByokConfig | null>(null); // provisioned config
 
   /* ── Loading state ── */
   const [loading, setLoading] = useState<LoadingState>({
@@ -489,6 +533,13 @@ export default function CustomizationConsoleApp() {
           tenant_id: activeTenantId, project_id: projectIdFromQuery || undefined, app_targets: implementRun.appTargets,
           validator_issues: validatorIssues.length > 0 ? validatorIssues : undefined, pipeline_mode: implementRun.pipelineMode,
           run_quality_gates: true, start_preview: true,
+          ...(byokConfig ? {
+            llm_config: {
+              provider: PROVIDER_TO_BACKEND_ID[byokConfig.provider],
+              model: byokConfig.modelId,
+              api_key: byokConfig.apiKey,
+            }
+          } : {}),
         }),
       });
       const payload = await parseJsonSafe<ImplementResponse>(response);
@@ -575,7 +626,17 @@ export default function CustomizationConsoleApp() {
     try {
       const response = await fetch('/api/customization/chat', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenant_id: activeTenantId, message }),
+        body: JSON.stringify({
+          tenant_id: activeTenantId,
+          message,
+          ...(byokConfig ? {
+            llm_config: {
+              provider: PROVIDER_TO_BACKEND_ID[byokConfig.provider],
+              model: byokConfig.modelId,
+              api_key: byokConfig.apiKey,
+            }
+          } : {}),
+        }),
       });
       const payload = await parseJsonSafe<ChatResponse>(response);
       if (!response.ok) throw new Error(getErrorMessage(payload, 'Failed to send chat message.'));
@@ -607,10 +668,48 @@ export default function CustomizationConsoleApp() {
     } finally {
       setLoading((prev) => ({ ...prev, chat: false }));
     }
-  }, [chatInput, fetchManifest, handleConfirm, runImplementation, loadAssets, performRepoReset, syncConfirmationState, tenantId]);
+  }, [byokConfig, chatInput, fetchManifest, handleConfirm, runImplementation, loadAssets, performRepoReset, syncConfirmationState, tenantId]);
+
+  const handleAssetUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const activeTenantId = sanitizeTenantId(tenantId);
+    if (!activeTenantId) {
+      setStatus({ level: 'error', text: 'Workspace required for asset upload.' });
+      return;
+    }
+    
+    setLoading(prev => ({ ...prev, upload: true }));
+    setStatus({ level: 'info', text: `Uploading ${assetType}...` });
+    
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('tenant_id', activeTenantId);
+      formData.append('asset_type', assetType);
+      
+      const response = await fetch('/api/customization/assets/upload', {
+        method: 'POST',
+        body: formData,
+      });
+      
+      if (!response.ok) {
+        const payload = await parseJsonSafe(response);
+        throw new Error(getErrorMessage(payload, 'Upload failed'));
+      }
+      
+      setStatus({ level: 'success', text: `Asset ${assetType} uploaded successfully.` });
+      await loadAssets(activeTenantId);
+    } catch (error) {
+      setStatus({ level: 'error', text: error instanceof Error ? error.message : 'Failed to upload asset.' });
+    } finally {
+      setLoading(prev => ({ ...prev, upload: false }));
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
 
   return (
-    <div className="flex flex-col h-screen bg-[#09090b] text-zinc-300 font-sans selection:bg-indigo-500/30 overflow-hidden">
+    <div className="flex flex-col h-screen bg-[#09090b] text-zinc-300 font-sans selection:bg-white/30 overflow-hidden">
       <style>{`
         ::-webkit-scrollbar { width: 14px; height: 14px; }
         ::-webkit-scrollbar-track { background: transparent; }
@@ -623,8 +722,10 @@ export default function CustomizationConsoleApp() {
       <header className="flex items-center justify-between h-12 px-4 bg-[#09090b] border-b border-zinc-800/80 shrink-0 text-xs">
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2.5 text-zinc-100 font-semibold tracking-wide">
-            <div className="w-6 h-6 rounded bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-[11px] font-bold text-white shadow-sm">IF</div>
-            <span>IFCA Console</span>
+            <div className="w-6 h-6 rounded flex items-center justify-center bg-gradient-to-br from-white via-zinc-400 to-zinc-500 shadow-sm shadow-zinc-400/20 ring-1 ring-white/10">
+               <Command className="w-3.5 h-3.5 text-white" />
+            </div>
+            <span>Deplai Console</span>
             {(projectNameFromQuery || projectIdFromQuery) && (
                <span className="text-zinc-500 font-normal"> / {projectNameFromQuery || projectIdFromQuery}</span>
             )}
@@ -710,8 +811,8 @@ export default function CustomizationConsoleApp() {
             <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800/80 bg-[#121214]">
               <div className="flex items-center">
                 <Terminal className="w-4 h-4 text-zinc-400 mr-2.5" />
-                <h2 className="text-xs font-semibold text-zinc-200">Copilot Session</h2>
-                <button onClick={() => setShowByokModal(true)} className="flex items-center gap-1.5 px-2 py-1 ml-3 text-[10px] font-bold text-black bg-white hover:bg-zinc-200 rounded transition-colors shadow-sm" title="Bring Your Own Key">
+                <h2 className="text-xs font-semibold text-zinc-200">Deplai Agent Session</h2>
+                <button onClick={() => setShowByokModal(true)} className="flex items-center gap-1.5 px-2 py-1 ml-3 text-[10px] font-bold text-black bg-white hover:bg-zinc-300 rounded transition-colors shadow-sm" title="Bring Your Own Key">
                   <Key className="w-3 h-3" /> BYOK
                 </button>
               </div>
@@ -730,7 +831,7 @@ export default function CustomizationConsoleApp() {
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center justify-between mb-2">
-                        <span className="text-[13px] font-bold text-zinc-100 tracking-wide">Copilot</span>
+                        <span className="text-[13px] font-bold text-zinc-100 tracking-wide">Deplai Agent</span>
                         <span className="text-[10px] text-zinc-600 font-mono">{msg.timestamp}</span>
                       </div>
                       <div className="text-[13px] leading-relaxed text-zinc-300">{formatUiText(msg.content)}</div>
@@ -752,7 +853,7 @@ export default function CustomizationConsoleApp() {
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center justify-between mb-2">
-                        <span className="text-[13px] font-bold text-zinc-100 tracking-wide">Copilot</span>
+                        <span className="text-[13px] font-bold text-zinc-100 tracking-wide">Deplai Agent</span>
                       </div>
                       <div className="text-[13px] leading-relaxed text-zinc-500 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin"/> Processing...</div>
                     </div>
@@ -763,18 +864,18 @@ export default function CustomizationConsoleApp() {
 
             <div className="p-5 bg-[#121214] border-t border-zinc-800/80">
               <div className="relative group">
-                <div className="absolute inset-0 bg-gradient-to-r from-indigo-500/20 to-purple-500/20 rounded-xl blur opacity-0 group-focus-within:opacity-100 transition-opacity"></div>
-                <form onSubmit={handleChatSubmit} className="relative flex items-center bg-[#09090b] border border-zinc-700 focus-within:border-indigo-500/50 rounded-xl overflow-hidden transition-colors">
+                <div className="absolute inset-0 bg-gradient-to-r from-white/20 to-zinc-400/20 rounded-xl blur opacity-0 group-focus-within:opacity-100 transition-opacity"></div>
+                <form onSubmit={handleChatSubmit} className="relative flex items-center bg-[#09090b] border border-zinc-700 focus-within:border-white/50 rounded-xl overflow-hidden transition-colors">
                   <div className="pl-4 pr-2 text-zinc-500"><Sparkles className="w-4 h-4" /></div>
                   <input 
                     type="text" 
                     value={chatInput}
                     onChange={(e) => setChatInput(e.target.value)}
                     disabled={loading.chat || isGlobalDisabled}
-                    placeholder="Instruct Copilot (say 'confirm' to execute)..." 
+                    placeholder="Instruct Deplai Agent (say 'confirm' to execute)..." 
                     className="flex-1 bg-transparent py-3.5 text-[13px] text-zinc-200 placeholder:text-zinc-600 focus:outline-none"
                   />
-                  <button type="submit" disabled={!chatInput.trim() || loading.chat || isGlobalDisabled} className="px-4 text-zinc-500 hover:text-indigo-400 transition-colors">
+                  <button type="submit" disabled={!chatInput.trim() || loading.chat || isGlobalDisabled} className="px-4 text-zinc-500 hover:text-zinc-300 transition-colors">
                     <SendHorizontal className="w-4 h-4" />
                   </button>
                 </form>
@@ -795,8 +896,8 @@ export default function CustomizationConsoleApp() {
                   onClick={() => setActiveTab(tab.value)}
                   className={`group flex items-center gap-2 px-4 h-full text-[13px] font-medium border-r border-zinc-800/40 transition-all relative shrink-0 ${isActive ? 'bg-[#09090b] text-zinc-100' : 'text-zinc-500 hover:bg-zinc-900 hover:text-zinc-300'}`}
                 >
-                  {isActive && <div className="absolute top-0 left-0 right-0 h-[2px] bg-indigo-500"></div>}
-                  <Icon className={`w-4 h-4 ${isActive ? 'text-indigo-400' : 'text-zinc-600 group-hover:text-zinc-400'}`} />
+                  {isActive && <div className="absolute top-0 left-0 right-0 h-[2px] bg-white"></div>}
+                  <Icon className={`w-4 h-4 ${isActive ? 'text-zinc-300' : 'text-zinc-600 group-hover:text-zinc-400'}`} />
                   {tab.label}
                   {tab.value === 'results' && lastImplementErrors.length > 0 && (
                     <span className="ml-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-rose-500/20 px-1 text-[9px] font-bold text-rose-400">{lastImplementErrors.length}</span>
@@ -809,7 +910,7 @@ export default function CustomizationConsoleApp() {
           <div className="flex-1 overflow-hidden relative flex flex-col">
             {/* PREVIEW VIEW */}
             {activeTab === 'preview' && (
-              <div className="w-full h-full p-6 flex flex-col items-center bg-[#09090b]">
+              <div className="flex-1 w-full p-6 flex flex-col items-center bg-[#09090b]">
                 <div className="w-full flex items-center justify-end h-10 mb-4 text-xs shrink-0">
                   <div className="flex items-center gap-3">
                     <div className="flex bg-[#121214] border border-zinc-800 rounded-md p-1 shadow-inner">
@@ -854,14 +955,14 @@ export default function CustomizationConsoleApp() {
                                 <>
                                   <div className="relative w-24 h-24 mb-8 flex items-center justify-center">
                                     <svg className="absolute inset-0 w-full h-full text-zinc-800 animate-[spin_4s_linear_infinite]" viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="none" strokeWidth="1" stroke="currentColor" strokeDasharray="4 4" /></svg>
-                                    <svg className="absolute inset-2 w-[calc(100%-16px)] h-[calc(100%-16px)] text-indigo-500 animate-[spin_2s_linear_infinite_reverse]" viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="none" strokeWidth="2" stroke="currentColor" strokeDasharray="80 220" strokeLinecap="round" /></svg>
+                                    <svg className="absolute inset-2 w-[calc(100%-16px)] h-[calc(100%-16px)] text-white animate-[spin_2s_linear_infinite_reverse]" viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="none" strokeWidth="2" stroke="currentColor" strokeDasharray="80 220" strokeLinecap="round" /></svg>
                                     <Code2 className="w-8 h-8 text-zinc-400" />
                                   </div>
                                   <h3 className="text-zinc-200 font-medium mb-2 text-lg">{previewStarting ? 'Starting dev server...' : 'Loading preview...'}</h3>
                                   <div className="w-full bg-[#121214] border border-zinc-800/80 rounded-lg p-4 font-mono text-xs text-zinc-500 mt-4 h-32 overflow-hidden relative shadow-inner text-left">
                                     <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-[#121214] z-10 pointer-events-none"></div>
                                     <div className="space-y-1.5 animate-pulse">
-                                      <p className="text-indigo-400/70">{previewMeta?.preview_detail || 'Initializing environments...'}</p>
+                                      <p className="text-zinc-300/70">{previewMeta?.preview_detail || 'Initializing environments...'}</p>
                                     </div>
                                   </div>
                                 </>
@@ -878,12 +979,12 @@ export default function CustomizationConsoleApp() {
 
             {/* RESULTS VIEW */}
             {activeTab === 'results' && (
-              <div className="flex flex-col h-full bg-[#09090b]">
+              <div className="flex-1 flex flex-col bg-[#09090b] overflow-hidden">
                 <div className="flex items-center gap-8 px-6 h-12 border-b border-zinc-800/80 text-[13px] font-medium shrink-0 bg-[#0c0c0e]">
-                  <button onClick={() => setResultsSubTab('diffs')} className={`h-full border-b-2 flex items-center transition-colors ${resultsSubTab === 'diffs' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-zinc-400 hover:text-zinc-200'}`}>
+                  <button onClick={() => setResultsSubTab('diffs')} className={`h-full border-b-2 flex items-center transition-colors ${resultsSubTab === 'diffs' ? 'border-white text-zinc-300' : 'border-transparent text-zinc-400 hover:text-zinc-200'}`}>
                     Code Diffs {codeDiffEntries.length > 0 && <span className="ml-2 px-2 py-0.5 rounded-full bg-zinc-800 text-[10px] text-zinc-300">{codeDiffEntries.length}</span>}
                   </button>
-                  <button onClick={() => setResultsSubTab('errors')} className={`h-full border-b-2 flex items-center transition-colors ${resultsSubTab === 'errors' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-zinc-400 hover:text-zinc-200'}`}>
+                  <button onClick={() => setResultsSubTab('errors')} className={`h-full border-b-2 flex items-center transition-colors ${resultsSubTab === 'errors' ? 'border-white text-zinc-300' : 'border-transparent text-zinc-400 hover:text-zinc-200'}`}>
                     Compilation Logs {lastImplementErrors.length > 0 && <span className="ml-2 px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-400 text-[10px]">{lastImplementErrors.length}</span>}
                   </button>
                 </div>
@@ -896,7 +997,7 @@ export default function CustomizationConsoleApp() {
                       </div>
                       <div className="flex-1 overflow-y-auto p-3 space-y-1">
                         {codeDiffEntries.map((entry, idx) => (
-                          <div key={idx} className="flex items-center justify-between px-3 py-2 hover:bg-zinc-800/50 rounded-md cursor-pointer text-zinc-400 hover:text-zinc-200 text-[13px] transition-colors">
+                          <div key={idx} onClick={() => diffRefs.current[idx]?.scrollIntoView({ behavior: 'smooth' })} className="flex items-center justify-between px-3 py-2 hover:bg-zinc-800/50 rounded-md cursor-pointer text-zinc-400 hover:text-zinc-200 text-[13px] transition-colors">
                             <div className="flex items-center gap-2.5 truncate"><FileCode2 className="w-4 h-4 shrink-0" /> <span className="truncate">{entry.file.split('/').pop()}</span></div>
                           </div>
                         ))}
@@ -907,7 +1008,7 @@ export default function CustomizationConsoleApp() {
                     <div className="flex-1 flex flex-col bg-[#09090b] overflow-hidden">
                       <div className="flex-1 overflow-auto p-5 space-y-4">
                         {codeDiffEntries.map((entry, idx) => (
-                           <div key={idx} className="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+                           <div key={idx} ref={(el) => { diffRefs.current[idx] = el; }} className="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
                               <div className="flex items-center justify-between border-b border-zinc-800/60 px-4 py-2.5">
                                 <span className="font-mono text-[12px] font-medium text-zinc-300">{entry.file}</span>
                               </div>
@@ -938,10 +1039,10 @@ export default function CustomizationConsoleApp() {
 
             {/* MANIFEST VIEW */}
             {activeTab === 'manifest' && (
-              <div className="flex flex-col h-full bg-[#09090b]">
+              <div className="flex-1 flex flex-col bg-[#09090b] overflow-hidden">
                 <div className="flex items-center justify-between px-6 h-14 border-b border-zinc-800/80 bg-[#121214] shrink-0">
                   <div className="flex items-center gap-3 text-[13px] font-semibold text-zinc-200">
-                    <Braces className="w-4 h-4 text-indigo-400" /> manifest.json
+                    <Braces className="w-4 h-4 text-zinc-300" /> manifest.json
                     {manifestJson && <span className="px-2.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[10px] uppercase tracking-wider">Valid JSON</span>}
                   </div>
                   <div className="flex items-center gap-2">
@@ -964,19 +1065,41 @@ export default function CustomizationConsoleApp() {
 
             {/* ASSETS VIEW */}
             {activeTab === 'assets' && (
-              <div className="flex flex-col h-full bg-[#09090b] overflow-y-auto">
+              <div className="flex-1 flex flex-col bg-[#09090b] overflow-y-auto">
                 <div className="max-w-5xl mx-auto w-full p-8 space-y-10">
                   <div>
                     <h2 className="text-2xl font-semibold text-zinc-100 tracking-tight">Branding Assets</h2>
                     <p className="text-sm text-zinc-500 mt-2">Upload and manage logos, favicons, and custom fonts for your implementation.</p>
                   </div>
                   
-                  {/* Keep simple UI mock for now, can implement file upload with handleUpload in real app */}
-                  <div className="group relative w-full rounded-2xl border-2 border-dashed border-zinc-700/80 hover:border-indigo-500 hover:bg-indigo-500/5 transition-all duration-300 p-12 flex flex-col items-center justify-center cursor-pointer bg-[#121214]/50">
-                    <div className="w-20 h-20 rounded-full bg-zinc-800 group-hover:bg-indigo-500/20 flex items-center justify-center mb-5 transition-colors">
-                      <UploadCloud className="w-10 h-10 text-zinc-400 group-hover:text-indigo-400 transition-colors" />
+                  <div className="flex items-center gap-4">
+                    <label className="text-sm font-medium text-zinc-300">Select Asset Type:</label>
+                    <select 
+                      value={assetType} 
+                      onChange={(e) => setAssetType(e.target.value as AssetType)}
+                      className="bg-[#121214] border border-zinc-700 text-zinc-200 rounded px-3 py-2 text-sm focus:outline-none focus:border-white"
+                    >
+                      {ASSET_OPTIONS.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                    </select>
+                  </div>
+
+                  <div 
+                    onClick={() => fileInputRef.current?.click()}
+                    className={`group relative w-full rounded-2xl border-2 border-dashed border-zinc-700/80 hover:border-white hover:bg-white/5 transition-all duration-300 p-12 flex flex-col items-center justify-center cursor-pointer ${loading.upload ? 'opacity-50 pointer-events-none' : 'bg-[#121214]/50'}`}
+                  >
+                    <input 
+                      type="file" 
+                      ref={fileInputRef} 
+                      onChange={handleAssetUpload} 
+                      className="hidden" 
+                      accept="image/svg+xml,image/png,image/jpeg,image/webp"
+                    />
+                    <div className="w-20 h-20 rounded-full bg-zinc-800 group-hover:bg-white/20 flex items-center justify-center mb-5 transition-colors">
+                      {loading.upload ? <Loader2 className="w-10 h-10 animate-spin text-zinc-300" /> : <UploadCloud className="w-10 h-10 text-zinc-400 group-hover:text-zinc-300 transition-colors" />}
                     </div>
-                    <h3 className="text-base font-semibold text-zinc-200 mb-2 group-hover:text-indigo-200 transition-colors">Click or drag file to this area to upload</h3>
+                    <h3 className="text-base font-semibold text-zinc-200 mb-2 group-hover:text-indigo-200 transition-colors">
+                      {loading.upload ? 'Uploading...' : 'Click or drag file to this area to upload'}
+                    </h3>
                     <p className="text-sm text-zinc-500 text-center max-w-md">Supports SVG, PNG, JPG, or WEBP. Max file size is 5MB.</p>
                   </div>
 
@@ -1002,7 +1125,7 @@ export default function CustomizationConsoleApp() {
 
             {/* SETTINGS VIEW */}
             {activeTab === 'settings' && (
-              <div className="w-full h-full overflow-y-auto bg-[#09090b]">
+              <div className="flex-1 w-full overflow-y-auto bg-[#09090b]">
                 <div className="max-w-4xl mx-auto p-8 space-y-12">
                   <div>
                     <h2 className="text-xl font-semibold text-zinc-100 tracking-tight">Configuration Settings</h2>
@@ -1015,9 +1138,9 @@ export default function CustomizationConsoleApp() {
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       {PIPELINE_MODE_OPTIONS.map((mode) => (
-                        <div key={mode.value} onClick={() => setImplementRun(p => ({...p, pipelineMode: mode.value}))} className={`relative p-4 rounded-xl border cursor-pointer transition-all ${implementRun.pipelineMode === mode.value ? 'bg-indigo-500/5 border-indigo-500/50 shadow-[0_0_15px_rgba(99,102,241,0.1)]' : 'bg-[#121214] border-zinc-800 hover:border-zinc-700'}`}>
+                        <div key={mode.value} onClick={() => setImplementRun(p => ({...p, pipelineMode: mode.value}))} className={`relative p-4 rounded-xl border cursor-pointer transition-all ${implementRun.pipelineMode === mode.value ? 'bg-white/5 border-white/50 shadow-[0_0_15px_rgba(99,102,241,0.1)]' : 'bg-[#121214] border-zinc-800 hover:border-zinc-700'}`}>
                           <div className="flex items-start gap-4">
-                            <div className={`p-2.5 rounded-lg ${implementRun.pipelineMode === mode.value ? 'bg-indigo-500/20 text-indigo-400' : 'bg-zinc-800 text-zinc-400'}`}><mode.icon className="w-5 h-5" /></div>
+                            <div className={`p-2.5 rounded-lg ${implementRun.pipelineMode === mode.value ? 'bg-white/20 text-zinc-300' : 'bg-zinc-800 text-zinc-400'}`}><mode.icon className="w-5 h-5" /></div>
                             <div className="flex-1 mt-0.5">
                               <h4 className="text-sm font-semibold text-zinc-200">{mode.label}</h4>
                               <p className="text-xs text-zinc-500">{mode.description}</p>
@@ -1052,46 +1175,114 @@ export default function CustomizationConsoleApp() {
 
       {/* BYOK MODAL */}
       {showByokModal && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-[#09090b] border border-zinc-800 rounded-xl shadow-2xl w-full max-w-md overflow-hidden">
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-[#09090b] border border-zinc-800 rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden">
             <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800 bg-[#121214]">
-              <h3 className="text-sm font-semibold text-white flex items-center gap-2"><Key className="w-4 h-4 text-zinc-400" /> Bring Your Own Key</h3>
+              <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                <Key className="w-4 h-4 text-zinc-300" />
+                Provision Deplai Agent
+              </h3>
               <button onClick={() => setShowByokModal(false)} className="text-zinc-500 hover:text-white transition-colors text-lg leading-none">&times;</button>
             </div>
-            <div className="p-6 space-y-5">
-              <div>
-                <label className="block text-xs font-medium text-zinc-400 mb-2">Paste API Key</label>
-                <input
-                  type="password"
-                  value={byokKey}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setByokKey(val);
-                    if (!val) setByokProvider('');
-                    else if (val.startsWith('sk-ant-')) setByokProvider('Anthropic (Claude)');
-                    else if (val.startsWith('sk-proj-') || (val.startsWith('sk-') && !val.startsWith('sk-or-'))) setByokProvider('OpenAI');
-                    else if (val.startsWith('xai-')) setByokProvider('xAI (Grok)');
-                    else if (val.startsWith('sk-or-')) setByokProvider('OpenRouter');
-                    else if (val.startsWith('gsk_')) setByokProvider('Groq');
-                    else setByokProvider('Custom / Unknown');
-                  }}
-                  placeholder="sk-... or gsk_..."
-                  className="w-full bg-[#121214] border border-zinc-700 focus:border-white focus:ring-1 focus:ring-white rounded-md px-3 py-2.5 text-sm text-white placeholder:text-zinc-600 outline-none transition-all"
-                />
-              </div>
-              {byokProvider && (
-                <div className="flex items-center gap-2 px-3 py-2.5 bg-zinc-900 border border-zinc-800 rounded-md">
-                  <CheckCircle className="w-4 h-4 text-emerald-400" />
-                  <span className="text-xs text-zinc-300">Detected: <strong className="text-white">{byokProvider}</strong></span>
+
+            {byokConfig ? (
+              /* ── Success Card ── */
+              <div className="p-6 space-y-5">
+                <div className="flex flex-col items-center text-center gap-3 py-4">
+                  <div className="w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center">
+                    <CheckCircle className="w-6 h-6 text-emerald-400" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-semibold text-white">Agent Provisioned</p>
+                    <p className="text-xs text-zinc-400 mt-1">Your key is active for this session only — never stored.</p>
+                  </div>
                 </div>
-              )}
-              <div className="text-[11px] text-zinc-500 leading-relaxed bg-[#121214] p-3.5 rounded-md border border-zinc-800/50">
-                Keys are stored locally. Groq is the default free model used for chat if no key is provided.
+                <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 divide-y divide-zinc-800 text-sm">
+                  <div className="flex items-center justify-between px-4 py-3">
+                    <span className="text-zinc-400">Provider</span>
+                    <span className="font-medium text-white">{byokConfig.provider}</span>
+                  </div>
+                  <div className="flex items-center justify-between px-4 py-3">
+                    <span className="text-zinc-400">Model</span>
+                    <span className="font-medium text-white">{PROVIDER_MODEL_MAP[byokConfig.provider].find(m => m.id === byokConfig.modelId)?.name ?? byokConfig.modelId}</span>
+                  </div>
+                  <div className="flex items-center justify-between px-4 py-3">
+                    <span className="text-zinc-400">Agentic Readiness</span>
+                    <span className="text-xs font-medium text-emerald-400 flex items-center gap-1.5"><span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />Active</span>
+                  </div>
+                </div>
+                <div className="flex gap-3">
+                  <button onClick={() => { setByokConfig(null); setByokDraft({ provider: '', modelId: '', apiKey: '' }); }} className="flex-1 px-4 py-2.5 text-xs font-medium text-zinc-300 bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors">Reconfigure</button>
+                  <button onClick={() => setShowByokModal(false)} className="flex-1 px-4 py-2.5 text-xs font-semibold text-black bg-white hover:bg-white rounded-lg transition-colors">Done</button>
+                </div>
               </div>
-            </div>
-            <div className="flex items-center justify-end gap-3 px-5 py-4 border-t border-zinc-800 bg-[#121214]">
-              <button onClick={() => setShowByokModal(false)} className="px-4 py-2 text-xs font-medium text-zinc-400 hover:text-white transition-colors">Close</button>
-            </div>
+            ) : (
+              /* ── Configuration Form ── */
+              <div className="p-6 space-y-5">
+                {/* Step 1: Provider */}
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-400 mb-2">1. Select Provider</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(Object.keys(PROVIDER_MODEL_MAP) as ByokProvider[]).map((p) => (
+                      <button
+                        key={p}
+                        onClick={() => setByokDraft(d => ({ ...d, provider: p, modelId: '' }))}
+                        className={`px-3 py-2.5 rounded-lg text-xs font-medium border transition-all text-left ${
+                          byokDraft.provider === p
+                            ? 'border-white bg-white/10 text-white'
+                            : 'border-zinc-700 text-zinc-400 hover:border-zinc-500 hover:text-zinc-200'
+                        }`}
+                      >
+                        {p}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Step 2: Model */}
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-400 mb-2">2. Select Model</label>
+                  <select
+                    disabled={!byokDraft.provider}
+                    value={byokDraft.modelId}
+                    onChange={(e) => setByokDraft(d => ({ ...d, modelId: e.target.value }))}
+                    className="w-full bg-[#121214] border border-zinc-700 focus:border-white rounded-lg px-3 py-2.5 text-sm text-white placeholder:text-zinc-600 outline-none transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <option value="" disabled>{byokDraft.provider ? 'Choose a model...' : 'Select a provider first'}</option>
+                    {byokDraft.provider && PROVIDER_MODEL_MAP[byokDraft.provider].map((m) => (
+                      <option key={m.id} value={m.id}>{m.name}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Step 3: API Key */}
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-400 mb-2">3. Paste API Key</label>
+                  <input
+                    type="password"
+                    value={byokDraft.apiKey}
+                    onChange={(e) => setByokDraft(d => ({ ...d, apiKey: e.target.value }))}
+                    placeholder={byokDraft.provider === 'Anthropic' ? 'sk-ant-...' : byokDraft.provider === 'Groq' ? 'gsk_...' : byokDraft.provider === 'OpenRouter' ? 'sk-or-...' : 'sk-...'}
+                    className="w-full bg-[#121214] border border-zinc-700 focus:border-white focus:ring-1 focus:ring-white/30 rounded-lg px-3 py-2.5 text-sm text-white placeholder:text-zinc-600 outline-none transition-all"
+                  />
+                  <p className="mt-2 text-[11px] text-zinc-500">Keys are used in-memory for this session only and are never logged or stored.</p>
+                </div>
+
+                <div className="flex items-center justify-end gap-3 pt-1">
+                  <button onClick={() => setShowByokModal(false)} className="px-4 py-2 text-xs font-medium text-zinc-400 hover:text-white transition-colors">Cancel</button>
+                  <button
+                    disabled={!byokDraft.provider || !byokDraft.modelId || !byokDraft.apiKey.trim()}
+                    onClick={() => {
+                      if (!byokDraft.provider || !byokDraft.modelId || !byokDraft.apiKey.trim()) return;
+                      setByokConfig({ provider: byokDraft.provider as ByokProvider, modelId: byokDraft.modelId, apiKey: byokDraft.apiKey.trim() });
+                    }}
+                    className="px-5 py-2 text-xs font-semibold text-black bg-white hover:bg-white disabled:opacity-40 disabled:cursor-not-allowed rounded-lg transition-colors"
+                  >
+                    Provision Agent
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

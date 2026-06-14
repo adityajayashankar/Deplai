@@ -16,6 +16,7 @@ class ConversationState(TypedDict, total=False):
     response: str
     questions: list[str]
     manifest_patch: dict[str, Any]
+    byok_config: Any  # Optional in-memory BYOK config, never persisted
 
 
 def conversation_handler(state: ConversationState) -> ConversationState:

@@ -377,7 +377,8 @@ def scan_repo(state: dict) -> dict:
             f"No canonical app roots detected for {app_targets}; using repository-wide fallback scan with roots: {effective_app_targets}",
         )
 
-    client = ProjectLLMClient()
+    byok_config = state.get("byok_config")
+    client = ProjectLLMClient(byok_config=byok_config)
     if not client.is_configured():
         log_agent("Scanner", "LLM client is not configured. Using deterministic repo map.")
         state["repo_map"] = repo_map

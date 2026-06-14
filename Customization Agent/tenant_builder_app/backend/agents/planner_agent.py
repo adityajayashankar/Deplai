@@ -1006,7 +1006,8 @@ def plan_frontend_changes(state: dict) -> dict:
         and any(path.startswith(f"{app_root}/") for app_root in app_targets)
     ]
 
-    client = ProjectLLMClient()
+    byok_config = state.get("byok_config")
+    client = ProjectLLMClient(byok_config=byok_config)
 
     # Two-stage, request-aware targeting: rank every candidate file by relevance
     # to this manifest, then (on large repos) let a cheap LLM pass narrow it to the

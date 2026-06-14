@@ -12,6 +12,7 @@ from services.llm_provider_config import (
     HF_API_URL,
     infer_provider,
     resolve_llm_provider_configs,
+    LLMProviderConfig,
 )
 
 
@@ -19,8 +20,33 @@ class ProjectLLMClient:
     DEFAULT_API_URL = HF_API_URL
     DEFAULT_MODEL = DEFAULT_HF_MODEL
 
-    def __init__(self) -> None:
-        self.provider_configs = resolve_llm_provider_configs()
+    def __init__(self, byok_config: Any | None = None) -> None:
+        if byok_config is not None:
+            # Map BYOK config to LLMProviderConfig just like llm_interpreter
+            provider_id = (getattr(byok_config, 'provider', '') or '').strip().lower()
+            OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions'
+            ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages'
+            OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'
+            MINIMAX_API_URL = 'https://api.minimax.chat/v1/text/chatcompletion_v2'
+            
+            provider_url_map = {
+                'openai': ('openai', OPENAI_API_URL),
+                'anthropic': ('anthropic', ANTHROPIC_API_URL),
+                'groq': ('openai', 'https://api.groq.com/openai/v1/chat/completions'),
+                'openrouter': ('openrouter', OPENROUTER_API_URL),
+                'minimax': ('openai', MINIMAX_API_URL),
+            }
+            provider_norm, api_url = provider_url_map.get(provider_id, (provider_id, OPENAI_API_URL))
+            
+            jit_config = LLMProviderConfig(
+                provider=provider_norm,
+                api_url=api_url,
+                model=getattr(byok_config, 'model', getattr(byok_config, 'modelId', self.DEFAULT_MODEL)),
+                api_key=getattr(byok_config, 'api_key', getattr(byok_config, 'apiKey', '')),
+            )
+            self.provider_configs = [jit_config]
+        else:
+            self.provider_configs = resolve_llm_provider_configs()
         first_config = self.provider_configs[0]
         self.api_url = first_config.api_url
         self.model = first_config.model

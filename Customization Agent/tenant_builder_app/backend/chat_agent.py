@@ -7,14 +7,15 @@ class ChatAgent:
         self.state = state
         self.graph = build_conversation_graph()
 
-    def handle_message(self, tenant_id: str, message: str) -> dict:
+    def handle_message(self, tenant_id: str, message: str, byok_config: object | None = None) -> dict:
         normalized_tenant_id = self.state.ensure_tenant(tenant_id)
-        graph_state = self.graph.invoke(
-            {
-                "message": message,
-                "manifest": self.state.get_manifest(normalized_tenant_id),
-            }
-        )
+        invoke_input: dict = {
+            "message": message,
+            "manifest": self.state.get_manifest(normalized_tenant_id),
+        }
+        if byok_config is not None:
+            invoke_input["byok_config"] = byok_config
+        graph_state = self.graph.invoke(invoke_input)
         response = graph_state.get("response")
         manifest_patch = graph_state.get("manifest_patch")
         questions = graph_state.get("questions", [])

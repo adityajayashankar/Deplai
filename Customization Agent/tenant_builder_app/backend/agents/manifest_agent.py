@@ -5,9 +5,11 @@ from llm_interpreter import LLMInterpreter
 
 def run_manifest_agent(state: dict) -> dict:
     interpreter = LLMInterpreter()
+    byok_config = state.get("byok_config")
     interpretation = interpreter.interpret(
         message=str(state.get("message") or ""),
         current_manifest=state.get("manifest", {}),
+        byok_config=byok_config,
     )
 
     response = interpretation.get("response")

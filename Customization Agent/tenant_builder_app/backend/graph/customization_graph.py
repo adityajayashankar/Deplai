@@ -27,6 +27,7 @@ class CustomizationState(TypedDict, total=False):
     modified_files: list[str]
     modification_records: list[dict[str, Any]]
     errors: list[str]
+    byok_config: Any
 
 
 LOG_PREFIX = "[CustomizationAgent]"

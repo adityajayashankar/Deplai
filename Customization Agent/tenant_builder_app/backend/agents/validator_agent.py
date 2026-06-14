@@ -193,7 +193,8 @@ def _validate_frontend_semantics_with_llm(state: dict, errors: list[str], client
 def validate_repo(state: dict) -> dict:
     repo_path = Path(state["repo_path"])
     errors = list(state.get("errors", []))
-    client = ProjectLLMClient()
+    byok_config = state.get("byok_config")
+    client = ProjectLLMClient(byok_config=byok_config)
 
     backend_files, frontend_files, missing_files = _collect_files_by_domain(
         repo_path,

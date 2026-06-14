@@ -194,7 +194,8 @@ def plan_backend_changes(state: dict) -> dict:
         for relative_path in allowed_paths
     }
 
-    client = ProjectLLMClient()
+    byok_config = state.get("byok_config")
+    client = ProjectLLMClient(byok_config=byok_config)
     planned_backend_changes: list[dict[str, Any]] = []
     if not client.is_configured():
         _log_message("Backend planner LLM is not configured; no backend plan generated.")

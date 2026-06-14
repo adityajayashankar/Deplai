@@ -111,7 +111,7 @@ class LLMInterpreter:
                 pass
         return self.retry_base_delay_seconds * (2 ** (attempt - 1))
 
-    def interpret(self, message: str, current_manifest: dict[str, Any]) -> dict[str, Any]:
+    def interpret(self, message: str, current_manifest: dict[str, Any], byok_config: Any | None = None) -> dict[str, Any]:
         self._current_manifest = current_manifest
         deterministic_frontend_patch = self._build_deterministic_frontend_patch(
             message=message,
@@ -135,7 +135,7 @@ class LLMInterpreter:
         prompt = self._build_prompt(message=message, current_manifest=current_manifest)
 
         try:
-            raw_content = self._call_llm(prompt=prompt)
+            raw_content = self._call_llm(prompt=prompt, byok_config=byok_config)
             parsed = self._parse_model_output(raw_content)
             normalized = self._normalize_result(parsed)
             if deterministic_frontend_patch:
@@ -808,7 +808,35 @@ class LLMInterpreter:
             "- Do not include markdown, code fences, or explanations outside the JSON object."
         )
 
-    def _call_llm(self, prompt: str) -> str:
+    def _call_llm(self, prompt: str, byok_config: Any | None = None) -> str:
+        # If the user provisioned their own key via BYOK, use it directly.
+        if byok_config is not None:
+            from services.llm_provider_config import LLMProviderConfig, GROQ_API_URL, OPENROUTER_API_URL
+            ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+            OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+            MINIMAX_API_URL = "https://api.minimax.chat/v1/chat/completions"
+            provider_id = (byok_config.provider or "").strip().lower()
+            provider_url_map = {
+                "claude": ("anthropic", ANTHROPIC_API_URL),
+                "anthropic": ("anthropic", ANTHROPIC_API_URL),
+                "openai": ("openai", OPENAI_API_URL),
+                "groq": ("groq", GROQ_API_URL),
+                "openrouter": ("openrouter", OPENROUTER_API_URL),
+                "minimax": ("openai", MINIMAX_API_URL),
+            }
+            provider_norm, api_url = provider_url_map.get(provider_id, (provider_id, OPENAI_API_URL))
+            # Security: key used in-memory only, never logged
+            jit_config = LLMProviderConfig(
+                provider=provider_norm,
+                api_url=api_url,
+                model=byok_config.model or self.MODEL,
+                api_key=byok_config.api_key,
+            )
+            result = self._call_llm_with_config(prompt=prompt, config=jit_config)
+            # Immediately clear reference to the key-carrying object
+            jit_config = None  # type: ignore[assignment]
+            return result
+
         failures: list[str] = []
         for config in resolve_llm_provider_configs():
             try:
