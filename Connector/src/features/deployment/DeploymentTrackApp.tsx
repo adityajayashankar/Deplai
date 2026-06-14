@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { ArrowRight, CheckCircle2, ChevronRight, CircleDashed, Download, ExternalLink, RefreshCw, Rocket, Server, Terminal } from 'lucide-react';
 import { ResourceCard } from '@/components/pipeline/ResourceCard';
 import { ApplyLogViewer } from '@/components/pipeline/ApplyLogViewer';
+import { AwsConsoleTerminal } from '@/components/pipeline/AwsConsoleTerminal';
 import { buildDeploymentWorkspace } from '@/lib/deployment-planning-contract';
 import {
   APPROVAL_PAYLOAD_KEY,
@@ -1727,10 +1728,12 @@ export default function DeploymentTrackApp() {
     () => deployLogs.filter((log) => log.stage === 'terraform_generation' || (!log.stage && Boolean(log.worker_id))),
     [deployLogs],
   );
-  const hasLiveRuntimeDetails = useMemo(
-    () => Boolean(liveRuntimeDetails && getLiveRuntimeInstanceId(deployResult) && getLiveRuntimeInstanceId(deployResult) !== 'n/a'),
-    [deployResult, liveRuntimeDetails],
-  );
+  const hasLiveRuntimeDetails = useMemo(() => {
+    if (deployResult?.mode === 'iac_pipeline') {
+      return Boolean(iacResourceOutputs && iacResourceOutputs.outputs.length > 0);
+    }
+    return Boolean(liveRuntimeDetails && getLiveRuntimeInstanceId(deployResult) && getLiveRuntimeInstanceId(deployResult) !== 'n/a');
+  }, [deployResult, liveRuntimeDetails, iacResourceOutputs]);
   const persistedEndpointChecks = useMemo(() => normalizeVerificationChecks(deployResult?.verification_checks), [deployResult?.verification_checks]);
   const effectiveEndpointChecks = endpointChecks.length > 0 ? endpointChecks : persistedEndpointChecks;
   const verificationFailed = useMemo(
@@ -4883,18 +4886,38 @@ export default function DeploymentTrackApp() {
                 </div>
               </div>
               <div className="grid grid-cols-3 gap-6">
-                <div className="col-span-2 flex h-125 flex-col overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]">
-                  <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-black px-4 py-2.5 font-mono text-xs text-zinc-500">
-                    <div className="flex items-center gap-2">
-                      <Terminal className="h-4 w-4 text-zinc-400" /> STDOUT
+                <div className="col-span-2 flex h-125 flex-col overflow-hidden rounded-lg border border-[#1E2433] bg-[#0A0E1A] shadow-xl">
+                  <div className="flex items-center justify-between border-b border-[#1E2433] bg-[#080D18] px-4 py-2.5 font-mono text-xs">
+                    <div className="flex items-center gap-2.5">
+                      <div className="flex gap-1.5">
+                        <span className="h-3 w-3 rounded-full bg-red-500/80" />
+                        <span className="h-3 w-3 rounded-full bg-amber-400/80" />
+                        <span className="h-3 w-3 rounded-full bg-emerald-500/80" />
+                      </div>
+                      <span className="text-[#4A9EFF] font-semibold tracking-wider">STDOUT</span>
+                      <span className="text-zinc-600">—</span>
+                      <span className="text-zinc-500">deployment.log</span>
                     </div>
-                    <div>{deployLogs.length} events</div>
+                    <div className="flex items-center gap-3 text-zinc-600">
+                      <span className="rounded bg-[#111827] px-2 py-0.5 text-[10px] font-mono text-zinc-500">{deployLogs.length} events</span>
+                    </div>
                   </div>
-                  <div className="custom-scrollbar flex-1 overflow-y-auto bg-black p-6 font-mono text-[13px]">
+                  <div className="custom-scrollbar flex-1 overflow-y-auto bg-[#070B14] p-4 font-mono text-[12px]" style={{ scrollbarWidth: 'thin', scrollbarColor: '#1E2433 transparent' }}>
+                    {deployLogs.length === 0 && (
+                      <div className="flex h-full items-center justify-center text-zinc-600 text-xs">Waiting for deployment events...</div>
+                    )}
                     {deployLogs.map((log, index) => (
-                      <div key={`${log.ts}-${index}`} className="mb-1 flex gap-4">
-                        <span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span>
-                        <span className={log.type === 'success' ? 'font-medium text-emerald-400' : log.type === 'error' ? 'text-red-400' : 'text-zinc-300'}>
+                      <div key={`${log.ts}-${index}`} className={`mb-0.5 flex gap-3 rounded px-2 py-0.5 ${index % 2 === 0 ? 'bg-transparent' : 'bg-[#0C1120]/40'}`}>
+                        <span className="shrink-0 select-none text-[10px] text-[#2A3A5C] mt-0.5">{String(index + 1).padStart(2, '0')}</span>
+                        <span className={`flex-1 leading-relaxed ${
+                          log.type === 'success' ? 'text-emerald-400' 
+                          : log.type === 'error' ? 'text-red-400' 
+                          : log.text.startsWith('✓') || log.text.includes('created') ? 'text-emerald-300'
+                          : log.text.startsWith('+') || log.text.includes('Creating') ? 'text-[#4A9EFF]'
+                          : log.text.includes('Error') || log.text.includes('failed') ? 'text-red-400'
+                          : log.text.startsWith('[') ? 'text-amber-300/80'
+                          : 'text-[#8BA3CC]'
+                        }`}>
                           {log.text}
                         </span>
                       </div>
@@ -4917,7 +4940,20 @@ export default function DeploymentTrackApp() {
                         style={{ width: `${deployProgress}%` }}
                       />
                     </div>
-                    <div className="mt-3 text-xs text-zinc-500">Status: <span className="font-mono text-zinc-300">{deployStatus}</span></div>
+                    <div className="mt-3 flex items-center gap-2 text-xs text-zinc-500">
+                      <span>Status:</span>
+                      <span className={`rounded-full px-2 py-0.5 font-mono text-[10px] font-semibold ${
+                        deployStatus === 'done' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                        : deployStatus === 'error' ? 'bg-red-500/10 text-red-400 border border-red-500/20'
+                        : deployProgress >= 100 ? 'animate-pulse bg-cyan-500/10 text-cyan-400 border border-cyan-500/20'
+                        : 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20'
+                      }`}>{deployProgress >= 100 && deployStatus === 'running' ? 'executing build' : deployStatus}</span>
+                    </div>
+                    {deployProgress >= 100 && deployStatus === 'running' && (
+                      <div className="mt-3 rounded-md border border-cyan-500/20 bg-cyan-500/5 px-3 py-2 text-[11px] text-cyan-300">
+                        ⚡ Build script running on EC2. This can take 30–60 min. Watch the terminal below.
+                      </div>
+                    )}
                   </div>
                   {costEstimate.total > costEstimate.cap && (
                     <div className="rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
@@ -4964,6 +5000,29 @@ export default function DeploymentTrackApp() {
               {deployResult?.mode === 'iac_pipeline' && deployResult?.run_id ? (
                 <ApplyLogViewer runId={deployResult.run_id} onComplete={onIacPipelineComplete} onError={onIacPipelineError} />
               ) : null}
+              {(() => {
+                const termInstanceId = deploySummary.instanceId && deploySummary.instanceId !== 'n/a' 
+                  ? deploySummary.instanceId 
+                  : String(iacResourceOutputs?.outputs?.find(o => o.key === 'instance_id' || o.key === 'ec2_instance_id')?.value || 'n/a');
+                const rawPublicIp = (deploySummary.publicIp && deploySummary.publicIp !== 'n/a') ? deploySummary.publicIp : String(iacResourceOutputs?.outputs?.find(o => o.key === 'public_ip')?.value || '');
+                const rawPrivateKey = (deploySummary.generatedPem && deploySummary.generatedPem !== 'n/a') ? deploySummary.generatedPem : String(iacResourceOutputs?.outputs?.find(o => o.key === 'private_key_pem')?.value || '');
+                // Sanitize: only pass real values, not placeholder strings
+                const sanitize = (v: string) => (!v || v === 'n/a' || v === 'N/A' || v === 'null' || v === 'undefined' ? undefined : v);
+                const termPublicIp = sanitize(rawPublicIp);
+                const termPrivateKey = sanitize(rawPrivateKey);
+                
+                return deployResult?.success && termInstanceId !== 'n/a' ? (
+                  <div className="mt-6">
+                    <AwsConsoleTerminal 
+                      instanceId={termInstanceId} 
+                      publicIp={termPublicIp}
+                      privateKey={termPrivateKey}
+                      region={terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION} 
+                      projectName={selectedProject?.name}
+                    />
+                  </div>
+                ) : null;
+              })()}
             </div>
           )}
           {activeStage === 'outputs' && (
@@ -4999,6 +5058,27 @@ export default function DeploymentTrackApp() {
                   onDestroyed={handleIacDestroyed}
                 />
               ) : null}
+              {(() => {
+                const termInstanceId = deploySummary.instanceId && deploySummary.instanceId !== 'n/a' 
+                  ? deploySummary.instanceId 
+                  : String(iacResourceOutputs?.outputs?.find(o => o.key === 'instance_id' || o.key === 'ec2_instance_id')?.value || 'n/a');
+                const rawPublicIp = (deploySummary.publicIp && deploySummary.publicIp !== 'n/a') ? deploySummary.publicIp : String(iacResourceOutputs?.outputs?.find(o => o.key === 'public_ip')?.value || '');
+                const rawPrivateKey = (deploySummary.generatedPem && deploySummary.generatedPem !== 'n/a') ? deploySummary.generatedPem : String(iacResourceOutputs?.outputs?.find(o => o.key === 'private_key_pem')?.value || '');
+                // Sanitize: only pass real values, not placeholder strings
+                const sanitize = (v: string) => (!v || v === 'n/a' || v === 'N/A' || v === 'null' || v === 'undefined' ? undefined : v);
+                const termPublicIp = sanitize(rawPublicIp);
+                const termPrivateKey = sanitize(rawPrivateKey);
+                
+                return termInstanceId !== 'n/a' ? (
+                  <AwsConsoleTerminal 
+                    instanceId={termInstanceId} 
+                    publicIp={termPublicIp}
+                    privateKey={termPrivateKey}
+                    region={terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION} 
+                    projectName={selectedProject?.name}
+                  />
+                ) : null;
+              })()}
               <div className="grid grid-cols-2 gap-6">
                 <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
                   <div className="mb-6 text-[10px] font-bold uppercase text-zinc-500">Security</div>
@@ -5027,23 +5107,32 @@ export default function DeploymentTrackApp() {
                 <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
                   <div className="mb-4 text-[10px] font-bold uppercase text-zinc-500">Endpoints</div>
                   <div className="space-y-3 text-sm">
-                    <div className="flex justify-between">
-                      <span className="text-zinc-400">App URL</span>
-                      <div className="flex items-center gap-2">
-                        <span className="font-mono text-zinc-200">{deploySummary.appUrl}</span>
-                        {canOpenApp && (
-                          <button onClick={() => window.open(deploySummary.appUrl, '_blank', 'noopener,noreferrer')} className="text-zinc-500 hover:text-zinc-200">
-                            <ExternalLink className="h-4 w-4" />
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex justify-between"><span className="text-zinc-400">Public IP</span><span className="font-mono text-zinc-200">{deploySummary.publicIp}</span></div>
-                    <div className="flex justify-between"><span className="text-zinc-400">Instance</span><span className="font-mono text-zinc-200">{deploySummary.instanceId}</span></div>
+                    {(() => {
+                      const termInstanceId = deploySummary.instanceId && deploySummary.instanceId !== 'n/a' ? deploySummary.instanceId : String(iacResourceOutputs?.outputs?.find(o => o.key === 'instance_id' || o.key === 'ec2_instance_id')?.value || 'n/a');
+                      const termPublicIp = (deploySummary.publicIp && deploySummary.publicIp !== 'n/a') ? deploySummary.publicIp : String(iacResourceOutputs?.outputs?.find(o => o.key === 'public_ip')?.value || 'n/a');
+                      const termAppUrl = (deploySummary.appUrl && deploySummary.appUrl !== 'n/a') ? deploySummary.appUrl : (termPublicIp !== 'n/a' ? `http://${termPublicIp}` : 'n/a');
+                      return (
+                        <>
+                          <div className="flex justify-between">
+                            <span className="text-zinc-400">App URL</span>
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-zinc-200">{termAppUrl !== 'n/a' ? termAppUrl : <span className="text-zinc-600">—</span>}</span>
+                              {canOpenApp && termAppUrl !== 'n/a' && (
+                                <button onClick={() => window.open(termAppUrl, '_blank', 'noopener,noreferrer')} className="text-zinc-500 hover:text-zinc-200">
+                                  <ExternalLink className="h-4 w-4" />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex justify-between"><span className="text-zinc-400">Public IP</span><span className="font-mono text-zinc-200">{termPublicIp !== 'n/a' ? termPublicIp : <span className="text-zinc-600">—</span>}</span></div>
+                          <div className="flex justify-between"><span className="text-zinc-400">Instance</span><span className="font-mono text-zinc-200">{termInstanceId !== 'n/a' ? termInstanceId : <span className="text-zinc-600">—</span>}</span></div>
+                        </>
+                      );
+                    })()}
                     <div className="flex justify-between">
                       <span className="text-zinc-400">CloudFront</span>
                       <div className="flex items-center gap-2">
-                        <span className="font-mono text-zinc-200">{deploySummary.cloudfrontUrl}</span>
+                        <span className="font-mono text-zinc-200">{deploySummary.cloudfrontUrl !== 'n/a' ? deploySummary.cloudfrontUrl : <span className="text-zinc-600">—</span>}</span>
                         {canOpenCloudfront && (
                           <button onClick={() => window.open(deploySummary.cloudfrontUrl.startsWith('http') ? deploySummary.cloudfrontUrl : `https://${deploySummary.cloudfrontUrl}`, '_blank', 'noopener,noreferrer')} className="text-zinc-500 hover:text-zinc-200">
                             <ExternalLink className="h-4 w-4" />

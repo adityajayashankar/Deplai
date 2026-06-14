@@ -80,6 +80,7 @@ def build_manifest_bundle(
     context_summary: str,
     website_index_html: str,
     manifest: list[dict[str, Any]],
+    repo_url: str = "",
 ) -> tuple[dict[str, str], list[str]]:
     warnings: list[str] = []
     resource_types = {str(component.get("type") or "") for component in manifest}
@@ -197,7 +198,7 @@ variable "force_destroy_site_bucket" {{
 
 variable "ec2_root_volume_size" {{
   type    = number
-  default = 8
+  default = 35
 }}
 
 variable "bootstrap_index_html_base64" {{
@@ -209,6 +210,12 @@ variable "bootstrap_index_html_base64" {{
 variable "context_summary" {{
   type    = string
   default = ""
+}}
+
+variable "repo_url" {{
+  type        = string
+  default     = "{repo_url}"
+  description = "GitHub repository URL to clone and deploy on EC2 first boot."
 }}
 """
 
@@ -225,11 +232,12 @@ use_default_vpc = true
 vpc_cidr_block = "10.42.0.0/16"
 public_subnet_cidr = "10.42.1.0/24"
 force_destroy_site_bucket = true
-ec2_root_volume_size = 8
+ec2_root_volume_size = 35
 bootstrap_index_html_base64 = "{encoded_index}"
 context_summary = <<-EOT
 {context_block}
 EOT
+repo_url = "{repo_url}"
 """
 
     manifest_comment = "\n".join(
@@ -421,9 +429,114 @@ resource "aws_instance" "app" {{
 
   user_data = <<-EOF
               #!/bin/bash
-              cat > /var/www/html/index.html <<'HTML'
-              ${{base64decode(var.bootstrap_index_html_base64)}}
-              HTML
+              set -euo pipefail
+              exec > /var/log/deplai-init.log 2>&1
+
+              echo "== [DeplAI] Boot provisioning started at $(date) =="
+
+              # ── 0. Expand disk ─────────────────────────────────────────────────────────
+              dnf install -y cloud-utils-growpart xfsprogs 2>/dev/null || true
+              growpart /dev/nvme0n1 1 || growpart /dev/xvda 1 || true
+              xfs_growfs -d / || resize2fs /dev/nvme0n1p1 || resize2fs /dev/xvda1 || true
+              echo "== Disk: $(df -h / | tail -1) =="
+
+              # ── 1. Swap (6 GB) ─────────────────────────────────────────────────────────
+              if [ ! -f /swapfile ]; then
+                fallocate -l 6G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=6144
+                chmod 600 /swapfile
+                mkswap /swapfile
+                swapon /swapfile
+                echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+              fi
+              echo "== Swap: $(free -h | grep Swap || true) =="
+
+              # ── 2. Install runtimes ────────────────────────────────────────────────────
+              dnf install -y git nodejs npm nginx 2>&1 || true
+              echo "== node $(node -v) | npm $(npm -v) | nginx $(nginx -v 2>&1) =="
+
+              # ── 3. Clone / update repo ─────────────────────────────────────────────────
+              GIT_URL="${var.repo_url}"
+              APP_DIR="/opt/app"
+              APP_NAME="deplai-app"
+              APP_PORT=3000
+
+              mkdir -p "$APP_DIR"
+              chown -R ec2-user:ec2-user "$APP_DIR"
+
+              if [ -n "$GIT_URL" ]; then
+                sudo -u ec2-user bash -c "
+                  if [ -d \"$APP_DIR/.git\" ]; then
+                    cd \"$APP_DIR\" && git pull
+                  else
+                    git clone \"$GIT_URL\" \"$APP_DIR\"
+                  fi
+                "
+              else
+                echo "[DeplAI] No repo_url provided — skipping git clone"
+              fi
+
+              # ── 4. Build frontend (try frontend/ subdir first, then root) ─────────────
+              BUILD_DIR=""
+              for candidate in "$APP_DIR/frontend" "$APP_DIR/client" "$APP_DIR"; do
+                if [ -f "$candidate/package.json" ]; then
+                  BUILD_DIR="$candidate"
+                  break
+                fi
+              done
+
+              if [ -z "$BUILD_DIR" ]; then
+                echo "[DeplAI] No package.json found – skipping Node build"
+              else
+                sudo -u ec2-user bash -c "
+                  cd \"$BUILD_DIR\"
+                  export NODE_OPTIONS='--max-old-space-size=4096'
+                  npm ci --legacy-peer-deps 2>&1 || npm install --legacy-peer-deps 2>&1
+                  npm run build 2>&1 || true
+                "
+              fi
+
+              # ── 5. Start app with PM2 ──────────────────────────────────────────────────
+              npm install -g pm2 2>&1 || true
+              if [ -n "$BUILD_DIR" ]; then
+                sudo -u ec2-user bash -c "
+                  cd \"$BUILD_DIR\"
+                  pm2 delete \"$APP_NAME\" 2>/dev/null || true
+                  PORT=\"$APP_PORT\" pm2 start npm --name \"$APP_NAME\" -- start
+                  pm2 save
+                "
+                pm2 startup systemd -u ec2-user --hp /home/ec2-user 2>&1 || true
+              fi
+
+              # ── 6. Configure nginx ─────────────────────────────────────────────────────
+              PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 || echo "localhost")
+              PUBLIC_DNS=$(curl -s http://169.254.169.254/latest/meta-data/public-hostname || echo "localhost")
+
+              cat > /etc/nginx/conf.d/app.conf <<NGINXCFG
+              server {{
+                listen 80 default_server;
+                server_name $PUBLIC_IP $PUBLIC_DNS _;
+
+                location / {{
+                  proxy_pass http://127.0.0.1:$APP_PORT;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade \$http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_cache_bypass \$http_upgrade;
+                }}
+              }}
+              NGINXCFG
+
+              nginx -t && systemctl enable nginx && systemctl restart nginx
+
+              # ── 7. Health check ────────────────────────────────────────────────────────
+              sleep 15
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{{http_code}}" http://localhost:80 || echo "000")
+              echo "== [DeplAI] Health check: HTTP $HTTP_STATUS =="
+
+              echo "== [DeplAI] Boot provisioning complete at $(date) =="
               EOF
 }}
 
@@ -587,6 +700,7 @@ def build_fallback_bundle(
     aws_region: str,
     context_summary: str,
     website_index_html: str,
+    repo_url: str = "",
 ) -> tuple[dict[str, str], list[str]]:
     files, warnings = build_manifest_bundle(
         project_name=project_name,
@@ -598,6 +712,7 @@ def build_fallback_bundle(
         context_summary=context_summary,
         website_index_html=website_index_html,
         manifest=[],
+        repo_url=repo_url,
     )
     warnings.insert(0, f"Terraform agent fell back to the deterministic AWS bundle: {', '.join(FALLBACK_RESOURCE_SET)}.")
     return files, warnings

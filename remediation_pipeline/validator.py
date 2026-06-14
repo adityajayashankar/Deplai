@@ -170,16 +170,5 @@ class DiffValidator:
 
     @staticmethod
     def _read_repo_file(project_id: str, rel_path: str) -> str | None:
-        cleaned = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
-        if not cleaned:
-            return None
-        try:
-            output = get_docker_client().containers.run(
-                "alpine",
-                command=["cat", f"/repo/{project_id}/{cleaned}"],
-                volumes={CODEBASE_VOLUME: {"bind": "/repo", "mode": "ro"}},
-                remove=True,
-            )
-            return decode_output(output)
-        except Exception:
-            return None
+        from utils import read_repo_file_cached
+        return read_repo_file_cached(project_id, rel_path)

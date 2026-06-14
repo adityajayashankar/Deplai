@@ -7,6 +7,7 @@ import path from 'path';
 
 const DEFAULT_CUSTOMIZATION_BACKEND = 'http://127.0.0.1:8010';
 const PREVIEW_ENTRY_CANDIDATES = [
+  'sandbox-index.html',
   'index.html',
   'index.htm',
   'index.html.html',
@@ -92,12 +93,17 @@ function getContentTypeForFile(filePath: string): string {
   return 'application/octet-stream';
 }
 
-function detectPreviewEntry(repoPath: string): string | null {
+function detectPreviewEntry(repoPath: string, baseRepoPath?: string): string | null {
   for (const candidate of PREVIEW_ENTRY_CANDIDATES) {
     const absoluteCandidate = path.resolve(repoPath, candidate);
-    if (!isWithinPath(repoPath, absoluteCandidate)) continue;
-    if (fs.existsSync(absoluteCandidate) && fs.statSync(absoluteCandidate).isFile()) {
+    if (isWithinPath(repoPath, absoluteCandidate) && fs.existsSync(absoluteCandidate) && fs.statSync(absoluteCandidate).isFile()) {
       return candidate;
+    }
+    if (baseRepoPath) {
+      const baseCandidate = path.resolve(baseRepoPath, candidate);
+      if (isWithinPath(baseRepoPath, baseCandidate) && fs.existsSync(baseCandidate) && fs.statSync(baseCandidate).isFile()) {
+        return candidate;
+      }
     }
   }
   return null;
@@ -124,11 +130,37 @@ function rewriteLivePreviewHtml(html: string, context: PreviewContext, servedRel
   const baseHref = buildPreviewRouteBase(context, directoryPrefix);
   const rootPreviewHref = buildPreviewRouteBase(context);
 
-  return rewritePreviewHtmlBase(html, baseHref)
+  let rewritten = rewritePreviewHtmlBase(html, baseHref)
     .replace(/(["'])\/(_next\/)/g, `$1${rootPreviewHref}$2`)
     .replace(/(["'])\/(@vite\/)/g, `$1${rootPreviewHref}$2`)
     .replace(/(["'])\/(src\/)/g, `$1${rootPreviewHref}$2`)
     .replace(/url\(\s*\/([^)'"]+)/g, `url(${rootPreviewHref}$1`);
+
+  const basePathStr = rootPreviewHref.replace(/\/$/, '');
+  if (rewritten.includes('<script id="__NEXT_DATA__"')) {
+    if (/"basePath"\s*:\s*""/.test(rewritten)) {
+      rewritten = rewritten.replace(/"basePath"\s*:\s*""/g, `"basePath":"${basePathStr}"`);
+    } else {
+      rewritten = rewritten.replace(/"page"\s*:/, `"basePath":"${basePathStr}","page":`);
+    }
+  }
+
+  // Also inject a patch script for window.history as a fail-safe
+  const routerPatch = `<script>
+    if (typeof window !== 'undefined') {
+      const originalPush = window.history.pushState;
+      const originalReplace = window.history.replaceState;
+      window.history.pushState = function(state, title, url) {
+        if (url && url.toString().includes('_next/webpack-hmr')) return;
+        return originalPush.apply(this, arguments);
+      };
+      window.history.replaceState = function(state, title, url) {
+        if (url && url.toString().includes('_next/webpack-hmr')) return;
+        return originalReplace.apply(this, arguments);
+      };
+    }
+  </script>`;
+  return rewritten.replace('<head>', '<head>' + routerPatch);
 }
 
 async function proxyLivePreviewRequest(
@@ -290,7 +322,7 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
       tenant_repo_path: tenantRepoCandidatePath,
       tenant_repo_exists: tenantRepoExists,
       preview_root_path: previewRootPath,
-      preview_entry: detectPreviewEntry(previewRootPath),
+      preview_entry: detectPreviewEntry(previewRootPath, baseRepoPath),
       preview_kind: livePreviewKnown ? 'live_server' : 'static_file',
       preview_url: liveReady ? backendPreviewStatus?.url : null,
       preview_status: livePreviewKnown ? (backendPreviewStatus?.status || 'unavailable') : (backendPreviewStatus?.status || 'unavailable'),
@@ -311,7 +343,7 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
     ) {
       relativeFilePath = '';
     } else {
-      const entry = detectPreviewEntry(previewRootPath);
+      const entry = detectPreviewEntry(previewRootPath, baseRepoPath);
       if (!entry) {
         return NextResponse.json({
           error: 'No preview entry file found. Expected index.html (or similar) in the selected repository.',
@@ -346,8 +378,13 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
     }, { status: 503 });
   }
 
-  const absoluteFilePath = path.resolve(previewRootPath, relativeFilePath);
-  if (!isWithinPath(previewRootPath, absoluteFilePath)) {
+  let absoluteFilePath = path.resolve(previewRootPath, relativeFilePath);
+  
+  if (relativeFilePath === 'sandbox-index.html' && !fs.existsSync(absoluteFilePath)) {
+    absoluteFilePath = path.resolve(baseRepoPath, relativeFilePath);
+  }
+
+  if (!isWithinPath(previewRootPath, absoluteFilePath) && !isWithinPath(baseRepoPath, absoluteFilePath)) {
     return NextResponse.json({ error: 'Preview file path is outside repository root.' }, { status: 400 });
   }
 
@@ -359,7 +396,7 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
   let servedRelativePath = relativeFilePath;
   if (fs.statSync(resolvedFilePath).isDirectory()) {
     const directoryIndex = path.resolve(resolvedFilePath, 'index.html');
-    if (!isWithinPath(previewRootPath, directoryIndex) || !fs.existsSync(directoryIndex)) {
+    if (!isWithinPath(previewRootPath, directoryIndex) && !isWithinPath(baseRepoPath, directoryIndex) || !fs.existsSync(directoryIndex)) {
       return NextResponse.json({ error: `Directory preview missing index.html: ${relativeFilePath}` }, { status: 404 });
     }
     resolvedFilePath = directoryIndex;
@@ -380,6 +417,18 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
     const baseHref = buildPreviewRouteBase({ normalizedProjectId, requestedTenantId }, directoryPrefix);
     let html = responseBody.toString('utf-8');
     html = rewritePreviewHtmlBase(html, baseHref);
+
+    if (servedRelativePath === 'sandbox-index.html' && requestedTenantId) {
+      try {
+        const themeCssPath = path.resolve(previewRootPath, 'frontend/styles/tenant-theme.css');
+        if (fs.existsSync(themeCssPath)) {
+          const themeCss = fs.readFileSync(themeCssPath, 'utf-8');
+          html = html.replace('</head>', `<style>\n${themeCss}\n</style></head>`);
+        }
+      } catch (e) {
+        console.error('Failed to inject tenant theme CSS:', e);
+      }
+    }
 
     responseBody = Buffer.from(html, 'utf-8');
   }

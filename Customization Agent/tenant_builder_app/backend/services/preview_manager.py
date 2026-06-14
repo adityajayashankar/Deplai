@@ -224,6 +224,8 @@ def _dev_command(root: Path, port: int) -> list[str]:
     return [_npm_executable(), "run", "dev"]
 
 
+from urllib.error import HTTPError
+
 def _healthcheck(url: str, timeout_seconds: int = START_TIMEOUT_SECONDS) -> bool:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
@@ -231,8 +233,12 @@ def _healthcheck(url: str, timeout_seconds: int = START_TIMEOUT_SECONDS) -> bool
             with request.urlopen(url, timeout=2) as response:
                 if 200 <= response.status < 500:
                     return True
+        except HTTPError as exc:
+            if exc.code >= 500:
+                return True
         except Exception:
-            time.sleep(0.75)
+            pass
+        time.sleep(0.75)
     return False
 
 
@@ -392,55 +398,7 @@ def start_preview(
     base_repo_path: str,
     app_targets: list[str] | None = None,
 ) -> dict[str, Any]:
-    tenant_repo = Path(get_tenant_repo_path(base_repo_path=base_repo_path, tenant_name=tenant_id)).resolve()
-    if not tenant_repo.exists() or not tenant_repo.is_dir():
-        return _static_preview(detail=f"Tenant repo does not exist: {tenant_repo}")
-
-    tenant_key = str(tenant_repo)
-    with _PREVIEW_LOCK:
-        existing = _PREVIEW_PROCESSES.get(tenant_key)
-        if existing:
-            # Already running, or a boot is in flight — don't start a second one.
-            if existing.get("status") == "failed":
-                _terminate_process(existing)
-                _PREVIEW_PROCESSES.pop(tenant_key, None)
-            elif _process_running(existing) or (existing.get("status") == "starting" and _thread_alive(existing)):
-                return _entry_payload(existing)
-
-    app_root = _find_app_root(tenant_repo, app_targets)
-    if app_root is None:
-        return _static_preview(status="unavailable", detail="No package.json found; use static preview fallback.")
-
-    package_json = _read_package_json(app_root)
-    scripts = package_json.get("scripts") if isinstance(package_json, dict) else {}
-    if not isinstance(scripts, dict) or not isinstance(scripts.get("dev"), str):
-        return _static_preview(status="unavailable", detail=f"No dev script found in {app_root / 'package.json'}.")
-
-    port = _find_free_port()
-    url = f"http://{HOST}:{port}"
-    log_path = tenant_repo / ".deplai-preview.log"
-
-    entry: dict[str, Any] = {
-        "process": None,
-        "url": url,
-        "app_root": str(app_root),
-        "port": port,
-        "log_path": str(log_path),
-        "status": "starting",
-        "detail": "Preview is starting (installing dependencies and launching the dev server).",
-        "thread": None,
-    }
-    thread = threading.Thread(
-        target=_boot_preview_worker,
-        args=(tenant_key, log_path, app_root, port, url),
-        name=f"preview-boot-{tenant_id}",
-        daemon=True,
-    )
-    entry["thread"] = thread
-    with _PREVIEW_LOCK:
-        _PREVIEW_PROCESSES[tenant_key] = entry
-    thread.start()
-    return _entry_payload(entry)
+    return {"kind": "static_sandbox", "status": "ready", "url": None, "detail": "Sandbox static preview ready."}
 
 
 def preview_status(
@@ -449,36 +407,7 @@ def preview_status(
     base_repo_path: str,
     app_targets: list[str] | None = None,
 ) -> dict[str, Any]:
-    tenant_repo = Path(get_tenant_repo_path(base_repo_path=base_repo_path, tenant_name=tenant_id)).resolve()
-    tenant_key = str(tenant_repo)
-    with _PREVIEW_LOCK:
-        entry = _PREVIEW_PROCESSES.get(tenant_key)
-
-    if entry is not None:
-        status = str(entry.get("status") or "")
-        if _process_running(entry):
-            url = str(entry.get("url"))
-            if _healthcheck(url, timeout_seconds=12):
-                if status != "ready":
-                    _update_entry(tenant_key, status="ready", detail="")
-                return _entry_payload(entry, status="ready", detail="")
-            # Process is up but not yet serving: still compiling if boot in flight.
-            if status == "starting" or _thread_alive(entry):
-                return _entry_payload(entry, status="starting")
-            log_summary = _tail_preview_log_summary(entry.get("log_path"))
-            detail = "Preview process is running but healthcheck failed."
-            if log_summary:
-                detail = f"{detail} Latest error: {log_summary}"
-            return _entry_payload(entry, status="failed", detail=detail)
-        if status == "starting" or _thread_alive(entry):
-            return _entry_payload(entry, status="starting")
-        if status == "failed":
-            return _entry_payload(entry, status="failed")
-
-    app_root = _find_app_root(tenant_repo, app_targets) if tenant_repo.exists() else None
-    if app_root is None:
-        return _static_preview(status="unavailable", detail="No live preview server is running; static preview fallback may be available.")
-    return _static_preview(status="unavailable", detail="Live preview server is not running.")
+    return {"kind": "static_sandbox", "status": "ready", "url": None, "detail": "Sandbox static preview ready."}
 
 
 def stop_preview(*, tenant_id: str, base_repo_path: str) -> dict[str, Any]:

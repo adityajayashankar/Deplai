@@ -66,6 +66,9 @@ class RemediationOrchestrator:
         llm_model: str | None = None,
         force_claude: bool = False,
     ) -> list[Fix]:
+        from utils import clear_repo_file_cache
+        clear_repo_file_cache()
+
         vulnerabilities = self.ingester.ingest(project_id)
         groups = self.grouper.group(vulnerabilities)
         snapshot = self._build_snapshot(vulnerabilities, groups, remediation_scope=remediation_scope)
@@ -123,6 +126,7 @@ class RemediationOrchestrator:
                         f"({snapshot['selected_findings']} finding(s) in active stage)."
                     ),
                 )
+            batch_tasks = []
             for group in group_batch:
                 try:
                     if on_progress is not None:
@@ -151,58 +155,98 @@ class RemediationOrchestrator:
                     continue
 
                 for bundle in bundles:
-                    try:
-                        fix = await loop.run_in_executor(
-                            None,
-                            self.generator.generate,
+                    batch_tasks.append(
+                        self._process_bundle_async(
                             bundle,
+                            project_id,
                             vuln_lookup,
                             llm_provider,
                             llm_api_key,
                             llm_model,
                             force_claude or bool(snapshot["force_claude"]),
+                            on_progress,
+                            loop,
                         )
-                    except Exception as exc:
-                        if on_progress is not None:
-                            await self._emit_progress(
-                                on_progress,
-                                "warning",
-                                f"{bundle.filepath}: fix generation crashed ({type(exc).__name__}: {exc}).",
-                            )
-                        continue
+                    )
 
-                    try:
-                        validated = await loop.run_in_executor(self._validator_pool, self.validator.validate, project_id, fix)
-                    except Exception as exc:
-                        if on_progress is not None:
-                            await self._emit_progress(
-                                on_progress,
-                                "warning",
-                                f"{bundle.filepath}: diff validation crashed ({type(exc).__name__}: {exc}).",
-                            )
-                        continue
-
-                    if validated is None:
-                        if on_progress is not None:
-                            await self._emit_progress(
-                                on_progress,
-                                "warning",
-                                f"{bundle.filepath}: generated diff could not be applied cleanly and was dropped.",
-                            )
-                        continue
-                    fixes.append(validated)
-                    if on_fix is not None:
-                        on_fix(validated)
+            if batch_tasks:
+                results = await asyncio.gather(*batch_tasks)
+                for validated in results:
+                    if validated is not None:
+                        fixes.append(validated)
+                        if on_fix is not None:
+                            on_fix(validated)
 
         return fixes
+
+    async def _process_bundle_async(
+        self,
+        bundle,
+        project_id: str,
+        vuln_lookup: dict,
+        llm_provider: str | None,
+        llm_api_key: str | None,
+        llm_model: str | None,
+        force_claude: bool,
+        on_progress: Callable | None,
+        loop: asyncio.AbstractEventLoop,
+    ) -> Fix | None:
+        try:
+            fix = await loop.run_in_executor(
+                None,
+                self.generator.generate,
+                bundle,
+                vuln_lookup,
+                llm_provider,
+                llm_api_key,
+                llm_model,
+                force_claude,
+            )
+        except Exception as exc:
+            if on_progress is not None:
+                await self._emit_progress(
+                    on_progress,
+                    "warning",
+                    f"{bundle.filepath}: fix generation crashed ({type(exc).__name__}: {exc}).",
+                )
+            return None
+
+        try:
+            validated = await loop.run_in_executor(self._validator_pool, self.validator.validate, project_id, fix)
+        except Exception as exc:
+            if on_progress is not None:
+                await self._emit_progress(
+                    on_progress,
+                    "warning",
+                    f"{bundle.filepath}: diff validation crashed ({type(exc).__name__}: {exc}).",
+                )
+            return None
+
+        if validated is None:
+            if on_progress is not None:
+                await self._emit_progress(
+                    on_progress,
+                    "warning",
+                    f"{bundle.filepath}: generated diff could not be applied cleanly and was dropped.",
+                )
+            return None
+
+        return validated
 
     def status(self) -> ProviderStatusResponse:
         return self.router.status()
 
     def refresh(self, project_id: str, remediation_scope: str = "all") -> dict[str, int | str]:
+        from utils import clear_repo_file_cache
+        clear_repo_file_cache()
+
+        print(f"[DEBUG] refresh: starting ingester for {project_id}", flush=True)
         vulnerabilities = self.ingester.ingest(project_id)
+        print(f"[DEBUG] refresh: ingester done. {len(vulnerabilities)} vulnerabilities found. starting grouper", flush=True)
         groups = self.grouper.group(vulnerabilities)
+        print(f"[DEBUG] refresh: grouper done. building snapshot", flush=True)
         snapshot = self._build_snapshot(vulnerabilities, groups, remediation_scope=remediation_scope)
+        print(f"[DEBUG] refresh: snapshot done.", flush=True)
         selected_groups = self._select_groups_for_run(groups, snapshot)
         self._apply_selection_stats(snapshot, selected_groups)
         return {

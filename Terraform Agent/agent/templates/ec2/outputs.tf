@@ -17,3 +17,8 @@ output "availability_zone" {
 output "arn" {
   value = module.ec2.arn
 }
+
+output "private_key_pem" {
+  value     = tls_private_key.deplai.private_key_pem
+  sensitive = true
+}

@@ -15,6 +15,29 @@ LLM_OUTPUT_VOLUME = "LLM_Output"
 GRYPE_DB_VOLUME = "grype_db_cache"
 VOLUME_NAMES = [CODEBASE_VOLUME, SECURITY_REPORTS_VOLUME, LLM_OUTPUT_VOLUME, GRYPE_DB_VOLUME]
 
+from functools import lru_cache
+
+@lru_cache(maxsize=1000)
+def read_repo_file_cached(project_id: str, rel_path: str) -> str | None:
+    """Read a file from the codebase volume with an LRU cache to avoid slow Docker runs."""
+    cleaned = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+    if not cleaned:
+        return None
+    try:
+        output = get_docker_client().containers.run(
+            "alpine",
+            command=["cat", f"/repo/{project_id}/{cleaned}"],
+            volumes={CODEBASE_VOLUME: {"bind": "/repo", "mode": "ro"}},
+            remove=True,
+        )
+        return decode_output(output)
+    except Exception:
+        return None
+
+def clear_repo_file_cache() -> None:
+    """Clear the cached codebase files."""
+    read_repo_file_cached.cache_clear()
+
 # Per-task project-scope tracking — safe for concurrent async tasks and executor threads
 # (asyncio.run_in_executor copies the current context to the thread).
 _current_project_id: ContextVar[str] = ContextVar("current_project_id", default="")

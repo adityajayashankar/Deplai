@@ -25,19 +25,19 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
-data "aws_ami" "ubuntu" {
+data "aws_ami" "al2023" {
   count       = var.ami_id == "" ? 1 : 0
   most_recent = true
-  owners      = ["099720109477"]
+  owners      = ["amazon"]
 
   filter {
     name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+    values = ["al2023-ami-2023*-x86_64"]
   }
 
   filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
+    name   = "architecture"
+    values = ["x86_64"]
   }
 }
 
@@ -120,6 +120,14 @@ resource "aws_security_group" "instance" {
   }
 
   ingress {
+    description = "App Port"
+    from_port   = var.app_port
+    to_port     = var.app_port
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
     description = "SSH"
     from_port   = 22
     to_port     = 22
@@ -151,7 +159,7 @@ module "ec2" {
   version = "~> 5.0"
 
   name                        = var.instance_name
-  ami                         = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu[0].id
+  ami                         = var.ami_id != "" ? var.ami_id : data.aws_ami.al2023[0].id
   instance_type               = var.instance_type
   key_name                    = aws_key_pair.deplai.key_name
   subnet_id                   = aws_subnet.public.id

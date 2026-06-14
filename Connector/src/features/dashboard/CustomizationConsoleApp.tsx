@@ -1,190 +1,105 @@
-'use client';
-
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import {
   AlertTriangle,
   ArrowLeft,
   Bot,
+  CheckCircle,
   CheckCircle2,
+  ChevronRight,
+  Code2,
   FileJson,
   GitCompareArrows,
   Image as ImageIcon,
   Key,
+  Loader2,
   Lock,
   MessageSquare,
   Monitor,
+  Palette,
   Play,
   RefreshCcw,
   RefreshCw,
   Send,
+  Settings,
   ShieldAlert,
   Smartphone,
   Sparkles,
   Tablet,
-  TerminalSquare,
   Upload,
   User,
   XCircle,
+  Terminal,
+  CircleDashed,
+  Cpu,
+  Search,
+  Bell,
+  PanelLeftClose,
+  Maximize2,
+  ExternalLink,
+  Settings2,
+  FolderTree,
+  MoreHorizontal,
+  Activity,
+  GitBranch,
+  Command,
+  SendHorizontal,
+  RotateCcw,
+  Check,
+  Copy,
+  Layers,
+  Wrench,
+  Microscope,
+  FileCode2,
+  FileText,
+  UploadCloud,
+  Trash2,
+  Download,
+  Braces,
+  LayoutTemplate
 } from 'lucide-react';
 
+/* ═══════════════════════════════════════════════════
+   TYPES
+   ═══════════════════════════════════════════════════ */
+
+// [Include all types from the old file here...]
 type StatusLevel = 'info' | 'success' | 'warning' | 'error';
-
-type ChatMessage = {
-  role: 'user' | 'agent';
-  content: string;
-  timestamp: string;
-};
-
-type StatusState = {
-  level: StatusLevel;
-  text: string;
-  details?: string;
-};
-
-type ConfirmationState = {
-  confirmed_tenant_id?: string;
-  has_unconfirmed_changes?: boolean;
-  is_confirmed?: boolean;
-};
-
-type AssetType =
-  | 'logo_light'
-  | 'logo_dark'
-  | 'favicon'
-  | 'og_image'
-  | 'hero_illustration'
-  | 'why_background'
-  | 'activities_background'
-  | 'curated_image';
-
-type AssetOption = {
-  value: AssetType;
-  label: string;
-};
-
-type AssetPreview = {
-  assetType: AssetType;
-  fileName: string;
-  previewUrl: string;
-  uploadedAt: string;
-  storedPath?: string;
-};
-
+type ChatMessage = { role: 'user' | 'agent'; content: string; timestamp: string; };
+type StatusState = { level: StatusLevel; text: string; details?: string; };
+type ConfirmationState = { confirmed_tenant_id?: string; has_unconfirmed_changes?: boolean; is_confirmed?: boolean; };
+type AssetType = 'logo_light' | 'logo_dark' | 'favicon' | 'og_image' | 'hero_illustration' | 'why_background' | 'activities_background' | 'curated_image';
+type AssetOption = { value: AssetType; label: string; };
+type AssetPreview = { assetType: AssetType; fileName: string; previewUrl: string; uploadedAt: string; storedPath?: string; };
 type PipelineMode = 'hybrid' | 'llm_only' | 'deterministic_only' | 'diagnostic';
-
-type ImplementRunState = {
-  appTargets: string[];
-  validatorIssues: string[];
-  repairPassUsed: boolean;
-  pipelineMode: PipelineMode;
-};
-
-type LoadingState = {
-  chat: boolean;
-  manifest: boolean;
-  confirm: boolean;
-  implement: boolean;
-  repair: boolean;
-  upload: boolean;
-  resetSession: boolean;
-  resetRepo: boolean;
-};
-
-type ChatResponse = {
-  response?: string;
-  manifest?: Record<string, unknown>;
-  confirmation?: ConfirmationState;
-  tenant_id?: string;
-};
-
-type ManifestResponse = {
-  tenant_id?: string;
-  manifest?: Record<string, unknown>;
-  confirmation?: ConfirmationState;
-};
-
-type ConfirmResponse = {
-  tenant_id: string;
-  path: string;
-  confirmation?: ConfirmationState;
-};
-
-type ImplementResponse = {
-  status?: 'implementation_complete' | 'no_changes';
-  run_id?: string;
-  pipeline_mode?: PipelineMode;
-  tenant_id: string;
-  app_targets?: string[];
-  base_repo_path?: string;
-  errors?: string[];
-  modified_files?: string[];
-  modified_file_diffs?: Array<{
-    file: string;
-    diff: string;
-    truncated?: boolean;
-    source?: string;
-    operation?: string;
-  }>;
-  change_sources?: Array<{ file: string; source: string; operation?: string }>;
-  quality_report?: QualityReport;
-  preview?: PreviewPayload;
-  warnings?: string[];
-  plan_markdown_path?: string;
-};
-
-type ResolveRepoPathResponse = {
-  project_id: string;
-  base_repo_path: string;
-};
-
-type PreviewMetaResponse = {
-  source?: 'base' | 'subspace';
-  base_repo_path?: string;
-  tenant_repo_path?: string | null;
-  tenant_repo_exists?: boolean;
-  preview_root_path?: string;
-  preview_entry?: string | null;
-  preview_kind?: 'live_server' | 'static_file';
-  preview_url?: string | null;
-  preview_status?: 'ready' | 'unavailable' | 'failed' | 'stopped' | 'starting';
-  preview_error?: string | null;
-  preview_detail?: string | null;
-};
-
-type QualityReport = {
-  status?: 'passed' | 'failed' | 'warning' | 'not_run';
-  checks?: Array<{ name?: string; status?: string; detail?: string }>;
-};
-
-type PreviewPayload = {
-  kind?: 'live_server' | 'static_file';
-  status?: 'ready' | 'unavailable' | 'failed' | 'stopped';
-  url?: string;
-  detail?: string;
-};
-
-type AssetsListResponse = {
-  tenant_id: string;
-  assets?: Record<string, { filename?: string }>;
-};
-
-type UploadAssetResponse = {
-  tenant_id: string;
-  asset_type: AssetType;
-  stored_path: string;
-  confirmation?: ConfirmationState;
-};
+type ImplementRunState = { appTargets: string[]; validatorIssues: string[]; repairPassUsed: boolean; pipelineMode: PipelineMode; };
+type LoadingState = { chat: boolean; manifest: boolean; confirm: boolean; implement: boolean; repair: boolean; upload: boolean; resetSession: boolean; resetRepo: boolean; };
+type ChatResponse = { response?: string; manifest?: Record<string, unknown>; confirmation?: ConfirmationState; tenant_id?: string; };
+type ManifestResponse = { tenant_id?: string; manifest?: Record<string, unknown>; confirmation?: ConfirmationState; };
+type ConfirmResponse = { tenant_id: string; path: string; confirmation?: ConfirmationState; };
+type QualityReport = { status?: 'passed' | 'failed' | 'warning' | 'not_run'; checks?: Array<{ name?: string; status?: string; detail?: string }>; };
+type PreviewPayload = { kind?: 'live_server' | 'static_file'; status?: 'ready' | 'unavailable' | 'failed' | 'stopped'; url?: string; detail?: string; };
+type ImplementResponse = { status?: 'implementation_complete' | 'no_changes'; run_id?: string; pipeline_mode?: PipelineMode; tenant_id: string; app_targets?: string[]; base_repo_path?: string; errors?: string[]; modified_files?: string[]; modified_file_diffs?: Array<{ file: string; diff: string; truncated?: boolean; source?: string; operation?: string }>; change_sources?: Array<{ file: string; source: string; operation?: string }>; quality_report?: QualityReport; preview?: PreviewPayload; warnings?: string[]; plan_markdown_path?: string; };
+type ResolveRepoPathResponse = { project_id: string; base_repo_path: string; };
+type PreviewMetaResponse = { source?: 'base' | 'subspace'; base_repo_path?: string; tenant_repo_path?: string | null; tenant_repo_exists?: boolean; preview_root_path?: string; preview_entry?: string | null; preview_kind?: 'live_server' | 'static_file'; preview_url?: string | null; preview_status?: 'ready' | 'unavailable' | 'failed' | 'stopped' | 'starting'; preview_error?: string | null; preview_detail?: string | null; };
+type AssetsListResponse = { tenant_id: string; assets?: Record<string, { filename?: string }>; };
+type UploadAssetResponse = { tenant_id: string; asset_type: AssetType; stored_path: string; confirmation?: ConfirmationState; };
 
 type PreviewDevice = 'desktop' | 'tablet' | 'mobile';
+type WorkspaceTab = 'preview' | 'results' | 'manifest' | 'assets' | 'settings';
+type ResultsSubTab = 'diffs' | 'errors' | 'quality';
+
+/* ═══════════════════════════════════════════════════
+   CONSTANTS
+   ═══════════════════════════════════════════════════ */
 
 const TENANT_STORAGE_KEY = 'deplai.customization.tenant-id';
 const DEFAULT_APP_TARGETS = ['frontend', 'admin-frontend', 'expert', 'corporates'];
-const PIPELINE_MODE_OPTIONS: Array<{ value: PipelineMode; label: string }> = [
-  { value: 'hybrid', label: 'Hybrid' },
-  { value: 'llm_only', label: 'LLM only' },
-  { value: 'deterministic_only', label: 'Deterministic' },
-  { value: 'diagnostic', label: 'Diagnostic' },
+const PIPELINE_MODE_OPTIONS = [
+  { value: 'hybrid' as PipelineMode, label: 'Hybrid', description: 'LLM + deterministic', icon: Layers },
+  { value: 'llm_only' as PipelineMode, label: 'LLM Only', description: 'AI-driven changes', icon: Bot },
+  { value: 'deterministic_only' as PipelineMode, label: 'Deterministic', description: 'Rule-based only', icon: Wrench },
+  { value: 'diagnostic' as PipelineMode, label: 'Diagnostic', description: 'Dry run & report', icon: Microscope },
 ];
 const REVERT_TO_BASE_CHAT_PATTERN = /(revert|reset|restore|undo).*(original|base|default).*(ui|theme|frontend|site|design)/i;
 const INITIAL_CHAT_TIMESTAMP = '--:--:--';
@@ -194,12 +109,11 @@ const CHAT_COMMAND_PRESETS = [
   'Set primary theme color to #14b8a6',
   'Remove landing parts 6 to 10',
 ];
-const PREVIEW_DEVICE_OPTIONS: Array<{ value: PreviewDevice; label: string; icon: typeof Monitor; widthClass: string }> = [
-  { value: 'desktop', label: 'Desktop', icon: Monitor, widthClass: 'w-full' },
-  { value: 'tablet', label: 'Tablet', icon: Tablet, widthClass: 'w-[760px] max-w-full' },
-  { value: 'mobile', label: 'Mobile', icon: Smartphone, widthClass: 'w-[390px] max-w-full' },
+const PREVIEW_DEVICE_OPTIONS = [
+  { value: 'desktop' as PreviewDevice, label: 'Desktop', icon: Monitor, width: 'w-full' },
+  { value: 'tablet' as PreviewDevice, label: 'Tablet', icon: Tablet, width: 'w-[768px] max-w-full' },
+  { value: 'mobile' as PreviewDevice, label: 'Mobile', icon: Smartphone, width: 'w-[390px] max-w-full' },
 ];
-
 const ASSET_OPTIONS: AssetOption[] = [
   { value: 'logo_light', label: 'Logo (Light)' },
   { value: 'logo_dark', label: 'Logo (Dark)' },
@@ -210,315 +124,63 @@ const ASSET_OPTIONS: AssetOption[] = [
   { value: 'activities_background', label: 'Activities Background' },
   { value: 'curated_image', label: 'Curated Image' },
 ];
+const WORKSPACE_TABS: Array<{ value: WorkspaceTab; label: string; icon: typeof Monitor }> = [
+  { value: 'preview', label: 'Live Preview', icon: Monitor },
+  { value: 'results', label: 'Code Diffs', icon: GitBranch },
+  { value: 'manifest', label: 'manifest.json', icon: Braces },
+  { value: 'assets', label: 'Assets', icon: ImageIcon },
+  { value: 'settings', label: 'Settings', icon: Settings2 },
+];
 
-class Pixel {
-  width: number;
-  height: number;
-  ctx: CanvasRenderingContext2D;
-  x: number;
-  y: number;
-  color: string;
-  speed: number;
-  size: number;
-  sizeStep: number;
-  minSize: number;
-  maxSizeInteger: number;
-  maxSize: number;
-  delay: number;
-  counter: number;
-  counterStep: number;
-  isIdle: boolean;
-  isReverse: boolean;
-  isShimmer: boolean;
+/* ═══════════════════════════════════════════════════
+   UTILITY FUNCTIONS
+   ═══════════════════════════════════════════════════ */
 
-  constructor(
-    canvas: HTMLCanvasElement,
-    context: CanvasRenderingContext2D,
-    x: number,
-    y: number,
-    color: string,
-    speed: number,
-    delay: number,
-  ) {
-    const dpr = window.devicePixelRatio || 1;
-    this.width = canvas.width / dpr;
-    this.height = canvas.height / dpr;
-    this.ctx = context;
-    this.x = x;
-    this.y = y;
-    this.color = color;
-    this.speed = (Math.random() * 0.8 + 0.1) * speed;
-    this.size = 0;
-    this.sizeStep = Math.random() * 0.4;
-    this.minSize = 0.5;
-    this.maxSizeInteger = 2;
-    this.maxSize = Math.random() * (this.maxSizeInteger - this.minSize) + this.minSize;
-    this.delay = delay;
-    this.counter = 0;
-    this.counterStep = Math.random() * 4 + (this.width + this.height) * 0.01;
-    this.isIdle = false;
-    this.isReverse = false;
-    this.isShimmer = false;
-  }
-
-  draw() {
-    const centerOffset = this.maxSizeInteger * 0.5 - this.size * 0.5;
-    this.ctx.fillStyle = this.color;
-    this.ctx.fillRect(
-      Math.round(this.x + centerOffset),
-      Math.round(this.y + centerOffset),
-      Math.round(this.size),
-      Math.round(this.size),
-    );
-  }
-
-  appear() {
-    this.isIdle = false;
-    if (this.counter <= this.delay) {
-      this.counter += this.counterStep;
-      return;
-    }
-    if (this.size >= this.maxSize) this.isShimmer = true;
-    if (this.isShimmer) this.shimmer();
-    else this.size += this.sizeStep;
-    this.draw();
-  }
-
-  disappear() {
-    this.isShimmer = false;
-    this.counter = 0;
-    if (this.size <= 0) {
-      this.isIdle = true;
-      return;
-    }
-    this.size -= 0.1;
-    this.draw();
-  }
-
-  shimmer() {
-    if (this.size >= this.maxSize) this.isReverse = true;
-    else if (this.size <= this.minSize) this.isReverse = false;
-    if (this.isReverse) this.size -= this.speed;
-    else this.size += this.speed;
-  }
-}
-
-type PixelCardProps = {
-  gap?: number;
-  speed?: number;
-  colors?: string;
-  className?: string;
-  children: React.ReactNode;
-};
-
-function PixelCard({
-  gap = 5,
-  speed = 35,
-  colors = '#3f3f46,#18181b,#ffffff',
-  className = '',
-  children,
-}: PixelCardProps) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const pixelsRef = useRef<Pixel[]>([]);
-  const animationRef = useRef<number | null>(null);
-  const timePreviousRef = useRef(0);
-
-  const initPixels = useCallback(() => {
-    if (!containerRef.current || !canvasRef.current) return;
-    const rect = containerRef.current.getBoundingClientRect();
-    const width = Math.floor(rect.width);
-    const height = Math.floor(rect.height);
-    const ctx = canvasRef.current.getContext('2d');
-    if (!ctx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    canvasRef.current.width = width * dpr;
-    canvasRef.current.height = height * dpr;
-    ctx.scale(dpr, dpr);
-
-    const colorsArray = colors.split(',');
-    const nextPixels: Pixel[] = [];
-
-    for (let x = 0; x < width; x += gap) {
-      for (let y = 0; y < height; y += gap) {
-        const color = colorsArray[Math.floor(Math.random() * colorsArray.length)];
-        const distance = Math.sqrt((x - width / 2) ** 2 + (y - height / 2) ** 2);
-        nextPixels.push(new Pixel(canvasRef.current, ctx, x, y, color, speed * 0.001, distance));
-      }
-    }
-
-    pixelsRef.current = nextPixels;
-  }, [colors, gap, speed]);
-
-  const handleAnimation = useCallback((name: 'appear' | 'disappear') => {
-    if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
-    timePreviousRef.current = performance.now();
-
-    function animateFrame() {
-      animationRef.current = requestAnimationFrame(animateFrame);
-
-      const timeNow = performance.now();
-      const timePassed = timeNow - timePreviousRef.current;
-      if (timePassed < 1000 / 60) return;
-      timePreviousRef.current = timeNow - (timePassed % (1000 / 60));
-
-      const canvas = canvasRef.current;
-      const ctx = canvas?.getContext('2d');
-      if (!ctx || !canvas) return;
-
-      const dpr = window.devicePixelRatio || 1;
-      ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
-
-      let allIdle = true;
-      pixelsRef.current.forEach((pixel) => {
-        pixel[name]();
-        if (!pixel.isIdle) allIdle = false;
-      });
-
-      if (allIdle && animationRef.current !== null) {
-        cancelAnimationFrame(animationRef.current);
-      }
-    }
-
-    animationRef.current = requestAnimationFrame(animateFrame);
-  }, []);
-
-  useEffect(() => {
-    initPixels();
-    const observer = new ResizeObserver(() => initPixels());
-    if (containerRef.current) observer.observe(containerRef.current);
-
-    return () => {
-      observer.disconnect();
-      if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
-    };
-  }, [initPixels]);
-
-  return (
-    <div
-      ref={containerRef}
-      className={`relative isolate overflow-hidden select-none transition-colors duration-200 ${className}`}
-      onMouseEnter={() => handleAnimation('appear')}
-      onMouseLeave={() => handleAnimation('disappear')}
-    >
-      <canvas className="pointer-events-none absolute inset-0 z-0 block h-full w-full mix-blend-lighten opacity-30" ref={canvasRef} />
-      <div className="relative z-10 flex h-full w-full flex-col">{children}</div>
-    </div>
-  );
-}
-
-type BorderGlowProps = {
-  children: React.ReactNode;
-  className?: string;
-  active?: boolean;
-};
-
-function BorderGlow({ children, className = '', active = false }: BorderGlowProps) {
-  const glowColor = active ? 'from-white/30 via-white/10' : 'from-zinc-500/10 via-zinc-500/5';
-  return (
-    <div className={`group relative ${className}`}>
-      <div className={`absolute -inset-[1px] rounded-lg bg-gradient-to-r ${glowColor} to-transparent opacity-100 blur-sm transition duration-500`} />
-      <div className="relative flex h-full flex-col overflow-hidden rounded-lg border border-[#262626] bg-[#050505]">
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function nowStamp(): string {
-  return new Date().toLocaleTimeString();
-}
-
-function sanitizeTenantId(raw: string): string {
-  return raw.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 63);
-}
-
-function isAssetType(value: string): value is AssetType {
-  return ASSET_OPTIONS.some((option) => option.value === value);
-}
-
+function nowStamp(): string { return new Date().toLocaleTimeString(); }
+function sanitizeTenantId(raw: string): string { return raw.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 63); }
+function isAssetType(value: string): value is AssetType { return ASSET_OPTIONS.some((option) => option.value === value); }
 function getErrorMessage(payload: unknown, fallback: string): string {
   if (!payload || typeof payload !== 'object') return fallback;
-
   const body = payload as { error?: unknown; detail?: unknown; message?: unknown };
-
   if (typeof body.error === 'string' && body.error.trim()) return body.error;
   if (typeof body.message === 'string' && body.message.trim()) return body.message;
   if (typeof body.detail === 'string' && body.detail.trim()) return body.detail;
-
   if (body.detail && typeof body.detail === 'object') {
     const detailObj = body.detail as { message?: unknown; errors?: unknown };
     if (typeof detailObj.message === 'string' && detailObj.message.trim()) {
-      if (Array.isArray(detailObj.errors) && detailObj.errors.length > 0) {
-        return `${detailObj.message} ${detailObj.errors.join(' | ')}`;
-      }
+      if (Array.isArray(detailObj.errors) && detailObj.errors.length > 0) return `${detailObj.message} ${detailObj.errors.join(' | ')}`;
       return detailObj.message;
     }
   }
-
   return fallback;
 }
-
 function formatUiText(value: string): string {
-  return value
-    .replace(/Tenant Customization Operator/gi, 'Customization Operator')
-    .replace(/\bTenant ID\b/gi, 'Workspace ID')
-    .replace(/\bTenant key\b/gi, 'Workspace')
-    .replace(/\btenant key\b/gi, 'workspace')
-    .replace(/\bTenant repository\b/gi, 'Workspace copy')
-    .replace(/\btenant repository\b/gi, 'workspace copy')
-    .replace(/\bTenant repo\b/gi, 'Workspace copy')
-    .replace(/\btenant repo\b/gi, 'workspace copy')
-    .replace(/\bTenant required\b/gi, 'Workspace required')
-    .replace(/\btenant assets\b/gi, 'workspace assets')
-    .replace(/\bTenant\b/g, 'Workspace')
-    .replace(/\btenant\b/g, 'workspace')
-    .replace(/SubSpace-/g, 'Edited-')
-    .replace(/\bSubSpace\b/g, 'Edited Copy');
+  return value.replace(/Tenant Customization Operator/gi, 'Customization Operator').replace(/\bTenant ID\b/gi, 'Workspace ID').replace(/\bTenant key\b/gi, 'Workspace').replace(/\btenant key\b/gi, 'workspace').replace(/\bTenant repository\b/gi, 'Workspace copy').replace(/\btenant repository\b/gi, 'workspace copy').replace(/\bTenant repo\b/gi, 'Workspace copy').replace(/\btenant repo\b/gi, 'workspace copy').replace(/\bTenant required\b/gi, 'Workspace required').replace(/\btenant assets\b/gi, 'workspace assets').replace(/\bTenant\b/g, 'Workspace').replace(/\btenant\b/g, 'workspace').replace(/SubSpace-/g, 'Edited-').replace(/\bSubSpace\b/g, 'Edited Copy');
 }
-
 function sanitizeManifestForDisplay(manifest: Record<string, unknown>): Record<string, unknown> {
   const clone = JSON.parse(JSON.stringify(manifest)) as Record<string, unknown>;
-
-  if ('tenant_id' in clone) {
-    clone.workspace_id = clone.tenant_id;
-    delete clone.tenant_id;
-  }
-  if ('tenant_name' in clone) {
-    clone.workspace_name = clone.tenant_name;
-    delete clone.tenant_name;
-  }
-
+  if ('tenant_id' in clone) { clone.workspace_id = clone.tenant_id; delete clone.tenant_id; }
+  if ('tenant_name' in clone) { clone.workspace_name = clone.tenant_name; delete clone.tenant_name; }
   const categories = clone.categories;
   if (categories && typeof categories === 'object') {
     const branding = (categories as { branding?: unknown }).branding;
     if (branding && typeof branding === 'object') {
       for (const [key, value] of Object.entries(branding as Record<string, unknown>)) {
-        if (typeof value === 'string') {
-          (branding as Record<string, unknown>)[key] = formatUiText(value);
-        }
+        if (typeof value === 'string') { (branding as Record<string, unknown>)[key] = formatUiText(value); }
       }
     }
   }
-
   return clone;
 }
-
 function diffLineClassName(line: string): string {
   if (line.startsWith('+++') || line.startsWith('---')) return 'text-zinc-400';
-  if (line.startsWith('@@')) return 'bg-cyan-400/10 text-cyan-200';
-  if (line.startsWith('+')) return 'bg-emerald-400/10 text-emerald-200';
-  if (line.startsWith('-')) return 'bg-rose-400/10 text-rose-200';
-  return 'text-zinc-300';
+  if (line.startsWith('@@')) return 'bg-sky-500/8 text-sky-300';
+  if (line.startsWith('+')) return 'bg-emerald-500/8 text-emerald-300';
+  if (line.startsWith('-')) return 'bg-rose-500/8 text-rose-300';
+  return 'text-zinc-400';
 }
-
 async function parseJsonSafe<T>(response: Response): Promise<T | null> {
-  try {
-    return (await response.json()) as T;
-  } catch {
-    return null;
-  }
+  try { return (await response.json()) as T; } catch { return null; }
 }
 
 export default function CustomizationConsoleApp() {
@@ -526,6 +188,7 @@ export default function CustomizationConsoleApp() {
   const searchParams = useSearchParams();
   const chatEndRef = useRef<HTMLDivElement | null>(null);
 
+  /* ── Query params ── */
   const tenantFromQuery = useMemo(() => sanitizeTenantId(searchParams.get('tenantId') || ''), [searchParams]);
   const projectIdFromQuery = useMemo(() => searchParams.get('projectId') || '', [searchParams]);
   const projectNameFromQuery = useMemo(() => searchParams.get('projectName') || '', [searchParams]);
@@ -535,25 +198,29 @@ export default function CustomizationConsoleApp() {
     [projectIdFromQuery],
   );
 
+  /* ── Core state ── */
   const [tenantId, setTenantId] = useState('');
   const [confirmedTenantId, setConfirmedTenantId] = useState('');
   const [isConfirmed, setIsConfirmed] = useState(false);
   const [manifestJson, setManifestJson] = useState<Record<string, unknown> | null>(null);
-  const [isManifestViewerOpen, setIsManifestViewerOpen] = useState(false);
-  const [isCodeDiffViewerOpen, setIsCodeDiffViewerOpen] = useState(false);
   const [codeDiffEntries, setCodeDiffEntries] = useState<Array<{ file: string; diff: string; truncated?: boolean; source?: string; operation?: string }>>([]);
   const [lastImplementErrors, setLastImplementErrors] = useState<string[]>([]);
+  const [lastImplementWarnings, setLastImplementWarnings] = useState<string[]>([]);
   const [lastQualityReport, setLastQualityReport] = useState<QualityReport | null>(null);
   const [lastPreviewPayload, setLastPreviewPayload] = useState<PreviewPayload | null>(null);
+  const [lastImplementStatus, setLastImplementStatus] = useState<'idle' | 'success' | 'partial' | 'failed'>('idle');
 
+  /* ── Chat state ── */
   const [chatInput, setChatInput] = useState('');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     { role: 'agent', content: 'Operator console initialized. Open from a repository card or enter a workspace ID.', timestamp: INITIAL_CHAT_TIMESTAMP },
   ]);
 
+  /* ── Asset state ── */
   const [assetType, setAssetType] = useState<AssetType>('logo_light');
   const [uploadedAssetsSession, setUploadedAssetsSession] = useState<AssetPreview[]>([]);
 
+  /* ── Implement state ── */
   const [implementRun, setImplementRun] = useState<ImplementRunState>({
     appTargets: [...DEFAULT_APP_TARGETS],
     validatorIssues: [],
@@ -561,29 +228,30 @@ export default function CustomizationConsoleApp() {
     pipelineMode: 'hybrid',
   });
 
-  const [status, setStatus] = useState<StatusState>({
-    level: 'info',
-    text: 'Enter workspace ID to continue.',
-  });
+  /* ── UI state ── */
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>('preview');
+  const [resultsSubTab, setResultsSubTab] = useState<ResultsSubTab>('diffs');
+  const [status, setStatus] = useState<StatusState>({ level: 'info', text: 'Enter workspace ID to continue.' });
   const [resolvedRepoPath, setResolvedRepoPath] = useState('');
   const [previewNonce, setPreviewNonce] = useState(0);
   const [previewMeta, setPreviewMeta] = useState<PreviewMetaResponse | null>(null);
   const [previewMetaLoading, setPreviewMetaLoading] = useState(false);
   const [previewDevice, setPreviewDevice] = useState<PreviewDevice>('desktop');
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [showByokModal, setShowByokModal] = useState(false);
 
+  /* ── BYOK State ── */
+  const [byokKey, setByokKey] = useState('');
+  const [byokProvider, setByokProvider] = useState('');
+
+  /* ── Loading state ── */
   const [loading, setLoading] = useState<LoadingState>({
-    chat: false,
-    manifest: false,
-    confirm: false,
-    implement: false,
-    repair: false,
-    upload: false,
-    resetSession: false,
-    resetRepo: false,
+    chat: false, manifest: false, confirm: false, implement: false, repair: false, upload: false, resetSession: false, resetRepo: false,
   });
 
+  /* ── Derived ── */
   const activePreviewDevice = useMemo(
-    () => PREVIEW_DEVICE_OPTIONS.find((option) => option.value === previewDevice) || PREVIEW_DEVICE_OPTIONS[0],
+    () => PREVIEW_DEVICE_OPTIONS.find((o) => o.value === previewDevice) || PREVIEW_DEVICE_OPTIONS[0],
     [previewDevice],
   );
 
@@ -604,127 +272,68 @@ export default function CustomizationConsoleApp() {
     return `/api/customization/preview/${encodeURIComponent(projectIdFromQuery)}/${tenantSegment}?meta=1&v=${previewNonce}`;
   }, [effectiveTenantId, previewNonce, projectIdFromQuery]);
 
-  const effectivePreviewUrl = useMemo(() => {
-    return previewUrl;
-  }, [previewUrl]);
+  const effectivePreviewUrl = useMemo(() => previewUrl, [previewUrl]);
+  const refreshPreview = useCallback(() => { setPreviewNonce(Date.now()); }, []);
 
-  const previewAddressLabel = useMemo(() => {
-    if (previewMeta?.preview_kind === 'live_server' && previewMeta.preview_status === 'ready') {
-      return previewMeta.preview_url || lastPreviewPayload?.url || effectivePreviewUrl;
-    }
-    return previewMeta?.preview_entry || effectivePreviewUrl || 'preview';
-  }, [effectivePreviewUrl, lastPreviewPayload?.url, previewMeta?.preview_entry, previewMeta?.preview_kind, previewMeta?.preview_status, previewMeta?.preview_url]);
+  const isGlobalDisabled = !tenantId.trim();
+  const isAnyLoading = loading.chat || loading.manifest || loading.confirm || loading.implement || loading.repair || loading.upload || loading.resetRepo || loading.resetSession || previewMetaLoading;
 
-  const refreshPreview = useCallback(() => {
-    setPreviewNonce(Date.now());
-  }, []);
+  const previewStarting = previewMeta?.preview_kind === 'live_server' && previewMeta?.preview_status === 'starting';
+  const previewFailed = previewMeta?.preview_kind === 'live_server' && previewMeta?.preview_status === 'failed';
+  const previewFrameHeld = previewStarting || previewFailed || (previewMetaLoading && !previewMeta);
+  const previewFrameSrc = previewFrameHeld ? '' : effectivePreviewUrl;
 
-  useEffect(() => {
-    // Keep initial SSR and client render deterministic for hydration safety.
-    setPreviewNonce(Date.now());
-  }, []);
+  const displayManifestJson = useMemo(
+    () => (manifestJson ? sanitizeManifestForDisplay(manifestJson) : null),
+    [manifestJson],
+  );
 
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatMessages, loading.chat]);
+  const workflowStep = useMemo(() => {
+    if (!tenantId.trim()) return 0;
+    if (!manifestJson) return 1;
+    if (!isConfirmed) return 2;
+    return 3;
+  }, [tenantId, manifestJson, isConfirmed]);
+
+  /* ═══════════════════════════════════════════════════
+     EFFECTS & LOGIC
+     ═══════════════════════════════════════════════════ */
+
+  useEffect(() => { setPreviewNonce(Date.now()); }, []);
+  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [chatMessages, loading.chat]);
 
   useEffect(() => {
     if (!previewMetaUrl) {
-      setPreviewMeta(null);
-      setPreviewMetaLoading(false);
-      return;
+      setPreviewMeta(null); setPreviewMetaLoading(false); return;
     }
-
     let isCancelled = false;
     setPreviewMetaLoading(true);
-
     const fetchPreviewMeta = async () => {
       try {
         const response = await fetch(previewMetaUrl, { cache: 'no-store' });
         const payload = await parseJsonSafe<PreviewMetaResponse>(response);
-        if (!response.ok || !payload || !payload.source) {
-          if (!isCancelled) {
-            setPreviewMeta(null);
-          }
-          return;
-        }
+        if (!response.ok || !payload || !payload.source) { if (!isCancelled) setPreviewMeta(null); return; }
         if (!isCancelled) {
           setPreviewMeta(payload);
           setStatus((prev) => {
             if (prev.level === 'error' && /customization backend is unreachable/i.test(prev.text)) {
-              return {
-                level: 'success',
-                text: payload.preview_kind === 'live_server' && payload.preview_status === 'ready'
-                  ? 'Customization backend reachable. Live preview connected.'
-                  : 'Customization backend reachable. Preview status refreshed.',
-              };
+              return { level: 'success', text: payload.preview_kind === 'live_server' && payload.preview_status === 'ready' ? 'Customization backend reachable. Live preview connected.' : 'Customization backend reachable. Preview status refreshed.' };
             }
             return prev;
           });
         }
-      } catch {
-        if (!isCancelled) {
-          setPreviewMeta(null);
-        }
-      } finally {
-        if (!isCancelled) {
-          setPreviewMetaLoading(false);
-        }
-      }
+      } catch { if (!isCancelled) setPreviewMeta(null); }
+      finally { if (!isCancelled) setPreviewMetaLoading(false); }
     };
-
     void fetchPreviewMeta();
-
-    return () => {
-      isCancelled = true;
-    };
+    return () => { isCancelled = true; };
   }, [previewMetaUrl]);
-
-  // The backend boots framework dev servers in the background and reports
-  // "starting" until deps install + first compile finish. Poll until it
-  // resolves so the live preview appears without a manual refresh.
-  const previewStarting =
-    previewMeta?.preview_kind === 'live_server' && previewMeta?.preview_status === 'starting';
-  const previewFailed =
-    previewMeta?.preview_kind === 'live_server' && previewMeta?.preview_status === 'failed';
 
   useEffect(() => {
     if (!previewStarting) return;
     const timer = setTimeout(() => refreshPreview(), 4000);
     return () => clearTimeout(timer);
   }, [previewStarting, previewNonce, refreshPreview]);
-
-  // Hold the iframe blank while the live server is still starting (or while we
-  // don't yet know the status) so it never flashes the "not ready" error page.
-  const previewFrameHeld = previewStarting || previewFailed || (previewMetaLoading && !previewMeta);
-  const previewFrameSrc = previewFrameHeld ? '' : effectivePreviewUrl;
-
-  const previewSourceLabel = useMemo(() => {
-    if (!projectIdFromQuery) return 'Preview Source: Unavailable';
-    if (previewMetaLoading) return 'Preview Source: Resolving...';
-    if (!previewMeta?.source) return 'Preview Source: Unknown';
-
-    if (previewMeta.source === 'subspace') {
-      return previewMeta.preview_kind === 'live_server'
-        ? 'Preview Source: Live Edited Copy'
-        : 'Preview Source: Static Edited Copy';
-    }
-
-    if (effectiveTenantId && previewMeta.tenant_repo_exists === false) {
-      return 'Preview Source: Base (edited copy not found)';
-    }
-
-    return 'Preview Source: Base';
-  }, [effectiveTenantId, previewMeta, previewMetaLoading, projectIdFromQuery]);
-
-  const previewSourceChipLabel = useMemo(() => {
-    if (!projectIdFromQuery) return 'Source: Unavailable';
-    if (previewMetaLoading) return 'Source: Resolving';
-    if (previewMeta?.preview_kind === 'live_server' && previewMeta.preview_status === 'ready') return 'Preview: Live server';
-    if (previewMeta?.source === 'subspace') return 'Preview: Static fallback';
-    if (previewMeta?.source === 'base') return 'Source: Base';
-    return 'Source: Unknown';
-  }, [previewMeta?.preview_kind, previewMeta?.preview_status, previewMeta?.source, previewMetaLoading, projectIdFromQuery]);
 
   const syncConfirmationState = useCallback((confirmation?: ConfirmationState) => {
     const isManifestConfirmed = Boolean(confirmation?.is_confirmed) && !confirmation?.has_unconfirmed_changes;
@@ -733,57 +342,33 @@ export default function CustomizationConsoleApp() {
   }, []);
 
   const loadAssets = useCallback(async (activeTenantId: string) => {
-    const response = await fetch(`/api/customization/assets/${encodeURIComponent(activeTenantId)}`, {
-      cache: 'no-store',
-    });
+    const response = await fetch(`/api/customization/assets/${encodeURIComponent(activeTenantId)}`, { cache: 'no-store' });
     const payload = await parseJsonSafe<AssetsListResponse>(response);
-    if (!response.ok) {
-      throw new Error(getErrorMessage(payload, 'Failed to load workspace assets.'));
-    }
-
+    if (!response.ok) throw new Error(getErrorMessage(payload, 'Failed to load workspace assets.'));
     const assetsMap = payload?.assets || {};
     const nextAssets: AssetPreview[] = Object.entries(assetsMap)
       .filter(([key]) => isAssetType(key))
-      .map(([key, value]) => {
-        const previewUrl = `/api/customization/assets/${encodeURIComponent(activeTenantId)}/${encodeURIComponent(key)}`;
-        return {
-          assetType: key as AssetType,
-          fileName: value.filename || `${key}.asset`,
-          previewUrl,
-          uploadedAt: nowStamp(),
-          storedPath: value.filename ? `tenants/${activeTenantId}/assets/${value.filename}` : undefined,
-        };
-      });
-
+      .map(([key, value]) => ({
+        assetType: key as AssetType, fileName: value.filename || `${key}.asset`,
+        previewUrl: `/api/customization/assets/${encodeURIComponent(activeTenantId)}/${encodeURIComponent(key)}`,
+        uploadedAt: nowStamp(), storedPath: value.filename ? `tenants/${activeTenantId}/assets/${value.filename}` : undefined,
+      }));
     setUploadedAssetsSession(nextAssets);
   }, []);
 
   const fetchManifest = useCallback(async (overrideTenantId?: string, silent = false) => {
     const activeTenantId = sanitizeTenantId(overrideTenantId || tenantId);
-    if (!activeTenantId) {
-      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID before fetching manifest.' });
-      return;
-    }
-
+    if (!activeTenantId) { setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID before fetching manifest.' }); return; }
     setLoading((prev) => ({ ...prev, manifest: true }));
     if (!silent) setStatus({ level: 'info', text: 'Fetching manifest...' });
-
     try {
-      const response = await fetch(`/api/customization/manifest?tenant_id=${encodeURIComponent(activeTenantId)}`, {
-        cache: 'no-store',
-      });
+      const response = await fetch(`/api/customization/manifest?tenant_id=${encodeURIComponent(activeTenantId)}`, { cache: 'no-store' });
       const payload = await parseJsonSafe<ManifestResponse>(response);
-      if (!response.ok || !payload?.manifest) {
-        throw new Error(getErrorMessage(payload, 'Failed to fetch manifest.'));
-      }
-
+      if (!response.ok || !payload?.manifest) throw new Error(getErrorMessage(payload, 'Failed to fetch manifest.'));
       setManifestJson(payload.manifest);
       syncConfirmationState(payload.confirmation);
       await loadAssets(activeTenantId);
-
-      if (!silent) {
-        setStatus({ level: 'success', text: 'Manifest fetched: Manifest loaded successfully.' });
-      }
+      if (!silent) setStatus({ level: 'success', text: 'Manifest loaded successfully.' });
     } catch (error) {
       setStatus({ level: 'error', text: error instanceof Error ? error.message : 'Failed to fetch manifest.' });
     } finally {
@@ -793,171 +378,72 @@ export default function CustomizationConsoleApp() {
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-
     const savedTenant = sanitizeTenantId(window.localStorage.getItem(TENANT_STORAGE_KEY) || '');
     const tenantFromProjectMetadata = sanitizeTenantId(projectNameFromQuery);
     const initialTenant = tenantFromQuery || tenantFromProjectMetadata || savedTenant;
-
     if (!initialTenant) return;
-
     setTenantId(initialTenant);
     window.localStorage.setItem(TENANT_STORAGE_KEY, initialTenant);
     void fetchManifest(initialTenant, true);
-    setChatMessages([
-      {
-        role: 'agent',
-        content: `Workspace loaded: ${initialTenant}. You can start chatting now.`,
-        timestamp: nowStamp(),
-      },
-    ]);
+    setChatMessages([{ role: 'agent', content: `Workspace loaded: ${initialTenant}. You can start chatting now.`, timestamp: nowStamp() }]);
     setStatus({ level: 'info', text: `Restored session for workspace: ${initialTenant}` });
   }, [fetchManifest, projectNameFromQuery, tenantFromQuery]);
 
   useEffect(() => {
-    if (!projectIdFromQuery) {
-      setResolvedRepoPath('');
-      return;
-    }
-
+    if (!projectIdFromQuery) { setResolvedRepoPath(''); return; }
     let isCancelled = false;
-
     const resolveRepoPath = async () => {
       try {
-        const response = await fetch(
-          `/api/customization/resolve-repo-path?project_id=${encodeURIComponent(projectIdFromQuery)}`,
-          { cache: 'no-store' },
-        );
+        const response = await fetch(`/api/customization/resolve-repo-path?project_id=${encodeURIComponent(projectIdFromQuery)}`, { cache: 'no-store' });
         const payload = await parseJsonSafe<ResolveRepoPathResponse>(response);
-        if (!response.ok || !payload?.base_repo_path) {
-          if (!isCancelled) {
-            setResolvedRepoPath('');
-          }
-          return;
-        }
-
-        if (!isCancelled) {
-          setResolvedRepoPath(payload.base_repo_path);
-        }
-      } catch {
-        if (!isCancelled) {
-          setResolvedRepoPath('');
-        }
-      }
+        if (!response.ok || !payload?.base_repo_path) { if (!isCancelled) setResolvedRepoPath(''); return; }
+        if (!isCancelled) setResolvedRepoPath(payload.base_repo_path);
+      } catch { if (!isCancelled) setResolvedRepoPath(''); }
     };
-
     void resolveRepoPath();
-
-    return () => {
-      isCancelled = true;
-    };
+    return () => { isCancelled = true; };
   }, [projectIdFromQuery]);
 
   const handleTenantChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const nextTenantId = sanitizeTenantId(event.target.value);
     setTenantId(nextTenantId);
-
     if (typeof window !== 'undefined') {
-      if (nextTenantId) {
-        window.localStorage.setItem(TENANT_STORAGE_KEY, nextTenantId);
-      } else {
-        window.localStorage.removeItem(TENANT_STORAGE_KEY);
-      }
+      if (nextTenantId) window.localStorage.setItem(TENANT_STORAGE_KEY, nextTenantId);
+      else window.localStorage.removeItem(TENANT_STORAGE_KEY);
     }
-
-    setIsConfirmed(false);
-    setConfirmedTenantId('');
-    setManifestJson(null);
-    setCodeDiffEntries([]);
-    setLastImplementErrors([]);
-    setLastQualityReport(null);
-    setLastPreviewPayload(null);
-    setIsCodeDiffViewerOpen(false);
-    setUploadedAssetsSession([]);
+    setIsConfirmed(false); setConfirmedTenantId(''); setManifestJson(null); setCodeDiffEntries([]); setLastImplementErrors([]); setLastImplementWarnings([]); setLastQualityReport(null); setLastPreviewPayload(null); setLastImplementStatus('idle'); setUploadedAssetsSession([]);
     setImplementRun({ appTargets: [...DEFAULT_APP_TARGETS], validatorIssues: [], repairPassUsed: false, pipelineMode: 'hybrid' });
-
-    if (!nextTenantId) {
-      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID to continue.' });
-      return;
-    }
-
-    setChatMessages([
-      {
-        role: 'agent',
-        content: `Workspace set to ${nextTenantId}. You can start chatting now.`,
-        timestamp: nowStamp(),
-      },
-    ]);
+    if (!nextTenantId) { setStatus({ level: 'warning', text: 'Enter a workspace ID to continue.' }); return; }
+    setChatMessages([{ role: 'agent', content: `Workspace set to ${nextTenantId}. You can start chatting now.`, timestamp: nowStamp() }]);
     setStatus({ level: 'info', text: 'Workspace updated. Fetch manifest to begin.' });
   }, []);
 
   const performRepoReset = useCallback(async (options?: { suppressPrompt?: boolean; preserveChatHistory?: boolean }) => {
     const activeTenantId = sanitizeTenantId(tenantId);
-    if (!activeTenantId) {
-      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID before repo reset.' });
-      return false;
-    }
-
+    if (!activeTenantId) { setStatus({ level: 'warning', text: 'Enter a workspace ID before repo reset.' }); return false; }
     const shouldPrompt = !(options?.suppressPrompt ?? false);
-    if (shouldPrompt && !window.confirm('This will reset the workspace copy entirely. Continue?')) {
-      return false;
-    }
-
+    if (shouldPrompt && !window.confirm('This will reset the workspace copy entirely. Continue?')) return false;
     setLoading((prev) => ({ ...prev, resetRepo: true }));
     setStatus({ level: 'warning', text: 'Resetting workspace copy...' });
-
     try {
       const response = await fetch('/api/customization/reset-repo', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          tenant_id: activeTenantId,
-          project_id: projectIdFromQuery || undefined,
-        }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tenant_id: activeTenantId, project_id: projectIdFromQuery || undefined }),
       });
-
-      const payload = await parseJsonSafe<{
-        tenant_id: string;
-        repo_path: string;
-        manifest?: Record<string, unknown>;
-        confirmation?: ConfirmationState;
-      }>(response);
-
-      if (!response.ok || !payload) {
-        throw new Error(getErrorMessage(payload, 'Failed to reset tenant repo.'));
-      }
-
-      if (payload.manifest) {
-        setManifestJson(payload.manifest);
-      }
-
-      setCodeDiffEntries([]);
-      setLastImplementErrors([]);
-      setLastQualityReport(null);
-      setLastPreviewPayload(null);
-      setIsCodeDiffViewerOpen(false);
+      const payload = await parseJsonSafe<{ tenant_id: string; repo_path: string; manifest?: Record<string, unknown>; confirmation?: ConfirmationState }>(response);
+      if (!response.ok || !payload) throw new Error(getErrorMessage(payload, 'Failed to reset tenant repo.'));
+      if (payload.manifest) setManifestJson(payload.manifest);
+      setCodeDiffEntries([]); setLastImplementErrors([]); setLastImplementWarnings([]); setLastQualityReport(null); setLastPreviewPayload(null); setLastImplementStatus('idle');
       setPreviewNonce(Date.now());
-
       if (options?.preserveChatHistory) {
-        setChatMessages((prev) => [
-          ...prev,
-          { role: 'agent', content: 'Reverted to original UI. Workspace copy was reset to base state.', timestamp: nowStamp() },
-        ]);
+        setChatMessages((prev) => [...prev, { role: 'agent', content: 'Reverted to original UI. Workspace copy was reset to base state.', timestamp: nowStamp() }]);
       } else {
-        setChatMessages([
-          { role: 'agent', content: 'Repository reset complete. Awaiting next instructions.', timestamp: nowStamp() },
-        ]);
+        setChatMessages([{ role: 'agent', content: 'Repository reset complete. Awaiting next instructions.', timestamp: nowStamp() }]);
       }
-
       setImplementRun({ appTargets: [...DEFAULT_APP_TARGETS], validatorIssues: [], repairPassUsed: false, pipelineMode: 'hybrid' });
       syncConfirmationState(payload.confirmation);
       await loadAssets(activeTenantId);
-
-      setStatus({
-        level: 'success',
-        text: `Reset repo success: Workspace copy reset complete for ${payload.tenant_id}.`,
-        details: payload.repo_path,
-      });
-
+      setStatus({ level: 'success', text: `Workspace copy reset complete for ${payload.tenant_id}.`, details: payload.repo_path });
       return true;
     } catch (error) {
       setStatus({ level: 'error', text: error instanceof Error ? error.message : 'Failed to reset tenant repo.' });
@@ -967,96 +453,20 @@ export default function CustomizationConsoleApp() {
     }
   }, [loadAssets, projectIdFromQuery, syncConfirmationState, tenantId]);
 
-  const handleChatSubmit = useCallback(async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-
-    const activeTenantId = sanitizeTenantId(tenantId);
-    const message = chatInput.trim();
-    if (!activeTenantId || !message) return;
-
-    const outgoingMessage: ChatMessage = {
-      role: 'user',
-      content: message,
-      timestamp: nowStamp(),
-    };
-
-    setChatMessages((prev) => [...prev, outgoingMessage]);
-    setChatInput('');
-
-    if (REVERT_TO_BASE_CHAT_PATTERN.test(message)) {
-      setStatus({ level: 'info', text: 'Reverting to original UI...' });
-      await performRepoReset({ suppressPrompt: true, preserveChatHistory: true });
-      return;
-    }
-
-    setLoading((prev) => ({ ...prev, chat: true }));
-    setStatus({ level: 'info', text: 'Chat sent: Sending message to customization agent...' });
-
-    try {
-      const response = await fetch('/api/customization/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenant_id: activeTenantId, message }),
-      });
-
-      const payload = await parseJsonSafe<ChatResponse>(response);
-      if (!response.ok) {
-        throw new Error(getErrorMessage(payload, 'Failed to send chat message.'));
-      }
-
-      const assistantResponse = payload?.response || 'Agent updated the manifest.';
-      setChatMessages((prev) => [
-        ...prev,
-        { role: 'agent', content: assistantResponse, timestamp: nowStamp() },
-      ]);
-
-      if (payload?.manifest) {
-        setManifestJson(payload.manifest);
-      }
-
-      syncConfirmationState(payload?.confirmation);
-      if (payload?.confirmation?.has_unconfirmed_changes) {
-        setStatus({ level: 'warning', text: 'Manifest updated. Confirm again before implementation.' });
-      } else {
-        setStatus({ level: 'success', text: 'Chat success: Agent response received. Manifest refreshed.' });
-      }
-
-      await loadAssets(activeTenantId);
-    } catch (error) {
-      setStatus({ level: 'error', text: error instanceof Error ? error.message : 'Failed to send chat message.' });
-    } finally {
-      setLoading((prev) => ({ ...prev, chat: false }));
-    }
-  }, [chatInput, loadAssets, performRepoReset, syncConfirmationState, tenantId]);
-
   const handleConfirm = useCallback(async () => {
     const activeTenantId = sanitizeTenantId(tenantId);
-    if (!activeTenantId) {
-      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID before confirming.' });
-      return;
-    }
-
+    if (!activeTenantId) { setStatus({ level: 'warning', text: 'Enter a workspace ID before confirming.' }); return; }
     setLoading((prev) => ({ ...prev, confirm: true }));
     setStatus({ level: 'info', text: 'Confirming manifest...' });
-
     try {
       const response = await fetch('/api/customization/confirm', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tenant_id: activeTenantId }),
       });
-
       const payload = await parseJsonSafe<ConfirmResponse>(response);
-      if (!response.ok || !payload) {
-        throw new Error(getErrorMessage(payload, 'Failed to confirm manifest.'));
-      }
-
+      if (!response.ok || !payload) throw new Error(getErrorMessage(payload, 'Failed to confirm manifest.'));
       syncConfirmationState(payload.confirmation);
-      setStatus({
-        level: 'success',
-        text: `Confirm success: Manifest confirmed for ${payload.tenant_id}.`,
-        details: payload.path,
-      });
+      setStatus({ level: 'success', text: `Manifest confirmed for ${payload.tenant_id}.`, details: payload.path });
     } catch (error) {
       setStatus({ level: 'error', text: error instanceof Error ? error.message : 'Failed to confirm manifest.' });
     } finally {
@@ -1064,939 +474,627 @@ export default function CustomizationConsoleApp() {
     }
   }, [syncConfirmationState, tenantId]);
 
-  const runImplementation = useCallback(async (options?: { isRepairPass?: boolean; validatorIssues?: string[] }) => {
+  const runImplementation = useCallback(async (options?: { isRepairPass?: boolean; validatorIssues?: string[]; skipConfirmCheck?: boolean }): Promise<boolean> => {
     const activeTenantId = sanitizeTenantId(confirmedTenantId || tenantId);
-    if (!activeTenantId) {
-      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID before implementation.' });
-      return;
-    }
-
-    if (!isConfirmed) {
-      setStatus({ level: 'error', text: 'Implement blocked: Confirm manifest before implementation.' });
-      return;
-    }
-
+    if (!activeTenantId) { setStatus({ level: 'warning', text: 'Enter a workspace ID before implementation.' }); return false; }
+    if (!options?.skipConfirmCheck && !isConfirmed) { setStatus({ level: 'error', text: 'Confirm manifest before implementation.' }); return false; }
     const isRepairPass = Boolean(options?.isRepairPass);
-    const validatorIssues = Array.isArray(options?.validatorIssues)
-      ? options.validatorIssues.filter((issue) => issue.trim().length > 0)
-      : [];
-
-    setLoading((prev) => ({
-      ...prev,
-      implement: !isRepairPass,
-      repair: isRepairPass,
-    }));
-
-    setStatus({
-      level: 'info',
-      text: isRepairPass
-        ? 'Repair running: Running one-time repair pass...'
-        : 'Implement running: Implementing changes across app targets...',
-    });
-
+    const validatorIssues = Array.isArray(options?.validatorIssues) ? options.validatorIssues.filter((i) => i.trim().length > 0) : [];
+    setLoading((prev) => ({ ...prev, implement: !isRepairPass, repair: isRepairPass }));
+    setStatus({ level: 'info', text: isRepairPass ? 'Running repair pass...' : 'Implementing changes across app targets...' });
     try {
       const response = await fetch('/api/customization/implement', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          tenant_id: activeTenantId,
-          project_id: projectIdFromQuery || undefined,
-          app_targets: implementRun.appTargets,
-          validator_issues: validatorIssues.length > 0 ? validatorIssues : undefined,
-          pipeline_mode: implementRun.pipelineMode,
-          run_quality_gates: true,
-          start_preview: true,
+          tenant_id: activeTenantId, project_id: projectIdFromQuery || undefined, app_targets: implementRun.appTargets,
+          validator_issues: validatorIssues.length > 0 ? validatorIssues : undefined, pipeline_mode: implementRun.pipelineMode,
+          run_quality_gates: true, start_preview: true,
         }),
       });
-
       const payload = await parseJsonSafe<ImplementResponse>(response);
-      if (!response.ok || !payload) {
-        throw new Error(getErrorMessage(payload, 'Implementation failed.'));
-      }
+      if (!response.ok || !payload) throw new Error(getErrorMessage(payload, 'Implementation failed.'));
 
       const nextDiffEntries = Array.isArray(payload.modified_file_diffs)
         ? payload.modified_file_diffs.filter(
-          (entry): entry is { file: string; diff: string; truncated?: boolean; source?: string; operation?: string } => (
-            Boolean(entry)
-            && typeof entry.file === 'string'
-            && typeof entry.diff === 'string'
-          ),
-        )
-        : [];
-
-      const errors = Array.isArray(payload.errors)
-        ? payload.errors.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-        : [];
-      const warnings = Array.isArray(payload.warnings)
-        ? payload.warnings.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-        : [];
+          (entry): entry is { file: string; diff: string; truncated?: boolean; source?: string; operation?: string } =>
+            Boolean(entry) && typeof entry.file === 'string' && typeof entry.diff === 'string',
+        ) : [];
+      const errors = Array.isArray(payload.errors) ? payload.errors.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
+      const warnings = Array.isArray(payload.warnings) ? payload.warnings.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
 
       setCodeDiffEntries(nextDiffEntries);
-      setLastImplementErrors(errors);
-      setLastQualityReport(payload.quality_report || null);
-      setLastPreviewPayload(payload.preview || null);
-      // Always open diff panel after implement so users can inspect either
-      // concrete diffs or explicit reasons why no diff was produced.
-      setIsCodeDiffViewerOpen(true);
+      setLastImplementErrors(errors); setLastImplementWarnings(warnings);
+      setLastQualityReport(payload.quality_report || null); setLastPreviewPayload(payload.preview || null);
+      setActiveTab('results');
 
-      const validatorIssuesFromRun = errors.filter(
-        (issue) => issue.startsWith('Validator issue') || issue.startsWith('[Validator]'),
-      );
+      const validatorIssuesFromRun = errors.filter((issue) => issue.startsWith('Validator issue') || issue.startsWith('[Validator]'));
 
       if (errors.length > 0 && validatorIssuesFromRun.length > 0 && !isRepairPass) {
-        setImplementRun((prev) => ({
-          ...prev,
-          validatorIssues: validatorIssuesFromRun,
-          repairPassUsed: false,
-        }));
-
-        setStatus({
-          level: 'warning',
-          text: 'Validator issues: Review issues and approve one repair pass.',
-          details: `${validatorIssuesFromRun.length} validator issue(s) detected.`,
-        });
-        return;
+        setImplementRun((prev) => ({ ...prev, validatorIssues: validatorIssuesFromRun, repairPassUsed: false }));
+        setLastImplementStatus('partial');
+        setStatus({ level: 'warning', text: 'Validator issues detected. Review and approve a repair pass.', details: `${validatorIssuesFromRun.length} issue(s)` });
+        return false;
       }
 
       if (errors.length > 0) {
+        setLastImplementStatus('failed');
         setStatus({
-          level: 'error',
-        text: isRepairPass
-          ? 'Repair completed with remaining issues.'
-          : 'Implementation completed with issues.',
-          details: [
-            errors.join(' | '),
-            payload.quality_report?.status ? `Quality: ${payload.quality_report.status}` : '',
-          ].filter(Boolean).join(' | '),
+          level: 'error', text: isRepairPass ? 'Repair completed with remaining issues.' : 'Implementation completed with errors.',
+          details: [errors.join(' | '), payload.quality_report?.status ? `Quality: ${payload.quality_report.status}` : ''].filter(Boolean).join(' | '),
         });
-        return;
+        return false;
       }
 
       if (payload.status === 'no_changes') {
-        setImplementRun((prev) => ({
-          ...prev,
-          validatorIssues: [],
-          repairPassUsed: isRepairPass ? true : prev.repairPassUsed,
-        }));
-        setLastImplementErrors([]);
+        setImplementRun((prev) => ({ ...prev, validatorIssues: [], repairPassUsed: isRepairPass ? true : prev.repairPassUsed }));
+        setLastImplementErrors([]); setLastImplementStatus('partial');
         setStatus({
-          level: 'warning',
-          text: 'Implement completed with no file changes.',
-          details: [
-            'No modifications were applied in this run.',
-            warnings.length > 0 ? `Warnings: ${warnings.join(' | ')}` : '',
-            payload.preview?.detail ? `Preview: ${payload.preview.detail}` : '',
-          ].filter(Boolean).join(' | '),
+          level: 'warning', text: 'Implementation completed with no file changes.',
+          details: ['No modifications were applied.', warnings.length > 0 ? `Warnings: ${warnings.join(' | ')}` : '', payload.preview?.detail ? `Preview: ${payload.preview.detail}` : ''].filter(Boolean).join(' | '),
         });
-        setPreviewNonce(Date.now());
-        await fetchManifest(activeTenantId, true);
-        return;
+        setPreviewNonce(Date.now()); await fetchManifest(activeTenantId, true); return true;
       }
 
-      setImplementRun((prev) => ({
-        ...prev,
-        validatorIssues: [],
-        repairPassUsed: isRepairPass ? true : prev.repairPassUsed,
-      }));
-
+      setImplementRun((prev) => ({ ...prev, validatorIssues: [], repairPassUsed: isRepairPass ? true : prev.repairPassUsed }));
+      setLastImplementErrors([]); setLastImplementStatus('success');
       setStatus({
         level: warnings.length > 0 || payload.preview?.status === 'failed' ? 'warning' : 'success',
-        text: warnings.length > 0 || payload.preview?.status === 'failed'
-          ? 'Implementation completed with warnings.'
-          : isRepairPass
-            ? `Implementation success (post-repair): Rolled out to ${(payload.app_targets || implementRun.appTargets).join(', ')}.`
-            : `Implementation success: Rolled out to ${(payload.app_targets || implementRun.appTargets).join(', ')}.`,
+        text: warnings.length > 0 || payload.preview?.status === 'failed' ? 'Implementation completed with warnings.' : `Implementation successful — ${(payload.app_targets || implementRun.appTargets).join(', ')}.`,
         details: [
-          payload.base_repo_path,
-          payload.pipeline_mode ? `mode=${payload.pipeline_mode}` : '',
-          warnings.length > 0 ? `warnings=${warnings.join(' | ')}` : '',
-          payload.quality_report?.status ? `quality=${payload.quality_report.status}` : '',
+          payload.base_repo_path, payload.pipeline_mode ? `mode=${payload.pipeline_mode}` : '',
+          warnings.length > 0 ? `warnings=${warnings.join(' | ')}` : '', payload.quality_report?.status ? `quality=${payload.quality_report.status}` : '',
           payload.preview?.status ? `preview=${payload.preview.status}${payload.preview.detail ? ` (${payload.preview.detail})` : ''}` : '',
         ].filter(Boolean).join(' | ') || undefined,
       });
-
-      setLastImplementErrors([]);
-      setPreviewNonce(Date.now());
-      await fetchManifest(activeTenantId, true);
+      setPreviewNonce(Date.now()); await fetchManifest(activeTenantId, true);
+      return true;
     } catch (error) {
-      setStatus({ level: 'error', text: error instanceof Error ? error.message : 'Implementation failed.' });
+      setLastImplementStatus('failed'); setStatus({ level: 'error', text: error instanceof Error ? error.message : 'Implementation failed.' });
+      return false;
     } finally {
-      setLoading((prev) => ({
-        ...prev,
-        implement: false,
-        repair: false,
-      }));
+      setLoading((prev) => ({ ...prev, implement: false, repair: false }));
     }
   }, [confirmedTenantId, fetchManifest, implementRun.appTargets, implementRun.pipelineMode, isConfirmed, projectIdFromQuery, tenantId]);
 
-  const handleRepair = useCallback(async () => {
-    if (implementRun.validatorIssues.length === 0) return;
-    setImplementRun((prev) => ({ ...prev, repairPassUsed: true }));
-    await runImplementation({
-      isRepairPass: true,
-      validatorIssues: implementRun.validatorIssues,
-    });
-  }, [implementRun.validatorIssues, runImplementation]);
-
-  const handleUpload = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
+  const handleChatSubmit = useCallback(async (event: React.FormEvent<HTMLFormElement> | { preventDefault: () => void }) => {
+    event.preventDefault();
     const activeTenantId = sanitizeTenantId(tenantId);
-
-    if (!file || !activeTenantId) {
-      event.target.value = '';
+    const message = chatInput.trim();
+    if (!activeTenantId || !message) return;
+    setChatMessages((prev) => [...prev, { role: 'user', content: message, timestamp: nowStamp() }]);
+    setChatInput('');
+    if (REVERT_TO_BASE_CHAT_PATTERN.test(message)) {
+      setStatus({ level: 'info', text: 'Reverting to original UI...' });
+      await performRepoReset({ suppressPrompt: true, preserveChatHistory: true });
       return;
     }
 
-    setLoading((prev) => ({ ...prev, upload: true }));
-    setStatus({ level: 'info', text: `Uploading ${assetType}...` });
-
+    // Original backend chat logic to modify manifest
+    setLoading((prev) => ({ ...prev, chat: true }));
+    setStatus({ level: 'info', text: 'Sending message to customization agent...' });
     try {
-      const formData = new FormData();
-      formData.append('tenant_id', activeTenantId);
-      formData.append('asset_type', assetType);
-      formData.append('file', file);
-
-      const response = await fetch('/api/customization/assets/upload', {
-        method: 'POST',
-        body: formData,
+      const response = await fetch('/api/customization/chat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tenant_id: activeTenantId, message }),
       });
-
-      const payload = await parseJsonSafe<UploadAssetResponse>(response);
-      if (!response.ok || !payload) {
-        throw new Error(getErrorMessage(payload, 'Asset upload failed.'));
-      }
-
-      const previewUrl = `/api/customization/assets/${encodeURIComponent(activeTenantId)}/${encodeURIComponent(assetType)}`;
-      setUploadedAssetsSession((prev) => {
-        const withoutCurrentType = prev.filter((entry) => entry.assetType !== assetType);
-        return [
-          ...withoutCurrentType,
-          {
-            assetType,
-            fileName: file.name,
-            previewUrl,
-            uploadedAt: nowStamp(),
-            storedPath: payload.stored_path,
-          },
-        ];
-      });
-
-      syncConfirmationState(payload.confirmation);
-      setStatus({ level: 'success', text: 'Upload success: Asset uploaded and manifest updated.' });
-      await fetchManifest(activeTenantId, true);
-    } catch (error) {
-      setStatus({ level: 'error', text: error instanceof Error ? error.message : 'Asset upload failed.' });
-    } finally {
-      setLoading((prev) => ({ ...prev, upload: false }));
-      event.target.value = '';
-    }
-  }, [assetType, fetchManifest, syncConfirmationState, tenantId]);
-
-  const handleResetSession = useCallback(async () => {
-    const activeTenantId = sanitizeTenantId(tenantId);
-    if (!activeTenantId) {
-      setStatus({ level: 'warning', text: 'Workspace required: Enter a workspace ID before reset.' });
-      return;
-    }
-
-    setLoading((prev) => ({ ...prev, resetSession: true }));
-    setStatus({ level: 'info', text: 'Resetting session...' });
-
-    try {
-      const response = await fetch('/api/customization/reset', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenant_id: activeTenantId }),
-      });
-
-      const payload = await parseJsonSafe<ManifestResponse>(response);
-      if (!response.ok || !payload?.manifest) {
-        throw new Error(getErrorMessage(payload, 'Failed to reset session.'));
-      }
-
-      setChatMessages([
-        { role: 'agent', content: 'Session reset. Awaiting instructions.', timestamp: nowStamp() },
-      ]);
-      setManifestJson(payload.manifest);
-      setCodeDiffEntries([]);
-      setLastImplementErrors([]);
-      setLastQualityReport(null);
-      setLastPreviewPayload(null);
-      setIsCodeDiffViewerOpen(false);
-      setImplementRun({ appTargets: [...DEFAULT_APP_TARGETS], validatorIssues: [], repairPassUsed: false, pipelineMode: 'hybrid' });
-      syncConfirmationState(payload.confirmation);
+      const payload = await parseJsonSafe<ChatResponse>(response);
+      if (!response.ok) throw new Error(getErrorMessage(payload, 'Failed to send chat message.'));
+      setChatMessages((prev) => [...prev, { role: 'agent', content: payload?.response || 'Agent updated the manifest.', timestamp: nowStamp() }]);
+      if (payload?.manifest) setManifestJson(payload.manifest);
+      syncConfirmationState(payload?.confirmation);
       await loadAssets(activeTenantId);
-      setStatus({ level: 'success', text: 'Reset session success: Session reset complete.' });
+
+      // AUTOMATIC IMPLEMENTATION PIPELINE
+      // Always run after a successful chat response to ensure any manifest changes are immediately implemented.
+      setStatus({ level: 'info', text: 'Manifest updated. Automatically starting implementation...' });
+      setChatMessages((prev) => [...prev, { role: 'agent', content: "Automatically applying these changes to the preview...", timestamp: nowStamp() }]);
+      
+      // We do not wait for the react state to settle to avoid race conditions. We pass skipConfirmCheck to bypass it.
+      setTimeout(async () => {
+        try {
+            await fetchManifest(activeTenantId, true);
+            await handleConfirm();
+            await runImplementation({ skipConfirmCheck: true });
+            setChatMessages((prev) => [...prev, { role: 'agent', content: "Implementation completed! You can view the live preview now.", timestamp: nowStamp() }]);
+        } catch (e) {
+            console.error('Auto-implementation workflow failed', e);
+            setChatMessages((prev) => [...prev, { role: 'agent', content: "Implementation encountered an error. Please check the logs.", timestamp: nowStamp() }]);
+        }
+      }, 100);
+
     } catch (error) {
-      setStatus({ level: 'error', text: error instanceof Error ? error.message : 'Failed to reset session.' });
+      setStatus({ level: 'error', text: error instanceof Error ? error.message : 'Failed to send chat message.' });
     } finally {
-      setLoading((prev) => ({ ...prev, resetSession: false }));
+      setLoading((prev) => ({ ...prev, chat: false }));
     }
-  }, [loadAssets, syncConfirmationState, tenantId]);
-
-  const handleResetRepo = useCallback(async () => {
-    await performRepoReset();
-  }, [performRepoReset]);
-
-  const isGlobalDisabled = !tenantId.trim();
-
-  const handleCommandPreset = useCallback((preset: string) => {
-    setChatInput(preset);
-  }, []);
-
-  const toggleAppTarget = useCallback((target: string) => {
-    setImplementRun((prev) => {
-      const isActive = prev.appTargets.includes(target);
-      const nextTargets = isActive
-        ? prev.appTargets.filter((item) => item !== target)
-        : [...prev.appTargets, target];
-
-      return {
-        ...prev,
-        appTargets: nextTargets.length > 0 ? nextTargets : prev.appTargets,
-      };
-    });
-  }, []);
-
-  const statusIcon = useMemo(() => {
-    if (status.level === 'success') return <CheckCircle2 className="h-4 w-4 shrink-0 text-white" />;
-    if (status.level === 'error') return <XCircle className="h-4 w-4 shrink-0 text-rose-500" />;
-    if (status.level === 'warning') return <AlertTriangle className="h-4 w-4 shrink-0 text-white" />;
-    return <TerminalSquare className="h-4 w-4 shrink-0 text-zinc-500" />;
-  }, [status.level]);
-
-  const displayManifestJson = useMemo(
-    () => (manifestJson ? sanitizeManifestForDisplay(manifestJson) : null),
-    [manifestJson],
-  );
-
-  const pipelineCards = useMemo(() => [
-    {
-      label: 'Manifest',
-      value: manifestJson ? 'Loaded' : 'Draft',
-      active: Boolean(manifestJson),
-      icon: FileJson,
-    },
-    {
-      label: 'Confirm',
-      value: isConfirmed ? 'Ready' : 'Open',
-      active: isConfirmed,
-      icon: CheckCircle2,
-    },
-    {
-      label: 'Preview',
-      value: previewMeta?.preview_kind === 'live_server' && previewMeta.preview_status === 'ready'
-        ? 'Live'
-        : previewMeta?.source === 'subspace' ? 'Static' : previewMeta?.source === 'base' ? 'Base' : 'Pending',
-      active: previewMeta?.source === 'subspace',
-      icon: Monitor,
-    },
-    {
-      label: 'Diffs',
-      value: `${codeDiffEntries.length}`,
-      active: codeDiffEntries.length > 0,
-      icon: GitCompareArrows,
-    },
-  ], [codeDiffEntries.length, isConfirmed, manifestJson, previewMeta?.preview_kind, previewMeta?.preview_status, previewMeta?.source]);
+  }, [chatInput, fetchManifest, handleConfirm, runImplementation, loadAssets, performRepoReset, syncConfirmationState, tenantId]);
 
   return (
-    <div className="relative flex h-screen flex-col overflow-y-auto bg-[#000000] font-sans text-zinc-300 selection:bg-white selection:text-black">
-      <style
-        dangerouslySetInnerHTML={{
-          __html: `
-            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-            .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
-            .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-            .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #262626; border-radius: 10px; }
-            .custom-scrollbar::-webkit-scrollbar-thumb:hover { background-color: #3f3f46; }
-            @keyframes operatorSweep {
-              0% { transform: translateX(-110%); opacity: 0; }
-              15% { opacity: 1; }
-              85% { opacity: 1; }
-              100% { transform: translateX(110%); opacity: 0; }
-            }
-            @keyframes softPulse {
-              0%, 100% { opacity: .45; }
-              50% { opacity: 1; }
-            }
-            .operator-grid {
-              background-image:
-                linear-gradient(rgba(255,255,255,.045) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(255,255,255,.045) 1px, transparent 1px);
-              background-size: 28px 28px;
-            }
-          `,
-        }}
-      />
-      <div className="pointer-events-none absolute inset-0 overflow-hidden">
-        <div className="operator-grid absolute inset-0 opacity-25" />
-      </div>
-
-      <header className="z-20 flex h-14 shrink-0 items-center justify-between border-b border-[#1A1A1A] bg-[#050505]/90 px-6 backdrop-blur-xl">
-        <div className="flex items-center gap-3">
-          <button
-            onClick={() => router.push('/dashboard')}
-            className="flex items-center gap-1.5 rounded border border-[#262626] bg-[#0A0A0A] px-2.5 py-1 text-[10px] font-semibold tracking-wider text-zinc-300 uppercase transition-colors hover:border-zinc-500 hover:text-white"
-          >
-            <ArrowLeft className="h-3 w-3" /> Back
-          </button>
-          <div className="flex h-6 w-6 items-center justify-center rounded bg-white text-[10px] font-bold tracking-tighter text-black">UI</div>
-          <div className="flex flex-col">
-            <h1 className="text-[11px] font-bold tracking-widest text-white uppercase">Customization Operator</h1>
+    <div className="flex flex-col h-screen bg-[#09090b] text-zinc-300 font-sans selection:bg-indigo-500/30 overflow-hidden">
+      <style>{`
+        ::-webkit-scrollbar { width: 14px; height: 14px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background-color: #27272a; border-radius: 8px; border: 4px solid #09090b; background-clip: padding-box; }
+        ::-webkit-scrollbar-thumb:hover { background-color: #3f3f46; }
+        * { scrollbar-width: thin; scrollbar-color: #27272a transparent; }
+      `}</style>
+      
+      {/* HEADER */}
+      <header className="flex items-center justify-between h-12 px-4 bg-[#09090b] border-b border-zinc-800/80 shrink-0 text-xs">
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2.5 text-zinc-100 font-semibold tracking-wide">
+            <div className="w-6 h-6 rounded bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-[11px] font-bold text-white shadow-sm">IF</div>
+            <span>IFCA Console</span>
             {(projectNameFromQuery || projectIdFromQuery) && (
-              <p className="text-[10px] text-zinc-500">
-                {projectNameFromQuery || 'Project'}
-                {projectIdFromQuery ? ` (${projectIdFromQuery})` : ''}
-              </p>
+               <span className="text-zinc-500 font-normal"> / {projectNameFromQuery || projectIdFromQuery}</span>
             )}
           </div>
         </div>
-
-        <div className="flex items-center gap-3">
-          {runAll && projectIdFromQuery ? (
-            <button
-              type="button"
-              onClick={() => router.push(securityPath)}
-              className="inline-flex items-center justify-center rounded-md border border-[#d4d4d8] bg-zinc-100 px-4 py-2 text-xs font-semibold text-black shadow-[0_8px_30px_rgba(0,0,0,0.35)] transition-colors hover:bg-white"
-            >
-              Move to Security Scan
-            </button>
-          ) : null}
-          <div className="flex items-center gap-3 rounded-md border border-[#262626] bg-[#000000] px-3 py-1">
-            <Key className="h-3.5 w-3.5 text-zinc-500" />
-            <input
-              type="text"
+        <div className="flex items-center gap-5">
+          <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-[#121214] border border-zinc-800 rounded-md text-zinc-500 w-64 transition-colors hover:border-zinc-700">
+            <Search className="w-3.5 h-3.5" />
+            <input 
+              type="text" 
               value={tenantId}
               onChange={handleTenantChange}
-              placeholder="workspace-id"
-              className="w-48 bg-transparent text-[12px] font-mono text-white placeholder:text-zinc-600 transition-colors focus:outline-none"
+              placeholder="Workspace ID..." 
+              className="w-full bg-transparent text-zinc-200 outline-none"
             />
+            <div className="flex items-center gap-0.5 text-[10px] font-mono bg-zinc-800/80 px-1.5 py-0.5 rounded text-zinc-400">
+              <Command className="w-3 h-3" />K
+            </div>
+          </div>
+          {runAll && projectIdFromQuery && (
+              <button onClick={() => router.push(securityPath)} className="text-xs font-semibold px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded transition-colors">
+                  Security Scan →
+              </button>
+          )}
+          <button className="text-zinc-500 hover:text-zinc-300 transition-colors">
+            <Bell className="w-4 h-4" />
+          </button>
+          <div className="w-7 h-7 rounded-full bg-zinc-800 border border-zinc-700 flex items-center justify-center text-[10px] font-bold text-zinc-300 cursor-pointer hover:bg-zinc-700 transition-colors">
+            AJ
           </div>
         </div>
       </header>
 
-      <main className="relative z-10 grid h-[calc(100vh-56px)] min-h-0 flex-1 grid-cols-12 overflow-visible">
+      {/* CONTEXT BAR */}
+      <div className="flex items-center justify-between h-14 px-5 bg-[#121214] border-b border-zinc-800/80 shrink-0 z-10">
+        <div className="flex items-center gap-3">
+          <button onClick={() => router.push('/dashboard')} className="p-1.5 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 rounded-md transition-all">
+            <ArrowLeft className="w-4 h-4" />
+          </button>
+          <div>
+            <h1 className="text-sm font-semibold text-zinc-100 tracking-tight">Customization Environment</h1>
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <button 
+            onClick={async () => { 
+                await fetchManifest(); 
+                await handleConfirm(); 
+                const success = await runImplementation(); 
+                if (success && securityPath) {
+                  router.push(securityPath);
+                }
+              }}
+            disabled={isGlobalDisabled || loading.implement}
+            className="flex items-center gap-2 px-4 py-2 bg-zinc-100 hover:bg-white disabled:opacity-50 text-zinc-900 text-xs font-semibold rounded-md shadow-sm transition-all active:scale-95"
+          >
+            {loading.implement ? <Loader2 className="w-3.5 h-3.5 animate-spin text-zinc-600" /> : <Play className="w-3.5 h-3.5 fill-current" />}
+            Commit & Proceed
+          </button>
+        </div>
+      </div>
+      
+      {/* MAIN LAYOUT */}
+      <div className="flex flex-1 overflow-hidden relative">
+        {/* LOCK OVERLAY */}
         {isGlobalDisabled && (
-          <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#000000]/80 backdrop-blur-sm">
-            <div className="flex max-w-sm flex-col items-center gap-4 rounded-lg border border-[#262626] bg-[#050505] p-6 text-center">
-              <div className="flex h-12 w-12 items-center justify-center rounded-full border border-[#262626] bg-[#111111]">
-                <Lock className="h-5 w-5 text-white" />
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#0A0A0F]/90 backdrop-blur-sm">
+            <div className="flex max-w-sm flex-col items-center gap-4 rounded-xl border border-zinc-800 bg-zinc-900/90 p-8 text-center shadow-2xl">
+              <div className="flex h-14 w-14 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800">
+                <Lock className="h-6 w-6 text-zinc-400" />
               </div>
               <div>
-                <h3 className="mb-1 font-bold text-white">Workspace Locked</h3>
-                <p className="text-xs leading-relaxed text-zinc-400">Please enter a valid workspace ID in the header bar to load customization controls.</p>
+                <h3 className="mb-1 text-lg font-semibold text-white">Workspace Required</h3>
+                <p className="text-sm leading-relaxed text-zinc-400">Enter a workspace ID in the header to unlock customization controls.</p>
               </div>
             </div>
           </div>
         )}
 
-        <section className="col-span-3 flex min-h-0 flex-col border-r border-[#1A1A1A] bg-[#000000]">
-          <div className="flex items-center gap-2 border-b border-[#1A1A1A] bg-[#050505] px-4 py-3">
-            <MessageSquare className="h-3.5 w-3.5 text-zinc-400" />
-            <span className="text-[10px] font-bold tracking-widest text-zinc-300 uppercase">Agent Chat</span>
-          </div>
-
-          <div className="shrink-0 border-b border-[#1A1A1A] bg-[#050505]/95 p-3">
-            <form onSubmit={handleChatSubmit} className="relative flex items-center">
-              <input
-                type="text"
-                value={chatInput}
-                onChange={(event) => setChatInput(event.target.value)}
-                disabled={loading.chat || isGlobalDisabled}
-                placeholder="Type here and press Enter..."
-                className="w-full rounded border border-[#262626] bg-[#000000] py-2.5 pr-10 pl-3 text-xs text-zinc-200 transition-colors placeholder:text-zinc-500 focus:border-white focus:outline-none disabled:opacity-60"
-              />
-              <button
-                type="submit"
-                disabled={!chatInput.trim() || loading.chat || isGlobalDisabled}
-                className="absolute right-1.5 inline-flex items-center gap-1 rounded bg-white px-2 py-1.5 text-[10px] font-semibold tracking-wide text-black transition-colors disabled:bg-transparent disabled:text-zinc-600"
-              >
-                <Send className="h-3 w-3" />
-                Send
-              </button>
-            </form>
-            <div className="mt-3 grid grid-cols-2 gap-2">
-              {CHAT_COMMAND_PRESETS.map((preset) => (
-                <button
-                  key={preset}
-                  type="button"
-                  onClick={() => handleCommandPreset(preset)}
-                  disabled={isGlobalDisabled}
-                  className="group flex min-h-9 items-center gap-2 rounded border border-[#1A1A1A] bg-[#0A0A0A] px-2 text-left text-[10px] leading-tight text-zinc-500 transition-all hover:border-cyan-400/50 hover:bg-cyan-400/5 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  <Sparkles className="h-3 w-3 shrink-0 text-cyan-400/70 transition-transform group-hover:scale-110" />
-                  <span className="overflow-hidden text-ellipsis">{preset}</span>
+        {/* SIDE PANEL */}
+        {sidebarOpen && (
+          <aside className="w-[360px] flex flex-col bg-[#09090b] border-r border-zinc-800/80 shrink-0 z-10 h-full">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800/80 bg-[#121214]">
+              <div className="flex items-center">
+                <Terminal className="w-4 h-4 text-zinc-400 mr-2.5" />
+                <h2 className="text-xs font-semibold text-zinc-200">Copilot Session</h2>
+                <button onClick={() => setShowByokModal(true)} className="flex items-center gap-1.5 px-2 py-1 ml-3 text-[10px] font-bold text-black bg-white hover:bg-zinc-200 rounded transition-colors shadow-sm" title="Bring Your Own Key">
+                  <Key className="w-3 h-3" /> BYOK
                 </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="custom-scrollbar min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
-            {chatMessages.map((message, index) => (
-              <div key={`${message.timestamp}-${index}`} className="flex flex-col gap-1.5">
-                <div className="flex items-center gap-2 px-1">
-                  {message.role === 'agent' ? (
-                    <Bot className="h-3 w-3 text-zinc-500" />
-                  ) : (
-                    <User className="h-3 w-3 text-zinc-500" />
-                  )}
-                  <span className="text-[10px] font-bold text-zinc-500 uppercase">{message.role === 'agent' ? 'Agent' : 'You'}</span>
-                  <span className="ml-auto font-mono text-[9px] text-zinc-600">{message.timestamp}</span>
-                </div>
-                <div className={`rounded-md border p-3 text-[12px] leading-relaxed shadow-[0_12px_40px_rgba(0,0,0,0.22)] transition-all hover:-translate-y-0.5 hover:border-zinc-500/60 ${message.role === 'agent' ? 'border-[#1A1A1A] bg-[#050505] text-zinc-300' : 'border-cyan-400/25 bg-cyan-400/10 text-white'}`}>
-                  {formatUiText(message.content)}
-                </div>
               </div>
-            ))}
-
-            {loading.chat && (
-              <div className="flex animate-pulse flex-col gap-1.5">
-                <div className="flex items-center gap-2 px-1">
-                  <Bot className="h-3 w-3 text-zinc-500" />
-                  <span className="text-[10px] font-bold text-zinc-500 uppercase">Agent</span>
-                </div>
-                <div className="rounded-md border border-[#1A1A1A] bg-[#050505] p-3 text-[12px] text-zinc-500">
-                  Processing request...
-                </div>
-              </div>
-            )}
-
-            <div ref={chatEndRef} />
-          </div>
-
-        </section>
-
-        <section className="col-span-5 flex min-h-0 flex-col border-r border-[#1A1A1A] bg-[#000000]">
-          <div className="flex min-h-0 flex-1 flex-col">
-            <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-[#050505] px-4 py-3">
-              <div className="flex items-center gap-2">
-                <TerminalSquare className="h-3.5 w-3.5 text-zinc-400" />
-                <span className="text-[10px] font-bold tracking-widest text-zinc-300 uppercase">Live Preview Canvas</span>
-                <span
-                  title={`${previewSourceLabel}${previewMeta?.preview_root_path ? `\n${previewMeta.preview_root_path}` : ''}`}
-                  className="max-w-[180px] truncate rounded border border-[#262626] bg-[#000000] px-1.5 py-0.5 font-mono text-[9px] tracking-wide text-zinc-400"
-                >
-                  {previewSourceChipLabel}
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="flex rounded border border-[#262626] bg-[#000000] p-0.5">
-                  {PREVIEW_DEVICE_OPTIONS.map((option) => {
-                    const Icon = option.icon;
-                    const isActive = previewDevice === option.value;
-                    return (
-                      <button
-                        key={option.value}
-                        type="button"
-                        title={option.label}
-                        onClick={() => setPreviewDevice(option.value)}
-                        className={`flex h-7 w-8 items-center justify-center rounded-sm transition-all ${isActive ? 'bg-white text-black' : 'text-zinc-500 hover:bg-[#111111] hover:text-white'}`}
-                      >
-                        <Icon className="h-3.5 w-3.5" />
-                      </button>
-                    );
-                  })}
-                </div>
-                <button
-                  onClick={refreshPreview}
-                  disabled={!projectIdFromQuery || isGlobalDisabled}
-                  className="inline-flex items-center gap-1 rounded border border-[#262626] bg-[#000000] px-2 py-1 text-[10px] font-semibold tracking-wider text-zinc-300 uppercase transition-colors hover:border-zinc-500 hover:text-white disabled:opacity-50"
-                >
-                  <RefreshCw className="h-3 w-3" /> Refresh
-                </button>
-                <a
-                  href={effectivePreviewUrl || '#'}
-                  target="_blank"
-                  rel="noreferrer"
-                  className={`inline-flex items-center rounded border border-[#262626] bg-[#111111] px-2 py-1 text-[10px] font-semibold tracking-wider text-zinc-300 uppercase transition-colors hover:border-zinc-500 hover:text-white ${!projectIdFromQuery || isGlobalDisabled ? 'pointer-events-none opacity-50' : ''}`}
-                >
-                  Open
-                </a>
+              <div className="flex gap-1">
+                <button onClick={() => performRepoReset()} className="p-1.5 text-zinc-500 hover:text-zinc-300 rounded hover:bg-zinc-800 transition-colors"><RotateCcw className="w-3.5 h-3.5" /></button>
+                <button className="p-1.5 text-zinc-500 hover:text-zinc-300 rounded hover:bg-zinc-800 transition-colors"><MoreHorizontal className="w-3.5 h-3.5" /></button>
               </div>
             </div>
-
-            <div className="flex min-h-0 flex-1 items-center justify-center bg-[#000000] p-4">
-              {projectIdFromQuery ? (
-                <div className={`flex h-full ${activePreviewDevice.widthClass} flex-col overflow-hidden rounded-lg border border-[#262626] bg-[#070707] shadow-[0_24px_80px_rgba(0,0,0,0.45)] transition-all duration-300`}>
-                  <div className="flex h-9 shrink-0 items-center gap-2 border-b border-[#1A1A1A] bg-[#0A0A0A] px-3">
-                    <div className="flex gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-full bg-rose-500/80" />
-                      <span className="h-2.5 w-2.5 rounded-full bg-amber-400/80" />
-                      <span className="h-2.5 w-2.5 rounded-full bg-emerald-400/80" />
+            
+            <div className="flex-1 overflow-y-auto p-5 space-y-6 bg-[#09090b]">
+              {chatMessages.map((msg, i) => (
+                msg.role === 'agent' ? (
+                  <div key={i} className="flex gap-3.5 mt-6 mb-2">
+                    <div className="w-7 h-7 rounded-full bg-gradient-to-b from-zinc-100 to-zinc-300 flex items-center justify-center shrink-0 shadow-sm ring-1 ring-zinc-800">
+                      <Cpu className="w-4 h-4 text-zinc-900" />
                     </div>
-                    <div className="min-w-0 flex-1 rounded border border-[#1A1A1A] bg-black px-2 py-1 font-mono text-[10px] text-zinc-500">
-                    <span className="block truncate">{previewAddressLabel}</span>
-                    </div>
-                    <span className="rounded bg-[#111111] px-2 py-1 text-[9px] font-bold tracking-widest text-zinc-400 uppercase">
-                      {activePreviewDevice.label}
-                    </span>
-                  </div>
-                  <div className="relative min-h-0 flex-1 bg-white">
-                    <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-px bg-gradient-to-r from-transparent via-cyan-300/70 to-transparent" />
-                    {previewFrameHeld ? (
-                      <div className="flex h-full flex-col items-center justify-center gap-3 bg-[#050505] text-center">
-                        {previewFailed ? (
-                          <AlertTriangle className="h-6 w-6 text-amber-300" />
-                        ) : (
-                          <div className="h-6 w-6 animate-spin rounded-full border-2 border-zinc-700 border-t-cyan-300" />
-                        )}
-                        <p className="text-xs text-zinc-400">
-                          {previewStarting ? 'Starting live preview…' : 'Resolving preview…'}
-                        </p>
-                        {previewStarting ? (
-                          <p className="max-w-xs text-[10px] text-zinc-600">
-                            {previewMeta?.preview_detail || 'Installing dependencies and launching the dev server. This can take a minute on the first run.'}
-                          </p>
-                        ) : null}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[13px] font-bold text-zinc-100 tracking-wide">Copilot</span>
+                        <span className="text-[10px] text-zinc-600 font-mono">{msg.timestamp}</span>
                       </div>
+                      <div className="text-[13px] leading-relaxed text-zinc-300">{formatUiText(msg.content)}</div>
+                    </div>
+                  </div>
+                ) : (
+                  <div key={i} className="flex flex-col items-end">
+                    <span className="text-[10px] text-zinc-600 font-mono mb-1.5">{msg.timestamp}</span>
+                    <div className="px-4 py-2.5 bg-zinc-100 text-zinc-900 text-[13px] font-semibold rounded-2xl rounded-tr-sm max-w-[85%] shadow-sm">
+                      {formatUiText(msg.content)}
+                    </div>
+                  </div>
+                )
+              ))}
+              {loading.chat && (
+                 <div className="flex gap-3.5 mt-6 mb-2">
+                    <div className="w-7 h-7 rounded-full bg-gradient-to-b from-zinc-100 to-zinc-300 flex items-center justify-center shrink-0 shadow-sm ring-1 ring-zinc-800">
+                      <Cpu className="w-4 h-4 animate-pulse text-zinc-900" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[13px] font-bold text-zinc-100 tracking-wide">Copilot</span>
+                      </div>
+                      <div className="text-[13px] leading-relaxed text-zinc-500 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin"/> Processing...</div>
+                    </div>
+                  </div>
+              )}
+              <div ref={chatEndRef} />
+            </div>
+
+            <div className="p-5 bg-[#121214] border-t border-zinc-800/80">
+              <div className="relative group">
+                <div className="absolute inset-0 bg-gradient-to-r from-indigo-500/20 to-purple-500/20 rounded-xl blur opacity-0 group-focus-within:opacity-100 transition-opacity"></div>
+                <form onSubmit={handleChatSubmit} className="relative flex items-center bg-[#09090b] border border-zinc-700 focus-within:border-indigo-500/50 rounded-xl overflow-hidden transition-colors">
+                  <div className="pl-4 pr-2 text-zinc-500"><Sparkles className="w-4 h-4" /></div>
+                  <input 
+                    type="text" 
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    disabled={loading.chat || isGlobalDisabled}
+                    placeholder="Instruct Copilot (say 'confirm' to execute)..." 
+                    className="flex-1 bg-transparent py-3.5 text-[13px] text-zinc-200 placeholder:text-zinc-600 focus:outline-none"
+                  />
+                  <button type="submit" disabled={!chatInput.trim() || loading.chat || isGlobalDisabled} className="px-4 text-zinc-500 hover:text-indigo-400 transition-colors">
+                    <SendHorizontal className="w-4 h-4" />
+                  </button>
+                </form>
+              </div>
+            </div>
+          </aside>
+        )}
+
+        {/* WORKSPACE AREA */}
+        <main className="flex-1 flex flex-col min-w-0 bg-[#09090b] relative z-0 h-full overflow-hidden">
+          <div className="flex items-center bg-[#121214] border-b border-zinc-800/80 h-12 shrink-0 px-2 overflow-x-auto">
+            {WORKSPACE_TABS.map((tab) => {
+              const Icon = tab.icon;
+              const isActive = activeTab === tab.value;
+              return (
+                <button
+                  key={tab.value}
+                  onClick={() => setActiveTab(tab.value)}
+                  className={`group flex items-center gap-2 px-4 h-full text-[13px] font-medium border-r border-zinc-800/40 transition-all relative shrink-0 ${isActive ? 'bg-[#09090b] text-zinc-100' : 'text-zinc-500 hover:bg-zinc-900 hover:text-zinc-300'}`}
+                >
+                  {isActive && <div className="absolute top-0 left-0 right-0 h-[2px] bg-indigo-500"></div>}
+                  <Icon className={`w-4 h-4 ${isActive ? 'text-indigo-400' : 'text-zinc-600 group-hover:text-zinc-400'}`} />
+                  {tab.label}
+                  {tab.value === 'results' && lastImplementErrors.length > 0 && (
+                    <span className="ml-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-rose-500/20 px-1 text-[9px] font-bold text-rose-400">{lastImplementErrors.length}</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex-1 overflow-hidden relative flex flex-col">
+            {/* PREVIEW VIEW */}
+            {activeTab === 'preview' && (
+              <div className="w-full h-full p-6 flex flex-col items-center bg-[#09090b]">
+                <div className="w-full flex items-center justify-end h-10 mb-4 text-xs shrink-0">
+                  <div className="flex items-center gap-3">
+                    <div className="flex bg-[#121214] border border-zinc-800 rounded-md p-1 shadow-inner">
+                      {PREVIEW_DEVICE_OPTIONS.map((opt) => (
+                        <button key={opt.value} onClick={() => setPreviewDevice(opt.value)} className={`p-1.5 rounded transition-colors ${previewDevice === opt.value ? 'text-zinc-200 bg-zinc-800' : 'text-zinc-500 hover:text-zinc-300'}`}><opt.icon className="w-4 h-4" /></button>
+                      ))}
+                    </div>
+                    <div className="w-px h-5 bg-zinc-800"></div>
+                    <button onClick={refreshPreview} className="flex items-center gap-1.5 text-zinc-400 hover:text-zinc-200 px-2 py-1 rounded hover:bg-zinc-800 transition-colors"><RefreshCw className="w-3.5 h-3.5" />Reload</button>
+                    <a href={effectivePreviewUrl || '#'} target="_blank" rel="noreferrer" className="flex items-center gap-1.5 text-zinc-400 hover:text-zinc-200 px-2 py-1 rounded hover:bg-zinc-800 transition-colors"><ExternalLink className="w-3.5 h-3.5" />Popout</a>
+                  </div>
+                </div>
+                
+                <div className="flex-1 flex flex-col bg-[#121214] border border-zinc-800/80 rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/5 transition-all duration-300 w-full" style={{ maxWidth: previewDevice === 'desktop' ? '100%' : previewDevice === 'tablet' ? '768px' : '375px' }}>
+                  <div className="h-12 flex items-center gap-4 px-4 bg-[#18181b] border-b border-zinc-800 shrink-0">
+                    <div className="flex gap-2">
+                      <div className="w-3 h-3 rounded-full bg-zinc-700"></div>
+                      <div className="w-3 h-3 rounded-full bg-zinc-700"></div>
+                      <div className="w-3 h-3 rounded-full bg-zinc-700"></div>
+                    </div>
+                    <div className="flex-1 flex items-center justify-center max-w-2xl mx-auto">
+                      <div className="w-full flex items-center gap-2 px-3 py-1.5 bg-[#09090b] border border-zinc-800/80 rounded-md text-[11px] font-mono text-zinc-500">
+                        <Lock className="w-3.5 h-3.5 text-zinc-600" />
+                        <span className="truncate">{previewMeta?.preview_url || effectivePreviewUrl || 'about:blank'}</span>
+                      </div>
+                    </div>
+                  </div>
+                  
+                  <div className="flex-1 bg-[#09090b] relative flex flex-col items-center justify-center overflow-hidden">
+                    {previewFrameHeld ? (
+                      <>
+                        <div className="absolute inset-0" style={{ backgroundImage: 'radial-gradient(#27272a 1px, transparent 1px)', backgroundSize: '24px 24px', opacity: 0.3 }}></div>
+                        <div className="relative z-10 flex flex-col items-center max-w-md w-full px-6 text-center">
+                            {previewFailed ? (
+                                <>
+                                  <div className="relative w-24 h-24 mb-8 flex items-center justify-center text-rose-500"><XCircle className="w-12 h-12" /></div>
+                                  <h3 className="text-zinc-200 font-medium mb-2 text-lg">Preview Failed</h3>
+                                  <p className="text-zinc-400 text-sm">{previewMeta?.preview_detail || 'The dev server failed to start.'}</p>
+                                  <button onClick={refreshPreview} className="mt-4 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-white text-sm rounded">Retry Preview</button>
+                                </>
+                            ) : (
+                                <>
+                                  <div className="relative w-24 h-24 mb-8 flex items-center justify-center">
+                                    <svg className="absolute inset-0 w-full h-full text-zinc-800 animate-[spin_4s_linear_infinite]" viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="none" strokeWidth="1" stroke="currentColor" strokeDasharray="4 4" /></svg>
+                                    <svg className="absolute inset-2 w-[calc(100%-16px)] h-[calc(100%-16px)] text-indigo-500 animate-[spin_2s_linear_infinite_reverse]" viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="none" strokeWidth="2" stroke="currentColor" strokeDasharray="80 220" strokeLinecap="round" /></svg>
+                                    <Code2 className="w-8 h-8 text-zinc-400" />
+                                  </div>
+                                  <h3 className="text-zinc-200 font-medium mb-2 text-lg">{previewStarting ? 'Starting dev server...' : 'Loading preview...'}</h3>
+                                  <div className="w-full bg-[#121214] border border-zinc-800/80 rounded-lg p-4 font-mono text-xs text-zinc-500 mt-4 h-32 overflow-hidden relative shadow-inner text-left">
+                                    <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-[#121214] z-10 pointer-events-none"></div>
+                                    <div className="space-y-1.5 animate-pulse">
+                                      <p className="text-indigo-400/70">{previewMeta?.preview_detail || 'Initializing environments...'}</p>
+                                    </div>
+                                  </div>
+                                </>
+                            )}
+                        </div>
+                      </>
                     ) : (
-                      <iframe
-                        key={previewFrameSrc}
-                        src={previewFrameSrc}
-                        title="Repository UI preview"
-                        className="h-full w-full border-0"
-                      />
+                      <iframe key={previewFrameSrc} src={previewFrameSrc} className="w-full h-full border-0 bg-white" />
                     )}
                   </div>
                 </div>
-              ) : (
-                <div className="flex h-full flex-col items-center justify-center space-y-3 text-zinc-600">
-                  <TerminalSquare className="h-6 w-6 opacity-30" />
-                  <p className="text-xs">Open customization from a project card to enable live preview.</p>
+              </div>
+            )}
+
+            {/* RESULTS VIEW */}
+            {activeTab === 'results' && (
+              <div className="flex flex-col h-full bg-[#09090b]">
+                <div className="flex items-center gap-8 px-6 h-12 border-b border-zinc-800/80 text-[13px] font-medium shrink-0 bg-[#0c0c0e]">
+                  <button onClick={() => setResultsSubTab('diffs')} className={`h-full border-b-2 flex items-center transition-colors ${resultsSubTab === 'diffs' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-zinc-400 hover:text-zinc-200'}`}>
+                    Code Diffs {codeDiffEntries.length > 0 && <span className="ml-2 px-2 py-0.5 rounded-full bg-zinc-800 text-[10px] text-zinc-300">{codeDiffEntries.length}</span>}
+                  </button>
+                  <button onClick={() => setResultsSubTab('errors')} className={`h-full border-b-2 flex items-center transition-colors ${resultsSubTab === 'errors' ? 'border-indigo-500 text-indigo-400' : 'border-transparent text-zinc-400 hover:text-zinc-200'}`}>
+                    Compilation Logs {lastImplementErrors.length > 0 && <span className="ml-2 px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-400 text-[10px]">{lastImplementErrors.length}</span>}
+                  </button>
+                </div>
+
+                {resultsSubTab === 'diffs' && (
+                  <div className="flex flex-1 overflow-hidden">
+                    <div className="w-72 border-r border-zinc-800/80 bg-[#0c0c0e] flex flex-col shrink-0">
+                      <div className="p-4 border-b border-zinc-800/80 text-xs font-bold text-zinc-400 uppercase tracking-wider flex items-center gap-2">
+                        <FolderTree className="w-4 h-4" /> Changed Files
+                      </div>
+                      <div className="flex-1 overflow-y-auto p-3 space-y-1">
+                        {codeDiffEntries.map((entry, idx) => (
+                          <div key={idx} className="flex items-center justify-between px-3 py-2 hover:bg-zinc-800/50 rounded-md cursor-pointer text-zinc-400 hover:text-zinc-200 text-[13px] transition-colors">
+                            <div className="flex items-center gap-2.5 truncate"><FileCode2 className="w-4 h-4 shrink-0" /> <span className="truncate">{entry.file.split('/').pop()}</span></div>
+                          </div>
+                        ))}
+                        {codeDiffEntries.length === 0 && <div className="text-zinc-600 text-xs p-2">No code diffs available.</div>}
+                      </div>
+                    </div>
+
+                    <div className="flex-1 flex flex-col bg-[#09090b] overflow-hidden">
+                      <div className="flex-1 overflow-auto p-5 space-y-4">
+                        {codeDiffEntries.map((entry, idx) => (
+                           <div key={idx} className="rounded-xl border border-zinc-800 bg-zinc-900/40 overflow-hidden">
+                              <div className="flex items-center justify-between border-b border-zinc-800/60 px-4 py-2.5">
+                                <span className="font-mono text-[12px] font-medium text-zinc-300">{entry.file}</span>
+                              </div>
+                              <div className="overflow-x-auto p-3 font-mono text-[11px] leading-relaxed">
+                                {entry.diff.split('\n').map((line, i) => (
+                                  <div key={i} className={`whitespace-pre-wrap break-all rounded-sm px-2 py-0.5 ${diffLineClassName(line)}`}>{line || ' '}</div>
+                                ))}
+                              </div>
+                           </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+                {resultsSubTab === 'errors' && (
+                  <div className="flex-1 overflow-auto p-6 space-y-3">
+                     {lastImplementErrors.map((err, i) => (
+                        <div key={i} className="rounded-xl border border-rose-500/20 bg-rose-500/5 p-4 flex gap-3 text-rose-300 text-sm">
+                           <XCircle className="w-5 h-5 shrink-0" />
+                           <p>{err}</p>
+                        </div>
+                     ))}
+                     {lastImplementErrors.length === 0 && <div className="text-zinc-500 text-sm">No errors in compilation logs.</div>}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* MANIFEST VIEW */}
+            {activeTab === 'manifest' && (
+              <div className="flex flex-col h-full bg-[#09090b]">
+                <div className="flex items-center justify-between px-6 h-14 border-b border-zinc-800/80 bg-[#121214] shrink-0">
+                  <div className="flex items-center gap-3 text-[13px] font-semibold text-zinc-200">
+                    <Braces className="w-4 h-4 text-indigo-400" /> manifest.json
+                    {manifestJson && <span className="px-2.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[10px] uppercase tracking-wider">Valid JSON</span>}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button onClick={() => fetchManifest()} className="flex items-center gap-2 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium rounded-md transition-colors">
+                      <RefreshCw className="w-4 h-4" /> Reload
+                    </button>
+                  </div>
+                </div>
+                <div className="flex-1 overflow-auto bg-[#09090b] p-6">
+                  {manifestJson ? (
+                    <div className="max-w-4xl mx-auto font-mono text-[14px] leading-loose tracking-wide bg-[#121214] border border-zinc-800/60 rounded-xl shadow-2xl relative overflow-hidden">
+                       <pre className="p-6 text-zinc-300">{JSON.stringify(displayManifestJson, null, 2)}</pre>
+                    </div>
+                  ) : (
+                    <div className="text-zinc-500 text-sm text-center mt-20">Manifest not loaded.</div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ASSETS VIEW */}
+            {activeTab === 'assets' && (
+              <div className="flex flex-col h-full bg-[#09090b] overflow-y-auto">
+                <div className="max-w-5xl mx-auto w-full p-8 space-y-10">
+                  <div>
+                    <h2 className="text-2xl font-semibold text-zinc-100 tracking-tight">Branding Assets</h2>
+                    <p className="text-sm text-zinc-500 mt-2">Upload and manage logos, favicons, and custom fonts for your implementation.</p>
+                  </div>
+                  
+                  {/* Keep simple UI mock for now, can implement file upload with handleUpload in real app */}
+                  <div className="group relative w-full rounded-2xl border-2 border-dashed border-zinc-700/80 hover:border-indigo-500 hover:bg-indigo-500/5 transition-all duration-300 p-12 flex flex-col items-center justify-center cursor-pointer bg-[#121214]/50">
+                    <div className="w-20 h-20 rounded-full bg-zinc-800 group-hover:bg-indigo-500/20 flex items-center justify-center mb-5 transition-colors">
+                      <UploadCloud className="w-10 h-10 text-zinc-400 group-hover:text-indigo-400 transition-colors" />
+                    </div>
+                    <h3 className="text-base font-semibold text-zinc-200 mb-2 group-hover:text-indigo-200 transition-colors">Click or drag file to this area to upload</h3>
+                    <p className="text-sm text-zinc-500 text-center max-w-md">Supports SVG, PNG, JPG, or WEBP. Max file size is 5MB.</p>
+                  </div>
+
+                  <div className="space-y-5 pt-4">
+                    <h3 className="text-sm font-semibold text-zinc-200 uppercase tracking-wider border-b border-zinc-800/80 pb-3">Session Uploads</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                      {uploadedAssetsSession.map((asset, i) => (
+                         <div key={i} className="bg-[#121214] border border-zinc-800 rounded-xl overflow-hidden shadow-lg">
+                           <div className="h-40 bg-zinc-900/80 flex items-center justify-center relative p-6">
+                             <img src={asset.previewUrl} alt={asset.fileName} className="max-w-full max-h-full object-contain" />
+                           </div>
+                           <div className="p-4 border-t border-zinc-800/80">
+                             <span className="text-sm font-semibold text-zinc-200">{asset.assetType}</span>
+                           </div>
+                         </div>
+                      ))}
+                      {uploadedAssetsSession.length === 0 && <div className="text-zinc-500 text-sm">No assets uploaded yet.</div>}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* SETTINGS VIEW */}
+            {activeTab === 'settings' && (
+              <div className="w-full h-full overflow-y-auto bg-[#09090b]">
+                <div className="max-w-4xl mx-auto p-8 space-y-12">
+                  <div>
+                    <h2 className="text-xl font-semibold text-zinc-100 tracking-tight">Configuration Settings</h2>
+                    <p className="text-sm text-zinc-500 mt-1">Manage implementation pipelines, targets, and environment paths.</p>
+                  </div>
+
+                  <section className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div><h3 className="text-sm font-medium text-zinc-200">Pipeline Mode</h3></div>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {PIPELINE_MODE_OPTIONS.map((mode) => (
+                        <div key={mode.value} onClick={() => setImplementRun(p => ({...p, pipelineMode: mode.value}))} className={`relative p-4 rounded-xl border cursor-pointer transition-all ${implementRun.pipelineMode === mode.value ? 'bg-indigo-500/5 border-indigo-500/50 shadow-[0_0_15px_rgba(99,102,241,0.1)]' : 'bg-[#121214] border-zinc-800 hover:border-zinc-700'}`}>
+                          <div className="flex items-start gap-4">
+                            <div className={`p-2.5 rounded-lg ${implementRun.pipelineMode === mode.value ? 'bg-indigo-500/20 text-indigo-400' : 'bg-zinc-800 text-zinc-400'}`}><mode.icon className="w-5 h-5" /></div>
+                            <div className="flex-1 mt-0.5">
+                              <h4 className="text-sm font-semibold text-zinc-200">{mode.label}</h4>
+                              <p className="text-xs text-zinc-500">{mode.description}</p>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                </div>
+              </div>
+            )}
+          </div>
+        </main>
+      </div>
+      
+      {/* STATUS BAR */}
+      <footer className="h-8 bg-[#09090b] border-t border-zinc-800/80 flex items-center justify-between px-4 text-[10px] font-mono text-zinc-500 shrink-0 z-20">
+        <div className="flex items-center gap-5">
+          <div onClick={() => setSidebarOpen(!sidebarOpen)} className="flex items-center gap-1.5 hover:text-zinc-300 cursor-pointer transition-colors"><PanelLeftClose className="w-3.5 h-3.5" /></div>
+          <div className="flex items-center gap-2 font-medium">
+            <div className={`w-1.5 h-1.5 rounded-full ${status.level === 'error' ? 'bg-rose-500' : status.level === 'success' ? 'bg-emerald-500 shadow-[0_0_8px_#10b981]' : 'bg-amber-400'}`}></div>
+            {status.text}
+          </div>
+          <div className="flex items-center gap-1.5"><Activity className="w-3.5 h-3.5"/> {isAnyLoading ? 'Loading...' : 'Idle'}</div>
+        </div>
+        <div className="flex items-center gap-5">
+          <div onClick={() => performRepoReset()} className="flex items-center gap-1.5 text-zinc-400 hover:text-rose-400 cursor-pointer transition-colors"><AlertTriangle className="w-3.5 h-3.5 text-rose-500/80" />Reset Env</div>
+          <div className="opacity-70">UTF-8</div>
+        </div>
+      </footer>
+
+      {/* BYOK MODAL */}
+      {showByokModal && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-[#09090b] border border-zinc-800 rounded-xl shadow-2xl w-full max-w-md overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800 bg-[#121214]">
+              <h3 className="text-sm font-semibold text-white flex items-center gap-2"><Key className="w-4 h-4 text-zinc-400" /> Bring Your Own Key</h3>
+              <button onClick={() => setShowByokModal(false)} className="text-zinc-500 hover:text-white transition-colors text-lg leading-none">&times;</button>
+            </div>
+            <div className="p-6 space-y-5">
+              <div>
+                <label className="block text-xs font-medium text-zinc-400 mb-2">Paste API Key</label>
+                <input
+                  type="password"
+                  value={byokKey}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setByokKey(val);
+                    if (!val) setByokProvider('');
+                    else if (val.startsWith('sk-ant-')) setByokProvider('Anthropic (Claude)');
+                    else if (val.startsWith('sk-proj-') || (val.startsWith('sk-') && !val.startsWith('sk-or-'))) setByokProvider('OpenAI');
+                    else if (val.startsWith('xai-')) setByokProvider('xAI (Grok)');
+                    else if (val.startsWith('sk-or-')) setByokProvider('OpenRouter');
+                    else if (val.startsWith('gsk_')) setByokProvider('Groq');
+                    else setByokProvider('Custom / Unknown');
+                  }}
+                  placeholder="sk-... or gsk_..."
+                  className="w-full bg-[#121214] border border-zinc-700 focus:border-white focus:ring-1 focus:ring-white rounded-md px-3 py-2.5 text-sm text-white placeholder:text-zinc-600 outline-none transition-all"
+                />
+              </div>
+              {byokProvider && (
+                <div className="flex items-center gap-2 px-3 py-2.5 bg-zinc-900 border border-zinc-800 rounded-md">
+                  <CheckCircle className="w-4 h-4 text-emerald-400" />
+                  <span className="text-xs text-zinc-300">Detected: <strong className="text-white">{byokProvider}</strong></span>
                 </div>
               )}
+              <div className="text-[11px] text-zinc-500 leading-relaxed bg-[#121214] p-3.5 rounded-md border border-zinc-800/50">
+                Keys are stored locally. Groq is the default free model used for chat if no key is provided.
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-3 px-5 py-4 border-t border-zinc-800 bg-[#121214]">
+              <button onClick={() => setShowByokModal(false)} className="px-4 py-2 text-xs font-medium text-zinc-400 hover:text-white transition-colors">Close</button>
             </div>
           </div>
-
-          <div className="flex h-56 flex-col border-t border-[#1A1A1A] bg-[#050505]">
-            <div className="flex items-center gap-2 border-b border-[#1A1A1A] px-4 py-3">
-              <ImageIcon className="h-3.5 w-3.5 text-zinc-400" />
-              <span className="text-[10px] font-bold tracking-widest text-zinc-300 uppercase">Branding Assets</span>
-            </div>
-
-            <div className="flex h-full flex-col overflow-hidden p-4">
-              <div className="mb-4 flex shrink-0 gap-2">
-                <select
-                  value={assetType}
-                  onChange={(event) => setAssetType(event.target.value as AssetType)}
-                  disabled={loading.upload || isGlobalDisabled}
-                  className="cursor-pointer rounded border border-[#262626] bg-[#000000] px-2 py-1.5 text-xs text-zinc-300 focus:border-white focus:outline-none disabled:opacity-60"
-                >
-                  {ASSET_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>{option.label}</option>
-                  ))}
-                </select>
-
-                <label className={`flex flex-1 cursor-pointer items-center justify-center gap-2 rounded border border-dashed border-[#333333] bg-[#000000] text-xs text-zinc-400 transition-colors hover:border-zinc-500 hover:text-white ${loading.upload || isGlobalDisabled ? 'cursor-not-allowed opacity-50' : ''}`}>
-                  <Upload className="h-3.5 w-3.5" />
-                  {loading.upload ? 'Uploading...' : 'Select File'}
-                  <input
-                    type="file"
-                    className="hidden"
-                    accept="image/*,.ico,.svg"
-                    onChange={handleUpload}
-                    disabled={loading.upload || isGlobalDisabled}
-                  />
-                </label>
-              </div>
-
-              <div className="custom-scrollbar flex-1 space-y-2 overflow-y-auto">
-                {uploadedAssetsSession.map((asset) => (
-                  <div key={asset.assetType} className="flex items-center justify-between rounded border border-[#1A1A1A] bg-[#000000] px-3 py-2 text-xs">
-                    <div className="flex items-center gap-3">
-                      <div className="w-24 text-[9px] font-bold text-zinc-500 uppercase">{ASSET_OPTIONS.find((item) => item.value === asset.assetType)?.label || asset.assetType}</div>
-                      <span className="max-w-[140px] truncate font-mono text-zinc-300">{asset.fileName}</span>
-                    </div>
-                    <a href={asset.previewUrl} target="_blank" rel="noreferrer" className="text-zinc-500 underline transition-colors hover:text-white">
-                      Preview
-                    </a>
-                  </div>
-                ))}
-
-                {uploadedAssetsSession.length === 0 && (
-                  <div className="py-4 text-center text-xs text-zinc-600">No assets uploaded in this session.</div>
-                )}
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section className="col-span-4 flex min-h-0 flex-col bg-[#050505]">
-          <div className="border-b border-[#1A1A1A] p-4">
-            <BorderGlow active className="h-32">
-              <div className="relative flex h-full flex-col overflow-hidden rounded-[inherit] bg-black p-3">
-                <div className={`absolute inset-x-0 top-0 h-px ${status.level === 'error' ? 'bg-rose-500' : status.level === 'warning' ? 'bg-amber-300' : status.level === 'success' ? 'bg-emerald-300' : 'bg-cyan-300'}`} />
-                {(loading.chat || loading.manifest || loading.confirm || loading.implement || loading.repair || loading.upload || loading.resetRepo || loading.resetSession || previewMetaLoading) && (
-                  <div className="absolute top-0 left-0 h-px w-1/2 bg-white/80 shadow-[0_0_20px_rgba(255,255,255,0.7)] [animation:operatorSweep_1.4s_ease-in-out_infinite]" />
-                )}
-                <div className="mb-2 flex items-center gap-2 border-b border-[#1A1A1A] pb-2 text-zinc-500">
-                  <TerminalSquare className="h-3.5 w-3.5" />
-                  <span className="text-[9px] font-bold tracking-widest uppercase">System Output</span>
-                </div>
-
-                <div className="custom-scrollbar flex flex-1 gap-3 overflow-y-auto font-mono text-[12px] leading-relaxed">
-                  {statusIcon}
-                  <div className="flex flex-col">
-                    <span className={status.level === 'error' ? 'text-rose-400' : 'text-zinc-200'}>{formatUiText(status.text)}</span>
-                    {status.details ? <span className="mt-1 text-zinc-500">{formatUiText(status.details)}</span> : null}
-                  </div>
-                </div>
-              </div>
-            </BorderGlow>
-          </div>
-
-          <div className="custom-scrollbar min-h-0 flex-1 space-y-6 overflow-y-auto p-5">
-            <div className="grid grid-cols-4 gap-2">
-              {pipelineCards.map((card) => {
-                const Icon = card.icon;
-                return (
-                  <div
-                    key={card.label}
-                    className={`group relative overflow-hidden rounded border p-3 transition-all hover:-translate-y-0.5 ${card.active ? 'border-cyan-400/40 bg-cyan-400/10 text-white' : 'border-[#262626] bg-[#000000] text-zinc-400 hover:border-zinc-500/70'}`}
-                  >
-                    <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/40 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
-                    <Icon className={`mb-2 h-4 w-4 ${card.active ? 'text-cyan-300' : 'text-zinc-600'}`} />
-                    <div className="text-[9px] font-bold tracking-widest text-zinc-500 uppercase">{card.label}</div>
-                    <div className="mt-1 truncate font-mono text-[11px]">{card.value}</div>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="space-y-3">
-              <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Pipeline Controls</span>
-
-              <div className="space-y-1">
-                <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Resolved Repo Path</span>
-                <div className="rounded border border-[#262626] bg-[#000000] px-3 py-2 font-mono text-[11px] leading-relaxed text-zinc-300">
-                  {resolvedRepoPath || 'Resolving from selected project...'}
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  onClick={() => void fetchManifest()}
-                  disabled={loading.manifest || isGlobalDisabled}
-                  className="flex flex-col items-center justify-center gap-2 rounded border border-[#262626] bg-[#000000] p-3 transition-all hover:-translate-y-0.5 hover:border-cyan-400/50 hover:bg-cyan-400/5 disabled:translate-y-0 disabled:opacity-50"
-                >
-                  <RefreshCw className={`h-4 w-4 text-zinc-300 ${loading.manifest ? 'animate-spin' : ''}`} />
-                  <span className="text-[11px] font-bold tracking-wider text-white uppercase">Fetch</span>
-                </button>
-
-                <button
-                  onClick={() => void handleConfirm()}
-                  disabled={loading.confirm || isConfirmed || isGlobalDisabled}
-                  className={`flex flex-col items-center justify-center gap-2 rounded border p-3 transition-all hover:-translate-y-0.5 disabled:translate-y-0 disabled:opacity-50 ${isConfirmed ? 'border-emerald-300 bg-emerald-300 text-black' : 'border-[#262626] bg-[#000000] text-white hover:border-emerald-400/50 hover:bg-emerald-400/5'}`}
-                >
-                  <CheckCircle2 className="h-4 w-4" />
-                  <span className="text-[11px] font-bold tracking-wider uppercase">{isConfirmed ? 'Confirmed' : 'Confirm'}</span>
-                </button>
-              </div>
-
-              <PixelCard gap={4} speed={40} colors="#ffffff,#a1a1aa,#000000" className="mt-3 cursor-pointer rounded border border-[#262626] transition-colors hover:border-white">
-                <button
-                  onClick={() => void runImplementation()}
-                  disabled={!isConfirmed || loading.implement || isGlobalDisabled}
-                  className="flex w-full items-center justify-center gap-2 bg-transparent py-4 text-[12px] font-bold tracking-widest text-white uppercase disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <Play className="h-4 w-4 fill-current" />
-                  {loading.implement ? 'Implementing...' : 'Execute Implement'}
-                </button>
-              </PixelCard>
-
-              <button
-                onClick={() => setIsManifestViewerOpen((prev) => !prev)}
-                disabled={isGlobalDisabled}
-                className="flex w-full items-center justify-center gap-2 rounded border border-[#262626] bg-[#000000] py-2.5 text-[11px] font-bold tracking-widest text-zinc-300 uppercase transition-colors hover:border-zinc-500 hover:text-white disabled:opacity-50"
-              >
-                <FileJson className="h-4 w-4" />
-                {isManifestViewerOpen ? 'Hide Manifest JSON' : 'View Manifest JSON'}
-              </button>
-
-              <button
-                onClick={() => setIsCodeDiffViewerOpen((prev) => !prev)}
-                disabled={isGlobalDisabled}
-                className="flex w-full items-center justify-center gap-2 rounded border border-[#262626] bg-[#000000] py-2.5 text-[11px] font-bold tracking-widest text-zinc-300 uppercase transition-colors hover:border-zinc-500 hover:text-white disabled:opacity-50"
-              >
-                <TerminalSquare className="h-4 w-4" />
-                {isCodeDiffViewerOpen ? 'Hide Code Diff' : 'View Code Diff'}
-              </button>
-            </div>
-
-            <div className="space-y-3 border-t border-[#1A1A1A] pt-4">
-              <div className="flex items-center justify-between">
-                <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Pipeline Mode</span>
-                <span className="font-mono text-[10px] text-zinc-600">{implementRun.pipelineMode}</span>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                {PIPELINE_MODE_OPTIONS.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    onClick={() => setImplementRun((prev) => ({ ...prev, pipelineMode: option.value }))}
-                    disabled={loading.implement || loading.repair || isGlobalDisabled}
-                    className={`rounded border px-2 py-1.5 text-[10px] font-semibold tracking-wide transition-all disabled:cursor-not-allowed disabled:opacity-50 ${implementRun.pipelineMode === option.value ? 'border-white bg-white text-black' : 'border-[#262626] bg-[#111111] text-zinc-500 hover:border-zinc-500 hover:text-zinc-200'}`}
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="space-y-3 border-t border-[#1A1A1A] pt-4">
-              <div className="flex items-center justify-between">
-                <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Implementation Scope</span>
-                <span className="font-mono text-[10px] text-zinc-600">{implementRun.appTargets.length}/{DEFAULT_APP_TARGETS.length}</span>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {DEFAULT_APP_TARGETS.map((target) => (
-                  <button
-                    key={target}
-                    type="button"
-                    onClick={() => toggleAppTarget(target)}
-                    disabled={loading.implement || loading.repair || isGlobalDisabled}
-                    className={`rounded border px-2 py-1 font-mono text-[10px] transition-all disabled:cursor-not-allowed disabled:opacity-50 ${implementRun.appTargets.includes(target) ? 'border-cyan-400/40 bg-cyan-400/10 text-cyan-100 shadow-[0_0_18px_rgba(34,211,238,0.08)]' : 'border-[#262626] bg-[#111111] text-zinc-600 hover:border-zinc-500 hover:text-zinc-300'}`}
-                  >
-                    {target}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {isManifestViewerOpen && (
-              <div className="space-y-2 border-t border-[#1A1A1A] pt-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Manifest JSON</span>
-                  <button
-                    onClick={() => void fetchManifest()}
-                    disabled={loading.manifest || isGlobalDisabled}
-                    className="inline-flex items-center gap-1 rounded border border-[#262626] bg-[#000000] px-2 py-1 text-[10px] font-semibold tracking-wider text-zinc-300 uppercase transition-colors hover:border-zinc-500 hover:text-white disabled:opacity-50"
-                  >
-                    <RefreshCw className={`h-3 w-3 ${loading.manifest ? 'animate-spin' : ''}`} /> Refresh
-                  </button>
-                </div>
-
-                <div className="custom-scrollbar max-h-56 overflow-y-auto rounded border border-[#262626] bg-[#000000] p-3 font-mono text-[11px] leading-relaxed text-zinc-300">
-                  {manifestJson ? (
-                    <pre className="whitespace-pre-wrap break-all text-zinc-300">{JSON.stringify(displayManifestJson, null, 2)}</pre>
-                  ) : (
-                    <p className="text-zinc-500">No manifest loaded yet. Click Refresh to fetch latest manifest.</p>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {isCodeDiffViewerOpen && (
-              <div className="space-y-2 border-t border-[#1A1A1A] pt-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Code Diff</span>
-                  <span className="text-[10px] text-zinc-500">{codeDiffEntries.length} file(s)</span>
-                </div>
-
-                <div className="custom-scrollbar max-h-72 space-y-3 overflow-y-auto rounded border border-[#262626] bg-[#000000] p-3">
-                  {codeDiffEntries.length > 0 ? (
-                    codeDiffEntries.map((entry) => (
-                      <div key={`${entry.file}-${entry.diff.length}`} className="rounded border border-[#1A1A1A] bg-[#050505] p-2">
-                        <div className="mb-2 flex items-center justify-between gap-2">
-                          <div className="min-w-0 truncate font-mono text-[10px] font-bold tracking-wide text-zinc-400 uppercase">{entry.file}</div>
-                          {entry.source && (
-                            <span className="shrink-0 rounded border border-cyan-400/30 bg-cyan-400/10 px-1.5 py-0.5 font-mono text-[9px] text-cyan-100">
-                              {entry.source}{entry.operation ? `:${entry.operation}` : ''}
-                            </span>
-                          )}
-                        </div>
-                        <div className="custom-scrollbar max-h-52 overflow-auto rounded border border-[#262626] bg-black p-2 font-mono text-[10px] leading-relaxed">
-                          {entry.diff.split('\n').map((line, index) => (
-                            <div key={`${entry.file}-${index}`} className={`whitespace-pre-wrap break-all px-1 ${diffLineClassName(line)}`}>
-                              {line || ' '}
-                            </div>
-                          ))}
-                        </div>
-                        {entry.truncated && <p className="mt-1 text-[10px] text-zinc-500">Diff truncated.</p>}
-                      </div>
-                    ))
-                  ) : (
-                    <div className="space-y-2 text-xs text-zinc-500">
-                      <p>No code diff was produced for the last implement run.</p>
-                      {lastImplementErrors.length > 0 && (
-                        <ul className="list-disc space-y-1 pl-4">
-                          {lastImplementErrors.map((error) => (
-                            <li key={error} className="break-all">{error}</li>
-                          ))}
-                        </ul>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {lastQualityReport && (
-              <div className="space-y-2 border-t border-[#1A1A1A] pt-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-bold tracking-widest text-zinc-500 uppercase">Quality Gates</span>
-                  <span className={`rounded border px-2 py-0.5 font-mono text-[10px] ${lastQualityReport.status === 'failed' ? 'border-rose-500/30 bg-rose-500/10 text-rose-200' : lastQualityReport.status === 'warning' ? 'border-amber-500/30 bg-amber-500/10 text-amber-200' : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'}`}>
-                    {lastQualityReport.status || 'not_run'}
-                  </span>
-                </div>
-                <div className="custom-scrollbar max-h-44 space-y-2 overflow-y-auto rounded border border-[#262626] bg-[#000000] p-3">
-                  {(lastQualityReport.checks || []).map((check, index) => (
-                    <div key={`${check.name || 'check'}-${index}`} className="rounded border border-[#1A1A1A] bg-[#050505] p-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="truncate font-mono text-[10px] text-zinc-300">{check.name || 'check'}</span>
-                        <span className="font-mono text-[10px] text-zinc-500">{check.status || 'unknown'}</span>
-                      </div>
-                      {check.detail && <p className="mt-1 break-all text-[10px] leading-relaxed text-zinc-500">{check.detail}</p>}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {implementRun.validatorIssues.length > 0 && !implementRun.repairPassUsed && (
-              <div className="relative flex animate-fade-in flex-col gap-3 overflow-hidden rounded border border-[#262626] bg-[#000000] p-4">
-                <div className="absolute top-0 bottom-0 left-0 w-1 bg-white" />
-                <div className="flex items-center gap-2 text-xs font-bold tracking-wider text-white uppercase">
-                  <ShieldAlert className="h-4 w-4" />
-                  Validator Intervention
-                </div>
-                <p className="text-xs leading-relaxed text-zinc-400">Validation failed during implementation. Review issues and approve a one-time repair pass.</p>
-                <div className="rounded border border-[#262626] bg-[#111111] p-3">
-                  <ul className="list-disc space-y-1 pl-4 font-mono text-[11px] text-zinc-300">
-                    {implementRun.validatorIssues.map((issue) => (
-                      <li key={issue}>{issue}</li>
-                    ))}
-                  </ul>
-                </div>
-                <button
-                  onClick={() => void handleRepair()}
-                  disabled={loading.repair || isGlobalDisabled}
-                  className="mt-1 w-full rounded bg-white py-2.5 text-[11px] font-bold tracking-wider text-black uppercase transition-colors hover:bg-zinc-200 disabled:opacity-50"
-                >
-                  {loading.repair ? 'Running Repair...' : 'Approve Repair Pass'}
-                </button>
-              </div>
-            )}
-          </div>
-
-          <div className="grid shrink-0 grid-cols-2 gap-3 border-t border-[#1A1A1A] bg-[#000000] p-4">
-            <button
-              onClick={() => void handleResetSession()}
-              disabled={loading.resetSession || isGlobalDisabled}
-              className="flex items-center justify-center gap-2 rounded border border-[#262626] bg-[#111111] py-2.5 text-[11px] font-bold tracking-wider text-zinc-300 uppercase transition-colors hover:border-zinc-500 hover:bg-[#1A1A1A] disabled:opacity-50"
-            >
-              <RefreshCcw className="h-3.5 w-3.5" /> Session
-            </button>
-            <button
-              onClick={() => void handleResetRepo()}
-              disabled={loading.resetRepo || isGlobalDisabled}
-              className="flex items-center justify-center gap-2 rounded border border-[#262626] bg-[#111111] py-2.5 text-[11px] font-bold tracking-wider text-rose-500 uppercase transition-colors hover:border-rose-500/50 hover:bg-[#1A1A1A] disabled:opacity-50"
-            >
-              <AlertTriangle className="h-3.5 w-3.5" /> Repo
-            </button>
-          </div>
-        </section>
-      </main>
+        </div>
+      )}
     </div>
   );
 }

@@ -27,7 +27,7 @@ variable "instance_type" {
 }
 
 variable "ami_id" {
-  description = "AMI ID. Empty string uses latest Ubuntu 22.04 LTS."
+  description = "AMI ID. Empty string uses latest Amazon Linux 2023."
   type        = string
   default     = ""
 }
@@ -41,11 +41,17 @@ variable "key_pair_name" {
 variable "root_volume_size_gb" {
   description = "Root volume size in GB."
   type        = number
-  default     = 20
+  default     = 35
 }
 
 variable "user_data" {
   description = "User data script to run on instance boot."
   type        = string
   default     = ""
+}
+
+variable "app_port" {
+  description = "The port the application listens on."
+  type        = number
+  default     = 3000
 }

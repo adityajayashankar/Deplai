@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+import functools
 
 from remediation_pipeline.models import Vulnerability
 from utils import CODEBASE_VOLUME, decode_output, find_volume_file, get_docker_client, read_volume_file
@@ -151,6 +152,8 @@ class VulnIngester:
             path = self._normalize_file_path(str(location.get("path") or ""), project_id)
             if not path:
                 continue
+            if "/node_modules/" in f"/{path}" or "/vendor/" in f"/{path}":
+                continue
             candidate_path = path
             line_number = self._safe_int(location.get("lineNumber"), 1)
             if path.endswith(("package.json", "requirements.txt", "go.mod", "pom.xml", "Pipfile", "pyproject.toml")):
@@ -212,7 +215,11 @@ class VulnIngester:
             return candidate, max(1, line or 1)
         return "", 1
 
+    @functools.lru_cache(maxsize=10000)
     def _find_dependency_line(self, project_id: str, rel_path: str, package_name: str) -> int:
+        normalized = rel_path.lower()
+        if "lock" in normalized or normalized.endswith(".sum"):
+            return 1
         text = self._read_repo_file(project_id, rel_path)
         if not text:
             return 1

@@ -1093,41 +1093,41 @@ grep -n "^variable" components/terraform/ec2-instance/variables.tf 2>/dev/null |
                             f"Failed to lookup default subnet in VPC {vpc_id}: {exc}"
                         ) from exc
                     
-                    # Dynamic AMI lookup for Ubuntu 22.04 LTS
+                    # Dynamic AMI lookup for Amazon Linux 2023
                     try:
                         ami_lookup = _run_workspace_shell_with_tracking(
                             volume_name,
-                            f'aws ec2 describe-images --owners 099720109477 --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" "Name=state,Values=available" "Name=architecture,Values=x86_64" --query "sort_by(Images, &CreationDate)[-1].ImageId" --output text --region {region}',
+                            f'aws ec2 describe-images --owners amazon --filters "Name=name,Values=al2023-ami-2023*-x86_64" "Name=state,Values=available" "Name=architecture,Values=x86_64" --query "sort_by(Images, &CreationDate)[-1].ImageId" --output text --region {region}',
                             env,
-                            command_label=f"lookup latest Ubuntu 22.04 AMI in {region}",
+                            command_label=f"lookup latest Amazon Linux 2023 AMI in {region}",
                             apply_context=apply_context,
                         )
                         ami_id = ami_lookup.strip()
                         if not ami_id or ami_id == "None" or "error" in ami_id.lower():
                             raise RuntimeError(
-                                f"No Ubuntu 22.04 AMI found in region {region}. "
+                                f"No Amazon Linux 2023 AMI found in region {region}. "
                                 f"Check AWS Marketplace or use a different region."
                             )
                         _emit_progress(
                             apply_context,
                             "info",
-                            f"Found Ubuntu 22.04 AMI: {ami_id}"
+                            f"Found Amazon Linux 2023 AMI: {ami_id}"
                         )
                     except Exception as exc:
                         raise RuntimeError(
-                            f"Failed to lookup Ubuntu 22.04 AMI in {region}: {exc}"
+                            f"Failed to lookup Amazon Linux 2023 AMI in {region}: {exc}"
                         ) from exc
                     
                     # Inject as -var flags (these override any values in the stack YAML)
                     plan_args.extend([
                         f"-var=vpc_id={vpc_id}",
                         f"-var=subnet={subnet_id}",
-                        f"-var=ami={ami_id}"
+                        f"-var=ami_id={ami_id}"
                     ])
                     _emit_progress(
                         apply_context,
                         "info",
-                        f"Injecting runtime vars: vpc_id={vpc_id}, subnet={subnet_id}, ami={ami_id}"
+                        f"Injecting runtime vars: vpc_id={vpc_id}, subnet={subnet_id}, ami_id={ami_id}"
                     )
                 
                 plan_logs[component] = _run_atmos_with_tracking(

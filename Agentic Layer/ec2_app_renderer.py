@@ -514,6 +514,13 @@ resource "aws_security_group" "app" {
     cidr_blocks = var.ingress_cidr_blocks
   }
 
+  ingress {
+    from_port   = var.app_port
+    to_port     = var.app_port
+    protocol    = "tcp"
+    cidr_blocks = var.ingress_cidr_blocks
+  }
+
   dynamic "ingress" {
     for_each = var.ssh_ingress_cidr_blocks
     content {
@@ -831,6 +838,9 @@ fi
 
 cd "$APP_DIR"
 if [ "$APP_KIND" = "node" ]; then
+  npm install -g pm2 || true
+  pm2 delete "$APP_NAME" || true
+  rm -rf .next
   npm cache clean --force || true
   if [ -f package-lock.json ]; then npm ci --legacy-peer-deps || npm install --legacy-peer-deps; else npm install --legacy-peer-deps; fi
   if [ -n "$BUILD_COMMAND" ]; then export NODE_OPTIONS="--max-old-space-size=4096"; $BUILD_COMMAND; fi

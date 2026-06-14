@@ -948,6 +948,11 @@ export default function SecurityAnalysisPage() {
   const [resultsTab, setResultsTab] = useState<'sca' | 'sast'>('sca');
   const [resultsQuery, setResultsQuery] = useState('');
   const [resultsSeverity, setResultsSeverity] = useState<'all' | 'critical' | 'high' | 'medium' | 'low'>('all');
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
   const [resultsLimit, setResultsLimit] = useState(100);
   const [lastResultsSyncAt, setLastResultsSyncAt] = useState<string | null>(null);
 
@@ -2000,8 +2005,8 @@ export default function SecurityAnalysisPage() {
           </div>
         </div>
         <div className="border-b border-[#1A1A1A] p-5">
-          <div className="mb-2 flex items-center justify-between"><span className="text-xs font-medium text-zinc-400">Track Progress</span><span className="text-xs font-bold text-indigo-400">{progressPercentage}%</span></div>
-          <div className="h-1 w-full overflow-hidden rounded-full bg-[#111111]"><div className="h-full bg-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.5)] transition-all duration-500" style={{ width: `${progressPercentage}%` }} /></div>
+          <div className="mb-2 flex items-center justify-between"><span className="text-xs font-medium text-zinc-400">Track Progress</span><span className="text-xs font-bold text-indigo-400">{mounted ? `${progressPercentage}%` : '...'}</span></div>
+          <div className="h-1 w-full overflow-hidden rounded-full bg-[#111111]"><div className="h-full bg-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.5)] transition-all duration-500" style={{ width: mounted ? `${progressPercentage}%` : '0%' }} /></div>
         </div>
         <div className="custom-scrollbar flex-1 space-y-1 overflow-y-auto px-3 py-6">
           {SIDEBAR_STAGES.map((stage) => {

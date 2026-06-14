@@ -54,6 +54,31 @@ def _project_name(payload: dict[str, Any]) -> str:
     return str(payload.get("project_name") or payload.get("workspace") or "deplai-project").strip()
 
 
+def _repo_url(payload: dict[str, Any]) -> str:
+    """Extract the GitHub repo URL from the request payload."""
+    candidates = [
+        payload.get("repo_url"),
+        payload.get("repository_url"),
+        payload.get("github_url"),
+        payload.get("git_url"),
+    ]
+    for candidate in candidates:
+        val = str(candidate or "").strip().rstrip("/")
+        if val.endswith(".git"):
+            val = val[:-4]
+        if val and val.startswith("https://"):
+            return val
+    repo_context = payload.get("repo_context") or {}
+    if isinstance(repo_context, dict):
+        for key in ("remote_url", "clone_url", "html_url", "url"):
+            val = str(repo_context.get(key) or "").strip().rstrip("/")
+            if val.endswith(".git"):
+                val = val[:-4]
+            if val and val.startswith("https://"):
+                return val
+    return ""
+
+
 def normalize_terraform_renderer(value: Any) -> str:
     renderer = str(value or "auto").strip().lower()
     if renderer in {"auto", "deplai_deterministic", "deplai_ec2_app"}:
@@ -192,6 +217,7 @@ def _run_plan_loop(
                 aws_region=state["aws_region"],
                 context_summary=_context_summary(request_payload),
                 website_index_html=_website_index_html(request_payload),
+                repo_url=_repo_url(request_payload),
             )
             state["warnings"].extend(fallback_warnings)
             replace_tree(local_bundle_dir, fallback_files)
@@ -322,6 +348,7 @@ def generate_terraform_run(request_payload: dict[str, Any]) -> dict[str, Any]:
                 context_summary=_context_summary(request_payload),
                 website_index_html=_website_index_html(request_payload),
                 manifest=manifest,
+                repo_url=_repo_url(request_payload),
             )
 
         state["components"] = manifest
