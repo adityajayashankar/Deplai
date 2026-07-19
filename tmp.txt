@@ -1,376 +1,562 @@
-import React, { ReactNode } from 'react';
-import { 
-  Network, 
-  ShieldAlert, 
-  CheckCircle2,
-  Github,
-  HardDrive,
-  Gitlab,
-  MessageSquare,
-  Sparkles,
-  User,
-  LucideIcon
-} from 'lucide-react';
-
-// --- Types ---
-interface IntegrationBadgeProps {
-  icon?: LucideIcon;
-  label: string;
-  active?: boolean;
-  status?: string;
-}
-
-interface FeatureCardProps {
-  title: string;
-  description: string;
-  icon: LucideIcon;
-  diagram: ReactNode;
-  accentColor: string;
-  accentBorder: string;
-}
-
-// --- Main Component ---
-const Capabilities: React.FC = () => {
-  return (
-    <div className="min-h-screen bg-[#000000] text-[#CBEFEB] font-sans p-8 md:p-16 flex flex-col items-center justify-center relative overflow-hidden">
-      
-      {/* Ambient Background Glows */}
-      <div className="absolute top-0 right-1/4 w-[600px] h-[600px] bg-[#05393F]/40 rounded-full blur-[150px] pointer-events-none" />
-      <div className="absolute bottom-0 left-1/4 w-[500px] h-[500px] bg-[#00524D]/30 rounded-full blur-[120px] pointer-events-none" />
-
-      {/* SVG Definitions for Custom Gradients */}
-      <svg className="w-0 h-0 absolute">
-        <defs>
-          <linearGradient id="grad-map" x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor="#00524D" />
-            <stop offset="100%" stopColor="#48A89A" />
-          </linearGradient>
-          <linearGradient id="grad-ready" x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor="#48A89A" />
-            <stop offset="100%" stopColor="#CBEFEB" />
-          </linearGradient>
-        </defs>
-      </svg>
-
-      {}
-      <style dangerouslySetInnerHTML={{__html: `
-        @keyframes pulse-ring {
-          0% { transform: scale(0.8); opacity: 0.5; }
-          100% { transform: scale(2); opacity: 0; }
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Repository Intelligence | Enterprise Security</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Fonts & Icons -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    },
+                    colors: {
+                        bgMain: '#050505',
+                        bgSecondary: '#0B090B',
+                        accent: '#FF7A9E',
+                        accentHover: '#FF95B0',
+                        textMain: '#F5F5F7',
+                        textSecondary: '#A7A7B0',
+                        textMuted: '#70707A'
+                    }
+                }
+            }
         }
-        @keyframes scan-line {
-          0% { top: 0%; opacity: 0; }
-          10% { opacity: 1; }
-          90% { opacity: 1; }
-          100% { top: 100%; opacity: 0; }
+    </script>
+
+    <style>
+        :root {
+            --accent: #FF7A9E;
+            --accent-glow: rgba(255, 122, 158, 0.12);
+            --accent-glow-strong: rgba(255, 122, 158, 0.3);
         }
-        @keyframes data-flow {
-          0% { stroke-dashoffset: 100; }
-          100% { stroke-dashoffset: 0; }
+
+        body {
+            /* Exact requested global grading */
+            background: radial-gradient(circle at 80% 0%, rgba(255, 122, 158, 0.08), transparent 40%), linear-gradient(180deg, #050505, #090909);
+            color: #F5F5F7;
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', sans-serif;
+            -webkit-font-smoothing: antialiased;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Top Nav Styling */
+        .top-nav {
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            background: rgba(5,5,5,0.8);
+            backdrop-filter: blur(12px);
+        }
+
+        .nav-link {
+            color: #A7A7B0;
+            transition: color 0.2s;
+            font-size: 0.85rem;
+        }
+        .nav-link:hover { color: #F5F5F7; }
+
+        /* The Exact Card Spec */
+        .tech-card {
+            background: transparent;
+            border: none;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Precision Corner Brackets for Elite HUD feel */
+        .hud-bracket::before, .hud-bracket::after {
+            content: '';
+            position: absolute;
+            width: 12px;
+            height: 12px;
+            border: 1px solid var(--accent);
+            opacity: 0.3;
+            transition: opacity 0.3s;
+            pointer-events: none;
+            z-index: 10;
+        }
+        .hud-bracket::before { top: 0; left: 0; border-right: none; border-bottom: none; }
+        .hud-bracket::after { bottom: 0; right: 0; border-left: none; border-top: none; }
+        .tech-card:hover.hud-bracket::before, .tech-card:hover.hud-bracket::after { opacity: 1; }
+
+        /* Subtle scanline overlay on cards */
+        .tech-card::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 2px,
+                rgba(255, 255, 255, 0.01) 2px,
+                rgba(255, 255, 255, 0.01) 4px
+            );
+            pointer-events: none;
+            z-index: 1;
+        }
+
+        /* Content needs to sit above scanlines */
+        .card-content {
+            position: relative;
+            z-index: 2;
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+        }
+
+        /* Toggle Buttons */
+        .repo-btn {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: #A7A7B0;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        .repo-btn.active {
+            border-color: var(--accent);
+            color: #fff;
+            background: rgba(255, 122, 158, 0.05);
+            box-shadow: 0 0 15px var(--accent-glow);
+        }
+        .repo-btn.soon {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* Agent Chat Animations */
+        .agent-typing-dot {
+            animation: typing 1.4s infinite ease-in-out both;
+            background-color: var(--accent);
+        }
+        .agent-typing-dot:nth-child(1) { animation-delay: -0.32s; }
+        .agent-typing-dot:nth-child(2) { animation-delay: -0.16s; }
+        @keyframes typing {
+            0%, 80%, 100% { transform: scale(0); opacity: 0.3; }
+            40% { transform: scale(1); opacity: 1; }
+        }
+
+        .code-reveal {
+            overflow: hidden;
+            white-space: nowrap;
+            border-right: 2px solid var(--accent);
+            animation: typewriter 2s steps(40) forwards, blink 0.75s step-end infinite;
+        }
+        @keyframes typewriter {
+            from { width: 0; }
+            to { width: 100%; }
         }
         @keyframes blink {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.4; }
+            from, to { border-color: transparent; }
+            50% { border-color: var(--accent); }
         }
-        @keyframes bar-pulse {
-          0% { transform: scaleY(0.2); }
-          100% { transform: scaleY(1); }
-        }
-        .anim-flow {
-          stroke-dasharray: 10 15;
-          animation: data-flow 2s linear infinite;
-        }
-        @keyframes chat-user-in {
-          0%, 5% { opacity: 0; transform: translateY(10px) scale(0.95); }
-          10%, 90% { opacity: 1; transform: translateY(0) scale(1); }
-          95%, 100% { opacity: 0; transform: translateY(-10px) scale(0.95); }
-        }
-        @keyframes chat-agent-typing {
-          0%, 15% { opacity: 0; transform: translateY(10px) scale(0.95); }
-          20%, 35% { opacity: 1; transform: translateY(0) scale(1); }
-          40%, 100% { opacity: 0; transform: translateY(-10px) scale(0.95); }
-        }
-        @keyframes chat-agent-reply {
-          0%, 35% { opacity: 0; transform: translateY(10px) scale(0.95); pointer-events: none; }
-          40%, 90% { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
-          95%, 100% { opacity: 0; transform: translateY(-10px) scale(0.95); pointer-events: none; }
-        }
-        @keyframes box-draw {
-          0%, 45% { stroke-dashoffset: 200; opacity: 0; fill: transparent; }
-          55% { stroke-dashoffset: 0; opacity: 1; fill: transparent; }
-          65%, 100% { fill: rgba(72, 168, 154, 0.15); stroke-dashoffset: 0; opacity: 1; }
-        }
-      `}} />
 
-      <div className="max-w-[1200px] w-full relative z-10">
+        /* Telemetry Ring Animation */
+        .progress-ring__circle {
+            transition: stroke-dashoffset 1.5s ease-in-out;
+            transform: rotate(-90deg);
+            transform-origin: 50% 50%;
+        }
+
+        /* Scan Trace Animation */
+        .scan-trace-line {
+            width: 100%;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--accent), transparent);
+            position: absolute;
+            left: 0;
+            opacity: 0;
+            animation: scanTrace 3s infinite;
+        }
+        @keyframes scanTrace {
+            0% { top: 0%; opacity: 0; }
+            10% { opacity: 1; }
+            90% { opacity: 1; }
+            100% { top: 100%; opacity: 0; }
+        }
+
+        @keyframes scanWorkflow {
+            0% { top: 0; opacity: 0; }
+            15% { opacity: 1; }
+            85% { opacity: 1; }
+            100% { top: calc(100% - 30px); opacity: 0; }
+        }
+    </style>
+</head>
+<body class="antialiased">
+
+    <main class="max-w-[1400px] mx-auto px-6 py-12 md:py-20">
         
-        {}
-        <div className="max-w-3xl mb-16">
-          <h2 className="text-4xl md:text-5xl font-bold tracking-tight text-[#CBEFEB] mb-6">
-            Repository <span className="text-transparent bg-clip-text bg-gradient-to-r from-[#CBEFEB] via-[#48A89A] to-[#00524D]">intelligence</span>
-          </h2>
-          <p className="text-lg text-[#CBEFEB]/70 mb-8 font-light">
-            Bring repositories and local files into one unified security and deployment workflow.
-          </p>
-          
-          <div className="flex flex-wrap items-center gap-3">
-            <IntegrationBadge icon={Github} label="GitHub" active />
-            <IntegrationBadge icon={HardDrive} label="Local files" active />
-            <IntegrationBadge icon={Gitlab} label="GitLab" status="soon" />
-            <IntegrationBadge label="Bitbucket" status="soon" />
-          </div>
-        </div>
+        <!-- Header Section -->
+        <header class="mb-12">
+            <h1 class="text-5xl md:text-6xl font-bold tracking-tight mb-5 text-[#F5F5F7]">Repository intelligence</h1>
+            <p class="text-textSecondary text-xl max-w-3xl leading-relaxed">An enterprise-grade engine unifying repository ingestion, decoupled UI customization, proactive security, and zero-touch deployment.</p>
+            
+            <!-- Integration Toggles -->
+            <div class="flex flex-wrap gap-4 mt-8">
+                <button class="repo-btn active rounded-full px-5 py-2.5 flex items-center gap-3 text-sm font-medium">
+                    <i class="fa-brands fa-github text-lg"></i>
+                    <span>GitHub</span>
+                </button>
+                <button class="repo-btn rounded-full px-5 py-2.5 flex items-center gap-3 text-sm font-medium hover:border-textSecondary">
+                    <i class="fa-solid fa-hard-drive text-lg text-textMuted"></i>
+                    <span>Local files</span>
+                </button>
+                <button class="repo-btn soon rounded-full px-5 py-2.5 flex items-center gap-3 text-sm font-mono">
+                    <i class="fa-brands fa-gitlab text-lg"></i>
+                    <span>GitLab</span>
+                    <span class="text-[10px] text-accent tracking-widest uppercase ml-1">- SOON</span>
+                </button>
+                <button class="repo-btn soon rounded-full px-5 py-2.5 flex items-center gap-3 text-sm font-mono">
+                    <i class="fa-brands fa-bitbucket text-lg"></i>
+                    <span>Bitbucket</span>
+                    <span class="text-[10px] text-accent tracking-widest uppercase ml-1">- SOON</span>
+                </button>
+            </div>
+        </header>
 
-        {}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          
-          {/* Card 1: Codebase Map */}
-          <FeatureCard 
-            title="Codebase Map"
-            description="Unified topology of all dependencies, frameworks, and services."
-            icon={Network}
-            accentColor="from-[#00524D]/40 to-[#48A89A]/10"
-            accentBorder="group-hover:border-[#48A89A]/40"
-            diagram={
-              <div className="relative w-full h-full flex items-center justify-center">
-                <svg viewBox="0 0 200 100" className="w-full h-full overflow-visible">
-                  <path d="M100 50 L40 20 M100 50 L40 80 M100 50 L160 20 M100 50 L160 80" stroke="#00524D" strokeWidth="1.5" />
-                  <path d="M100 50 L40 20 M100 50 L40 80 M100 50 L160 20 M100 50 L160 80" stroke="url(#grad-map)" strokeWidth="2" className="anim-flow" opacity="0.8" />
-                  <g className="transform-gpu transition-transform group-hover:scale-110 duration-500">
-                    <circle cx="100" cy="50" r="14" fill="#000000" stroke="url(#grad-map)" strokeWidth="2" />
-                    <circle cx="100" cy="50" r="24" fill="none" stroke="url(#grad-map)" strokeWidth="1" opacity="0.4" style={{animation: 'pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite'}} />
-                  </g>
-                  <circle cx="40" cy="20" r="8" fill="#05393F" stroke="#00524D" strokeWidth="1.5" />
-                  <circle cx="40" cy="80" r="8" fill="#05393F" stroke="#00524D" strokeWidth="1.5" />
-                  <circle cx="160" cy="20" r="8" fill="#05393F" stroke="#00524D" strokeWidth="1.5" />
-                  <circle cx="160" cy="80" r="8" fill="#05393F" stroke="#00524D" strokeWidth="1.5" />
-                </svg>
-              </div>
-            }
-          />
-
-          {/* Card 2: Agent Conversation */}
-          <FeatureCard 
-            title="Agent Conversation"
-            description="Specify your infrastructure needs in plain English and get tailored blueprints."
-            icon={MessageSquare}
-            accentColor="from-[#05393F]/40 to-[#48A89A]/10"
-            accentBorder="group-hover:border-[#48A89A]/40"
-            diagram={
-              <div className="relative w-full h-full flex flex-col justify-center px-6 py-2 gap-3 overflow-hidden">
-                {/* User Prompt */}
-                <div 
-                  className="relative z-10 self-end w-[85%] bg-gradient-to-r from-[#00524D]/40 to-[#48A89A]/20 border border-[#48A89A]/30 rounded-2xl rounded-tr-sm p-3 shadow-lg origin-bottom-right" 
-                  style={{ animation: 'chat-user-in 8s infinite cubic-bezier(0.4, 0, 0.2, 1)' }}
-                >
-                  <div className="flex items-center justify-end gap-3 mb-2">
-                    <div className="flex flex-col items-end gap-1.5 w-full">
-                      <div className="w-full max-w-[120px] h-1.5 bg-[#CBEFEB]/80 rounded-full" />
-                      <div className="w-2/3 h-1.5 bg-[#CBEFEB]/40 rounded-full" />
-                    </div>
-                    <div className="w-5 h-5 flex-shrink-0 rounded-full bg-[#48A89A]/20 flex items-center justify-center border border-[#48A89A]/40">
-                      <User className="w-3 h-3 text-[#CBEFEB]" />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="relative w-[100%] self-start h-[100px]">
-                  {/* Typing Indicator */}
-                  <div 
-                    className="absolute top-0 left-0 bg-[#000000] border border-[#00524D] rounded-2xl rounded-tl-sm p-3 w-16 h-10 flex items-center justify-center gap-1.5 shadow-xl origin-bottom-left" 
-                    style={{ animation: 'chat-agent-typing 8s infinite cubic-bezier(0.4, 0, 0.2, 1)' }}
-                  >
-                    <div className="w-1.5 h-1.5 rounded-full bg-[#48A89A]" style={{ animation: 'blink 1s infinite' }} />
-                    <div className="w-1.5 h-1.5 rounded-full bg-[#48A89A]" style={{ animation: 'blink 1s infinite 0.2s' }} />
-                    <div className="w-1.5 h-1.5 rounded-full bg-[#48A89A]" style={{ animation: 'blink 1s infinite 0.4s' }} />
-                  </div>
-
-                  {/* Agent Response */}
-                  <div 
-                    className="absolute top-0 left-0 bg-[#000000]/90 border border-[#00524D] shadow-[0_0_20px_rgba(72,168,154,0.15)] rounded-2xl rounded-tl-sm p-3.5 w-[90%] origin-bottom-left group-hover:border-[#48A89A]/50 transition-colors duration-500" 
-                    style={{ animation: 'chat-agent-reply 8s infinite cubic-bezier(0.4, 0, 0.2, 1)' }}
-                  >
-                    <div className="flex items-center gap-2.5 mb-2.5">
-                      <div className="w-5 h-5 rounded-full bg-gradient-to-tr from-[#00524D] to-[#48A89A] flex items-center justify-center shadow-[0_0_10px_rgba(72,168,154,0.3)]">
-                        <Sparkles className="w-3 h-3 text-[#CBEFEB]" />
-                      </div>
-                      <div className="flex-1 flex gap-2">
-                        <div className="w-1/2 h-1.5 bg-[#CBEFEB]/60 rounded-full" />
-                        <div className="w-1/4 h-1.5 bg-[#CBEFEB]/30 rounded-full" />
-                      </div>
-                    </div>
-                    
-                    {/* Inner Diagram Generation */}
-                    <div className="h-12 w-full rounded-lg border border-[#48A89A]/30 bg-[#05393F]/20 relative overflow-hidden flex items-center justify-center">
-                       <svg viewBox="0 0 100 40" className="w-full h-full overflow-visible drop-shadow-[0_0_8px_rgba(72,168,154,0.2)]">
-                          <path d="M 35 20 L 65 20" stroke="url(#grad-map)" strokeWidth="1.5" strokeDasharray="100" style={{ animation: 'box-draw 8s infinite' }} />
-                          <rect x="15" y="10" width="20" height="20" rx="4" stroke="#48A89A" strokeWidth="1" strokeDasharray="100" style={{ animation: 'box-draw 8s infinite' }} />
-                          <circle cx="25" cy="20" r="4" fill="#48A89A" opacity="0.5" style={{ animation: 'blink 8s infinite' }} />
-                          <rect x="65" y="10" width="20" height="20" rx="4" stroke="#CBEFEB" strokeWidth="1" strokeDasharray="100" style={{ animation: 'box-draw 8s infinite' }} />
-                          <circle cx="75" cy="20" r="4" fill="#CBEFEB" opacity="0.5" style={{ animation: 'blink 8s infinite' }} />
-                       </svg>
-                       <div className="absolute left-0 top-0 h-full w-[2px] bg-gradient-to-b from-transparent via-[#CBEFEB] to-transparent shadow-[0_0_8px_rgba(203,239,235,0.8)]" style={{ animation: 'chat-agent-reply 8s infinite, scan-line 2.5s ease-in-out infinite 3.5s' }} />
-                    </div>
-                  </div>
-                </div>
-              </div>
-            }
-          />
-
-          {/* Card 3: Security Context */}
-          <FeatureCard 
-            title="Security Context"
-            description="Vulnerabilities traced directly back to affected source code lines."
-            icon={ShieldAlert}
-            accentColor="from-[#00524D]/40 to-[#48A89A]/10"
-            accentBorder="group-hover:border-[#48A89A]/40"
-            diagram={
-              <div className="relative w-full h-full flex items-center justify-center p-6">
-                <div className="w-full max-w-[200px] bg-[#05393F]/20 rounded-md border border-[#00524D] p-4 relative overflow-hidden font-mono text-[8px] leading-relaxed">
-                  <div className="w-3/4 h-1.5 bg-[#00524D] rounded mb-2" />
-                  <div className="w-1/2 h-1.5 bg-[#00524D] rounded mb-2" />
-                  <div className="w-full h-1.5 bg-[#00524D]/50 border border-[#48A89A]/60 rounded mb-2 relative">
-                     <div className="absolute -left-2 top-1/2 -translate-y-1/2 w-1 h-1 bg-[#CBEFEB] rounded-full animate-ping" />
-                  </div>
-                  <div className="w-5/6 h-1.5 bg-[#00524D] rounded mb-2" />
-                  <div className="w-2/3 h-1.5 bg-[#00524D] rounded" />
-                  
-                  {/* Laser Scanner Effect */}
-                  <div 
-                    className="absolute left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-[#48A89A] to-transparent shadow-[0_0_8px_rgba(72,168,154,0.8)] z-20"
-                    style={{ animation: 'scan-line 3s ease-in-out infinite' }}
-                  />
-                  <div 
-                    className="absolute left-0 w-full h-8 bg-gradient-to-b from-transparent to-[#00524D]/40 z-10"
-                    style={{ animation: 'scan-line 3s ease-in-out infinite' }}
-                  />
-                </div>
-              </div>
-            }
-          />
-
-          {/* Card 4: Deployment Readiness (Telemetry Radar) */}
-          <FeatureCard 
-            title="Deployment Readiness"
-            description="Pre-flight validation for missing configurations and architecture decisions."
-            icon={CheckCircle2}
-            accentColor="from-[#05393F]/40 to-[#48A89A]/10"
-            accentBorder="group-hover:border-[#48A89A]/40"
-            diagram={
-              <div className="relative w-full h-full flex items-center justify-center gap-6 p-6">
+        <div class="w-full min-h-[650px] flex">
+            
+            <!-- PANEL 1: MASTER TOPOLOGY CANVAS (Full width) -->
+            <div class="w-full tech-card hud-bracket rounded-2xl group cursor-crosshair relative overflow-hidden flex flex-col">
                 
-                {/* Radar Dial */}
-                <div className="relative w-28 h-28 flex-shrink-0 group-hover:scale-105 transition-transform duration-700">
-                  <svg viewBox="0 0 100 100" className="w-full h-full overflow-visible">
-                    <circle cx="50" cy="50" r="45" fill="none" stroke="#00524D" strokeWidth="1" />
-                    <circle cx="50" cy="50" r="35" fill="none" stroke="#00524D" strokeWidth="4" />
-
-                    <g className="origin-center animate-[spin_8s_linear_infinite]">
-                      <circle cx="50" cy="50" r="45" fill="none" stroke="url(#grad-ready)" strokeWidth="2" strokeDasharray="4 8" />
-                    </g>
-
-                    <g className="origin-center animate-[spin_12s_linear_infinite_reverse]">
-                       <circle cx="50" cy="50" r="35" fill="none" stroke="url(#grad-ready)" strokeWidth="5" strokeDasharray="60 40 30 20" strokeLinecap="round" className="opacity-80" />
-                    </g>
-                    <text x="50" y="54" textAnchor="middle" fill="#CBEFEB" fontSize="14" fontWeight="bold" fontFamily="monospace" className="drop-shadow-[0_0_8px_rgba(203,239,235,0.8)]">92%</text>
-                  </svg>
-                  
-                  {/* Radar Sweep */}
-                  <div className="absolute inset-0 rounded-full border border-[#48A89A]/10 shadow-[inset_0_0_20px_rgba(72,168,154,0.1)] overflow-hidden">
-                     <div className="absolute top-1/2 left-1/2 w-[50%] h-[2px] bg-gradient-to-r from-transparent via-[#CBEFEB] to-white origin-left animate-[spin_3s_linear_infinite]" />
-                     <div className="absolute top-1/2 left-1/2 w-[50%] h-[50%] bg-gradient-to-br from-[#48A89A]/40 to-transparent origin-top-left animate-[spin_3s_linear_infinite]" style={{ clipPath: 'polygon(0 0, 100% 0, 100% 100%)' }} />
-                  </div>
+                <!-- Floating Header -->
+                <div class="absolute top-0 left-0 w-full p-6 z-20 flex justify-between items-start pointer-events-none">
+                    <div class="flex items-center gap-3 bg-[#050505]/60 backdrop-blur-md px-4 py-2 rounded-full border border-white/5 shadow-lg">
+                        <i class="fa-solid fa-network-wired text-accent text-sm"></i>
+                        <h3 class="font-mono text-xs font-bold tracking-[0.15em] uppercase text-textMain">Live Topology</h3>
+                        <span class="w-2 h-2 rounded-full bg-accent animate-pulse ml-2"></span>
+                    </div>
                 </div>
 
-                {/* Live Equalizer Bars */}
-                <div className="flex flex-col gap-4 flex-1">
-                  <div className="flex items-end h-12 gap-1 border-b border-[#00524D] pb-1">
-                    {[
-                      { delay: '0s', h: '60%' }, { delay: '-0.5s', h: '80%' }, { delay: '-1.2s', h: '40%' },
-                      { delay: '-0.2s', h: '90%' }, { delay: '-0.8s', h: '50%' }, { delay: '-1.5s', h: '70%' },
-                      { delay: '-0.4s', h: '100%' }, { delay: '-1.1s', h: '65%' },
-                    ].map((bar, i) => (
-                      <div key={i} className="w-full bg-[#00524D]/30 rounded-t-sm relative overflow-hidden h-full">
-                        <div 
-                          className="absolute bottom-0 w-full bg-gradient-to-t from-[#00524D] to-[#48A89A] rounded-t-sm origin-bottom"
-                          style={{ height: bar.h, animation: `bar-pulse 1.5s ease-in-out infinite alternate`, animationDelay: bar.delay }} 
-                        />
-                      </div>
-                    ))}
-                  </div>
-                  
-                  <div className="space-y-2.5">
-                     <div className="flex items-center gap-3">
-                       <div className="w-1.5 h-1.5 rounded-full bg-[#CBEFEB] shadow-[0_0_8px_#CBEFEB] animate-pulse" />
-                       <div className="h-1 flex-1 bg-[#00524D]/50 rounded-full overflow-hidden">
-                         <div className="h-full bg-gradient-to-r from-[#00524D] to-[#48A89A] w-full relative">
-                           <div className="absolute inset-0 bg-white/20 animate-[scan-line_2s_linear_infinite]" />
-                         </div>
-                       </div>
-                     </div>
-                     <div className="flex items-center gap-3">
-                       <div className="w-1.5 h-1.5 rounded-full bg-[#CBEFEB] shadow-[0_0_8px_#CBEFEB] animate-pulse" style={{ animationDelay: '0.5s' }} />
-                       <div className="h-1 flex-1 bg-[#00524D]/50 rounded-full overflow-hidden">
-                         <div className="h-full bg-gradient-to-r from-[#00524D] to-[#48A89A]/80 w-[75%]" />
-                       </div>
-                     </div>
-                  </div>
+                <!-- Floating Capabilities Workflow HUD -->
+                <div class="absolute left-8 top-20 z-20 pointer-events-none hidden md:block max-w-md">
+                    <!-- Added subtle gradient backdrop to protect text readability from the moving canvas -->
+                    <div class="relative pl-8 space-y-10 border-l-2 border-white/10 py-6 bg-gradient-to-r from-[#050505]/95 via-[#050505]/60 to-transparent backdrop-blur-[2px] pr-12 rounded-r-3xl">
+                        <!-- Animated Scanning Line -->
+                        <div class="absolute left-[-2px] top-0 w-[2px] h-[50px] bg-accent shadow-[0_0_15px_var(--accent)] z-10" style="animation: scanWorkflow 8s ease-in-out infinite;"></div>
+
+                        <!-- 01 -->
+                        <div class="relative group">
+                            <div class="absolute -left-[37px] top-1.5 w-2.5 h-2.5 rounded-full bg-[#111214] border border-accent shadow-[0_0_10px_var(--accent-glow-strong)] transition-all"></div>
+                            <h4 class="font-mono text-xs text-accent tracking-[0.15em] mb-2 font-semibold">01. INGESTION</h4>
+                            <p class="text-sm text-textMain max-w-[280px] leading-relaxed opacity-95">Connect cloud repositories or local environments instantly.</p>
+                        </div>
+                        <!-- 02 -->
+                        <div class="relative group">
+                            <div class="absolute -left-[37px] top-1.5 w-2.5 h-2.5 rounded-full bg-[#111214] border border-white/20"></div>
+                            <h4 class="font-mono text-xs text-textSecondary tracking-[0.15em] mb-2 font-semibold">02. DECOUPLED UI</h4>
+                            <p class="text-sm text-textSecondary max-w-[280px] leading-relaxed">Modify frontend interfaces securely without altering core business logic.</p>
+                        </div>
+                        <!-- 03 -->
+                        <div class="relative group">
+                            <div class="absolute -left-[37px] top-1.5 w-2.5 h-2.5 rounded-full bg-[#111214] border border-white/20"></div>
+                            <h4 class="font-mono text-xs text-textSecondary tracking-[0.15em] mb-2 font-semibold">03. SECURITY REMEDIATION</h4>
+                            <p class="text-sm text-textSecondary max-w-[280px] leading-relaxed">Autonomous security scanning paired with AI-driven agent patching.</p>
+                        </div>
+                        <!-- 04 -->
+                        <div class="relative group">
+                            <div class="absolute -left-[37px] top-1.5 w-2.5 h-2.5 rounded-full bg-[#111214] border border-white/20"></div>
+                            <h4 class="font-mono text-xs text-textSecondary tracking-[0.15em] mb-2 font-semibold">04. AUTO DEPLOYMENT</h4>
+                            <p class="text-sm text-textSecondary max-w-[280px] leading-relaxed">Auto-provision required infrastructure and execute zero-touch deployments.</p>
+                        </div>
+                    </div>
                 </div>
 
-              </div>
+                <!-- Expanded Canvas Container -->
+                <div class="w-full h-full relative z-10 flex-1 min-h-[400px]">
+                    <canvas id="nodeMap" class="w-full h-full absolute inset-0"></canvas>
+                    
+                    <!-- Deep Space Background Elements -->
+                    <div class="absolute -bottom-20 -right-20 w-[500px] h-[500px] border border-accent/10 rounded-full opacity-30 group-hover:scale-110 transition-transform duration-[1500ms] pointer-events-none"></div>
+                    <div class="absolute -top-20 -left-20 w-[300px] h-[300px] border border-accent/5 rounded-full opacity-20 pointer-events-none"></div>
+                </div>
+
+                <!-- Floating Telemetry HUD (Integrated into Canvas) -->
+                <div class="absolute bottom-6 right-6 z-20 flex items-end gap-6 bg-[#050505]/40 backdrop-blur-md border border-white/5 p-4 rounded-xl shadow-2xl pointer-events-none">
+                    
+                    <!-- Circular Progress Dial -->
+                    <div class="relative w-24 h-24 flex-shrink-0">
+                        <svg class="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+                            <circle cx="50" cy="50" r="45" fill="none" stroke="rgba(255,255,255,0.05)" stroke-width="4" />
+                            <circle cx="50" cy="50" r="38" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="1" stroke-dasharray="2 4" />
+                            <circle 
+                                id="telemetry-ring"
+                                cx="50" cy="50" r="45" fill="none" 
+                                stroke="var(--accent)" stroke-width="4" 
+                                stroke-dasharray="283" stroke-dashoffset="283" 
+                                stroke-linecap="round"
+                                style="filter: drop-shadow(0 0 6px var(--accent-glow-strong));"
+                            />
+                        </svg>
+                        <div class="absolute inset-0 flex items-center justify-center flex-col">
+                            <span class="font-mono text-xl font-bold text-textMain" id="telemetry-val">0</span>
+                            <span class="font-mono text-[7px] text-textMuted tracking-widest mt-1">HEALTH</span>
+                        </div>
+                    </div>
+
+                    <!-- Equalizer / Network Load Bars -->
+                    <div class="flex flex-col justify-end space-y-3 pb-1 w-32">
+                        <div class="flex items-end gap-1 h-12 w-full" id="equalizer-bars">
+                            <!-- Bars injected by JS -->
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <div class="w-1 h-1 bg-accent rounded-full shadow-[0_0_5px_var(--accent)]"></div>
+                            <div class="h-1 bg-white/10 w-full rounded-sm overflow-hidden">
+                                <div class="h-full bg-accent w-[92%] shadow-[0_0_8px_var(--accent)]"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+        </div>
+    </main>
+
+    <script>
+        // ==========================================
+        // 1. NODE MAP PHYSICS ENGINE (Upgraded for large canvas)
+        // ==========================================
+        const canvas = document.getElementById('nodeMap');
+        const ctx = canvas.getContext('2d');
+        
+        let nodes = [];
+        let connections = [];
+        let mouseX = -1000;
+        let mouseY = -1000;
+
+        function initCanvas() {
+            const rect = canvas.parentElement.getBoundingClientRect();
+            canvas.width = rect.width * 2;
+            canvas.height = rect.height * 2;
+            ctx.scale(2, 2);
+            
+            const cw = rect.width;
+            const ch = rect.height;
+
+            // Define central Core node
+            const centerNode = { x: cw/2, y: ch/2, radius: 32, type: 'center', vx: 0, vy: 0, baseX: cw/2, baseY: ch/2 };
+            nodes = [centerNode];
+            connections = [];
+
+            // Define Primary child nodes (Inner Ring)
+            const numPrimary = 6;
+            const primaryDist = 120;
+            for(let i=0; i<numPrimary; i++) {
+                const angle = (i * 2 * Math.PI) / numPrimary;
+                const nx = cw/2 + Math.cos(angle) * primaryDist;
+                const ny = ch/2 + Math.sin(angle) * primaryDist;
+                nodes.push({ x: nx, y: ny, radius: 12, type: 'child', vx: 0, vy: 0, baseX: nx, baseY: ny, offset: i });
+                connections.push({ from: 0, to: nodes.length - 1 });
             }
-          />
 
-        </div>
-      </div>
-    </div>
-  );
-};
+            // Define Secondary child nodes (Outer Ring)
+            const numSecondary = 8;
+            const secondaryDist = 240;
+            for(let i=0; i<numSecondary; i++) {
+                const angle = (i * 2 * Math.PI) / numSecondary + 0.5;
+                const nx = cw/2 + Math.cos(angle) * secondaryDist;
+                const ny = ch/2 + Math.sin(angle) * secondaryDist;
+                nodes.push({ x: nx, y: ny, radius: 8, type: 'secondary', vx: 0, vy: 0, baseX: nx, baseY: ny, offset: i * 2 });
+                // Connect to a random primary node
+                const randomPrimary = Math.floor(Math.random() * numPrimary) + 1;
+                connections.push({ from: randomPrimary, to: nodes.length - 1 });
+                // Sometimes connect secondary nodes together
+                if (i > 0 && Math.random() > 0.5) {
+                    connections.push({ from: nodes.length - 2, to: nodes.length - 1 });
+                }
+            }
+        }
 
-// --- Sub-components ---
-const IntegrationBadge: React.FC<IntegrationBadgeProps> = ({ icon: Icon, label, active, status }) => (
-  <div className={`
-    flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium border transition-colors
-    ${active 
-      ? 'bg-[#05393F]/40 border-[#48A89A]/40 text-[#CBEFEB] hover:bg-[#05393F]/60' 
-      : 'bg-transparent border-[#00524D]/50 text-[#48A89A]/60'
-    }
-  `}>
-    {Icon && <Icon className="w-4 h-4" />}
-    {label}
-    {status && (
-      <span className="text-[10px] uppercase tracking-wider text-[#48A89A]/80 ml-1">- {status}</span>
-    )}
-  </div>
-);
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            mouseX = e.clientX - rect.left;
+            mouseY = e.clientY - rect.top;
+        });
+        canvas.addEventListener('mouseleave', () => {
+            mouseX = -1000; mouseY = -1000;
+        });
 
-const FeatureCard: React.FC<FeatureCardProps> = ({ title, description, icon: Icon, diagram, accentColor, accentBorder }) => (
-  <div className={`
-    group relative overflow-hidden rounded-2xl bg-[#000000] border border-[#00524D]/30 
-    hover:bg-[#05393F]/10 transition-all duration-500
-    ${accentBorder}
-  `}>
-    {/* Hover Accent Glow */}
-    <div className={`absolute -inset-px opacity-0 group-hover:opacity-100 transition-opacity duration-500 bg-gradient-to-br ${accentColor} blur-2xl z-0`} />
-    
-    <div className="relative z-10 flex flex-col h-full">
-      {/* Diagram Container */}
-      <div className="h-48 border-b border-[#00524D]/20 bg-gradient-to-b from-[#05393F]/20 to-transparent overflow-hidden">
-        {diagram}
-      </div>
-      
-      {/* Text Container */}
-      <div className="p-6">
-        <div className="flex items-center gap-3 mb-2">
-          <Icon className="w-4 h-4 text-[#48A89A] group-hover:text-[#CBEFEB] transition-colors" />
-          <h3 className="text-sm font-semibold tracking-wide text-[#CBEFEB] uppercase">{title}</h3>
-        </div>
-        <p className="text-[#CBEFEB]/60 text-sm leading-relaxed font-light">
-          {description}
-        </p>
-      </div>
-    </div>
-  </div>
-);
+        function animateNodes(time) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-export default Capabilities;
+            // Update Physics
+            nodes.forEach(node => {
+                if (node.type === 'child' || node.type === 'secondary') {
+                    // Complex sine wave floating based on time, type, and offset
+                    const speed = node.type === 'child' ? 1000 : 1500;
+                    const magnitude = node.type === 'child' ? 8 : 15;
+                    const hoverOffsetX = Math.cos(time / speed + node.offset) * magnitude;
+                    const hoverOffsetY = Math.sin(time / speed + node.offset) * magnitude;
+                    node.targetX = node.baseX + hoverOffsetX;
+                    node.targetY = node.baseY + hoverOffsetY;
+                } else {
+                    node.targetX = node.baseX;
+                    node.targetY = node.baseY;
+                }
+
+                // Mouse Repulsion Field
+                const dx = mouseX - node.x;
+                const dy = mouseY - node.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                
+                const repulseRadius = 100;
+                if (dist < repulseRadius) {
+                    const force = (repulseRadius - dist) / repulseRadius;
+                    node.targetX -= (dx / dist) * force * 30;
+                    node.targetY -= (dy / dist) * force * 30;
+                }
+
+                // Spring back
+                node.x += (node.targetX - node.x) * 0.08;
+                node.y += (node.targetY - node.y) * 0.08;
+            });
+
+            // Draw Connections
+            connections.forEach(conn => {
+                const n1 = nodes[conn.from];
+                const n2 = nodes[conn.to];
+                
+                const grad = ctx.createLinearGradient(n1.x, n1.y, n2.x, n2.y);
+                grad.addColorStop(0, 'rgba(255, 122, 158, 0.4)');
+                grad.addColorStop(1, 'rgba(255, 122, 158, 0.05)');
+                
+                ctx.beginPath();
+                // Make outer connections thinner
+                ctx.lineWidth = nodes[conn.to].type === 'secondary' ? 1 : 2;
+                ctx.strokeStyle = grad;
+                ctx.moveTo(n1.x, n1.y);
+                ctx.lineTo(n2.x, n2.y);
+                ctx.stroke();
+
+                // Draw moving data packets along primary lines occasionally
+                if (nodes[conn.to].type === 'child' && (Math.floor(time / 50) + conn.to) % 30 === 0) {
+                     ctx.beginPath();
+                     ctx.fillStyle = '#FF7A9E';
+                     const progress = (time % 1000) / 1000;
+                     const px = n1.x + (n2.x - n1.x) * progress;
+                     const py = n1.y + (n2.y - n1.y) * progress;
+                     ctx.arc(px, py, 2, 0, Math.PI * 2);
+                     ctx.fill();
+                     ctx.shadowBlur = 10;
+                     ctx.shadowColor = '#FF7A9E';
+                     ctx.fill();
+                     ctx.shadowBlur = 0;
+                }
+            });
+
+            // Draw Nodes
+            nodes.forEach(node => {
+                ctx.beginPath();
+                ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
+                
+                if (node.type === 'center') {
+                    ctx.fillStyle = '#050505';
+                    ctx.fill();
+                    ctx.lineWidth = 4;
+                    ctx.strokeStyle = '#FF7A9E';
+                    
+                    // Core pulsing effect
+                    const pulse = Math.sin(time / 300) * 5 + 15;
+                    ctx.shadowBlur = pulse;
+                    ctx.shadowColor = 'rgba(255, 122, 158, 0.6)';
+                    ctx.stroke();
+                    ctx.shadowBlur = 0; 
+                } else if (node.type === 'child') {
+                    ctx.fillStyle = '#1A1418';
+                    ctx.fill();
+                    ctx.lineWidth = 2;
+                    ctx.strokeStyle = '#FF7A9E';
+                    ctx.stroke();
+                } else {
+                    ctx.fillStyle = 'rgba(255, 122, 158, 0.1)';
+                    ctx.fill();
+                    ctx.lineWidth = 1;
+                    ctx.strokeStyle = 'rgba(255, 122, 158, 0.5)';
+                    ctx.stroke();
+                }
+            });
+
+            requestAnimationFrame(animateNodes);
+        }
+
+        // Initialize and handle resize
+        initCanvas();
+        requestAnimationFrame(animateNodes);
+        window.addEventListener('resize', initCanvas);
+
+
+        // ==========================================
+        // 3. TELEMETRY DASHBOARD (Now HUD Overlay)
+        // ==========================================
+        
+        const circle = document.getElementById('telemetry-ring');
+        const valText = document.getElementById('telemetry-val');
+        const targetPercent = 92;
+        const circumference = 2 * Math.PI * 45; // r=45
+        
+        // Initial setup
+        circle.style.strokeDasharray = `${circumference} ${circumference}`;
+        circle.style.strokeDashoffset = circumference;
+
+        setTimeout(() => {
+            const offset = circumference - (targetPercent / 100) * circumference;
+            circle.style.strokeDashoffset = offset;
+            
+            // Counter animation
+            let current = 0;
+            const timer = setInterval(() => {
+                current += 2;
+                if(current >= targetPercent) {
+                    current = targetPercent;
+                    clearInterval(timer);
+                }
+                valText.innerText = current + '%';
+            }, 30);
+        }, 500);
+
+        // Dynamic Equalizer Bars
+        const eqContainer = document.getElementById('equalizer-bars');
+        const numBars = 10; // Increased bars for HUD
+        const bars = [];
+
+        for(let i=0; i<numBars; i++) {
+            const bar = document.createElement('div');
+            bar.className = 'flex-1 bg-accent/80 rounded-t-sm transition-all duration-300 shadow-[0_0_5px_var(--accent-glow)]';
+            bar.style.height = '10%'; 
+            eqContainer.appendChild(bar);
+            bars.push(bar);
+        }
+
+        setInterval(() => {
+            bars.forEach(bar => {
+                if (bar === bars[bars.length - 1] || bar === bars[bars.length - 2]) {
+                    bar.style.height = (75 + Math.random() * 25) + '%';
+                } else {
+                    const height = 15 + Math.random() * 65;
+                    bar.style.height = height + '%';
+                    
+                    if(height < 35) bar.style.backgroundColor = 'rgba(255, 122, 158, 0.3)';
+                    else bar.style.backgroundColor = '#FF7A9E';
+                }
+            });
+        }, 400);
+
+    </script>
+</body>
+</html>

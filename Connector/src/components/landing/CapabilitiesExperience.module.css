@@ -1,0 +1,98 @@
+.section {
+  --accent: #ff7a9e;
+  --accent-soft: rgba(255, 122, 158, .12);
+  --text: #f5f5f7;
+  --secondary: #a7a7b0;
+  --muted: #70707a;
+  position: relative;
+  overflow: hidden;
+  padding: 5rem 1.5rem;
+  background: radial-gradient(circle at 80% 0%, rgba(255, 122, 158, .08), transparent 40%), linear-gradient(180deg, #050505, #090909);
+  color: var(--text);
+}
+
+.section::before, .section::after { content: ''; position: absolute; border-radius: 50%; pointer-events: none; filter: blur(130px); }
+.section::before { top: 0; right: 20%; width: 600px; height: 600px; background: rgba(255, 122, 158, .08); }
+.section::after { bottom: -180px; left: 15%; width: 500px; height: 500px; background: rgba(242, 85, 119, .08); }
+.content { position: relative; z-index: 1; width: 100%; max-width: 1400px; margin: 0 auto; }
+.header { max-width: 850px; margin-bottom: 3rem; }
+.header h2 { margin: 0 0 1.25rem; font-size: clamp(2.6rem, 5.4vw, 4rem); font-weight: 700; letter-spacing: -.045em; line-height: 1; }
+.header > p { max-width: 780px; margin: 0; color: var(--secondary); font-size: clamp(1rem, 2vw, 1.25rem); font-weight: 300; line-height: 1.55; }
+
+.integrations { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 2rem; }
+.integration { display: inline-flex; align-items: center; gap: .75rem; border: 1px solid rgba(255, 255, 255, .1); border-radius: 999px; background: rgba(255, 255, 255, .03); padding: .65rem 1.25rem; color: var(--secondary); cursor: pointer; font-size: .875rem; font-weight: 500; transition: color .3s ease, border-color .3s ease, background .3s ease, box-shadow .3s ease; }
+.integration:hover:not(:disabled) { border-color: rgba(255, 149, 176, .7); color: var(--text); }
+.integrationActive { border-color: var(--accent); background: rgba(255, 122, 158, .05); box-shadow: 0 0 15px var(--accent-soft); color: #fff; }
+.integrationSoon { cursor: not-allowed; opacity: .5; }
+.integration small { color: var(--accent); font-family: var(--font-mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+
+.topology { position: relative; display: flex; min-height: 650px; overflow: hidden; border-radius: 1rem; background: rgba(5, 5, 5, .16); cursor: crosshair; }
+.topology::before { content: ''; position: absolute; inset: 0; z-index: 1; pointer-events: none; background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(255,255,255,.01) 2px, rgba(255,255,255,.01) 4px); }
+.cornerBrackets::before, .cornerBrackets::after { content: ''; position: absolute; z-index: 5; width: 12px; height: 12px; border: 1px solid var(--accent); opacity: .3; transition: opacity .3s ease; pointer-events: none; }
+.cornerBrackets::before { top: 0; left: 0; border-right: 0; border-bottom: 0; }
+.cornerBrackets::after { right: 0; bottom: 0; border-left: 0; border-top: 0; }
+.topology:hover .cornerBrackets::before, .topology:hover .cornerBrackets::after { opacity: 1; }
+
+.topologyHeader { position: absolute; z-index: 4; top: 1.5rem; left: 1.5rem; pointer-events: none; }
+.topologyHeader span { display: flex; align-items: center; gap: .7rem; border: 1px solid rgba(255,255,255,.05); border-radius: 999px; background: rgba(5,5,5,.6); padding: .5rem 1rem; box-shadow: 0 8px 22px rgba(0,0,0,.28); backdrop-filter: blur(12px); color: var(--text); font-family: var(--font-mono); font-size: 11px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
+.topologyHeader svg { color: var(--accent); }
+.topologyHeader i { width: 8px; height: 8px; margin-left: .35rem; border-radius: 50%; background: var(--accent); box-shadow: 0 0 9px var(--accent); animation: pulse 1.5s ease-in-out infinite; }
+
+.workflow { position: absolute; z-index: 4; top: 5rem; left: 2rem; width: min(360px, 42%); border-left: 2px solid rgba(255,255,255,.1); border-radius: 0 1.5rem 1.5rem 0; background: linear-gradient(90deg, rgba(5,5,5,.95), rgba(5,5,5,.58), transparent); padding: 1.5rem 3rem 1.5rem 2rem; backdrop-filter: blur(2px); pointer-events: none; }
+.workflow > div:not(.workflowScan) { position: relative; margin-bottom: 2.25rem; }
+.workflow > div:last-child { margin-bottom: 0; }
+.workflow > div > i { position: absolute; top: .25rem; left: -2.62rem; width: 10px; height: 10px; border: 1px solid rgba(255,255,255,.2); border-radius: 50%; background: #111214; }
+.workflowPrimary > i { border-color: var(--accent) !important; box-shadow: 0 0 10px rgba(255,122,158,.3); }
+.workflow h3 { margin: 0 0 .45rem; color: var(--secondary); font-family: var(--font-mono); font-size: 12px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; }
+.workflowPrimary h3 { color: var(--accent); }
+.workflow p { max-width: 280px; margin: 0; color: var(--secondary); font-size: 14px; line-height: 1.5; }
+.workflowPrimary p { color: var(--text); }
+.workflowScan { position: absolute !important; top: 0; left: -2px; width: 2px; height: 50px; background: var(--accent); box-shadow: 0 0 15px var(--accent); animation: workflowScan 8s ease-in-out infinite; }
+
+.canvasShell { position: relative; z-index: 2; flex: 1; min-height: 650px; }
+.canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; }
+.ringLarge, .ringSmall { position: absolute; z-index: -1; border: 1px solid rgba(255,122,158,.1); border-radius: 50%; pointer-events: none; }
+.ringLarge { right: -5rem; bottom: -5rem; width: 500px; height: 500px; opacity: .3; transition: transform 1.5s ease; }
+.ringSmall { top: -5rem; left: -5rem; width: 300px; height: 300px; opacity: .2; }
+.topology:hover .ringLarge { transform: scale(1.1); }
+
+.telemetry { position: absolute; z-index: 4; right: 1.5rem; bottom: 1.5rem; display: flex; align-items: flex-end; gap: 1.5rem; border: 1px solid rgba(255,255,255,.05); border-radius: .75rem; background: rgba(5,5,5,.4); padding: 1rem; box-shadow: 0 18px 36px rgba(0,0,0,.4); backdrop-filter: blur(12px); pointer-events: none; }
+.healthDial { position: relative; width: 96px; height: 96px; flex-shrink: 0; }
+.healthDial svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+.healthRing { stroke: var(--accent); filter: drop-shadow(0 0 6px rgba(255,122,158,.3)); transition: stroke-dashoffset 1.38s cubic-bezier(.2, .8, .2, 1); }
+.healthDial > div { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.healthDial strong { font-family: var(--font-mono); font-size: 20px; }
+.healthDial small { margin-top: .25rem; color: var(--muted); font-family: var(--font-mono); font-size: 7px; letter-spacing: .12em; text-transform: uppercase; }
+.equalizer { display: flex; width: 128px; flex-direction: column; justify-content: flex-end; gap: .75rem; padding-bottom: .25rem; }
+.bars { display: flex; height: 48px; align-items: flex-end; gap: 4px; }
+.bars i { flex: 1; border-radius: 2px 2px 0 0; background: var(--accent); box-shadow: 0 0 5px rgba(255,122,158,.2); transition: height .3s ease, opacity .3s ease; }
+.signal { display: flex; align-items: center; gap: .5rem; }
+.signal > i { width: 4px; height: 4px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 5px var(--accent); }
+.signal span { width: 100%; height: 4px; overflow: hidden; border-radius: 2px; background: rgba(255,255,255,.1); }
+.signal b { display: block; width: 92%; height: 100%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+
+@keyframes pulse { 50% { opacity: .35; transform: scale(.75); } }
+@keyframes workflowScan { 0% { top: 0; opacity: 0; } 15% { opacity: 1; } 85% { opacity: 1; } 100% { top: calc(100% - 50px); opacity: 0; } }
+
+@media (min-width: 768px) { .section { padding: 5rem 4rem; } }
+@media (max-width: 767px) {
+  .section { padding: 4rem 1.25rem; }
+  .header { margin-bottom: 2.25rem; }
+  .integrations { gap: .65rem; }
+  .integration { padding: .55rem .9rem; }
+  .topology, .canvasShell { min-height: 540px; }
+  .workflow { display: none; }
+  .telemetry { right: 1rem; bottom: 1rem; transform: scale(.82); transform-origin: bottom right; }
+}
+@media (max-width: 480px) {
+  .topology, .canvasShell { min-height: 470px; }
+  .topologyHeader { top: 1rem; left: 1rem; }
+  .topologyHeader span { padding: .45rem .75rem; font-size: 9px; }
+  .integrations { gap: .5rem; }
+  .integration { gap: .45rem; padding: .5rem .7rem; font-size: 12px; }
+  .integration small { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .topologyHeader i, .workflowScan { animation: none; }
+  .healthRing, .bars i, .ringLarge, .cornerBrackets::before, .cornerBrackets::after { transition: none; }
+}
