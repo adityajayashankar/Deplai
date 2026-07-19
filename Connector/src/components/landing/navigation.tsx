@@ -5,11 +5,13 @@ import { Button } from "@/components/ui/button";
 import { Menu, X } from "lucide-react";
 
 const navLinks = [
-  { name: "Capabilities",  href: "#features"      },
-  { name: "Process",       href: "#how-it-works"  },
-  { name: "Infra",         href: "#infra"          },
-  { name: "Integrations",  href: "#integrations"  },
-  { name: "Security",      href: "#security"      },
+  { name: "Capabilities", href: "#features" },
+  { name: "Process", href: "#how-it-works" },
+  { name: "Security", href: "#security" },
+  { name: "Infra", href: "#infra" },
+  { name: "Integrations", href: "#integrations" },
+  { name: "Pricings", href: "#pricing" },
+  { name: "Documentation", href: "/dashboard/documentation" },
 ];
 
 const githubLoginHref = "/api/auth/login?force=1";
@@ -53,7 +55,7 @@ export function Navigation() {
           </a>
 
           {/* Desktop Navigation */}
-          <div className="hidden md:flex items-center gap-12">
+          <div className="hidden md:flex items-center gap-7">
             {navLinks.map((link) => (
               <a
                 key={link.name}

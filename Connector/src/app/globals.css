@@ -209,7 +209,7 @@ body {
 @keyframes repository-chat-user-in { 0%, 5% { opacity: 0; transform: translateY(10px) scale(.95); } 10%, 90% { opacity: 1; transform: translateY(0) scale(1); } 95%, 100% { opacity: 0; transform: translateY(-10px) scale(.95); } }
 @keyframes repository-chat-agent-typing { 0%, 15% { opacity: 0; transform: translateY(10px) scale(.95); } 20%, 35% { opacity: 1; transform: translateY(0) scale(1); } 40%, 100% { opacity: 0; transform: translateY(-10px) scale(.95); } }
 @keyframes repository-chat-agent-reply { 0%, 35% { opacity: 0; transform: translateY(10px) scale(.95); pointer-events: none; } 40%, 90% { opacity: 1; transform: translateY(0) scale(1); } 95%, 100% { opacity: 0; transform: translateY(-10px) scale(.95); } }
-@keyframes repository-box-draw { 0%, 45% { stroke-dashoffset: 200; opacity: 0; fill: transparent; } 55% { stroke-dashoffset: 0; opacity: 1; fill: transparent; } 65%, 100% { fill: rgba(72, 168, 154, .15); stroke-dashoffset: 0; opacity: 1; } }
+@keyframes repository-box-draw { 0%, 45% { stroke-dashoffset: 200; opacity: 0; fill: transparent; } 55% { stroke-dashoffset: 0; opacity: 1; fill: transparent; } 65%, 100% { fill: rgba(255, 122, 158, .12); stroke-dashoffset: 0; opacity: 1; } }
 
 @media (prefers-reduced-motion: reduce) {
   .compute-landing .animate-flow,
