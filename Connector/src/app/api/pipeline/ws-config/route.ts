@@ -21,7 +21,11 @@ export async function GET() {
   const { error } = await requireAuth();
   if (error) return error;
 
-  const wsBase = toWsBase(AGENTIC_URL);
+  // AGENTIC_LAYER_URL points to the Docker-internal service name. Prefer the
+  // public WebSocket URL so clients that fall back to this endpoint never try
+  // to connect to `ws://agentic-layer:8000` from the browser.
+  const publicWsUrl = String(process.env.NEXT_PUBLIC_AGENTIC_WS_URL || '').trim();
+  const wsBase = toWsBase(publicWsUrl || AGENTIC_URL);
   if (!wsBase) {
     return NextResponse.json(
       { success: false, error: 'Unable to resolve websocket base from AGENTIC_LAYER_URL.' },

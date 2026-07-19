@@ -2,7 +2,7 @@ import { getIronSession } from 'iron-session';
 import { cookies } from 'next/headers';
 import { NextResponse } from 'next/server';
 import { timingSafeEqual } from 'node:crypto';
-import { sessionOptions, SessionData } from './session';
+import { getSessionOptions, SessionData } from './session';
 import { query } from './db';
 
 function adminEmailSet(): Set<string> {
@@ -73,7 +73,7 @@ export async function hasWorkspaceAdminAccess(
 
 export async function getAuthenticatedUser() {
   const cookieStore = await cookies();
-  const session = await getIronSession<SessionData>(cookieStore, sessionOptions);
+  const session = await getIronSession<SessionData>(cookieStore, getSessionOptions());
 
   if (!session.isLoggedIn || !session.user) {
     return null;

@@ -81,6 +81,21 @@ Optional: Customization backend (FastAPI, port 8010)
 
 ## Local setup
 
+### Quick local Docker start
+
+For a complete local stack with no credentials required to open the UI, start
+Docker Desktop and run this from the repository root:
+
+```bash
+docker compose up --build
+```
+
+Open `http://localhost:3000`. This starts the Connector, Agentic Layer,
+customization backend, MySQL, Neo4j, and Qdrant. GitHub sign-in, repository
+access, PR creation, cloud deployment, and LLM-backed features require their
+respective credentials; see the full setup below. Stop the stack with
+`docker compose down` (do not add `-v` unless you intend to erase local data).
+
 ### 1. Create the shared environment file
 
 Copy `.env.template` to `.env` and set non-placeholder secrets. At minimum, configure:

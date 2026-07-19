@@ -1,14 +1,14 @@
 import { NextResponse } from 'next/server';
 import { getIronSession } from 'iron-session';
 import { cookies } from 'next/headers';
-import { sessionOptions } from '@/lib/session';
+import { getSessionOptions } from '@/lib/session';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 
 const LOGOUT_GUARD_COOKIE = 'deplai_recent_logout';
 
 export async function POST() {
   const cookieStore = await cookies();
-  const session = await getIronSession(cookieStore, sessionOptions);
+  const session = await getIronSession(cookieStore, getSessionOptions());
   const cleanupOnLogout = (process.env.CLEANUP_SCAN_VOLUMES_ON_LOGOUT || '').toLowerCase() === 'true';
 
   if (cleanupOnLogout) {

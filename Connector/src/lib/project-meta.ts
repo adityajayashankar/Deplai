@@ -10,6 +10,14 @@ export interface ProjectMeta {
   installation_uuid: string | null;
 }
 
+function safeRepositoryError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error || 'unknown error');
+  // Git command failures can include their remote URL.  Installation tokens
+  // are embedded in that URL for the clone itself, so never write credentials
+  // to container logs.
+  return message.replace(/(https?:\/\/)[^\s/@]+@/gi, '$1***@');
+}
+
 export async function resolveProjectMeta(
   userId: string,
   projectId: string,
@@ -53,20 +61,17 @@ export async function resolveProjectSourceRoot(
   if (meta.project_type === 'github' && meta.repo_full_name && meta.installation_uuid) {
     const [owner, repo] = meta.repo_full_name.split('/');
     if (!owner || !repo) return null;
-    const repoRootFallback = path.join(process.cwd(), 'tmp', 'repos', owner, repo);
     try {
       const repoRoot = await githubService.ensureRepoFresh(meta.installation_uuid, owner, repo);
       if (repoRoot && fs.existsSync(repoRoot) && fs.statSync(repoRoot).isDirectory()) {
         return repoRoot;
       }
-    } catch {
-      if (fs.existsSync(repoRootFallback) && fs.statSync(repoRootFallback).isDirectory()) {
-        return repoRootFallback;
-      }
+    } catch (error) {
+      // Do not treat a partial/failed clone as source code.  The detailed Git
+      // failure stays in server logs (and never reaches the browser, where a
+      // clone URL could expose an installation token).
+      console.error(`Unable to prepare GitHub repository ${owner}/${repo}: ${safeRepositoryError(error)}`);
       return null;
-    }
-    if (fs.existsSync(repoRootFallback) && fs.statSync(repoRootFallback).isDirectory()) {
-      return repoRootFallback;
     }
     return null;
   }

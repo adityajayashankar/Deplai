@@ -93,6 +93,12 @@ SNAPSHOT_IGNORED_DIR_NAMES = {
 }
 
 
+@app.get("/health")
+def health_check() -> dict[str, str]:
+    """Container readiness endpoint; the Connector remains the public gateway."""
+    return {"status": "healthy", "service": "customization-backend"}
+
+
 def _normalize_app_targets(raw_targets: object) -> list[str]:
     if not isinstance(raw_targets, list):
         return ["frontend", "admin-frontend", "expert", "corporates"]

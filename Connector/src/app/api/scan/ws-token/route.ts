@@ -3,10 +3,6 @@ import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { createHmac } from 'crypto';
 import { requireEnv } from '@/lib/env';
 
-// WS_TOKEN_SECRET is a server-side-only secret used to sign short-lived WebSocket tokens.
-// It must be explicitly configured and never default to an empty or unrelated secret.
-const WS_TOKEN_SECRET = requireEnv('WS_TOKEN_SECRET');
-
 export async function GET(request: NextRequest) {
   const { error, user } = await requireAuth();
   if (error) return error;
@@ -31,7 +27,10 @@ export async function GET(request: NextRequest) {
     JSON.stringify({ sub: String(user!.id), project_id: projectId, exp: Math.floor(Date.now() / 1000) + 300 })
   ).toString('base64url');
 
-  const sig = createHmac('sha256', WS_TOKEN_SECRET).update(payload).digest('hex');
+  // This is intentionally resolved per request: Next.js evaluates route modules
+  // during image builds, before Docker Compose provides runtime secrets.
+  const wsTokenSecret = requireEnv('WS_TOKEN_SECRET');
+  const sig = createHmac('sha256', wsTokenSecret).update(payload).digest('hex');
 
   return NextResponse.json({ token: `${payload}.${sig}` });
 }

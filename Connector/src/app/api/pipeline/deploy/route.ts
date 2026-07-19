@@ -729,7 +729,7 @@ const SERVICE_TYPE_SUFFIXES = [
   '-database', '-cache', '-balancer', '-gateway',
 ] as const;
 
-export function normalizeServiceType(raw: string): string {
+function normalizeServiceType(raw: string): string {
   const lower = raw.trim().toLowerCase();
   const stripped = SERVICE_TYPE_SUFFIXES.reduce(
     (s, suffix) => s.endsWith(suffix) ? s.slice(0, -suffix.length) : s,

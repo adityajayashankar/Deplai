@@ -1,0 +1,26 @@
+{
+    email {$ACME_EMAIL}
+}
+
+{$APP_DOMAIN} {
+    encode zstd gzip
+
+    header {
+        -Server
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    }
+
+    # The browser connects to the Agentic Layer only through this WSS route.
+    # handle_path strips /agentic so FastAPI still receives /ws/... and /api/....
+    handle_path /agentic/* {
+        reverse_proxy agentic-layer:8000
+    }
+
+    handle {
+        reverse_proxy connector:3000
+    }
+}

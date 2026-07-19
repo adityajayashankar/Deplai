@@ -1,0 +1,170 @@
+name: deplai-local
+
+# One-command local stack. From the repository root run:
+#   docker compose up --build
+#
+# It starts the Connector UI, Agentic Layer, customization backend, MySQL,
+# Neo4j, and Qdrant. GitHub OAuth/App and LLM functionality remains inactive
+# until real credentials are supplied as environment variables.
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --skip-name-resolve
+    environment:
+      MYSQL_DATABASE: deplai
+      MYSQL_USER: deplai
+      MYSQL_PASSWORD: deplai-local-password
+      MYSQL_ROOT_PASSWORD: deplai-local-root-password
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./Connector/database.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -udeplai -pdeplai-local-password --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  connector:
+    build:
+      context: .
+      dockerfile: Connector/Dockerfile
+      args:
+        NEXT_PUBLIC_APP_URL: http://localhost:3000
+        NEXT_PUBLIC_AGENTIC_WS_URL: ws://localhost:8000
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # The OAuth routes also need this at runtime to build callback URLs.
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+      # Used by the runtime WebSocket config fallback as well as the client build.
+      NEXT_PUBLIC_AGENTIC_WS_URL: ws://localhost:8000
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: deplai
+      DB_USER: deplai
+      DB_PASSWORD: deplai-local-password
+      AGENTIC_LAYER_URL: http://agentic-layer:8000
+      CUSTOMIZATION_AGENT_BASE_URL: http://customization:8010
+      CUSTOMIZATION_BACKEND_URL: http://customization:8010
+      DEPLAI_SERVICE_KEY: local-only-service-key-change-before-production
+      WS_TOKEN_SECRET: local-only-websocket-secret-change-before-production
+      SESSION_SECRET: local-only-session-secret-change-before-production
+      ADMIN_EMAILS: admin@local.test
+      ADMIN_ACCESS_KEY: local-only-admin-key-change-before-production
+      # Dummy values let the UI start. Replace all GitHub variables to enable
+      # sign-in, GitHub App installation, cloning, and PR creation locally.
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-local-client-id}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-local-client-secret}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-0}
+      GITHUB_PRIVATE_KEY: ${GITHUB_PRIVATE_KEY:-not-configured}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-local-webhook-secret}
+    ports:
+      - "3000:3000"
+    volumes:
+      - github_repos:/app/tmp/repos
+      - local_projects:/app/tmp/local-projects
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  agentic-layer:
+    build:
+      context: .
+      dockerfile: Agentic Layer/Dockerfile
+    restart: unless-stopped
+    # Local-only convenience: root is used solely so the service can reach the
+    # Docker Desktop socket without requiring host-specific group-ID setup.
+    # Production uses the non-root service in docker-compose.production.yml.
+    user: "0:0"
+    environment:
+      APP_ENV: development
+      DEPLAI_SERVICE_KEY: local-only-service-key-change-before-production
+      WS_TOKEN_SECRET: local-only-websocket-secret-change-before-production
+      CORS_ORIGINS: http://localhost:3000
+      DEPLAI_LOCAL_PROJECTS_ROOT: /local-projects
+      DEPLAI_GITHUB_REPOS_ROOT: /repos
+      IAC_WORKSPACE_ROOT: /workspace/iac-workspaces
+      NEO4J_URI: neo4j://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: deplai-local-neo4j-password
+      NEO4J_DATABASE: neo4j
+      QDRANT_URL: http://qdrant:6333
+      ALLOW_GLOBAL_CLEANUP: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - local_projects:/local-projects:ro
+      - github_repos:/repos:ro
+      - agentic_runtime:/workspace/runtime
+      - iac_workspaces:/workspace/iac-workspaces
+      - codebase_deplai:/var/lib/deplai/codebase:ro
+      - security_reports:/var/lib/deplai/security-reports:ro
+      - llm_output:/var/lib/deplai/llm-output:ro
+      - grype_db_cache:/var/lib/deplai/grype-db:ro
+    tmpfs:
+      - /tmp:size=2g,mode=1777
+    depends_on:
+      neo4j:
+        condition: service_started
+      qdrant:
+        condition: service_started
+
+  customization:
+    build:
+      context: .
+      dockerfile: Customization Agent/tenant_builder_app/backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: development
+      CUSTOMIZATION_PREVIEW_HOST: 127.0.0.1
+      CUSTOMIZATION_PREVIEW_AUTO_INSTALL: "0"
+    volumes:
+      - github_repos:/app/tmp/repos
+      - local_projects:/app/tmp/local-projects
+      - customization_state:/app/tenant_builder_app/backend/tenants
+      - customization_logs:/app/tenant_builder_app/backend/logs
+
+  neo4j:
+    image: neo4j:5-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/deplai-local-neo4j-password
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  mysql_data:
+  github_repos:
+  local_projects:
+  agentic_runtime:
+  iac_workspaces:
+  customization_state:
+  customization_logs:
+  neo4j_data:
+  neo4j_logs:
+  qdrant_data:
+  # The Agentic Layer Docker SDK refers to these exact volume names.
+  codebase_deplai:
+    name: codebase_deplai
+  security_reports:
+    name: security_reports
+  llm_output:
+    name: LLM_Output
+  grype_db_cache:
+    name: grype_db_cache

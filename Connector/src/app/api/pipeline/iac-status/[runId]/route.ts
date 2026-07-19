@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getIronSession } from "iron-session";
-import { sessionOptions, SessionData } from "@/lib/session";
+import { getSessionOptions, SessionData } from "@/lib/session";
 import { cookies } from "next/headers";
 
 const AGENTIC_URL = process.env.AGENTIC_LAYER_URL ?? "http://localhost:8001";
@@ -10,7 +10,7 @@ export async function GET(
   req: Request,
   { params }: { params: Promise<{ runId: string }> }
 ) {
-  const session = await getIronSession<SessionData>(await cookies(), sessionOptions);
+  const session = await getIronSession<SessionData>(await cookies(), getSessionOptions());
   if (!session.user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -37,7 +37,7 @@ export async function DELETE(
   req: Request,
   { params }: { params: Promise<{ runId: string }> }
 ) {
-  const session = await getIronSession<SessionData>(await cookies(), sessionOptions);
+  const session = await getIronSession<SessionData>(await cookies(), getSessionOptions());
   if (!session.user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }

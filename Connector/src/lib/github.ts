@@ -233,21 +233,36 @@ export class GitHubService {
   ): Promise<string> {
     const token = await this.getInstallationToken(installationId);
     const repoDir = this.repoPath(owner, repo);
+    const repoParent = path.dirname(repoDir);
 
-    fs.mkdirSync(path.dirname(repoDir), { recursive: true });
-    if (fs.existsSync(repoDir)) {
-      fs.rmSync(repoDir, { recursive: true, force: true });
-    }
+    fs.mkdirSync(repoParent, { recursive: true });
 
     const cloneUrl = `https://x-access-token:${token}@github.com/${owner}/${repo}.git`;
     const git = simpleGit();
+    // Clone into a sibling directory and only replace the cached checkout
+    // after Git succeeds.  In particular, a TLS/network failure must not
+    // leave an empty repoDir that later requests mistake for usable source.
+    const cloneRoot = fs.mkdtempSync(path.join(repoParent, `.${repo}.clone-`));
+    const cloneDir = path.join(cloneRoot, 'checkout');
 
     console.log(`Cloning ${owner}/${repo}...`);
 
-    await this.withBranchFallback(owner, repo, branch || 'main', async (b) => {
-      await git.clone(cloneUrl, repoDir, ['--depth', '1', '--single-branch', '--branch', b]);
-      console.log(`Cloned ${owner}/${repo} (branch: ${b}) successfully`);
-    });
+    try {
+      await this.withBranchFallback(owner, repo, branch || 'main', async (b) => {
+        // A missing configured default branch can leave a partial checkout.
+        // Start each fallback attempt with a fresh target directory.
+        fs.rmSync(cloneDir, { recursive: true, force: true });
+        await git.clone(cloneUrl, cloneDir, ['--depth', '1', '--single-branch', '--branch', b]);
+        console.log(`Cloned ${owner}/${repo} (branch: ${b}) successfully`);
+      });
+
+      if (fs.existsSync(repoDir)) {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+      }
+      fs.renameSync(cloneDir, repoDir);
+    } finally {
+      fs.rmSync(cloneRoot, { recursive: true, force: true });
+    }
 
     await this.updateRepoState(owner, repo, repoDir);
     return repoDir;
@@ -298,7 +313,10 @@ export class GitHubService {
       throw new Error('Repository not found in database');
     }
 
-    const needsRefresh = repoData.needs_refresh || !fs.existsSync(repoPath);
+    // A directory is not a valid cached repository unless it contains Git
+    // metadata.  This also recovers cleanly from interrupted legacy clones.
+    const hasUsableCheckout = fs.existsSync(path.join(repoPath, '.git'));
+    const needsRefresh = repoData.needs_refresh || !hasUsableCheckout;
 
     if (!needsRefresh) return repoPath;
 
@@ -567,8 +585,27 @@ export class GitHubService {
 
 }
 
-export const githubService = new GitHubService({
-  appId: requireEnv('GITHUB_APP_ID'),
-  privateKey: requireEnv('GITHUB_PRIVATE_KEY'),
-  webhookSecret: requireEnv('GITHUB_WEBHOOK_SECRET'),
+let githubServiceInstance: GitHubService | undefined;
+
+function getGithubService(): GitHubService {
+  if (!githubServiceInstance) {
+    githubServiceInstance = new GitHubService({
+      appId: requireEnv('GITHUB_APP_ID'),
+      privateKey: requireEnv('GITHUB_PRIVATE_KEY'),
+      webhookSecret: requireEnv('GITHUB_WEBHOOK_SECRET'),
+    });
+  }
+
+  return githubServiceInstance;
+}
+
+// Route modules are evaluated by Next.js while the Docker image is built.
+// Defer GitHub credential validation until an API handler actually uses it,
+// keeping the real credentials in the container's runtime environment.
+export const githubService = new Proxy({} as GitHubService, {
+  get(_target, property) {
+    const service = getGithubService();
+    const value = Reflect.get(service, property);
+    return typeof value === 'function' ? value.bind(service) : value;
+  },
 });

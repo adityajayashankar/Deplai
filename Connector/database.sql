@@ -1,8 +1,8 @@
-CREATE DATABASE deplai;
+CREATE DATABASE IF NOT EXISTS deplai;
 USE deplai;
 
 -- Users table
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id VARCHAR(36) PRIMARY KEY,
     email VARCHAR(255) NOT NULL UNIQUE,
     name VARCHAR(255),
@@ -10,7 +10,7 @@ CREATE TABLE users (
 );
 
 -- GitHub installations
-CREATE TABLE github_installations (
+CREATE TABLE IF NOT EXISTS github_installations (
     id VARCHAR(36) PRIMARY KEY,
     installation_id BIGINT NOT NULL UNIQUE,
     account_login VARCHAR(255) NOT NULL,
@@ -26,7 +26,7 @@ CREATE TABLE github_installations (
 );
 
 -- GitHub repositories
-CREATE TABLE github_repositories (
+CREATE TABLE IF NOT EXISTS github_repositories (
     id VARCHAR(36) PRIMARY KEY,
     installation_id VARCHAR(36) NOT NULL,
     github_repo_id BIGINT NOT NULL,
@@ -51,7 +51,7 @@ CREATE TABLE github_repositories (
 );
 
 -- Projects
-CREATE TABLE projects (
+CREATE TABLE IF NOT EXISTS projects (
     id VARCHAR(36) PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     project_type VARCHAR(20) NOT NULL DEFAULT 'github',
@@ -91,4 +91,14 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE,
     INDEX idx_chat_messages_session (session_id, created_at)
+);
+
+-- Workspace and tenant settings. This was previously created lazily by the
+-- API route; declaring it here keeps fresh Docker deployments deterministic.
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id VARCHAR(36) PRIMARY KEY,
+    data_json JSON NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );

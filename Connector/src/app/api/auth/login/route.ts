@@ -3,13 +3,13 @@ import { NextResponse } from 'next/server';
 import { getIronSession } from 'iron-session';
 import { cookies } from 'next/headers';
 import { requireEnv } from '@/lib/env';
-import { sessionOptions, type SessionData } from '@/lib/session';
+import { getSessionOptions, type SessionData } from '@/lib/session';
 
 const LOGOUT_GUARD_COOKIE = 'deplai_recent_logout';
 
 export async function GET(request: Request) {
   const cookieStore = await cookies();
-  const session = await getIronSession<SessionData>(cookieStore, sessionOptions);
+  const session = await getIronSession<SessionData>(cookieStore, getSessionOptions());
   const { searchParams } = new URL(request.url);
   const logoutGuardCookie = cookieStore.get(LOGOUT_GUARD_COOKIE)?.value;
   const isForcedLogin = searchParams.get('force') === '1';

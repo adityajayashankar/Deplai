@@ -1,0 +1,44 @@
+# Keep secrets, local state, and large development artifacts out of every image
+.git
+.env
+.env.*
+!.env.template
+**/.env
+**/.env.*
+!**/.env.template
+
+# Dependency and build output
+**/node_modules
+**/.next
+**/dist
+**/build
+**/.venv
+**/.venv-*
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/*.py[cod]
+
+# Runtime data and user uploads
+Connector/tmp
+runtime
+Agentic Layer/runtime
+Customization Agent/SubSpace-*
+Customization Agent/tenant_builder_app/backend/tenants
+Customization Agent/tenant_builder_app/backend/logs
+tmp
+temp_tf_fmt_check
+tmp_tf_fmt_check
+
+# Editor and local-only files
+.vscode
+.idea
+.claude
+.kiro
+.hypothesis
+scratch_puppeteer
+fallback-plan.txt
+tmp.txt
+tmp_stages_ui.tsx
+test_index.html
+

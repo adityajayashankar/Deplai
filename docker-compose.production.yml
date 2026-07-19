@@ -1,0 +1,208 @@
+name: deplai
+
+# Production deployment stack. Use this file with --env-file deploy/.env.
+# Only Caddy publishes host ports; every application API and database stays on
+# the private Docker network.
+services:
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2.8.4-alpine}
+    restart: unless-stopped
+    env_file:
+      - ./deploy/.env
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - backend
+    depends_on:
+      connector:
+        condition: service_healthy
+      agentic-layer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  mysql:
+    image: ${MYSQL_IMAGE:-mysql:8.4}
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --skip-name-resolve
+    env_file:
+      - ./deploy/.env
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?Set MYSQL_DATABASE in deploy/.env}
+      MYSQL_USER: ${MYSQL_USER:?Set MYSQL_USER in deploy/.env}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in deploy/.env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in deploy/.env}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./Connector/database.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  connector:
+    build:
+      context: .
+      dockerfile: Connector/Dockerfile
+      args:
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:?Set NEXT_PUBLIC_APP_URL in deploy/.env}
+        NEXT_PUBLIC_AGENTIC_WS_URL: ${NEXT_PUBLIC_AGENTIC_WS_URL:?Set NEXT_PUBLIC_AGENTIC_WS_URL in deploy/.env}
+    restart: unless-stopped
+    env_file:
+      - ./deploy/.env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: ${MYSQL_DATABASE}
+      DB_USER: ${MYSQL_USER}
+      DB_PASSWORD: ${MYSQL_PASSWORD}
+      AGENTIC_LAYER_URL: http://agentic-layer:8000
+      CUSTOMIZATION_AGENT_BASE_URL: http://customization:8010
+      CUSTOMIZATION_BACKEND_URL: http://customization:8010
+    volumes:
+      - github_repos:/app/tmp/repos
+      - local_projects:/app/tmp/local-projects
+    networks:
+      - backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+      customization:
+        condition: service_healthy
+
+  agentic-layer:
+    build:
+      context: .
+      dockerfile: Agentic Layer/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./deploy/.env
+    environment:
+      APP_ENV: production
+      DEPLAI_LOCAL_PROJECTS_ROOT: /local-projects
+      DEPLAI_GITHUB_REPOS_ROOT: /repos
+      IAC_WORKSPACE_ROOT: /workspace/iac-workspaces
+      NEO4J_URI: neo4j://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in deploy/.env}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      QDRANT_URL: http://qdrant:6333
+    # The current scanner, remediation, and Terraform implementations create
+    # short-lived worker containers through the Docker Engine. Keep this API
+    # private and see deploy/README.md for the trust-boundary requirement.
+    group_add:
+      - "${DOCKER_GID:?Set DOCKER_GID to the host Docker socket group ID}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - local_projects:/local-projects:ro
+      - github_repos:/repos:ro
+      - agentic_runtime:/workspace/runtime
+      - iac_workspaces:/workspace/iac-workspaces
+      - codebase_deplai:/var/lib/deplai/codebase:ro
+      - security_reports:/var/lib/deplai/security-reports:ro
+      - llm_output:/var/lib/deplai/llm-output:ro
+      - grype_db_cache:/var/lib/deplai/grype-db:ro
+    tmpfs:
+      - /tmp:size=2g,mode=1777
+    networks:
+      - backend
+    depends_on:
+      neo4j:
+        condition: service_started
+      qdrant:
+        condition: service_started
+
+  customization:
+    build:
+      context: .
+      dockerfile: Customization Agent/tenant_builder_app/backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./deploy/.env
+    environment:
+      APP_ENV: production
+      CUSTOMIZATION_PREVIEW_HOST: 127.0.0.1
+      CUSTOMIZATION_PREVIEW_AUTO_INSTALL: "0"
+    volumes:
+      # Preserve the same paths that the Connector sends in customization
+      # requests, while keeping them inaccessible from the public network.
+      - github_repos:/app/tmp/repos
+      - local_projects:/app/tmp/local-projects
+      - customization_state:/app/tenant_builder_app/backend/tenants
+      - customization_logs:/app/tenant_builder_app/backend/logs
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8010/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  neo4j:
+    image: ${NEO4J_IMAGE:-neo4j:5-community}
+    restart: unless-stopped
+    env_file:
+      - ./deploy/.env
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in deploy/.env}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      - backend
+
+  qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.13.6}
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
+  mysql_data:
+  github_repos:
+  local_projects:
+  agentic_runtime:
+  iac_workspaces:
+  customization_state:
+  customization_logs:
+  neo4j_data:
+  neo4j_logs:
+  qdrant_data:
+  # These exact names are used by the Docker SDK in the Agentic Layer.
+  codebase_deplai:
+    name: codebase_deplai
+  security_reports:
+    name: security_reports
+  llm_output:
+    name: LLM_Output
+  grype_db_cache:
+    name: grype_db_cache

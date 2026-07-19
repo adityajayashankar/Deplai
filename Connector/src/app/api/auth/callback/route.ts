@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { timingSafeEqual } from 'crypto';
 import { getIronSession } from 'iron-session';
 import { cookies } from 'next/headers';
-import { sessionOptions, SessionData } from '@/lib/session';
+import { getSessionOptions, SessionData } from '@/lib/session';
 import { query } from '@/lib/db';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -56,7 +56,7 @@ function safeStateMatches(expected: string, actual: string): boolean {
 export async function GET(request: NextRequest) {
   try {
     const cookieStore = await cookies();
-    const session = await getIronSession<SessionData>(cookieStore, sessionOptions);
+    const session = await getIronSession<SessionData>(cookieStore, getSessionOptions());
     const { searchParams } = new URL(request.url);
     const code = searchParams.get('code');
     const installationIdParam = String(searchParams.get('installation_id') || '').trim();

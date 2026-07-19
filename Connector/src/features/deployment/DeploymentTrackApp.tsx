@@ -109,6 +109,7 @@ type DeploymentPlanOption = {
 };
 
 const PIPELINE_SOCKET_RETRY_DELAYS_MS = [1000, 2000, 5000, 5000];
+const CONNECTOR_READINESS_RETRY_DELAYS_MS = [0, 500, 1_500];
 const APPROVED_DECISION_KEY = 'deplai.pipeline.approvedDecision';
 const DECISION_COST_ESTIMATE_KEY = 'deplai.pipeline.decisionCostEstimate';
 const DEPLOYMENT_PLAN_KEY = 'deplai.pipeline.deploymentPlan';
@@ -121,6 +122,33 @@ const DEFAULT_EC2_RESOURCE_CONFIG: Ec2ResourceConfig = {
   app_port: 3000,
   ssh_ingress_cidr_blocks: [],
 };
+
+function waitForDelay(delayMs: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
+}
+
+async function ensureConnectorApiReady(): Promise<void> {
+  let lastReason = 'no response';
+
+  for (const delayMs of CONNECTOR_READINESS_RETRY_DELAYS_MS) {
+    if (delayMs > 0) await waitForDelay(delayMs);
+    try {
+      const response = await fetch('/api/health', {
+        cache: 'no-store',
+        credentials: 'same-origin',
+      });
+      if (response.ok) return;
+      lastReason = `HTTP ${response.status}`;
+    } catch (error) {
+      lastReason = error instanceof Error ? error.message : 'network error';
+    }
+  }
+
+  throw new Error(
+    `The DeplAI API is not ready to start Terraform generation (${lastReason}). ` +
+    'Wait a moment for the Connector service to become healthy, then select Regenerate Terraform.',
+  );
+}
 
 const DEPLOYMENT_PLAN_OPTIONS: DeploymentPlanOption[] = [
   {
@@ -3048,9 +3076,16 @@ export default function DeploymentTrackApp() {
     setTerraformGenerating(true);
     appendLog('Starting infrastructure generation from the confirmed deployment profile.', 'info', { stage: 'terraform_generation' });
     try {
+      // The dashboard may restore this stage immediately after a Connector
+      // container restart.  Do not fire the one-shot generation request until
+      // the same-origin API is ready; otherwise browsers surface only the
+      // unhelpful TypeError: Failed to fetch.
+      await ensureConnectorApiReady();
       const response = await fetch('/api/pipeline/iac', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        credentials: 'same-origin',
         body: JSON.stringify({
           project_id: selectedProject.id,
           provider: 'aws',
@@ -3155,9 +3190,12 @@ export default function DeploymentTrackApp() {
       }
       return true;
     } catch (reason) {
-      const message = reason instanceof Error ? reason.message : 'Infrastructure generation failed.';
+      const rawMessage = reason instanceof Error ? reason.message : 'Infrastructure generation failed.';
+      const message = /failed to fetch/i.test(rawMessage)
+        ? 'The connection to the DeplAI API was interrupted before Terraform generation returned a result. Select Regenerate Terraform to retry.'
+        : rawMessage;
       appendLog(message, 'error', { stage: 'terraform_generation' });
-      throw reason;
+      throw new Error(message);
     } finally {
       setTerraformGenerating(false);
     }
