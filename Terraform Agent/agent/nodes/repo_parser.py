@@ -1,4 +1,4 @@
-﻿"""repo_parser.py – Reads the repository from disk (if not already loaded) and
+"""repo_parser.py – Reads the repository from disk (if not already loaded) and
 extracts infrastructure signals from file names and content.
 
 Bug fixed: previously this node expected ``raw_file_contents`` to be
@@ -49,7 +49,7 @@ def run_repo_parser(state: AgentState) -> AgentState:
         signals.append("dockerfile_present")
     if "docker-compose" in lower_blob:
         signals.append("compose_present")
-    if "psycopg2" in lower_blob or "sqlalchemy" in lower_blob:
+    if "psycopg2" in lower_blob or "sqlalchemy" in lower_blob or "prisma" in lower_blob:
         signals.append("postgres_libraries_detected")
     if "redis" in lower_blob:
         signals.append("redis_detected")
@@ -108,7 +108,7 @@ def run_repo_parser(state: AgentState) -> AgentState:
         tech_stack["frameworks"].append("nextjs")
 
     # Data stores
-    if "sqlalchemy" in lower_blob or "psycopg2" in lower_blob:
+    if "sqlalchemy" in lower_blob or "psycopg2" in lower_blob or "prisma" in lower_blob:
         tech_stack["data_stores"].append("postgres")
     if "redis" in lower_blob:
         tech_stack["data_stores"].append("redis")

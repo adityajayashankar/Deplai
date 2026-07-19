@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from typing import Any
 
 from deployment_packager import DeploymentPackage
@@ -165,6 +166,59 @@ def _redis_settings(deployment_profile: dict[str, Any] | None) -> dict[str, Any]
     }
 
 
+def _app_env_vars_hcl(env_map: dict[str, str]) -> str:
+    """Render a HCL map literal from a Python dict of env var key→value pairs."""
+    if not env_map:
+        return "{}"
+    lines = [
+        f'    {json.dumps(k)} = {json.dumps(v)}'
+        for k, v in sorted(env_map.items())
+    ]
+    return "{\n" + "\n".join(lines) + "\n  }"
+
+
+def _build_app_env_vars(
+    deployment_package: DeploymentPackage,
+    database: dict[str, Any],
+) -> dict[str, str]:
+    """Build a map of env vars to inject into the EC2 app's .env file.
+
+    When RDS is enabled, DATABASE_URL is constructed from Terraform output
+    interpolation expressions so the value is resolved at apply time.
+    The caller MUST treat this dict as Terraform HCL template values, not
+    plain strings — they may contain ``${...}`` interpolations.
+    """
+    env: dict[str, str] = {}
+    if not database.get("enabled"):
+        return env
+
+    engine = str(database.get("engine") or "postgres").lower()
+    # Terraform interpolation: resolved after aws_db_instance is created.
+    # Port is known from the db_port local in main.tf.
+    if engine in {"mysql", "mariadb"}:
+        protocol = "mysql"
+        port_expr = "${local.db_port}"
+    else:
+        protocol = "postgresql"
+        port_expr = "${local.db_port}"
+
+    # These are rendered as Terraform template strings inside the user_data.
+    # The actual values are interpolated when Terraform creates the EC2 resource.
+    env["DATABASE_URL"] = (
+        f"{protocol}://deplaiadmin:"
+        "${random_password.db_master[0].result}"
+        "@${aws_db_instance.app[0].address}"
+        f":{port_expr}/appdb"
+    )
+    env["DB_HOST"] = "${aws_db_instance.app[0].address}"
+    env["DB_PORT"] = port_expr
+    env["DB_NAME"] = "appdb"
+    env["DB_USER"] = "deplaiadmin"
+    env["DB_PASSWORD"] = "${random_password.db_master[0].result}"
+    return env
+
+
+
 def render_ec2_app_bundle(
     *,
     project_name: str,
@@ -184,7 +238,41 @@ def render_ec2_app_bundle(
     app_port = int(ec2_settings["app_port"])
     root_volume_size_gb = int(ec2_settings["root_volume_size_gb"])
     ssh_ingress_cidr_blocks = list(ec2_settings["ssh_ingress_cidr_blocks"])
-    database = _database_settings(deployment_profile)
+
+    # ── Database: merge detected repo requirements with profile settings ──────
+    # db_requirements from the packager (real repo scan) takes precedence over
+    # what the architecture profile says, ensuring prisma/postgres apps always
+    # get RDS even when the architecture agent didn't notice it.
+    repo_db = deployment_package.db_requirements
+    profile_db = _database_settings(deployment_profile)
+    if repo_db.enabled and not profile_db.get("enabled"):
+        # Repo scan found a DB need that the profile missed — promote it.
+        database: dict[str, Any] = {
+            "enabled": True,
+            "engine": repo_db.engine or "postgres",
+            "engine_version": "",
+            "instance_class": "db.t3.micro",
+            "allocated_storage": 20,
+            "multi_az": False,
+            "backup_retention_period": 7,
+            "deletion_protection": False,
+        }
+    else:
+        database = profile_db
+
+    # Generate a stable random JWT secret for this project (used when the app
+    # has no JWT_SECRET set). We derive it from project_slug so it is
+    # deterministic across regenerates but unique per project.
+    import hashlib as _hashlib
+    jwt_secret = _hashlib.sha256(f"deplai-jwt-{project_slug}".encode()).hexdigest()
+
+    app_env_vars = _build_app_env_vars(deployment_package, database)
+    # Always inject a JWT_SECRET so auth frameworks don't crash even when there
+    # is no user-supplied secret.
+    app_env_vars.setdefault("JWT_SECRET", jwt_secret)
+    app_env_vars.setdefault("NODE_ENV", "production")
+    app_env_vars.setdefault("PORT", str(app_port))
+
     redis = _redis_settings(deployment_profile)
     backend_tf = 'terraform {\n  backend "local" {}\n}\n'
     if state_bucket and lock_table:
@@ -392,7 +480,19 @@ variable "redis_engine_version" {{
   type    = string
   default = {_hcl_string(redis.get("engine_version"))}
 }}
+
+variable "has_prisma" {{
+  type    = bool
+  default = {str(bool(repo_db.has_prisma)).lower()}
+}}
 '''
+
+    # Build tfvars env map — when RDS is enabled the DATABASE_URL contains
+    # Terraform interpolation expressions, so we emit a templatefile()-style
+    # locals block in main.tf instead of a static tfvars entry.
+    # For the tfvars file we only include non-interpolated vars.
+    static_env_vars = {k: v for k, v in app_env_vars.items() if "${" not in v}
+    interpolated_env_vars = {k: v for k, v in app_env_vars.items() if "${" in v}
 
     tfvars = f'''project_name = {_hcl_string(project_slug)}
 aws_region = {_hcl_string(aws_region)}
@@ -426,16 +526,29 @@ db_deletion_protection = {str(bool(database.get("deletion_protection"))).lower()
 enable_elasticache = {str(bool(redis["enabled"])).lower()}
 redis_node_type = {_hcl_string(redis.get("node_type"))}
 redis_engine_version = {_hcl_string(redis.get("engine_version"))}
+has_prisma = {str(bool(repo_db.has_prisma)).lower()}
 '''
 
-    main_tf = r'''locals {
-  tags = {
+    main_tf = f'''locals {{
+  tags = {{
     Project     = var.project_name
     Environment = var.environment
     ManagedBy   = "deplai"
     Renderer    = "deplai_ec2_app"
-  }
-}
+  }}
+  # Static env vars always injected into the app .env file.
+  # DB vars are added at runtime via a separate locals block (below)
+  # that uses try() so they are safe when enable_rds=false.
+  static_env_block = join("\\n", [
+    "NODE_ENV=production",
+    "PORT=${{var.app_port}}",
+    "JWT_SECRET={jwt_secret}",
+  ])
+}}
+'''
+
+    main_tf_resources = r'''
+
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -547,7 +660,26 @@ resource "aws_security_group" "app" {
 
 locals {
   db_port = contains(["mysql", "mariadb"], var.db_engine) ? 3306 : 5432
+
+  # Build the DATABASE_URL and companion vars using try() so that when
+  # enable_rds=false (count=0) the expression safely returns "" instead
+  # of causing a Terraform plan error from a missing resource reference.
+  _db_address  = try(aws_db_instance.app[0].address, "")
+  _db_pw       = try(random_password.db_master[0].result, "")
+  db_env_block = var.enable_rds ? join("\n", [
+    "DATABASE_URL=postgresql://deplaiadmin:${local._db_pw}@${local._db_address}:${local.db_port}/appdb",
+    "DB_HOST=${local._db_address}",
+    "DB_PORT=${local.db_port}",
+    "DB_NAME=appdb",
+    "DB_USER=deplaiadmin",
+    "DB_PASSWORD=${local._db_pw}",
+  ]) : ""
+  app_env_block = join("\n", compact([
+    local.db_env_block,
+    local.static_env_block,
+  ]))
 }
+
 
 resource "aws_security_group" "database" {
   count       = var.enable_rds ? 1 : 0
@@ -612,7 +744,14 @@ resource "aws_db_instance" "app" {
   auto_minor_version_upgrade  = true
   copy_tags_to_snapshot       = true
   tags                        = merge(local.tags, { Name = "${var.project_name}-db" })
+
+  timeouts {
+    create = "45m"
+    update = "60m"
+    delete = "40m"
+  }
 }
+
 
 resource "aws_security_group" "redis" {
   count       = var.enable_elasticache ? 1 : 0
@@ -850,6 +989,35 @@ if [ "$APP_KIND" = "python" ] && [ -f requirements.txt ]; then
 fi
 write_status "application_dependencies_ready"
 
+# ── Write .env file with injected environment variables ──────────────────────
+# local.app_env_block is computed by Terraform before EC2 boots. It contains
+# the actual DATABASE_URL (resolved from RDS outputs) and static vars like
+# NODE_ENV, PORT, JWT_SECRET. The shell never sees raw ${...} expressions.
+printf '%s\n' '${local.app_env_block}' > "$APP_DIR/.env"
+chmod 600 "$APP_DIR/.env" || true
+write_status "env_file_written"
+
+# ── Prisma: generate client and run migrations ───────────────────────────────
+# Run only for node apps that have a prisma directory (detected at build time).
+if [ "$APP_KIND" = "node" ] && [ "${var.has_prisma}" = "true" ]; then
+  export $(grep -v '^#' "$APP_DIR/.env" | xargs) 2>/dev/null || true
+  # Generate Prisma client (may already be done in node_modules from npm install)
+  npx prisma generate --schema="$APP_DIR/prisma/schema.prisma" 2>/dev/null \
+    || npx prisma generate 2>/dev/null || true
+  # Run migrations if migrations directory exists; otherwise push schema
+  if [ -d "$APP_DIR/prisma/migrations" ] && [ "$(ls -A "$APP_DIR/prisma/migrations" 2>/dev/null)" ]; then
+    write_status "prisma_migrate_deploy_started"
+    npx prisma migrate deploy --schema="$APP_DIR/prisma/schema.prisma" 2>/dev/null \
+      || npx prisma migrate deploy 2>/dev/null || true
+    write_status "prisma_migrate_deploy_done"
+  else
+    write_status "prisma_db_push_started"
+    npx prisma db push --schema="$APP_DIR/prisma/schema.prisma" --accept-data-loss 2>/dev/null \
+      || npx prisma db push --accept-data-loss 2>/dev/null || true
+    write_status "prisma_db_push_done"
+  fi
+fi
+
 if [ "$APP_KIND" = "static" ]; then
   rm -rf /usr/share/nginx/html/*
   cp -R "$APP_DIR"/. /usr/share/nginx/html/
@@ -1050,7 +1218,7 @@ Generated by the deterministic `deplai_ec2_app` renderer. No LLM generated Terra
         {"path": "terraform/providers.tf", "content": providers_tf},
         {"path": "terraform/backend.tf", "content": backend_tf},
         {"path": "terraform/variables.tf", "content": variables_tf},
-        {"path": "terraform/main.tf", "content": main_tf},
+        {"path": "terraform/main.tf", "content": main_tf + main_tf_resources},
         {"path": "terraform/outputs.tf", "content": outputs_tf},
         {"path": "terraform/terraform.tfvars", "content": tfvars},
         {"path": "README.md", "content": readme},

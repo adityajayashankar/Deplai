@@ -1,4 +1,4 @@
-﻿import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { validateTerraformArchitectureInput } from '@/lib/deployment-planning-contract';
@@ -448,46 +448,73 @@ function inferRepositoryDetection(params: {
     || (params.frontendDetection?.runtime === 'node' ? 'javascript' : params.frontendDetection?.runtime === 'python' ? 'python' : '')
     || 'unknown';
 
+  // Treat 'unknown' from frontendDetection as absent so repo scanner frameworks take priority
+  const frontendFramework = readText(params.frontendDetection?.framework);
   const framework =
-    readText(params.frontendDetection?.framework)
+    (frontendFramework && frontendFramework !== 'unknown' ? frontendFramework : '')
     || readText(frameworks[0]?.name)
     || readText(repoFrontend.framework)
     || readText(metadata.framework)
     || 'unknown';
 
-  const dataTypes = dataLayer
-    .map(item => readText(item.type).toLowerCase())
-    .filter(Boolean);
+  // Combine data_layer (architecture diagram) + data_stores (Python scanner) for broad coverage
+  const repoDataStores = asRecords(repositoryContext.data_stores);
+  const dataTypes = [
+    ...dataLayer.map(item => readText(item.type).toLowerCase()),
+    ...repoDataStores.map(ds => readText(ds.type).toLowerCase()),
+  ].filter(Boolean);
+
+  // nodeHas searches architecture node corpus only (not the full repo context to avoid false positives)
   const nodeHas = (re: RegExp) => re.test(nodeCorpus);
 
-  const hasRedis = dataTypes.includes('redis') || nodeHas(/redis|elasticache/);
-  const databaseType = dataTypes.find((t) => ['postgres', 'postgresql', 'mysql', 'mariadb', 'mongodb', 'dynamodb'].includes(t))
-    || (nodeHas(/postgres|rds/) ? 'postgres'
-      : nodeHas(/mysql|mariadb/) ? 'mysql'
-        : nodeHas(/mongodb|documentdb/) ? 'mongodb'
-          : nodeHas(/dynamodb/) ? 'dynamodb'
+  // repoContextHas scans the Python scanner output for additional signals
+  const repoContextStr = JSON.stringify(repositoryContext).toLowerCase();
+  const repoHas = (re: RegExp) => re.test(repoContextStr);
+
+  const hasRedis =
+    dataTypes.includes('redis')
+    || nodeHas(/redis|elasticache/)
+    || repoHas(/redis|elasticache/);
+
+  const databaseType =
+    dataTypes.find((t) => ['postgres', 'postgresql', 'mysql', 'mariadb', 'mongodb', 'dynamodb'].includes(t))
+    || (nodeHas(/postgres|rds/) || repoHas(/psycopg2|sqlalchemy|postgresql|database_url/) ? 'postgres'
+      : nodeHas(/mysql|mariadb/) || repoHas(/mysql|mariadb/) ? 'mysql'
+        : nodeHas(/mongodb|documentdb/) || repoHas(/mongodb|mongoose/) ? 'mongodb'
+          : nodeHas(/dynamodb/) || repoHas(/dynamodb/) ? 'dynamodb'
             : 'unknown');
   const hasDatabase = databaseType !== 'unknown';
 
   const hasWebServer =
     services.some((service) => readText(service.process_type).toLowerCase() === 'web')
+    || asRecords(repositoryContext.processes).some(p => readText(p.type).toLowerCase() === 'web')
     || nodeHas(/alb|load[_ -]?balancer|api[_ -]?gateway|web|nginx|ecs|ec2|fargate|service/);
 
   const hasWorkers =
     services.some((service) => readText(service.process_type).toLowerCase() === 'worker')
-    || nodeHas(/worker|celery|sidekiq|consumer|batch|cron|job/);
+    || asRecords(repositoryContext.processes).some(p => readText(p.type).toLowerCase() === 'worker')
+    || nodeHas(/worker|celery|sidekiq|consumer|batch|cron|job/)
+    || repoHas(/"celery"|"sidekiq"|"rq"/);
 
   const hasStaticAssets =
     Boolean(params.frontendDetection?.has_build_output)
     || nodeHas(/cloudfront|static|cdn|s3/)
-    || readText(repoBuild.output_dir).length > 0;
+    || readText(repoBuild.output_dir).length > 0
+    || readText(asRecord(repositoryContext.build).output_dir).length > 0;
 
   const hasDockerfile =
     readBoolLike(repoBuild.has_dockerfile) === true
+    || readBoolLike(asRecord(repositoryContext.build).has_dockerfile) === true
     || readBoolLike(metadata.has_dockerfile) === true
-    || readText(repoBuild.dockerfile_path).length > 0;
+    || readText(repoBuild.dockerfile_path).length > 0
+    || readText(asRecord(repositoryContext.build).dockerfile_path).length > 0
+    || readBoolLike(asRecord(repositoryContext.infrastructure_hints).existing_compose) === true;
 
-  const hasQueue = nodeHas(/queue|sqs|rabbitmq|kafka|pubsub/);
+  const hasQueue =
+    nodeHas(/queue|sqs|rabbitmq|kafka|pubsub/)
+    || dataTypes.some(t => ['rabbitmq', 'kafka'].includes(t))
+    || repoHas(/"rabbitmq"|"kafka"|"sqs"|"pubsub"/);
+
 
   return {
     language: language.toLowerCase(),
@@ -635,7 +662,7 @@ function buildDeterministicConsultantDecision(params: {
   if (hasRds) {
     stackConfig.rds = {
       engine: databaseEngine,
-      engine_version: databaseEngine === 'mysql' ? '8.0' : databaseEngine === 'mariadb' ? '10.11' : '15.3',
+      engine_version: databaseEngine === 'mysql' ? '8.0' : databaseEngine === 'mariadb' ? '10.11' : '15.10',
       instance_class: 'db.t3.micro',
       multi_az: false,
       backup_retention_period: 7,

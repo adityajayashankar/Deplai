@@ -358,7 +358,7 @@ def _derive_data_layer(context: RepositoryContextDocument, answers: dict[str, st
                 DataLayerProfile(
                     id="primary_db",
                     type="postgresql",
-                    engine_version=store.version or "15.4",
+                    engine_version=store.version or "16.6",
                     instance_class=db_instance_class,
                     multi_az=answers.get("q_db_multi_az", "true") == "true",
                     storage_gb=storage_gb,

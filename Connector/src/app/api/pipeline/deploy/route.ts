@@ -791,7 +791,7 @@ export async function POST(req: NextRequest) {
     }
 
     const runtimeMode = body.runtime_apply === true;
-    if (provider === 'aws') {
+    if (provider === 'aws' && !runtimeMode) {
       let agenticRes: Response;
       try {
         agenticRes = await fetch(`${AGENTIC_URL}/api/iac/generate-and-apply`, {
@@ -803,7 +803,7 @@ export async function POST(req: NextRequest) {
           body: JSON.stringify({
             project_id: projectId,
             service_type: body.service_type,
-            repo_context: body.repo_context ?? {},
+            repo_context: { ...((body.repo_context as Record<string, unknown>) ?? {}), project_name: projectName },
             user_customizations: body.customizations ?? body.user_customizations ?? {},
             aws_credentials: {
               access_key_id: body.aws_access_key_id,

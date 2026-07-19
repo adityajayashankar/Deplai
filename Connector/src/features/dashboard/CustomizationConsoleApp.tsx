@@ -124,9 +124,30 @@ const PROVIDER_MODEL_MAP: Record<ByokProvider, ByokModel[]> = {
     { id: 'moonshotai/kimi-k2-instruct', name: 'Kimi K2 (Coding)' },
   ],
   OpenRouter: [
-    { id: 'anthropic/claude-opus-4-5', name: 'Claude Opus 4.5 (via OpenRouter)' },
-    { id: 'google/gemini-2.5-pro', name: 'Gemini 2.5 Pro (via OpenRouter)' },
-    { id: 'openai/gpt-4o', name: 'GPT-4o (via OpenRouter)' },
+    // ── High-capability free models ──────────────────────────────────────
+    { id: 'nvidia/nemotron-3-ultra-550b-a55b:free', name: 'NVIDIA: Nemotron 3 Ultra 550B (1M ctx) ⭐' },
+    { id: 'nvidia/nemotron-3-super-120b-a12b:free', name: 'NVIDIA: Nemotron 3 Super 120B (1M ctx)' },
+    { id: 'qwen/qwen3-coder:free', name: 'Qwen: Qwen3 Coder 480B (1M ctx)' },
+    { id: 'openai/gpt-oss-120b:free', name: 'OpenAI: GPT OSS 120B (131k ctx)' },
+    { id: 'meta-llama/llama-3.3-70b-instruct:free', name: 'Meta: Llama 3.3 70B Instruct (131k ctx)' },
+    { id: 'nousresearch/hermes-3-llama-3.1-405b:free', name: 'Nous: Hermes 3 405B Instruct (131k ctx)' },
+    { id: 'nex-agi/nex-n2-pro:free', name: 'Nex AGI: Nex-N2-Pro (262k ctx)' },
+    { id: 'qwen/qwen3-next-80b-a3b-instruct:free', name: 'Qwen: Qwen3 Next 80B A3B (262k ctx)' },
+    // ── Mid-tier free models ──────────────────────────────────────────────
+    { id: 'google/gemma-4-31b-it:free', name: 'Google: Gemma 4 31B (262k ctx)' },
+    { id: 'google/gemma-4-26b-a4b-it:free', name: 'Google: Gemma 4 26B A4B (262k ctx)' },
+    { id: 'poolside/laguna-m.1:free', name: 'Poolside: Laguna M.1 (262k ctx)' },
+    { id: 'poolside/laguna-xs.2:free', name: 'Poolside: Laguna XS.2 (262k ctx)' },
+    { id: 'nvidia/nemotron-3-nano-30b-a3b:free', name: 'NVIDIA: Nemotron 3 Nano 30B A3B (256k ctx)' },
+    { id: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', name: 'NVIDIA: Nemotron 3 Nano Omni (256k ctx)' },
+    { id: 'nvidia/nemotron-nano-12b-v2-vl:free', name: 'NVIDIA: Nemotron Nano 12B V2 VL (128k ctx)' },
+    { id: 'nvidia/nemotron-nano-9b-v2:free', name: 'NVIDIA: Nemotron Nano 9B V2 (128k ctx)' },
+    { id: 'openai/gpt-oss-20b:free', name: 'OpenAI: GPT OSS 20B (131k ctx)' },
+    { id: 'meta-llama/llama-3.2-3b-instruct:free', name: 'Meta: Llama 3.2 3B Instruct (131k ctx)' },
+    { id: 'liquid/lfm-2.5-1.2b-thinking:free', name: 'LiquidAI: LFM2.5-1.2B-Thinking (32k ctx)' },
+    { id: 'liquid/lfm-2.5-1.2b-instruct:free', name: 'LiquidAI: LFM2.5-1.2B-Instruct (32k ctx)' },
+    { id: 'nvidia/nemotron-3.5-content-safety:free', name: 'NVIDIA: Nemotron 3.5 Content Safety (128k ctx)' },
+    { id: 'cognitivecomputations/dolphin-mistral-24b-venice-edition:free', name: 'Venice: Uncensored Dolphin Mistral 24B (32k ctx)' },
   ],
   MiniMax: [
     { id: 'minimax-m3', name: 'MiniMax M3 (Latest / Agentic)' },
@@ -664,7 +685,9 @@ export default function CustomizationConsoleApp() {
       }, 100);
 
     } catch (error) {
-      setStatus({ level: 'error', text: error instanceof Error ? error.message : 'Failed to send chat message.' });
+      const errorMsg = error instanceof Error ? error.message : 'Failed to send chat message.';
+      setStatus({ level: 'error', text: errorMsg });
+      setChatMessages((prev) => [...prev, { role: 'agent', content: `Error: ${errorMsg}`, timestamp: nowStamp() }]);
     } finally {
       setLoading((prev) => ({ ...prev, chat: false }));
     }
@@ -834,13 +857,13 @@ export default function CustomizationConsoleApp() {
                         <span className="text-[13px] font-bold text-zinc-100 tracking-wide">Deplai Agent</span>
                         <span className="text-[10px] text-zinc-600 font-mono">{msg.timestamp}</span>
                       </div>
-                      <div className="text-[13px] leading-relaxed text-zinc-300">{formatUiText(msg.content)}</div>
+                      <div className="text-[13px] leading-relaxed text-zinc-300 select-text cursor-text">{formatUiText(msg.content)}</div>
                     </div>
                   </div>
                 ) : (
                   <div key={i} className="flex flex-col items-end">
                     <span className="text-[10px] text-zinc-600 font-mono mb-1.5">{msg.timestamp}</span>
-                    <div className="px-4 py-2.5 bg-zinc-100 text-zinc-900 text-[13px] font-semibold rounded-2xl rounded-tr-sm max-w-[85%] shadow-sm">
+                    <div className="px-4 py-2.5 bg-zinc-100 text-zinc-900 text-[13px] font-semibold rounded-2xl rounded-tr-sm max-w-[85%] shadow-sm select-text cursor-text">
                       {formatUiText(msg.content)}
                     </div>
                   </div>

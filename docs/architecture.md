@@ -1,401 +1,248 @@
-# DeplAI Architecture
+# DeplAI architecture
 
-## Table of Contents
-- System Context
-- Constraints and Non-goals
-- Component Inventory
-- End-to-End Data Flows
-- Agent and Service Contracts
-- Architecture Decision Records
-- Non-functional Characteristics
-- Security Model
-- Diagrams
+This document describes the implementation currently present in the repository. It is derived from the Connector, Agentic Layer, Terraform Agent, customization backend, database schema, and Docker configuration.
 
-## System Context
-DeplAI is an internal deployment orchestration platform with a clear control-plane and execution-plane split:
-- Control plane: Connector (Next.js) authenticates users, enforces ownership checks, and exposes user-facing API routes.
-- Execution plane: Agentic Layer (FastAPI) performs long-running scan/remediation/planning/deployment workflows.
+## System boundary
 
-The system is optimized for:
-- Project-scoped isolation in Docker volumes.
-- Ownership-validated operations before any backend execution.
-- Progressive pipeline UX through websocket streaming and status polling.
+DeplAI has a browser-facing control plane and a backend execution plane.
 
-## Constraints and Non-goals
-### Hard constraints implemented in code
-- Agentic Layer requires DEPLAI_SERVICE_KEY at startup; service refuses to boot without it.
-- Websocket tokens are project-bound and short-lived (5 minutes), signed with WS_TOKEN_SECRET.
-- Global cleanup is disabled unless ALLOW_GLOBAL_CLEANUP=true.
-- Terraform runtime apply route enforces strict request size limits and stale bundle checks before execution.
-- Multiple timeout guards exist across API-to-API calls and runtime operations.
-
-### Explicit non-goals visible in implementation
-- Multi-cloud runtime apply is not implemented: runtime_apply in Connector deploy route accepts AWS only.
-- Agentic Layer does not persist scan contexts beyond in-memory process lifetime.
-- Agentic health endpoint currently reports Docker and Neo4j checks only; deeper component checks are composed by Connector.
-
-## Component Inventory
-| Component | Type | Responsibility | Owns | Depends On |
-|---|---|---|---|---|
-| Connector | Next.js app + API routes | Authenticated UI and API facade for all workflow stages | Browser session state, API contracts, user settings endpoints | MySQL, Agentic Layer, GitHub API |
-| Connector auth module | Server lib | Session auth and ownership checks for local/GitHub projects | Session cookie contract, ownership logic | iron-session, MySQL tables |
-| Connector DB pool | Service | Shared MySQL execution pool | Connection pool (limit 10), SQL execution surface | MySQL server |
-| Agentic Layer FastAPI app | Backend API | Scan/remediation/planning/terraform/aws endpoints + websocket buses | In-memory active workflow maps, endpoint contracts | Docker, boto3, optional Neo4j |
-| EnvironmentInitializer | Runner | Scan orchestration with per-project volume scope | Scan pipeline state in websocket stream | Docker engine, Bearer, Syft, Grype |
-| RemediationRunner | Runner | Root-cause dedup, remediation loops, approval-gated progression | Remediation cycle state | scan result parser, Claude model adapters, Docker |
-| Repository analysis service | Analyzer | Derive repository_context document from codebase signals | context.json/context.md in runtime/repo-analyzer | filesystem, yaml/json parser |
-| Architecture decision service | Planner | Generate review questions and deployment profile from repository context + answers | review_payload.json, deployment_profile.json, architecture_view.json | repository analysis, stage7 bridge |
-| Stage7 bridge | Adapter | Invoke Stage7 subprocess or deterministic fallback payload | Approval payload object | Diagram-Cost-Agent runner path, cost estimator |
-| Terraform apply runtime | Executor | Execute terraform init/plan/apply in ephemeral Docker volume and parse outputs | apply status cache, emitted pipeline events | hashicorp/terraform:1.9.0 image, AWS APIs |
-| GitHub service (Connector) | Integration service | GitHub App installation tokens, clone/pull, webhook-related DB sync | Installation token cache | Octokit, MySQL |
-| Diagram-Cost-Agent | LangGraph agent | Build diagram nodes/edges and cost/budget payload for Stage 7 | stage7_approval_payload.json output | langgraph, boto3/openai backends |
-| Terraform Agent | LangGraph agent | Generate Terraform bundle from repository/deployment profile | output terraform bundle paths | langgraph, xAI/OpenAI-compatible model |
-
-## End-to-End Data Flows
-### Flow 1: Scan and remediation
-1. User calls Connector POST /api/scan/validate with project_id, project_name, project_type, scan_type.
-2. Connector validates session and ownership, enriches GitHub token for GitHub projects, forwards to Agentic POST /api/scan/validate.
-3. Agentic stores scan context in memory and returns success.
-4. Client obtains websocket token from Connector GET /api/scan/ws-token?project_id=... .
-5. Client opens Agentic WS /ws/scan/{project_id} with token and sends action=start.
-6. EnvironmentInitializer pipeline runs:
-   - Validates Docker engine.
-   - Ensures volumes exist.
-   - Clears project-specific paths and stale reports.
-   - Copies local project or clones GitHub repo to project-scoped folder in codebase_deplai volume.
-   - Executes Bearer and/or Syft+Grype based on scan_type.
-7. Agentic status endpoint returns running/found/not_found/not_initiated based on in-memory state and parsed volume reports.
-8. Connector GET /api/scan/results returns parsed findings grouped by CWE and CVE metadata.
-9. User starts remediation via Connector POST /api/remediate/start; Connector forwards validated payload to Agentic POST /api/remediate/validate.
-10. Client opens WS /ws/remediate/{project_id}; remediation rounds proceed with continue_round, push_current, approve_push actions.
-
-Failure behavior:
-- Invalid/missing ws token closes socket with code 1008.
-- Missing context on start emits websocket error status with explicit message.
-- Backend connectivity failures are mapped to 502/504 by Connector routes.
-
-### Flow 2: Planning to deployment
-1. Connector POST /api/repository-analysis/run forwards to Agentic /api/repository-analysis/run.
-2. Agentic resolves source path and writes runtime artifacts:
-   - runtime/repo-analyzer/<workspace>/context.json
-   - runtime/repo-analyzer/<workspace>/context.md
-3. Connector POST /api/architecture/review/start requests review payload.
-4. Agentic returns context_json + generated architecture questions and defaults.
-5. Connector POST /api/architecture/review/complete sends operator answers.
-6. Agentic returns:
-   - answers_json
-   - deployment_profile
-   - architecture_view
-   - approval_payload
-7. Connector POST /api/pipeline/stage7 can also call Agentic /api/stage7/approval directly.
-8. IaC generation path:
-   - Connector POST /api/pipeline/iac builds AWS six-file bundle locally when provider=aws and architecture_json is valid.
-   - Azure/GCP bundles are generated locally in Connector route.
-9. Deployment path:
-   - Runtime apply mode forwards to Agentic /api/terraform/apply.
-   - GitOps mode creates/updates GitHub repo, pushes files, and writes repo workflow vars.
-10. Runtime status/control paths call Agentic /api/terraform/apply/status and /api/terraform/apply/stop.
-11. Runtime inventory and lifecycle call Agentic AWS endpoints:
-   - /api/aws/runtime-details
-   - /api/aws/instance-action
-   - /api/aws/destroy-runtime
-
-## Agent and Service Contracts
-### EnvironmentInitializer contract
-Input model:
-- project_id: string (validated by regex in shared models)
-- project_name: string
-- project_type: local or github
-- user_id: string
-- scan_type: sast, sca, or all
-- github_token/repository_url for GitHub projects
-
-Output behavior:
-- Streams message events with indexed ScanMessage payload.
-- Emits final status completed or error over websocket.
-- Persists scan artifacts to security_reports volume.
-
-### RemediationRunner contract
-Input model:
-- project_id, project_name, project_type
-- user_id
-- optional cortex_context
-- remediation_scope: major or all
-- LLM override fields are normalized to Claude-compatible values
-
-Interactive commands:
-- continue_round
-- push_current
-- approve_push
-
-Output behavior:
-- Streams phase/info/success/error messages.
-- Supports approval-gated transitions between remediation cycles.
-- Reuses cached scan parse invalidation to force fresh post-remediation reads.
-
-### Stage7 bridge contract
-Input:
-- infra_plan: dict
-- budget_cap_usd: float
-- pipeline_run_id: string
-- environment: string
-
-Output:
-- approval payload containing diagram node/edge set, cost line_items, budget gate verdict, warnings, next stage metadata.
-
-Fallback behavior:
-- If expected runner path repo_root/diagram_cost-estimation_agent/run_stage7.py is missing, non-zero, empty, or invalid JSON, bridge returns deterministic fallback payload and warning text.
-
-### Terraform apply runtime contract
-Input model:
-- project_id/project_name
-- provider
-- optional run_id/workspace references
-- files[] where each item includes path/content/encoding
-- aws_access_key_id/aws_secret_access_key/aws_region
-- enforce_free_tier_ec2
-
-Output model:
-- success boolean
-- outputs dict
-- cloudfront_url string (if available)
-- details object with execution metadata
-
-Control endpoints:
-- status endpoint returns idle/running/completed/error and cached result.
-- stop endpoint toggles cancel_requested and attempts container kill/remove.
-
-## Architecture Decision Records
-### ADR-001: Session auth + backend API key dual boundary
-Decision:
-- Keep user identity and ownership checks in Connector, and service-to-service trust between Connector and Agentic via X-API-Key.
-
-Context:
-- Backend endpoints execute destructive and infrastructure-affecting operations and should not be directly internet-exposed.
-
-Tradeoffs:
-- Pros: simple boundary and explicit trust chain.
-- Cons: requires env synchronization for DEPLAI_SERVICE_KEY and tighter deployment discipline.
-
-### ADR-002: Websocket stream + REST polling coexistence
-Decision:
-- Use websocket streams for progress and REST status/results as durability fallback.
-
-Context:
-- Browser reload/navigation should not terminate long-running backend operations.
-
-Tradeoffs:
-- Pros: real-time UX plus recoverable state after disconnect.
-- Cons: more endpoint surface and token choreography.
-
-### ADR-003: Deterministic AWS architecture fallback in Connector
-Decision:
-- For AWS architecture route without explicit LLM override, generate deterministic architecture JSON directly in Connector.
-
-Context:
-- Reduces latency, cost, and dependency on model calls for common flow.
-
-Tradeoffs:
-- Pros: predictable outputs and no model dependency for baseline AWS path.
-- Cons: less flexible than model-generated architecture for unusual requirements.
-
-### ADR-004: Stage7 deterministic fallback payload
-Decision:
-- Return deterministic Stage7 payload if subprocess runner is unavailable or malformed.
-
-Context:
-- Stage 7 path mismatch can happen due folder naming differences between expected and implemented agent directories.
-
-Tradeoffs:
-- Pros: pipeline can continue with known-safe payload shape.
-- Cons: cost/diagram fidelity is lower than live Stage7 graph output.
-
-## Non-functional Characteristics
-| Property | Implemented Target/Limit | Source in code |
-|---|---|---|
-| API upstream timeout (typical Connector -> Agentic) | 30s to 120s depending on route | AbortSignal.timeout in Connector routes |
-| Runtime terraform apply timeout | 3600s request timeout in Connector deploy route | maxDuration and fetch timeout in deploy route |
-| Docker operation timeout | 120s default | CONTAINER_OP_TIMEOUT in Agentic environment.py |
-| Scanner timeout | 1200s to 1800s defaults | SCANNER_TIMEOUT_SECONDS usage in bearer/sbom modules |
-| Grype timeout | 900s default | GRYPE_TIMEOUT_SECONDS in sbom.py |
-| Websocket token TTL | 300 seconds | Connector scan ws-token route |
-| MySQL connector pool size | 10 connections | Connector db.ts createPool config |
-| Claude pipeline budget cap | 3.0 USD default | DEPLAI_CLAUDE_MAX_PIPELINE_COST_USD |
-| Remediation model budget cap | 1.0 USD default | DEPLAI_MAX_REMEDIATION_COST_USD |
-
-## Security Model
-### Authentication and authorization
-- Connector uses iron-session cookie auth.
-- Every protected Connector API route calls requireAuth and returns 401 on missing session.
-- Project-scoped routes call verifyProjectOwnership or repository ownership checks before acting.
-
-### Service-to-service auth
-- Connector injects X-API-Key header when DEPLAI_SERVICE_KEY is set.
-- Agentic Layer enforces x_api_key header via dependency for most HTTP endpoints.
-
-### Websocket authorization
-- Connector mints short-lived HMAC tokens containing sub, project_id, exp.
-- Agentic verifies signature, expiry, and project binding before accepting socket.
-- Agentic also checks token sub against stored context user_id at workflow start.
-
-### Secrets handling
-- GitHub installation tokens are generated server-side and not persisted in database.
-- Clone URLs embed token only transiently, then origin URL is reset to non-token form in cloned repo config.
-- Session cookie uses httpOnly and secure in production.
-
-### Network exposure
-- Connector default dev port: 3000.
-- Agentic Layer default port: 8000.
-- Docker bridge network deplai is configured in compose.
-
-## Diagrams
-### 1) System Architecture Overview
-```mermaid
-graph TD
-  User[Engineer] --> Connector[Connector Next.js]
-  Connector --> MySQL[(MySQL deplai)]
-  Connector --> Agentic[Agentic Layer FastAPI]
-  Connector --> GitHub[GitHub API]
-  Connector --> Customization[Customization backend proxy]
-
-  Agentic --> Docker[Docker Engine]
-  Docker --> Codebase[(codebase_deplai)]
-  Docker --> Reports[(security_reports)]
-  Docker --> LLMOut[(LLM_Output)]
-
-  Agentic --> Stage7[Stage7 bridge]
-  Stage7 --> Stage7Agent[diagram_cost-estimation_agent runner]
-  Agentic --> TerraformApply[Terraform apply runtime]
-  TerraformApply --> AWS[AWS APIs]
+```text
+                         ┌─────────────────────────────────────┐
+                         │               Browser               │
+                         │ Landing + Dashboard + Documentation │
+                         └──────────────────┬──────────────────┘
+                                            │ HTTPS / WebSocket
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Connector — Next.js 16                                                        │
+│                                                                             │
+│  App Router pages · iron-session · MySQL · GitHub OAuth/App · API façade   │
+│  project ownership · file/repository operations · UI-specific adaptations  │
+└─────────────┬───────────────────────────┬─────────────────────────┬─────────┘
+              │ X-API-Key                 │ GitHub API              │ authenticated proxy
+              ▼                           ▼                         ▼
+┌──────────────────────────┐   ┌──────────────────────┐  ┌────────────────────┐
+│ Agentic Layer — FastAPI  │   │ GitHub OAuth + App   │  │ Customization      │
+│ scans/remediation        │   │ profiles/installations│  │ backend — FastAPI  │
+│ analysis/planning        │   │ tokens/webhooks/repos │  │ tenant manifests   │
+│ Terraform + AWS ops      │   └──────────────────────┘  │ previews/assets    │
+└───────────┬──────────────┘                              └────────────────────┘
+            │
+            ├── Docker Engine: scanners, volumes, Terraform execution
+            ├── Terraform Agent: bundle generation, state, locks, apply
+            ├── remediation_pipeline: finding-to-fix orchestration
+            ├── optional KGagent: knowledge-graph support
+            └── AWS APIs: cost, Terraform-managed resources, runtime inspection
 ```
 
-### 2) Primary Data Flow
-```mermaid
-sequenceDiagram
-  participant U as User
-  participant C as Connector API
-  participant A as Agentic Layer
-  participant D as Docker
-  participant G as GitHub
+The Connector is the only browser-facing backend. The Agentic Layer is a trusted internal service authenticated with `DEPLAI_SERVICE_KEY`; browsers do not receive that key. The customization backend is also reached through the Connector proxy so its repository resolution remains tied to the authenticated DeplAI user.
 
-  U->>C: POST /api/scan/validate
-  C->>A: POST /api/scan/validate (X-API-Key)
-  A-->>C: validation accepted
-  C-->>U: success
+## Components
 
-  U->>C: GET /api/scan/ws-token?project_id=...
-  C-->>U: signed ws token
-  U->>A: WS /ws/scan/{project_id}?token=...
-  U->>A: { action: start }
-  A->>D: clone/copy repo + run scanners
-  D-->>A: scan artifacts in volumes
-  A-->>U: streamed progress + completed
+### Connector (`Connector/`)
 
-  U->>C: POST /api/pipeline/iac
-  C->>A: GET /api/scan/status, GET /api/scan/results
-  C-->>U: generated IaC bundle
+The Connector is a Next.js 16 application using the App Router, React 19, TypeScript, Tailwind CSS, MySQL, `iron-session`, Octokit, and server-side file access.
 
-  U->>C: POST /api/pipeline/deploy
-  C->>A: POST /api/terraform/apply
-  A->>AWS: provision resources
-  AWS-->>A: outputs
-  A-->>C: deployment response
-  C-->>U: runtime endpoint + details
-```
+Its responsibilities are:
 
-### 3) Agent Interaction Graph
-```mermaid
-graph LR
-  ConnectorRoutes[Connector pipeline routes] --> RepoAnalyzer[Agentic repository_analysis service]
-  ConnectorRoutes --> ArchDecision[Agentic architecture_decision service]
-  ConnectorRoutes --> Stage7Bridge[Agentic stage7_bridge]
-  Stage7Bridge --> Stage7Graph[Diagram-Cost-Agent LangGraph]
-  ConnectorRoutes --> TerraformRuntime[Agentic terraform_apply runtime]
-  ConnectorRoutes --> ScanRunner[EnvironmentInitializer]
-  ConnectorRoutes --> RemediationRunner[RemediationRunner]
-  RemediationRunner --> ClaudeRemediator[claude_remediator backend adapters]
-```
+- Render the public landing page and authenticated dashboard applications.
+- Complete GitHub OAuth login, establish the encrypted `deplai_session` cookie, and expose session state.
+- Require authenticated sessions and verify project, repository, or installation ownership before protected operations.
+- Maintain MySQL records for users, projects, GitHub installations/repositories, chat history, and settings.
+- Manage GitHub App installation tokens, repository cloning/pulling, file/branch APIs, webhooks, and repository sync.
+- Receive local ZIP uploads, extract them into project-scoped storage, and expose safe browse/read endpoints.
+- Shape UI requests into internal Agentic Layer contracts and attach `X-API-Key`.
+- Issue short-lived HMAC WebSocket tokens bound to a project and a user.
+- Proxy customization requests while resolving a project’s source directory from ownership-checked database records.
 
-### 4) Deployment Topology
-```mermaid
-graph TD
-  subgraph Host
-    ConnectorTmp[Connector/tmp/local-projects and tmp/repos]
-    DockerSock[/var/run/docker.sock/]
-  end
+The public landing page lives at `/`; the main dashboard is `/dashboard`. Other current routes include pipeline, deployment, instance-management, customization, documentation, project-installation, and code-view experiences.
 
-  subgraph agentic-layer container
-    App[/app FastAPI/]
-    MountLocal[/local-projects ro/]
-    MountRepos[/repos ro/]
-  end
+### Agentic Layer (`Agentic Layer/`)
 
-  subgraph Docker volumes
-    V1[codebase_deplai]
-    V2[security_reports]
-    V3[LLM_Output]
-    V4[grype_db_cache]
-  end
+The Agentic Layer is a FastAPI service. It requires `DEPLAI_SERVICE_KEY` at startup and rejects internal HTTP requests without a matching `X-API-Key` header.
 
-  DockerSock --> App
-  ConnectorTmp --> MountLocal
-  ConnectorTmp --> MountRepos
-  App --> V1
-  App --> V2
-  App --> V3
-  App --> V4
-```
+It owns:
 
-### 5) Connector ER Diagram
-```mermaid
-erDiagram
-  users ||--o{ github_installations : owns
-  github_installations ||--o{ github_repositories : contains
-  users ||--o{ projects : creates
-  github_repositories o|--o{ projects : linked_by_repository_id
-  users ||--o{ chat_sessions : owns
-  chat_sessions ||--o{ chat_messages : contains
+- Scan validation, scan execution context, scan status/result retrieval, and scan-report cleanup.
+- Remediation validation, remediation runners, and remediation orchestration.
+- Repository analysis and architecture-review start/complete APIs.
+- Architecture generation, cloud-cost estimation, Stage 7 approval generation, and Terraform generation.
+- Terraform apply, status, stop, runtime-detail, EC2 action, and runtime-destruction APIs.
+- Project-scoped scan/remediation/pipeline WebSockets.
+- Health/readiness reporting and stale Terraform-workspace cleanup at startup.
 
-  users {
-    varchar id PK
-    varchar email
-    varchar name
-    timestamp created_at
-  }
-  github_installations {
-    varchar id PK
-    bigint installation_id
-    varchar account_login
-    varchar account_type
-    varchar user_id FK
-    timestamp suspended_at
-  }
-  github_repositories {
-    varchar id PK
-    varchar installation_id FK
-    bigint github_repo_id
-    varchar full_name
-    varchar default_branch
-    boolean needs_refresh
-  }
-  projects {
-    varchar id PK
-    varchar name
-    varchar project_type
-    varchar repository_id FK
-    varchar local_path
-    varchar user_id FK
-  }
-  chat_sessions {
-    varchar id PK
-    varchar user_id FK
-    varchar title
-    int message_count
-  }
-  chat_messages {
-    varchar id PK
-    varchar session_id FK
-    varchar role
-    text content
-  }
-```
+Scan, remediation, and pipeline state is primarily held in process memory while a run is active. A restart clears active in-memory contexts and WebSocket subscribers; persistent findings and repository/project state are retrieved from their respective storage locations.
+
+### Terraform Agent (`Terraform Agent/agent/`)
+
+The Terraform Agent is imported as the `terraform_agent` Python package. Docker Compose mounts `Terraform Agent/` at `/app/terraform_agent`, while the small root compatibility package makes the same imports work in local development.
+
+Core responsibilities:
+
+- Build a manifest and dependency order from an architecture document.
+- Build deterministic deployment-profile bundles for static sites and ECS-style profiles.
+- Build repository-aware bundles and a dedicated EC2 application bundle.
+- Validate and refine Terraform using plan attempts and diagnostics.
+- Keep per-workspace run state, artifacts, generated files, and optional S3 snapshots.
+- Acquire/release DynamoDB workspace locks when configured.
+- Run Terraform commands, parse JSON event streams, separate sensitive outputs, and retry safe apply failures.
+- Destroy an IaC run when requested through the alternate `/api/iac` router.
+
+The Agentic Layer also exposes direct Terraform generation/apply APIs for the current dashboard deployment path. The `/api/iac` router provides an asynchronous run model with `run_id`, polling, a log WebSocket, and run destruction.
+
+### Customization backend (`Customization Agent/tenant_builder_app/backend/`)
+
+The optional customization backend manages tenant manifests and safely applies customization plans to tenant copies of projects.
+
+The flow is:
+
+1. The Connector authenticates the user and resolves an owned source repository or local project path.
+2. The user sends a customization message through the Connector proxy.
+3. The backend keeps up to six recent turns per tenant in memory, classifies the request, and sends a reduced or full manifest context to the configured LLM.
+4. The user confirms the manifest.
+5. The implementation endpoint runs the hybrid deterministic/LLM pipeline, returns changed files and diffs, can run quality gates, and can start a preview.
+
+LLM interpreter, scanner, and planner failures deliberately surface as errors rather than silently falling back to broad deterministic behavior. The Connector maps unavailable backend errors to a clear `502` response.
+
+## Identity, sessions, and ownership
+
+### GitHub OAuth
+
+`GET /api/auth/login` creates a random OAuth state, stores its ten-minute expiry in the encrypted session, and redirects to GitHub’s authorization endpoint. The request includes `prompt=select_account`, so a browser with an existing GitHub session is prompted to choose an account instead of silently reusing the most recent one.
+
+`GET /api/auth/callback` verifies the state in constant time, exchanges the authorization code, reads the GitHub profile and email list, upserts the DeplAI user by email, writes session identity data, and binds compatible GitHub installations.
+
+The `deplai_session` cookie is `HttpOnly`, `SameSite=Lax`, seven days long, and `Secure` in production. Production requires `SESSION_SECRET`; local development has a development fallback to reduce setup friction.
+
+### GitHub App
+
+The GitHub App integration uses its configured app ID and private key to create installation access tokens. Tokens are cached until expiry. Installation/repository records are synchronized into MySQL and are associated with a DeplAI user. Protected operations verify direct ownership and retain a legacy fallback through a project record when an older installation row has no user ID.
+
+### Authorization layers
+
+| Boundary | Enforcement |
+| --- | --- |
+| Browser → Connector | `iron-session`; protected routes use `requireAuth`. |
+| Connector project access | Local-project, project, repository, and installation ownership helpers query MySQL. |
+| Connector → Agentic Layer | `X-API-Key: DEPLAI_SERVICE_KEY`. |
+| Browser → Agentic WebSocket | Connector-minted HMAC token with expiry, `project_id`, and user subject. |
+| GitHub data | OAuth user identity plus GitHub App installation tokens; scoped write token for remediation PRs. |
+| Customization backend | Connector session + project path resolution before upstream proxying. |
+
+The Agentic Layer validates that WebSocket tokens have not expired, match the connecting project, and have a subject that matches the user in the stored scan/remediation context. A browser reconnect attaches to an active run instead of automatically starting it again.
+
+## Persistence and workspace storage
+
+### MySQL
+
+`Connector/database.sql` defines the baseline tables:
+
+| Table | Purpose |
+| --- | --- |
+| `users` | DeplAI user identity keyed by UUID, with unique email. |
+| `github_installations` | GitHub App installations, account metadata, owner binding, suspension state, and raw metadata. |
+| `github_repositories` | Installed repositories, branch, language metadata, sync/clone status, webhook ID, and hidden flag. |
+| `projects` | User-owned local projects and optional links to GitHub repository records. |
+| `chat_sessions` / `chat_messages` | Per-user persisted agent-chat history with API-enforced session/message limits. |
+
+The Connector’s settings APIs additionally support workspace/user settings data. Deployments should apply the baseline schema before starting the UI and preserve schema compatibility during upgrades.
+
+### File locations
+
+- Local ZIP uploads are extracted to `Connector/tmp/local-projects/<user-id>/<project-id>` and the original ZIP is retained beside the user directory.
+- GitHub repositories are cloned to `Connector/tmp/repos/<owner>/<repo>`.
+- Docker Compose mounts both paths read-only into the Agentic Layer as `/local-projects` and `/repos`.
+- Terraform Agent run state, generated bundles, artifacts, and knowledge cache use its runtime paths; optional configured S3/DynamoDB resources support snapshots and locking.
+- Customization backend files are stored under its backend tenant data path, including assets, saved manifest, plan, repository index, and tenant repository copy.
+
+ZIP extraction excludes hidden files and common generated directories such as `node_modules`, `.git`, build output, Python caches, virtual environments, and editor metadata. File browse/read helpers validate paths to prevent directory traversal.
+
+## Execution flows
+
+### Project onboarding
+
+1. The user authenticates through GitHub OAuth.
+2. For a GitHub project, the Connector synchronizes GitHub App installations and repository records, then creates/reuses a shallow clone when source access is needed.
+3. For a local project, the Connector accepts a ZIP up to 1 GB, extracts the safe content, calculates file count/size, and saves a `projects` record.
+4. `GET /api/projects` combines user-owned local projects and visible GitHub repositories into the dashboard project list.
+
+### Security scan
+
+1. The browser posts project ID, name, source type, and scan type (`sast`, `sca`, or `all`) to the Connector.
+2. The Connector validates ownership; GitHub projects obtain an installation token and repository URL server-side.
+3. The Connector posts the normalized context to `POST /api/scan/validate` in the Agentic Layer.
+4. The browser requests a short-lived Connector WebSocket token and connects to `/ws/scan/{project_id}` through the Agentic endpoint.
+5. Sending `{ "action": "start" }` starts or reconnects to the scan runner. Status and message frames stream progress.
+6. The Connector retrieves status/results through protected routes; Agentic cache invalidation occurs before the completed status is emitted.
+
+### Remediation
+
+1. The Connector validates project ownership and resolves an installation token or supplied token for a GitHub project.
+2. It submits a remediation context to Agentic and opens the remediation WebSocket.
+3. The remediation pipeline extracts, groups, generates, and validates changes. The runner may request a decision or approval through command frames.
+4. GitHub remediation supports a scoped installation token with content and pull-request write permissions. PR lookup/creation is always ownership checked by the Connector.
+
+### Planning and IaC generation
+
+1. Repository analysis produces source, framework, service, and infrastructure signals.
+2. Architecture review starts with source context and finishes with collected answers and a deployment profile.
+3. Architecture generation accepts deterministic AWS input by default or forwards explicitly requested LLM configuration to Agentic. Deterministic AWS generation derives region, free-tier mode, instance sizing, storage, traffic, VPC/subnet/security-group, S3, and CloudFront values from the prompt and review answers.
+4. Cost estimation and Stage 7 approval consume architecture/deployment context.
+5. The Connector calls Terraform generation with project metadata, architecture/profile/approval payload, security data, source root, renderer selection, state settings, AWS settings, and optional LLM configuration.
+6. The Agentic Layer selects a renderer and returns generated files, manifest, dependency order, warnings, workspace/run identity, and renderer metadata.
+
+### Database-aware EC2 application deployment
+
+The deployment packager inspects the source repository before rendering an EC2 application bundle. It detects a database from:
+
+1. Prisma schema datasource.
+2. Postgres/MySQL/MariaDB Docker Compose image.
+3. Known ORM/database packages in `package.json`.
+4. `DATABASE_URL` in a supported environment sample.
+
+If a database is detected but the deployment profile did not request one, the EC2 renderer promotes the profile to a small RDS configuration. Generated runtime environment variables include the Terraform-resolved database URL and connection fields. A deterministic per-project `JWT_SECRET`, `NODE_ENV=production`, and application port are also injected.
+
+PostgreSQL defaults to `16.6`. The RDS configuration model has expanded support for standard RDS and Aurora controls, including storage type/autoscaling, Multi-AZ, backup retention, deletion protection, public access, Aurora replica count, cluster storage type, and Serverless v2 capacity bounds.
+
+### Terraform apply and runtime operations
+
+1. The dashboard submits generated files/run metadata, AWS credentials, region, and free-tier/plan-confirmation flags to the Connector.
+2. The Connector sends the trusted request to Agentic, which starts Terraform execution and exposes status/stop paths.
+3. The user confirms the plan summary before a guarded apply proceeds.
+4. Runtime details call AWS APIs for project-tagged or specifically selected resources. The dashboard can start, stop, or reboot a target EC2 instance.
+5. Runtime destruction is a best-effort cleanup of DeplAI-tagged EC2 instances, key pairs, available volumes, S3 buckets, CloudFront distributions, and security groups. CloudFront distributions may need asynchronous disablement before deletion.
+
+## Deployment concerns
+
+### Required configuration
+
+The core configuration is in `.env.template`.
+
+| Variable | Used by | Why it matters |
+| --- | --- | --- |
+| `DEPLAI_SERVICE_KEY` | Connector + Agentic | Authenticates internal API calls. Required for Agentic startup. |
+| `WS_TOKEN_SECRET` | Connector + Agentic | Signs/verifies short-lived project-bound WebSocket tokens. |
+| `SESSION_SECRET` | Connector | Encrypts browser session data. Required in production. |
+| `NEXT_PUBLIC_APP_URL` | Connector OAuth | Canonical origin and OAuth callback base. |
+| `AGENTIC_LAYER_URL` | Connector | Internal Agentic HTTP base; Compose default is `http://localhost:8001`. |
+| `DB_*` | Connector | MySQL connection. |
+| `GITHUB_CLIENT_*` | Connector | GitHub OAuth login. |
+| `GITHUB_APP_*` | Connector | GitHub App installation/repository operations. |
+| `AWS_*` | Agentic/Terraform | AWS cost, plan, apply, and runtime operations. |
+| `CUSTOMIZATION_AGENT_BASE_URL` | Connector | Optional customization backend base URL. |
+
+### Docker requirements
+
+The Agentic container mounts `/var/run/docker.sock`. This gives it high privilege over the Docker daemon and is necessary for the current scanner/runtime workflow. Treat the host and Agentic service as a trusted execution boundary; do not expose the Agentic port publicly without network protection.
+
+### Observability
+
+- `GET /ready` confirms FastAPI readiness.
+- `GET /health` reports Docker reachability and optional dependency checks.
+- Connector `GET /api/pipeline/health` exposes Agentic health to authenticated dashboard clients.
+- Scan/remediation/pipeline WebSockets emit status and timestamped message frames.
+- Terraform runs retain state, generated files, warnings, diagnostics, logs, plan summaries, outputs, and errors in their run context.
+
+### Destructive operations
+
+`POST /api/cleanup` on the Agentic Layer removes all Docker volumes only when `ALLOW_GLOBAL_CLEANUP=true`. This is global across projects and should be disabled in normal production operation. Project deletion and runtime destruction are separate, ownership-checked pathways.

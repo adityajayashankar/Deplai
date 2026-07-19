@@ -32,6 +32,9 @@ export async function GET(request: Request) {
     redirect_uri: `${requireEnv('NEXT_PUBLIC_APP_URL')}/api/auth/callback`,
     scope: 'user:email read:user read:org',
     state,
+    // Do not silently reuse the last GitHub browser session. This lets a user
+    // deliberately choose another account after signing out of Deplai.
+    prompt: 'select_account',
   });
 
   return NextResponse.redirect(`https://github.com/login/oauth/authorize?${params}`, 302);

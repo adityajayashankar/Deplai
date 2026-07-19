@@ -2437,7 +2437,7 @@ resource "aws_db_instance" "main" {
   count                   = var.postgres_config == null ? 0 : 1
   identifier              = "${var.project_name}-postgres"
   engine                  = "postgres"
-  engine_version          = try(var.postgres_config.engine_version, "15.4")
+  engine_version          = try(var.postgres_config.engine_version, "16.6")
   instance_class          = try(var.postgres_config.instance_class, "db.t3.small")
   allocated_storage       = try(var.postgres_config.storage_gb, 20)
   storage_type            = "gp3"

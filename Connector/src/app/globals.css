@@ -1,5 +1,6 @@
 /* Import custom fonts */
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans:ital,wght@0,100..900;1,100..900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wdth,wght@0,75..100,400..700;1,75..100,400..700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap');
 
 @import "../../node_modules/tailwindcss/index.css";
 
@@ -34,6 +35,59 @@
   --color-suspended-bg: var(--suspended-bg);
   --color-suspended-fg: var(--suspended-fg);
   --font-sans: 'Noto Sans', sans-serif;
+  --font-display: 'Space Grotesk', 'Avenir Next', sans-serif;
+}
+
+/* The public Compute the Platform page owns a dark visual system. Scoping
+   these tokens keeps its design isolated from the authenticated dashboard. */
+.compute-landing {
+  --background: oklch(0.06 0.008 260);
+  --foreground: oklch(0.94 0.005 90);
+  --card: oklch(0.09 0.008 260);
+  --card-foreground: oklch(0.94 0.005 90);
+  --popover: oklch(0.09 0.008 260);
+  --popover-foreground: oklch(0.94 0.005 90);
+  --primary: oklch(0.94 0.005 90);
+  --primary-foreground: oklch(0.06 0.008 260);
+  --secondary: oklch(0.12 0.008 260);
+  --secondary-foreground: oklch(0.94 0.005 90);
+  --muted: oklch(0.12 0.008 260);
+  --muted-foreground: oklch(0.55 0.015 90);
+  --accent: oklch(0.14 0.01 260);
+  --accent-foreground: oklch(0.94 0.005 90);
+  --border: oklch(0.18 0.008 260);
+  --input: oklch(0.14 0.008 260);
+  --ring: oklch(0.94 0.005 90);
+  --font-sans: 'Instrument Sans', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  --font-display: 'Space Grotesk', 'Avenir Next', sans-serif;
+  color: var(--foreground);
+  background: var(--background);
+  font-family: var(--font-sans);
+}
+
+.compute-landing .brand-wordmark {
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  line-height: 1;
+}
+
+@theme inline {
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -86,5 +140,100 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: 'Noto Sans', sans-serif;
+}
+
+@keyframes landing-progress {
+  from { width: 0%; }
+  to { width: 100%; }
+}
+
+@keyframes landing-fade-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.compute-landing .animate-progress {
+  animation: landing-progress 6s linear forwards;
+}
+
+.compute-landing .animate-fadeSlideIn {
+  animation: landing-fade-slide-in 0.5s ease-out forwards;
+}
+
+.compute-landing .landing-text-stroke {
+  -webkit-text-stroke: 1.5px currentColor;
+  -webkit-text-fill-color: transparent;
+}
+
+@keyframes flowLine {
+  0% { stroke-dashoffset: 1000; }
+  100% { stroke-dashoffset: 0; }
+}
+
+/* Animated packets travelling from the orchestrator to each workflow stage. */
+.compute-landing .animate-flow {
+  stroke-dasharray: 60 400;
+  animation: flowLine 4s linear infinite;
+}
+
+/* Repository-intelligence capability-card animations stay global so this
+   server-rendered landing section has no styled-jsx or hydration boundary. */
+.compute-landing .repository-animate-flow {
+  stroke-dasharray: 10 15;
+  animation: repository-data-flow 2s linear infinite;
+}
+
+.compute-landing .repository-pulse-ring { animation: repository-pulse-ring 2s cubic-bezier(.4, 0, .6, 1) infinite; }
+.compute-landing .repository-blink { animation: repository-blink 1s infinite; }
+.compute-landing .repository-blink-slow { animation: repository-blink 8s infinite; }
+.compute-landing .repository-chat-user { animation: repository-chat-user-in 8s infinite cubic-bezier(.4, 0, .2, 1); }
+.compute-landing .repository-chat-typing { animation: repository-chat-agent-typing 8s infinite cubic-bezier(.4, 0, .2, 1); }
+.compute-landing .repository-chat-reply { animation: repository-chat-agent-reply 8s infinite cubic-bezier(.4, 0, .2, 1); }
+.compute-landing .repository-chat-scan { animation: repository-chat-agent-reply 8s infinite cubic-bezier(.4, 0, .2, 1), repository-scan-line 2.5s ease-in-out infinite 3.5s; }
+.compute-landing .repository-box-draw { animation: repository-box-draw 8s infinite; }
+.compute-landing .repository-scan-line,
+.compute-landing .repository-scan-fade { animation: repository-scan-line 3s ease-in-out infinite; }
+.compute-landing .repository-bar-pulse { animation: repository-bar-pulse 1.5s ease-in-out infinite alternate; }
+
+@keyframes repository-pulse-ring { 0% { transform: scale(.8); opacity: .5; } 100% { transform: scale(2); opacity: 0; } }
+@keyframes repository-scan-line { 0% { top: 0%; opacity: 0; } 10% { opacity: 1; } 90% { opacity: 1; } 100% { top: 100%; opacity: 0; } }
+@keyframes repository-data-flow { 0% { stroke-dashoffset: 100; } 100% { stroke-dashoffset: 0; } }
+@keyframes repository-blink { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+@keyframes repository-bar-pulse { 0% { transform: scaleY(.2); } 100% { transform: scaleY(1); } }
+@keyframes repository-chat-user-in { 0%, 5% { opacity: 0; transform: translateY(10px) scale(.95); } 10%, 90% { opacity: 1; transform: translateY(0) scale(1); } 95%, 100% { opacity: 0; transform: translateY(-10px) scale(.95); } }
+@keyframes repository-chat-agent-typing { 0%, 15% { opacity: 0; transform: translateY(10px) scale(.95); } 20%, 35% { opacity: 1; transform: translateY(0) scale(1); } 40%, 100% { opacity: 0; transform: translateY(-10px) scale(.95); } }
+@keyframes repository-chat-agent-reply { 0%, 35% { opacity: 0; transform: translateY(10px) scale(.95); pointer-events: none; } 40%, 90% { opacity: 1; transform: translateY(0) scale(1); } 95%, 100% { opacity: 0; transform: translateY(-10px) scale(.95); } }
+@keyframes repository-box-draw { 0%, 45% { stroke-dashoffset: 200; opacity: 0; fill: transparent; } 55% { stroke-dashoffset: 0; opacity: 1; fill: transparent; } 65%, 100% { fill: rgba(72, 168, 154, .15); stroke-dashoffset: 0; opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .compute-landing .animate-flow,
+  .compute-landing .repository-animate-flow,
+  .compute-landing .repository-pulse-ring,
+  .compute-landing .repository-blink,
+  .compute-landing .repository-blink-slow,
+  .compute-landing .repository-chat-user,
+  .compute-landing .repository-chat-typing,
+  .compute-landing .repository-chat-reply,
+  .compute-landing .repository-chat-scan,
+  .compute-landing .repository-box-draw,
+  .compute-landing .repository-scan-line,
+  .compute-landing .repository-scan-fade,
+  .compute-landing .repository-bar-pulse {
+    animation: none;
+  }
+}
+
+@media (min-width: 1024px) {
+  /* The landing product section contains five capability cards; prevent the
+     final grid cell from appearing as an unfinished empty card. */
+  #product > div > div:last-child {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
 }
 

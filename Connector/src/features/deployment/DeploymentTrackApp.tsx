@@ -153,27 +153,142 @@ const REDIS_RESOURCE_CONFIG_KEY = 'deplai.pipeline.redisResourceConfig';
 const ECS_RESOURCE_CONFIG_KEY = 'deplai.pipeline.ecsResourceConfig';
 const STATIC_SITE_RESOURCE_CONFIG_KEY = 'deplai.pipeline.staticSiteResourceConfig';
 
-const RDS_ENGINES = ['postgres', 'mysql', 'mariadb'] as const;
-const RDS_INSTANCE_CLASSES = ['db.t4g.micro', 'db.t4g.small', 'db.t3.small', 'db.t3.medium', 'db.r6g.large'] as const;
-const RDS_DEFAULT_VERSIONS: Record<(typeof RDS_ENGINES)[number], string> = {
-  postgres: '15.5',
-  mysql: '8.0',
-  mariadb: '10.11',
+const RDS_ENGINES = ['postgres', 'mysql', 'mariadb', 'aurora-mysql', 'aurora-postgresql', 'oracle-ee', 'sqlserver-ex', 'db2-ae'] as const;
+
+/** Per-engine metadata matching AWS RDS "Create database" engine options */
+const RDS_ENGINE_META: Record<(typeof RDS_ENGINES)[number], {
+  label: string;
+  versions: string[];
+  defaultVersion: string;
+  instanceClasses: string[];
+  defaultInstanceClass: string;
+  minStorage: number;
+  defaultStorage: number;
+  supportsAurora: boolean;
+  supportsMultiAz: boolean;
+  licenseNote?: string;
+}> = {
+  postgres: {
+    label: 'PostgreSQL',
+    versions: ['17.2', '16.6', '15.10', '14.15', '13.18'],
+    defaultVersion: '16.6',
+    instanceClasses: ['db.t4g.micro', 'db.t4g.small', 'db.t3.small', 'db.t3.medium', 'db.m7g.large', 'db.r8g.large'],
+    defaultInstanceClass: 'db.t4g.micro',
+    minStorage: 20,
+    defaultStorage: 20,
+    supportsAurora: false,
+    supportsMultiAz: true,
+  },
+  mysql: {
+    label: 'MySQL',
+    versions: ['8.4.4', '8.0.41'],
+    defaultVersion: '8.0.41',
+    instanceClasses: ['db.t4g.micro', 'db.t4g.small', 'db.t3.small', 'db.t3.medium', 'db.m7g.large', 'db.r8g.large'],
+    defaultInstanceClass: 'db.t4g.micro',
+    minStorage: 20,
+    defaultStorage: 20,
+    supportsAurora: false,
+    supportsMultiAz: true,
+  },
+  mariadb: {
+    label: 'MariaDB',
+    versions: ['11.4.5', '10.11.11', '10.6.21'],
+    defaultVersion: '10.11.11',
+    instanceClasses: ['db.t4g.micro', 'db.t4g.small', 'db.t3.small', 'db.t3.medium', 'db.m7g.large', 'db.r8g.large'],
+    defaultInstanceClass: 'db.t4g.micro',
+    minStorage: 20,
+    defaultStorage: 20,
+    supportsAurora: false,
+    supportsMultiAz: true,
+  },
+  'aurora-mysql': {
+    label: 'Aurora (MySQL Compatible)',
+    versions: ['MySQL 8.0 (3.09)', 'MySQL 8.0 (3.08)', 'MySQL 5.7 (2.12)'],
+    defaultVersion: 'MySQL 8.0 (3.09)',
+    instanceClasses: ['db.serverless', 'db.t4g.medium', 'db.r8g.large', 'db.r8g.xlarge', 'db.r8g.2xlarge'],
+    defaultInstanceClass: 'db.serverless',
+    minStorage: 10,
+    defaultStorage: 10,
+    supportsAurora: true,
+    supportsMultiAz: false,
+    licenseNote: 'Aurora storage auto-scales from 10 GiB to 128 TiB.',
+  },
+  'aurora-postgresql': {
+    label: 'Aurora (PostgreSQL Compatible)',
+    versions: ['PostgreSQL 17.2', 'PostgreSQL 16.6', 'PostgreSQL 15.10', 'PostgreSQL 14.15'],
+    defaultVersion: 'PostgreSQL 17.2',
+    instanceClasses: ['db.serverless', 'db.t4g.medium', 'db.r8g.large', 'db.r8g.xlarge', 'db.r8g.2xlarge'],
+    defaultInstanceClass: 'db.serverless',
+    minStorage: 10,
+    defaultStorage: 10,
+    supportsAurora: true,
+    supportsMultiAz: false,
+    licenseNote: 'Aurora storage auto-scales from 10 GiB to 128 TiB.',
+  },
+  'oracle-ee': {
+    label: 'Oracle',
+    versions: ['19.0.0.0.ru-2024-07'],
+    defaultVersion: '19.0.0.0.ru-2024-07',
+    instanceClasses: ['db.t3.small', 'db.t3.medium', 'db.m7g.large', 'db.r8g.large', 'db.r8g.xlarge'],
+    defaultInstanceClass: 'db.t3.medium',
+    minStorage: 20,
+    defaultStorage: 100,
+    supportsAurora: false,
+    supportsMultiAz: true,
+    licenseNote: 'Oracle Enterprise Edition — requires BYOL or License Included.',
+  },
+  'sqlserver-ex': {
+    label: 'Microsoft SQL Server',
+    versions: ['SQL Server 2022 16.00', 'SQL Server 2019 15.00', 'SQL Server 2017 14.00'],
+    defaultVersion: 'SQL Server 2022 16.00',
+    instanceClasses: ['db.t3.small', 'db.t3.medium', 'db.m7g.large', 'db.r8g.large'],
+    defaultInstanceClass: 'db.t3.medium',
+    minStorage: 20,
+    defaultStorage: 100,
+    supportsAurora: false,
+    supportsMultiAz: true,
+    licenseNote: 'SQL Server Express (free license) — limited to 1 vCPU, 1 GiB RAM, 10 GiB DB.',
+  },
+  'db2-ae': {
+    label: 'IBM Db2',
+    versions: ['Db2 11.5.9'],
+    defaultVersion: 'Db2 11.5.9',
+    instanceClasses: ['db.t3.small', 'db.t3.medium', 'db.m7g.large', 'db.r8g.large'],
+    defaultInstanceClass: 'db.t3.medium',
+    minStorage: 20,
+    defaultStorage: 100,
+    supportsAurora: false,
+    supportsMultiAz: true,
+    licenseNote: 'IBM Db2 Advanced Edition.',
+  },
 };
-const REDIS_NODE_TYPES = ['cache.t4g.micro', 'cache.t3.small', 'cache.t3.medium', 'cache.r6g.large'] as const;
-const REDIS_ENGINE_VERSIONS = ['7.0', '6.2'] as const;
-const ECS_CPU_OPTIONS = [256, 512, 1024, 2048, 4096] as const;
-const ECS_MEMORY_OPTIONS = [512, 1024, 2048, 3072, 4096, 8192] as const;
-const CLOUDFRONT_PRICE_CLASSES = ['PriceClass_100', 'PriceClass_200', 'PriceClass_All'] as const;
 
 const DEFAULT_RDS_RESOURCE_CONFIG: RdsResourceConfig = {
   engine: 'postgres',
-  engine_version: '15.5',
+  engine_version: '16.6',
   instance_class: 'db.t4g.micro',
   allocated_storage: 20,
   multi_az: false,
   backup_retention_period: 7,
+  instance_size_tier: 'free_tier',
+  db_identifier: 'database-1',
+  master_username: 'admin',
+  credentials_mode: 'self_managed',
+  auto_generate_password: false,
+  master_password: '',
+  aurora_min_acu: 0,
+  aurora_max_acu: 4,
+  aurora_pause_after_inactivity: 300,
+  storage_type: 'gp3',
+  storage_autoscaling: true,
+  max_allocated_storage: 1000,
+  publicly_accessible: false,
+  aurora_cluster_storage_type: 'standard',
+  aurora_replica_count: 0,
+  deletion_protection: false,
 };
+
+
 const DEFAULT_REDIS_RESOURCE_CONFIG: RedisResourceConfig = {
   node_type: 'cache.t4g.micro',
   engine_version: '7.0',
@@ -188,6 +303,12 @@ const DEFAULT_STATIC_SITE_RESOURCE_CONFIG: StaticSiteResourceConfig = {
   spa_fallback: false,
 };
 
+const REDIS_NODE_TYPES = ['cache.t4g.micro', 'cache.t3.small', 'cache.t3.medium', 'cache.r6g.large'] as const;
+const REDIS_ENGINE_VERSIONS = ['7.0', '6.2'] as const;
+const ECS_CPU_OPTIONS = [256, 512, 1024, 2048, 4096] as const;
+const ECS_MEMORY_OPTIONS = [512, 1024, 2048, 3072, 4096, 8192] as const;
+const CLOUDFRONT_PRICE_CLASSES = ['PriceClass_100', 'PriceClass_200', 'PriceClass_All'] as const;
+
 function normalizeBool(value: unknown, fallback: boolean): boolean {
   if (typeof value === 'boolean') return value;
   const normalized = String(value ?? '').trim().toLowerCase();
@@ -201,16 +322,41 @@ function normalizeRdsResourceConfig(value: unknown): RdsResourceConfig {
   const engine = RDS_ENGINES.includes(String(record.engine || '').trim().toLowerCase() as (typeof RDS_ENGINES)[number])
     ? String(record.engine).trim().toLowerCase() as RdsResourceConfig['engine']
     : DEFAULT_RDS_RESOURCE_CONFIG.engine;
+  const meta = RDS_ENGINE_META[engine];
   const requestedClass = String(record.instance_class || '').trim();
+  const isAuroraServerless = meta.supportsAurora && (requestedClass === 'db.serverless' || !requestedClass);
+  const credentialsMode = record.credentials_mode === 'secrets_manager' ? 'secrets_manager' : 'self_managed';
+  const sizeTiers = ['production', 'dev_test', 'free_tier'] as const;
+  const requestedTier = String(record.instance_size_tier || '').trim();
   return {
     engine,
-    engine_version: String(record.engine_version || RDS_DEFAULT_VERSIONS[engine]).trim() || RDS_DEFAULT_VERSIONS[engine],
-    instance_class: requestedClass || DEFAULT_RDS_RESOURCE_CONFIG.instance_class,
-    allocated_storage: clampInteger(record.allocated_storage ?? record.storage_gb, DEFAULT_RDS_RESOURCE_CONFIG.allocated_storage, 20, 4096),
-    multi_az: normalizeBool(record.multi_az, DEFAULT_RDS_RESOURCE_CONFIG.multi_az),
+    engine_version: String(record.engine_version || meta.defaultVersion).trim() || meta.defaultVersion,
+    instance_class: requestedClass || meta.defaultInstanceClass,
+    allocated_storage: meta.supportsAurora
+      ? meta.defaultStorage
+      : clampInteger(record.allocated_storage ?? record.storage_gb, meta.defaultStorage, meta.minStorage, 4096),
+    multi_az: meta.supportsAurora ? false : normalizeBool(record.multi_az, DEFAULT_RDS_RESOURCE_CONFIG.multi_az),
     backup_retention_period: clampInteger(record.backup_retention_period ?? record.backup_retention_days, DEFAULT_RDS_RESOURCE_CONFIG.backup_retention_period, 0, 35),
+    aurora_mode: meta.supportsAurora ? (isAuroraServerless ? 'serverless' : 'provisioned') : undefined,
+    instance_size_tier: sizeTiers.includes(requestedTier as (typeof sizeTiers)[number]) ? requestedTier as RdsResourceConfig['instance_size_tier'] : DEFAULT_RDS_RESOURCE_CONFIG.instance_size_tier,
+    db_identifier: String(record.db_identifier || DEFAULT_RDS_RESOURCE_CONFIG.db_identifier || 'database-1').trim(),
+    master_username: String(record.master_username || DEFAULT_RDS_RESOURCE_CONFIG.master_username || 'admin').trim(),
+    credentials_mode: credentialsMode,
+    auto_generate_password: normalizeBool(record.auto_generate_password, false),
+    master_password: String(record.master_password || ''),
+    aurora_min_acu: clampInteger(record.aurora_min_acu, 0, 0, 256),
+    aurora_max_acu: clampInteger(record.aurora_max_acu, 4, 1, 256),
+    aurora_pause_after_inactivity: clampInteger(record.aurora_pause_after_inactivity, 300, 300, 86400),
+    storage_type: ['gp3', 'gp2', 'io1', 'standard'].includes(String(record.storage_type)) ? String(record.storage_type) as RdsResourceConfig['storage_type'] : DEFAULT_RDS_RESOURCE_CONFIG.storage_type,
+    storage_autoscaling: normalizeBool(record.storage_autoscaling, DEFAULT_RDS_RESOURCE_CONFIG.storage_autoscaling ?? true),
+    max_allocated_storage: clampInteger(record.max_allocated_storage, 1000, 21, 65536),
+    publicly_accessible: normalizeBool(record.publicly_accessible, DEFAULT_RDS_RESOURCE_CONFIG.publicly_accessible ?? false),
+    aurora_cluster_storage_type: record.aurora_cluster_storage_type === 'io_optimized' ? 'io_optimized' : 'standard',
+    aurora_replica_count: clampInteger(record.aurora_replica_count, 0, 0, 15),
+    deletion_protection: normalizeBool(record.deletion_protection, DEFAULT_RDS_RESOURCE_CONFIG.deletion_protection ?? false),
   };
 }
+
 
 function normalizeRedisResourceConfig(value: unknown): RedisResourceConfig {
   const record = toRecord(value);
@@ -1445,6 +1591,7 @@ export default function DeploymentTrackApp() {
   const terraformAutostartRef = useRef<string | null>(null);
   const decisionCostRequestKeyRef = useRef<string | null>(null);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [activeStage, setActiveStage] = useState<PipelineStageId>('analysis');
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [repoContext, setRepoContext] = useState<RepositoryContextJson | null>(() => readStoredJson<RepositoryContextJson>('deplai.pipeline.repoContext'));
@@ -1826,7 +1973,7 @@ export default function DeploymentTrackApp() {
     };
   }, [backendErrorMessage, deployResult, deployStatus, hasLiveRuntimeDetails, verificationFailed, verificationPassed]);
   const outputBannerClassName = useMemo(() => {
-    if (outputBanner.tone === 'success') return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400';
+    if (outputBanner.tone === 'success') return 'border-zinc-700 bg-zinc-800/50 text-zinc-200';
     if (outputBanner.tone === 'error') return 'border-red-500/20 bg-red-500/10 text-red-300';
     return 'border-amber-500/20 bg-amber-500/10 text-amber-300';
   }, [outputBanner.tone]);
@@ -2099,8 +2246,14 @@ export default function DeploymentTrackApp() {
   useEffect(() => {
     fetch('/api/projects', { cache: 'no-store' })
       .then((response) => response.json())
-      .then((data: { projects?: ProjectRecord[] }) => setProjects(Array.isArray(data.projects) ? data.projects : []))
-      .catch(() => setProjects([]));
+      .then((data: { projects?: ProjectRecord[] }) => {
+        setProjects(Array.isArray(data.projects) ? data.projects : []);
+        setProjectsLoaded(true);
+      })
+      .catch(() => {
+        setProjects([]);
+        setProjectsLoaded(true);
+      });
   }, []);
 
   useEffect(() => {
@@ -2648,8 +2801,9 @@ export default function DeploymentTrackApp() {
   const handleRdsResourceConfigChange = useCallback((patch: Partial<RdsResourceConfig>) => {
     const merged: Partial<RdsResourceConfig> = { ...rdsResourceConfig, ...patch };
     if (patch.engine && patch.engine_version === undefined) {
-      merged.engine_version = RDS_DEFAULT_VERSIONS[patch.engine];
+      merged.engine_version = RDS_ENGINE_META[patch.engine]?.defaultVersion;
     }
+
     const next = normalizeRdsResourceConfig(merged);
     writeStoredJson(RDS_RESOURCE_CONFIG_KEY, next);
     invalidateDecisionForResourceChange('RDS settings changed. Re-approve the consultant decision before Terraform generation.');
@@ -3336,6 +3490,10 @@ export default function DeploymentTrackApp() {
             deployment_profile: deploymentProfile || undefined,
             deployment_plan: deploymentPlan,
             selected_components: selectedDeploymentComponents,
+            ...rdsResourceConfig,
+            db_name: rdsResourceConfig?.db_identifier,
+            db_username: rdsResourceConfig?.master_username,
+            db_password: rdsResourceConfig?.master_password,
           },
           run_id: canReuseSavedRun ? activeSavedRun?.run_id : undefined,
           workspace: canReuseSavedRun ? activeSavedRun?.workspace : undefined,
@@ -3708,8 +3866,8 @@ export default function DeploymentTrackApp() {
       </div>
 
       <div className="grid grid-cols-3 gap-6">
-        <div className="col-span-2 flex min-h-112 flex-col overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]">
-          <div className="border-b border-[#1A1A1A] px-5 py-4">
+        <div className="col-span-2 flex min-h-112 flex-col overflow-hidden rounded-lg border border-[#262626] bg-[#0a0a0a]">
+          <div className="border-b border-[#262626] px-5 py-4">
             <div className="text-sm font-semibold text-zinc-100">Infra Consultant</div>
             <div className="mt-1 text-xs text-zinc-500">One question at a time. The assistant will challenge unsafe assumptions before it returns a final component plan.</div>
           </div>
@@ -3719,11 +3877,11 @@ export default function DeploymentTrackApp() {
                 key={`${message.role}-${index}`}
                 className={`max-w-[88%] rounded-2xl border px-4 py-3 text-sm leading-relaxed ${
                   message.role === 'assistant'
-                    ? 'border-cyan-500/20 bg-cyan-500/10 text-cyan-50'
+                    ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200'
                     : 'ml-auto border-[#262626] bg-[#111111] text-zinc-200'
                 }`}
               >
-                <div className="mb-2 text-[10px] font-bold uppercase tracking-widest opacity-70">
+                <div className="mb-2 text-xs font-semibold text-zinc-400">
                   {message.role === 'assistant' ? 'Consultant' : 'You'}
                 </div>
                 <div className="whitespace-pre-wrap">{message.content}</div>
@@ -3734,7 +3892,7 @@ export default function DeploymentTrackApp() {
               </div>
             )}
           </div>
-          <div className="border-t border-[#1A1A1A] p-4">
+          <div className="border-t border-[#262626] p-4">
             {currentInfraConsultant?.decision ? (
               <div className="flex flex-wrap items-center gap-3">
                 <button
@@ -3752,7 +3910,7 @@ export default function DeploymentTrackApp() {
                   No, keep refining
                 </button>
                 {currentInfraConsultant.confirmed ? (
-                  <div className="text-xs text-emerald-300">Approved. Continue to Architecture Diagram and Cost.</div>
+                  <div className="text-xs text-zinc-300">Approved. Continue to Architecture Diagram and Cost.</div>
                 ) : (
                   <div className="text-xs text-zinc-500">Review the decision summary and confirm when you are ready.</div>
                 )}
@@ -3769,12 +3927,12 @@ export default function DeploymentTrackApp() {
                     }
                   }}
                   placeholder="Reply to the consultant"
-                  className="min-h-18 flex-1 resize-none rounded-xl border border-[#262626] bg-[#050505] px-4 py-3 text-sm text-zinc-200 outline-none transition-colors placeholder:text-zinc-600 focus:border-cyan-500/50"
+                  className="min-h-18 flex-1 resize-none rounded-xl border border-[#262626] bg-[#111] px-4 py-3 text-sm text-zinc-200 outline-none transition-colors placeholder:text-zinc-600 focus:border-zinc-500"
                 />
                 <button
                   onClick={() => void submitInfraConsultantMessage().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to continue the infra conversation.'))}
                   disabled={infraConsultantLoading || !infraConsultantInput.trim()}
-                  className="self-end rounded-xl bg-cyan-500 px-5 py-3 text-sm font-semibold text-black hover:bg-cyan-400 disabled:bg-[#111111] disabled:text-zinc-500"
+                  className="self-end rounded-xl bg-white px-5 py-3 text-sm font-semibold text-black hover:bg-zinc-200 disabled:bg-[#111111] disabled:text-zinc-500"
                 >
                   {infraConsultantLoading ? 'Thinking...' : 'Send'}
                 </button>
@@ -3783,8 +3941,8 @@ export default function DeploymentTrackApp() {
           </div>
         </div>
         <div className="space-y-6">
-          <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
-            <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Service Decision</div>
+          <div className="rounded-lg border border-[#262626] bg-[#0a0a0a] p-5">
+            <div className="mb-3 text-xs font-semibold text-zinc-400">Service Decision</div>
             <div className="space-y-3">
               {DEPLOYMENT_PLAN_OPTIONS.map((option) => {
                 const selected = deploymentPlan === option.id;
@@ -3796,7 +3954,7 @@ export default function DeploymentTrackApp() {
                     disabled={infraConsultantLoading || deployStatus === 'running'}
                     className={`w-full rounded-md border px-3 py-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
                       selected
-                        ? 'border-indigo-500/50 bg-indigo-500/10 text-zinc-100'
+                        ? 'border-zinc-400 bg-zinc-800 text-zinc-100'
                         : 'border-[#262626] bg-black text-zinc-300 hover:border-zinc-600 hover:bg-[#0A0A0A]'
                     }`}
                   >
@@ -3818,12 +3976,12 @@ export default function DeploymentTrackApp() {
                 disabled={infraConsultantLoading || deployStatus === 'running'}
                 className={`rounded-md border px-3 py-2 text-left text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
                   deploymentServices.rds
-                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                    ? 'border-blue-500/40 bg-blue-500/10 text-blue-300'
                     : 'border-[#262626] bg-black text-zinc-400 hover:border-zinc-600'
                 }`}
               >
                 <div className="font-semibold">RDS</div>
-                <div className="mt-1 text-[11px] text-zinc-500">Managed SQL</div>
+                <div className="mt-1 text-sm text-zinc-500">Managed SQL</div>
               </button>
               <button
                 type="button"
@@ -3831,92 +3989,497 @@ export default function DeploymentTrackApp() {
                 disabled={infraConsultantLoading || deployStatus === 'running'}
                 className={`rounded-md border px-3 py-2 text-left text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
                   deploymentServices.redis
-                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                    ? 'border-blue-500/40 bg-blue-500/10 text-blue-300'
                     : 'border-[#262626] bg-black text-zinc-400 hover:border-zinc-600'
                 }`}
               >
                 <div className="font-semibold">Redis</div>
-                <div className="mt-1 text-[11px] text-zinc-500">Managed cache</div>
+                <div className="mt-1 text-sm text-zinc-500">Managed cache</div>
               </button>
             </div>
-            {deploymentServices.rds ? (
-              <div className="mt-4 rounded-md border border-emerald-500/20 bg-black p-4">
-                <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-emerald-300/80">RDS Settings</div>
-                <div className="grid grid-cols-2 gap-3">
-                  <label className="block text-xs font-medium text-zinc-400">
-                    <span className="mb-1 block">Engine</span>
-                    <select
-                      value={rdsResourceConfig.engine}
-                      onChange={(event) => handleRdsResourceConfigChange({ engine: event.target.value as RdsResourceConfig['engine'] })}
-                      disabled={infraConsultantLoading || deployStatus === 'running'}
-                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {RDS_ENGINES.map((engine) => (<option key={engine} value={engine}>{engine}</option>))}
-                    </select>
-                  </label>
-                  <label className="block text-xs font-medium text-zinc-400">
-                    <span className="mb-1 block">Engine version</span>
-                    <input
-                      type="text"
-                      value={rdsResourceConfig.engine_version}
-                      onChange={(event) => handleRdsResourceConfigChange({ engine_version: event.target.value })}
-                      disabled={infraConsultantLoading || deployStatus === 'running'}
-                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
-                    />
-                  </label>
-                  <label className="block text-xs font-medium text-zinc-400">
-                    <span className="mb-1 block">Instance class</span>
-                    <select
-                      value={rdsResourceConfig.instance_class}
-                      onChange={(event) => handleRdsResourceConfigChange({ instance_class: event.target.value })}
-                      disabled={infraConsultantLoading || deployStatus === 'running'}
-                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {RDS_INSTANCE_CLASSES.map((cls) => (<option key={cls} value={cls}>{cls}</option>))}
-                    </select>
-                  </label>
-                  <label className="block text-xs font-medium text-zinc-400">
-                    <span className="mb-1 block">Storage (GB)</span>
-                    <input
-                      type="number"
-                      min={20}
-                      max={4096}
-                      value={rdsResourceConfig.allocated_storage}
-                      onChange={(event) => handleRdsResourceConfigChange({ allocated_storage: Number(event.target.value) })}
-                      disabled={infraConsultantLoading || deployStatus === 'running'}
-                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
-                    />
-                  </label>
-                  <label className="block text-xs font-medium text-zinc-400">
-                    <span className="mb-1 block">Backups (days)</span>
-                    <input
-                      type="number"
-                      min={0}
-                      max={35}
-                      value={rdsResourceConfig.backup_retention_period}
-                      onChange={(event) => handleRdsResourceConfigChange({ backup_retention_period: Number(event.target.value) })}
-                      disabled={infraConsultantLoading || deployStatus === 'running'}
-                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
-                    />
-                  </label>
-                  <label className="block text-xs font-medium text-zinc-400">
-                    <span className="mb-1 block">Multi-AZ</span>
-                    <select
-                      value={rdsResourceConfig.multi_az ? 'true' : 'false'}
-                      onChange={(event) => handleRdsResourceConfigChange({ multi_az: event.target.value === 'true' })}
-                      disabled={infraConsultantLoading || deployStatus === 'running'}
-                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      <option value="false">Single-AZ (lower cost)</option>
-                      <option value="true">Multi-AZ (high availability)</option>
-                    </select>
-                  </label>
+            {deploymentServices.rds ? (() => {
+              const rdsMeta = RDS_ENGINE_META[rdsResourceConfig.engine];
+              const isAurora = rdsMeta.supportsAurora;
+              const isServerless = isAurora && rdsResourceConfig.instance_class === 'db.serverless';
+              const isSelfManaged = rdsResourceConfig.credentials_mode !== 'secrets_manager';
+              const showPassword = isSelfManaged && !rdsResourceConfig.auto_generate_password;
+
+              // Per-engine instance size tiers (non-Aurora only)
+              const instanceSizeTiers = [
+                { id: 'production' as const, label: 'Production', hint: rdsMeta.instanceClasses.find(c => c.includes('r8g')) || rdsMeta.instanceClasses[rdsMeta.instanceClasses.length - 1], cost: 'High availability' },
+                { id: 'dev_test' as const, label: 'Dev/Test', hint: rdsMeta.instanceClasses.find(c => c.includes('t3.medium')) || rdsMeta.instanceClasses[2] || rdsMeta.instanceClasses[0], cost: 'Lower cost' },
+                { id: 'free_tier' as const, label: 'Free tier', hint: rdsMeta.instanceClasses[0], cost: 'Free eligible' },
+              ].filter(t => !(t.id === 'free_tier' && !['postgres', 'mysql'].includes(rdsResourceConfig.engine)));
+
+              // Instance class derived from tier
+              const tierToClass: Record<string, string> = {
+                production: rdsMeta.instanceClasses[rdsMeta.instanceClasses.length - 1],
+                dev_test: rdsMeta.instanceClasses.find(c => c.includes('t3.medium') || c.includes('t4g.small')) || rdsMeta.instanceClasses[1] || rdsMeta.instanceClasses[0],
+                free_tier: rdsMeta.instanceClasses[0],
+              };
+
+              return (
+                <div className="mt-4 space-y-0 overflow-hidden rounded-lg border border-[#262626] bg-[#0a0a0a]">
+                  {/* Header */}
+                  <div className="flex items-center justify-between border-b border-[#262626] px-4 py-3">
+                    <div className="text-sm font-bold uppercase tracking-widest text-zinc-400">Database Configuration</div>
+                    {isAurora && (
+                      <div className="rounded bg-zinc-800 px-2 py-0.5 text-xs font-medium text-zinc-300 ring-1 ring-inset ring-zinc-700">
+                        Aurora Cluster
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="space-y-5 p-4">
+
+                    {/* ── Engine Type ── */}
+                    <div>
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">Engine type</div>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {RDS_ENGINES.map((eng) => {
+                          const meta = RDS_ENGINE_META[eng];
+                          const isSelected = rdsResourceConfig.engine === eng;
+                          return (
+                            <button
+                              key={eng}
+                              type="button"
+                              disabled={infraConsultantLoading || deployStatus === 'running'}
+                              onClick={() => handleRdsResourceConfigChange({
+                                engine: eng,
+                                engine_version: meta.defaultVersion,
+                                instance_class: meta.defaultInstanceClass,
+                                allocated_storage: meta.defaultStorage,
+                                multi_az: false,
+                                instance_size_tier: 'free_tier',
+                                aurora_mode: meta.supportsAurora ? 'serverless' : undefined,
+                                master_username: ['oracle-ee', 'sqlserver-ex'].includes(eng) ? 'admin' : 'postgres',
+                                storage_type: 'gp3',
+                              })}
+                              className={`flex items-center gap-2 rounded-md border px-2.5 py-2 text-left transition-all disabled:cursor-not-allowed disabled:opacity-50 ${
+                                isSelected
+                                  ? 'border-blue-500/40 bg-blue-500/10 ring-1 ring-inset ring-blue-500/20'
+                                  : 'border-[#262626] bg-[#111] hover:border-zinc-500'
+                              }`}
+                            >
+                              <div className="min-w-0 flex-1">
+                                <div className={`truncate text-sm font-semibold leading-tight ${isSelected ? 'text-blue-300' : 'text-zinc-300'}`}>{meta.label}</div>
+                                <div className="mt-0.5 truncate text-xs text-zinc-500">{meta.defaultVersion}</div>
+                              </div>
+                              {isSelected && (
+                                <div className="size-1.5 shrink-0 rounded-full bg-blue-400" />
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* ── License note ── */}
+                    {rdsMeta.licenseNote && (
+                      <div className="rounded-md border border-amber-500/20 bg-amber-950/30 px-3 py-2 text-sm leading-relaxed text-amber-300/80">
+                        ⚠ {rdsMeta.licenseNote}
+                      </div>
+                    )}
+
+                    {/* ── DB Instance Type (Aurora only: Serverless vs Provisioned) ── */}
+                    {isAurora && (
+                      <div>
+                        <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">DB instance type</div>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {[
+                            { mode: 'serverless' as const, label: 'Serverless v2', desc: 'Auto vertical scaling' },
+                            { mode: 'provisioned' as const, label: 'Provisioned', desc: 'Fixed instance class' },
+                          ].map(({ mode, label, desc }) => {
+                            const active = mode === 'serverless' ? isServerless : !isServerless;
+                            return (
+                              <button
+                                key={mode}
+                                type="button"
+                                disabled={infraConsultantLoading || deployStatus === 'running'}
+                                onClick={() => handleRdsResourceConfigChange({
+                                  instance_class: mode === 'serverless' ? 'db.serverless' : (rdsMeta.instanceClasses.find(c => c !== 'db.serverless') || rdsMeta.defaultInstanceClass),
+                                  aurora_mode: mode,
+                                })}
+                                className={`rounded-md border px-3 py-2.5 text-left text-xs transition-all disabled:cursor-not-allowed disabled:opacity-50 ${
+                                  active
+                                    ? 'border-blue-500/40 bg-blue-500/10 ring-1 ring-inset ring-blue-500/20'
+                                    : 'border-[#262626] bg-[#111] hover:border-zinc-500'
+                                }`}
+                              >
+                                <div className={`font-semibold ${active ? 'text-blue-300' : 'text-zinc-300'}`}>{label}</div>
+                                <div className="mt-0.5 text-xs text-zinc-500">{desc}</div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ── DB Instance Size (non-Aurora) ── */}
+                    {!isAurora && (
+                      <div>
+                        <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">DB instance size</div>
+                        <div className="space-y-1.5">
+                          {instanceSizeTiers.map(({ id, label, hint, cost }) => {
+                            const active = rdsResourceConfig.instance_size_tier === id;
+                            return (
+                              <button
+                                key={id}
+                                type="button"
+                                disabled={infraConsultantLoading || deployStatus === 'running'}
+                                onClick={() => handleRdsResourceConfigChange({ instance_size_tier: id, instance_class: tierToClass[id] || rdsMeta.defaultInstanceClass })}
+                                className={`w-full rounded-md border px-3 py-2.5 text-left transition-all disabled:cursor-not-allowed disabled:opacity-50 ${
+                                  active
+                                    ? 'border-blue-500/40 bg-blue-500/10 ring-1 ring-inset ring-blue-500/20'
+                                    : 'border-[#262626] bg-[#111] hover:border-zinc-500'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between">
+                                  <span className={`text-xs font-semibold ${active ? 'text-blue-300' : 'text-zinc-300'}`}>{label}</span>
+                                  <span className="text-xs text-zinc-500">{cost}</span>
+                                </div>
+                                <div className="mt-0.5 font-mono text-xs text-zinc-500">{hint}</div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ── Engine version + Instance class (provisioned Aurora or non-Aurora) ── */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <label className="block">
+                        <span className="mb-1 block text-sm font-medium text-zinc-400">Engine version</span>
+                        <select
+                          value={rdsResourceConfig.engine_version}
+                          onChange={(event) => handleRdsResourceConfigChange({ engine_version: event.target.value })}
+                          disabled={infraConsultantLoading || deployStatus === 'running'}
+                          className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {rdsMeta.versions.map((v) => (<option key={v} value={v}>{v}</option>))}
+                        </select>
+                      </label>
+                      {(!isAurora || !isServerless) && (
+                        <label className="block">
+                          <span className="mb-1 block text-sm font-medium text-zinc-400">Instance class</span>
+                          <select
+                            value={rdsResourceConfig.instance_class}
+                            onChange={(event) => handleRdsResourceConfigChange({ instance_class: event.target.value })}
+                            disabled={infraConsultantLoading || deployStatus === 'running'}
+                            className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {rdsMeta.instanceClasses.filter(c => c !== 'db.serverless').map((cls) => (<option key={cls} value={cls}>{cls}</option>))}
+                          </select>
+                        </label>
+                      )}
+                    </div>
+
+                    {/* ── Aurora Serverless ACU settings ── */}
+                    {isAurora && isServerless && (
+                      <div>
+                        <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">Capacity settings</div>
+                        <div className="grid grid-cols-3 gap-3">
+                          <label className="block">
+                            <span className="mb-1 block text-sm font-medium text-zinc-400">Min ACU</span>
+                            <input
+                              type="number"
+                              min={0}
+                              max={rdsResourceConfig.aurora_max_acu ?? 256}
+                              step={0.5}
+                              value={rdsResourceConfig.aurora_min_acu ?? 0}
+                              onChange={(e) => handleRdsResourceConfigChange({ aurora_min_acu: Number(e.target.value) })}
+                              disabled={infraConsultantLoading || deployStatus === 'running'}
+                              className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 font-mono text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                            />
+                            <div className="mt-0.5 text-xs text-zinc-600">0 = scale to 0</div>
+                          </label>
+                          <label className="block">
+                            <span className="mb-1 block text-sm font-medium text-zinc-400">Max ACU</span>
+                            <input
+                              type="number"
+                              min={1}
+                              max={256}
+                              step={0.5}
+                              value={rdsResourceConfig.aurora_max_acu ?? 4}
+                              onChange={(e) => handleRdsResourceConfigChange({ aurora_max_acu: Number(e.target.value) })}
+                              disabled={infraConsultantLoading || deployStatus === 'running'}
+                              className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 font-mono text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                            />
+                            <div className="mt-0.5 text-xs text-zinc-600">1–256 in 0.5</div>
+                          </label>
+                          <label className="block">
+                            <span className="mb-1 block text-sm font-medium text-zinc-400">Pause (s)</span>
+                            <input
+                              type="number"
+                              min={300}
+                              max={86400}
+                              value={rdsResourceConfig.aurora_pause_after_inactivity ?? 300}
+                              onChange={(e) => handleRdsResourceConfigChange({ aurora_pause_after_inactivity: Number(e.target.value) })}
+                              disabled={infraConsultantLoading || deployStatus === 'running'}
+                              className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 font-mono text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                            />
+                            <div className="mt-0.5 text-xs text-zinc-600">300–86400</div>
+                          </label>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ── Storage (non-Aurora) ── */}
+                    {!isAurora && (
+                      <div className="space-y-3">
+                        <div className="grid grid-cols-2 gap-3">
+                          <label className="block">
+                            <span className="mb-1 block text-sm font-medium text-zinc-400">Storage type</span>
+                            <select
+                              value={rdsResourceConfig.storage_type}
+                              onChange={(e) => handleRdsResourceConfigChange({ storage_type: e.target.value as 'gp3' | 'gp2' | 'io1' | 'standard' })}
+                              disabled={infraConsultantLoading || deployStatus === 'running'}
+                              className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              <option value="gp3">General Purpose SSD (gp3)</option>
+                              <option value="gp2">General Purpose SSD (gp2)</option>
+                              <option value="io1">Provisioned IOPS (io1)</option>
+                              <option value="standard">Magnetic (standard)</option>
+                            </select>
+                          </label>
+                          <label className="block">
+                            <span className="mb-1 block text-sm font-medium text-zinc-400">Allocated storage (GB)</span>
+                            <input
+                              type="number"
+                              min={rdsMeta.minStorage}
+                              max={4096}
+                              value={rdsResourceConfig.allocated_storage}
+                              onChange={(e) => handleRdsResourceConfigChange({ allocated_storage: Number(e.target.value) })}
+                              disabled={infraConsultantLoading || deployStatus === 'running'}
+                              className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 font-mono text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                            />
+                          </label>
+                        </div>
+                        <label className="flex cursor-pointer items-center gap-2.5">
+                          <input
+                            type="checkbox"
+                            checked={rdsResourceConfig.storage_autoscaling ?? true}
+                            onChange={(e) => handleRdsResourceConfigChange({ storage_autoscaling: e.target.checked })}
+                            disabled={infraConsultantLoading || deployStatus === 'running'}
+                            className="size-3.5 rounded border-zinc-600 bg-black accent-zinc-500"
+                          />
+                          <span className="text-sm text-zinc-400">Enable storage autoscaling</span>
+                        </label>
+                        {rdsResourceConfig.storage_autoscaling && (
+                          <label className="block">
+                            <span className="mb-1 block text-sm font-medium text-zinc-400">Maximum storage threshold (GB)</span>
+                            <input
+                              type="number"
+                              min={rdsResourceConfig.allocated_storage}
+                              max={65536}
+                              value={rdsResourceConfig.max_allocated_storage}
+                              onChange={(e) => handleRdsResourceConfigChange({ max_allocated_storage: Number(e.target.value) })}
+                              disabled={infraConsultantLoading || deployStatus === 'running'}
+                              className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 font-mono text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                            />
+                          </label>
+                        )}
+                      </div>
+                    )}
+
+                    {/* ── Aurora cluster storage ── */}
+                    {isAurora && (
+                      <div>
+                        <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">Cluster storage configuration</div>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {[
+                            { mode: 'standard' as const, label: 'Aurora Standard', desc: 'Pay per request' },
+                            { mode: 'io_optimized' as const, label: 'Aurora I/O-Optimized', desc: 'Predictable pricing' },
+                          ].map(({ mode, label, desc }) => {
+                            const active = rdsResourceConfig.aurora_cluster_storage_type === mode;
+                            return (
+                              <button
+                                key={mode}
+                                type="button"
+                                disabled={infraConsultantLoading || deployStatus === 'running'}
+                                onClick={() => handleRdsResourceConfigChange({ aurora_cluster_storage_type: mode })}
+                                className={`rounded-md border px-3 py-2.5 text-left text-xs transition-all disabled:cursor-not-allowed disabled:opacity-50 ${
+                                  active
+                                    ? 'border-blue-500/40 bg-blue-500/10 ring-1 ring-inset ring-blue-500/20'
+                                    : 'border-[#262626] bg-[#111] hover:border-zinc-500'
+                                }`}
+                              >
+                                <div className={`font-semibold ${active ? 'text-blue-300' : 'text-zinc-300'}`}>{label}</div>
+                                <div className="mt-0.5 text-xs text-zinc-500">{desc}</div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* ── High Availability & Backups ── */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <label className="block">
+                        <span className="mb-1 block text-sm font-medium text-zinc-400">Backups (days)</span>
+                        <input
+                          type="number"
+                          min={0}
+                          max={35}
+                          value={rdsResourceConfig.backup_retention_period}
+                          onChange={(e) => handleRdsResourceConfigChange({ backup_retention_period: Number(e.target.value) })}
+                          disabled={infraConsultantLoading || deployStatus === 'running'}
+                          className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 font-mono text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                        />
+                      </label>
+                      {isAurora ? (
+                        <label className="block">
+                          <span className="mb-1 block text-sm font-medium text-zinc-400">Aurora Replicas</span>
+                          <select
+                            value={rdsResourceConfig.aurora_replica_count}
+                            onChange={(e) => handleRdsResourceConfigChange({ aurora_replica_count: Number(e.target.value) })}
+                            disabled={infraConsultantLoading || deployStatus === 'running'}
+                            className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <option value={0}>0 (Single instance)</option>
+                            <option value={1}>1 (Multi-AZ)</option>
+                            <option value={2}>2 (High availability)</option>
+                            <option value={3}>3 (Scale read)</option>
+                          </select>
+                        </label>
+                      ) : (
+                        rdsMeta.supportsMultiAz && (
+                          <label className="block">
+                            <span className="mb-1 block text-sm font-medium text-zinc-400">Availability</span>
+                            <select
+                              value={rdsResourceConfig.multi_az ? 'true' : 'false'}
+                              onChange={(e) => handleRdsResourceConfigChange({ multi_az: e.target.value === 'true' })}
+                              disabled={infraConsultantLoading || deployStatus === 'running'}
+                              className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              <option value="false">Single DB instance</option>
+                              <option value="true">Multi-AZ deployment</option>
+                            </select>
+                          </label>
+                        )
+                      )}
+                    </div>
+
+                    {/* ── Public Access & Deletion Protection ── */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <label className="flex cursor-pointer items-center gap-2.5">
+                        <input
+                          type="checkbox"
+                          checked={rdsResourceConfig.publicly_accessible ?? false}
+                          onChange={(e) => handleRdsResourceConfigChange({ publicly_accessible: e.target.checked })}
+                          disabled={infraConsultantLoading || deployStatus === 'running'}
+                          className="size-3.5 rounded border-zinc-600 bg-black accent-zinc-500"
+                        />
+                        <span className="text-sm text-zinc-400">Publicly accessible</span>
+                      </label>
+                      <label className="flex cursor-pointer items-center gap-2.5">
+                        <input
+                          type="checkbox"
+                          checked={rdsResourceConfig.deletion_protection ?? false}
+                          onChange={(e) => handleRdsResourceConfigChange({ deletion_protection: e.target.checked })}
+                          disabled={infraConsultantLoading || deployStatus === 'running'}
+                          className="size-3.5 rounded border-zinc-600 bg-black accent-zinc-500"
+                        />
+                        <span className="text-sm text-zinc-400">Deletion protection</span>
+                      </label>
+                    </div>
+
+                    {/* ── DB Identifier + Master Username ── */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <label className="block">
+                        <span className="mb-1 block text-sm font-medium text-zinc-400">DB identifier</span>
+                        <input
+                          type="text"
+                          value={rdsResourceConfig.db_identifier ?? 'database-1'}
+                          onChange={(e) => handleRdsResourceConfigChange({ db_identifier: e.target.value })}
+                          placeholder="database-1"
+                          disabled={infraConsultantLoading || deployStatus === 'running'}
+                          className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 font-mono text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                        />
+                      </label>
+                      <label className="block">
+                        <span className="mb-1 block text-sm font-medium text-zinc-400">Master username</span>
+                        <input
+                          type="text"
+                          value={rdsResourceConfig.master_username ?? 'admin'}
+                          onChange={(e) => handleRdsResourceConfigChange({ master_username: e.target.value })}
+                          placeholder="admin"
+                          disabled={infraConsultantLoading || deployStatus === 'running'}
+                          className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 font-mono text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                        />
+                      </label>
+                    </div>
+
+                    {/* ── Credentials management ── */}
+                    <div>
+                      <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">Credentials management</div>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        {[
+                          { mode: 'secrets_manager' as const, label: 'AWS Secrets Manager', desc: 'Most secure' },
+                          { mode: 'self_managed' as const, label: 'Self managed', desc: 'Manage your own password' },
+                        ].map(({ mode, label, desc }) => {
+                          const active = rdsResourceConfig.credentials_mode === mode;
+                          return (
+                            <button
+                              key={mode}
+                              type="button"
+                              disabled={infraConsultantLoading || deployStatus === 'running'}
+                              onClick={() => handleRdsResourceConfigChange({ credentials_mode: mode })}
+                              className={`rounded-md border px-3 py-2.5 text-left transition-all disabled:cursor-not-allowed disabled:opacity-50 ${
+                                active
+                                  ? 'border-blue-500/40 bg-blue-500/10 ring-1 ring-inset ring-blue-500/20'
+                                  : 'border-[#262626] bg-[#111] hover:border-zinc-500'
+                              }`}
+                            >
+                              <div className={`text-sm font-semibold ${active ? 'text-blue-300' : 'text-zinc-300'}`}>{label}</div>
+                              <div className="mt-0.5 text-xs text-zinc-500">{desc}</div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* ── Auto-generate password + Password fields (self managed only) ── */}
+                    {isSelfManaged && (
+                      <div className="space-y-3">
+                        <label className="flex cursor-pointer items-center gap-2.5">
+                          <input
+                            type="checkbox"
+                            checked={rdsResourceConfig.auto_generate_password ?? false}
+                            onChange={(e) => handleRdsResourceConfigChange({ auto_generate_password: e.target.checked })}
+                            disabled={infraConsultantLoading || deployStatus === 'running'}
+                            className="size-3.5 rounded border-zinc-600 bg-black accent-zinc-500"
+                          />
+                          <span className="text-sm text-zinc-400">Auto generate password</span>
+                        </label>
+                        {showPassword && (
+                          <div className="grid grid-cols-1 gap-3">
+                            <label className="block">
+                              <span className="mb-1 block text-sm font-medium text-zinc-400">Master password</span>
+                              <input
+                                type="password"
+                                value={rdsResourceConfig.master_password ?? ''}
+                                onChange={(e) => handleRdsResourceConfigChange({ master_password: e.target.value })}
+                                placeholder="Min 8 characters"
+                                disabled={infraConsultantLoading || deployStatus === 'running'}
+                                className="w-full rounded-md border border-[#262626] bg-[#111] px-2.5 py-2 font-mono text-xs text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
+                              />
+                              <div className="mt-0.5 text-xs text-zinc-600">At least 8 printable ASCII characters. Cannot contain / {`"`} @</div>
+                            </label>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                  </div>
                 </div>
-              </div>
-            ) : null}
+              );
+            })() : null}
+
             {deploymentServices.redis ? (
-              <div className="mt-4 rounded-md border border-emerald-500/20 bg-black p-4">
-                <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-emerald-300/80">Redis Settings</div>
+
+              <div className="mt-4 rounded-md border border-[#262626] bg-[#0a0a0a] p-4">
+                <div className="mb-3 text-xs font-semibold tracking-wide text-zinc-400">Redis Settings</div>
                 <div className="grid grid-cols-2 gap-3">
                   <label className="block text-xs font-medium text-zinc-400">
                     <span className="mb-1 block">Node type</span>
@@ -3924,7 +4487,7 @@ export default function DeploymentTrackApp() {
                       value={redisResourceConfig.node_type}
                       onChange={(event) => handleRedisResourceConfigChange({ node_type: event.target.value })}
                       disabled={infraConsultantLoading || deployStatus === 'running'}
-                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                      className="w-full rounded-md border border-[#262626] bg-[#111] px-3 py-2 text-sm text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       {REDIS_NODE_TYPES.map((node) => (<option key={node} value={node}>{node}</option>))}
                     </select>
@@ -3935,7 +4498,7 @@ export default function DeploymentTrackApp() {
                       value={redisResourceConfig.engine_version}
                       onChange={(event) => handleRedisResourceConfigChange({ engine_version: event.target.value })}
                       disabled={infraConsultantLoading || deployStatus === 'running'}
-                      className="w-full rounded-md border border-[#262626] bg-black px-3 py-2 text-sm text-zinc-200 outline-none focus:border-indigo-500/50 disabled:cursor-not-allowed disabled:opacity-60"
+                      className="w-full rounded-md border border-[#262626] bg-[#111] px-3 py-2 text-sm text-zinc-200 outline-none focus:border-zinc-500 disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       {REDIS_ENGINE_VERSIONS.map((version) => (<option key={version} value={version}>{version}</option>))}
                     </select>
@@ -3947,14 +4510,14 @@ export default function DeploymentTrackApp() {
               Components: <span className="font-mono text-zinc-300">{selectedDeploymentComponents.map(formatComponentName).join(' / ')}</span>
             </div>
             {currentInfraConsultant?.confirmed ? (
-              <div className="mt-3 text-xs text-emerald-300">This service decision is approved for Architecture, Cost, and Terraform.</div>
+              <div className="mt-3 text-xs text-zinc-200">This service decision is approved for Architecture, Cost, and Terraform.</div>
             ) : (
               <div className="mt-3 text-xs text-zinc-500">Choose services here, then approve the consultant decision.</div>
             )}
           </div>
           {deploymentPlan === 'ec2' ? (
             <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
-              <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Advanced EC2 Settings</div>
+              <div className="mb-3 text-xs font-semibold tracking-wide text-zinc-500">Advanced EC2 Settings</div>
               <div className="space-y-4">
                 <label className="block text-xs font-medium text-zinc-400">
                   <span className="mb-1 block">Instance type</span>
@@ -4015,7 +4578,7 @@ export default function DeploymentTrackApp() {
           ) : null}
           {deploymentPlan === 'ecs_fargate' ? (
             <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
-              <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">ECS Fargate Settings</div>
+              <div className="mb-3 text-xs font-semibold tracking-wide text-zinc-500">ECS Fargate Settings</div>
               <div className="space-y-4">
                 <label className="block text-xs font-medium text-zinc-400">
                   <span className="mb-1 block">Task CPU</span>
@@ -4063,7 +4626,7 @@ export default function DeploymentTrackApp() {
           ) : null}
           {deploymentPlan === 's3_cloudfront' ? (
             <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
-              <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">CloudFront Settings</div>
+              <div className="mb-3 text-xs font-semibold tracking-wide text-zinc-500">CloudFront Settings</div>
               <div className="space-y-4">
                 <label className="block text-xs font-medium text-zinc-400">
                   <span className="mb-1 block">Price class</span>
@@ -4092,7 +4655,7 @@ export default function DeploymentTrackApp() {
             </div>
           ) : null}
           <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
-            <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Decision Status</div>
+            <div className="mb-3 text-xs font-semibold tracking-wide text-zinc-500">Decision Status</div>
             <div className="text-lg font-semibold text-zinc-100">
               {currentInfraConsultant?.decision ? (currentInfraConsultant.confirmed ? 'Approved' : 'Ready for confirmation') : infraConsultantLoading ? 'Consulting' : 'In progress'}
             </div>
@@ -4104,8 +4667,8 @@ export default function DeploymentTrackApp() {
             </div>
           </div>
           <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
-            <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Repo Detection Summary</div>
-            <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-zinc-500">
+            <div className="mb-3 text-xs font-semibold tracking-wide text-zinc-500">Repo Detection Summary</div>
+            <pre className="whitespace-pre-wrap font-mono text-sm leading-relaxed text-zinc-500">
               {normalizeRepoDetectionSummaryText(currentInfraConsultant?.repo_detection_summary) || 'Waiting for consultant context.'}
             </pre>
           </div>
@@ -4214,7 +4777,28 @@ export default function DeploymentTrackApp() {
       <aside className="flex h-full w-65 shrink-0 flex-col border-r border-[#1A1A1A] bg-[#050505]">
         <div className="flex h-16 items-center border-b border-[#1A1A1A] px-6"><div className="flex items-center gap-3"><div className="flex h-6 w-6 items-center justify-center rounded border border-[#262626] bg-[#111111] text-xs font-bold text-white">N</div><span className="text-sm font-semibold tracking-wide text-white">DepLAI</span></div></div>
         <div className="custom-scrollbar flex-1 space-y-1 overflow-y-auto px-3 py-6">
-          {SIDEBAR_STAGES.map((stage) => <button key={stage.id} onClick={() => setAndPersistStage(stage.id)} className={`flex w-full items-center gap-3 rounded-md px-3 py-2 text-left ${activeStage === stage.id ? 'bg-[#111111] text-zinc-100' : 'text-zinc-400 hover:bg-[#0A0A0A]'}`}><div className="flex shrink-0 items-center justify-center">{activeStage === stage.id ? <CircleDashed className="h-4 w-4 animate-spin text-indigo-500" /> : <div className="h-4 w-4 rounded-full border border-zinc-700" />}</div><div><div className="text-[13px] font-medium">{stage.label}</div><div className="text-[10px] uppercase tracking-widest text-zinc-600">{stage.details}</div></div></button>)}
+          {(() => {
+            const activeIndex = SIDEBAR_STAGES.findIndex((s) => s.id === activeStage);
+            return SIDEBAR_STAGES.map((stage, idx) => {
+              const isActive = activeStage === stage.id;
+              const isDone = idx < activeIndex;
+              return (
+                <button key={stage.id} onClick={() => setAndPersistStage(stage.id)} className={`flex w-full items-center gap-3 rounded-md px-3 py-2 text-left ${isActive ? 'bg-[#111111] text-zinc-100' : isDone ? 'text-zinc-400 hover:bg-[#0A0A0A]' : 'text-zinc-600 hover:bg-[#0A0A0A]'}`}>
+                  <div className="flex shrink-0 items-center justify-center">
+                    {isActive
+                      ? <CircleDashed className="h-4 w-4 animate-spin text-indigo-500" />
+                      : isDone
+                        ? <div className="h-4 w-4 rounded-full bg-indigo-600 flex items-center justify-center"><svg width="8" height="8" viewBox="0 0 8 8" fill="none"><path d="M1.5 4l2 2 3-3" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg></div>
+                        : <div className="h-4 w-4 rounded-full border border-zinc-700" />}
+                  </div>
+                  <div>
+                    <div className="text-[13px] font-medium">{stage.label}</div>
+                    <div className="text-xs uppercase tracking-widest text-zinc-600">{stage.details}</div>
+                  </div>
+                </button>
+              );
+            });
+          })()}
         </div>
       </aside>
       <div className="flex h-full flex-1 flex-col overflow-hidden">
@@ -4240,7 +4824,7 @@ export default function DeploymentTrackApp() {
               ) : null}
             </div>
           )}
-          {activeStage === 'analysis' && <div className="mx-auto max-w-5xl space-y-6">{selectedProject ? <><div><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Repository Analysis</h1><p className="text-sm text-zinc-400">{analysisLoading ? 'Scanning codebase and waiting for Agentic Layer.' : 'Scanning codebase to infer runtime and deployment requirements.'}</p></div><div className="grid grid-cols-3 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Runtime</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : String(repoContext?.language?.runtime || 'Unknown')}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Frameworks</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : analysisFrameworkNames.join(' / ') || 'None detected'}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Data Stores</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : analysisDataStoreNames.join(', ') || 'None detected'}</div></div></div>{!analysisLoading && repoContext && <div className="grid grid-cols-2 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Scanner Summary</div><div className="space-y-2 text-sm text-zinc-300"><div>{String(repoContext.summary || 'No summary generated yet.')}</div><div className="text-zinc-500">Workspace: <span className="font-mono text-zinc-300">{repoContext.workspace}</span></div><div className="text-zinc-500">Build: <span className="font-mono text-zinc-300">{String(repoContext.build?.build_command || 'not detected')}</span></div><div className="text-zinc-500">Start: <span className="font-mono text-zinc-300">{String(repoContext.build?.start_command || 'not detected')}</span></div><div className="text-zinc-500">Health: <span className="font-mono text-zinc-300">{String(repoContext.health?.endpoint || 'not detected')}</span></div></div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Terraform Context</div><pre className="max-h-55 overflow-y-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-400">{qaSummary || 'Repository context will appear here after the scanner completes.'}</pre></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Processes & Config</div><div className="space-y-2 text-sm text-zinc-300">{analysisProcessLines.length > 0 ? analysisProcessLines.map((line) => <div key={line}>{line}</div>) : <div className="text-zinc-500">No explicit processes detected.</div>}{analysisConfigNames.length > 0 && <div className="pt-3 text-zinc-500">Config values: <span className="text-zinc-300">{analysisConfigNames.join(', ')}</span></div>}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Secrets & Flags</div><div className="space-y-2 text-sm text-zinc-300">{analysisSecretNames.length > 0 ? <div>Required secrets: {analysisSecretNames.join(', ')}</div> : <div className="text-zinc-500">No required secrets detected.</div>}{analysisFlagLines.length > 0 ? analysisFlagLines.map((line) => <div key={line} className="text-amber-300">{line}</div>) : <div className="text-zinc-500">No major flags raised by the scanner.</div>}{repoContext.readme_notes && <div className="text-zinc-400">{String(repoContext.readme_notes)}</div>}</div></div></div>}{!analysisLoading && repoContextMd && <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">Scanner Markdown</div><pre className="max-h-80 overflow-y-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-400">{repoContextMd}</pre></div>}<div className="flex justify-end"><button onClick={() => setAndPersistStage('qa')} disabled={analysisLoading || !repoContext || repoContext.workspace !== expectedWorkspace} className="flex items-center gap-2 rounded-md bg-zinc-100 px-6 py-2.5 text-sm font-semibold text-black hover:bg-white disabled:cursor-not-allowed disabled:bg-[#111111] disabled:text-zinc-500">{analysisLoading ? 'Scanning Repository...' : 'Continue to Questions'} <ArrowRight className="h-4 w-4" /></button></div></> : <div className="rounded-xl border border-[#1A1A1A] bg-[#050505] p-8"><h1 className="mb-2 text-2xl font-semibold text-zinc-100">Choose a Repository from the Dashboard</h1><p className="max-w-2xl text-sm leading-relaxed text-zinc-400">Deployment Track only runs against a specific repository. Start from a repo card on the dashboard so the AWS deployment flow is bound to the correct project.</p><div className="mt-6"><button onClick={() => router.push('/dashboard')} className="rounded-md bg-zinc-100 px-5 py-2.5 text-sm font-semibold text-black hover:bg-white">Back to Dashboard</button></div></div>}</div>}
+          {activeStage === 'analysis' && <div className="mx-auto max-w-5xl space-y-6">{!projectsLoaded ? <div className="flex min-h-[400px] items-center justify-center"><div className="text-sm font-medium text-zinc-400 animate-pulse">Loading workspace data...</div></div> : selectedProject ? <><div><h1 className="mb-1 text-2xl font-semibold text-zinc-100">Repository Analysis</h1><p className="text-sm text-zinc-400">{analysisLoading ? 'Scanning codebase and waiting for Agentic Layer.' : 'Scanning codebase to infer runtime and deployment requirements.'}</p></div><div className="grid grid-cols-3 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-xs font-semibold uppercase tracking-widest text-zinc-500">Runtime</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : String(repoContext?.language?.runtime || 'Unknown')}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-xs font-semibold uppercase tracking-widest text-zinc-500">Frameworks</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : analysisFrameworkNames.join(' / ') || 'None detected'}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-1 text-xs font-semibold uppercase tracking-widest text-zinc-500">Data Stores</div><div className="text-lg font-medium text-zinc-100">{analysisLoading ? 'Scanning...' : analysisDataStoreNames.join(', ') || 'None detected'}</div></div></div>{!analysisLoading && repoContext && <div className="grid grid-cols-2 gap-6"><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-xs font-semibold uppercase tracking-widest text-zinc-500">Scanner Summary</div><div className="space-y-2 text-sm text-zinc-300"><div>{String(repoContext.summary || 'No summary generated yet.')}</div><div className="text-zinc-500">Workspace: <span className="font-mono text-zinc-300">{repoContext.workspace}</span></div><div className="text-zinc-500">Build: <span className="font-mono text-zinc-300">{String(repoContext.build?.build_command || 'not detected')}</span></div><div className="text-zinc-500">Start: <span className="font-mono text-zinc-300">{String(repoContext.build?.start_command || 'not detected')}</span></div><div className="text-zinc-500">Health: <span className="font-mono text-zinc-300">{String(repoContext.health?.endpoint || 'not detected')}</span></div></div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-xs font-semibold uppercase tracking-widest text-zinc-500">Terraform Context</div><pre className="max-h-55 overflow-y-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-400">{qaSummary || 'Repository context will appear here after the scanner completes.'}</pre></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-xs font-semibold uppercase tracking-widest text-zinc-500">Processes & Config</div><div className="space-y-2 text-sm text-zinc-300">{analysisProcessLines.length > 0 ? analysisProcessLines.map((line) => <div key={line}>{line}</div>) : <div className="text-zinc-500">No explicit processes detected.</div>}{analysisConfigNames.length > 0 && <div className="pt-3 text-zinc-500">Config values: <span className="text-zinc-300">{analysisConfigNames.join(', ')}</span></div>}</div></div><div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-xs font-semibold uppercase tracking-widest text-zinc-500">Secrets & Flags</div><div className="space-y-2 text-sm text-zinc-300">{analysisSecretNames.length > 0 ? <div>Required secrets: {analysisSecretNames.join(', ')}</div> : <div className="text-zinc-500">No required secrets detected.</div>}{analysisFlagLines.length > 0 ? analysisFlagLines.map((line) => <div key={line} className="text-amber-300">{line}</div>) : <div className="text-zinc-500">No major flags raised by the scanner.</div>}{repoContext.readme_notes && <div className="text-zinc-400">{String(repoContext.readme_notes)}</div>}</div></div></div>}{!analysisLoading && repoContextMd && <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6"><div className="mb-3 text-xs font-semibold uppercase tracking-widest text-zinc-500">Scanner Markdown</div><pre className="max-h-80 overflow-y-auto whitespace-pre-wrap font-mono text-xs leading-relaxed text-zinc-400">{repoContextMd}</pre></div>}<div className="flex justify-end"><button onClick={() => setAndPersistStage('qa')} disabled={analysisLoading || !repoContext || repoContext.workspace !== expectedWorkspace} className="flex items-center gap-2 rounded-md bg-zinc-100 px-6 py-2.5 text-sm font-semibold text-black hover:bg-white disabled:cursor-not-allowed disabled:bg-[#111111] disabled:text-zinc-500">{analysisLoading ? 'Scanning Repository...' : 'Continue to Questions'} <ArrowRight className="h-4 w-4" /></button></div></> : <div className="rounded-xl border border-[#1A1A1A] bg-[#050505] p-8"><h1 className="mb-2 text-2xl font-semibold text-zinc-100">Choose a Repository from the Dashboard</h1><p className="max-w-2xl text-sm leading-relaxed text-zinc-400">Deployment Track only runs against a specific repository. Start from a repo card on the dashboard so the AWS deployment flow is bound to the correct project.</p><div className="mt-6"><button onClick={() => router.push('/dashboard')} className="rounded-md bg-zinc-100 px-5 py-2.5 text-sm font-semibold text-black hover:bg-white">Back to Dashboard</button></div></div>}</div>}
           {activeStage === 'qa' && (
             useLiveConsultantQa ? qaLiveConsultantView : (
             <div className="mx-auto max-w-6xl space-y-6">
@@ -4256,7 +4840,7 @@ export default function DeploymentTrackApp() {
                   </div>
                   <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
                     <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] px-4 py-3">
-                      <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Required</div>
+                      <div className="text-xs font-semibold tracking-wide text-zinc-500">Required</div>
                       <div className="mt-1 text-xl font-semibold text-zinc-100">{answeredRequiredCount}/{requiredQuestions.length || 0}</div>
                     </div>
                     <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] px-4 py-3">
@@ -4284,12 +4868,12 @@ export default function DeploymentTrackApp() {
                   <div className="space-y-6">
                     <div className="grid gap-4 md:grid-cols-3">
                       <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-5">
-                        <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Repository</div>
+                        <div className="text-xs font-semibold tracking-wide text-zinc-500">Repository</div>
                         <div className="mt-2 text-sm font-medium text-zinc-100">{selectedProject?.name || 'Unknown project'}</div>
                         <div className="mt-2 text-xs text-zinc-500">{String(repoContext?.language?.runtime || 'Unknown runtime')}</div>
                       </div>
                       <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-5">
-                        <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Detected Stack</div>
+                        <div className="text-xs font-semibold tracking-wide text-zinc-500">Detected Stack</div>
                         <div className="mt-2 text-sm text-zinc-200">
                           {analysisFrameworkNames.length > 0 ? analysisFrameworkNames.join(' / ') : 'Frameworks not detected'}
                         </div>
@@ -4298,7 +4882,7 @@ export default function DeploymentTrackApp() {
                         </div>
                       </div>
                       <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-5">
-                        <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Question Scope</div>
+                        <div className="text-xs font-semibold tracking-wide text-zinc-500">Question Scope</div>
                         <div className="mt-2 text-sm text-zinc-200">{reviewQuestions.length} total questions</div>
                         <div className="mt-2 text-xs text-zinc-500">{optionalQuestionCount} optional</div>
                       </div>
@@ -4308,7 +4892,7 @@ export default function DeploymentTrackApp() {
                       <section key={category} className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
                         <div className="mb-5 flex items-center justify-between gap-4">
                           <div>
-                            <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">{category}</div>
+                            <div className="text-xs font-semibold tracking-wide text-zinc-500">{category}</div>
                             <div className="mt-1 text-sm text-zinc-400">
                               {questions.filter((question) => String(answers[question.id] || '').trim()).length}/{questions.length} answered
                             </div>
@@ -4336,18 +4920,18 @@ export default function DeploymentTrackApp() {
                                   isNext
                                     ? 'border-indigo-500/40 bg-indigo-500/5'
                                     : answer
-                                      ? 'border-emerald-500/20 bg-emerald-500/5'
+                                      ? 'border-zinc-700 bg-zinc-800/50'
                                       : 'border-[#1A1A1A] bg-black/40'
                                 }`}
                               >
                                 <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
                                   <div>
                                     <div className="mb-2 flex flex-wrap items-center gap-2">
-                                      <span className="rounded-full border border-[#262626] bg-[#111111] px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest text-zinc-500">
+                                      <span className="rounded-full border border-[#262626] bg-[#111111] px-2.5 py-1 text-xs font-semibold tracking-wide text-zinc-500">
                                         Question {index + 1}
                                       </span>
                                       <span
-                                        className={`rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest ${
+                                        className={`rounded-full border px-2.5 py-1 text-xs font-semibold tracking-wide ${
                                           isRequired
                                             ? 'border-amber-500/20 bg-amber-500/10 text-amber-300'
                                             : 'border-zinc-700 bg-[#111111] text-zinc-500'
@@ -4356,7 +4940,7 @@ export default function DeploymentTrackApp() {
                                         {isRequired ? 'Required' : 'Optional'}
                                       </span>
                                       {isNext ? (
-                                        <span className="rounded-full border border-indigo-500/20 bg-indigo-500/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest text-indigo-300">
+                                        <span className="rounded-full border border-indigo-500/20 bg-indigo-500/10 px-2.5 py-1 text-xs font-semibold tracking-wide text-indigo-300">
                                           Next
                                         </span>
                                       ) : null}
@@ -4364,7 +4948,7 @@ export default function DeploymentTrackApp() {
                                     <h2 className="text-base font-medium leading-relaxed text-zinc-100">{question.question}</h2>
                                   </div>
                                   {answer ? (
-                                    <div className="inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-300">
+                                    <div className="inline-flex items-center gap-2 rounded-full border border-zinc-700 bg-zinc-800/50 px-3 py-1 text-xs font-medium text-zinc-200">
                                       <CheckCircle2 className="h-3.5 w-3.5" />
                                       Answered
                                     </div>
@@ -4397,7 +4981,7 @@ export default function DeploymentTrackApp() {
                                             {selected ? (
                                               <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-indigo-300" />
                                             ) : suggestedOption ? (
-                                              <span className="rounded-full border border-zinc-700 px-2 py-0.5 text-[10px] uppercase tracking-widest text-zinc-500">
+                                              <span className="rounded-full border border-zinc-700 px-2 py-0.5 text-xs uppercase tracking-widest text-zinc-500">
                                                 Suggested
                                               </span>
                                             ) : null}
@@ -4431,7 +5015,7 @@ export default function DeploymentTrackApp() {
 
                   <div className="space-y-4 lg:sticky lg:top-8 lg:self-start">
                     <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
-                      <div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Readiness</div>
+                      <div className="mb-4 text-xs font-semibold tracking-wide text-zinc-500">Readiness</div>
                       <div className="mb-3 text-3xl font-semibold text-zinc-100">{reviewCompletionPercent}%</div>
                       <div className="h-2 overflow-hidden rounded-full bg-[#111111]">
                         <div className="h-full rounded-full bg-indigo-500" style={{ width: `${reviewCompletionPercent}%` }} />
@@ -4442,13 +5026,13 @@ export default function DeploymentTrackApp() {
                         {nextRequiredQuestion ? (
                           <div>Next question: <span className="text-zinc-200">{nextRequiredQuestion.question}</span></div>
                         ) : (
-                          <div className="text-emerald-300">All required deployment questions are complete.</div>
+                          <div className="text-zinc-200">All required deployment questions are complete.</div>
                         )}
                       </div>
                     </div>
 
                     <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
-                      <div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Repository Signal</div>
+                      <div className="mb-4 text-xs font-semibold tracking-wide text-zinc-500">Repository Signal</div>
                       <div className="space-y-3 text-sm text-zinc-300">
                         <div>
                           <div className="text-zinc-500">Workspace</div>
@@ -4466,7 +5050,7 @@ export default function DeploymentTrackApp() {
                     </div>
 
                     <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
-                      <div className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">What Happens Next</div>
+                      <div className="mb-4 text-xs font-semibold tracking-wide text-zinc-500">What Happens Next</div>
                       <div className="space-y-2 text-sm text-zinc-400">
                         <div>1. Generate AWS architecture and cost estimate.</div>
                         <div>2. Review architecture and cost.</div>
@@ -4520,7 +5104,7 @@ export default function DeploymentTrackApp() {
                 </div>
                 <div className="space-y-6">
                   <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
-                    <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Selected Components</div>
+                    <div className="mb-3 text-xs font-semibold tracking-wide text-zinc-500">Selected Components</div>
                     <div className="space-y-2 text-sm text-zinc-300">
                       {decisionDiagram.components.length > 0 ? decisionDiagram.components.map((item) => (
                         <div key={item} className="rounded-md border border-[#1A1A1A] bg-black px-3 py-2 font-mono text-xs text-zinc-300">{formatComponentName(item)}</div>
@@ -4528,7 +5112,7 @@ export default function DeploymentTrackApp() {
                     </div>
                   </div>
                   <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
-                    <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Consultant Notes</div>
+                    <div className="mb-3 text-xs font-semibold tracking-wide text-zinc-500">Consultant Notes</div>
                     <div className="space-y-2 text-xs leading-relaxed text-zinc-400">
                       {consultantNotesList.length > 0 ? consultantNotesList.map((note, index) => (
                         <div key={`${index}-${note}`} className="rounded-md border border-[#1A1A1A] bg-black px-3 py-2">{note}</div>
@@ -4567,7 +5151,7 @@ export default function DeploymentTrackApp() {
                     ) : decisionCostRows.length > 0 ? (
                       <table className="w-full text-sm">
                         <thead>
-                          <tr className="border-b border-[#1A1A1A] text-left text-[11px] uppercase tracking-widest text-zinc-500">
+                          <tr className="border-b border-[#1A1A1A] text-left text-xs font-semibold tracking-wide text-zinc-500">
                             <th className="px-2 py-3">Component</th>
                             <th className="px-2 py-3">Hourly</th>
                             <th className="px-2 py-3">Monthly</th>
@@ -4601,7 +5185,7 @@ export default function DeploymentTrackApp() {
                 </div>
                 <div className="space-y-6">
                   <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
-                    <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Optimization Tips</div>
+                    <div className="mb-3 text-xs font-semibold tracking-wide text-zinc-500">Optimization Tips</div>
                     <div className="space-y-2 text-xs leading-relaxed text-zinc-400">
                       {decisionOptimizationTips.length > 0 ? decisionOptimizationTips.map((tip, index) => (
                         <div key={`${index}-${tip}`} className="rounded-md border border-[#1A1A1A] bg-black px-3 py-2">{tip}</div>
@@ -4640,7 +5224,7 @@ export default function DeploymentTrackApp() {
                   <button
                     onClick={() => void createIacPr()}
                     disabled={terraformGenerating || iacPrCreating || deployableIacFiles.length === 0 || Boolean(iacPrUrl)}
-                    className="rounded-md border border-cyan-500/20 bg-cyan-500/10 px-5 py-2 text-sm font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"
+                    className="rounded-md border border-zinc-700 bg-zinc-800/50 px-5 py-2 text-sm font-semibold text-zinc-200 hover:bg-zinc-800/50 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"
                   >
                     {iacPrUrl ? 'PR ready' : iacPrCreating ? 'Creating PR...' : 'Create PR'}
                   </button>
@@ -4669,14 +5253,14 @@ export default function DeploymentTrackApp() {
                 </div>
               </div>
               {!hasSuccessfulGeneration ? (
-                <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-4 py-3 text-xs text-cyan-200">
+                <div className="rounded-lg border border-zinc-700 bg-zinc-800/50 px-4 py-3 text-xs text-zinc-200">
                   Terraform stage only shows generation status and artifacts. Use Questions to refine consultant decisions.
                 </div>
               ) : null}
               <div className="grid grid-cols-3 gap-6">
                 <div className="space-y-6">
                   <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
-                    <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Generator</div>
+                    <div className="mb-2 text-xs font-semibold tracking-wide text-zinc-500">Generator</div>
                     <div className="text-lg font-semibold text-zinc-100">{terraformRendererSummary.primary}</div>
                     <div className="mt-1 text-sm text-zinc-400">{terraformRendererSummary.secondary}</div>
                     <div className="mt-3 space-y-2 text-xs text-zinc-500">
@@ -4685,15 +5269,15 @@ export default function DeploymentTrackApp() {
                       <div>Run ID: <span className="font-mono text-zinc-300">{shouldUseSavedRunForDeploy ? activeSavedRun?.run_id : (hasCurrentIacMeta ? 'bundle-only' : 'pending')}</span></div>
                       <div>Workspace: <span className="font-mono text-zinc-300">{(shouldUseSavedRunForDeploy ? activeSavedRun?.workspace : savedIacMeta?.workspace) || expectedWorkspace || 'pending'}</span></div>
                       <div>Files: <span className="font-mono text-zinc-300">{iacFiles.length}</span></div>
-                      <div>Socket: <span className={`font-mono ${deploySocketState === 'connected' ? 'text-emerald-400' : deploySocketState === 'connecting' ? 'text-cyan-400' : deploySocketState === 'error' ? 'text-amber-400' : 'text-zinc-300'}`}>{deploySocketState}</span></div>
+                      <div>Socket: <span className={`font-mono ${deploySocketState === 'connected' ? 'text-zinc-200' : deploySocketState === 'connecting' ? 'text-zinc-200' : deploySocketState === 'error' ? 'text-amber-400' : 'text-zinc-300'}`}>{deploySocketState}</span></div>
                     </div>
                     {socketNotices.length > 0 ? (
                       <div className="mt-4 space-y-2">
-                        <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Connection Notices</div>
+                        <div className="text-xs font-semibold tracking-wide text-zinc-500">Connection Notices</div>
                         {socketNotices.map((notice) => (
-                          <div key={notice.key} className={`rounded-md border px-3 py-2 text-xs ${notice.tone === 'error' ? 'border-amber-500/20 bg-amber-500/10 text-amber-200' : 'border-cyan-500/20 bg-cyan-500/10 text-cyan-200'}`}>
+                          <div key={notice.key} className={`rounded-md border px-3 py-2 text-xs ${notice.tone === 'error' ? 'border-amber-500/20 bg-amber-500/10 text-amber-200' : 'border-zinc-700 bg-zinc-800/50 text-zinc-200'}`}>
                             <div>{notice.text}</div>
-                            <div className="mt-1 font-mono text-[10px] opacity-70">{notice.ts}</div>
+                            <div className="mt-1 font-mono text-xs opacity-70">{notice.ts}</div>
                           </div>
                         ))}
                       </div>
@@ -4704,27 +5288,27 @@ export default function DeploymentTrackApp() {
                       </div>
                     ) : null}
                     {iacPrUrl ? (
-                      <div className="mt-4 rounded-md border border-emerald-500/20 bg-emerald-500/10 p-3 text-xs text-emerald-300">
+                      <div className="mt-4 rounded-md border border-zinc-700 bg-zinc-800/50 p-3 text-xs text-zinc-200">
                         Pull request creation is available and does not block AWS Config or deploy readiness.
                       </div>
                     ) : null}
                   </div>
                   <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
-                    <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Workers</div>
+                    <div className="mb-3 text-xs font-semibold tracking-wide text-zinc-500">Workers</div>
                     <div className="space-y-2 text-xs">
                       {terraformWorkerStates.length > 0 ? terraformWorkerStates.map((worker) => (
                         <div key={worker.worker_id} className="rounded-md border border-[#1A1A1A] bg-black px-3 py-2">
                           <div className="flex items-center justify-between gap-3">
                             <div>
                               <div className="font-medium text-zinc-200">{worker.worker_role || worker.worker_id}</div>
-                              <div className="font-mono text-[11px] text-zinc-500">{worker.worker_id}</div>
+                              <div className="font-mono text-sm text-zinc-500">{worker.worker_id}</div>
                             </div>
-                            <span className={`rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-widest ${
+                            <span className={`rounded border px-2 py-0.5 text-xs font-semibold uppercase tracking-widest ${
                               worker.worker_status === 'completed'
-                                ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400'
+                                ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200'
                                 : worker.worker_status === 'failed'
                                   ? 'border-red-500/20 bg-red-500/10 text-red-300'
-                                  : 'border-cyan-500/20 bg-cyan-500/10 text-cyan-300'
+                                  : 'border-zinc-700 bg-zinc-800/50 text-zinc-200'
                             }`}>
                               {worker.worker_status || 'running'}
                             </span>
@@ -4749,17 +5333,17 @@ export default function DeploymentTrackApp() {
                           <span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span>
                           <div className="min-w-0">
                             <div className="mb-1 flex flex-wrap items-center gap-2">
-                              {log.worker_id && <span className="rounded border border-[#262626] bg-[#111111] px-2 py-0.5 text-[10px] uppercase tracking-widest text-zinc-400">{log.worker_id}</span>}
-                              {log.worker_status && <span className={`rounded border px-2 py-0.5 text-[10px] uppercase tracking-widest ${
+                              {log.worker_id && <span className="rounded border border-[#262626] bg-[#111111] px-2 py-0.5 text-xs uppercase tracking-widest text-zinc-400">{log.worker_id}</span>}
+                              {log.worker_status && <span className={`rounded border px-2 py-0.5 text-xs uppercase tracking-widest ${
                                 log.worker_status === 'completed'
-                                  ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400'
+                                  ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200'
                                   : log.worker_status === 'failed'
                                     ? 'border-red-500/20 bg-red-500/10 text-red-300'
-                                    : 'border-cyan-500/20 bg-cyan-500/10 text-cyan-300'
+                                    : 'border-zinc-700 bg-zinc-800/50 text-zinc-200'
                               }`}>{log.worker_status}</span>}
-                              {log.model && <span className="font-mono text-[10px] text-zinc-600">{log.model}</span>}
+                              {log.model && <span className="font-mono text-xs text-zinc-600">{log.model}</span>}
                             </div>
-                            <div className={log.type === 'success' ? 'font-medium text-emerald-400' : log.type === 'error' ? 'text-red-400' : 'text-zinc-300'}>{log.text}</div>
+                            <div className={log.type === 'success' ? 'font-medium text-zinc-200' : log.type === 'error' ? 'text-red-400' : 'text-zinc-300'}>{log.text}</div>
                           </div>
                         </div>
                       )) : (
@@ -4782,8 +5366,8 @@ export default function DeploymentTrackApp() {
                   </div>
                   <div className="flex h-130 flex-1 flex-col rounded-lg border border-[#1A1A1A] bg-[#050505]">
                     <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-black px-4 py-2.5">
-                      <div className="font-mono text-[11px] text-zinc-400">{activeIacFilePath || 'Generated files'}</div>
-                      <div className="text-[11px] uppercase tracking-widest text-zinc-500">Editable</div>
+                      <div className="font-mono text-sm text-zinc-400">{activeIacFilePath || 'Generated files'}</div>
+                      <div className="text-xs font-semibold tracking-wide text-zinc-500">Editable</div>
                     </div>
                     <textarea
                       value={(iacFiles.find((file) => file.path === activeIacFilePath) || iacFiles[0])?.content || ''}
@@ -4828,7 +5412,7 @@ export default function DeploymentTrackApp() {
                 </div>
                 <div className="space-y-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
                   <div>
-                    <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Runtime Inputs</div>
+                    <div className="text-xs font-semibold tracking-wide text-zinc-500">Runtime Inputs</div>
                     <div className="mt-3 space-y-2 text-xs text-zinc-400">
                       <div>Deploy source: <span className="font-mono text-zinc-200">{shouldUseSavedRunForDeploy ? 'saved run' : 'session files'}</span></div>
                       <div>Workspace: <span className="font-mono text-zinc-200">{shouldUseSavedRunForDeploy ? (activeSavedRun?.workspace || expectedWorkspace || 'pending') : (expectedWorkspace || 'local session')}</span></div>
@@ -4839,7 +5423,7 @@ export default function DeploymentTrackApp() {
                       <div>Budget cap: <span className="font-mono text-zinc-200">${costEstimate.cap.toFixed(2)}</span></div>
                     </div>
                   </div>
-                  <div className={`rounded-md border px-3 py-2 text-xs ${hasAwsSecrets && canContinueToAwsConfig ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300' : hasAwsSecrets ? 'border-zinc-700 bg-[#111111] text-zinc-400' : 'border-amber-500/20 bg-amber-500/10 text-amber-300'}`}>
+                  <div className={`rounded-md border px-3 py-2 text-xs ${hasAwsSecrets && canContinueToAwsConfig ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200' : hasAwsSecrets ? 'border-zinc-700 bg-[#111111] text-zinc-400' : 'border-amber-500/20 bg-amber-500/10 text-amber-300'}`}>
                     {hasAwsSecrets && canContinueToAwsConfig
                       ? 'AWS credentials are ready. Add AWS_SESSION_TOKEN if you are using temporary STS credentials.'
                       : hasAwsSecrets
@@ -4873,10 +5457,10 @@ export default function DeploymentTrackApp() {
                   </p>
                 </div>
                 <div
-                  className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-widest ${deploySocketState === 'connected'
-                    ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400'
+                  className={`rounded-full border px-3 py-1 text-sm font-semibold uppercase tracking-widest ${deploySocketState === 'connected'
+                    ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200'
                     : deploySocketState === 'connecting'
-                      ? 'border-cyan-500/20 bg-cyan-500/10 text-cyan-400'
+                      ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200'
                       : deploySocketState === 'error'
                         ? 'border-amber-500/20 bg-amber-500/10 text-amber-400'
                         : 'border-zinc-700 bg-[#111111] text-zinc-500'
@@ -4892,14 +5476,14 @@ export default function DeploymentTrackApp() {
                       <div className="flex gap-1.5">
                         <span className="h-3 w-3 rounded-full bg-red-500/80" />
                         <span className="h-3 w-3 rounded-full bg-amber-400/80" />
-                        <span className="h-3 w-3 rounded-full bg-emerald-500/80" />
+                        <span className="h-3 w-3 rounded-full bg-zinc-800/50" />
                       </div>
                       <span className="text-[#4A9EFF] font-semibold tracking-wider">STDOUT</span>
                       <span className="text-zinc-600">—</span>
                       <span className="text-zinc-500">deployment.log</span>
                     </div>
                     <div className="flex items-center gap-3 text-zinc-600">
-                      <span className="rounded bg-[#111827] px-2 py-0.5 text-[10px] font-mono text-zinc-500">{deployLogs.length} events</span>
+                      <span className="rounded bg-[#111827] px-2 py-0.5 text-xs font-mono text-zinc-500">{deployLogs.length} events</span>
                     </div>
                   </div>
                   <div className="custom-scrollbar flex-1 overflow-y-auto bg-[#070B14] p-4 font-mono text-[12px]" style={{ scrollbarWidth: 'thin', scrollbarColor: '#1E2433 transparent' }}>
@@ -4908,11 +5492,11 @@ export default function DeploymentTrackApp() {
                     )}
                     {deployLogs.map((log, index) => (
                       <div key={`${log.ts}-${index}`} className={`mb-0.5 flex gap-3 rounded px-2 py-0.5 ${index % 2 === 0 ? 'bg-transparent' : 'bg-[#0C1120]/40'}`}>
-                        <span className="shrink-0 select-none text-[10px] text-[#2A3A5C] mt-0.5">{String(index + 1).padStart(2, '0')}</span>
+                        <span className="shrink-0 select-none text-xs text-[#2A3A5C] mt-0.5">{String(index + 1).padStart(2, '0')}</span>
                         <span className={`flex-1 leading-relaxed ${
-                          log.type === 'success' ? 'text-emerald-400' 
+                          log.type === 'success' ? 'text-zinc-200' 
                           : log.type === 'error' ? 'text-red-400' 
-                          : log.text.startsWith('✓') || log.text.includes('created') ? 'text-emerald-300'
+                          : log.text.startsWith('✓') || log.text.includes('created') ? 'text-zinc-200'
                           : log.text.startsWith('+') || log.text.includes('Creating') ? 'text-[#4A9EFF]'
                           : log.text.includes('Error') || log.text.includes('failed') ? 'text-red-400'
                           : log.text.startsWith('[') ? 'text-amber-300/80'
@@ -4927,12 +5511,12 @@ export default function DeploymentTrackApp() {
                 </div>
                 <div className="space-y-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
                   <div>
-                    <div className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Execution</div>
+                    <div className="text-xs font-semibold tracking-wide text-zinc-500">Execution</div>
                     <div className="mt-3 text-3xl font-semibold text-zinc-100">{deployProgress}%</div>
                     <div className="mt-2 h-2 overflow-hidden rounded-full bg-[#111111]">
                       <div
                         className={`h-full rounded-full ${deployStatus === 'done'
-                          ? 'bg-emerald-500'
+                          ? 'bg-zinc-600'
                           : deployStatus === 'error'
                             ? 'bg-red-500'
                             : 'bg-indigo-500'
@@ -4942,15 +5526,15 @@ export default function DeploymentTrackApp() {
                     </div>
                     <div className="mt-3 flex items-center gap-2 text-xs text-zinc-500">
                       <span>Status:</span>
-                      <span className={`rounded-full px-2 py-0.5 font-mono text-[10px] font-semibold ${
-                        deployStatus === 'done' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                      <span className={`rounded-full px-2 py-0.5 font-mono text-xs font-semibold ${
+                        deployStatus === 'done' ? 'bg-zinc-800/50 text-zinc-200 border border-zinc-700'
                         : deployStatus === 'error' ? 'bg-red-500/10 text-red-400 border border-red-500/20'
-                        : deployProgress >= 100 ? 'animate-pulse bg-cyan-500/10 text-cyan-400 border border-cyan-500/20'
+                        : deployProgress >= 100 ? 'animate-pulse bg-zinc-800/50 text-zinc-200 border border-zinc-700'
                         : 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20'
                       }`}>{deployProgress >= 100 && deployStatus === 'running' ? 'executing build' : deployStatus}</span>
                     </div>
                     {deployProgress >= 100 && deployStatus === 'running' && (
-                      <div className="mt-3 rounded-md border border-cyan-500/20 bg-cyan-500/5 px-3 py-2 text-[11px] text-cyan-300">
+                      <div className="mt-3 rounded-md border border-zinc-700 bg-zinc-800/50 px-3 py-2 text-sm text-zinc-200">
                         ⚡ Build script running on EC2. This can take 30–60 min. Watch the terminal below.
                       </div>
                     )}
@@ -4969,7 +5553,7 @@ export default function DeploymentTrackApp() {
                         />
                         <span>
                           <span className="block font-medium text-amber-100">Override budget guardrail for this deploy</span>
-                          <span className="mt-1 block text-[11px] text-amber-200/80">Use only when you intentionally approve costs above the configured cap.</span>
+                          <span className="mt-1 block text-sm text-amber-200/80">Use only when you intentionally approve costs above the configured cap.</span>
                         </span>
                       </label>
                     </div>
@@ -5028,7 +5612,7 @@ export default function DeploymentTrackApp() {
           {activeStage === 'outputs' && (
             <div className="mx-auto max-w-5xl space-y-6">
               <div className="mt-4 mb-8 border-b border-[#1A1A1A] pb-6">
-                <div className={`mb-4 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-bold uppercase ${outputBannerClassName}`}>
+                <div className={`mb-4 inline-flex items-center gap-2 rounded-full border px-3 py-1 text-sm font-bold uppercase ${outputBannerClassName}`}>
                   <CheckCircle2 className="h-3.5 w-3.5" /> {outputBanner.label}
                 </div>
                 <h1 className="mb-2 text-2xl font-semibold text-zinc-100">{outputBanner.title}</h1>
@@ -5081,7 +5665,7 @@ export default function DeploymentTrackApp() {
               })()}
               <div className="grid grid-cols-2 gap-6">
                 <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
-                  <div className="mb-6 text-[10px] font-bold uppercase text-zinc-500">Security</div>
+                  <div className="mb-6 text-xs font-semibold tracking-wide text-zinc-500">Security</div>
                   <div className="flex gap-2">
                     <button
                       onClick={() => deploySummary.generatedPem && downloadTextFile(`${deploySummary.keyName}.pem`, deploySummary.generatedPem.endsWith('\n') ? deploySummary.generatedPem : `${deploySummary.generatedPem}\n`)}
@@ -5105,7 +5689,7 @@ export default function DeploymentTrackApp() {
                   )}
                 </div>
                 <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
-                  <div className="mb-4 text-[10px] font-bold uppercase text-zinc-500">Endpoints</div>
+                  <div className="mb-4 text-xs font-semibold tracking-wide text-zinc-500">Endpoints</div>
                   <div className="space-y-3 text-sm">
                     {(() => {
                       const termInstanceId = deploySummary.instanceId && deploySummary.instanceId !== 'n/a' ? deploySummary.instanceId : String(iacResourceOutputs?.outputs?.find(o => o.key === 'instance_id' || o.key === 'ec2_instance_id')?.value || 'n/a');
@@ -5140,7 +5724,7 @@ export default function DeploymentTrackApp() {
                         )}
                       </div>
                     </div>
-                    <div className="flex justify-between"><span className="text-zinc-400">Verification</span><span className={`font-medium ${outputBanner.tone === 'success' ? 'text-emerald-400' : outputBanner.tone === 'error' ? 'text-red-300' : 'text-amber-300'}`}>{outputBanner.label}</span></div>
+                    <div className="flex justify-between"><span className="text-zinc-400">Verification</span><span className={`font-medium ${outputBanner.tone === 'success' ? 'text-zinc-200' : outputBanner.tone === 'error' ? 'text-red-300' : 'text-amber-300'}`}>{outputBanner.label}</span></div>
                   </div>
                 </div>
               </div>
@@ -5148,7 +5732,7 @@ export default function DeploymentTrackApp() {
                 <button onClick={() => void fetchRuntimeDetails().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to fetch runtime details.'))} disabled={!canFetchRuntimeDetails} className="flex items-center gap-2 rounded-md border border-[#262626] bg-[#111111] px-4 py-2 text-sm font-semibold text-zinc-300 hover:bg-[#181818] disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">
                   <RefreshCw className="h-4 w-4" /> Fetch Latest Runtime Details
                 </button>
-                <button onClick={() => void verifyLiveEndpoints()} disabled={verifyLoading || !canVerifyLiveEndpoints} className="flex items-center gap-2 rounded-md border border-cyan-500/20 bg-cyan-500/10 px-4 py-2 text-sm font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">
+                <button onClick={() => void verifyLiveEndpoints()} disabled={verifyLoading || !canVerifyLiveEndpoints} className="flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-800/50 px-4 py-2 text-sm font-semibold text-zinc-200 hover:bg-zinc-800/50 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">
                   <ExternalLink className="h-4 w-4" /> {verifyLoading ? 'Verifying...' : 'Verify Live Endpoints'}
                 </button>
                 <button onClick={() => void destroyDeployment().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Destroy failed.'))} disabled={destroyLoading || !hasAwsSecrets} className="flex items-center gap-2 rounded-md border border-red-500/20 bg-red-500/10 px-4 py-2 text-sm font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">
@@ -5164,9 +5748,9 @@ export default function DeploymentTrackApp() {
                         <div className="flex items-center justify-between">
                           <div>
                             <div className="text-sm font-medium text-zinc-200">{check.label}</div>
-                            <div className="mt-1 font-mono text-[11px] text-zinc-500">{check.url || 'n/a'}</div>
+                            <div className="mt-1 font-mono text-sm text-zinc-500">{check.url || 'n/a'}</div>
                           </div>
-                          <span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${check.ok ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-300'}`}>
+                          <span className={`rounded border px-2.5 py-1 text-sm font-medium ${check.ok ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200' : 'border-red-500/20 bg-red-500/10 text-red-300'}`}>
                             {check.ok ? `HTTP ${check.status ?? 200}` : (check.status ? `HTTP ${check.status}` : 'Unreachable')}
                           </span>
                         </div>
@@ -5188,9 +5772,9 @@ export default function DeploymentTrackApp() {
                       <div className="flex items-center justify-between">
                         <div>
                           <p className="text-sm font-medium text-zinc-200">{new Date(entry.createdAt).toLocaleString()}</p>
-                          <p className="mt-1 font-mono text-[11px] text-zinc-400">EC2: {entry.instanceId}</p>
+                          <p className="mt-1 font-mono text-sm text-zinc-400">EC2: {entry.instanceId}</p>
                         </div>
-                        <span className={`rounded border px-2.5 py-1 text-[11px] font-medium ${entry.status === 'done' ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-400' : 'border-red-500/20 bg-red-500/10 text-red-400'}`}>
+                        <span className={`rounded border px-2.5 py-1 text-sm font-medium ${entry.status === 'done' ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200' : 'border-red-500/20 bg-red-500/10 text-red-400'}`}>
                           {entry.status === 'done' ? 'Success' : 'Error'}
                         </span>
                       </div>

@@ -1,8 +1,8 @@
-﻿Given repository signals, map the application to concrete AWS infrastructure.
+Given repository signals, map the application to concrete AWS infrastructure.
 Rules:
 1. Dockerfile strongly implies ECS Fargate for app compute unless explicit serverless signals exist.
 2. Presence of handler.py, lambda_handler, or serverless.yml implies Lambda.
-3. psycopg2 or sqlalchemy with postgres dialect implies RDS PostgreSQL.
+3. psycopg2, sqlalchemy with postgres dialect, or prisma implies RDS PostgreSQL.
 4. redis or celery implies ElastiCache Redis and separate worker service.
 5. If ambiguous, include "requires_clarification" with short reason.
 6. Never choose EC2 when ECS Fargate is appropriate.

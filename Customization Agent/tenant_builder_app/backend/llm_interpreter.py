@@ -57,6 +57,159 @@ class LLMInterpreter:
             float(os.getenv("LLM_RETRY_BASE_DELAY_SECONDS", "1.5") or "1.5"),
         )
 
+
+    # ── Intent classification ────────────────────────────────────────────────
+
+    _TEXT_STYLE_SIGNALS = re.compile(
+        r"\b(colour|color|gradient|font|size|bold|italic|underline|background|bg|style"
+        r"|shadow|border|radius|opacity|visibility|show|hide|display"
+        r"|make|change|set|update|turn|rename|reword|replace"
+        r"|text|copy|label|heading|title|subtitle|description|cta|button"
+        r"|hero|landing|topbar|footer|nav|auth|login|register"
+        r"|hero_[123]|hero_description|company\s*name)\b",
+        re.IGNORECASE,
+    )
+    _BRANDING_SIGNALS = re.compile(
+        r"\b(company\s*name|logo|brand(?:ing)?|primary|secondary|accent|theme\s*colou?r)\b",
+        re.IGNORECASE,
+    )
+    _DOMAIN_SIGNALS = re.compile(
+        r"\b(domain|url|site\s*url|website|host)\b",
+        re.IGNORECASE,
+    )
+    _STRUCTURAL_SIGNALS = re.compile(
+        r"\b(add\s+(a\s+)?(button|page|section|component|feature|field)"
+        r"|restructure|reorder|move\s+(the\s+)?section"
+        r"|new\s+page|create\s+page|add\s+page"
+        r"|integrate|payment|api|webhook|third.?party)\b",
+        re.IGNORECASE,
+    )
+
+    _MICRO_PROMPT = (
+        "You are a manifest assistant. Return ONLY a JSON object — no markdown, no prose outside JSON.\n"
+        'Shape: {"response": "short human reply", "manifest_patch": {}, "questions": []}\n'
+        "manifest_patch must contain ONLY changed fields.\n"
+        "For UI text/style/colour changes use extensions:\n"
+        '  {"type":"nl_key_value","scope":"frontend","target_raw":"<old text or style key>","value":"<new value>"}\n'
+        "For visibility: target_raw like \"landing.show_hero\", value \"true\" or \"false\".\n"
+        "questions must be [] unless genuinely ambiguous."
+    )
+
+    def _classify_intent(self, message: str) -> str:
+        """Classify the user message into a context tier.
+
+        Returns one of:
+          "text_style"  — UI text, color, style, visibility, hero copy (most requests)
+          "branding"    — company name, logo, primary/secondary theme
+          "domain"      — domain / URL changes
+          "structural"  — add page/component, integrate APIs (needs full context)
+        """
+        if self._STRUCTURAL_SIGNALS.search(message):
+            return "structural"
+        if self._BRANDING_SIGNALS.search(message) and not self._TEXT_STYLE_SIGNALS.search(message):
+            return "branding"
+        if self._DOMAIN_SIGNALS.search(message):
+            return "domain"
+        return "text_style"
+
+    def _extract_relevant_manifest(self, intent: str, manifest: dict) -> dict:
+        """Return only the manifest slice relevant to this intent.
+
+        text_style  → empty dict (extension format hint is enough)
+        branding    → categories.branding + categories.theme only
+        domain      → categories.domains only
+        structural  → full manifest
+        """
+        cats = manifest.get("categories", {}) if isinstance(manifest, dict) else {}
+        if intent == "text_style":
+            # Include any existing extensions so the LLM can see prior changes,
+            # but strip everything else — it does not need portals/integrations/etc.
+            exts = manifest.get("extensions", [])
+            return {"extensions": exts} if exts else {}
+        if intent == "branding":
+            return {
+                "categories": {
+                    k: cats.get(k, {})
+                    for k in ("branding", "theme")
+                    if cats.get(k)
+                }
+            }
+        if intent == "domain":
+            return {
+                "categories": {
+                    "domains": cats.get("domains", {})
+                }
+            }
+        # structural — full manifest
+        return manifest
+
+    # ── Deterministic style-on-literal-text catcher ──────────────────────────
+
+    _STYLE_ON_TEXT_PATTERN = re.compile(
+        r"(?:make|set|change|turn)\s+"
+        r"[\u2018\u2019\u201c\u201d\"\'](?P<target>[^\"\u201d\u2019\']{2,120})[\"\u201d\u2019\']"
+        r"\s+(?P<style>gradient(?:\s+colou?r)?|colou?r|background|font(?:\s+(?:size|color|weight))?)"
+        r"\s+(?P<value>[a-zA-Z#][a-zA-Z0-9#_,\-\s]{0,40})",
+        re.IGNORECASE,
+    )
+
+    def _parse_style_on_literal_text(
+        self,
+        message: str,
+        current_manifest: dict,
+    ) -> dict | None:
+        """Catch patterns like:
+          make "Connect, Learn & Grow with IFCA" gradient colour purple
+          set 'Dashboard UI' color red
+        """
+        match = self._STYLE_ON_TEXT_PATTERN.search(message)
+        if not match:
+            return None
+
+        raw_target = match.group("target").strip()
+        style_type = match.group("style").strip().lower()
+        raw_value  = match.group("value").strip().rstrip(".,;")
+
+        # Build the target_raw key: "<literal text> color" or "<literal text> background"
+        if "background" in style_type:
+            target_key = f"{raw_target} background"
+        else:
+            target_key = f"{raw_target} color"
+
+        entry = {
+            "type": "nl_key_value",
+            "scope": "frontend",
+            "target_raw": target_key,
+            "value": raw_value,
+        }
+
+        existing_extensions = current_manifest.get("extensions")
+        merged: list = []
+        if isinstance(existing_extensions, list):
+            for item in existing_extensions:
+                if isinstance(item, dict):
+                    import json as _json
+                    merged.append(_json.loads(_json.dumps(item)))
+
+        replaced = False
+        for idx, ex in enumerate(merged):
+            if (
+                isinstance(ex, dict)
+                and str(ex.get("type", "")).strip().lower() == "nl_key_value"
+                and str(ex.get("target_raw", "")).strip().lower() == target_key.lower()
+            ):
+                merged[idx] = entry
+                replaced = True
+                break
+        if not replaced:
+            merged.append(entry)
+
+        return {
+            "response": f"Applied style change: '{raw_target}' {style_type} set to {raw_value}.",
+            "manifest_patch": {"extensions": merged},
+            "questions": [],
+        }
+
     def _infer_provider(self, api_url: str) -> str:
         return infer_provider(api_url)
 
@@ -111,7 +264,7 @@ class LLMInterpreter:
                 pass
         return self.retry_base_delay_seconds * (2 ** (attempt - 1))
 
-    def interpret(self, message: str, current_manifest: dict[str, Any], byok_config: Any | None = None) -> dict[str, Any]:
+    def interpret(self, message: str, current_manifest: dict[str, Any], byok_config: Any | None = None, conversation_context: str = "") -> dict[str, Any]:
         self._current_manifest = current_manifest
         deterministic_frontend_patch = self._build_deterministic_frontend_patch(
             message=message,
@@ -132,7 +285,15 @@ class LLMInterpreter:
         if exact_replace_patch is not None:
             return exact_replace_patch
 
-        prompt = self._build_prompt(message=message, current_manifest=current_manifest)
+        # Deterministic style-on-literal-text: "make 'X' colour Y" — zero LLM tokens
+        style_patch = self._parse_style_on_literal_text(
+            message=message,
+            current_manifest=current_manifest,
+        )
+        if style_patch is not None:
+            return style_patch
+
+        prompt = self._build_prompt(message=message, current_manifest=current_manifest, conversation_context=conversation_context)
 
         try:
             raw_content = self._call_llm(prompt=prompt, byok_config=byok_config)
@@ -146,22 +307,7 @@ class LLMInterpreter:
                 normalized = self._normalize_result(normalized)
             return normalized
         except Exception as exc:
-            if deterministic_frontend_patch:
-                return {
-                    "response": "Applied deterministic frontend patch from your request.",
-                    "manifest_patch": deterministic_frontend_patch,
-                    "questions": [],
-                }
-            return {
-                "response": (
-                    "The LLM interpreter is unavailable, and I could not derive a safe "
-                    "deterministic manifest change from that message. Try an explicit "
-                    "command such as: change hero 1 to \"New headline\" or "
-                    "replace \"Old text\" with \"New text\"."
-                ),
-                "manifest_patch": {},
-                "questions": [],
-            }
+            raise RuntimeError(f"LLM API Error: {str(exc)}") from exc
 
     def _build_deterministic_frontend_patch(
         self,
@@ -775,12 +921,44 @@ class LLMInterpreter:
             "questions": [],
         }
 
-    def _build_prompt(self, message: str, current_manifest: dict[str, Any]) -> str:
-        manifest_json = json.dumps(current_manifest, indent=2)
+    def _build_prompt(self, message: str, current_manifest: dict[str, Any], conversation_context: str = "") -> str:
+        """Build the smallest possible prompt for the given request.
+
+        Intent routing:
+          text_style  → micro-prompt + extensions slice only (~300 chars)
+          branding    → micro-prompt + branding/theme slice (~600 chars)
+          domain      → micro-prompt + domains slice (~400 chars)
+          structural  → full prompt + full manifest (unchanged behaviour)
+        """
+        intent = self._classify_intent(message)
+        slim_manifest = self._extract_relevant_manifest(intent, current_manifest)
+
+        history_block = ""
+        if conversation_context and conversation_context.strip():
+            history_block = (
+                "Recent conversation history:\n"
+                f"{conversation_context.strip()}\n\n"
+            )
+
+        manifest_json = json.dumps(slim_manifest, indent=2) if slim_manifest else "{}"
+
+        if intent != "structural":
+            # ── Micro-prompt path: minimal context, fast and cheap ──────
+            manifest_block = f"Existing manifest context:\n{manifest_json}\n\n" if slim_manifest else ""
+            return (
+                f"{self._MICRO_PROMPT}\n\n"
+                f"{manifest_block}"
+                f"{history_block}"
+                f"User request: {message}"
+            )
+
+        # ── Full-prompt path for structural changes ────────────────────
+        full_manifest_json = json.dumps(current_manifest, indent=2)
         return (
             f"{self.prompt_template}\n\n"
             "Current manifest JSON:\n"
-            f"{manifest_json}\n\n"
+            f"{full_manifest_json}\n\n"
+            f"{history_block}"
             "User message:\n"
             f"{message}\n\n"
             "Return exactly one JSON object with this shape:\n"
@@ -797,15 +975,15 @@ class LLMInterpreter:
             "- Prefer typed fields under categories over extensions when possible.\n"
             "- If a user request introduces a new tenant field not present in the typed schema, add it under extensions.\n"
             "- Preserve freeform UI copy requests that do not fit the typed schema under extensions, using the user's exact requested wording.\n"
-            "- Example extension entry for frontend text: {\"type\": \"nl_key_value\", \"scope\": \"frontend\", \"target_raw\": \"landing.hero_1\", \"value\": \"Safwan welcome\"}.\n"
+            '- Example extension entry for frontend text: {"type": "nl_key_value", "scope": "frontend", "target_raw": "landing.hero_1", "value": "Safwan welcome"}.\n'
             "- flow_rules must stay declarative and only use supported preset-style rules.\n"
             "- You are a tenant configuration assistant. Ask follow-up questions only when the request is genuinely ambiguous and cannot be mapped safely.\n"
-            "- Do not ask follow-up questions for known frontend alias requests (landing.hero_1/2/3, hero description, landing text keys, topbar/footer/auth text keys, all_sessions/contact/home/my_schedule/my_communities/search text keys, browse_classes/cart_checkout/course_details/community_details/user_settings/all_sessions_live/all_sessions_videos/community_home/community_subscription/media_player/community_commerce/category_sessions/trainer_bio/user_portal/session_management/community_threads/student_registration text keys, visibility toggles, style changes, remove landing parts X-Y with keep part Z, remove login image, company name, primary/secondary colors).\n"
-            "- If the user explicitly indicates that no further changes are required, you must stop asking questions and terminate the interaction immediately. Missing fields are acceptable and should remain unchanged.\n"
+            "- If the user explicitly indicates that no further changes are required, you must stop asking questions and terminate the interaction immediately.\n"
             "- If the user explicitly requests no changes, return an empty manifest_patch and no questions.\n"
             "- Any follow-up question must appear both inside the response text and inside the questions array.\n"
             "- questions must be an array of plain strings and may be empty if no clarification is needed.\n"
-            "- Do not include markdown, code fences, or explanations outside the JSON object."
+            "- Do not include markdown, code fences, or explanations outside the JSON object.\n"
+            "- Use the conversation history above to understand context from previous user messages when interpreting ambiguous references like 'that section', 'make it bolder', etc."
         )
 
     def _call_llm(self, prompt: str, byok_config: Any | None = None) -> str:
@@ -821,6 +999,7 @@ class LLMInterpreter:
                 "anthropic": ("anthropic", ANTHROPIC_API_URL),
                 "openai": ("openai", OPENAI_API_URL),
                 "groq": ("groq", GROQ_API_URL),
+                "grroq": ("groq", GROQ_API_URL),
                 "openrouter": ("openrouter", OPENROUTER_API_URL),
                 "minimax": ("openai", MINIMAX_API_URL),
             }
@@ -964,7 +1143,23 @@ class LLMInterpreter:
                 return content_text
             raise RuntimeError("Unexpected response format from Anthropic API")
 
-        content = parsed_body["choices"][0]["message"]["content"]
+        choices = parsed_body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            error_detail = parsed_body.get("error") or parsed_body
+            raise RuntimeError(f"LLM API returned no choices: {str(error_detail)[:400]}")
+
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise RuntimeError("Unexpected response format from LLM API: choices[0] is not an object")
+
+        message = first_choice.get("message") or {}
+        content = message.get("content")
+
+        # Some reasoning/thinking models (NVIDIA Nemotron, Qwen3, etc.) return
+        # content=null and put the answer in reasoning_content or reasoning.
+        if content is None:
+            content = message.get("reasoning_content") or message.get("reasoning") or ""
+
         if isinstance(content, list):
             text_parts = []
             for item in content:
@@ -973,7 +1168,7 @@ class LLMInterpreter:
             return "".join(text_parts)
         if isinstance(content, str):
             return content
-        raise RuntimeError("Unexpected response format from LLM API")
+        raise RuntimeError(f"Unexpected response format from LLM API: content field is {type(content).__name__}")
 
     def _parse_http_json_body(self, body: str) -> dict[str, Any]:
         """

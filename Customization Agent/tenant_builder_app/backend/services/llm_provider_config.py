@@ -62,6 +62,7 @@ def _normalize_provider(raw: str) -> str:
         "or": "openrouter",
         "lmstudio": "local",
         "lm-studio": "local",
+        "grroq": "groq",
     }
     return aliases.get(provider, provider)
 

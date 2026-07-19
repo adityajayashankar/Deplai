@@ -17,6 +17,7 @@ class ConversationState(TypedDict, total=False):
     questions: list[str]
     manifest_patch: dict[str, Any]
     byok_config: Any  # Optional in-memory BYOK config, never persisted
+    conversation_context: str  # Recent chat history for multi-turn context
 
 
 def conversation_handler(state: ConversationState) -> ConversationState:

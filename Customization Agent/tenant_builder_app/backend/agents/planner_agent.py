@@ -333,14 +333,14 @@ def _log_manifest_fields(manifest: dict[str, Any]) -> int:
     return processed
 
 
-def _read_excerpt(repo_path: Path, relative_path: str, max_lines: int = 30) -> str:
+def _read_excerpt(repo_path: Path, relative_path: str, max_lines: int = 80) -> str:
     file_path = repo_path / relative_path
     try:
         content = file_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return ""
     lines = [line for line in content.splitlines()[:max_lines]]
-    return "\n".join(lines)[:1200]
+    return "\n".join(lines)[:3500]
 
 
 def _read_file_content(repo_path: Path, relative_path: str) -> str:
@@ -1123,14 +1123,7 @@ def plan_frontend_changes(state: dict) -> dict:
             elif normalized:
                 log_planner(f"Skipping no-op change: {normalized}")
     except Exception as exc:
-        log_planner(f"Planner LLM failed. Using deterministic fallback planner: {exc}")
-        planned_changes = _build_deterministic_changes(
-            manifest,
-            deterministic_allowed_paths,
-            deterministic_file_content_by_path,
-            app_targets,
-        )
-        state["planner_source"] = "deterministic_planner_fallback"
+        raise RuntimeError(f"Planner LLM failed: {exc}") from exc
 
     literal_replacements = _get_literal_replace_extensions(manifest)
     if literal_replacements and planned_changes:

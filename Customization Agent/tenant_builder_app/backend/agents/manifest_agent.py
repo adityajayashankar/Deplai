@@ -6,10 +6,12 @@ from llm_interpreter import LLMInterpreter
 def run_manifest_agent(state: dict) -> dict:
     interpreter = LLMInterpreter()
     byok_config = state.get("byok_config")
+    conversation_context = state.get("conversation_context", "")
     interpretation = interpreter.interpret(
         message=str(state.get("message") or ""),
         current_manifest=state.get("manifest", {}),
         byok_config=byok_config,
+        conversation_context=conversation_context,
     )
 
     response = interpretation.get("response")

@@ -1,0 +1,376 @@
+import React, { ReactNode } from 'react';
+import { 
+  Network, 
+  ShieldAlert, 
+  CheckCircle2,
+  Github,
+  HardDrive,
+  Gitlab,
+  MessageSquare,
+  Sparkles,
+  User,
+  LucideIcon
+} from 'lucide-react';
+
+// --- Types ---
+interface IntegrationBadgeProps {
+  icon?: LucideIcon;
+  label: string;
+  active?: boolean;
+  status?: string;
+}
+
+interface FeatureCardProps {
+  title: string;
+  description: string;
+  icon: LucideIcon;
+  diagram: ReactNode;
+  accentColor: string;
+  accentBorder: string;
+}
+
+// --- Main Component ---
+const Capabilities: React.FC = () => {
+  return (
+    <div className="min-h-screen bg-[#000000] text-[#CBEFEB] font-sans p-8 md:p-16 flex flex-col items-center justify-center relative overflow-hidden">
+      
+      {/* Ambient Background Glows */}
+      <div className="absolute top-0 right-1/4 w-[600px] h-[600px] bg-[#05393F]/40 rounded-full blur-[150px] pointer-events-none" />
+      <div className="absolute bottom-0 left-1/4 w-[500px] h-[500px] bg-[#00524D]/30 rounded-full blur-[120px] pointer-events-none" />
+
+      {/* SVG Definitions for Custom Gradients */}
+      <svg className="w-0 h-0 absolute">
+        <defs>
+          <linearGradient id="grad-map" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stopColor="#00524D" />
+            <stop offset="100%" stopColor="#48A89A" />
+          </linearGradient>
+          <linearGradient id="grad-ready" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stopColor="#48A89A" />
+            <stop offset="100%" stopColor="#CBEFEB" />
+          </linearGradient>
+        </defs>
+      </svg>
+
+      {}
+      <style dangerouslySetInnerHTML={{__html: `
+        @keyframes pulse-ring {
+          0% { transform: scale(0.8); opacity: 0.5; }
+          100% { transform: scale(2); opacity: 0; }
+        }
+        @keyframes scan-line {
+          0% { top: 0%; opacity: 0; }
+          10% { opacity: 1; }
+          90% { opacity: 1; }
+          100% { top: 100%; opacity: 0; }
+        }
+        @keyframes data-flow {
+          0% { stroke-dashoffset: 100; }
+          100% { stroke-dashoffset: 0; }
+        }
+        @keyframes blink {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.4; }
+        }
+        @keyframes bar-pulse {
+          0% { transform: scaleY(0.2); }
+          100% { transform: scaleY(1); }
+        }
+        .anim-flow {
+          stroke-dasharray: 10 15;
+          animation: data-flow 2s linear infinite;
+        }
+        @keyframes chat-user-in {
+          0%, 5% { opacity: 0; transform: translateY(10px) scale(0.95); }
+          10%, 90% { opacity: 1; transform: translateY(0) scale(1); }
+          95%, 100% { opacity: 0; transform: translateY(-10px) scale(0.95); }
+        }
+        @keyframes chat-agent-typing {
+          0%, 15% { opacity: 0; transform: translateY(10px) scale(0.95); }
+          20%, 35% { opacity: 1; transform: translateY(0) scale(1); }
+          40%, 100% { opacity: 0; transform: translateY(-10px) scale(0.95); }
+        }
+        @keyframes chat-agent-reply {
+          0%, 35% { opacity: 0; transform: translateY(10px) scale(0.95); pointer-events: none; }
+          40%, 90% { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
+          95%, 100% { opacity: 0; transform: translateY(-10px) scale(0.95); pointer-events: none; }
+        }
+        @keyframes box-draw {
+          0%, 45% { stroke-dashoffset: 200; opacity: 0; fill: transparent; }
+          55% { stroke-dashoffset: 0; opacity: 1; fill: transparent; }
+          65%, 100% { fill: rgba(72, 168, 154, 0.15); stroke-dashoffset: 0; opacity: 1; }
+        }
+      `}} />
+
+      <div className="max-w-[1200px] w-full relative z-10">
+        
+        {}
+        <div className="max-w-3xl mb-16">
+          <h2 className="text-4xl md:text-5xl font-bold tracking-tight text-[#CBEFEB] mb-6">
+            Repository <span className="text-transparent bg-clip-text bg-gradient-to-r from-[#CBEFEB] via-[#48A89A] to-[#00524D]">intelligence</span>
+          </h2>
+          <p className="text-lg text-[#CBEFEB]/70 mb-8 font-light">
+            Bring repositories and local files into one unified security and deployment workflow.
+          </p>
+          
+          <div className="flex flex-wrap items-center gap-3">
+            <IntegrationBadge icon={Github} label="GitHub" active />
+            <IntegrationBadge icon={HardDrive} label="Local files" active />
+            <IntegrationBadge icon={Gitlab} label="GitLab" status="soon" />
+            <IntegrationBadge label="Bitbucket" status="soon" />
+          </div>
+        </div>
+
+        {}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          
+          {/* Card 1: Codebase Map */}
+          <FeatureCard 
+            title="Codebase Map"
+            description="Unified topology of all dependencies, frameworks, and services."
+            icon={Network}
+            accentColor="from-[#00524D]/40 to-[#48A89A]/10"
+            accentBorder="group-hover:border-[#48A89A]/40"
+            diagram={
+              <div className="relative w-full h-full flex items-center justify-center">
+                <svg viewBox="0 0 200 100" className="w-full h-full overflow-visible">
+                  <path d="M100 50 L40 20 M100 50 L40 80 M100 50 L160 20 M100 50 L160 80" stroke="#00524D" strokeWidth="1.5" />
+                  <path d="M100 50 L40 20 M100 50 L40 80 M100 50 L160 20 M100 50 L160 80" stroke="url(#grad-map)" strokeWidth="2" className="anim-flow" opacity="0.8" />
+                  <g className="transform-gpu transition-transform group-hover:scale-110 duration-500">
+                    <circle cx="100" cy="50" r="14" fill="#000000" stroke="url(#grad-map)" strokeWidth="2" />
+                    <circle cx="100" cy="50" r="24" fill="none" stroke="url(#grad-map)" strokeWidth="1" opacity="0.4" style={{animation: 'pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite'}} />
+                  </g>
+                  <circle cx="40" cy="20" r="8" fill="#05393F" stroke="#00524D" strokeWidth="1.5" />
+                  <circle cx="40" cy="80" r="8" fill="#05393F" stroke="#00524D" strokeWidth="1.5" />
+                  <circle cx="160" cy="20" r="8" fill="#05393F" stroke="#00524D" strokeWidth="1.5" />
+                  <circle cx="160" cy="80" r="8" fill="#05393F" stroke="#00524D" strokeWidth="1.5" />
+                </svg>
+              </div>
+            }
+          />
+
+          {/* Card 2: Agent Conversation */}
+          <FeatureCard 
+            title="Agent Conversation"
+            description="Specify your infrastructure needs in plain English and get tailored blueprints."
+            icon={MessageSquare}
+            accentColor="from-[#05393F]/40 to-[#48A89A]/10"
+            accentBorder="group-hover:border-[#48A89A]/40"
+            diagram={
+              <div className="relative w-full h-full flex flex-col justify-center px-6 py-2 gap-3 overflow-hidden">
+                {/* User Prompt */}
+                <div 
+                  className="relative z-10 self-end w-[85%] bg-gradient-to-r from-[#00524D]/40 to-[#48A89A]/20 border border-[#48A89A]/30 rounded-2xl rounded-tr-sm p-3 shadow-lg origin-bottom-right" 
+                  style={{ animation: 'chat-user-in 8s infinite cubic-bezier(0.4, 0, 0.2, 1)' }}
+                >
+                  <div className="flex items-center justify-end gap-3 mb-2">
+                    <div className="flex flex-col items-end gap-1.5 w-full">
+                      <div className="w-full max-w-[120px] h-1.5 bg-[#CBEFEB]/80 rounded-full" />
+                      <div className="w-2/3 h-1.5 bg-[#CBEFEB]/40 rounded-full" />
+                    </div>
+                    <div className="w-5 h-5 flex-shrink-0 rounded-full bg-[#48A89A]/20 flex items-center justify-center border border-[#48A89A]/40">
+                      <User className="w-3 h-3 text-[#CBEFEB]" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="relative w-[100%] self-start h-[100px]">
+                  {/* Typing Indicator */}
+                  <div 
+                    className="absolute top-0 left-0 bg-[#000000] border border-[#00524D] rounded-2xl rounded-tl-sm p-3 w-16 h-10 flex items-center justify-center gap-1.5 shadow-xl origin-bottom-left" 
+                    style={{ animation: 'chat-agent-typing 8s infinite cubic-bezier(0.4, 0, 0.2, 1)' }}
+                  >
+                    <div className="w-1.5 h-1.5 rounded-full bg-[#48A89A]" style={{ animation: 'blink 1s infinite' }} />
+                    <div className="w-1.5 h-1.5 rounded-full bg-[#48A89A]" style={{ animation: 'blink 1s infinite 0.2s' }} />
+                    <div className="w-1.5 h-1.5 rounded-full bg-[#48A89A]" style={{ animation: 'blink 1s infinite 0.4s' }} />
+                  </div>
+
+                  {/* Agent Response */}
+                  <div 
+                    className="absolute top-0 left-0 bg-[#000000]/90 border border-[#00524D] shadow-[0_0_20px_rgba(72,168,154,0.15)] rounded-2xl rounded-tl-sm p-3.5 w-[90%] origin-bottom-left group-hover:border-[#48A89A]/50 transition-colors duration-500" 
+                    style={{ animation: 'chat-agent-reply 8s infinite cubic-bezier(0.4, 0, 0.2, 1)' }}
+                  >
+                    <div className="flex items-center gap-2.5 mb-2.5">
+                      <div className="w-5 h-5 rounded-full bg-gradient-to-tr from-[#00524D] to-[#48A89A] flex items-center justify-center shadow-[0_0_10px_rgba(72,168,154,0.3)]">
+                        <Sparkles className="w-3 h-3 text-[#CBEFEB]" />
+                      </div>
+                      <div className="flex-1 flex gap-2">
+                        <div className="w-1/2 h-1.5 bg-[#CBEFEB]/60 rounded-full" />
+                        <div className="w-1/4 h-1.5 bg-[#CBEFEB]/30 rounded-full" />
+                      </div>
+                    </div>
+                    
+                    {/* Inner Diagram Generation */}
+                    <div className="h-12 w-full rounded-lg border border-[#48A89A]/30 bg-[#05393F]/20 relative overflow-hidden flex items-center justify-center">
+                       <svg viewBox="0 0 100 40" className="w-full h-full overflow-visible drop-shadow-[0_0_8px_rgba(72,168,154,0.2)]">
+                          <path d="M 35 20 L 65 20" stroke="url(#grad-map)" strokeWidth="1.5" strokeDasharray="100" style={{ animation: 'box-draw 8s infinite' }} />
+                          <rect x="15" y="10" width="20" height="20" rx="4" stroke="#48A89A" strokeWidth="1" strokeDasharray="100" style={{ animation: 'box-draw 8s infinite' }} />
+                          <circle cx="25" cy="20" r="4" fill="#48A89A" opacity="0.5" style={{ animation: 'blink 8s infinite' }} />
+                          <rect x="65" y="10" width="20" height="20" rx="4" stroke="#CBEFEB" strokeWidth="1" strokeDasharray="100" style={{ animation: 'box-draw 8s infinite' }} />
+                          <circle cx="75" cy="20" r="4" fill="#CBEFEB" opacity="0.5" style={{ animation: 'blink 8s infinite' }} />
+                       </svg>
+                       <div className="absolute left-0 top-0 h-full w-[2px] bg-gradient-to-b from-transparent via-[#CBEFEB] to-transparent shadow-[0_0_8px_rgba(203,239,235,0.8)]" style={{ animation: 'chat-agent-reply 8s infinite, scan-line 2.5s ease-in-out infinite 3.5s' }} />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            }
+          />
+
+          {/* Card 3: Security Context */}
+          <FeatureCard 
+            title="Security Context"
+            description="Vulnerabilities traced directly back to affected source code lines."
+            icon={ShieldAlert}
+            accentColor="from-[#00524D]/40 to-[#48A89A]/10"
+            accentBorder="group-hover:border-[#48A89A]/40"
+            diagram={
+              <div className="relative w-full h-full flex items-center justify-center p-6">
+                <div className="w-full max-w-[200px] bg-[#05393F]/20 rounded-md border border-[#00524D] p-4 relative overflow-hidden font-mono text-[8px] leading-relaxed">
+                  <div className="w-3/4 h-1.5 bg-[#00524D] rounded mb-2" />
+                  <div className="w-1/2 h-1.5 bg-[#00524D] rounded mb-2" />
+                  <div className="w-full h-1.5 bg-[#00524D]/50 border border-[#48A89A]/60 rounded mb-2 relative">
+                     <div className="absolute -left-2 top-1/2 -translate-y-1/2 w-1 h-1 bg-[#CBEFEB] rounded-full animate-ping" />
+                  </div>
+                  <div className="w-5/6 h-1.5 bg-[#00524D] rounded mb-2" />
+                  <div className="w-2/3 h-1.5 bg-[#00524D] rounded" />
+                  
+                  {/* Laser Scanner Effect */}
+                  <div 
+                    className="absolute left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-[#48A89A] to-transparent shadow-[0_0_8px_rgba(72,168,154,0.8)] z-20"
+                    style={{ animation: 'scan-line 3s ease-in-out infinite' }}
+                  />
+                  <div 
+                    className="absolute left-0 w-full h-8 bg-gradient-to-b from-transparent to-[#00524D]/40 z-10"
+                    style={{ animation: 'scan-line 3s ease-in-out infinite' }}
+                  />
+                </div>
+              </div>
+            }
+          />
+
+          {/* Card 4: Deployment Readiness (Telemetry Radar) */}
+          <FeatureCard 
+            title="Deployment Readiness"
+            description="Pre-flight validation for missing configurations and architecture decisions."
+            icon={CheckCircle2}
+            accentColor="from-[#05393F]/40 to-[#48A89A]/10"
+            accentBorder="group-hover:border-[#48A89A]/40"
+            diagram={
+              <div className="relative w-full h-full flex items-center justify-center gap-6 p-6">
+                
+                {/* Radar Dial */}
+                <div className="relative w-28 h-28 flex-shrink-0 group-hover:scale-105 transition-transform duration-700">
+                  <svg viewBox="0 0 100 100" className="w-full h-full overflow-visible">
+                    <circle cx="50" cy="50" r="45" fill="none" stroke="#00524D" strokeWidth="1" />
+                    <circle cx="50" cy="50" r="35" fill="none" stroke="#00524D" strokeWidth="4" />
+
+                    <g className="origin-center animate-[spin_8s_linear_infinite]">
+                      <circle cx="50" cy="50" r="45" fill="none" stroke="url(#grad-ready)" strokeWidth="2" strokeDasharray="4 8" />
+                    </g>
+
+                    <g className="origin-center animate-[spin_12s_linear_infinite_reverse]">
+                       <circle cx="50" cy="50" r="35" fill="none" stroke="url(#grad-ready)" strokeWidth="5" strokeDasharray="60 40 30 20" strokeLinecap="round" className="opacity-80" />
+                    </g>
+                    <text x="50" y="54" textAnchor="middle" fill="#CBEFEB" fontSize="14" fontWeight="bold" fontFamily="monospace" className="drop-shadow-[0_0_8px_rgba(203,239,235,0.8)]">92%</text>
+                  </svg>
+                  
+                  {/* Radar Sweep */}
+                  <div className="absolute inset-0 rounded-full border border-[#48A89A]/10 shadow-[inset_0_0_20px_rgba(72,168,154,0.1)] overflow-hidden">
+                     <div className="absolute top-1/2 left-1/2 w-[50%] h-[2px] bg-gradient-to-r from-transparent via-[#CBEFEB] to-white origin-left animate-[spin_3s_linear_infinite]" />
+                     <div className="absolute top-1/2 left-1/2 w-[50%] h-[50%] bg-gradient-to-br from-[#48A89A]/40 to-transparent origin-top-left animate-[spin_3s_linear_infinite]" style={{ clipPath: 'polygon(0 0, 100% 0, 100% 100%)' }} />
+                  </div>
+                </div>
+
+                {/* Live Equalizer Bars */}
+                <div className="flex flex-col gap-4 flex-1">
+                  <div className="flex items-end h-12 gap-1 border-b border-[#00524D] pb-1">
+                    {[
+                      { delay: '0s', h: '60%' }, { delay: '-0.5s', h: '80%' }, { delay: '-1.2s', h: '40%' },
+                      { delay: '-0.2s', h: '90%' }, { delay: '-0.8s', h: '50%' }, { delay: '-1.5s', h: '70%' },
+                      { delay: '-0.4s', h: '100%' }, { delay: '-1.1s', h: '65%' },
+                    ].map((bar, i) => (
+                      <div key={i} className="w-full bg-[#00524D]/30 rounded-t-sm relative overflow-hidden h-full">
+                        <div 
+                          className="absolute bottom-0 w-full bg-gradient-to-t from-[#00524D] to-[#48A89A] rounded-t-sm origin-bottom"
+                          style={{ height: bar.h, animation: `bar-pulse 1.5s ease-in-out infinite alternate`, animationDelay: bar.delay }} 
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  
+                  <div className="space-y-2.5">
+                     <div className="flex items-center gap-3">
+                       <div className="w-1.5 h-1.5 rounded-full bg-[#CBEFEB] shadow-[0_0_8px_#CBEFEB] animate-pulse" />
+                       <div className="h-1 flex-1 bg-[#00524D]/50 rounded-full overflow-hidden">
+                         <div className="h-full bg-gradient-to-r from-[#00524D] to-[#48A89A] w-full relative">
+                           <div className="absolute inset-0 bg-white/20 animate-[scan-line_2s_linear_infinite]" />
+                         </div>
+                       </div>
+                     </div>
+                     <div className="flex items-center gap-3">
+                       <div className="w-1.5 h-1.5 rounded-full bg-[#CBEFEB] shadow-[0_0_8px_#CBEFEB] animate-pulse" style={{ animationDelay: '0.5s' }} />
+                       <div className="h-1 flex-1 bg-[#00524D]/50 rounded-full overflow-hidden">
+                         <div className="h-full bg-gradient-to-r from-[#00524D] to-[#48A89A]/80 w-[75%]" />
+                       </div>
+                     </div>
+                  </div>
+                </div>
+
+              </div>
+            }
+          />
+
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- Sub-components ---
+const IntegrationBadge: React.FC<IntegrationBadgeProps> = ({ icon: Icon, label, active, status }) => (
+  <div className={`
+    flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium border transition-colors
+    ${active 
+      ? 'bg-[#05393F]/40 border-[#48A89A]/40 text-[#CBEFEB] hover:bg-[#05393F]/60' 
+      : 'bg-transparent border-[#00524D]/50 text-[#48A89A]/60'
+    }
+  `}>
+    {Icon && <Icon className="w-4 h-4" />}
+    {label}
+    {status && (
+      <span className="text-[10px] uppercase tracking-wider text-[#48A89A]/80 ml-1">- {status}</span>
+    )}
+  </div>
+);
+
+const FeatureCard: React.FC<FeatureCardProps> = ({ title, description, icon: Icon, diagram, accentColor, accentBorder }) => (
+  <div className={`
+    group relative overflow-hidden rounded-2xl bg-[#000000] border border-[#00524D]/30 
+    hover:bg-[#05393F]/10 transition-all duration-500
+    ${accentBorder}
+  `}>
+    {/* Hover Accent Glow */}
+    <div className={`absolute -inset-px opacity-0 group-hover:opacity-100 transition-opacity duration-500 bg-gradient-to-br ${accentColor} blur-2xl z-0`} />
+    
+    <div className="relative z-10 flex flex-col h-full">
+      {/* Diagram Container */}
+      <div className="h-48 border-b border-[#00524D]/20 bg-gradient-to-b from-[#05393F]/20 to-transparent overflow-hidden">
+        {diagram}
+      </div>
+      
+      {/* Text Container */}
+      <div className="p-6">
+        <div className="flex items-center gap-3 mb-2">
+          <Icon className="w-4 h-4 text-[#48A89A] group-hover:text-[#CBEFEB] transition-colors" />
+          <h3 className="text-sm font-semibold tracking-wide text-[#CBEFEB] uppercase">{title}</h3>
+        </div>
+        <p className="text-[#CBEFEB]/60 text-sm leading-relaxed font-light">
+          {description}
+        </p>
+      </div>
+    </div>
+  </div>
+);
+
+export default Capabilities;

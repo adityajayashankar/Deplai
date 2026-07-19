@@ -340,11 +340,10 @@ def run_customization(
                 operation="fast_path",
             )
         if deterministic_files:
-            use_llm_graph = False
+            # Deterministic phase already ran; skip the post-LLM deterministic
+            # pass but keep the LLM graph enabled so both intelligent and
+            # rule-based changes are applied in true hybrid fashion.
             run_deterministic_phase = False
-            warnings.append(
-                "LLM graph skipped because deterministic customization applied changes successfully."
-            )
 
     if normalized_pipeline_mode == "diagnostic":
         log_cursor = _log_cursor()
@@ -372,6 +371,8 @@ def run_customization(
                     planner_source,
                 )
             )
+        except RuntimeError as exc:
+            raise
         except Exception as exc:
             fallback_errors = list(initial_state.get("errors", []))
             if normalized_pipeline_mode == "llm_only":

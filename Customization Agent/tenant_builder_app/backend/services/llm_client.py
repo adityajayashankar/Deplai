@@ -32,7 +32,8 @@ class ProjectLLMClient:
             provider_url_map = {
                 'openai': ('openai', OPENAI_API_URL),
                 'anthropic': ('anthropic', ANTHROPIC_API_URL),
-                'groq': ('openai', 'https://api.groq.com/openai/v1/chat/completions'),
+                'groq': ('groq', 'https://api.groq.com/openai/v1/chat/completions'),
+                'grroq': ('groq', 'https://api.groq.com/openai/v1/chat/completions'),
                 'openrouter': ('openrouter', OPENROUTER_API_URL),
                 'minimax': ('openai', MINIMAX_API_URL),
             }
@@ -123,6 +124,9 @@ class ProjectLLMClient:
             headers["anthropic-version"] = "2023-06-01"
         elif self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+            if self.provider == "openrouter":
+                headers["HTTP-Referer"] = "https://deplai.io"
+                headers["X-Title"] = "Deplai Customization Console"
 
         req = request.Request(
             self.api_url,
@@ -275,14 +279,19 @@ class ProjectLLMClient:
             first_choice = choices[0]
             if not isinstance(first_choice, dict):
                 raise RuntimeError("Unexpected response format from LLM API: invalid choices[0]")
-            message = first_choice.get("message")
-            if not isinstance(message, dict) or "content" not in message:
-                raise RuntimeError("Unexpected response format from LLM API: missing message.content")
-            content = message["content"]
-            raw_text = self._normalize_content(content)
+            message = first_choice.get("message") or {}
+            # Allow content=null — thinking models use reasoning_content/reasoning instead
+            content = message.get("content")
+            raw_text = self._normalize_content(content, message=message)
         return self._parse_json(raw_text)
 
-    def _normalize_content(self, content: Any) -> str:
+    def _normalize_content(self, content: Any, message: dict | None = None) -> str:
+        # Some reasoning/thinking models (NVIDIA Nemotron, Qwen3, etc.) return
+        # content=null and put the answer in reasoning_content or reasoning.
+        if content is None and isinstance(message, dict):
+            content = message.get("reasoning_content") or message.get("reasoning") or ""
+        if content is None:
+            content = ""
         if isinstance(content, list):
             text_parts: list[str] = []
             for item in content:
@@ -291,7 +300,7 @@ class ProjectLLMClient:
             return "".join(text_parts)
         if isinstance(content, str):
             return content
-        raise RuntimeError("Unexpected response format from LLM API")
+        raise RuntimeError(f"Unexpected response format from LLM API: content field is {type(content).__name__}")
 
     def _parse_json(self, raw_content: str) -> Any:
         cleaned = raw_content.strip()

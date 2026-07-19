@@ -290,7 +290,10 @@ def chat(request: ChatRequest) -> dict:
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id is required.")
     normalized_tenant_id = state.ensure_tenant(tenant_id)
-    result = agent.handle_message(normalized_tenant_id, request.message, byok_config=request.llm_config)
+    try:
+        result = agent.handle_message(normalized_tenant_id, request.message, byok_config=request.llm_config)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     result["confirmation"] = state.get_confirmation_state(normalized_tenant_id)
     result["tenant_id"] = normalized_tenant_id
     return result
@@ -374,6 +377,8 @@ def implement_tenant(request: ImplementRequest) -> dict:
         ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     tenant_repo_path = Path(str(result.get("repo_path", ""))).resolve()
     snapshot_after = _snapshot_repo_files(tenant_repo_path)
     snapshot_modified_files = _derive_snapshot_modified_files(snapshot_before, snapshot_after) if tenant_repo_existed_before else []

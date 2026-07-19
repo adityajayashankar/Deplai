@@ -5,8 +5,9 @@ import hashlib
 import io
 import json
 import os
+import re
 import tarfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,36 @@ MAX_PACKAGE_FILES = int(os.getenv("DEPLAI_APP_PACKAGE_MAX_FILES", "2500"))
 PACKAGE_STORE_ROOT = Path(__file__).resolve().parent / ".deplai_runtime" / "deployment_packages"
 
 
+# ORM / database-client packages in package.json that indicate a DB is needed.
+_DB_NPM_PACKAGES = {
+    "prisma", "@prisma/client",
+    "typeorm", "sequelize", "sequelize-typescript",
+    "pg", "pg-native", "mysql", "mysql2", "mariadb",
+    "mongoose", "mongodb",
+    "knex", "objection",
+    "drizzle-orm",
+}
+
+
+@dataclass
+class DatabaseRequirements:
+    """Result of scanning a repository for database dependencies."""
+    enabled: bool
+    engine: str  # 'postgres', 'mysql', 'mariadb', or ''
+    has_prisma: bool
+    has_migrations: bool
+    detection_sources: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "engine": self.engine,
+            "has_prisma": self.has_prisma,
+            "has_migrations": self.has_migrations,
+            "detection_sources": self.detection_sources,
+        }
+
+
 @dataclass
 class DeploymentPackage:
     package_id: str
@@ -67,6 +98,11 @@ class DeploymentPackage:
     package_tarball_path: str
     manifest_path: str
     warnings: list[str]
+    db_requirements: DatabaseRequirements = field(
+        default_factory=lambda: DatabaseRequirements(
+            enabled=False, engine="", has_prisma=False, has_migrations=False
+        )
+    )
 
     def as_manifest(self) -> dict[str, Any]:
         return {
@@ -83,6 +119,7 @@ class DeploymentPackage:
             "package_tarball_path": self.package_tarball_path,
             "manifest_path": self.manifest_path,
             "warnings": self.warnings,
+            "db_requirements": self.db_requirements.as_dict(),
         }
 
 
@@ -107,6 +144,193 @@ def _is_ignored(path: Path) -> bool:
 
 def _has_file(root: Path, *names: str) -> bool:
     return any((root / name).exists() for name in names)
+
+
+def _find_file(root: Path, *names: str) -> Path | None:
+    """Return first existing file matching any of the given relative paths."""
+    for name in names:
+        candidate = root / name
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _read_text_safe(path: Path | None) -> str:
+    if path is None or not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def detect_database_requirements(root: Path) -> DatabaseRequirements:
+    """Scan a repository root and determine whether it needs a database.
+
+    Detection signals (in order of reliability):
+    1. ``prisma/schema.prisma`` — definitive: engine read from datasource block.
+    2. ``docker-compose.yml`` / ``docker-compose.yaml`` — postgres/mysql image.
+    3. ``package.json`` dependencies/devDependencies — ORM/DB client packages.
+    4. Loose ``.env`` or ``.env.example`` containing DATABASE_URL.
+    """
+    enabled = False
+    engine = ""
+    has_prisma = False
+    has_migrations = False
+    sources: list[str] = []
+
+    # ── 1. Prisma schema ──────────────────────────────────────────────────────
+    # Search across common subdirs (backend, server, api, src, root)
+    prisma_candidates = [
+        root / "prisma" / "schema.prisma",
+        root / "backend" / "prisma" / "schema.prisma",
+        root / "server" / "prisma" / "schema.prisma",
+        root / "api" / "prisma" / "schema.prisma",
+        root / "src" / "prisma" / "schema.prisma",
+    ]
+    prisma_schema: Path | None = None
+    for candidate in prisma_candidates:
+        if candidate.exists() and candidate.is_file():
+            prisma_schema = candidate
+            break
+
+    if prisma_schema is None:
+        # Glob fallback for deeply-nested monorepos
+        found = list(root.rglob("prisma/schema.prisma"))
+        if found:
+            prisma_schema = found[0]
+
+    if prisma_schema is not None:
+        has_prisma = True
+        enabled = True
+        sources.append(f"prisma/schema.prisma ({prisma_schema.relative_to(root).as_posix()})")
+        schema_text = _read_text_safe(prisma_schema)
+        # Extract provider from: provider = "postgresql" / "mysql" / "sqlite"
+        provider_match = re.search(
+            r'datasource\s+\w+\s*\{[^}]*provider\s*=\s*"([^"]+)"',
+            schema_text,
+            re.DOTALL,
+        )
+        if provider_match:
+            raw_engine = provider_match.group(1).lower().strip()
+            if raw_engine in {"postgresql", "postgres"}:
+                engine = "postgres"
+            elif raw_engine in {"mysql", "mariadb"}:
+                engine = raw_engine
+            elif raw_engine == "sqlite":
+                # SQLite doesn't need RDS – treat as no external DB
+                enabled = False
+                has_prisma = True  # keep flag so migration step knows to run
+                sources.append("prisma engine=sqlite → RDS not needed")
+        else:
+            engine = "postgres"  # Sensible default when provider not parseable
+
+        # Check for migrations directory next to schema.prisma
+        migrations_dir = prisma_schema.parent / "migrations"
+        if migrations_dir.is_dir() and any(migrations_dir.iterdir()):
+            has_migrations = True
+
+    # ── 2. docker-compose ────────────────────────────────────────────────────
+    if not enabled:
+        compose_paths = [
+            root / "docker-compose.yml",
+            root / "docker-compose.yaml",
+            root / "backend" / "docker-compose.yml",
+            root / "backend" / "docker-compose.yaml",
+        ]
+        for compose_path in compose_paths:
+            text = _read_text_safe(compose_path)
+            if not text:
+                continue
+            if re.search(r'image:\s*postgres', text, re.IGNORECASE):
+                enabled = True
+                engine = engine or "postgres"
+                sources.append(f"docker-compose postgres image ({compose_path.relative_to(root).as_posix()})")
+                break
+            if re.search(r'image:\s*mysql', text, re.IGNORECASE):
+                enabled = True
+                engine = engine or "mysql"
+                sources.append(f"docker-compose mysql image ({compose_path.relative_to(root).as_posix()})")
+                break
+            if re.search(r'image:\s*mariadb', text, re.IGNORECASE):
+                enabled = True
+                engine = engine or "mariadb"
+                sources.append(f"docker-compose mariadb image ({compose_path.relative_to(root).as_posix()})")
+                break
+
+    # ── 3. package.json ORM dependencies ────────────────────────────────────
+    if not enabled:
+        pkg_candidates = [
+            root / "package.json",
+            root / "backend" / "package.json",
+            root / "server" / "package.json",
+            root / "api" / "package.json",
+        ]
+        for pkg_path in pkg_candidates:
+            text = _read_text_safe(pkg_path)
+            if not text:
+                continue
+            try:
+                pkg = json.loads(text)
+            except Exception:
+                continue
+            if not isinstance(pkg, dict):
+                continue
+            all_deps: set[str] = set()
+            for dep_key in ("dependencies", "devDependencies", "peerDependencies"):
+                deps = pkg.get(dep_key)
+                if isinstance(deps, dict):
+                    all_deps.update(deps.keys())
+            matched = all_deps & _DB_NPM_PACKAGES
+            if matched:
+                enabled = True
+                if not engine:
+                    # Infer engine from matched package names
+                    if "prisma" in matched or "@prisma/client" in matched:
+                        engine = "postgres"  # Prisma defaults to postgres
+                    elif "mysql" in matched or "mysql2" in matched:
+                        engine = "mysql"
+                    elif "mariadb" in matched:
+                        engine = "mariadb"
+                    elif "pg" in matched or "pg-native" in matched:
+                        engine = "postgres"
+                    else:
+                        engine = "postgres"
+                sources.append(
+                    f"package.json deps: {', '.join(sorted(matched))} "
+                    f"({pkg_path.relative_to(root).as_posix()})"
+                )
+                break
+
+    # ── 4. .env / .env.example containing DATABASE_URL ──────────────────────
+    if not enabled:
+        env_candidates = [
+            root / ".env.example",
+            root / ".env.sample",
+            root / "backend" / ".env.example",
+            root / "backend" / ".env.sample",
+        ]
+        for env_path in env_candidates:
+            text = _read_text_safe(env_path)
+            if re.search(r'DATABASE_URL\s*=', text):
+                enabled = True
+                if not engine:
+                    if "postgresql" in text or "postgres" in text:
+                        engine = "postgres"
+                    elif "mysql" in text:
+                        engine = "mysql"
+                    else:
+                        engine = "postgres"
+                sources.append(f"DATABASE_URL in {env_path.relative_to(root).as_posix()}")
+                break
+
+    return DatabaseRequirements(
+        enabled=enabled,
+        engine=engine or ("postgres" if enabled else ""),
+        has_prisma=has_prisma,
+        has_migrations=has_migrations,
+        detection_sources=sources,
+    )
 
 
 def _read_package_json(root: Path) -> dict[str, Any]:
@@ -328,6 +552,15 @@ def build_deployment_package(
     digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
     package_id = f"{_safe_slug(project_name)}-{digest}"
 
+    # Detect database requirements by scanning the actual repo files.
+    db_requirements = detect_database_requirements(root)
+    if db_requirements.enabled and db_requirements.detection_sources:
+        warnings.append(
+            f"Database detected ({db_requirements.engine}): "
+            + "; ".join(db_requirements.detection_sources)
+            + ". RDS will be provisioned automatically."
+        )
+
     static_root = _select_static_root(root)
     if static_root is not None:
         package_base64, file_count, byte_count = _tar_directory(static_root)
@@ -346,6 +579,7 @@ def build_deployment_package(
             package_tarball_path="",
             manifest_path="",
             warnings=warnings,
+            db_requirements=db_requirements,
         ))
 
     node_roots: list[Path] = []
@@ -381,6 +615,7 @@ def build_deployment_package(
                 package_tarball_path="",
                 manifest_path="",
                 warnings=warnings,
+                db_requirements=db_requirements,
             ))
 
     python_entry = next((name for name in ("app.py", "main.py", "server.py") if (root / name).exists()), "")
@@ -404,6 +639,7 @@ def build_deployment_package(
             package_tarball_path="",
             manifest_path="",
             warnings=warnings,
+            db_requirements=db_requirements,
         ))
 
     warnings.append(
@@ -428,4 +664,5 @@ def build_deployment_package(
         package_tarball_path="",
         manifest_path="",
         warnings=warnings,
+        db_requirements=db_requirements,
     ))

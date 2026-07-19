@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "DeplAI",
-  description: "AI-native platform",
+  description: "From repository to reliable deployment with AI-assisted security, infrastructure, and runtime workflows.",
 };
 
 export default function RootLayout({

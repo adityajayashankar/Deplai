@@ -295,8 +295,28 @@ def _run_terraform_with_tracking(
 
     try:
         container.start()
+        
+        log_chunks = []
+        current_line = []
+        for chunk_bytes in container.logs(stream=True, stdout=True, stderr=True):
+            chunk_str = chunk_bytes.decode("utf-8", errors="replace")
+            log_chunks.append(chunk_str)
+            for char in chunk_str:
+                if char == "\n":
+                    line_str = "".join(current_line).strip()
+                    if line_str:
+                        _emit_progress(apply_context, "info", f"[{primary}] {line_str}")
+                    current_line.clear()
+                else:
+                    current_line.append(char)
+                    
+        if current_line:
+            line_str = "".join(current_line).strip()
+            if line_str:
+                _emit_progress(apply_context, "info", f"[{primary}] {line_str}")
+                
         result = container.wait()
-        logs = decode_output(container.logs(stdout=True, stderr=True))
+        logs = "".join(log_chunks)
         if isinstance(result, dict):
             raw_status = result.get("StatusCode")
         else:
@@ -2170,6 +2190,111 @@ def _normalize_rds_elasticache_provider_versions(
     return patched
 
 
+# Map of retired/invalid RDS engine versions -> current valid replacement.
+# AWS periodically removes old minor versions from the CreateDBInstance API.
+# Keep this list updated when AWS retires more versions.
+_RETIRED_POSTGRES_VERSIONS: dict[str, str] = {
+    # PostgreSQL 15 — AWS retired 15.1-15.9; minimum available is 15.10
+    "15.1": "15.10",
+    "15.2": "15.10",
+    "15.3": "15.10",
+    "15.4": "15.10",
+    "15.5": "15.10",
+    "15.6": "15.10",
+    "15.7": "15.10",
+    "15.8": "15.10",
+    "15.9": "15.10",
+    # PostgreSQL 14 — AWS retired 14.1-14.12; minimum available is 14.15
+    "14.1": "14.15",
+    "14.2": "14.15",
+    "14.3": "14.15",
+    "14.4": "14.15",
+    "14.5": "14.15",
+    "14.6": "14.15",
+    "14.7": "14.15",
+    "14.8": "14.15",
+    "14.9": "14.15",
+    "14.10": "14.15",
+    "14.11": "14.15",
+    "14.12": "14.15",
+    "14.13": "14.15",
+    "14.14": "14.15",
+    # PostgreSQL 13 — AWS retired 13.1-13.17; minimum available is 13.18
+    "13.1": "13.18",
+    "13.2": "13.18",
+    "13.3": "13.18",
+    "13.4": "13.18",
+    "13.5": "13.18",
+    "13.6": "13.18",
+    "13.7": "13.18",
+    "13.8": "13.18",
+    "13.9": "13.18",
+    "13.10": "13.18",
+    "13.11": "13.18",
+    "13.12": "13.18",
+    "13.13": "13.18",
+    "13.14": "13.18",
+    "13.15": "13.18",
+    "13.16": "13.18",
+    "13.17": "13.18",
+    # PostgreSQL 16 — safe minimum
+    "16.1": "16.6",
+    "16.2": "16.6",
+    "16.3": "16.6",
+    "16.4": "16.6",
+    "16.5": "16.6",
+}
+
+
+def _normalize_rds_engine_versions(
+    files: list[dict[str, Any]],
+    apply_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Replace retired AWS RDS engine_version values in Terraform files.
+
+    AWS periodically removes old PostgreSQL minor versions from the
+    ``CreateDBInstance`` API, causing ``InvalidParameterCombination`` errors
+    like 'Cannot find version 15.3 for postgres'. This function rewrites any
+    known-retired engine_version string assignments to the nearest valid current
+    minor version so deploys don't fail due to stale LLM-generated versions.
+    """
+    # Build a single regex that matches engine_version = "<retired_version>"
+    # in HCL. We match the value in both double-quoted string assignments and
+    # inside tfvars-style `key = "value"` lines.
+    version_pattern = re.compile(
+        r'((?:engine_version|default|value)\s*=\s*)"(' + "|".join(re.escape(v) for v in _RETIRED_POSTGRES_VERSIONS) + r')"',
+        flags=re.IGNORECASE,
+    )
+
+    patched: list[dict[str, Any]] = []
+    changed = False
+    for item in files:
+        path = str(item.get("path", "")).replace("\\", "/").lower()
+        if not (path.endswith(".tf") or path.endswith(".tfvars")):
+            patched.append(item)
+            continue
+        text = _extract_text_payload(item)
+
+        def _replace_version(match: re.Match[str]) -> str:
+            prefix = match.group(1)
+            old_ver = match.group(2)
+            new_ver = _RETIRED_POSTGRES_VERSIONS.get(old_ver, old_ver)
+            return f'{prefix}"{new_ver}"'
+
+        rewritten = version_pattern.sub(_replace_version, text)
+        if rewritten != text:
+            item = _set_text_payload(dict(item), rewritten)
+            changed = True
+        patched.append(item)
+    if changed:
+        _emit_progress(
+            apply_context,
+            "info",
+            "Patched retired RDS engine_version values to current AWS-supported versions (e.g. 15.3 -> 15.10).",
+        )
+    return patched
+
+
 def _collect_terraform_text(files: list[dict[str, Any]]) -> str:
     chunks: list[str] = []
     for item in files:
@@ -2996,6 +3121,7 @@ def apply_terraform_bundle(
         bundle_has_registry_module = _terraform_has_registry_module(tf_text_preflight)
         if bundle_has_rds_or_elasticache:
             files = _normalize_rds_elasticache_provider_versions(files, apply_context)
+            files = _normalize_rds_engine_versions(files, apply_context)
             normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
             _write_files_to_volume(volume_name, files)
         _emit_progress(apply_context, "info", "Terraform files staged into runtime workspace.")

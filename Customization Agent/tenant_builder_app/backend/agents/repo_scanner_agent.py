@@ -466,7 +466,7 @@ def scan_repo(state: dict) -> dict:
         repo_map["theme_targets"] = _normalize_paths(result.get("theme_targets"), allowed_paths)
         repo_map["api_targets"] = _normalize_paths(result.get("api_targets"), allowed_paths)
     except Exception as exc:
-        log_agent("Scanner", f"LLM scan failed: {exc}")
+        raise RuntimeError(f"Scanner LLM failed: {exc}") from exc
 
     state["repo_map"] = repo_map
     state["errors"] = errors

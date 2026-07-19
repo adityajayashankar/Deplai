@@ -71,13 +71,50 @@ export interface Ec2ResourceConfig {
 }
 
 export interface RdsResourceConfig {
-  engine: 'postgres' | 'mysql' | 'mariadb';
+  engine: 'postgres' | 'mysql' | 'mariadb' | 'aurora-mysql' | 'aurora-postgresql' | 'oracle-ee' | 'sqlserver-ex' | 'db2-ae';
   engine_version: string;
   instance_class: string;
   allocated_storage: number;
   multi_az: boolean;
   backup_retention_period: number;
+  /** For Aurora engines: 'serverless' | 'provisioned'. */
+  aurora_mode?: 'serverless' | 'provisioned';
+  /** DB instance size tier (non-Aurora): 'production' | 'dev_test' | 'free_tier' */
+  instance_size_tier?: 'production' | 'dev_test' | 'free_tier';
+  /** DB cluster/instance identifier */
+  db_identifier?: string;
+  /** Master username */
+  master_username?: string;
+  /** Credentials mode: managed by Secrets Manager or self-managed */
+  credentials_mode?: 'secrets_manager' | 'self_managed';
+  /** Auto-generate password (only applies when credentials_mode = 'self_managed') */
+  auto_generate_password?: boolean;
+  /** Master password (only used when self_managed and not auto_generate) */
+  master_password?: string;
+  /** Aurora Serverless v2 min ACU (0 = scales to zero after inactivity) */
+  aurora_min_acu?: number;
+  /** Aurora Serverless v2 max ACU */
+  aurora_max_acu?: number;
+  /** Aurora Serverless: seconds before pausing after inactivity (300–86400) */
+  aurora_pause_after_inactivity?: number;
+  /** Storage type for non-Aurora (e.g. gp3, gp2, io1) */
+  storage_type?: 'gp3' | 'gp2' | 'io1' | 'standard';
+  /** Storage autoscaling (non-Aurora) */
+  storage_autoscaling?: boolean;
+  /** Maximum allocated storage for autoscaling */
+  max_allocated_storage?: number;
+  /** Publicly accessible DB instance */
+  publicly_accessible?: boolean;
+  /** Aurora cluster storage config: standard vs io-optimized */
+  aurora_cluster_storage_type?: 'standard' | 'io_optimized';
+  /** Number of Aurora reader replicas */
+  aurora_replica_count?: number;
+  /** Deletion protection */
+  deletion_protection?: boolean;
 }
+
+
+
 
 export interface RedisResourceConfig {
   node_type: string;
@@ -772,7 +809,7 @@ export function extractDeploymentSummary(result: DeployApiResult | null): Deploy
     ),
     generatedPem: result?.keypair?.private_key_pem
       || result?.generated_ec2_private_key_pem
-      || pickOutputRaw(runtimeOutputs, ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem'])
+      || pickOutputRaw(runtimeOutputs, ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem'])
       || pickNestedOutputRaw(details || undefined, ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem']),
     instanceId: String(instance?.instance_id || result?.ec2?.instance_id || pickOutput(runtimeOutputs, ['ec2_instance_id', 'instance_id'])),
     instanceArn: String(instance?.instance_arn || result?.ec2?.instance_arn || pickOutput(runtimeOutputs, ['ec2_instance_arn', 'instance_arn'])),
