@@ -1346,17 +1346,35 @@ export default function SecurityAnalysisPage() {
   }, [maxUnlockedIndex]);
 
   const handleStartScan = useCallback(async () => {
+    console.log("=== START SCAN CLICKED ===");
+    console.log({
+      loadingProject,
+      projectMeta,
+      projectAuthError,
+      scanState,
+      rerunInProgress,
+    });
+
     if (loadingProject) {
+      console.log("Blocked: loadingProject");
       setError('Project metadata is still loading. Wait a moment, then retry.');
       return;
     }
+
     if (!projectMeta || projectAuthError) {
-      setError(projectAuthError || 'Project access could not be verified. Reopen it from the dashboard, then retry.');
+      console.log("Blocked: missing projectMeta or auth error");
+      console.log({ projectMeta, projectAuthError });
+      setError(projectAuthError || 'Project access could not be verified.');
       return;
     }
+
+    console.log("About to POST /api/scan/validate");
+
     if (scanState === 'running' || rerunInProgress) return;
+
     setRerunInProgress(true);
     setError(null);
+
     try {
       const validateRes = await fetch('/api/scan/validate', {
         method: 'POST',
@@ -1371,19 +1389,40 @@ export default function SecurityAnalysisPage() {
           scan_type: 'all',
         }),
       });
+
+      console.log("validate response", validateRes.status);
+
       if (!validateRes.ok) {
-        const body = (await validateRes.json().catch(() => ({}))) as { error?: string };
+        const body = await validateRes.json().catch(() => ({}));
+        console.log(body);
         throw new Error(body.error || 'Failed to validate scan');
       }
+
+      console.log("Calling startScan()");
+
       await startScan(projectId, projectName || projectId);
+
+      console.log("startScan returned");
+
       resetRemediation(projectId);
       setActiveStage('scan');
-    } catch (scanError) {
-      setError(scanError instanceof Error ? scanError.message : 'Failed to start scan');
+    } catch (err) {
+      console.error("START SCAN ERROR:", err);
+      setError(err instanceof Error ? err.message : 'Failed to start scan');
     } finally {
       setRerunInProgress(false);
     }
-  }, [loadingProject, projectAuthError, projectId, projectMeta, projectName, rerunInProgress, resetRemediation, scanState, startScan]);
+  }, [
+    loadingProject,
+    projectAuthError,
+    projectId,
+    projectMeta,
+    projectName,
+    rerunInProgress,
+    resetRemediation,
+    scanState,
+    startScan,
+  ]);
 
   const handleStartRemediation = useCallback(async () => {
     const trimmedKey = keyInput.trim();
