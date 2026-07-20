@@ -372,7 +372,13 @@ def run_customization(
                 )
             )
         except RuntimeError as exc:
-            raise
+            if normalized_pipeline_mode == "llm_only":
+                raise
+            warnings.append(f"LLM graph failed at runtime; switched to deterministic fallback: {exc}")
+            final_state = {
+                **initial_state,
+                "errors": list(initial_state.get("errors", [])),
+            }
         except Exception as exc:
             fallback_errors = list(initial_state.get("errors", []))
             if normalized_pipeline_mode == "llm_only":

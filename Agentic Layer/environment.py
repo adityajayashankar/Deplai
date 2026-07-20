@@ -7,10 +7,17 @@ from models import ScanContext, StreamStatus
 from runner_base import RunnerBase
 from bearer import run_bearer_scan
 from sbom import run_syft_scan, run_grype_scan
-from utils import get_docker_client, decode_output, VOLUME_NAMES, CODEBASE_VOLUME, SECURITY_REPORTS_VOLUME, resolve_host_projects_dir, set_current_project_id
+from utils import ensure_docker_image, get_docker_client, decode_output, VOLUME_NAMES, CODEBASE_VOLUME, SECURITY_REPORTS_VOLUME, resolve_host_projects_dir, set_current_project_id
 
 TOTAL_STEPS = 12
 CONTAINER_OP_TIMEOUT = int(os.getenv("CONTAINER_OP_TIMEOUT", "120"))  # seconds for volume/clone ops
+SCAN_IMAGES = (
+    "alpine",
+    "alpine/git",
+    "bearer/bearer:latest-amd64",
+    "anchore/syft",
+    "anchore/grype",
+)
 
 
 class EnvironmentInitializer(RunnerBase):
@@ -42,6 +49,19 @@ class EnvironmentInitializer(RunnerBase):
             return (True, "")
         except Exception as e:
             return (False, str(e))
+
+    def _ensure_scan_images(self) -> tuple[bool, str]:
+        """Pull scanner worker images before mutating a project workspace.
+
+        This gives a direct error when the Docker host has no registry access,
+        instead of appearing to stall on the first Docker operation.
+        """
+        try:
+            for image in SCAN_IMAGES:
+                ensure_docker_image(image)
+            return (True, "")
+        except Exception as exc:
+            return (False, str(exc))
 
     def _clear_codebase_volume(self) -> tuple[bool, str]:
         """Remove and recreate the project's own subdirectory in the codebase volume.
@@ -214,6 +234,14 @@ class EnvironmentInitializer(RunnerBase):
             return await self._terminate(
                 "Docker Engine is not running. Please start Docker Desktop and try again."
             )
+
+        await self._send_message("info", "Preparing security scanner images...")
+        images_ready, image_error = await self._run_step(self._ensure_scan_images)
+        if not images_ready:
+            return await self._terminate(
+                f"Unable to prepare required scanner images. Verify Docker Hub access from the production host. {image_error}"
+            )
+        await self._send_message("success", "Security scanner images are ready.")
 
         already_exist = await self._run_step(self._check_volumes_exist)
 

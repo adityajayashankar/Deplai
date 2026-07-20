@@ -626,7 +626,7 @@ export default function CustomizationConsoleApp() {
     } finally {
       setLoading((prev) => ({ ...prev, implement: false, repair: false }));
     }
-  }, [confirmedTenantId, fetchManifest, implementRun.appTargets, implementRun.pipelineMode, isConfirmed, projectIdFromQuery, tenantId]);
+  }, [byokConfig, confirmedTenantId, fetchManifest, implementRun.appTargets, implementRun.pipelineMode, isConfirmed, projectIdFromQuery, tenantId]);
 
   const handleChatSubmit = useCallback(async (event: React.FormEvent<HTMLFormElement> | { preventDefault: () => void }) => {
     event.preventDefault();
@@ -676,8 +676,14 @@ export default function CustomizationConsoleApp() {
         try {
             await fetchManifest(activeTenantId, true);
             await handleConfirm();
-            await runImplementation({ skipConfirmCheck: true });
-            setChatMessages((prev) => [...prev, { role: 'agent', content: "Implementation completed! You can view the live preview now.", timestamp: nowStamp() }]);
+            const implemented = await runImplementation({ skipConfirmCheck: true });
+            setChatMessages((prev) => [...prev, {
+              role: 'agent',
+              content: implemented
+                ? 'Implementation completed. You can view the live preview now.'
+                : 'Implementation did not complete. Review the implementation result before opening the preview.',
+              timestamp: nowStamp(),
+            }]);
         } catch (e) {
             console.error('Auto-implementation workflow failed', e);
             setChatMessages((prev) => [...prev, { role: 'agent', content: "Implementation encountered an error. Please check the logs.", timestamp: nowStamp() }]);

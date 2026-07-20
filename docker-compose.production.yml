@@ -77,8 +77,8 @@ services:
       AGENTIC_LAYER_URL: http://agentic-layer:8000
       CUSTOMIZATION_AGENT_BASE_URL: http://customization:8010
       CUSTOMIZATION_BACKEND_URL: http://customization:8010
-    ports:
-      - "3000:3000"
+    # Keep the Connector private. Caddy is the sole public ingress and also
+    # proxies browser WebSockets to the Agentic Layer at /agentic.
     volumes:
       - github_repos:/app/tmp/repos
       - local_projects:/app/tmp/local-projects
