@@ -2,7 +2,7 @@
 
 This bundle packages the production Connector UI/API, Agentic Layer, Terraform
 Agent, remediation pipeline, Diagram/Cost agent, customization backend, MySQL,
-and Caddy TLS proxy. The standalone design
+Neo4j, Qdrant, and a Caddy HTTP proxy. The standalone design
 experiments elsewhere in the repository are not application runtime services
 and are intentionally not started.
 
@@ -10,12 +10,12 @@ and are intentionally not started.
 
 Use a supported Linux server with Docker Engine and the Docker Compose plugin.
 For an initial multi-user deployment, start with at least 8 vCPU, 32 GB RAM,
-and 200 GB SSD. Allow inbound TCP ports 80 and 443 only; restrict SSH to a
+and 200 GB SSD. Allow inbound TCP ports 22 and 80 only; restrict SSH to a
 VPN, bastion, or known administrator IP addresses.
 
-Point `APP_DOMAIN` DNS to the server before the first start. Caddy obtains and
-renews TLS certificates automatically, so ports 80 and 443 must be reachable
-from the internet during certificate issuance.
+Set `APP_DOMAIN` to the EC2 public IPv4 address before the first start. This
+deployment serves plain HTTP only; it does not obtain TLS certificates and it
+does not publish port 443.
 
 ## 2. Configure secrets
 
@@ -34,11 +34,11 @@ in `GITHUB_PRIVATE_KEY`.
 Set the GitHub OAuth callback to:
 
 ```text
-https://<APP_DOMAIN>/api/auth/callback
+http://<APP_DOMAIN>/api/auth/callback
 ```
 
 Set `NEXT_PUBLIC_APP_URL`, `NEXT_PUBLIC_AGENTIC_WS_URL`, and `CORS_ORIGINS` to
-the same HTTPS hostname. These `NEXT_PUBLIC_*` values are compiled into the
+the same HTTP public IP. These `NEXT_PUBLIC_*` values are compiled into the
 Connector browser bundle, so rebuild the Connector image when they change.
 
 ## 3. Validate and start
@@ -50,14 +50,14 @@ docker compose --env-file deploy/.env -f docker-compose.production.yml ps
 docker compose --env-file deploy/.env -f docker-compose.production.yml logs -f caddy connector agentic-layer
 ```
 
-Only Caddy publishes host ports. MySQL, the customization backend, and the
-Agentic Layer have no host port mappings.
+Only Caddy publishes host port 80. MySQL, Neo4j, Qdrant, the customization
+backend, Connector, and the Agentic Layer have no host port mappings.
 
 Verify:
 
 ```bash
-curl -fsS https://<APP_DOMAIN>/api/health
-curl -fsS https://<APP_DOMAIN>/agentic/ready
+curl -fsS http://<APP_DOMAIN>/api/health
+curl -fsS http://<APP_DOMAIN>/agentic/ready
 ```
 
 The MySQL initialization script runs only when `mysql_data` is empty. Do not
@@ -66,8 +66,8 @@ explicit migration before rolling out new application code.
 
 ## 4. Operate safely
 
-Create encrypted off-server backups of `mysql_data`, `agentic_runtime`,
-`github_repos`, `local_projects`, and
+Create encrypted off-server backups of `mysql_data`, `neo4j_data`,
+`qdrant_data`, `agentic_runtime`, `github_repos`, `local_projects`, and
 `customization_state`. Test restoring a MySQL backup regularly. Monitor disk
 usage: cloned repositories, scanner databases, Docker images, and Terraform
 workspaces can grow quickly.

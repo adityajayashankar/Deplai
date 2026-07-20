@@ -11,8 +11,6 @@ services:
       - ./deploy/.env
     ports:
       - "80:80"
-      - "443:443"
-      - "443:443/udp"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -79,6 +77,8 @@ services:
       CUSTOMIZATION_BACKEND_URL: http://customization:8010
     # Keep the Connector private. Caddy is the sole public ingress and also
     # proxies browser WebSockets to the Agentic Layer at /agentic.
+    expose:
+      - "3000"
     volumes:
       - github_repos:/app/tmp/repos
       - local_projects:/app/tmp/local-projects
@@ -102,6 +102,8 @@ services:
       DEPLAI_LOCAL_PROJECTS_ROOT: /local-projects
       DEPLAI_GITHUB_REPOS_ROOT: /repos
       IAC_WORKSPACE_ROOT: /workspace/iac-workspaces
+    expose:
+      - "8000"
     # The current scanner, remediation, and Terraform implementations create
     # short-lived worker containers through the Docker Engine. Keep this API
     # private and see deploy/README.md for the trust-boundary requirement.
@@ -121,6 +123,10 @@ services:
       - /tmp:size=2g,mode=1777
     networks:
       - backend
+    depends_on:
+      connector:
+        condition: service_healthy
+
   customization:
     build:
       context: .
@@ -132,6 +138,8 @@ services:
       APP_ENV: production
       CUSTOMIZATION_PREVIEW_HOST: 127.0.0.1
       CUSTOMIZATION_PREVIEW_AUTO_INSTALL: "0"
+    expose:
+      - "8010"
     volumes:
       # Preserve the same paths that the Connector sends in customization
       # requests, while keeping them inaccessible from the public network.
@@ -141,12 +149,39 @@ services:
       - customization_logs:/app/tenant_builder_app/backend/logs
     networks:
       - backend
+    depends_on:
+      mysql:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8010/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8010/ready', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  neo4j:
+    image: ${NEO4J_IMAGE:-neo4j:5-community}
+    restart: unless-stopped
+    env_file:
+      - ./deploy/.env
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in deploy/.env}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in deploy/.env}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      - backend
+
+  qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.13.6}
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - backend
 
 networks:
   backend:
@@ -162,6 +197,9 @@ volumes:
   iac_workspaces:
   customization_state:
   customization_logs:
+  neo4j_data:
+  neo4j_logs:
+  qdrant_data:
   # These exact names are used by the Docker SDK in the Agentic Layer.
   codebase_deplai:
     name: codebase_deplai

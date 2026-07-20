@@ -99,6 +99,12 @@ def health_check() -> dict[str, str]:
     return {"status": "healthy", "service": "customization-backend"}
 
 
+@app.get("/ready")
+def readiness_check() -> dict[str, str]:
+    """Readiness endpoint used by the production Compose health check."""
+    return {"status": "ready", "service": "customization-backend"}
+
+
 def _normalize_app_targets(raw_targets: object) -> list[str]:
     if not isinstance(raw_targets, list):
         return ["frontend", "admin-frontend", "expert", "corporates"]
