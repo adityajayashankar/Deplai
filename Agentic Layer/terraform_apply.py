@@ -23,7 +23,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from docker.errors import ContainerError
 
-from utils import decode_output, get_docker_client
+from utils import decode_output, ensure_docker_image, get_docker_client
 
 TERRAFORM_IMAGE = "hashicorp/terraform:1.9.0"
 DEFAULT_ATMOS_IMAGE = "ghcr.io/cloudposse/atmos:1.185.0"
@@ -260,6 +260,7 @@ def _write_files_to_volume(volume_name: str, files: list[dict[str, Any]]) -> Non
 
 
 def _run_terraform(volume_name: str, tf_root: str, args: list[str], env: dict[str, str]) -> str:
+    ensure_docker_image(TERRAFORM_IMAGE)
     output = get_docker_client().containers.run(
         TERRAFORM_IMAGE,
         command=[f"-chdir={tf_root}", *args],
@@ -283,6 +284,7 @@ def _run_terraform_with_tracking(
     primary = str(args[0] if args else "terraform").strip() or "terraform"
     _emit_progress(apply_context, "info", f"Running terraform {primary}...")
 
+    ensure_docker_image(TERRAFORM_IMAGE)
     docker = get_docker_client()
     container = docker.containers.create(
         TERRAFORM_IMAGE,

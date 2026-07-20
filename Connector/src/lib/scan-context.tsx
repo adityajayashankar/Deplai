@@ -8,6 +8,7 @@ const MAX_PROJECT_ENTRIES = 40;
 const MAX_MESSAGES_PER_PROJECT = 500;
 const MAX_STORED_REMEDIATION_MESSAGES = 160;
 const MAX_STORED_MESSAGE_CONTENT_CHARS = 2_000;
+const WEBSOCKET_CONNECT_TIMEOUT_MS = 15_000;
 
 type OperationState = 'idle' | 'running' | 'waiting_decision' | 'waiting_approval' | 'completed' | 'error';
 export type ScanState = OperationState;
@@ -159,9 +160,18 @@ function connectWebSocket(
   wsToken: string,
 ): WebSocket {
   const base = `${normalizeWsBase(wsBaseUrl)}${path}/${projectId}`;
+  const workflowLabel = path.includes('/remediate') ? 'remediation' : 'scan';
   const ws = new WebSocket(wsToken ? `${base}?token=${encodeURIComponent(wsToken)}` : base);
+  let opened = false;
+  const connectTimeout = window.setTimeout(() => {
+    if (opened || ws.readyState !== WebSocket.CONNECTING) return;
+    onError(projectId, `The live ${workflowLabel} connection timed out. Verify the production WebSocket URL and reverse proxy, then retry.`);
+    ws.close();
+  }, WEBSOCKET_CONNECT_TIMEOUT_MS);
 
   ws.onopen = () => {
+    opened = true;
+    window.clearTimeout(connectTimeout);
     ws.send(JSON.stringify({ action: 'start' }));
   };
 
@@ -205,9 +215,12 @@ function connectWebSocket(
   };
 
   ws.onerror = () => {
-    onError(projectId, 'WebSocket transport error while streaming remediation logs.');
+    onError(projectId, `WebSocket transport error while streaming ${workflowLabel} logs. Verify the production WebSocket URL and reverse proxy, then retry.`);
   };
-  ws.onclose = (event) => onClose(projectId, { code: event.code, reason: event.reason });
+  ws.onclose = (event) => {
+    window.clearTimeout(connectTimeout);
+    onClose(projectId, { code: event.code, reason: event.reason });
+  };
 
   return ws;
 }
@@ -263,31 +276,6 @@ function clampRecordSize<T>(input: Record<string, T>): Record<string, T> {
   return Object.fromEntries(entries.slice(entries.length - MAX_PROJECT_ENTRIES));
 }
 
-function normalizeStoredScanStates(input: Record<string, ProjectScanState> | undefined): Record<string, ProjectScanState> {
-  const out: Record<string, ProjectScanState> = {};
-  for (const [projectId, state] of Object.entries(input || {})) {
-    if (!projectId || !state) continue;
-    out[projectId] = {
-      state: state.state || 'idle',
-      projectName: String(state.projectName || ''),
-      messages: trimMessageList(Array.isArray(state.messages) ? state.messages : []),
-    };
-  }
-  return clampRecordSize(out);
-}
-
-function normalizeStoredRemediationStates(input: Record<string, ProjectRemediationState> | undefined): Record<string, ProjectRemediationState> {
-  const out: Record<string, ProjectRemediationState> = {};
-  for (const [projectId, state] of Object.entries(input || {})) {
-    if (!projectId || !state) continue;
-    out[projectId] = {
-      state: state.state || 'idle',
-      messages: trimMessageList(Array.isArray(state.messages) ? state.messages : []),
-    };
-  }
-  return clampRecordSize(out);
-}
-
 function normalizeRemediationStatesForStorage(input: Record<string, ProjectRemediationState> | undefined): Record<string, ProjectRemediationState> {
   const out: Record<string, ProjectRemediationState> = {};
   for (const [projectId, state] of Object.entries(input || {})) {
@@ -295,18 +283,6 @@ function normalizeRemediationStatesForStorage(input: Record<string, ProjectRemed
     out[projectId] = {
       state: state.state || 'idle',
       messages: sanitizeRemediationMessagesForStorage(Array.isArray(state.messages) ? state.messages : []),
-    };
-  }
-  return clampRecordSize(out);
-}
-
-function normalizeStoredResultsCache(input: Record<string, CachedScanResults> | undefined): Record<string, CachedScanResults> {
-  const out: Record<string, CachedScanResults> = {};
-  for (const [projectId, cached] of Object.entries(input || {})) {
-    if (!projectId || !cached) continue;
-    out[projectId] = {
-      status: cached.status || 'not_initiated',
-      data: cached.data ?? null,
     };
   }
   return clampRecordSize(out);
@@ -324,10 +300,13 @@ function readPersistedSnapshot(): PersistedScanContextSnapshot | null {
 }
 
 export function ScanProvider({ children }: { children: React.ReactNode }) {
-  const [scanStates, setScanStates] = useState<Record<string, ProjectScanState>>(() => normalizeStoredScanStates(readPersistedSnapshot()?.scanStates));
-  const [remediationStates, setRemediationStates] = useState<Record<string, ProjectRemediationState>>(() => normalizeStoredRemediationStates(readPersistedSnapshot()?.remediationStates));
-  const [resultsCache, setResultsCache] = useState<Record<string, CachedScanResults>>(() => normalizeStoredResultsCache(readPersistedSnapshot()?.resultsCache));
-  const [storageHydrated] = useState(true);
+  // Keep the initial client render identical to the server render. Restoring
+  // localStorage here would make a persisted scan state appear before React
+  // hydrates and trigger a production hydration mismatch.
+  const [scanStates, setScanStates] = useState<Record<string, ProjectScanState>>({});
+  const [remediationStates, setRemediationStates] = useState<Record<string, ProjectRemediationState>>({});
+  const [resultsCache, setResultsCache] = useState<Record<string, CachedScanResults>>({});
+  const [storageHydrated, setStorageHydrated] = useState(false);
   const wsRefs = useRef<Record<string, WebSocket>>({});
   const remWsRefs = useRef<Record<string, WebSocket>>({});
 
@@ -375,6 +354,19 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     }
     return clampMapSize(out);
   }, [clampMapSize]);
+
+  useEffect(() => {
+    const restoreTimer = window.setTimeout(() => {
+      const snapshot = readPersistedSnapshot();
+      if (snapshot) {
+        setScanStates(normalizeScanStates(snapshot.scanStates));
+        setRemediationStates(normalizeRemediationStates(snapshot.remediationStates));
+        setResultsCache(normalizeResultsCache(snapshot.resultsCache));
+      }
+      setStorageHydrated(true);
+    }, 0);
+    return () => window.clearTimeout(restoreTimer);
+  }, [normalizeRemediationStates, normalizeResultsCache, normalizeScanStates]);
 
   useEffect(() => {
     if (!storageHydrated) return;
@@ -466,9 +458,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
         setScanStates(prev => {
           const existing = prev[projectId];
           if (!existing) return prev;
-          if (existing.state !== 'running') {
-            return { ...prev, [projectId]: { ...existing, state: 'idle' } };
-          }
+          if (existing.state !== 'running') return prev;
           const nextMessages = trimMessages([
             ...existing.messages,
             {
@@ -519,22 +509,44 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       return next;
     });
 
-    const wsBaseUrl = await resolveWsBaseUrl();
-    const wsToken = await fetchWsToken(projectId);
-    wsRefs.current[projectId] = connectWebSocket(
-      wsBaseUrl,
-      '/ws/scan', projectId,
-      appendScanMessage,
-      updateScanStatus,
-      (id) => updateScanStatus(id, 'error'),
-      (id) => {
-        // Reconcile with backend status to avoid false failures when the WS drops
-        // during server restarts/reloads while scan workers may still be running.
-        void reconcileScanStatusAfterSocketClose(id);
-        delete wsRefs.current[id];
-      },
-      wsToken,
-    );
+    try {
+      const wsBaseUrl = await resolveWsBaseUrl();
+      const wsToken = await fetchWsToken(projectId);
+      wsRefs.current[projectId] = connectWebSocket(
+        wsBaseUrl,
+        '/ws/scan', projectId,
+        appendScanMessage,
+        updateScanStatus,
+        (id, detail) => {
+          appendScanMessage(id, {
+            index: Date.now(),
+            total: Date.now(),
+            type: 'error',
+            content: detail || 'Failed to connect to the live scan stream.',
+            timestamp: new Date().toISOString(),
+          });
+          updateScanStatus(id, 'error');
+        },
+        (id) => {
+          // Reconcile with backend status to avoid false failures when the WS drops
+          // during server restarts/reloads while scan workers may still be running.
+          void reconcileScanStatusAfterSocketClose(id);
+          delete wsRefs.current[id];
+        },
+        wsToken,
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Failed to connect to the live scan stream.';
+      appendScanMessage(projectId, {
+        index: Date.now(),
+        total: Date.now(),
+        type: 'error',
+        content: detail,
+        timestamp: new Date().toISOString(),
+      });
+      updateScanStatus(projectId, 'error');
+      throw error;
+    }
   }, [appendScanMessage, reconcileScanStatusAfterSocketClose, updateScanStatus]);
 
   const getScanState = useCallback((projectId: string): ProjectScanState => {

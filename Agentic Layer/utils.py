@@ -67,6 +67,23 @@ def get_docker_client() -> docker.DockerClient:
     return _docker_client
 
 
+def ensure_docker_image(image: str) -> None:
+    """Ensure an image exists on the Docker host before `containers.create`.
+
+    Docker SDK's `containers.create` does not pull a missing image, unlike
+    `containers.run`. Terraform uses `create` so the first production deploy
+    previously failed with a 404 instead of fetching the pinned image.
+    """
+    docker_client = get_docker_client()
+    try:
+        docker_client.images.get(image)
+    except docker.errors.ImageNotFound:
+        try:
+            docker_client.images.pull(image)
+        except Exception as exc:
+            raise RuntimeError(f"Unable to pull required Docker image {image}: {exc}") from exc
+
+
 def resolve_host_projects_dir() -> str | None:
     """Resolve host path mapped to /local-projects for helper containers.
 

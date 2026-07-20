@@ -31,6 +31,21 @@ def _docker_client() -> Any:
     return docker.from_env()
 
 
+def _ensure_terraform_image(docker_client: Any) -> None:
+    """Pull Terraform once when the host does not already have the pinned image."""
+    from docker.errors import ImageNotFound
+
+    try:
+        docker_client.images.get(TERRAFORM_IMAGE)
+    except ImageNotFound as lookup_error:
+        try:
+            docker_client.images.pull(TERRAFORM_IMAGE)
+        except Exception as pull_error:
+            raise RuntimeError(
+                f"Unable to pull required Docker image {TERRAFORM_IMAGE}: {pull_error}"
+            ) from lookup_error
+
+
 def _decode_output(output: bytes | str) -> str:
     return output.decode() if isinstance(output, bytes) else str(output)
 
@@ -141,6 +156,7 @@ def run_terraform_command(
 
     volume_name = f"deplai_tf_exec_{uuid.uuid4().hex[:12]}"
     docker_client = _docker_client()
+    _ensure_terraform_image(docker_client)
     volume = docker_client.volumes.create(name=volume_name)
     stdout = ""
     timeout_seconds = _command_timeout_seconds(args)
