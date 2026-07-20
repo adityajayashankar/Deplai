@@ -31,7 +31,6 @@ DeplAI has a browser-facing control plane and a backend execution plane.
             ├── Docker Engine: scanners, volumes, Terraform execution
             ├── Terraform Agent: bundle generation, state, locks, apply
             ├── remediation_pipeline: finding-to-fix orchestration
-            ├── optional KGagent: knowledge-graph support
             └── AWS APIs: cost, Terraform-managed resources, runtime inspection
 ```
 

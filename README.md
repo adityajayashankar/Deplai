@@ -53,7 +53,6 @@ Optional: Customization backend (FastAPI, port 8010)
 | `Terraform Agent/agent/` | Terraform run engine, renderers, validation/refinement loop, state storage, lock handling, deployment profiles, templates, and execution helpers. |
 | `Customization Agent/tenant_builder_app/backend/` | Tenant manifest chat, planning, repository edits, asset storage, preview orchestration, and customization quality gates. |
 | `remediation_pipeline/` | Remediation extraction, grouping, generation, validation, and track orchestration used by the Agentic Layer. |
-| `KGagent/` | Optional knowledge-graph support mounted into the Agentic Layer. |
 | `Connector/database.sql` | Baseline MySQL schema for users, GitHub installations/repositories, projects, and chat sessions/messages. |
 | `docker-compose.yml` | Agentic Layer development container, source mounts, Docker socket access, and service network. |
 | `.env.template` | Shared environment-variable template. Never commit the populated `.env` file. |
@@ -91,7 +90,7 @@ docker compose up --build
 ```
 
 Open `http://localhost:3000`. This starts the Connector, Agentic Layer,
-customization backend, MySQL, Neo4j, and Qdrant. GitHub sign-in, repository
+customization backend and MySQL. GitHub sign-in, repository
 access, PR creation, cloud deployment, and LLM-backed features require their
 respective credentials; see the full setup below. Stop the stack with
 `docker compose down` (do not add `-v` unless you intend to erase local data).

@@ -57,7 +57,7 @@ export async function POST(request: NextRequest) {
     const { user, error } = await requireAuth();
     if (error) return error;
 
-    const { project_id, cortex_context, github_token, llm_provider, llm_api_key, llm_model, remediation_scope } = await request.json();
+    const { project_id, github_token, llm_provider, llm_api_key, llm_model, remediation_scope } = await request.json();
     const runtimeGithubToken =
       typeof github_token === 'string' && github_token.trim().length > 0
         ? github_token.trim()
@@ -123,7 +123,6 @@ export async function POST(request: NextRequest) {
           user_id: String(user.id),
           github_token: token,
           repository_url: `https://github.com/${owner}/${repo}`,
-          cortex_context: cortex_context || null,
           llm_provider: normalizedLlmProvider,
           llm_api_key: normalizedLlmApiKey,
           llm_model: normalizedLlmModel,
@@ -135,7 +134,6 @@ export async function POST(request: NextRequest) {
           project_name: project.name,
           project_type: 'local',
           user_id: String(user.id),
-          cortex_context: cortex_context || null,
           llm_provider: normalizedLlmProvider,
           llm_api_key: normalizedLlmApiKey,
           llm_model: normalizedLlmModel,
@@ -177,7 +175,6 @@ export async function POST(request: NextRequest) {
         user_id: String(user.id),
         github_token: token,
         repository_url: `https://github.com/${owner}/${repo}`,
-        cortex_context: cortex_context || null,
         llm_provider: normalizedLlmProvider,
         llm_api_key: normalizedLlmApiKey,
         llm_model: normalizedLlmModel,

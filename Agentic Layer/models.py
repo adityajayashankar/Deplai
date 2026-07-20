@@ -88,8 +88,6 @@ class RemediationRequest(BaseModel):
     # GitHub-specific fields (only for github projects)
     github_token: Optional[str] = None
     repository_url: Optional[str] = None
-    # Optional context from external knowledge graph agent (Cortex)
-    cortex_context: Optional[str] = None
     # User-supplied LLM provider override (ollama | claude | openai | gemini | groq | openrouter)
     llm_provider: Optional[str] = None
     llm_api_key: Optional[str] = None

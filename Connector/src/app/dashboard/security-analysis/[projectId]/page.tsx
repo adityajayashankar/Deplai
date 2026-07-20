@@ -7,8 +7,6 @@ import {
   AlertCircle,
   Bot,
   CheckCircle2,
-  ChevronDown,
-  ChevronRight,
   CircleDashed,
   ExternalLink,
   Eye,
@@ -98,53 +96,6 @@ interface ChangedFileEntry {
   path: string;
   reason?: string;
   diff?: string;
-}
-
-interface KgCorrelation {
-  id: string;
-  description: string;
-  relationship: string;
-  cvss: string;
-}
-
-interface KgQuery {
-  entity: string;
-  type: string;
-  status: 'online' | 'offline';
-  summary: string;
-  direct_count: number;
-  inferred_count: number;
-  correlations: KgCorrelation[];
-  inferred: KgCorrelation[];
-  actions: string[];
-}
-
-interface KgContextFinding {
-  cwe_id: string;
-  title: string;
-  severity: string;
-  count: number;
-}
-
-interface KgContextVuln {
-  cve_id: string;
-  name: string;
-  version: string;
-  severity: string;
-  fix_version: string | null;
-}
-
-interface KgContext {
-  total_components: number;
-  queries: KgQuery[];
-  code_security: KgContextFinding[];
-  supply_chain: KgContextVuln[];
-}
-
-interface KgResultPayload {
-  business_logic_summary?: string;
-  vulnerability_summary?: string;
-  context?: KgContext;
 }
 
 function computeStats(data: ScanResults): ScanStats {
@@ -943,7 +894,6 @@ export default function SecurityAnalysisPage() {
   const [locallyApproved, setLocallyApproved] = useState(false);
   const [prUrl, setPrUrl] = useState<string | null>(null);
   const [selectedDiffPath, setSelectedDiffPath] = useState<string | null>(null);
-  const [kgExpanded, setKgExpanded] = useState(true);
   const [activeStage, setActiveStage] = useState<PipelineStageId>('scan');
   const [resultsTab, setResultsTab] = useState<'sca' | 'sast'>('sca');
   const [resultsQuery, setResultsQuery] = useState('');
@@ -1245,16 +1195,6 @@ export default function SecurityAnalysisPage() {
     }
   }, [changedFiles, selectedDiffPath]);
 
-  const latestKgResult = useMemo(() => {
-    const message = [...remMessages].reverse().find((item) => item.type === 'kg_result');
-    if (!message) return null;
-    try {
-      return JSON.parse(message.content) as KgResultPayload;
-    } catch {
-      return null;
-    }
-  }, [remMessages]);
-
   const hasScanOutcome = useMemo(() => vulnStatus !== 'not_initiated' || scanState === 'completed' || results !== null || loadingResults, [loadingResults, results, scanState, vulnStatus]);
   const deploymentPath = useMemo(
     () => `/dashboard/deploy?projectId=${encodeURIComponent(projectId)}&entry=run-all`,
@@ -1455,7 +1395,6 @@ export default function SecurityAnalysisPage() {
     try {
       await startRemediation(
         projectId,
-        undefined,
         trimmedToken || undefined,
         provider,
         trimmedKey || apiKeys[provider] || undefined,
@@ -1877,7 +1816,7 @@ export default function SecurityAnalysisPage() {
         <div className="custom-scrollbar flex-1 overflow-y-auto bg-[#000000] p-6 font-mono text-[13px] leading-relaxed">
           {remMessages.map((message, index) => {
             const logText = String(message.content || '');
-            const toneClass = message.type === 'kg_phase' ? 'text-violet-300' : logText.includes('[waiting_approval]') || logText.includes('[waiting_decision]') || message.type === 'warning' ? 'text-amber-400 font-medium' : message.type === 'success' ? 'text-emerald-400' : message.type === 'error' ? 'text-rose-400' : 'text-zinc-400';
+            const toneClass = logText.includes('[waiting_approval]') || logText.includes('[waiting_decision]') || message.type === 'warning' ? 'text-amber-400 font-medium' : message.type === 'success' ? 'text-emerald-400' : message.type === 'error' ? 'text-rose-400' : 'text-zinc-400';
             return <div key={`${message.timestamp}-${index}`} className="mb-2 flex gap-4 animate-fade-in"><span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span><span className={toneClass}>{logText}</span></div>;
           })}
           {remediatingThisProject ? <div className="mt-2 animate-pulse text-zinc-600">_</div> : null}
@@ -1885,20 +1824,6 @@ export default function SecurityAnalysisPage() {
         </div>
       </BorderGlow>
 
-      {latestKgResult?.context ? (
-        <BorderGlow backgroundColor="#050505" colors={['#6d28d9', '#050505']} glowColor="280 80 50" borderRadius={8} className="overflow-hidden border border-violet-500/20 shadow-lg">
-          <button type="button" onClick={() => setKgExpanded((value) => !value)} className="flex w-full items-center justify-between border-b border-violet-500/15 bg-violet-500/5 px-5 py-4 text-left">
-            <div><div className="text-xs font-semibold uppercase tracking-widest text-violet-300">Knowledge Graph Intelligence</div><div className="mt-1 text-[12px] text-zinc-500">{latestKgResult.context.total_components} components analysed · {latestKgResult.context.queries?.length || 0} KG queries</div></div>
-            {kgExpanded ? <ChevronDown className="h-4 w-4 text-zinc-500" /> : <ChevronRight className="h-4 w-4 text-zinc-500" />}
-          </button>
-          {kgExpanded ? (
-            <div className="space-y-4 p-5">
-              {latestKgResult.business_logic_summary ? <div><div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Business Context</div><div className="rounded-lg border border-[#1A1A1A] bg-black/50 p-4 text-sm leading-relaxed text-zinc-300">{latestKgResult.business_logic_summary}</div></div> : null}
-              {latestKgResult.vulnerability_summary ? <div><div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Vulnerability Summary</div><div className="custom-scrollbar max-h-65 overflow-y-auto rounded-lg border border-[#1A1A1A] bg-black/50 p-4 font-mono text-[12px] leading-relaxed text-zinc-300"><pre className="whitespace-pre-wrap">{latestKgResult.vulnerability_summary}</pre></div></div> : null}
-            </div>
-          ) : null}
-        </BorderGlow>
-      ) : null}
     </div>
   );
 

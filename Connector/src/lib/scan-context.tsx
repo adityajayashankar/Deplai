@@ -59,7 +59,6 @@ interface ScanContextValue {
   resetAll: () => void;
   startRemediation: (
     projectId: string,
-    cortexContext?: string,
     githubToken?: string,
     llmProvider?: string,
     llmApiKey?: string,
@@ -579,7 +578,6 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
 
   const startRemediation = useCallback(async (
     projectId: string,
-    cortexContext?: string,
     githubToken?: string,
     llmProvider?: string,
     llmApiKey?: string,
@@ -600,7 +598,6 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           project_id: projectId,
-          cortex_context: cortexContext || null,
           github_token: githubToken || null,
           llm_provider: llmProvider || null,
           llm_api_key: llmApiKey || null,

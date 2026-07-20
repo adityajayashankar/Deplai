@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build this image from the repository root. The Agentic Layer imports the
-# Terraform Agent, remediation pipeline, KG agent, and diagram/cost agent at
+# Terraform Agent, remediation pipeline, and diagram/cost agent at
 # runtime, so a production image must package all of them together.
 FROM python:3.13-slim-bookworm
 
@@ -31,7 +31,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # quick when only application code changes.
 COPY ["Agentic Layer/requirements.txt", "/tmp/requirements/agentic.txt"]
 COPY ["Terraform Agent/agent/requirements.txt", "/tmp/requirements/terraform-agent.txt"]
-COPY ["KGagent/requirements.txt", "/tmp/requirements/kgagent.txt"]
 COPY ["Diagram-Cost-Agent/requirements.txt", "/tmp/requirements/diagram-cost.txt"]
 
 # CPU-only PyTorch avoids pulling CUDA libraries into a server image.
@@ -39,16 +38,14 @@ RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install \
       -r /tmp/requirements/agentic.txt \
       -r /tmp/requirements/terraform-agent.txt \
-      -r /tmp/requirements/kgagent.txt \
       -r /tmp/requirements/diagram-cost.txt
 
 # Preserve the workspace layout. It is required by planning_runtime.repo_root(),
-# Stage 7's Diagram-Cost-Agent subprocess, and the KG agent fallback imports.
+# Stage 7's Diagram-Cost-Agent subprocess.
 WORKDIR /workspace/Agentic Layer
 COPY ["Agentic Layer/", "/workspace/Agentic Layer/"]
 COPY ["Terraform Agent/", "/workspace/Terraform Agent/"]
 COPY ["remediation_pipeline/", "/workspace/remediation_pipeline/"]
-COPY ["KGagent/", "/workspace/KGagent/"]
 COPY ["Diagram-Cost-Agent/", "/workspace/Diagram-Cost-Agent/"]
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin deplai \

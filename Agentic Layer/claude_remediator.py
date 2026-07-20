@@ -703,8 +703,6 @@ def _collect_context_files(scan_data: dict[str, Any]) -> dict[str, str]:
 def _build_prompt(
     scan_data: dict[str, Any],
     contexts: dict[str, str],
-    cortex_context: str | None,
-    agent_analysis: dict | None = None,
     shrink_level: int = 0,
 ) -> str:
     raw_code_findings = scan_data.get("code_security", [])
@@ -798,20 +796,6 @@ def _build_prompt(
         current_context_chars += len(trimmed)
         sections.append(f"### {path}\n```text\n{trimmed}\n```")
 
-    # Knowledge graph analysis section
-    biz_summary = (agent_analysis or {}).get("business_logic_summary", "").strip()
-    vuln_context = (agent_analysis or {}).get("vulnerability_summary", "").strip()
-    kg_section = ""
-    if biz_summary or vuln_context:
-        kg_section = f"""Knowledge Graph Analysis (static source-code analysis by a dedicated agent):
-
-Business Logic:
-{biz_summary or 'Not analyzed'}
-
-Vulnerability Context:
-{vuln_context or 'Not analyzed'}
-"""
-
     prompt = f"""You are remediating security vulnerabilities in a real repository.
 
 Use the scanner findings and file contexts to produce concrete code fixes.
@@ -838,10 +822,7 @@ Rules:
 Security findings (Bearer + Grype):
 {json.dumps({"code_security": code_findings, "supply_chain": supply_findings}, indent=2)}
 
-Context from Cortex knowledge graph (optional):
-{cortex_context or "None provided"}
-
-{kg_section}Repository file contexts:
+Repository file contexts:
 {chr(10).join(sections)}
 """
 
@@ -1235,11 +1216,9 @@ def _is_prompt_too_large_error(message: str) -> bool:
 
 def run_claude_remediation(
     scan_data: dict[str, Any],
-    cortex_context: str | None = None,
     llm_provider: str | None = None,
     llm_api_key: str | None = None,
     llm_model: str | None = None,
-    agent_analysis: dict | None = None,
     budget_tracker: ClaudeBudgetTracker | None = None,
 ) -> tuple[bool, dict[str, Any] | str]:
     """Generate and apply remediation edits in the codebase volume."""
@@ -1301,8 +1280,6 @@ def run_claude_remediation(
         prompt = _build_prompt(
             scan_data,
             contexts,
-            cortex_context,
-            agent_analysis,
             shrink_level=shrink_level,
         )
         if shrink_level >= 3 and len(prompt) > 9000:

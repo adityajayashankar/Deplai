@@ -82,8 +82,6 @@ class RemediationState(TypedDict):
     scan_data: dict
     contexts: dict          # {relative_path: file_content}
     allowed_paths: list     # list[str] — paths the Synthesizer may write
-    cortex_context: str
-    agent_analysis: dict
     llm_provider: str
     llm_api_key: str
     llm_model: str
@@ -239,8 +237,6 @@ def _planner_node(state: RemediationState) -> RemediationState:
 def _build_proposer_prompt(state: RemediationState) -> str:
     scan_data       = state["scan_data"]
     contexts        = state["contexts"]
-    cortex_context  = state.get("cortex_context") or ""
-    agent_analysis  = state.get("agent_analysis") or {}
     critique        = state.get("critique") or {}
     round_num       = state.get("round", 0)
 
@@ -293,16 +289,6 @@ def _build_proposer_prompt(state: RemediationState) -> str:
             snippet = snippet[:remaining]
         total_context_chars += len(snippet)
         file_sections.append(f"### {path}\n```text\n{snippet}\n```")
-
-    biz = agent_analysis.get("business_logic_summary", "").strip()
-    vuln = agent_analysis.get("vulnerability_summary", "").strip()
-    kg_block = ""
-    if biz or vuln:
-        kg_block = f"""
-Knowledge Graph Analysis:
-  Business Logic: {biz or 'Not analyzed'}
-  Vulnerability Context: {vuln or 'Not analyzed'}
-"""
 
     critique_block = ""
     if round_num > 0 and critique:
@@ -358,11 +344,9 @@ Rules:
 3. Changes must be minimal and targeted — fix the vulnerability, preserve functionality.
 4. All code must be syntactically correct.
 5. If a safe fix is not possible for a finding, omit it and note it in the summary.
-{critique_block}{planner_block}{kg_block}
+{critique_block}{planner_block}
 Security Findings:
 {json.dumps({"code_security": compact_code, "supply_chain": compact_supply}, indent=2)}
-
-Cortex Context: {cortex_context or "None"}
 
 Repository Files:
 {chr(10).join(file_sections)}"""
@@ -661,11 +645,9 @@ def build_supervisor_graph() -> Any:
 
 async def run_remediation_supervisor(
     scan_data: dict,
-    cortex_context: str | None = None,
     llm_provider: str | None = None,
     llm_api_key: str | None = None,
     llm_model: str | None = None,
-    agent_analysis: dict | None = None,
     budget_tracker: ClaudeBudgetTracker | None = None,
     on_message=None,
 ) -> tuple[bool, dict[str, Any] | str]:
@@ -705,8 +687,6 @@ async def run_remediation_supervisor(
         "scan_data":      scan_data,
         "contexts":       contexts,
         "allowed_paths":  list(contexts.keys()),
-        "cortex_context": cortex_context or "",
-        "agent_analysis": agent_analysis or {},
         "llm_provider":   llm_provider or "",
         "llm_api_key":    llm_api_key or "",
         "llm_model":      llm_model or "",

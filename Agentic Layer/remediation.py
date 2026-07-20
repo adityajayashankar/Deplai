@@ -12,7 +12,7 @@ from functools import partial
 
 from fastapi import WebSocket
 
-from agent import run_analysis_agent, run_remediation_supervisor
+from agent import run_remediation_supervisor
 from Analysis.dataingestor import get_scan_results
 from bearer import run_bearer_scan
 from claude_remediator import ClaudeBudgetTracker, run_claude_remediation  # kept as fallback
@@ -1081,25 +1081,6 @@ echo "PUSHED"
                     ),
                 )
 
-                await self._send_message("phase", f"{batch_label} Knowledge Graph Analysis")
-                agent_analysis: dict = {}
-                try:
-                    async def _on_kg_message(msg_type: str, content: str):
-                        await self._send_message(msg_type, content)
-
-                    agent_analysis = await run_analysis_agent(
-                        project_id=self.project_id,
-                        scan_data=batch_scan_data,
-                        on_message=_on_kg_message,
-                    )
-                    await self._send_message("kg_result", json.dumps({
-                        "business_logic_summary": agent_analysis.get("business_logic_summary", ""),
-                        "vulnerability_summary":  agent_analysis.get("vulnerability_summary", ""),
-                        "context":               agent_analysis.get("context"),
-                    }))
-                except Exception as _kg_exc:
-                    await self._send_message("warning", f"{batch_label} Knowledge graph analysis skipped: {_kg_exc}")
-
                 self._check_cancelled()
 
                 await self._send_message("phase", f"{batch_label} Running Remediation Supervisor")
@@ -1109,11 +1090,9 @@ echo "PUSHED"
 
                     success, remediation_result = await run_remediation_supervisor(
                         scan_data=batch_scan_data,
-                        cortex_context=self.context.cortex_context,
                         llm_provider=effective_llm_provider,
                         llm_api_key=effective_llm_api_key,
                         llm_model=effective_llm_model,
-                        agent_analysis=agent_analysis,
                         budget_tracker=budget_tracker,
                         on_message=_on_supervisor_message,
                     )
@@ -1138,11 +1117,9 @@ echo "PUSHED"
                                 partial(
                                 run_claude_remediation,
                                 batch_scan_data,
-                                cortex_context=self.context.cortex_context,
                                 llm_provider=effective_llm_provider,
                                 llm_api_key=effective_llm_api_key,
                                 llm_model=effective_llm_model,
-                                agent_analysis=agent_analysis,
                                 budget_tracker=budget_tracker,
                             )
                         )

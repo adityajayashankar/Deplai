@@ -10,7 +10,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 if "agent" not in sys.modules:
     agent_stub = types.ModuleType("agent")
-    agent_stub.run_analysis_agent = lambda *args, **kwargs: {}
     agent_stub.run_remediation_supervisor = lambda *args, **kwargs: (True, {})
     sys.modules["agent"] = agent_stub
 

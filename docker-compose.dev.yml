@@ -27,6 +27,5 @@ services:
       - ./Agentic Layer:/workspace/Agentic Layer
       - ./Terraform Agent:/workspace/Terraform Agent
       - ./remediation_pipeline:/workspace/remediation_pipeline
-      - ./KGagent:/workspace/KGagent:ro
       - ./Diagram-Cost-Agent:/workspace/Diagram-Cost-Agent:ro
     restart: unless-stopped

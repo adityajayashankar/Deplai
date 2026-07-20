@@ -105,7 +105,6 @@ The response contains `success` and the new project’s ID, type, local path, fi
 ```json
 {
   "project_id": "project-or-repository-id",
-  "cortex_context": "optional external context",
   "llm_provider": "optional-provider",
   "llm_api_key": "optional per-request key",
   "llm_model": "optional model",

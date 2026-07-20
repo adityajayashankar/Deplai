@@ -3,9 +3,8 @@
 export const STAGES: Stage[] = [
   { id: 0, key: 'preflight', label: 'Preflight checks', group: null, track: 'shared', status: 'success', duration: '1.8s' },
   { id: 1, key: 'scan', label: 'run_scan (SAST/SCA)', group: 'loop', track: 'security', status: 'success', duration: '4m 32s' },
-  { id: 2, key: 'kg', label: 'KG Agent analysis', group: 'loop', track: 'security', status: 'success', duration: '22s' },
-  { id: 3, key: 'remediate', label: 'Remediate vulnerabilities', group: 'loop', track: 'security', status: 'success', duration: '2m 14s' },
-  { id: 4, key: 'pr', label: 'Create PR', group: 'loop', track: 'security', status: 'success', duration: '4s' },
+  { id: 2, key: 'remediate', label: 'Remediate vulnerabilities', group: 'loop', track: 'security', status: 'success', duration: '2m 14s' },
+  { id: 3, key: 'pr', label: 'Create PR', group: 'loop', track: 'security', status: 'success', duration: '4s' },
   { id: 4.5, key: 'merge', label: 'Merge gate', group: 'loop', track: 'security', status: 'active', gate: true },
   { id: 4.6, key: 'postmerge', label: 'Post-merge actions', group: 'loop', track: 'security', status: 'pending' },
   { id: 6, key: 'qa', label: 'Q/A context gathering', track: 'deployment', status: 'pending', gate: true },

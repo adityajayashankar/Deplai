@@ -1635,41 +1635,6 @@ async def health_check():
             "detail": str(exc),
         })
 
-    # Neo4j availability (optional for remediation flow; KG can be skipped)
-    neo4j_uri = os.environ.get("NEO4J_URI", "").strip()
-    neo4j_user = os.environ.get("NEO4J_USER", "").strip()
-    neo4j_password = os.environ.get("NEO4J_PASSWORD", "").strip()
-    if not neo4j_uri:
-        checks.append({
-            "name": "neo4j",
-            "state": "down",
-            "detail": "NEO4J_URI is not configured",
-        })
-    else:
-        try:
-            from neo4j import GraphDatabase  # type: ignore
-
-            driver = GraphDatabase.driver(
-                neo4j_uri,
-                auth=(neo4j_user, neo4j_password),
-                connection_timeout=3,
-            )
-            try:
-                driver.verify_connectivity()
-            finally:
-                driver.close()
-            checks.append({
-                "name": "neo4j",
-                "state": "healthy",
-                "detail": f"Connected to {neo4j_uri}",
-            })
-        except Exception as exc:
-            checks.append({
-                "name": "neo4j",
-                "state": "down",
-                "detail": str(exc),
-            })
-
     has_down = any(c.get("state") == "down" for c in checks)
     has_degraded = any(c.get("state") == "degraded" for c in checks)
     status = "down" if has_down else ("degraded" if has_degraded else "healthy")

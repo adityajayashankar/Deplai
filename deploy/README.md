@@ -1,8 +1,8 @@
 # Production Docker deployment
 
 This bundle packages the production Connector UI/API, Agentic Layer, Terraform
-Agent, remediation pipeline, KG agent, Diagram/Cost agent, customization
-backend, MySQL, Neo4j, Qdrant, and Caddy TLS proxy. The standalone design
+Agent, remediation pipeline, Diagram/Cost agent, customization backend, MySQL,
+and Caddy TLS proxy. The standalone design
 experiments elsewhere in the repository are not application runtime services
 and are intentionally not started.
 
@@ -50,8 +50,8 @@ docker compose --env-file deploy/.env -f docker-compose.production.yml ps
 docker compose --env-file deploy/.env -f docker-compose.production.yml logs -f caddy connector agentic-layer
 ```
 
-Only Caddy publishes host ports. MySQL, Neo4j, Qdrant, the customization
-backend, and the Agentic Layer have no host port mappings.
+Only Caddy publishes host ports. MySQL, the customization backend, and the
+Agentic Layer have no host port mappings.
 
 Verify:
 
@@ -66,8 +66,8 @@ explicit migration before rolling out new application code.
 
 ## 4. Operate safely
 
-Create encrypted off-server backups of `mysql_data`, `neo4j_data`,
-`qdrant_data`, `agentic_runtime`, `github_repos`, `local_projects`, and
+Create encrypted off-server backups of `mysql_data`, `agentic_runtime`,
+`github_repos`, `local_projects`, and
 `customization_state`. Test restoring a MySQL backup regularly. Monitor disk
 usage: cloned repositories, scanner databases, Docker images, and Terraform
 workspaces can grow quickly.

@@ -15,7 +15,6 @@ const MESSAGE_STYLES: Record<string, { color: string; prefix: string }> = {
   phase:            { color: 'text-blue-400 font-bold',           prefix: ''            },
   error:            { color: 'text-red-500',                      prefix: '[ERR]'       },
   info:             { color: 'text-gray-300',                     prefix: '[*]'         },
-  kg_phase:         { color: 'text-violet-400 font-medium',       prefix: '[KG]'        },
   planner_phase:    { color: 'text-orange-400 font-medium',       prefix: '[PLANNER]'   },
   supervisor_phase: { color: 'text-sky-400 font-bold',            prefix: '[SUPERVISOR]'},
   proposer_phase:   { color: 'text-amber-400 font-medium',        prefix: '[PROPOSER]'  },
@@ -126,14 +125,7 @@ export default function MonitorPopup({ projectId, isOpen, onClose }: MonitorPopu
           </div>
         )}
         {messages.map((msg, i) => {
-          // kg_result and changed_files carry raw JSON — show a friendly summary line instead
-          if (msg.type === 'kg_result') {
-            return (
-              <div key={i} className="flex gap-2">
-                <span className="text-violet-300">[KG] Knowledge context captured — enriching remediation prompt</span>
-              </div>
-            );
-          }
+          // changed_files carries raw JSON — show a friendly summary line instead
           if (msg.type === 'changed_files') {
             let count = 0;
             try { count = JSON.parse(msg.content).length; } catch { /* ignore */ }

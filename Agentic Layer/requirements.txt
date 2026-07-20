@@ -22,13 +22,10 @@ langchain-community>=0.3.0
 langchain-huggingface>=0.1.0
 langsmith>=0.2.0
 
-# KGagent LLM backends
+# LLM backends
 groq>=0.11.0
 openai>=1.40.0
 
-# KGagent knowledge graph + vector store
-neo4j>=5.0.0
-qdrant-client>=1.9.0
 sentence-transformers>=3.0.0
 
 # Utility

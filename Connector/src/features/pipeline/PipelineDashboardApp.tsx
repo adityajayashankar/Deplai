@@ -88,7 +88,6 @@ export default function PipelineDashboardApp() {
   const [rerunInProgress, setRerunInProgress] = useState<boolean>(false);
   const [deploySucceeded, setDeploySucceeded] = useState<boolean>(false);
   const [deployRuntimeState, setDeployRuntimeState] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
-  const [kgPhase, setKgPhase] = useState<'idle' | 'running' | 'completed' | 'skipped'>('idle');
   const [runOptions, setRunOptions] = useState<PipelineRunOptions>(() => {
     if (typeof window === 'undefined') {
       return { autopilot: true, skipRemediation: false, skipScan: false };
@@ -121,11 +120,6 @@ export default function PipelineDashboardApp() {
     () => Array.from(new Set(projects.filter((project) => project.type === 'github').map((project) => project.source).filter(Boolean))) as string[],
     [projects],
   );
-  const neo4jConnected = useMemo(
-    () => healthChecks.find((c) => c.name === 'neo4j')?.state === 'healthy',
-    [healthChecks],
-  );
-
   const remediation = selectedProjectId
     ? getRemediationState(selectedProjectId)
     : { state: 'idle' as const, messages: [] as Array<{ type: string; content: string; timestamp?: string }> };
@@ -421,31 +415,21 @@ export default function PipelineDashboardApp() {
     if (navigateOnDone) {
       if (finalScan === 'found') {
         if (skipRemediation) {
-          setKgPhase('idle');
           setPostMergeDone(true);
           setCurrent('qa');
           return finalScan;
         }
         setCurrent('scan');
-        if (neo4jConnected) {
-          setKgPhase('running');
-          setCurrent('kg');
-          await sleep(1200);
-          setKgPhase('completed');
-        } else {
-          setKgPhase('skipped');
-        }
         setCurrent('remediate');
       }
       if (finalScan === 'not_found') {
-        setKgPhase('idle');
         setPostMergeDone(true);
         setCurrent('qa');
       }
     }
 
     return finalScan;
-  }, [neo4jConnected, pollScanUntilFinished, refreshRuntime, selectedProject, startScan]);
+  }, [pollScanUntilFinished, refreshRuntime, selectedProject, startScan]);
 
   const runInitialScan = useCallback(async () => {
     if (!selectedProject) return;
@@ -456,14 +440,12 @@ export default function PipelineDashboardApp() {
       setMergeConfirmed(false);
       setPostMergeDone(false);
       setPrUrl(null);
-      setKgPhase('idle');
 
       const healthRes = await fetch('/api/pipeline/health', { cache: 'no-store' });
       if (!healthRes.ok) throw new Error('Preflight check failed.');
 
       if (normalizedRunOptions.skipScan) {
         setPostMergeDone(true);
-        setKgPhase('skipped');
         setCurrent('qa');
         setRunnerState('idle');
         return;
@@ -615,32 +597,6 @@ export default function PipelineDashboardApp() {
       }
     }
 
-    const kg = base.find((s) => s.key === 'kg');
-    const hasKgEvent = remediation.messages.some((m) => m.type === 'kg_result');
-    if (kg) {
-      if (!scanInitiated) {
-        kg.status = 'pending';
-      } else if (kgPhase === 'running') {
-        kg.status = 'running';
-        kg.duration = 'analyzing';
-      } else if (kgPhase === 'completed') {
-        kg.status = 'success';
-        kg.duration = 'enriched';
-      } else if (kgPhase === 'skipped') {
-        kg.status = 'success';
-        kg.duration = 'skipped (neo4j offline)';
-      } else if (hasKgEvent) {
-        kg.status = 'success';
-        kg.duration = 'enriched';
-      } else if (!neo4jConnected && remediation.state !== 'idle') {
-        kg.status = 'success';
-        kg.duration = 'skipped (neo4j offline)';
-      } else if (remediation.state === 'running') {
-        kg.status = 'running';
-        kg.duration = 'analyzing';
-      }
-    }
-
     const remediate = base.find((s) => s.key === 'remediate');
     if (remediate) {
       if (!scanInitiated) {
@@ -740,7 +696,7 @@ export default function PipelineDashboardApp() {
     }
 
     return base;
-  }, [costEstimate.totalMonthlyUsd, current, deployRuntimeState, deploySucceeded, healthChecks, kgPhase, mergeConfirmed, neo4jConnected, noRemediationChanges, postMergeDone, prUrl, remediation.messages, remediation.state, scanRuntimeState, runnerState, scanStatus]);
+  }, [costEstimate.totalMonthlyUsd, current, deployRuntimeState, deploySucceeded, healthChecks, mergeConfirmed, noRemediationChanges, postMergeDone, prUrl, remediation.messages, remediation.state, scanRuntimeState, runnerState, scanStatus]);
 
   useEffect(() => {
     const timerId = window.setTimeout(() => {
@@ -783,7 +739,6 @@ export default function PipelineDashboardApp() {
       case 'preflight':
         return <PreflightPage checks={healthChecks} />;
       case 'scan':
-      case 'kg':
         return <ScanPage scanStatus={scanStatus} scanResults={scanResults} />;
       case 'remediate':
       case 'pr':

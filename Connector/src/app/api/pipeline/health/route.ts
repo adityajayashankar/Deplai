@@ -15,8 +15,6 @@ interface AgenticHealthPayload {
   checks?: Array<{ name?: string; state?: string; detail?: string }>;
 }
 
-const OPTIONAL_UPSTREAM_CHECKS = new Set(['neo4j']);
-
 async function checkAgenticHealth(): Promise<{ check: HealthCheck; upstreamChecks: HealthCheck[]; reachable: boolean }> {
   try {
     const res = await fetch(`${AGENTIC_URL}/health`, {
@@ -44,12 +42,9 @@ async function checkAgenticHealth(): Promise<{ check: HealthCheck; upstreamCheck
           const normalizedState: HealthState = (check.state === 'healthy' || check.state === 'degraded' || check.state === 'down')
             ? check.state
             : 'degraded';
-          const state: HealthState = normalizedState === 'down' && OPTIONAL_UPSTREAM_CHECKS.has(name)
-            ? 'degraded'
-            : normalizedState;
           return {
             name,
-            state,
+            state: normalizedState,
             detail: String(check.detail || ''),
           };
         })
@@ -91,7 +86,6 @@ export async function GET() {
     checks.find((c) => c.name === name)?.state;
   const agenticAvailable = agenticHealth.reachable;
   const dockerUp = checks.find(c => c.name === 'docker_engine')?.state === 'healthy';
-  const neo4jUp = upstreamState('neo4j') === 'healthy';
   const architectureEngineUp = upstreamState('architecture') !== 'down';
   const costEngineUp = upstreamState('cost') !== 'down';
   const terraformEngineUp = upstreamState('terraform') !== 'down';
@@ -105,12 +99,7 @@ export async function GET() {
     {
       name: 'remediation',
       state: agenticAvailable && dockerUp ? 'healthy' : 'down',
-      detail: agenticAvailable && dockerUp ? (neo4jUp ? 'Ready' : 'Ready (KG will be skipped - Neo4j offline)') : !agenticAvailable ? 'Agentic layer unavailable' : 'Docker engine unavailable',
-    },
-    {
-      name: 'kg_agent',
-      state: neo4jUp ? 'healthy' : 'degraded',
-      detail: neo4jUp ? 'Neo4j connected' : 'Neo4j offline - remediation will continue without KG enrichment',
+      detail: agenticAvailable && dockerUp ? 'Ready' : !agenticAvailable ? 'Agentic layer unavailable' : 'Docker engine unavailable',
     },
     { name: 'architecture', state: agenticAvailable && architectureEngineUp ? 'healthy' : 'down', detail: agenticAvailable && architectureEngineUp ? 'Ready' : 'Agentic layer unavailable' },
     { name: 'diagram', state: agenticAvailable && diagramEngineUp ? 'healthy' : 'down', detail: agenticAvailable && diagramEngineUp ? 'Ready' : 'Architecture JSON renderer offline' },
