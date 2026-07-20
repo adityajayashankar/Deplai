@@ -1,9 +1,8 @@
 {
-    auto_https off
     admin off
 }
 
-http://{$APP_DOMAIN} {
+{$APP_DOMAIN} {
     encode zstd gzip
 
     header {
