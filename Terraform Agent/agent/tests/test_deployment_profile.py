@@ -71,3 +71,80 @@ class DeploymentProfileTests(unittest.TestCase):
         self.assertIn('name_prefix        = substr("${var.project_name}-${var.environment}-ec2-role-", 0, 38)', files["terraform/modules/iam/main.tf"])
         self.assertIn("from_port   = 80", files["terraform/modules/compute/main.tf"])
         self.assertIn("to_port     = 80", files["terraform/modules/compute/main.tf"])
+
+    def test_need_alb_and_eip_emit_registry_modules_and_endpoint_outputs(self) -> None:
+        files, warnings = build_profile_bundle(
+            payload={
+                "document_kind": "deployment_profile",
+                "workspace": "demo",
+                "project_name": "demo",
+                "environment": "dev",
+                "need_alb": True,
+                "need_eip": True,
+                "compute": {
+                    "strategy": "ec2",
+                    "services": [{"id": "app", "process_type": "web", "port": 3000}],
+                },
+                "networking": {
+                    "vpc": "new",
+                    "load_balancer": {"public": True, "type": "application", "enabled": True},
+                    "elastic_ip": {"enabled": True},
+                },
+                "runtime_config": {},
+                "consultant_decision": {
+                    "need_alb": True,
+                    "need_eip": True,
+                    "components": ["ec2", "alb", "eip"],
+                    "stack_config": {"alb": {"enabled": True}, "eip": {"enabled": True}},
+                },
+            },
+            provider_version="~> 5.0",
+            state_bucket="",
+            lock_table="",
+            aws_region="eu-north-1",
+            context_summary="alb-eip golden",
+            website_index_html="<html></html>",
+        )
+
+        compute_hcl = files["terraform/modules/compute/main.tf"]
+        outputs_hcl = files["terraform/outputs.tf"]
+        networking_hcl = files["terraform/modules/networking/main.tf"]
+
+        self.assertTrue(any("module alb" in line or 'module "alb"' in line for line in compute_hcl.splitlines()) or "module \"alb\"" in compute_hcl)
+        self.assertIn('module "alb"', compute_hcl)
+        self.assertIn("terraform-aws-modules/alb/aws", compute_hcl)
+        self.assertIn("terraform-aws-modules/ec2-instance/aws", compute_hcl)
+        self.assertIn("terraform-aws-modules/vpc/aws", networking_hcl)
+        self.assertIn('resource "aws_eip" "app"', compute_hcl)
+        self.assertIn('output "alb_dns_name"', outputs_hcl)
+        self.assertNotIn('output "alb_dns_name" {\n  value = null\n}', outputs_hcl)
+        self.assertIn('output "elastic_ip"', outputs_hcl)
+        self.assertIn('output "app_url"', outputs_hcl)
+        self.assertIn('output "instance_id"', outputs_hcl)
+        self.assertIn('output "vpc_id"', outputs_hcl)
+        self.assertIn('variable "enable_alb"', files["terraform/variables.tf"])
+        self.assertIn("default = true", files["terraform/variables.tf"])
+        self.assertIn("enable_alb                  = local.enable_alb", files["terraform/main.tf"])
+        self.assertTrue(any("ALB enabled" in item or "Elastic IP enabled" in item for item in warnings))
+
+    def test_alb_request_on_static_strategy_fails_clearly(self) -> None:
+        with self.assertRaises(ValueError) as raised:
+            build_profile_bundle(
+                payload={
+                    "document_kind": "deployment_profile",
+                    "workspace": "demo",
+                    "project_name": "demo",
+                    "environment": "dev",
+                    "need_alb": True,
+                    "compute": {"strategy": "s3_cloudfront", "services": []},
+                    "networking": {"load_balancer": {"public": True}},
+                    "runtime_config": {},
+                },
+                provider_version="~> 5.0",
+                state_bucket="",
+                lock_table="",
+                aws_region="eu-north-1",
+                context_summary="should fail",
+                website_index_html="<html></html>",
+            )
+        self.assertIn("Refusing silent EC2-only downgrade", str(raised.exception))

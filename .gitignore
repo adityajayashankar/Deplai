@@ -79,6 +79,7 @@ Terraform-generation-plan.md
 Customization Agent/SubSpace-*
 Customization Agent/CulturePlace-main/frontend/.env.local
 Customization Agent/tenant_builder_app/backend/logs/customization.log
+Customization Agent/tenant_builder_app/backend/logs/previews/
 Customization Agent/tenant_builder_app/backend/tenants/
 
 # KGagent data and config files — needed as Neo4j fallback and for agent config

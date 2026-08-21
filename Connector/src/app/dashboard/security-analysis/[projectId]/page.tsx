@@ -854,6 +854,8 @@ export default function SecurityAnalysisPage() {
   const searchParams = useSearchParams();
   const projectId = params.projectId as string;
   const runAll = searchParams.get('runAll') === '1';
+  const customizationSnapshotId = (searchParams.get('customizationSnapshotId') || '').trim();
+  const tenantId = (searchParams.get('tenantId') || '').trim();
 
   const {
     getScanState,
@@ -1197,8 +1199,17 @@ export default function SecurityAnalysisPage() {
 
   const hasScanOutcome = useMemo(() => vulnStatus !== 'not_initiated' || scanState === 'completed' || results !== null || loadingResults, [loadingResults, results, scanState, vulnStatus]);
   const deploymentPath = useMemo(
-    () => `/dashboard/deploy?projectId=${encodeURIComponent(projectId)}&entry=run-all`,
-    [projectId],
+    () => {
+      const query = new URLSearchParams({ projectId, entry: 'run-all' });
+      if (customizationSnapshotId) {
+        query.set('customizationSnapshotId', customizationSnapshotId);
+      }
+      if (tenantId) {
+        query.set('tenantId', tenantId);
+      }
+      return `/dashboard/deploy?${query.toString()}`;
+    },
+    [customizationSnapshotId, projectId, tenantId],
   );
   const canProceedToDeployment = useMemo(
     () => hasScanOutcome && !loading && !loadingResults && scanState !== 'running',
@@ -1327,6 +1338,8 @@ export default function SecurityAnalysisPage() {
           owner: projectMeta.owner,
           repo: projectMeta.repo,
           scan_type: 'all',
+          customization_snapshot_id: customizationSnapshotId || undefined,
+          tenant_id: tenantId || undefined,
         }),
       });
 
@@ -1353,6 +1366,7 @@ export default function SecurityAnalysisPage() {
       setRerunInProgress(false);
     }
   }, [
+    customizationSnapshotId,
     loadingProject,
     projectAuthError,
     projectId,
@@ -1362,6 +1376,7 @@ export default function SecurityAnalysisPage() {
     resetRemediation,
     scanState,
     startScan,
+    tenantId,
   ]);
 
   const handleStartRemediation = useCallback(async () => {

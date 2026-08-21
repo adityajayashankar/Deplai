@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from copy import deepcopy
+from datetime import datetime, timezone
 from math import ceil
 from pathlib import Path
 from typing import Any, Callable
@@ -75,6 +76,62 @@ def normalize_terraform_renderer(value: Any) -> str:
     if renderer in {"auto", "deplai_deterministic", "deplai_ec2_app"}:
         return renderer
     return "auto"
+
+
+def _compute_strategy_from_profile(profile_payload: dict[str, Any] | None) -> str:
+    payload = profile_payload if isinstance(profile_payload, dict) else {}
+    compute = payload.get("compute") if isinstance(payload.get("compute"), dict) else {}
+    strategy = str(compute.get("strategy") or payload.get("compute_strategy") or "").strip().lower()
+    if strategy in {"ec2", "ec2-instance"}:
+        return "ec2"
+    if strategy in {"s3_cloudfront", "cloudfront", "s3cloudfront"}:
+        return "s3_cloudfront"
+    if strategy in {"ecs", "ecs_fargate", "fargate"}:
+        return "ecs_fargate"
+    return strategy
+
+
+def _should_auto_select_ec2_app_renderer(
+    *,
+    terraform_renderer: str,
+    profile_payload: dict[str, Any] | None,
+    source_root: str,
+    source_root_candidates: list[str] | None,
+    project_name: str,
+    repository_context_json: dict[str, Any] | None,
+    user_answers_json: dict[str, Any] | None,
+) -> tuple[bool, Any | None]:
+    """Prefer the clone/install/build/start EC2 path for real app repos under auto.
+
+    The enterprise/deterministic bundle provisions ALB/EIP/RDS correctly but only
+    bootstraps a static HTML shell. Auto should route runnable Node/Python/Docker apps to
+    deplai_ec2_app so the cloned repo is actually installed and started.
+    """
+    requested = normalize_terraform_renderer(terraform_renderer)
+    if requested == "deplai_ec2_app":
+        return True, None
+    if requested != "auto":
+        return False, None
+    strategy = _compute_strategy_from_profile(profile_payload)
+    if strategy and strategy != "ec2":
+        return False, None
+    try:
+        package = build_deployment_package(
+            source_root=source_root,
+            source_roots=source_root_candidates or [],
+            project_name=project_name,
+            repository_context=repository_context_json or {},
+            deployment_profile=profile_payload or {},
+            user_answers=user_answers_json or {},
+        )
+    except Exception:
+        return False, None
+    kind = str(package.app_kind or "").strip().lower()
+    if kind in {"node", "python", "docker", "go", "java", "dotnet", "php", "ruby", "rust"}:
+        return True, package
+    if kind == "static" and str(package.selected_root or "") != "generated-placeholder":
+        return True, package
+    return False, None
 
 
 SKIP_DIRS = {
@@ -1174,6 +1231,150 @@ def _canonical_rds_engine(value: Any) -> str:
     return "postgres"
 
 
+def _profile_has_required_fields(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    required = ("workspace", "project_name", "application_type", "environment", "compute", "networking")
+    if any(not str(payload.get(key) or "").strip() and key not in {"compute", "networking"} for key in required[:4]):
+        return False
+    if not isinstance(payload.get("compute"), dict) or not str((_as_record(payload.get("compute")).get("strategy") or "")).strip():
+        return False
+    if not isinstance(payload.get("networking"), dict):
+        return False
+    return True
+
+
+def _synthesize_deployment_profile_document(
+    *,
+    source: dict[str, Any] | None,
+    project_name: str,
+    workspace: str,
+    aws_region: str,
+    repository_context_json: dict[str, Any] | None,
+    consultant_decision_json: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build a minimal valid deployment_profile when UI only has consultant decision context."""
+    base = _as_record(source)
+    repo = _as_record(repository_context_json)
+    decision = _as_record(consultant_decision_json)
+    stack = _as_record(decision.get("stack_config"))
+    components = [
+        str(item or "").strip().lower()
+        for item in (decision.get("components") or [])
+        if str(item or "").strip()
+    ]
+    language = _as_record(repo.get("language"))
+    runtime = str(language.get("runtime") or language.get("primary") or "node").strip() or "node"
+
+    strategy = "ec2"
+    if any(token in components for token in ("ecs", "ecs_fargate", "fargate")):
+        strategy = "ecs_fargate"
+    elif any(token in components for token in ("s3_cloudfront", "cloudfront", "static")):
+        strategy = "s3_cloudfront"
+    elif str(_as_record(base.get("compute")).get("strategy") or "").strip():
+        strategy = str(_as_record(base.get("compute")).get("strategy")).strip()
+
+    ec2_cfg = _as_record(stack.get("ec2") or stack.get("ec2-instance"))
+    app_port = _decision_int(ec2_cfg.get("app_port")) or 3000
+    need_alb = ("alb" in components) or (_decision_bool(decision.get("need_alb")) is True)
+    need_eip = ("eip" in components) or (_decision_bool(decision.get("need_eip")) is True)
+
+    compute = _as_record(base.get("compute"))
+    if not compute or not str(compute.get("strategy") or "").strip():
+        compute = {
+            "strategy": strategy,
+            "services": [] if strategy == "s3_cloudfront" else [{
+                "id": "app",
+                "process_type": "web",
+                "cpu": 512,
+                "memory": 1024,
+                "port": app_port,
+                "desired_count": 1,
+                "autoscaling": {"min_count": 1, "max_count": 2, "target_cpu_utilization": 60},
+            }],
+        }
+    else:
+        compute = {**compute, "strategy": str(compute.get("strategy") or strategy)}
+
+    networking = _as_record(base.get("networking"))
+    if not networking:
+        networking = {
+            "vpc": "new",
+            "layout": "private_subnets",
+            "nat_gateway": strategy != "s3_cloudfront",
+            "load_balancer": {"public": True, "scheme": "internet-facing"} if need_alb else {},
+            "elastic_ip": {"enabled": True} if need_eip else {},
+            "ports_exposed": [443, 80, app_port] if strategy != "s3_cloudfront" else [443, 80],
+        }
+    else:
+        vpc_value = networking.get("vpc")
+        if isinstance(vpc_value, bool):
+            networking["vpc"] = "new" if vpc_value else "existing"
+        elif not str(vpc_value or "").strip():
+            networking["vpc"] = "new"
+        else:
+            networking["vpc"] = str(vpc_value).strip()
+        if "layout" not in networking:
+            networking["layout"] = "private_subnets"
+
+    data_layer = _as_records(base.get("data_layer"))
+    if not data_layer:
+        rds_cfg = _as_record(stack.get("rds"))
+        redis_cfg = _as_record(stack.get("elasticache") or stack.get("redis"))
+        if rds_cfg or any(token in components for token in ("rds", "postgres", "postgresql", "mysql")):
+            data_layer.append({
+                "id": "primary_db",
+                "type": "postgresql",
+                "engine": _canonical_rds_engine(rds_cfg.get("engine")),
+                "instance_class": str(rds_cfg.get("instance_class") or "db.t3.micro"),
+                "multi_az": bool(rds_cfg.get("multi_az")),
+                "storage_gb": _decision_int(rds_cfg.get("allocated_storage")) or 20,
+            })
+        if redis_cfg or any(token in components for token in ("elasticache", "redis")):
+            data_layer.append({
+                "id": "cache",
+                "type": "redis",
+                "node_type": str(redis_cfg.get("node_type") or "cache.t4g.micro"),
+                "purpose": ["cache"],
+            })
+
+    project = str(base.get("project_name") or project_name or repo.get("project_name") or "project").strip() or "project"
+    workspace_name = str(base.get("workspace") or workspace or repo.get("workspace") or "deploy-workspace").strip() or "deploy-workspace"
+    environment = str(base.get("environment") or "prod").strip() or "prod"
+    application_type = str(base.get("application_type") or ("static_site" if strategy == "s3_cloudfront" else runtime)).strip() or runtime
+
+    warnings = _string_list(base.get("warnings"))
+    warnings.append(
+        f"Synthesized deployment profile for {project} from consultant decision "
+        f"(region={aws_region or 'eu-north-1'}, strategy={compute.get('strategy')})."
+    )
+
+    return {
+        "document_kind": "deployment_profile",
+        "profile_version": str(base.get("profile_version") or "consultant_seed_v1"),
+        "generated_at": str(base.get("generated_at") or datetime.now(timezone.utc).isoformat()),
+        "workspace": workspace_name,
+        "project_name": project,
+        "provider": "aws",
+        "application_type": application_type,
+        "environment": environment,
+        "compute": compute,
+        "networking": networking,
+        "data_layer": data_layer,
+        "build_pipeline": _as_record(base.get("build_pipeline")),
+        "runtime_config": _as_record(base.get("runtime_config")) or {
+            "required_secrets": [],
+            "config_values": ["AWS_REGION"],
+            "secrets_manager_prefix": f"/{project}/{environment}",
+        },
+        "dns_and_tls": _as_record(base.get("dns_and_tls")),
+        "operational": _as_record(base.get("operational")),
+        "compliance": _as_record(base.get("compliance")),
+        "warnings": warnings,
+        "aws_region": str(aws_region or base.get("aws_region") or "eu-north-1"),
+    }
+
+
 def _apply_consultant_decision_to_profile(
     *,
     profile_payload: dict[str, Any],
@@ -1188,8 +1389,22 @@ def _apply_consultant_decision_to_profile(
         return profile_payload
 
     stack_config = _as_record(decision.get("stack_config"))
+    try:
+        from terraform_agent.agent.internal_registry import filter_allowlisted_edits
+
+        if stack_config.get("ec2") or stack_config.get("ec2-instance"):
+            raw_ec2 = _as_record(stack_config.get("ec2") or stack_config.get("ec2-instance"))
+            stack_config["ec2"] = filter_allowlisted_edits("ec2_instance", raw_ec2)
+        if stack_config.get("rds"):
+            stack_config["rds"] = filter_allowlisted_edits("rds", _as_record(stack_config.get("rds")))
+        if stack_config.get("elasticache") or stack_config.get("redis"):
+            raw_cache = _as_record(stack_config.get("elasticache") or stack_config.get("redis"))
+            stack_config["elasticache"] = filter_allowlisted_edits("elasticache", raw_cache)
+    except Exception:
+        pass
     components = [str(item or "").strip().lower() for item in (decision.get("components") or []) if str(item or "").strip()]
-    if not stack_config and not components:
+    has_endpoint_flags = _decision_bool(decision.get("need_alb")) is True or _decision_bool(decision.get("need_eip")) is True
+    if not stack_config and not components and not has_endpoint_flags:
         return profile_payload
 
     enriched = deepcopy(profile_payload)
@@ -1324,6 +1539,62 @@ def _apply_consultant_decision_to_profile(
         if site:
             enriched["static_site"] = site
             applied.append("s3_cloudfront")
+
+    # Phase 2: fold need_alb / need_eip (and networking) into the profile so
+    # enterprise_bundle / build_profile_bundle emit ALB+EIP HCL instead of silent EC2-only.
+    networking = _as_record(enriched.get("networking"))
+    networking_cfg = _as_record(stack_config.get("networking"))
+    alb_cfg = _as_record(stack_config.get("alb"))
+    eip_cfg = _as_record(stack_config.get("eip"))
+    need_alb = _decision_bool(decision.get("need_alb"))
+    if need_alb is None:
+        need_alb = bool(alb_cfg) or any(token in components for token in ("alb", "load_balancer", "application_load_balancer"))
+    need_eip = _decision_bool(decision.get("need_eip"))
+    if need_eip is None:
+        need_eip = bool(eip_cfg) or any(token in components for token in ("eip", "elastic_ip", "elasticip"))
+
+    if networking_cfg:
+        networking = {**networking, **networking_cfg}
+    # Profile contract requires networking.vpc as a string ("new" | vpc-id), never a bool.
+    vpc_value = networking.get("vpc")
+    if isinstance(vpc_value, bool):
+        networking["vpc"] = "new" if vpc_value else "existing"
+    elif vpc_value is None or str(vpc_value).strip() == "":
+        networking["vpc"] = "new"
+    else:
+        networking["vpc"] = str(vpc_value).strip()
+    if need_alb:
+        load_balancer = _as_record(networking.get("load_balancer"))
+        load_balancer.update(
+            {
+                "public": True,
+                "type": str(alb_cfg.get("type") or load_balancer.get("type") or "application"),
+                "enabled": True,
+                **{k: v for k, v in alb_cfg.items() if k not in {"enabled"}},
+            }
+        )
+        networking["load_balancer"] = load_balancer
+        if not networking.get("ports_exposed"):
+            networking["ports_exposed"] = [80, 443]
+        enriched["need_alb"] = True
+        applied.append("alb")
+    elif authoritative and "alb" not in components and not alb_cfg:
+        enriched["need_alb"] = False
+
+    if need_eip:
+        networking["elastic_ip"] = {
+            **_as_record(networking.get("elastic_ip")),
+            **eip_cfg,
+            "enabled": True,
+        }
+        enriched["need_eip"] = True
+        applied.append("eip")
+    elif authoritative and "eip" not in components and not eip_cfg:
+        enriched["need_eip"] = False
+
+    if networking:
+        enriched["networking"] = networking
+    enriched["consultant_decision"] = decision
 
     if applied:
         _append_profile_warning(
@@ -2196,12 +2467,30 @@ variable "create_nat_gateway" { type = bool }
 variable "load_balancer_enabled" { type = bool }
 variable "ports_exposed" { type = list(number) }
 variable "common_tags" { type = map(string) }
+variable "use_default_vpc" {
+  type    = bool
+  default = true
+}
 """
     networking_main_tf = """data "aws_availability_zones" "available" {
   state = "available"
 }
 
+data "aws_vpc" "default" {
+  count   = var.use_default_vpc ? 1 : 0
+  default = true
+}
+
+data "aws_subnets" "default" {
+  count = var.use_default_vpc ? 1 : 0
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default[0].id]
+  }
+}
+
 resource "aws_vpc" "main" {
+  count                = var.use_default_vpc ? 0 : 1
   cidr_block           = "10.60.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -2209,77 +2498,87 @@ resource "aws_vpc" "main" {
 }
 
 resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
+  count  = var.use_default_vpc ? 0 : 1
+  vpc_id = aws_vpc.main[0].id
   tags   = merge(var.common_tags, { Name = "${var.project_name}-igw" })
 }
 
 resource "aws_subnet" "public" {
-  count                   = 2
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = cidrsubnet(aws_vpc.main.cidr_block, 8, count.index + 1)
+  count                   = var.use_default_vpc ? 0 : 2
+  vpc_id                  = aws_vpc.main[0].id
+  cidr_block              = cidrsubnet(aws_vpc.main[0].cidr_block, 8, count.index + 1)
   availability_zone       = data.aws_availability_zones.available.names[count.index]
   map_public_ip_on_launch = true
   tags                    = merge(var.common_tags, { Name = "${var.project_name}-public-${count.index + 1}" })
 }
 
 resource "aws_subnet" "private" {
-  count             = 2
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = cidrsubnet(aws_vpc.main.cidr_block, 8, count.index + 11)
+  count             = var.use_default_vpc ? 0 : 2
+  vpc_id            = aws_vpc.main[0].id
+  cidr_block        = cidrsubnet(aws_vpc.main[0].cidr_block, 8, count.index + 11)
   availability_zone = data.aws_availability_zones.available.names[count.index]
   tags              = merge(var.common_tags, { Name = "${var.project_name}-private-${count.index + 1}" })
 }
 
+locals {
+  selected_vpc_id = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
+  public_subnet_ids = var.use_default_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(2, length(data.aws_subnets.default[0].ids))) : aws_subnet.public[*].id
+  private_subnet_ids = var.use_default_vpc ? local.public_subnet_ids : aws_subnet.private[*].id
+}
+
 resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
+  count  = var.use_default_vpc ? 0 : 1
+  vpc_id = aws_vpc.main[0].id
   tags   = merge(var.common_tags, { Name = "${var.project_name}-public-rt" })
 }
 
 resource "aws_route" "public_internet" {
-  route_table_id         = aws_route_table.public.id
+  count                  = var.use_default_vpc ? 0 : 1
+  route_table_id         = aws_route_table.public[0].id
   destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.main.id
+  gateway_id             = aws_internet_gateway.main[0].id
 }
 
 resource "aws_route_table_association" "public" {
-  count          = 2
+  count          = var.use_default_vpc ? 0 : 2
   subnet_id      = aws_subnet.public[count.index].id
-  route_table_id = aws_route_table.public.id
+  route_table_id = aws_route_table.public[0].id
 }
 
 resource "aws_eip" "nat" {
-  count  = var.create_nat_gateway ? 1 : 0
+  count  = var.use_default_vpc || !var.create_nat_gateway ? 0 : 1
   domain = "vpc"
 }
 
 resource "aws_nat_gateway" "main" {
-  count         = var.create_nat_gateway ? 1 : 0
+  count         = var.use_default_vpc || !var.create_nat_gateway ? 0 : 1
   allocation_id = aws_eip.nat[0].id
   subnet_id     = aws_subnet.public[0].id
   tags          = merge(var.common_tags, { Name = "${var.project_name}-nat" })
 }
 
 resource "aws_route_table" "private" {
-  vpc_id = aws_vpc.main.id
+  count  = var.use_default_vpc ? 0 : 1
+  vpc_id = aws_vpc.main[0].id
   tags   = merge(var.common_tags, { Name = "${var.project_name}-private-rt" })
 }
 
 resource "aws_route" "private_nat" {
-  count                  = var.create_nat_gateway ? 1 : 0
-  route_table_id         = aws_route_table.private.id
+  count                  = var.use_default_vpc || !var.create_nat_gateway ? 0 : 1
+  route_table_id         = aws_route_table.private[0].id
   destination_cidr_block = "0.0.0.0/0"
   nat_gateway_id         = aws_nat_gateway.main[0].id
 }
 
 resource "aws_route_table_association" "private" {
-  count          = 2
+  count          = var.use_default_vpc ? 0 : 2
   subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = var.create_nat_gateway ? aws_route_table.private.id : aws_route_table.public.id
+  route_table_id = var.create_nat_gateway ? aws_route_table.private[0].id : aws_route_table.public[0].id
 }
 
 resource "aws_security_group" "alb" {
   name_prefix = "${var.project_name}-alb-"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = local.selected_vpc_id
 
   ingress {
     from_port   = 80
@@ -2298,7 +2597,7 @@ resource "aws_security_group" "alb" {
 
 resource "aws_security_group" "app" {
   name_prefix = "${var.project_name}-app-"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = local.selected_vpc_id
 
   dynamic "ingress" {
     for_each = toset([for port in var.ports_exposed : tostring(port)])
@@ -2320,7 +2619,7 @@ resource "aws_security_group" "app" {
 
 resource "aws_security_group" "db" {
   name_prefix = "${var.project_name}-db-"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = local.selected_vpc_id
 
   ingress {
     from_port       = 5432
@@ -2339,7 +2638,7 @@ resource "aws_security_group" "db" {
 
 resource "aws_security_group" "cache" {
   name_prefix = "${var.project_name}-cache-"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = local.selected_vpc_id
 
   ingress {
     from_port       = 6379
@@ -2356,9 +2655,9 @@ resource "aws_security_group" "cache" {
   }
 }
 """
-    networking_outputs_tf = """output "vpc_id" { value = aws_vpc.main.id }
-output "public_subnet_ids" { value = aws_subnet.public[*].id }
-output "private_subnet_ids" { value = aws_subnet.private[*].id }
+    networking_outputs_tf = """output "vpc_id" { value = local.selected_vpc_id }
+output "public_subnet_ids" { value = local.public_subnet_ids }
+output "private_subnet_ids" { value = local.private_subnet_ids }
 output "alb_security_group_id" { value = aws_security_group.alb.id }
 output "app_security_group_id" { value = aws_security_group.app.id }
 output "db_security_group_id" { value = aws_security_group.db.id }
@@ -3144,6 +3443,7 @@ def generate_terraform_bundle(
     source_root: str = "",
     source_root_candidates: list[str] | None = None,
     repository_url: str = "",
+    source_metadata_json: dict[str, Any] | None = None,
     llm_provider: str | None = None,
     llm_api_key: str | None = None,
     llm_model: str | None = None,
@@ -3181,7 +3481,29 @@ def generate_terraform_bundle(
     )
 
     approved_source = deployment_profile_json if isinstance(deployment_profile_json, dict) and deployment_profile_json else architecture_json
-    approved_profile = parse_deployment_profile(approved_source)
+    if not isinstance(approved_source, dict):
+        approved_source = {}
+    if not _profile_has_required_fields(approved_source):
+        approved_source = _synthesize_deployment_profile_document(
+            source=approved_source,
+            project_name=project_name,
+            workspace=workspace,
+            aws_region=aws_region,
+            repository_context_json=repository_context_json,
+            consultant_decision_json=consultant_decision_json,
+        )
+    try:
+        approved_profile = parse_deployment_profile(approved_source)
+    except Exception:
+        approved_source = _synthesize_deployment_profile_document(
+            source={},
+            project_name=project_name,
+            workspace=workspace,
+            aws_region=aws_region,
+            repository_context_json=repository_context_json,
+            consultant_decision_json=consultant_decision_json,
+        )
+        approved_profile = parse_deployment_profile(approved_source)
     approved_profile_payload = approved_profile.model_dump(exclude_none=True)
     approved_profile_payload = _enrich_deployment_profile_for_deterministic_rendering(
         profile_payload=approved_profile_payload,
@@ -3207,9 +3529,18 @@ def generate_terraform_bundle(
         profile_payload=approved_profile_payload,
     )
     raw_renderer = str(terraform_renderer or "").strip().lower()
-    if raw_renderer == "deplai_ec2_app":
+    use_ec2_app, prebuilt_package = _should_auto_select_ec2_app_renderer(
+        terraform_renderer=raw_renderer,
+        profile_payload=approved_profile_payload,
+        source_root=source_root,
+        source_root_candidates=source_root_candidates or [],
+        project_name=project_name,
+        repository_context_json=repository_context_json,
+        user_answers_json=user_answers_json,
+    )
+    if use_ec2_app:
         try:
-            deployment_package = build_deployment_package(
+            deployment_package = prebuilt_package or build_deployment_package(
                 source_root=source_root,
                 source_roots=source_root_candidates or [],
                 project_name=project_name,
@@ -3217,6 +3548,25 @@ def generate_terraform_bundle(
                 deployment_profile=approved_profile_payload,
                 user_answers=user_answers_json or {},
             )
+            if normalize_terraform_renderer(raw_renderer) == "auto":
+                _emit_worker(
+                    progress_callback,
+                    msg_type="info",
+                    content=(
+                        f"Auto-selected deplai_ec2_app for {deployment_package.app_kind} app "
+                        f"(install/build/start from repository), not the HTML-only enterprise shell."
+                    ),
+                    worker_id="deplai-ec2-app-renderer",
+                    worker_role="Deterministic EC2 App Renderer",
+                    worker_status="running",
+                    extra={
+                        "workspace": workspace,
+                        "app_kind": deployment_package.app_kind,
+                        "selected_root": deployment_package.selected_root,
+                        "build_command": deployment_package.build_command,
+                        "start_command": deployment_package.start_command,
+                    },
+                )
             rendered = render_ec2_app_bundle(
                 project_name=project_name,
                 aws_region=aws_region,
@@ -3230,42 +3580,59 @@ def generate_terraform_bundle(
             )
         except Exception as exc:
             reason = str(exc)
-            _emit_worker(
-                progress_callback,
-                msg_type="error",
-                content=f"EC2 app renderer blocked deployment: {reason}",
-                worker_id="deplai-ec2-app-renderer",
-                worker_role="Deterministic EC2 App Renderer",
-                worker_status="failed",
-                extra={"workspace": workspace, "aws_region": aws_region},
-            )
-            return {
-                "success": False,
-                "provider": "aws",
-                "project_name": project_name,
-                "run_id": None,
-                "workspace": workspace,
-                "warnings": [*preflight_warnings],
-                "error": reason,
-                "source": "deplai_ec2_app",
-                "requested_renderer": "deplai_ec2_app",
-                "actual_renderer": "deplai_ec2_app",
-                "unsupported_reason": reason if "unsupported_deployment_shape" in reason else "",
-                "renderer": "deplai_ec2_app",
-                "component_catalog_version": None,
-                "execution_kind": "terraform",
-                "llm_iac_calls": 0,
-                "llm_iac_disabled": True,
-                "decision_applied": bool(consultant_decision_json),
-                "decision_drift": [],
-                "details": {
-                    "execution_kind": "terraform",
+            if normalize_terraform_renderer(raw_renderer) == "auto":
+                _emit_worker(
+                    progress_callback,
+                    msg_type="info",
+                    content=(
+                        f"EC2 app renderer unavailable under auto ({reason}); "
+                        "falling back to deterministic enterprise bundle."
+                    ),
+                    worker_id="deplai-ec2-app-renderer",
+                    worker_role="Deterministic EC2 App Renderer",
+                    worker_status="completed",
+                    extra={"workspace": workspace, "aws_region": aws_region, "fallback": True},
+                )
+                use_ec2_app = False
+            else:
+                _emit_worker(
+                    progress_callback,
+                    msg_type="error",
+                    content=f"EC2 app renderer blocked deployment: {reason}",
+                    worker_id="deplai-ec2-app-renderer",
+                    worker_role="Deterministic EC2 App Renderer",
+                    worker_status="failed",
+                    extra={"workspace": workspace, "aws_region": aws_region},
+                )
+                return {
+                    "success": False,
+                    "provider": "aws",
+                    "project_name": project_name,
+                    "run_id": None,
+                    "workspace": workspace,
+                    "warnings": [*preflight_warnings],
+                    "error": reason,
+                    "source": "deplai_ec2_app",
+                    "requested_renderer": "deplai_ec2_app",
+                    "actual_renderer": "deplai_ec2_app",
+                    "unsupported_reason": reason if "unsupported_deployment_shape" in reason else "",
                     "renderer": "deplai_ec2_app",
-                    "source_root": source_root,
-                    "repository_url": repository_url,
-                },
-            }
+                    "component_catalog_version": None,
+                    "execution_kind": "terraform",
+                    "llm_iac_calls": 0,
+                    "llm_iac_disabled": True,
+                    "decision_applied": bool(consultant_decision_json),
+                    "decision_drift": [],
+                    "details": {
+                        "execution_kind": "terraform",
+                        "renderer": "deplai_ec2_app",
+                        "source_root": source_root,
+                        "repository_url": repository_url,
+                        "source_metadata": dict(source_metadata_json or {}),
+                    },
+                }
 
+    if use_ec2_app:
         package_manifest = rendered["package_manifest"]
         files = list(rendered["files"])
         run_id = save_terraform_run(
@@ -3278,6 +3645,7 @@ def generate_terraform_bundle(
                 "aws_region": aws_region,
                 "state_bucket": state_bucket or None,
                 "lock_table": lock_table or None,
+                "source_metadata": dict(source_metadata_json or {}),
             },
         )
         _emit_worker(
@@ -3308,7 +3676,7 @@ def generate_terraform_bundle(
             "files": files,
             "readme": next((str(item.get("content") or "") for item in files if item.get("path") == "README.md"), None),
             "source": "deplai_ec2_app",
-            "requested_renderer": "deplai_ec2_app",
+            "requested_renderer": normalize_terraform_renderer(raw_renderer),
             "actual_renderer": "deplai_ec2_app",
             "unsupported_reason": "",
             "renderer": "deplai_ec2_app",

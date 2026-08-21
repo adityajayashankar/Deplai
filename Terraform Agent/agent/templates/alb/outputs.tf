@@ -1,11 +1,15 @@
 output "lb_dns_name" {
-  value = aws_lb.main.dns_name
+  value = module.alb.dns_name
+}
+
+output "alb_dns_name" {
+  value = module.alb.dns_name
 }
 
 output "lb_arn" {
-  value = aws_lb.main.arn
+  value = module.alb.arn
 }
 
 output "target_group_arn" {
-  value = aws_lb_target_group.main.arn
+  value = try(module.alb.target_groups["app"].arn, null)
 }

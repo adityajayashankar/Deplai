@@ -34,61 +34,54 @@ locals {
   }
 }
 
-resource "aws_security_group" "alb" {
-  name        = "${var.alb_name}-alb-sg"
-  description = "DeplAI ALB access"
-  vpc_id      = data.aws_vpc.default.id
+module "alb" {
+  source  = "terraform-aws-modules/alb/aws"
+  version = "9.17.0"
 
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = local.tags
-}
-
-resource "aws_lb" "main" {
   name               = var.alb_name
   load_balancer_type = "application"
   internal           = var.internal
-  security_groups    = [aws_security_group.alb.id]
+  vpc_id             = data.aws_vpc.default.id
   subnets            = data.aws_subnets.default.ids
 
-  tags = local.tags
-}
-
-resource "aws_lb_target_group" "main" {
-  name        = "${var.alb_name}-tg"
-  port        = var.target_port
-  protocol    = "HTTP"
-  target_type = "ip"
-  vpc_id      = data.aws_vpc.default.id
-
-  health_check {
-    enabled = true
-    path    = "/"
+  security_group_ingress_rules = {
+    all_http = {
+      from_port   = 80
+      to_port     = 80
+      ip_protocol = "tcp"
+      cidr_ipv4   = "0.0.0.0/0"
+    }
   }
 
-  tags = local.tags
-}
+  security_group_egress_rules = {
+    all = {
+      ip_protocol = "-1"
+      cidr_ipv4   = "0.0.0.0/0"
+    }
+  }
 
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = 80
-  protocol          = "HTTP"
+  listeners = {
+    http = {
+      port     = 80
+      protocol = "HTTP"
+      forward = {
+        target_group_key = "app"
+      }
+    }
+  }
 
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.main.arn
+  target_groups = {
+    app = {
+      name_prefix      = "app-"
+      protocol         = "HTTP"
+      port             = var.target_port
+      target_type      = "ip"
+      protocol_version = "HTTP1"
+      health_check = {
+        enabled = true
+        path    = "/"
+      }
+    }
   }
 
   tags = local.tags

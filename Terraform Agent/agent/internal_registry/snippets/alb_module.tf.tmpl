@@ -1,0 +1,44 @@
+module "alb" {
+  count   = var.enabled && var.enable_alb ? 1 : 0
+  source  = "{{ source }}"
+  version = "{{ version }}"
+
+  name = substr(replace("${var.project_name}-${var.environment}-${substr(md5(var.vpc_id), 0, 6)}", "_", "-"), 0, 32)
+  load_balancer_type = "application"
+  vpc_id             = var.vpc_id
+  subnets            = var.public_subnet_ids
+  internal           = false
+
+  security_groups       = [aws_security_group.alb[0].id]
+  create_security_group = false
+
+  listeners = {
+    http = {
+      port     = 80
+      protocol = "HTTP"
+      forward = {
+        target_group_key = "app"
+      }
+    }
+  }
+
+  target_groups = {
+    app = {
+      name_prefix      = "app-"
+      protocol         = "HTTP"
+      port             = var.app_port
+      target_type      = "instance"
+      protocol_version = "HTTP1"
+      target_id        = module.ec2[0].id
+      health_check = {
+        enabled             = true
+        path                = "{{ health_path }}"
+        matcher             = "200-399"
+        healthy_threshold   = 2
+        unhealthy_threshold = 3
+      }
+    }
+  }
+
+  tags = var.common_tags
+}

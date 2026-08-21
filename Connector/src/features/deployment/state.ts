@@ -138,6 +138,12 @@ export interface InfraConsultantDecision {
   stack_config: Record<string, unknown>;
   outputs_to_capture: string[];
   consultant_notes?: string[];
+  need_alb?: boolean;
+  need_eip?: boolean;
+  region?: string;
+  provider?: string;
+  open_questions?: string[];
+  intakes?: Record<string, unknown>;
 }
 
 export interface InfraConsultantState {
@@ -148,6 +154,30 @@ export interface InfraConsultantState {
   decision: InfraConsultantDecision | null;
   summary: string;
   confirmed: boolean;
+  /** True when the consultant finished intake and the decision is ready to approve. */
+  ready?: boolean;
+  budget_cap_usd?: number;
+  selected_tier?: 'baseline' | 'recommended' | 'resilient';
+  upgrade_suggestions?: Array<{
+    extra_monthly_usd?: number;
+    title?: string;
+    plain_benefit?: string;
+    unlocks?: string[];
+    tier?: string;
+  }>;
+  budget_gate?: {
+    cap_usd?: number;
+    total_usd?: number;
+    percent_used?: number;
+    status?: string;
+    gap_usd?: number;
+  };
+  advisor_cost_estimate?: {
+    subtotal_monthly_usd?: number;
+    currency?: string;
+    line_items?: unknown[];
+  };
+  requirements?: Record<string, string>;
 }
 
 export interface DeployApiResult {
@@ -191,10 +221,19 @@ export interface DeployApiResult {
   network?: {
     vpc_id?: string | null;
     subnet_id?: string | null;
+    alb_dns_name?: string | null;
+    alb_url?: string | null;
+    elastic_ip?: string | null;
+    eip_public_ip?: string | null;
   } | null;
   app_url?: string | null;
+  alb_url?: string | null;
+  alb_dns_name?: string | null;
+  elastic_ip?: string | null;
+  customization_source?: SavedIacMeta['source_metadata'];
   cdn?: {
     cloudfront_url?: string | null;
+    app_url?: string | null;
   } | null;
   error?: string;
 }
@@ -256,6 +295,17 @@ export interface SavedIacMeta {
   unsupported_reason?: string;
   deployment_package_id?: string;
   decision_applied?: boolean;
+  source_metadata?: {
+    kind?: string;
+    project_id?: string;
+    tenant_id?: string;
+    snapshot_id?: string;
+    snapshot_path?: string;
+    agentic_source_root?: string;
+    source_tree_hash?: string;
+    created_at?: string | null;
+    status?: string;
+  } | null;
   decision_drift?: Array<{
     component: string;
     key: string;
@@ -271,6 +321,190 @@ export interface AwsSessionConfig {
   aws_region: string;
 }
 
+/** How long secret key + session token may remain in sessionStorage. */
+export const AWS_OPERATOR_CRED_TTL_MS_ASIA = 60 * 60 * 1000; // 1 hour (STS-style)
+export const AWS_OPERATOR_CRED_TTL_MS_AKIA = 2 * 60 * 60 * 1000; // 2 hours
+const AWS_OPERATOR_STORAGE_KEY = 'pipeline.aws';
+const AWS_OPERATOR_LEGACY_LOCAL_KEYS = [
+  'pipeline.aws',
+  'deplai.pipeline.aws',
+  'deplai.aws',
+  'deplai.pipeline.awsConfig',
+];
+
+type StoredAwsSession = {
+  aws_access_key_id?: string;
+  aws_secret_access_key?: string;
+  aws_session_token?: string;
+  aws_region?: string;
+  saved_at?: number;
+  expires_at?: number;
+};
+
+function emptyAwsSession(region = DEFAULT_AWS_REGION): AwsSessionConfig {
+  return {
+    aws_access_key_id: '',
+    aws_secret_access_key: '',
+    aws_session_token: '',
+    aws_region: region,
+  };
+}
+
+function awsOperatorCredTtlMs(accessKeyId: string): number {
+  return accessKeyId.trim().toUpperCase().startsWith('ASIA')
+    ? AWS_OPERATOR_CRED_TTL_MS_ASIA
+    : AWS_OPERATOR_CRED_TTL_MS_AKIA;
+}
+
+/** Remove leftover localStorage copies of operator AWS credentials. */
+export function wipeLegacyAwsLocalStorage(): void {
+  if (typeof window === 'undefined') return;
+  for (const key of AWS_OPERATOR_LEGACY_LOCAL_KEYS) {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+export function clearSavedAws(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    sessionStorage.removeItem(AWS_OPERATOR_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+  wipeLegacyAwsLocalStorage();
+}
+
+export function readSavedAws(): AwsSessionConfig {
+  if (typeof window === 'undefined') {
+    return emptyAwsSession();
+  }
+  wipeLegacyAwsLocalStorage();
+  try {
+    const raw = sessionStorage.getItem(AWS_OPERATOR_STORAGE_KEY);
+    if (!raw) return emptyAwsSession();
+    const parsed = JSON.parse(raw) as StoredAwsSession;
+    const accessKeyId = String(parsed.aws_access_key_id || '');
+    const region = String(parsed.aws_region || DEFAULT_AWS_REGION) || DEFAULT_AWS_REGION;
+    const savedAt = Number(parsed.saved_at || 0);
+    const expiresAt = Number(parsed.expires_at || 0);
+    const now = Date.now();
+    const expired = Boolean(expiresAt && now > expiresAt)
+      || (Boolean(savedAt) && now - savedAt > awsOperatorCredTtlMs(accessKeyId));
+
+    if (expired) {
+      // Drop secret material; keep region for UX.
+      clearSavedAws();
+      return emptyAwsSession(region);
+    }
+
+    return {
+      aws_access_key_id: accessKeyId,
+      aws_secret_access_key: String(parsed.aws_secret_access_key || ''),
+      aws_session_token: String(parsed.aws_session_token || ''),
+      aws_region: region,
+    };
+  } catch {
+    return emptyAwsSession();
+  }
+}
+
+export function writeSavedAws(config: AwsSessionConfig): void {
+  if (typeof window === 'undefined') return;
+  wipeLegacyAwsLocalStorage();
+  const accessKeyId = String(config.aws_access_key_id || '').trim();
+  const secret = String(config.aws_secret_access_key || '');
+  const token = String(config.aws_session_token || '');
+  const region = String(config.aws_region || DEFAULT_AWS_REGION).trim() || DEFAULT_AWS_REGION;
+
+  if (!accessKeyId && !secret && !token) {
+    clearSavedAws();
+    return;
+  }
+
+  const now = Date.now();
+  const payload: StoredAwsSession = {
+    aws_access_key_id: accessKeyId,
+    aws_region: region,
+    saved_at: now,
+    expires_at: now + awsOperatorCredTtlMs(accessKeyId),
+    // Secret material is session-scoped and TTL-bound — never localStorage.
+    aws_secret_access_key: secret,
+    aws_session_token: token,
+  };
+  sessionStorage.setItem(AWS_OPERATOR_STORAGE_KEY, JSON.stringify(payload));
+}
+
+/** Milliseconds until stored operator credentials expire; 0 if missing/expired. */
+export function awsOperatorCredRemainingMs(config?: AwsSessionConfig | null): number {
+  if (typeof window === 'undefined') return 0;
+  try {
+    const raw = sessionStorage.getItem(AWS_OPERATOR_STORAGE_KEY);
+    if (!raw) return 0;
+    const parsed = JSON.parse(raw) as StoredAwsSession;
+    const expiresAt = Number(parsed.expires_at || 0);
+    if (!expiresAt) {
+      const accessKeyId = String(config?.aws_access_key_id || parsed.aws_access_key_id || '');
+      const savedAt = Number(parsed.saved_at || 0);
+      if (!savedAt) return 0;
+      return Math.max(0, savedAt + awsOperatorCredTtlMs(accessKeyId) - Date.now());
+    }
+    return Math.max(0, expiresAt - Date.now());
+  } catch {
+    return 0;
+  }
+}
+
+export type PersistedAppSecretMeta = {
+  key: string;
+  is_set: boolean;
+  required?: boolean;
+};
+
+/** Persist App Secrets key metadata only — never secret values. */
+export function readAppSecretsMeta(projectId: string): PersistedAppSecretMeta[] {
+  if (typeof window === 'undefined') return [];
+  const id = String(projectId || '').trim();
+  if (!id) return [];
+  try {
+    const raw = sessionStorage.getItem(`${APP_SECRETS_META_STORAGE_PREFIX}${id}`);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((item) => {
+        const row = item as PersistedAppSecretMeta;
+        const key = String(row?.key || '').trim();
+        if (!key) return null;
+        return {
+          key,
+          is_set: Boolean(row.is_set),
+          required: Boolean(row.required),
+        };
+      })
+      .filter((row): row is PersistedAppSecretMeta => Boolean(row));
+  } catch {
+    return [];
+  }
+}
+
+export function writeAppSecretsMeta(projectId: string, meta: PersistedAppSecretMeta[]): void {
+  if (typeof window === 'undefined') return;
+  const id = String(projectId || '').trim();
+  if (!id) return;
+  const safe = (Array.isArray(meta) ? meta : [])
+    .map((row) => ({
+      key: String(row.key || '').trim(),
+      is_set: Boolean(row.is_set),
+      required: Boolean(row.required),
+    }))
+    .filter((row) => row.key);
+  sessionStorage.setItem(`${APP_SECRETS_META_STORAGE_PREFIX}${id}`, JSON.stringify(safe));
+}
+
 export interface TerraformRuntimeConfig {
   aws_region: string;
   state_bucket: string;
@@ -280,6 +514,7 @@ export interface TerraformRuntimeConfig {
 export interface DeploymentInstanceSummary {
   cloudfrontUrl: string;
   albDns: string;
+  elasticIp: string;
   rdsEndpoint: string;
   keyName: string;
   generatedPem: string | null;
@@ -325,6 +560,7 @@ export const DEPLOY_UI_STAGE_STORAGE_PREFIX = 'deplai.deploy.stage.';
 export const TERRAFORM_RUNTIME_STORAGE_PREFIX = 'deplai.pipeline.terraformRuntime.';
 export const DEPLOY_HISTORY_MAX = 20;
 export const DEFAULT_AWS_REGION = 'eu-north-1';
+export const APP_SECRETS_META_STORAGE_PREFIX = 'deplai.pipeline.appSecretsMeta.';
 const IAC_SESSION_MAX_TOTAL_CHARS = 400000;
 const IAC_SESSION_MAX_FILE_CHARS = 80000;
 const IAC_TRUNCATION_NOTE = '\n\n# [truncated in browser session cache]';
@@ -462,30 +698,6 @@ export function clearPlanningState(): void {
   ].forEach((key) => sessionStorage.removeItem(key));
 }
 
-export function readSavedAws(): AwsSessionConfig {
-  if (typeof window === 'undefined') {
-    return { aws_access_key_id: '', aws_secret_access_key: '', aws_session_token: '', aws_region: DEFAULT_AWS_REGION };
-  }
-  try {
-    const raw = sessionStorage.getItem('pipeline.aws');
-    if (!raw) return { aws_access_key_id: '', aws_secret_access_key: '', aws_session_token: '', aws_region: DEFAULT_AWS_REGION };
-    const parsed = JSON.parse(raw) as Partial<AwsSessionConfig>;
-    return {
-      aws_access_key_id: String(parsed.aws_access_key_id || ''),
-      aws_secret_access_key: String(parsed.aws_secret_access_key || ''),
-      aws_session_token: String(parsed.aws_session_token || ''),
-      aws_region: String(parsed.aws_region || DEFAULT_AWS_REGION),
-    };
-  } catch {
-    return { aws_access_key_id: '', aws_secret_access_key: '', aws_session_token: '', aws_region: DEFAULT_AWS_REGION };
-  }
-}
-
-export function writeSavedAws(config: AwsSessionConfig): void {
-  if (typeof window === 'undefined') return;
-  sessionStorage.setItem('pipeline.aws', JSON.stringify(config));
-}
-
 function normalizeTerraformRuntimeConfig(
   value: Partial<TerraformRuntimeConfig> | null | undefined,
   fallbackRegion = DEFAULT_AWS_REGION,
@@ -576,6 +788,7 @@ export function readSavedIacMeta(): SavedIacMeta | null {
     return {
       project_id: projectId,
       workspace: String(parsed.workspace || '').trim() || undefined,
+      runtime_workspace: String(parsed.runtime_workspace || '').trim() || undefined,
       source: String(parsed.source || '').trim() || undefined,
       generated_at: String(parsed.generated_at || '').trim() || undefined,
       has_run: parsed.has_run === true,
@@ -586,6 +799,21 @@ export function readSavedIacMeta(): SavedIacMeta | null {
       unsupported_reason: String(parsed.unsupported_reason || '').trim() || undefined,
       deployment_package_id: String(parsed.deployment_package_id || '').trim() || undefined,
       decision_applied: typeof parsed.decision_applied === 'boolean' ? parsed.decision_applied : undefined,
+      source_metadata: parsed.source_metadata && typeof parsed.source_metadata === 'object'
+        ? {
+            kind: String(parsed.source_metadata.kind || '').trim() || undefined,
+            project_id: String(parsed.source_metadata.project_id || '').trim() || undefined,
+            tenant_id: String(parsed.source_metadata.tenant_id || '').trim() || undefined,
+            snapshot_id: String(parsed.source_metadata.snapshot_id || '').trim() || undefined,
+            snapshot_path: String(parsed.source_metadata.snapshot_path || '').trim() || undefined,
+            agentic_source_root: String(parsed.source_metadata.agentic_source_root || '').trim() || undefined,
+            source_tree_hash: String(parsed.source_metadata.source_tree_hash || '').trim() || undefined,
+            created_at: parsed.source_metadata.created_at
+              ? String(parsed.source_metadata.created_at)
+              : null,
+            status: String(parsed.source_metadata.status || '').trim() || undefined,
+          }
+        : null,
       decision_drift: Array.isArray(parsed.decision_drift)
         ? parsed.decision_drift
           .filter((item) => item && typeof item === 'object')
@@ -789,17 +1017,50 @@ export function extractDeploymentSummary(result: DeployApiResult | null): Deploy
   const details = result?.details as Record<string, unknown> | null | undefined;
   const liveRuntimeDetails = details?.live_runtime_details as { instance?: Record<string, unknown> } | undefined;
   const instance = liveRuntimeDetails?.instance as Record<string, unknown> | undefined;
+  const network = result?.network;
   const publicIp = String(instance?.public_ipv4_address || result?.ec2?.public_ip || pickOutput(runtimeOutputs, ['ec2_public_ip', 'public_ip', 'instance_public_ip']));
-  const explicitAppUrl = String(result?.app_url || pickOutputRaw(runtimeOutputs, ['app_url', 'application_url', 'site_url']) || '').trim();
+  const albDns = String(
+    result?.alb_dns_name
+    || network?.alb_dns_name
+    || pickOutputRaw(runtimeOutputs, ['alb_dns_name', 'load_balancer_dns_name', 'alb_dns'])
+    || 'n/a',
+  );
+  const elasticIp = String(
+    result?.elastic_ip
+    || network?.elastic_ip
+    || network?.eip_public_ip
+    || pickOutputRaw(runtimeOutputs, ['elastic_ip', 'eip_public_ip', 'eip_allocation_public_ip'])
+    || 'n/a',
+  );
+  const cloudfrontUrl = String(
+    result?.cdn?.cloudfront_url
+    || result?.cloudfront_url
+    || pickOutput(runtimeOutputs, ['cloudfront_url', 'cloudfront_domain_name']),
+  );
+  const explicitAppUrl = String(
+    result?.app_url
+    || result?.cdn?.app_url
+    || result?.alb_url
+    || network?.alb_url
+    || pickOutputRaw(runtimeOutputs, ['app_url', 'application_url', 'site_url', 'alb_url'])
+    || '',
+  ).trim();
   const appUrl = String(
     explicitAppUrl
+    || (cloudfrontUrl !== 'n/a' ? (cloudfrontUrl.startsWith('http') ? cloudfrontUrl : `https://${cloudfrontUrl}`) : '')
+    || (albDns !== 'n/a' ? `http://${albDns}` : '')
+    || (elasticIp !== 'n/a' ? `http://${elasticIp}` : '')
     || (publicIp !== 'n/a' ? `http://${publicIp}` : 'n/a'),
   );
 
   return {
-    cloudfrontUrl: String(result?.cdn?.cloudfront_url || result?.cloudfront_url || pickOutput(runtimeOutputs, ['cloudfront_url', 'cloudfront_domain_name'])),
-    albDns: pickOutput(runtimeOutputs, ['alb_dns_name', 'load_balancer_dns_name']),
-    rdsEndpoint: pickOutput(runtimeOutputs, ['rds_endpoint', 'database_endpoint', 'db_endpoint']),
+    cloudfrontUrl,
+    albDns,
+    elasticIp,
+    rdsEndpoint: String(
+      pickOutputRaw(runtimeOutputs, ['rds_endpoint', 'database_endpoint', 'db_endpoint'])
+      || 'n/a',
+    ),
     keyName: String(
       result?.keypair?.key_name
       || result?.ec2_key_name

@@ -1,0 +1,28 @@
+resource "aws_security_group" "app" {
+  count       = var.enabled ? 1 : 0
+  name_prefix = "${var.project_name}-${var.environment}-app-"
+  description = "Application traffic"
+  vpc_id      = var.vpc_id
+  tags        = var.common_tags
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = var.app_port
+    to_port     = var.app_port
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}

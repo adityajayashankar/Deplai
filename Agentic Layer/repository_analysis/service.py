@@ -86,14 +86,132 @@ PYTHON_FRAMEWORK_MAP: dict[str, tuple[str, str]] = {
     "prometheus-client": ("prometheus", "metrics"),
 }
 
-DATASTORE_HINTS: dict[str, list[str]] = {
-    "postgresql": ["postgres", "psycopg2", "prisma", "typeorm", "sequelize", "sqlalchemy", "database_url", "postgresql://"],
-    "mysql": ["mysql", "pymysql", "mysql://"],
-    "mongodb": ["mongoose", "mongo", "mongodb://"],
-    "redis": ["redis", "ioredis", "bull", "rediss://"],
-    "rabbitmq": ["amqp", "rabbitmq", "amqplib"],
-    "kafka": ["kafka", "kafkajs"],
-    "elasticsearch": ["elastic", "elasticsearch"],
+DATASTORE_DEPENDENCIES: dict[str, set[str]] = {
+    "postgresql": {
+        "pg",
+        "postgres",
+        "postgresql",
+        "psycopg",
+        "psycopg2",
+        "psycopg2-binary",
+        "@prisma/adapter-pg",
+    },
+    "mysql": {
+        "mysql",
+        "mysql2",
+        "pymysql",
+        "mysqlclient",
+        "@prisma/adapter-mariadb",
+    },
+    "mongodb": {
+        "mongodb",
+        "mongoose",
+        "pymongo",
+    },
+    "redis": {
+        "redis",
+        "ioredis",
+        "bull",
+        "bullmq",
+        "@nestjs/bull",
+        "@nestjs/bullmq",
+    },
+    "rabbitmq": {
+        "amqplib",
+        "amqp-connection-manager",
+        "pika",
+    },
+    "kafka": {
+        "kafkajs",
+        "kafka-python",
+        "confluent-kafka",
+        "node-rdkafka",
+    },
+    "elasticsearch": {
+        "@elastic/elasticsearch",
+        "elasticsearch",
+        "opensearch",
+        "@opensearch-project/opensearch",
+    },
+}
+
+DATASTORE_COMPOSE_TOKENS: dict[str, tuple[str, ...]] = {
+    "postgresql": ("postgres", "postgresql"),
+    "mysql": ("mysql", "mariadb"),
+    "mongodb": ("mongo", "mongodb"),
+    "redis": ("redis",),
+    "rabbitmq": ("rabbitmq",),
+    "kafka": ("kafka",),
+    "elasticsearch": ("elasticsearch", "opensearch"),
+}
+
+# Strong in-file evidence only (URIs / explicit providers). Never bare words like "kafka".
+DATASTORE_CONTENT_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "postgresql": (
+        re.compile(r"postgres(?:ql)?://", re.I),
+        re.compile(r"provider\s*=\s*[\"']postgresql[\"']", re.I),
+        re.compile(r"[\"']dialect[\"']\s*:\s*[\"']postgres(?:ql)?[\"']", re.I),
+    ),
+    "mysql": (
+        re.compile(r"mysql(?:2)?://", re.I),
+        re.compile(r"provider\s*=\s*[\"'](?:mysql|mariadb)[\"']", re.I),
+        re.compile(r"[\"']dialect[\"']\s*:\s*[\"']mysql[\"']", re.I),
+    ),
+    "mongodb": (
+        re.compile(r"mongodb(?:\+srv)?://", re.I),
+        re.compile(r"provider\s*=\s*[\"']mongodb[\"']", re.I),
+    ),
+    "redis": (
+        re.compile(r"rediss?://", re.I),
+    ),
+    "rabbitmq": (
+        re.compile(r"amqps?://", re.I),
+    ),
+    "kafka": (
+        re.compile(r"\bkafkajs\b|\bKafkaJS\b|\bKafkaClient\b", re.I),
+    ),
+    "elasticsearch": (
+        re.compile(r"@elastic/elasticsearch", re.I),
+        re.compile(r"@opensearch-project/opensearch", re.I),
+    ),
+}
+
+DATASTORE_ENV_PREFIXES: dict[str, tuple[str, ...]] = {
+    "postgresql": ("POSTGRES_", "PGDATABASE", "PGHOST", "PGUSER", "PGPASSWORD"),
+    "mysql": ("MYSQL_", "MYSQLHOST", "MYSQLUSER", "MYSQLDATABASE"),
+    "mongodb": ("MONGO_", "MONGODB_"),
+    "redis": ("REDIS_",),
+    "rabbitmq": ("RABBITMQ_", "AMQP_"),
+    "kafka": ("KAFKA_",),
+    "elasticsearch": ("ELASTICSEARCH_", "ELASTIC_", "OPENSEARCH_"),
+}
+
+CONTENT_SCAN_NAMES = {
+    "schema.prisma",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+    ".env",
+    ".env.example",
+    ".env.sample",
+    ".env.local",
+    "alembic.ini",
+    "database.yml",
+    "application.yml",
+    "application.yaml",
+    "application.properties",
+}
+CONTENT_SCAN_SUFFIXES = (".env", ".prisma")
+SKIP_CONTENT_NAMES = {
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "cargo.lock",
+    "poetry.lock",
+    "composer.lock",
 }
 
 
@@ -213,9 +331,18 @@ def _dependency_scanner(root: Path, files: list[Path]) -> dict[str, Any]:
     if not build.test_command and test_frameworks:
         build.test_command = test_frameworks[0]
 
+    deduped: list[RepositoryFinding] = []
+    seen_frameworks: set[tuple[str, str]] = set()
+    for finding in frameworks:
+        key = (str(finding.name or "").strip().lower(), str(finding.role or "").strip().lower())
+        if not key[0] or key in seen_frameworks:
+            continue
+        seen_frameworks.add(key)
+        deduped.append(finding)
+
     return {
         "language": language,
-        "frameworks": frameworks,
+        "frameworks": deduped,
         "build": build,
         "detected_names": sorted(detected_names),
     }
@@ -264,7 +391,13 @@ def _infra_scanner(root: Path, files: list[Path]) -> dict[str, Any]:
     for path in files:
         rel = _relative(path, root)
         lower_rel = rel.lower()
-        if path.name.lower() == "docker-compose.yml":
+        name_lower = path.name.lower()
+        if name_lower == "dockerfile" or name_lower.startswith("dockerfile."):
+            hints.has_dockerfile = True
+            build.has_dockerfile = True
+        if name_lower in {"chart.yaml", "chart.yml"} or "/charts/" in lower_rel or lower_rel.startswith("charts/"):
+            hints.helm_charts = True
+        if name_lower == "docker-compose.yml" or name_lower.startswith("docker-compose.") or name_lower in {"compose.yml", "compose.yaml"}:
             hints.existing_compose = True
             payload = yaml.safe_load(_read_text(path)) or {}
             services = payload.get("services") if isinstance(payload, dict) else {}
@@ -281,23 +414,32 @@ def _infra_scanner(root: Path, files: list[Path]) -> dict[str, Any]:
                         if port_match:
                             build.dockerfile_port = int(port_match.group(2) or port_match.group(1))
                     processes.append(ProcessFinding(type="service", source=rel, command=str(service.get("command") or service_name)))
-        elif path.name.lower() == "procfile":
+        elif name_lower == "procfile":
             for line in _read_text(path).splitlines():
                 if ":" not in line:
                     continue
                 proc_type, command = line.split(":", 1)
                 processes.append(ProcessFinding(type=proc_type.strip(), source=rel, command=command.strip()))
-        elif "kubernetes" in lower_rel or lower_rel.startswith("k8s/"):
+        elif "kubernetes" in lower_rel or lower_rel.startswith("k8s/") or "/manifests/" in lower_rel:
             hints.kubernetes_manifests = True
-        elif path.name.lower() in {"serverless.yml", "template.yaml"}:
+        elif name_lower in {"serverless.yml", "template.yaml"}:
             hints.serverless_config = True
-        if rel.count("/") > 0 and path.name.lower() == "package.json":
+        if rel.count("/") > 0 and name_lower == "package.json":
             nested_package_json += 1
-        if rel.count("/") > 0 and path.name.lower() == "dockerfile":
+        if rel.count("/") > 0 and (name_lower == "dockerfile" or name_lower.startswith("dockerfile.")):
             nested_dockerfiles += 1
 
     hints.monorepo = nested_package_json > 1 or nested_dockerfiles > 1
-    return {"infrastructure_hints": hints, "processes": processes, "compose_images": compose_images, "build": build}
+    # Preserve order while de-duplicating compose images.
+    seen_images: set[str] = set()
+    unique_images: list[str] = []
+    for image in compose_images:
+        if image in seen_images:
+            continue
+        seen_images.add(image)
+        unique_images.append(image)
+    hints.compose_images = unique_images
+    return {"infrastructure_hints": hints, "processes": processes, "compose_images": unique_images, "build": build}
 
 
 def _env_scanner(root: Path, files: list[Path]) -> dict[str, Any]:
@@ -335,33 +477,82 @@ def _env_scanner(root: Path, files: list[Path]) -> dict[str, Any]:
     return {"environment_variables": info, "env_names": sorted(env_names)}
 
 
-def _data_store_scanner(root: Path, files: list[Path], dependency_names: set[str], compose_images: list[str], env_names: set[str]) -> dict[str, Any]:
-    signals_by_store: dict[str, list[str]] = {key: [] for key in DATASTORE_HINTS}
-    versions: dict[str, str | None] = {key: None for key in DATASTORE_HINTS}
-    file_text_cache: list[tuple[str, str]] = [(_relative(path, root), _read_text(path)) for path in files if path.suffix.lower() in {".py", ".js", ".ts", ".tsx", ".yml", ".yaml", ".env", ".toml", ".txt", ".json"}]
+def _dependency_matches_store(dep_name: str, store_packages: set[str]) -> bool:
+    lowered = str(dep_name or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered in store_packages:
+        return True
+    # scoped packages: match exact or trailing package name only
+    if "/" in lowered:
+        trailing = lowered.rsplit("/", 1)[-1]
+        if trailing in store_packages:
+            return True
+    return False
 
-    for store, hints in DATASTORE_HINTS.items():
+
+def _compose_image_matches_store(image: str, tokens: tuple[str, ...]) -> bool:
+    lowered = str(image or "").strip().lower()
+    if not lowered:
+        return False
+    # Prefer image repository segment: redis:7, bitnami/mysql:8.4, public.ecr.aws/.../postgres
+    name = lowered.split("/")[-1]
+    repo = name.split(":")[0]
+    for token in tokens:
+        if repo == token or repo.startswith(f"{token}-") or repo.endswith(f"-{token}"):
+            return True
+    return False
+
+
+def _should_scan_file_for_datastores(path: Path, root: Path) -> bool:
+    name = path.name.lower()
+    if name in SKIP_CONTENT_NAMES:
+        return False
+    if name in CONTENT_SCAN_NAMES:
+        return True
+    if name.endswith(CONTENT_SCAN_SUFFIXES):
+        return True
+    rel = _relative(path, root).lower()
+    if "docker-compose" in name or rel.endswith(("compose.yml", "compose.yaml")):
+        return True
+    if rel.endswith("schema.prisma") or "/prisma/" in rel:
+        return True
+    return False
+
+
+def _data_store_scanner(root: Path, files: list[Path], dependency_names: set[str], compose_images: list[str], env_names: set[str]) -> dict[str, Any]:
+    store_keys = tuple(DATASTORE_DEPENDENCIES.keys())
+    signals_by_store: dict[str, list[str]] = {key: [] for key in store_keys}
+    versions: dict[str, str | None] = {key: None for key in store_keys}
+
+    for store, packages in DATASTORE_DEPENDENCIES.items():
         for dep in dependency_names:
-            if any(hint == dep or hint in dep for hint in hints):
+            if _dependency_matches_store(dep, packages):
                 signals_by_store[store].append(f"dependency:{dep}")
+
+    for store, tokens in DATASTORE_COMPOSE_TOKENS.items():
         for image in compose_images:
-            lowered = image.lower()
-            if any(hint in lowered for hint in hints):
+            if _compose_image_matches_store(image, tokens):
                 signals_by_store[store].append(f"compose_image:{image}")
-                version_match = re.search(r":([\w.\-]+)$", image)
-                if version_match:
+                version_match = re.search(r":([\w.\-]+)$", image.strip())
+                if version_match and versions[store] is None:
                     versions[store] = version_match.group(1)
+
+    for store, prefixes in DATASTORE_ENV_PREFIXES.items():
         for env in env_names:
-            lowered = env.lower()
-            if any(hint.replace("://", "").replace("_", "") in lowered.replace("_", "") for hint in hints):
+            upper = str(env or "").strip().upper()
+            if any(upper == prefix.rstrip("_") or upper.startswith(prefix) for prefix in prefixes):
+                # DATABASE_URL alone is ambiguous — ignore unless value scan finds a scheme.
+                if upper in {"DATABASE_URL", "DB_URL"}:
+                    continue
                 signals_by_store[store].append(f"env:{env}")
-        for rel, raw in file_text_cache:
-            lowered = raw.lower()
-            if store == "postgresql" and ("prisma/migrations" in rel or "alembic" in rel or "db/migrate" in rel):
-                signals_by_store[store].append(f"migration:{rel}")
-            if store == "redis" and "bull" in lowered:
-                signals_by_store[store].append(f"queue_signal:{rel}")
-            if any(hint in lowered for hint in hints):
+
+    content_files = [path for path in files if _should_scan_file_for_datastores(path, root)]
+    for path in content_files:
+        rel = _relative(path, root)
+        raw = _read_text(path)
+        for store, patterns in DATASTORE_CONTENT_PATTERNS.items():
+            if any(pattern.search(raw) for pattern in patterns):
                 signals_by_store[store].append(f"config:{rel}")
 
     data_stores: list[DataStoreFinding] = []
@@ -370,10 +561,19 @@ def _data_store_scanner(root: Path, files: list[Path], dependency_names: set[str
         normalized = sorted({signal for signal in signals})
         if not normalized:
             continue
+        # Require at least one strong signal (dep / compose / URI-provider config).
+        # Env-only matches are too noisy for listing as an active datastore.
+        strong = [
+            signal
+            for signal in normalized
+            if signal.startswith(("dependency:", "compose_image:", "config:"))
+        ]
+        if not strong:
+            continue
         purpose: list[str] = []
         if store == "redis" and any("bull" in signal for signal in normalized):
             purpose = ["queue", "cache"]
-        confidence = "high" if len(normalized) >= 2 else "medium"
+        confidence = "high" if len(strong) >= 2 or any(signal.startswith("compose_image:") for signal in strong) else "medium"
         data_stores.append(
             DataStoreFinding(
                 type=store,
@@ -384,7 +584,12 @@ def _data_store_scanner(root: Path, files: list[Path], dependency_names: set[str
             )
         )
         if versions.get(store) is None:
-            low_confidence_items.append(LowConfidenceItem(field=f"data_stores.{store}.version", reason=f"{store} version not specified anywhere in repo"))
+            low_confidence_items.append(
+                LowConfidenceItem(
+                    field=f"data_stores.{store}.version",
+                    reason=f"{store} version not specified anywhere in repo",
+                )
+            )
     return {"data_stores": data_stores, "low_confidence_items": low_confidence_items}
 
 
@@ -486,6 +691,20 @@ def _summarize_context(context: RepositoryContextDocument) -> str:
         parts.append("Frameworks: " + ", ".join(sorted({item.name for item in context.frameworks})))
     if context.data_stores:
         parts.append("Data stores: " + ", ".join(sorted({item.type for item in context.data_stores})))
+    hints = context.infrastructure_hints
+    infra_bits: list[str] = []
+    if hints.has_dockerfile or context.build.has_dockerfile:
+        infra_bits.append("Dockerfile")
+    if hints.existing_compose:
+        infra_bits.append("Compose")
+    if hints.kubernetes_manifests:
+        infra_bits.append("Kubernetes")
+    if hints.helm_charts:
+        infra_bits.append("Helm")
+    if hints.compose_images:
+        infra_bits.append(f"images:{len(hints.compose_images)}")
+    if infra_bits:
+        parts.append("Infra: " + ", ".join(infra_bits))
     return " | ".join(parts)
 
 
@@ -496,6 +715,19 @@ def _context_markdown(context: RepositoryContextDocument) -> str:
         for item in context.data_stores
     ) or "- None detected"
     process_lines = "\n".join(f"- `{item.type}` — {item.command or item.source}" for item in context.processes) or "- No explicit processes detected"
+    hints = context.infrastructure_hints
+    image_lines = "\n".join(f"- `{image}`" for image in hints.compose_images) or "- None detected"
+    infra_lines = "\n".join(
+        item
+        for item in [
+            f"- Dockerfile: {'yes' if (hints.has_dockerfile or context.build.has_dockerfile) else 'no'}",
+            f"- Docker Compose: {'yes' if hints.existing_compose else 'no'}",
+            f"- Kubernetes manifests: {'yes' if hints.kubernetes_manifests else 'no'}",
+            f"- Helm charts: {'yes' if hints.helm_charts else 'no'}",
+            f"- Monorepo signals: {'yes' if hints.monorepo else 'no'}",
+            f"- Serverless config: {'yes' if hints.serverless_config else 'no'}",
+        ]
+    )
     flags = [f"- {item.reason}" for item in context.low_confidence_items] + [f"- {item.reason}" for item in context.conflicts]
     flag_lines = "\n".join(flags) or "- No major flags"
     return f"""# Repository Analysis — {context.project_name}
@@ -504,13 +736,18 @@ def _context_markdown(context: RepositoryContextDocument) -> str:
 - **Language:** {context.language.primary or 'unknown'} / {context.language.runtime or 'unknown'} {context.language.version or ''}
 - **Build:** {context.build.build_command or 'not found'}
 - **Start:** {context.build.start_command or 'not found'}
-- **Dockerfile:** {'yes' if context.build.has_dockerfile else 'no'}
 
 ## Frameworks
 {framework_lines}
 
 ## Data Stores
 {datastore_lines}
+
+## Containers & Orchestration
+{infra_lines}
+
+## Compose / Runtime Images
+{image_lines}
 
 ## Processes
 {process_lines}

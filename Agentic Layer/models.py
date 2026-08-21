@@ -19,6 +19,15 @@ def _validate_project_id(v: str) -> str:
     return v
 
 
+class RepositorySourceOverride(BaseModel):
+    kind: Literal["customization_snapshot"]
+    project_id: str
+    tenant_id: str
+    snapshot_id: str
+    source_root: str
+    source_tree_hash: str
+
+
 class ScanValidationRequest(BaseModel):
     project_id: str
     project_name: str
@@ -34,6 +43,7 @@ class ScanValidationRequest(BaseModel):
     # GitHub-specific fields (only for github projects)
     github_token: Optional[str] = None
     repository_url: Optional[str] = None
+    source_override: Optional[RepositorySourceOverride] = None
 
 
 class ScanValidationResponse(BaseModel):
@@ -177,6 +187,7 @@ class TerraformGenRequest(BaseModel):
     source_root: Optional[str] = None
     source_root_candidates: Optional[list[str]] = None
     repository_url: Optional[str] = None
+    source_metadata: Optional[dict[str, Any]] = None
 
 
 class TerraformConsultRequest(BaseModel):
@@ -188,6 +199,15 @@ class TerraformConsultRequest(BaseModel):
     conversation_history: list[dict[str, str]] = Field(default_factory=list)
     turn_count: int = 0
     force_decision: bool = False
+    workspace: Optional[str] = None
+    project_id: Optional[str] = None
+    project_name: Optional[str] = None
+    user_answers: Optional[dict[str, Any]] = None
+    prior_decision: Optional[dict[str, Any]] = None
+    llm_provider: Optional[str] = None
+    llm_api_key: Optional[str] = None
+    llm_model: Optional[str] = None
+    llm_api_base_url: Optional[str] = None
 
 
 class TerraformConsultResponse(BaseModel):
@@ -195,8 +215,56 @@ class TerraformConsultResponse(BaseModel):
     assistant_message: Optional[str] = None
     ready: bool = False
     decision: Optional[dict[str, Any]] = None
+    open_questions: Optional[list[str]] = None
     repo_detection_summary: Optional[str] = None
     turn_count: int = 0
+    decision_summary: Optional[str] = None
+    source: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    error: Optional[str] = None
+
+
+class InfraAdviseRequest(BaseModel):
+    architecture_json: dict[str, Any] = Field(default_factory=dict)
+    repository_context: Optional[dict[str, Any]] = None
+    deployment_profile: Optional[dict[str, Any]] = None
+    detected: Optional[dict[str, Any]] = None
+    aws_region: str = "eu-north-1"
+    conversation_history: list[dict[str, str]] = Field(default_factory=list)
+    turn_count: int = 0
+    force_decision: bool = False
+    workspace: Optional[str] = None
+    project_id: Optional[str] = None
+    project_name: Optional[str] = None
+    user_answers: Optional[dict[str, Any]] = None
+    prior_decision: Optional[dict[str, Any]] = None
+    budget_cap_usd: Optional[float] = None
+    selected_tier: Optional[str] = None
+    requirements: Optional[dict[str, Any]] = None
+    llm_provider: Optional[str] = None
+    llm_api_key: Optional[str] = None
+    llm_model: Optional[str] = None
+    llm_api_base_url: Optional[str] = None
+
+
+class InfraAdviseResponse(BaseModel):
+    success: bool
+    assistant_message: Optional[str] = None
+    ready: bool = False
+    decision: Optional[dict[str, Any]] = None
+    open_questions: Optional[list[str]] = None
+    repo_detection_summary: Optional[str] = None
+    turn_count: int = 0
+    decision_summary: Optional[str] = None
+    source: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    budget_cap_usd: Optional[float] = None
+    selected_tier: Optional[str] = None
+    cost_estimate: Optional[dict[str, Any]] = None
+    budget_gate: Optional[dict[str, Any]] = None
+    upgrade_suggestions: Optional[list[dict[str, Any]]] = None
+    plan_tiers: Optional[dict[str, Any]] = None
+    requirements: Optional[dict[str, Any]] = None
     error: Optional[str] = None
 
 
@@ -246,6 +314,7 @@ class TerraformApplyRequest(BaseModel):
     provider: str = "aws"
     run_id: Optional[str] = None
     workspace: Optional[str] = None
+    deployment_metadata: Optional[dict[str, Any]] = None
     state_bucket: Optional[str] = None
     lock_table: Optional[str] = None
     files: list[TerraformApplyFile] = Field(default_factory=list)
@@ -297,6 +366,7 @@ class AwsRuntimeDetailsRequest(BaseModel):
     project_name: str = "deplai-project"
     aws_access_key_id: str
     aws_secret_access_key: str
+    aws_session_token: Optional[str] = None
     aws_region: str = "eu-north-1"
     instance_id: Optional[str] = None
 
@@ -311,6 +381,7 @@ class AwsDestroyRequest(BaseModel):
     project_name: str = "deplai-project"
     aws_access_key_id: str
     aws_secret_access_key: str
+    aws_session_token: Optional[str] = None
     aws_region: str = "eu-north-1"
 
 
@@ -324,6 +395,7 @@ class AwsInstanceActionRequest(BaseModel):
     project_name: str = "deplai-project"
     aws_access_key_id: str
     aws_secret_access_key: str
+    aws_session_token: Optional[str] = None
     aws_region: str = "eu-north-1"
     instance_id: str
     action: str  # start | stop | reboot
@@ -332,6 +404,50 @@ class AwsInstanceActionRequest(BaseModel):
 class AwsInstanceActionResponse(BaseModel):
     success: bool
     details: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class AwsAppSecretEntry(BaseModel):
+    key: str
+    value: str
+
+
+class AwsAppSecretsListRequest(BaseModel):
+    project_name: str = "deplai-project"
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: Optional[str] = None
+    aws_region: str = "eu-north-1"
+    secrets_manager_prefix: str = ""
+    environment: str = "prod"
+
+
+class AwsAppSecretsUpsertRequest(BaseModel):
+    project_name: str = "deplai-project"
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: Optional[str] = None
+    aws_region: str = "eu-north-1"
+    secrets_manager_prefix: str = ""
+    environment: str = "prod"
+    secrets: list[AwsAppSecretEntry]
+
+
+class AwsAppSecretsDeleteRequest(BaseModel):
+    project_name: str = "deplai-project"
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: Optional[str] = None
+    aws_region: str = "eu-north-1"
+    secrets_manager_prefix: str = ""
+    environment: str = "prod"
+    key: str
+
+
+class AwsAppSecretsResponse(BaseModel):
+    success: bool
+    prefix: Optional[str] = None
+    secrets: Optional[list[dict]] = None
     error: Optional[str] = None
 
 

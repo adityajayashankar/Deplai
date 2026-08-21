@@ -35,12 +35,15 @@ from models import (
     CostEstimateRequest, CostEstimateResponse,
     Stage7ApprovalRequest, Stage7ApprovalResponse,
     TerraformGenRequest, TerraformGenResponse,
+    TerraformConsultRequest, TerraformConsultResponse,
+    InfraAdviseRequest, InfraAdviseResponse,
     TerraformApplyRequest, TerraformApplyResponse,
     TerraformApplyStopRequest, TerraformApplyStopResponse,
     TerraformApplyStatusRequest, TerraformApplyStatusResponse,
     AwsRuntimeDetailsRequest, AwsRuntimeDetailsResponse,
     AwsDestroyRequest, AwsDestroyResponse,
     AwsInstanceActionRequest, AwsInstanceActionResponse,
+    AwsAppSecretsListRequest, AwsAppSecretsUpsertRequest, AwsAppSecretsDeleteRequest, AwsAppSecretsResponse,
 )
 from environment import EnvironmentInitializer
 from cleanup import cleanup_volumes, cleanup_project_reports
@@ -69,6 +72,8 @@ from deployment_planning_contract import (
 from claude_deployment_pipeline import generate_terraform_bundle
 from repository_analysis import run_repository_analysis
 from stage7_bridge import run_stage7_approval_payload
+from terraform_consult import run_terraform_consult
+from infra_advisor import run_infra_advise
 from utils import get_docker_client
 
 logger = logging.getLogger(__name__)
@@ -827,6 +832,74 @@ async def stage7_approval(request: Stage7ApprovalRequest):
     return Stage7ApprovalResponse(success=True, approval_payload=approval_payload)
 
 
+@app.post("/api/terraform/consult", response_model=TerraformConsultResponse, dependencies=[Depends(verify_api_key)])
+async def terraform_consult(request: TerraformConsultRequest):
+    """Intake-aware infrastructure consultant for the deploy chat vertical slice."""
+    try:
+        result = await asyncio.to_thread(
+            run_terraform_consult,
+            architecture_json=dict(request.architecture_json or {}),
+            repository_context=dict(request.repository_context or {}) if request.repository_context else None,
+            deployment_profile=dict(request.deployment_profile or {}) if request.deployment_profile else None,
+            detected=dict(request.detected or {}) if request.detected else None,
+            aws_region=request.aws_region or "eu-north-1",
+            conversation_history=list(request.conversation_history or []),
+            turn_count=int(request.turn_count or 0),
+            force_decision=bool(request.force_decision),
+            workspace=request.workspace,
+            project_id=request.project_id,
+            project_name=request.project_name,
+            user_answers=dict(request.user_answers or {}) if request.user_answers else None,
+            prior_decision=dict(request.prior_decision or {}) if request.prior_decision else None,
+            llm_provider=request.llm_provider,
+            llm_api_key=request.llm_api_key,
+            llm_model=request.llm_model,
+            llm_api_base_url=request.llm_api_base_url,
+        )
+        return TerraformConsultResponse(**result)
+    except Exception as exc:
+        logger.exception("terraform consult failed")
+        return TerraformConsultResponse(
+            success=False,
+            error=str(exc),
+            ready=False,
+            turn_count=int(request.turn_count or 0),
+        )
+
+
+@app.post("/api/infra/advise", response_model=InfraAdviseResponse, dependencies=[Depends(verify_api_key)])
+async def infra_advise(request: InfraAdviseRequest):
+    """LangGraph beginner infra advisor: project + budget aware interactive planning."""
+    try:
+        result = await asyncio.to_thread(
+            run_infra_advise,
+            architecture_json=dict(request.architecture_json or {}),
+            repository_context=dict(request.repository_context or {}) if request.repository_context else None,
+            deployment_profile=dict(request.deployment_profile or {}) if request.deployment_profile else None,
+            detected=dict(request.detected or {}) if request.detected else None,
+            aws_region=request.aws_region or "eu-north-1",
+            conversation_history=list(request.conversation_history or []),
+            turn_count=int(request.turn_count or 0),
+            force_decision=bool(request.force_decision),
+            workspace=request.workspace,
+            project_id=request.project_id,
+            project_name=request.project_name,
+            user_answers=dict(request.user_answers or {}) if request.user_answers else None,
+            prior_decision=dict(request.prior_decision or {}) if request.prior_decision else None,
+            budget_cap_usd=request.budget_cap_usd,
+            selected_tier=request.selected_tier,
+            requirements=dict(request.requirements or {}) if request.requirements else None,
+            llm_provider=request.llm_provider,
+            llm_api_key=request.llm_api_key,
+            llm_model=request.llm_model,
+            llm_api_base_url=request.llm_api_base_url,
+        )
+        return InfraAdviseResponse(**result)
+    except Exception as exc:
+        logger.exception("infra advise failed")
+        return InfraAdviseResponse(success=False, error=str(exc), ready=False, turn_count=int(request.turn_count or 0))
+
+
 @app.post("/api/terraform/generate", response_model=TerraformGenResponse, dependencies=[Depends(verify_api_key)])
 async def terraform_generate(request: TerraformGenRequest):
     """Generate Terraform IaC files from a Claude-derived deployment profile."""
@@ -871,38 +944,61 @@ async def terraform_generate(request: TerraformGenRequest):
                 "stage": "terraform_generation",
             },
         )
-    agent_result = await loop.run_in_executor(
-        None,
-        lambda: generate_terraform_bundle(
-            architecture_json=architecture_json,
+    try:
+        agent_result = await loop.run_in_executor(
+            None,
+            lambda: generate_terraform_bundle(
+                architecture_json=architecture_json,
+                project_name=request.project_name,
+                workspace=request.workspace,
+                aws_region=request.aws_region,
+                state_bucket=request.state_bucket,
+                lock_table=request.lock_table,
+                iac_mode=request.iac_mode,
+                qa_summary=request.qa_summary or "",
+                website_index_html=request.website_index_html or "",
+                repository_context_json=repository_context_json,
+                deployment_profile_json=dict(request.deployment_profile or {}),
+                approval_payload_json=dict(request.approval_payload or {}),
+                security_context_json=dict(request.security_context or {}),
+                website_asset_stats_json=dict(request.website_asset_stats or {}),
+                frontend_entrypoint_detection_json=dict(request.frontend_entrypoint_detection or {}),
+                detected_json=dict(request.detected or {}),
+                user_answers_json=dict(request.user_answers or {}),
+                consultant_decision_json=dict(request.consultant_decision or {}),
+                source_root=request.source_root or "",
+                source_root_candidates=list(request.source_root_candidates or []),
+                repository_url=request.repository_url or "",
+                source_metadata_json=dict(request.source_metadata or {}),
+                llm_provider=request.llm_provider,
+                llm_api_key=request.llm_api_key,
+                llm_model=request.llm_model,
+                llm_api_base_url=request.llm_api_base_url,
+                terraform_renderer=request.terraform_renderer,
+                progress_callback=progress_callback,
+            ),
+        )
+    except Exception as exc:
+        logger.exception("terraform generate failed")
+        if project_id:
+            await _broadcast_pipeline_event(
+                project_id,
+                "error",
+                f"Terraform agent workflow failed: {exc}",
+                meta={
+                    "worker_id": "terraform-orchestrator",
+                    "worker_role": "Terraform Orchestrator",
+                    "worker_status": "failed",
+                    "stage": "terraform_generation",
+                },
+            )
+        return TerraformGenResponse(
+            success=False,
+            provider=request.provider,
             project_name=request.project_name,
-            workspace=request.workspace,
-            aws_region=request.aws_region,
-            state_bucket=request.state_bucket,
-            lock_table=request.lock_table,
-            iac_mode=request.iac_mode,
-            qa_summary=request.qa_summary or "",
-            website_index_html=request.website_index_html or "",
-            repository_context_json=repository_context_json,
-            deployment_profile_json=dict(request.deployment_profile or {}),
-            approval_payload_json=dict(request.approval_payload or {}),
-            security_context_json=dict(request.security_context or {}),
-            website_asset_stats_json=dict(request.website_asset_stats or {}),
-            frontend_entrypoint_detection_json=dict(request.frontend_entrypoint_detection or {}),
-            detected_json=dict(request.detected or {}),
-            user_answers_json=dict(request.user_answers or {}),
-            consultant_decision_json=dict(request.consultant_decision or {}),
-            source_root=request.source_root or "",
-            source_root_candidates=list(request.source_root_candidates or []),
-            repository_url=request.repository_url or "",
-            llm_provider=request.llm_provider,
-            llm_api_key=request.llm_api_key,
-            llm_model=request.llm_model,
-            llm_api_base_url=request.llm_api_base_url,
-            terraform_renderer=request.terraform_renderer,
-            progress_callback=progress_callback,
-        ),
-    )
+            error=str(exc),
+            source="unavailable",
+        )
 
     if agent_result and agent_result.get("success"):
         if project_id:
@@ -1012,7 +1108,12 @@ async def terraform_apply(request: TerraformApplyRequest):
         except Exception:
             pass
 
-    apply_ctx = {"cancel_requested": False, "container_id": None, "emit": emit_apply_event}
+    apply_ctx = {
+        "cancel_requested": False,
+        "container_id": None,
+        "emit": emit_apply_event,
+        "deployment_metadata": dict(request.deployment_metadata or {}),
+    }
     active_terraform_applies[apply_key] = apply_ctx
     terraform_apply_results[apply_key] = {"status": "running", "result": None}
 
@@ -1064,6 +1165,12 @@ async def terraform_apply(request: TerraformApplyRequest):
     finally:
         active_terraform_applies.pop(apply_key, None)
         if result is not None:
+            if request.deployment_metadata:
+                details = result.get("details")
+                if not isinstance(details, dict):
+                    details = {}
+                details["deployment_metadata"] = dict(request.deployment_metadata)
+                result["details"] = details
             result_status = str(result.get("status") or "").strip()
             terraform_apply_results[apply_key] = {
                 "status": result_status if result_status == "awaiting_plan_confirmation" else ("completed" if bool(result.get("success")) else "error"),
@@ -1172,11 +1279,14 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
             or (requested_project_name and requested_project_name != "deplai-project")
         )
 
-        session = boto3.session.Session(
-            aws_access_key_id=request.aws_access_key_id,
-            aws_secret_access_key=request.aws_secret_access_key,
-            region_name=request.aws_region,
-        )
+        session_kwargs = {
+            "aws_access_key_id": request.aws_access_key_id,
+            "aws_secret_access_key": request.aws_secret_access_key,
+            "region_name": request.aws_region,
+        }
+        if request.aws_session_token:
+            session_kwargs["aws_session_token"] = request.aws_session_token
+        session = boto3.session.Session(**session_kwargs)
         ec2 = session.client("ec2", region_name=request.aws_region)
         s3 = session.client("s3", region_name=request.aws_region)
         cloudfront = session.client("cloudfront")
@@ -1343,6 +1453,74 @@ async def aws_runtime_details(request: AwsRuntimeDetailsRequest):
         return AwsRuntimeDetailsResponse(success=False, error=str(exc))
 
 
+@app.post("/api/aws/app-secrets/list", response_model=AwsAppSecretsResponse, dependencies=[Depends(verify_api_key)])
+async def aws_app_secrets_list(request: AwsAppSecretsListRequest):
+    try:
+        from app_secrets import list_app_secrets, normalize_secrets_prefix
+
+        prefix = normalize_secrets_prefix(
+            request.secrets_manager_prefix,
+            project_name=request.project_name,
+            environment=request.environment,
+        )
+        secrets = list_app_secrets(
+            aws_access_key_id=request.aws_access_key_id,
+            aws_secret_access_key=request.aws_secret_access_key,
+            aws_session_token=request.aws_session_token,
+            aws_region=request.aws_region,
+            prefix=prefix,
+        )
+        return AwsAppSecretsResponse(success=True, prefix=prefix, secrets=secrets)
+    except Exception as exc:
+        return AwsAppSecretsResponse(success=False, error=str(exc))
+
+
+@app.post("/api/aws/app-secrets/upsert", response_model=AwsAppSecretsResponse, dependencies=[Depends(verify_api_key)])
+async def aws_app_secrets_upsert(request: AwsAppSecretsUpsertRequest):
+    try:
+        from app_secrets import normalize_secrets_prefix, upsert_app_secrets
+
+        prefix = normalize_secrets_prefix(
+            request.secrets_manager_prefix,
+            project_name=request.project_name,
+            environment=request.environment,
+        )
+        results = upsert_app_secrets(
+            aws_access_key_id=request.aws_access_key_id,
+            aws_secret_access_key=request.aws_secret_access_key,
+            aws_session_token=request.aws_session_token,
+            aws_region=request.aws_region,
+            prefix=prefix,
+            secrets=[{"key": item.key, "value": item.value} for item in request.secrets],
+        )
+        return AwsAppSecretsResponse(success=True, prefix=prefix, secrets=results)
+    except Exception as exc:
+        return AwsAppSecretsResponse(success=False, error=str(exc))
+
+
+@app.post("/api/aws/app-secrets/delete", response_model=AwsAppSecretsResponse, dependencies=[Depends(verify_api_key)])
+async def aws_app_secrets_delete(request: AwsAppSecretsDeleteRequest):
+    try:
+        from app_secrets import delete_app_secret, normalize_secrets_prefix
+
+        prefix = normalize_secrets_prefix(
+            request.secrets_manager_prefix,
+            project_name=request.project_name,
+            environment=request.environment,
+        )
+        result = delete_app_secret(
+            aws_access_key_id=request.aws_access_key_id,
+            aws_secret_access_key=request.aws_secret_access_key,
+            aws_session_token=request.aws_session_token,
+            aws_region=request.aws_region,
+            prefix=prefix,
+            key=request.key,
+        )
+        return AwsAppSecretsResponse(success=True, prefix=prefix, secrets=[result])
+    except Exception as exc:
+        return AwsAppSecretsResponse(success=False, error=str(exc))
+
+
 @app.post("/api/aws/instance-action", response_model=AwsInstanceActionResponse, dependencies=[Depends(verify_api_key)])
 async def aws_instance_action(request: AwsInstanceActionRequest):
     """Perform start/stop/reboot on a specific EC2 instance and return refreshed live details."""
@@ -1351,11 +1529,14 @@ async def aws_instance_action(request: AwsInstanceActionRequest):
         if action not in {"start", "stop", "reboot"}:
             return AwsInstanceActionResponse(success=False, error="action must be one of: start, stop, reboot")
 
-        session = boto3.session.Session(
-            aws_access_key_id=request.aws_access_key_id,
-            aws_secret_access_key=request.aws_secret_access_key,
-            region_name=request.aws_region,
-        )
+        session_kwargs = {
+            "aws_access_key_id": request.aws_access_key_id,
+            "aws_secret_access_key": request.aws_secret_access_key,
+            "region_name": request.aws_region,
+        }
+        if request.aws_session_token:
+            session_kwargs["aws_session_token"] = request.aws_session_token
+        session = boto3.session.Session(**session_kwargs)
         ec2 = session.client("ec2", region_name=request.aws_region)
         sts = session.client("sts", region_name=request.aws_region)
         account_id = str(sts.get_caller_identity().get("Account", ""))
@@ -1428,11 +1609,14 @@ async def aws_instance_action(request: AwsInstanceActionRequest):
 async def aws_destroy_runtime(request: AwsDestroyRequest):
     """Best-effort runtime cleanup for DeplAI-managed AWS resources for a project."""
     try:
-        session = boto3.session.Session(
-            aws_access_key_id=request.aws_access_key_id,
-            aws_secret_access_key=request.aws_secret_access_key,
-            region_name=request.aws_region,
-        )
+        session_kwargs = {
+            "aws_access_key_id": request.aws_access_key_id,
+            "aws_secret_access_key": request.aws_secret_access_key,
+            "region_name": request.aws_region,
+        }
+        if request.aws_session_token:
+            session_kwargs["aws_session_token"] = request.aws_session_token
+        session = boto3.session.Session(**session_kwargs)
         ec2 = session.client("ec2", region_name=request.aws_region)
         s3 = session.client("s3", region_name=request.aws_region)
         cloudfront = session.client("cloudfront")

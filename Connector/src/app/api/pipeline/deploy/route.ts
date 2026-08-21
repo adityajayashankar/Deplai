@@ -2,6 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { readLegacyCicdTemplate } from '@/lib/legacy-assets';
+import {
+  resolveCustomizationSnapshot,
+  SnapshotResolutionError,
+  type CustomizationSnapshotSource,
+} from '@/lib/customization-snapshot';
 
 const AGENTIC_KEY = process.env.DEPLAI_SERVICE_KEY ?? '';
 
@@ -44,6 +49,12 @@ interface DeployBody {
   estimated_monthly_usd?: number;
   budget_limit_usd?: number;
   budget_override?: boolean;
+  customization_snapshot_id?: string;
+  tenant_id?: string;
+  iac_source?: Record<string, unknown>;
+  required_secret_keys?: string[];
+  secrets_manager_prefix?: string;
+  environment?: string;
 }
 
 function resolveAgenticOrigin(): string {
@@ -393,10 +404,26 @@ function buildDeploymentSummary(params: {
   const cloudfrontUrl = params.normalizedRuntime.cdn.cloudfront_url
     || extractOutputString(outputs, ['cloudfront_url'])
     || (cloudfrontDomain ? `https://${cloudfrontDomain}` : null);
-  const albDns = extractOutputString(outputs, ['alb_dns_name', 'alb_url']);
-  const albUrl = albDns
-    ? (albDns.startsWith('http://') || albDns.startsWith('https://') ? albDns : `http://${albDns}`)
+  const albDns = params.normalizedRuntime.network.alb_dns_name
+    || extractOutputString(outputs, ['alb_dns_name', 'alb_url']);
+  const albUrl = params.normalizedRuntime.network.alb_url
+    || (albDns
+      ? (albDns.startsWith('http://') || albDns.startsWith('https://') ? albDns : `http://${albDns}`)
+      : null);
+  const elasticIp = params.normalizedRuntime.network.elastic_ip
+    || extractOutputString(outputs, ['elastic_ip', 'eip_public_ip', 'eip']);
+  const eipUrl = elasticIp
+    ? (elasticIp.startsWith('http://') || elasticIp.startsWith('https://') ? elasticIp : `http://${elasticIp}`)
     : null;
+  const ec2Url = params.normalizedRuntime.ec2.public_ip
+    ? `http://${params.normalizedRuntime.ec2.public_ip}`
+    : null;
+  const appUrl = params.normalizedRuntime.cdn.app_url
+    || cloudfrontUrl
+    || albUrl
+    || eipUrl
+    || ec2Url
+    || extractOutputString(outputs, ['app_url', 'application_url', 'site_url']);
   const rdsEndpoint = extractOutputString(outputs, ['rds_endpoint', 'postgres_endpoint', 'db_endpoint']);
   const vpcId = extractOutputString(outputs, ['vpc_id', 'ec2_vpc_id']) || params.normalizedRuntime.network.vpc_id;
   const ecsCluster = extractOutputString(outputs, ['ecs_cluster_name', 'ecs_cluster']);
@@ -404,8 +431,13 @@ function buildDeploymentSummary(params: {
   return {
     status: 'deployed',
     resources: {
-      app_url: cloudfrontUrl || albUrl,
+      app_url: appUrl,
       alb_url: albUrl,
+      alb_dns_name: albDns,
+      elastic_ip: elasticIp,
+      eip_public_ip: elasticIp,
+      ec2_public_ip: params.normalizedRuntime.ec2.public_ip,
+      cloudfront_url: cloudfrontUrl,
       rds_endpoint: rdsEndpoint,
       vpc_id: vpcId,
       ecs_cluster: ecsCluster,
@@ -437,6 +469,7 @@ async function fetchAwsRuntimeDetails(params: {
   projectName: string;
   awsAccessKeyId: string;
   awsSecretAccessKey: string;
+  awsSessionToken?: string;
   awsRegion: string;
   instanceId?: string | null;
 }): Promise<Record<string, unknown> | null> {
@@ -450,6 +483,7 @@ async function fetchAwsRuntimeDetails(params: {
       project_name: params.projectName,
       aws_access_key_id: params.awsAccessKeyId,
       aws_secret_access_key: params.awsSecretAccessKey,
+      aws_session_token: params.awsSessionToken || undefined,
       aws_region: params.awsRegion,
       instance_id: params.instanceId || undefined,
     }),
@@ -529,14 +563,21 @@ async function waitForRecoveredApplyResult(params: {
 }
 
 type EndpointCheck = {
-  label: 'cloudfront' | 'instance';
+  label: 'cloudfront' | 'alb' | 'instance' | 'app';
   url: string;
   ok: boolean;
   status: number | null;
   detail: string;
 };
 
-async function probeEndpoint(label: 'cloudfront' | 'instance', rawUrl: string): Promise<EndpointCheck> {
+function ensureHttpUrl(raw: string | null | undefined): string {
+  const value = String(raw || '').trim();
+  if (!value) return '';
+  if (value.startsWith('http://') || value.startsWith('https://')) return value;
+  return `http://${value}`;
+}
+
+async function probeEndpoint(label: EndpointCheck['label'], rawUrl: string): Promise<EndpointCheck> {
   const url = String(rawUrl || '').trim();
   if (!url) {
     return { label, url: '', ok: false, status: null, detail: 'No endpoint provided.' };
@@ -573,6 +614,7 @@ async function sleep(ms: number): Promise<void> {
 
 async function waitForRuntimeVerification(params: {
   cloudfrontUrl?: string | null;
+  albUrl?: string | null;
   appUrl?: string | null;
   healthCheckUrl?: string | null;
   publicIp?: string | null;
@@ -584,12 +626,26 @@ async function waitForRuntimeVerification(params: {
   const startedAt = Date.now();
   let checks: EndpointCheck[] = [];
 
+  const cloudfrontUrl = ensureHttpUrl(params.cloudfrontUrl);
+  const albUrl = ensureHttpUrl(params.albUrl);
+  const appUrl = ensureHttpUrl(params.appUrl || params.healthCheckUrl);
+  const instanceUrl = params.publicIp ? ensureHttpUrl(params.publicIp) : '';
+
   while (Date.now() - startedAt < timeoutMs) {
-    checks = await Promise.all([
-      probeEndpoint('cloudfront', String(params.cloudfrontUrl || '')),
-      probeEndpoint('instance', params.publicIp ? `http://${String(params.publicIp).trim()}` : ''),
-    ]);
-    if (checks.some((check) => check.ok)) {
+    const probes: Array<Promise<EndpointCheck>> = [];
+    if (cloudfrontUrl) probes.push(probeEndpoint('cloudfront', cloudfrontUrl));
+    if (albUrl) probes.push(probeEndpoint('alb', albUrl));
+    if (appUrl && appUrl !== cloudfrontUrl && appUrl !== albUrl && appUrl !== instanceUrl) {
+      probes.push(probeEndpoint('app', appUrl));
+    }
+    if (instanceUrl) probes.push(probeEndpoint('instance', instanceUrl));
+
+    checks = probes.length > 0
+      ? await Promise.all(probes)
+      : [];
+
+    // Succeed when any intended front door (CF, ALB, or instance) is healthy.
+    if (checks.some((check) => check.ok && (check.label === 'cloudfront' || check.label === 'alb' || check.label === 'instance' || check.label === 'app'))) {
       return { checks, verified: true };
     }
     await sleep(intervalMs);
@@ -630,9 +686,32 @@ function normalizeDeploymentRuntime(payload: {
     },
     ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem'],
   );
-  const cloudfrontUrl = normalizeScalar(payload.cloudfrontUrl)
+  const cloudfrontUrlRaw = normalizeScalar(payload.cloudfrontUrl)
     || extractOutputString(outputs, ['cloudfront_url'])
     || extractOutputString(outputs, ['cloudfront_domain_name']);
+  const cloudfrontUrl = cloudfrontUrlRaw
+    ? (cloudfrontUrlRaw.startsWith('http') ? cloudfrontUrlRaw : `https://${cloudfrontUrlRaw}`)
+    : null;
+
+  const albDns = extractOutputString(outputs, ['alb_dns_name', 'alb_dns', 'load_balancer_dns'])
+    || extractStringFromRecord(details, ['alb_dns_name', 'alb_dns']);
+  const albUrlRaw = extractOutputString(outputs, ['alb_url'])
+    || albDns;
+  const albUrl = albUrlRaw
+    ? (albUrlRaw.startsWith('http://') || albUrlRaw.startsWith('https://') ? albUrlRaw : `http://${albUrlRaw}`)
+    : null;
+
+  const elasticIp = extractOutputString(outputs, ['elastic_ip', 'eip_public_ip', 'eip', 'elastic_ip_public'])
+    || extractStringFromRecord(details, ['elastic_ip', 'eip_public_ip']);
+
+  const ec2PublicIp = normalizeScalar(liveInstance?.public_ipv4_address)
+    || extractOutputString(outputs, ['ec2_public_ip', 'public_ip', 'instance_public_ip']);
+
+  const preferredAppUrl = cloudfrontUrl
+    || albUrl
+    || (elasticIp ? (elasticIp.startsWith('http') ? elasticIp : `http://${elasticIp}`) : null)
+    || (ec2PublicIp ? `http://${ec2PublicIp}` : null)
+    || extractOutputString(outputs, ['app_url', 'application_url', 'site_url']);
 
   return {
     keypair: {
@@ -643,7 +722,7 @@ function normalizeDeploymentRuntime(payload: {
       instance_id: normalizeScalar(liveInstance?.instance_id) || extractOutputString(outputs, ['ec2_instance_id', 'instance_id']),
       state: normalizeScalar(liveInstance?.instance_state) || extractOutputString(outputs, ['ec2_instance_state', 'instance_state']),
       type: normalizeScalar(liveInstance?.instance_type) || extractOutputString(outputs, ['ec2_instance_type', 'instance_type']),
-      public_ip: normalizeScalar(liveInstance?.public_ipv4_address) || extractOutputString(outputs, ['ec2_public_ip', 'public_ip', 'instance_public_ip']),
+      public_ip: ec2PublicIp,
       private_ip: normalizeScalar(liveInstance?.private_ipv4_address) || extractOutputString(outputs, ['ec2_private_ip', 'private_ip', 'instance_private_ip']),
       public_dns: normalizeScalar(liveInstance?.public_dns) || extractOutputString(outputs, ['ec2_public_dns', 'instance_public_dns', 'public_dns']),
       private_dns: normalizeScalar(liveInstance?.private_dns) || extractOutputString(outputs, ['ec2_private_dns', 'private_dns', 'instance_private_dns']),
@@ -652,9 +731,14 @@ function normalizeDeploymentRuntime(payload: {
     network: {
       vpc_id: normalizeScalar(liveInstance?.vpc_id) || extractOutputString(outputs, ['ec2_vpc_id', 'vpc_id']),
       subnet_id: normalizeScalar(liveInstance?.subnet_id) || extractOutputString(outputs, ['ec2_subnet_id', 'subnet_id']),
+      alb_dns_name: albDns,
+      alb_url: albUrl,
+      elastic_ip: elasticIp,
+      eip_public_ip: elasticIp,
     },
     cdn: {
-      cloudfront_url: cloudfrontUrl ? (cloudfrontUrl.startsWith('http') ? cloudfrontUrl : `https://${cloudfrontUrl}`) : null,
+      cloudfront_url: cloudfrontUrl,
+      app_url: preferredAppUrl,
     },
   };
 }
@@ -698,13 +782,17 @@ function detectStaleAwsTerraformBundle(files: GeneratedFile[]): string[] {
 
   const hasUseDefaultVpcVar = /variable\s+"use_default_vpc"\s*\{/i.test(combined);
   const hasUseExistingVpcVar = /variable\s+"use_existing_vpc"\s*\{/i.test(combined);
+  const hasUseRegistryVpcVar = /variable\s+"use_registry_vpc"\s*\{/i.test(combined);
   const hasLegacyVpcCreate = /resource\s+"aws_vpc"\s+"main"\s*\{/i.test(combined);
-  const hasVpcConditionalCount = /resource\s+"aws_vpc"\s+"main"\s*\{[\s\S]*?count\s*=\s*var\.use_default_vpc\s*\?\s*0\s*:\s*1/i.test(combined);
-  const hasVpcConditionalCountExisting = /resource\s+"aws_vpc"\s+"main"\s*\{[\s\S]*?count\s*=\s*var\.use_existing_vpc\s*\?\s*0\s*:\s*1/i.test(combined);
-  if (hasLegacyVpcCreate && !(
-    (hasUseDefaultVpcVar && hasVpcConditionalCount)
-    || (hasUseExistingVpcVar && hasVpcConditionalCountExisting)
-  )) {
+  // Enterprise / EC2 / ECS renderers use several equivalent count forms, e.g.
+  //   count = var.use_default_vpc ? 0 : 1
+  //   count = var.use_existing_vpc ? 0 : 1
+  //   count = var.use_existing_vpc || var.use_registry_vpc ? 0 : 1
+  const vpcMainBlockMatch = combined.match(/resource\s+"aws_vpc"\s+"main"\s*\{([\s\S]*?)\n\}/i);
+  const vpcMainBody = vpcMainBlockMatch?.[1] || '';
+  const hasVpcConditionalCount = /count\s*=\s*[^\n]*var\.(use_default_vpc|use_existing_vpc|use_registry_vpc)/i.test(vpcMainBody);
+  const hasSupportedVpcModeVar = hasUseDefaultVpcVar || hasUseExistingVpcVar || hasUseRegistryVpcVar;
+  if (hasLegacyVpcCreate && !(hasSupportedVpcModeVar && hasVpcConditionalCount)) {
     reasons.push('Terraform bundle still creates aws_vpc.main without default-VPC conditional mode.');
   }
 
@@ -771,6 +859,56 @@ export async function POST(req: NextRequest) {
 
     const provider = clampProvider(body.provider);
     const projectName = String(owned.project?.name || owned.project?.full_name || projectId).split('/').pop() || projectId;
+    const customizationSnapshotId = String(body.customization_snapshot_id || '').trim();
+    const tenantId = String(body.tenant_id || '').trim();
+    if (Boolean(customizationSnapshotId) !== Boolean(tenantId)) {
+      return NextResponse.json(
+        { error: 'customization_snapshot_id and tenant_id must be provided together' },
+        { status: 400 },
+      );
+    }
+    let snapshotSource: CustomizationSnapshotSource | null = null;
+    if (customizationSnapshotId && tenantId) {
+      try {
+        snapshotSource = await resolveCustomizationSnapshot({
+          userId: String(user.id),
+          projectId,
+          tenantId,
+          snapshotId: customizationSnapshotId,
+        });
+      } catch (snapshotError) {
+        const status = snapshotError instanceof SnapshotResolutionError ? snapshotError.status : 502;
+        return NextResponse.json(
+          { error: snapshotError instanceof Error ? snapshotError.message : 'Snapshot validation failed.' },
+          { status },
+        );
+      }
+      const iacSource = body.iac_source || {};
+      if (
+        String(iacSource.kind || '') !== 'customization_snapshot'
+        || String(iacSource.snapshot_id || '') !== snapshotSource.snapshot_id
+        || String(iacSource.tenant_id || '') !== snapshotSource.tenant_id
+        || String(iacSource.source_tree_hash || '') !== snapshotSource.source_tree_hash
+      ) {
+        return NextResponse.json(
+          { error: 'Generated IaC source metadata does not match the validated customization snapshot. Regenerate Stage 8.' },
+          { status: 409 },
+        );
+      }
+    }
+    const customizationSource = snapshotSource
+      ? {
+          kind: snapshotSource.kind,
+          project_id: snapshotSource.project_id,
+          tenant_id: snapshotSource.tenant_id,
+          snapshot_id: snapshotSource.snapshot_id,
+          snapshot_path: snapshotSource.snapshot_path,
+          agentic_source_root: snapshotSource.agentic_source_root,
+          source_tree_hash: snapshotSource.source_tree_hash,
+          created_at: snapshotSource.created_at,
+          status: snapshotSource.status,
+        }
+      : null;
     const estimatedMonthlyUsd = Number(body.estimated_monthly_usd);
     const budgetLimitUsd = Number(body.budget_limit_usd);
     if (
@@ -804,7 +942,10 @@ export async function POST(req: NextRequest) {
             project_id: projectId,
             service_type: body.service_type,
             repo_context: { ...((body.repo_context as Record<string, unknown>) ?? {}), project_name: projectName },
-            user_customizations: body.customizations ?? body.user_customizations ?? {},
+            user_customizations: {
+              ...(body.customizations ?? body.user_customizations ?? {}),
+              ...(customizationSource ? { customization_source: customizationSource } : {}),
+            },
             aws_credentials: {
               access_key_id: body.aws_access_key_id,
               secret_access_key: body.aws_secret_access_key,
@@ -842,6 +983,12 @@ export async function POST(req: NextRequest) {
     const workspace = String(body.workspace || '').trim();
     const baseFiles = Array.isArray(body.files) ? body.files : [];
     const useRunReference = runtimeMode && Boolean(runId && workspace);
+    if (snapshotSource && !useRunReference) {
+      return NextResponse.json(
+        { error: 'Snapshot deployments require the validated saved Terraform run from Stage 8. Regenerate infrastructure and retry.' },
+        { status: 409 },
+      );
+    }
     if (baseFiles.length === 0 && !useRunReference) {
       return NextResponse.json(
         { error: 'No generated IaC files provided. Generate Terraform/Ansible first.' },
@@ -892,10 +1039,23 @@ export async function POST(req: NextRequest) {
         }
         : null;
       if (staleReasons.length > 0) {
-        console.warn('Runtime deploy received potentially stale Terraform bundle:', {
+        console.warn('Runtime deploy blocked: stale Terraform bundle:', {
           project_id: projectId,
           reasons: staleReasons,
         });
+        return NextResponse.json(
+          {
+            success: false,
+            error: [
+              'Terraform bundle is outdated for current AWS runtime safety constraints.',
+              ...staleReasons,
+              'Regenerate Infrastructure (Stage 8), then click Start Deploy again.',
+            ].join(' '),
+            stale_bundle_warning: staleBundleWarning,
+            recommended_actions: staleBundleWarning?.recommended_actions || [],
+          },
+          { status: 409 },
+        );
       }
 
       const awsAccessKeyId = String(body.aws_access_key_id || '').trim();
@@ -935,6 +1095,13 @@ export async function POST(req: NextRequest) {
         aws_region: awsRegion,
         enforce_free_tier_ec2: enforceFreeTierEc2,
         confirm_plan_summary: body.confirm_plan_summary === true,
+        deployment_metadata: {
+          user_customizations: {
+            ...(body.user_customizations || {}),
+            ...(customizationSource ? { customization_source: customizationSource } : {}),
+          },
+          customization_source: customizationSource,
+        },
       };
       let agenticRes: Response | null = null;
       let recoveredApplyResult: Record<string, unknown> | null = null;
@@ -1021,6 +1188,7 @@ export async function POST(req: NextRequest) {
             projectName,
             awsAccessKeyId,
             awsSecretAccessKey,
+            awsSessionToken,
             awsRegion,
             instanceId: extractOutputString(runtimeOutputPayload, ['ec2_instance_id', 'instance_id']),
           }).catch(() => null);
@@ -1040,7 +1208,11 @@ export async function POST(req: NextRequest) {
             });
             const verification = await waitForRuntimeVerification({
               cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
-              publicIp: normalizedRuntime.ec2.public_ip,
+              albUrl: normalizedRuntime.network.alb_url,
+              appUrl: normalizedRuntime.cdn.app_url
+                || extractOutputString(runtimeOutputPayload, ['app_url', 'application_url', 'site_url']),
+              healthCheckUrl: extractOutputString(runtimeOutputPayload, ['health_check_url', 'health_url']),
+              publicIp: normalizedRuntime.network.elastic_ip || normalizedRuntime.ec2.public_ip,
             });
             if (!verification.verified) {
               return NextResponse.json(
@@ -1062,7 +1234,12 @@ export async function POST(req: NextRequest) {
               provider,
               project_id: projectId,
               mode: 'runtime_apply',
+              app_url: normalizedRuntime.cdn.app_url
+                || (normalizedRuntime.ec2.public_ip ? `http://${normalizedRuntime.ec2.public_ip}` : null),
               cloudfront_url: normalizedRuntime.cdn.cloudfront_url,
+              alb_url: normalizedRuntime.network.alb_url,
+              alb_dns_name: normalizedRuntime.network.alb_dns_name,
+              elastic_ip: normalizedRuntime.network.elastic_ip,
               outputs: runtimeOutputPayload ?? {},
               raw_outputs: runtimeOutputPayload ?? {},
               details: mergedDetails,
@@ -1115,6 +1292,7 @@ export async function POST(req: NextRequest) {
           projectName,
           awsAccessKeyId,
           awsSecretAccessKey,
+          awsSessionToken,
           awsRegion,
           instanceId: extractOutputString(runtimeOutputPayload, ['ec2_instance_id', 'instance_id']),
         }).catch(() => null)
@@ -1144,6 +1322,7 @@ export async function POST(req: NextRequest) {
       const mergedDetails = {
         ...(applyDetails || {}),
         ...(runtimeDetails ? { live_runtime_details: runtimeDetails } : {}),
+        ...(customizationSource ? { customization_source: customizationSource } : {}),
       };
       const normalizedRuntime = normalizeDeploymentRuntime({
         cloudfrontUrl: typeof applyData.cloudfront_url === 'string' ? applyData.cloudfront_url : null,
@@ -1153,9 +1332,11 @@ export async function POST(req: NextRequest) {
       });
       const verification = await waitForRuntimeVerification({
         cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
-        appUrl: extractOutputString(runtimeOutputPayload, ['app_url', 'application_url', 'site_url']),
+        albUrl: normalizedRuntime.network.alb_url,
+        appUrl: normalizedRuntime.cdn.app_url
+          || extractOutputString(runtimeOutputPayload, ['app_url', 'application_url', 'site_url']),
         healthCheckUrl: extractOutputString(runtimeOutputPayload, ['health_check_url', 'health_url']),
-        publicIp: normalizedRuntime.ec2.public_ip,
+        publicIp: normalizedRuntime.network.elastic_ip || normalizedRuntime.ec2.public_ip,
       });
       if (!verification.verified && !hasDbResources) {
         return NextResponse.json(
@@ -1177,11 +1358,16 @@ export async function POST(req: NextRequest) {
         provider,
         project_id: projectId,
         mode: 'runtime_apply',
-        app_url: normalizedRuntime.ec2.public_ip ? `http://${normalizedRuntime.ec2.public_ip}` : null,
+        app_url: normalizedRuntime.cdn.app_url
+          || (normalizedRuntime.ec2.public_ip ? `http://${normalizedRuntime.ec2.public_ip}` : null),
         cloudfront_url: normalizedRuntime.cdn.cloudfront_url,
+        alb_url: normalizedRuntime.network.alb_url,
+        alb_dns_name: normalizedRuntime.network.alb_dns_name,
+        elastic_ip: normalizedRuntime.network.elastic_ip,
         outputs: runtimeOutputPayload ?? {},
         raw_outputs: runtimeOutputPayload ?? {},
         details: mergedDetails,
+        customization_source: customizationSource,
         sensitive_output_arns:
           (applyDetails as Record<string, unknown> | undefined)?.sensitive_output_arns ?? null,
         ec2_key_name: normalizedRuntime.keypair.key_name,

@@ -1,0 +1,41 @@
+module "ec2" {
+  count                       = var.enabled ? 1 : 0
+  source                      = "{{ source }}"
+  version                     = "{{ version }}"
+  name                        = "${var.project_name}-${var.environment}-app"
+  ami                         = var.ami_id
+  instance_type               = var.instance_type
+  subnet_id                   = var.subnet_id
+  vpc_security_group_ids      = [aws_security_group.app[0].id]
+  iam_instance_profile        = var.instance_profile_name
+  key_name                    = local.ec2_key_name
+  associate_public_ip_address = !var.enable_eip
+
+  root_block_device = [
+    {
+      encrypted   = true
+      volume_type = "gp3"
+      volume_size = {{ root_volume_size_gb }}
+    }
+  ]
+
+  metadata_options = {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  user_data = join("\n", [
+    "#!/bin/bash",
+    "set -euxo pipefail",
+    "dnf install -y nginx",
+    "mkdir -p /usr/share/nginx/html",
+    "cat <<'HTML' > /usr/share/nginx/html/index.html",
+    "${base64decode(var.bootstrap_index_html_base64)}",
+    "HTML",
+    "systemctl enable nginx",
+    "systemctl restart nginx"
+  ])
+
+  tags = merge(var.common_tags, { Name = "${var.project_name}-${var.environment}-app" })
+}

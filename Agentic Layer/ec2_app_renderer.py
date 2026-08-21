@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+from pathlib import Path
 from typing import Any
 
 from deployment_packager import DeploymentPackage
@@ -237,6 +238,15 @@ def render_ec2_app_bundle(
     instance_type = str(ec2_settings["instance_type"])
     app_port = int(ec2_settings["app_port"])
     root_volume_size_gb = int(ec2_settings["root_volume_size_gb"])
+    try:
+        from runtime_catalog import get_runtime_recipe
+
+        recipe = get_runtime_recipe(deployment_package.app_kind)
+        if recipe is not None:
+            root_volume_size_gb = max(root_volume_size_gb, int(recipe.min_root_volume_gb))
+    except Exception:
+        if str(deployment_package.app_kind or "").strip().lower() == "docker":
+            root_volume_size_gb = max(root_volume_size_gb, 40)
     ssh_ingress_cidr_blocks = list(ec2_settings["ssh_ingress_cidr_blocks"])
 
     # ── Database: merge detected repo requirements with profile settings ──────
@@ -267,11 +277,46 @@ def render_ec2_app_bundle(
     jwt_secret = _hashlib.sha256(f"deplai-jwt-{project_slug}".encode()).hexdigest()
 
     app_env_vars = _build_app_env_vars(deployment_package, database)
-    # Always inject a JWT_SECRET so auth frameworks don't crash even when there
-    # is no user-supplied secret.
+    # Bootstrap-only non-secret defaults. Operator OAuth/API secrets come from
+    # AWS Secrets Manager at boot — never embed plaintext into HCL/userdata.
     app_env_vars.setdefault("JWT_SECRET", jwt_secret)
+    app_env_vars.setdefault("NEXTAUTH_SECRET", jwt_secret)
+    app_env_vars.setdefault("AUTH_SECRET", jwt_secret)
     app_env_vars.setdefault("NODE_ENV", "production")
     app_env_vars.setdefault("PORT", str(app_port))
+
+    runtime_config = _record((deployment_profile or {}).get("runtime_config"))
+    secrets_manager_prefix = str(
+        runtime_config.get("secrets_manager_prefix")
+        or f"/{project_slug}/{environment}"
+    ).strip() or f"/{project_slug}/{environment}"
+    if not secrets_manager_prefix.startswith("/"):
+        secrets_manager_prefix = f"/{secrets_manager_prefix}"
+    secrets_manager_prefix = secrets_manager_prefix.rstrip("/") or f"/{project_slug}/{environment}"
+    required_secret_names = [
+        str(item).strip()
+        for item in (runtime_config.get("required_secrets") or [])
+        if str(item).strip()
+    ]
+
+    auth_requirements = None
+    try:
+        from auth_provisioning import auth_warnings, detect_auth_requirements, public_url_bootstrap_bash
+
+        source_root = Path(str(deployment_package.source_root or "")).expanduser()
+        if source_root.exists():
+            auth_requirements = detect_auth_requirements(source_root, user_answers=user_answers)
+            for key in auth_requirements.required_secret_keys:
+                if key not in required_secret_names and key.upper() not in {
+                    "JWT_SECRET",
+                    "NEXTAUTH_SECRET",
+                    "AUTH_SECRET",
+                }:
+                    required_secret_names.append(key)
+    except Exception:
+        auth_requirements = None
+        public_url_bootstrap_bash = None  # type: ignore[assignment]
+        auth_warnings = None  # type: ignore[assignment]
 
     redis = _redis_settings(deployment_profile)
     backend_tf = 'terraform {\n  backend "local" {}\n}\n'
@@ -485,6 +530,16 @@ variable "has_prisma" {{
   type    = bool
   default = {str(bool(repo_db.has_prisma)).lower()}
 }}
+
+variable "secrets_manager_prefix" {{
+  type    = string
+  default = {_hcl_string(secrets_manager_prefix)}
+}}
+
+variable "required_secret_names" {{
+  type    = list(string)
+  default = {_hcl_string_list(required_secret_names)}
+}}
 '''
 
     # Build tfvars env map — when RDS is enabled the DATABASE_URL contains
@@ -493,6 +548,27 @@ variable "has_prisma" {{
     # For the tfvars file we only include non-interpolated vars.
     static_env_vars = {k: v for k, v in app_env_vars.items() if "${" not in v}
     interpolated_env_vars = {k: v for k, v in app_env_vars.items() if "${" in v}
+
+    static_env_lines: list[str] = []
+    for key, value in sorted(static_env_vars.items()):
+        if key == "PORT":
+            static_env_lines.append('"PORT=${var.app_port}"')
+        else:
+            static_env_lines.append(json.dumps(f"{key}={value}"))
+    if not static_env_lines:
+        static_env_lines = [
+            '"NODE_ENV=production"',
+            '"PORT=${var.app_port}"',
+            json.dumps(f"JWT_SECRET={jwt_secret}"),
+        ]
+    static_env_block_items = ",\n    ".join(static_env_lines)
+
+    public_url_bash = ""
+    auth_warning_lines: list[str] = []
+    if auth_requirements is not None and public_url_bootstrap_bash is not None:
+        public_url_bash = public_url_bootstrap_bash(auth_requirements.callback_paths)
+        if auth_warnings is not None:
+            auth_warning_lines = auth_warnings(auth_requirements)
 
     tfvars = f'''project_name = {_hcl_string(project_slug)}
 aws_region = {_hcl_string(aws_region)}
@@ -527,6 +603,8 @@ enable_elasticache = {str(bool(redis["enabled"])).lower()}
 redis_node_type = {_hcl_string(redis.get("node_type"))}
 redis_engine_version = {_hcl_string(redis.get("engine_version"))}
 has_prisma = {str(bool(repo_db.has_prisma)).lower()}
+secrets_manager_prefix = {_hcl_string(secrets_manager_prefix)}
+required_secret_names = {_hcl_string_list(required_secret_names)}
 '''
 
     main_tf = f'''locals {{
@@ -539,16 +617,19 @@ has_prisma = {str(bool(repo_db.has_prisma)).lower()}
   # Static env vars always injected into the app .env file.
   # DB vars are added at runtime via a separate locals block (below)
   # that uses try() so they are safe when enable_rds=false.
+  # Includes generated JWT/NEXTAUTH fallbacks only — OAuth/API secrets come from Secrets Manager at boot.
   static_env_block = join("\\n", [
-    "NODE_ENV=production",
-    "PORT=${{var.app_port}}",
-    "JWT_SECRET={jwt_secret}",
+    {static_env_block_items}
   ])
 }}
 '''
 
     main_tf_resources = r'''
 
+
+data "aws_caller_identity" "current" {}
+
+data "aws_partition" "current" {}
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -863,15 +944,35 @@ resource "aws_iam_role_policy" "ec2_logs" {
   role        = aws_iam_role.ec2.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents"
-      ]
-      Resource = "*"
-    }]
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "*"
+      },
+      {
+        # ListSecrets cannot be resource-scoped; Get/Describe are limited to this app prefix.
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:ListSecrets"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ]
+        Resource = [
+          "arn:${data.aws_partition.current.partition}:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:${var.secrets_manager_prefix}*"
+        ]
+      }
+    ]
   })
 }
 
@@ -936,6 +1037,48 @@ fi
 if [ "$APP_KIND" = "python" ]; then
   dnf install -y python3 python3-pip
 fi
+if [ "$APP_KIND" = "go" ]; then
+  dnf install -y golang
+fi
+if [ "$APP_KIND" = "java" ]; then
+  dnf install -y java-17-amazon-corretto-devel maven
+fi
+if [ "$APP_KIND" = "dotnet" ]; then
+  rpm --import https://packages.microsoft.com/keys/microsoft.asc || true
+  curl -fsSL -o /tmp/packages-microsoft-prod.rpm https://packages.microsoft.com/config/centos/7/packages-microsoft-prod.rpm || true
+  rpm -Uvh /tmp/packages-microsoft-prod.rpm || true
+  dnf install -y dotnet-sdk-8.0 || dnf install -y dotnet-sdk-6.0 || true
+fi
+if [ "$APP_KIND" = "php" ]; then
+  dnf install -y php php-cli php-fpm php-mbstring php-xml php-mysqlnd unzip
+  if ! command -v composer >/dev/null 2>&1; then
+    curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+  fi
+fi
+if [ "$APP_KIND" = "ruby" ]; then
+  dnf install -y ruby ruby-devel gcc make redhat-rpm-config
+  gem install bundler --no-document || true
+fi
+if [ "$APP_KIND" = "rust" ]; then
+  if ! command -v cargo >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    . "$HOME/.cargo/env"
+  fi
+fi
+if [ "$APP_KIND" = "docker" ]; then
+  dnf install -y docker
+  systemctl enable --now docker
+  usermod -aG docker ec2-user || true
+  mkdir -p /usr/local/lib/docker/cli-plugins
+  if [ ! -x /usr/local/lib/docker/cli-plugins/docker-compose ]; then
+    curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64" \
+      -o /usr/local/lib/docker/cli-plugins/docker-compose
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+  fi
+  docker version
+  docker compose version || true
+  write_status "docker_engine_ready"
+fi
 write_status "runtime_packages_installed"
 
 unpack_embedded_archive() {
@@ -983,19 +1126,77 @@ if [ "$APP_KIND" = "node" ]; then
   npm cache clean --force || true
   if [ -f package-lock.json ]; then npm ci --legacy-peer-deps || npm install --legacy-peer-deps; else npm install --legacy-peer-deps; fi
   if [ -n "$BUILD_COMMAND" ]; then export NODE_OPTIONS="--max-old-space-size=4096"; $BUILD_COMMAND; fi
+  # CRA/Vite production builds should be served as static assets, not via webpack-dev `npm start`.
+  for candidate in build dist out; do
+    if [ -d "$APP_DIR/$candidate" ] && [ -f "$APP_DIR/$candidate/index.html" ]; then
+      APP_KIND="static"
+      APP_DIR="$APP_DIR/$candidate"
+      APP_PORT="80"
+      write_status "node_build_exported_as_static_$candidate"
+      break
+    fi
+  done
 fi
-if [ "$APP_KIND" = "python" ] && [ -f requirements.txt ]; then
-  python3 -m pip install -r requirements.txt
+if [ "$APP_KIND" = "python" ]; then
+  if [ -f requirements.txt ]; then
+    python3 -m pip install -r requirements.txt
+  elif [ -f pyproject.toml ]; then
+    python3 -m pip install .
+  fi
+  if [ -n "$BUILD_COMMAND" ] && [ "$BUILD_COMMAND" != "python3 -m pip install -r requirements.txt" ] && [ "$BUILD_COMMAND" != "python3 -m pip install ." ]; then
+    bash -lc "$BUILD_COMMAND" || true
+  fi
+fi
+if [ "$APP_KIND" = "go" ] || [ "$APP_KIND" = "java" ] || [ "$APP_KIND" = "dotnet" ] || [ "$APP_KIND" = "php" ] || [ "$APP_KIND" = "ruby" ] || [ "$APP_KIND" = "rust" ]; then
+  if [ -n "$BUILD_COMMAND" ]; then
+    write_status "language_build_started"
+    bash -lc "cd '$APP_DIR' && $BUILD_COMMAND"
+    write_status "language_build_done"
+  fi
+fi
+if [ "$APP_KIND" = "docker" ]; then
+  write_status "docker_build_or_compose_pending"
 fi
 write_status "application_dependencies_ready"
 
 # ── Write .env file with injected environment variables ──────────────────────
 # local.app_env_block is computed by Terraform before EC2 boots. It contains
 # the actual DATABASE_URL (resolved from RDS outputs) and static vars like
-# NODE_ENV, PORT, JWT_SECRET. The shell never sees raw ${...} expressions.
+# NODE_ENV, PORT, JWT_SECRET. The shell never sees raw Terraform interpolations.
 printf '%s\n' '${local.app_env_block}' > "$APP_DIR/.env"
 chmod 600 "$APP_DIR/.env" || true
 write_status "env_file_written"
+
+# ── Pull application secrets from AWS Secrets Manager (never logged) ────────
+SECRETS_PREFIX="${var.secrets_manager_prefix}"
+AWS_REGION_BOOT="${var.aws_region}"
+if [ -n "$SECRETS_PREFIX" ]; then
+  write_status "secrets_manager_fetch_started"
+  dnf install -y awscli || true
+  SECRET_NAMES="$(aws secretsmanager list-secrets --region "$AWS_REGION_BOOT" --filters Key=name,Values="$SECRETS_PREFIX" --query 'SecretList[].Name' --output text 2>/dev/null || true)"
+  if [ -n "$SECRET_NAMES" ]; then
+    echo "$SECRET_NAMES" | tr '\t' '\n' | while read -r SECRET_NAME; do
+      [ -z "$SECRET_NAME" ] && continue
+      case "$SECRET_NAME" in
+        "$SECRETS_PREFIX"/*)
+          SECRET_KEY="$${SECRET_NAME##*/}"
+          [ -z "$SECRET_KEY" ] && continue
+          SECRET_VALUE="$(aws secretsmanager get-secret-value --region "$AWS_REGION_BOOT" --secret-id "$SECRET_NAME" --query SecretString --output text 2>/dev/null || true)"
+          if [ -n "$SECRET_VALUE" ]; then
+            # Remove any prior key assignment, then append (value never echoed).
+            grep -v "^$${SECRET_KEY}=" "$APP_DIR/.env" > "$APP_DIR/.env.tmp" 2>/dev/null || cp "$APP_DIR/.env" "$APP_DIR/.env.tmp"
+            printf '%s=%s\n' "$SECRET_KEY" "$SECRET_VALUE" >> "$APP_DIR/.env.tmp"
+            mv "$APP_DIR/.env.tmp" "$APP_DIR/.env"
+          fi
+          ;;
+      esac
+    done
+  fi
+  chmod 600 "$APP_DIR/.env" || true
+  write_status "secrets_manager_fetch_done"
+fi
+
+__DEPLAI_PUBLIC_URL_BOOTSTRAP__
 
 # ── Prisma: generate client and run migrations ───────────────────────────────
 # Run only for node apps that have a prisma directory (detected at build time).
@@ -1022,6 +1223,59 @@ if [ "$APP_KIND" = "static" ]; then
   rm -rf /usr/share/nginx/html/*
   cp -R "$APP_DIR"/. /usr/share/nginx/html/
   write_status "static_site_staged"
+elif [ "$APP_KIND" = "docker" ]; then
+  cd "$APP_DIR"
+  ENV_FILE_ARGS=()
+  if [ -f "$APP_DIR/.env" ]; then
+    ENV_FILE_ARGS=(--env-file "$APP_DIR/.env")
+  fi
+  if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ] || [ -f compose.yml ] || [ -f compose.yaml ]; then
+    COMPOSE_FILE=""
+    for candidate in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+      if [ -f "$candidate" ]; then COMPOSE_FILE="$candidate"; break; fi
+    done
+    write_status "docker_compose_up_started"
+    if [ -f "$APP_DIR/.env" ]; then
+      docker compose -f "$COMPOSE_FILE" --env-file "$APP_DIR/.env" up -d --build
+    else
+      docker compose -f "$COMPOSE_FILE" up -d --build
+    fi
+    # Compose typically publishes its own host ports; avoid fighting nginx on :80.
+    systemctl stop nginx || true
+    systemctl disable nginx || true
+    write_status "docker_compose_up_done"
+  elif [ -f Dockerfile ] || [ -f dockerfile ]; then
+    DOCKERFILE="Dockerfile"
+    [ -f dockerfile ] && [ ! -f Dockerfile ] && DOCKERFILE="dockerfile"
+    write_status "docker_image_build_started"
+    docker build -t "$APP_NAME:latest" -f "$DOCKERFILE" .
+    write_status "docker_image_build_done"
+    docker rm -f "$APP_NAME" || true
+    docker run -d --name "$APP_NAME" --restart unless-stopped \
+      -p "127.0.0.1:$APP_PORT:$APP_PORT" \
+      "$${ENV_FILE_ARGS[@]}" \
+      -e PORT="$APP_PORT" \
+      "$APP_NAME:latest"
+    cat >/etc/nginx/conf.d/deplai-app.conf <<NGINX
+server {
+  listen 80 default_server;
+  server_name _;
+  location / {
+    proxy_pass http://127.0.0.1:$APP_PORT;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+NGINX
+    write_status "docker_container_started"
+  else
+    write_status "docker_artifacts_missing"
+    exit 1
+  fi
+  write_status "application_service_started"
 else
   if [ "$APP_KIND" = "node" ]; then
     npm install -g pm2
@@ -1033,6 +1287,7 @@ else
     fi
     pm2 save
   else
+    # python | go | java | dotnet | php | ruby | rust (and any future catalog language)
     cat >/etc/systemd/system/deplai-app.service <<SERVICE
 [Unit]
 Description=DeplAI deployed application
@@ -1042,7 +1297,10 @@ After=network.target
 Type=simple
 WorkingDirectory=$APP_DIR
 Environment=PORT=$APP_PORT
-ExecStart=/bin/bash -lc "$START_COMMAND"
+Environment=APP_PORT=$APP_PORT
+Environment=ASPNETCORE_URLS=http://0.0.0.0:$APP_PORT
+EnvironmentFile=-$APP_DIR/.env
+ExecStart=/bin/bash -lc "cd '$APP_DIR' && $START_COMMAND"
 Restart=always
 RestartSec=5
 
@@ -1069,12 +1327,19 @@ server {
 NGINX
 fi
 
-nginx -t
-systemctl enable --now nginx
-systemctl restart nginx
-write_status "nginx_started"
+if [ "$APP_KIND" = "static" ] || [ -f /etc/nginx/conf.d/deplai-app.conf ]; then
+  nginx -t
+  systemctl enable --now nginx
+  systemctl restart nginx
+  write_status "nginx_started"
+else
+  write_status "nginx_skipped_container_publishes_ports"
+fi
 for attempt in $(seq 1 30); do
-  if curl -fsS "http://127.0.0.1:$APP_PORT$HEALTH_PATH" || curl -fsS "http://127.0.0.1:$APP_PORT/"; then
+  if curl -fsS "http://127.0.0.1:$APP_PORT$HEALTH_PATH" \
+    || curl -fsS "http://127.0.0.1:$APP_PORT/" \
+    || curl -fsS "http://127.0.0.1$HEALTH_PATH" \
+    || curl -fsS "http://127.0.0.1/"; then
     write_status "ready"
     exit 0
   fi
@@ -1088,6 +1353,8 @@ systemctl status nginx --no-pager || true
 systemctl status deplai-app --no-pager || true
 journalctl -u deplai-app --no-pager -n 80 || true
 pm2 status || true
+docker ps || true
+docker compose ps || true
 exit 1
 USERDATA
   )
@@ -1196,6 +1463,27 @@ output "cloudfront_url" {
 }
 '''
 
+    main_tf_resources = main_tf_resources.replace(
+        "__DEPLAI_PUBLIC_URL_BOOTSTRAP__",
+        public_url_bash.strip() if public_url_bash else 'write_status "public_url_skipped"',
+    )
+
+    auth_readme = ""
+    if auth_requirements is not None:
+        auth_readme = "\n".join(
+            [
+                "",
+                "## Auth / OAuth",
+                f"- Providers detected: {', '.join(auth_requirements.providers) or 'none'}",
+                f"- Callback paths to register: {', '.join(auth_requirements.callback_paths[:6])}",
+                *(f"- {line}" for line in auth_warning_lines),
+                "- Supply OAuth/API secrets in the App Secrets tab (AWS Secrets Manager).",
+                "- DeplAI injects NEXTAUTH_URL/APP_URL from the instance public IP at boot.",
+                f"- Secrets Manager prefix: `{secrets_manager_prefix}`",
+                "",
+            ]
+        )
+
     readme = f'''# DeplAI EC2 App Deployment
 
 Generated by the deterministic `deplai_ec2_app` renderer. No LLM generated Terraform.
@@ -1210,7 +1498,7 @@ Generated by the deterministic `deplai_ec2_app` renderer. No LLM generated Terra
 - Package bytes: `{deployment_package.package_bytes}`
 - RDS enabled: `{bool(database["enabled"])}`
 - ElastiCache enabled: `{bool(redis["enabled"])}`
-
+{auth_readme}
 {context_summary}
 '''
 
@@ -1225,6 +1513,12 @@ Generated by the deterministic `deplai_ec2_app` renderer. No LLM generated Terra
     ]
 
     package_manifest = deployment_package.as_manifest()
+    if auth_requirements is not None:
+        package_manifest["auth"] = auth_requirements.as_dict()
+        package_manifest["warnings"] = [
+            *list(package_manifest.get("warnings") or []),
+            *auth_warning_lines,
+        ]
     return {
         "files": files,
         "manifest": [
@@ -1239,4 +1533,8 @@ Generated by the deterministic `deplai_ec2_app` renderer. No LLM generated Terra
         "dag_order": ["ec2_app"],
         "package_manifest": package_manifest,
         "provider_version": PROVIDER_VERSION,
+        "warnings": [
+            *list(deployment_package.warnings or []),
+            *auth_warning_lines,
+        ],
     }

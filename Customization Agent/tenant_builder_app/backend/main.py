@@ -1,11 +1,13 @@
 import json
 import difflib
 import hashlib
+import http.client
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlencode, urlsplit
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request as FastAPIRequest, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -20,8 +22,21 @@ from services.asset_service import (
     store_asset,
 )
 from services.manifest_validator import ManifestValidationError
-from services.preview_manager import preview_status, start_preview, stop_preview
+from services.preview_manager import (
+    get_preview_upstream_url,
+    preview_status,
+    start_preview,
+    stop_preview,
+)
 from services.repo_service import get_tenant_repo_path, reset_tenant_repo
+from services.snapshot_manager import (
+    SnapshotError,
+    create_snapshot,
+    get_latest_snapshot,
+    get_snapshot,
+    load_implementation_record,
+    write_implementation_record,
+)
 
 
 class LlmConfig(BaseModel):
@@ -61,6 +76,13 @@ class PreviewRequest(BaseModel):
     tenant_id: str
     base_repo_path: str | None = None
     app_targets: list[str] | None = None
+    force_restart: bool = False
+
+
+class SnapshotCreateRequest(BaseModel):
+    tenant_id: str
+    base_repo_path: str | None = None
+    quality_report: dict[str, Any] | None = None
 
 
 app = FastAPI(title="Tenant Builder API", version="0.1.0")
@@ -418,6 +440,29 @@ def implement_tenant(request: ImplementRequest) -> dict:
                 if source.get("operation"):
                     entry["operation"] = source.get("operation")
 
+    quality_report = result.get("quality_report", {"status": "not_run", "checks": []})
+    implementation_record_path = (
+        BACKEND_DIR
+        / "tenants"
+        / normalized_tenant_id
+        / "latest-implementation.json"
+    )
+    try:
+        write_implementation_record(
+            record_path=implementation_record_path,
+            tenant_id=normalized_tenant_id,
+            base_repo_path=str(resolved_base_repo_path),
+            source_repo_path=str(tenant_repo_path),
+            manifest=manifest,
+            quality_report=quality_report,
+            run_id=str(result.get("run_id", "")),
+        )
+    except (OSError, SnapshotError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Implementation completed but its snapshot handoff record could not be written: {exc}",
+        ) from exc
+
     return {
         "status": "implementation_complete" if normalized_modified_files else "no_changes",
         "run_id": result.get("run_id", ""),
@@ -429,7 +474,7 @@ def implement_tenant(request: ImplementRequest) -> dict:
         "modified_files": normalized_modified_files,
         "modified_file_diffs": modified_file_diffs,
         "change_sources": result.get("change_sources", []),
-        "quality_report": result.get("quality_report", {"status": "not_run", "checks": []}),
+        "quality_report": quality_report,
         "preview": result.get("preview"),
         "diagnostic": result.get("diagnostic"),
         "errors": errors,
@@ -447,6 +492,20 @@ def start_tenant_preview(request: PreviewRequest) -> dict:
         tenant_id=tenant_id,
         base_repo_path=str(resolved_base_repo_path),
         app_targets=app_targets,
+        force_restart=request.force_restart,
+    )
+
+
+@app.post("/api/tenant/preview/restart")
+def restart_tenant_preview(request: PreviewRequest) -> dict:
+    tenant_id = state.ensure_tenant(request.tenant_id.strip())
+    resolved_base_repo_path = _resolve_base_repo_path(request.base_repo_path)
+    app_targets = _normalize_app_targets(request.app_targets)
+    return start_preview(
+        tenant_id=tenant_id,
+        base_repo_path=str(resolved_base_repo_path),
+        app_targets=app_targets,
+        force_restart=True,
     )
 
 
@@ -468,6 +527,224 @@ def stop_tenant_preview(request: PreviewRequest) -> dict:
         tenant_id=tenant_id,
         base_repo_path=str(resolved_base_repo_path),
     )
+
+
+def _proxy_tenant_preview_content(
+    *,
+    http_request: FastAPIRequest,
+    tenant_id: str,
+    base_repo_path: str | None,
+    asset_path: str,
+) -> Response:
+    normalized_tenant_id = state.ensure_tenant(tenant_id.strip())
+    resolved_base_repo_path = _resolve_base_repo_path(base_repo_path)
+    status = preview_status(
+        tenant_id=normalized_tenant_id,
+        base_repo_path=str(resolved_base_repo_path),
+    )
+    if (
+        status.get("kind") != "live_server"
+        or status.get("status") != "ready"
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=status.get("detail") or "Live preview is not ready.",
+        )
+
+    upstream_url = get_preview_upstream_url(
+        tenant_id=normalized_tenant_id,
+        base_repo_path=str(resolved_base_repo_path),
+    )
+    if not upstream_url:
+        raise HTTPException(status_code=503, detail="Live preview process is no longer available.")
+    parsed_url = urlsplit(upstream_url)
+    if parsed_url.scheme != "http" or parsed_url.hostname != "127.0.0.1" or parsed_url.port is None:
+        raise HTTPException(status_code=502, detail="Preview manager returned an unsafe upstream URL.")
+    normalized_asset_path = str(asset_path or "").replace("\\", "/").lstrip("/")
+    if "\0" in normalized_asset_path:
+        raise HTTPException(status_code=400, detail="Invalid preview asset path.")
+    upstream_path = "/" + quote(normalized_asset_path, safe="/@._~-")
+    forwarded_query = [
+        (key, value)
+        for key, value in http_request.query_params.multi_items()
+        if key not in {"tenant_id", "tenantId", "base_repo_path", "project_id", "projectId", "meta"}
+    ]
+    if forwarded_query:
+        upstream_path = f"{upstream_path}?{urlencode(forwarded_query)}"
+
+    connection = http.client.HTTPConnection("127.0.0.1", parsed_url.port, timeout=20)
+    try:
+        connection.request(
+            "GET",
+            upstream_path,
+            headers={
+                "Accept": http_request.headers.get("accept", "*/*"),
+                "User-Agent": http_request.headers.get("user-agent", "DeplAI Preview Proxy"),
+            },
+        )
+        upstream = connection.getresponse()
+        body = upstream.read(25 * 1024 * 1024 + 1)
+        if len(body) > 25 * 1024 * 1024:
+            raise HTTPException(status_code=502, detail="Preview response exceeded the 25 MB proxy limit.")
+        headers: dict[str, str] = {}
+        content_type = upstream.getheader("content-type")
+        location = upstream.getheader("location")
+        if content_type:
+            headers["content-type"] = content_type
+        if location:
+            headers["location"] = location
+        return Response(content=body, status_code=upstream.status, headers=headers)
+    except (OSError, http.client.HTTPException) as exc:
+        raise HTTPException(status_code=502, detail=f"Live preview proxy failed: {exc}") from exc
+    finally:
+        connection.close()
+
+
+@app.get("/api/tenant/preview/content")
+def proxy_tenant_preview_root(
+    http_request: FastAPIRequest,
+    tenant_id: str,
+    base_repo_path: str | None = None,
+) -> Response:
+    return _proxy_tenant_preview_content(
+        http_request=http_request,
+        tenant_id=tenant_id,
+        base_repo_path=base_repo_path,
+        asset_path="",
+    )
+
+
+@app.get("/api/tenant/preview/content/{asset_path:path}")
+def proxy_tenant_preview_asset(
+    asset_path: str,
+    http_request: FastAPIRequest,
+    tenant_id: str,
+    base_repo_path: str | None = None,
+) -> Response:
+    return _proxy_tenant_preview_content(
+        http_request=http_request,
+        tenant_id=tenant_id,
+        base_repo_path=base_repo_path,
+        asset_path=asset_path,
+    )
+
+
+def _snapshot_request_context(
+    tenant_id: str,
+    base_repo_path: str | None,
+) -> tuple[str, Path, dict[str, Any], dict[str, Any]]:
+    normalized_tenant_id = state.ensure_tenant(tenant_id.strip())
+    resolved_base_repo_path = _resolve_base_repo_path(base_repo_path)
+    manifest = _load_saved_manifest(normalized_tenant_id)
+    record_path = (
+        BACKEND_DIR
+        / "tenants"
+        / normalized_tenant_id
+        / "latest-implementation.json"
+    )
+    try:
+        implementation_record = load_implementation_record(record_path)
+    except SnapshotError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if (
+        not implementation_record.get("manifest_hash")
+        or not implementation_record.get("base_revision")
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Latest implementation record is incomplete; run implementation again.",
+        )
+    expected_source_path = Path(
+        get_tenant_repo_path(
+            base_repo_path=str(resolved_base_repo_path),
+            tenant_name=normalized_tenant_id,
+        )
+    ).resolve()
+    if (
+        implementation_record.get("tenant_id") != normalized_tenant_id
+        or Path(str(implementation_record.get("base_repo_path") or "")).resolve()
+        != resolved_base_repo_path
+        or Path(str(implementation_record.get("source_repo_path") or "")).resolve()
+        != expected_source_path
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Tenant source is stale for the requested base repository.",
+        )
+    return (
+        normalized_tenant_id,
+        resolved_base_repo_path,
+        manifest,
+        implementation_record,
+    )
+
+
+@app.post("/api/tenant/snapshots")
+def create_tenant_snapshot(request: SnapshotCreateRequest) -> dict:
+    tenant_id, base_repo_path, manifest, implementation_record = _snapshot_request_context(
+        request.tenant_id,
+        request.base_repo_path,
+    )
+    quality_report = request.quality_report
+    if quality_report is None:
+        stored_quality = implementation_record.get("quality_report")
+        quality_report = (
+            stored_quality
+            if isinstance(stored_quality, dict)
+            else {"status": "not_run", "checks": []}
+        )
+    try:
+        return create_snapshot(
+            tenant_id=tenant_id,
+            base_repo_path=str(base_repo_path),
+            manifest=manifest,
+            quality_report=quality_report,
+            expected_manifest_hash=str(implementation_record.get("manifest_hash") or ""),
+            expected_base_revision=str(implementation_record.get("base_revision") or ""),
+        )
+    except SnapshotError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Snapshot creation failed: {exc}") from exc
+
+
+@app.get("/api/tenant/snapshots/latest")
+def get_latest_tenant_snapshot(
+    tenant_id: str,
+    base_repo_path: str | None = None,
+) -> dict:
+    normalized_tenant_id = state.ensure_tenant(tenant_id.strip())
+    resolved_base_repo_path = _resolve_base_repo_path(base_repo_path)
+    try:
+        return get_latest_snapshot(
+            tenant_id=normalized_tenant_id,
+            base_repo_path=str(resolved_base_repo_path),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SnapshotError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/api/tenant/snapshots/{snapshot_id}")
+def get_tenant_snapshot(
+    snapshot_id: str,
+    tenant_id: str,
+    base_repo_path: str | None = None,
+) -> dict:
+    normalized_tenant_id = state.ensure_tenant(tenant_id.strip())
+    resolved_base_repo_path = _resolve_base_repo_path(base_repo_path)
+    try:
+        return get_snapshot(
+            tenant_id=normalized_tenant_id,
+            base_repo_path=str(resolved_base_repo_path),
+            snapshot_id=snapshot_id,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SnapshotError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/admin/tenant/reset-repo")

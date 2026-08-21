@@ -29,7 +29,8 @@ STATIC_DIR_CANDIDATES = (
     "dist",
     "build",
     "out",
-    "public",
+    # Note: do not treat source "public/" as a finished static site — CRA/Vite keep
+    # unbuilt assets there while package.json still owns build/start.
     "frontend/dist",
     "frontend/build",
     "frontend/out",
@@ -45,6 +46,24 @@ NODE_APP_DIR_CANDIDATES = (
     "web",
     "client",
     "app",
+)
+
+DOCKER_COMPOSE_CANDIDATES = (
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+    "backend/docker-compose.yml",
+    "backend/docker-compose.yaml",
+)
+
+DOCKERFILE_CANDIDATES = (
+    "Dockerfile",
+    "dockerfile",
+    "backend/Dockerfile",
+    "frontend/Dockerfile",
+    "app/Dockerfile",
+    "server/Dockerfile",
 )
 
 MAX_PACKAGE_BYTES = int(os.getenv("DEPLAI_APP_PACKAGE_MAX_BYTES", "8000000"))
@@ -393,6 +412,54 @@ def _infer_health_path(repository_context: dict[str, Any], deployment_profile: d
     return "/"
 
 
+def _dockerfile_exposed_port(dockerfile: Path) -> int | None:
+    text = _read_text_safe(dockerfile)
+    # Prefer the last EXPOSE directive; ignore protocol suffix (e.g. 8080/tcp).
+    matches = re.findall(r"(?im)^\s*EXPOSE\s+(\d{2,5})\b", text)
+    for raw in reversed(matches):
+        try:
+            port = int(raw)
+            if 1 <= port <= 65535:
+                return port
+        except Exception:
+            continue
+    return None
+
+
+def _detect_docker_deploy(root: Path) -> dict[str, str] | None:
+    """Return docker deploy metadata when compose or Dockerfile is present.
+
+    Prefer compose when both exist — that is usually the intended full-stack
+    runtime for repos that ship images.
+    """
+    for rel in DOCKER_COMPOSE_CANDIDATES:
+        compose_path = root / rel
+        if compose_path.is_file():
+            selected = compose_path.parent
+            selected_root = selected.relative_to(root).as_posix() if selected != root else "."
+            return {
+                "mode": "compose",
+                "compose_file": compose_path.name,
+                "dockerfile": "",
+                "selected_root": selected_root,
+                "context_root": str(selected),
+            }
+
+    for rel in DOCKERFILE_CANDIDATES:
+        dockerfile = root / rel
+        if dockerfile.is_file():
+            selected = dockerfile.parent
+            selected_root = selected.relative_to(root).as_posix() if selected != root else "."
+            return {
+                "mode": "dockerfile",
+                "compose_file": "",
+                "dockerfile": dockerfile.name,
+                "selected_root": selected_root,
+                "context_root": str(selected),
+            }
+    return None
+
+
 def _tar_directory(root: Path, arc_root: str = ".") -> tuple[str, int, int]:
     files: list[Path] = []
     for path in sorted(root.rglob("*")):
@@ -561,6 +628,48 @@ def build_deployment_package(
             + ". RDS will be provisioned automatically."
         )
 
+    # Prefer Docker when the repo ships images — install+run on EC2 instead of
+    # treating source public/ or package.json as the primary runtime.
+    docker_meta = _detect_docker_deploy(root)
+    if docker_meta is not None:
+        context_root = Path(docker_meta["context_root"])
+        package_base64, file_count, byte_count = _tar_directory(context_root)
+        docker_port = app_port
+        if docker_meta["mode"] == "dockerfile":
+            exposed = _dockerfile_exposed_port(context_root / docker_meta["dockerfile"])
+            if exposed is not None:
+                docker_port = exposed
+            warnings.append(
+                f"Dockerfile detected ({docker_meta['selected_root']}/{docker_meta['dockerfile']}); "
+                "EC2 bootstrap will install Docker, build the image, and run the container."
+            )
+            build_command = "docker"
+            start_command = f"dockerfile:{docker_meta['dockerfile']}"
+        else:
+            warnings.append(
+                f"Docker Compose detected ({docker_meta['selected_root']}/{docker_meta['compose_file']}); "
+                "EC2 bootstrap will install Docker and run `docker compose up --build -d`."
+            )
+            build_command = "compose"
+            start_command = f"compose:{docker_meta['compose_file']}"
+        return _persist_package(DeploymentPackage(
+            package_id=package_id,
+            source_root=str(root),
+            app_kind="docker",
+            app_port=docker_port,
+            health_path=health_path,
+            build_command=build_command,
+            start_command=start_command,
+            package_base64=package_base64,
+            package_file_count=file_count,
+            package_bytes=byte_count,
+            selected_root=docker_meta["selected_root"],
+            package_tarball_path="",
+            manifest_path="",
+            warnings=warnings,
+            db_requirements=db_requirements,
+        ))
+
     static_root = _select_static_root(root)
     if static_root is not None:
         package_base64, file_count, byte_count = _tar_directory(static_root)
@@ -582,68 +691,56 @@ def build_deployment_package(
             db_requirements=db_requirements,
         ))
 
-    node_roots: list[Path] = []
-    for rel in NODE_APP_DIR_CANDIDATES:
-        candidate = root if rel == "." else root / rel
-        if candidate.is_dir() and (candidate / "package.json").exists():
-            node_roots.append(candidate)
+    from runtime_catalog import (
+        detect_bootstrappable_recipe,
+        get_runtime_recipe,
+        infer_commands_for_recipe,
+        resolve_package_root,
+    )
 
-    for node_root in node_roots:
-        package_json = _read_package_json(node_root)
-        build_command = _script_command(package_json, "build")
-        start_command = _script_command(package_json, "start")
-        if not start_command and _has_file(node_root, "server.js", "app.js", "index.js"):
-            entry = next(name for name in ("server.js", "app.js", "index.js") if (node_root / name).exists())
-            start_command = f"node {entry}"
-        if start_command:
-            package_base64, file_count, byte_count = _tar_directory(node_root)
-            if not build_command:
-                warnings.append("No npm build script detected; EC2 bootstrap will skip build.")
-            selected_root = node_root.relative_to(root).as_posix() if node_root != root else "."
-            return _persist_package(DeploymentPackage(
-                package_id=package_id,
-                source_root=str(root),
-                app_kind="node",
-                app_port=app_port,
-                health_path=health_path,
-                build_command=build_command,
-                start_command=start_command,
-                package_base64=package_base64,
-                package_file_count=file_count,
-                package_bytes=byte_count,
-                selected_root=selected_root,
-                package_tarball_path="",
-                manifest_path="",
-                warnings=warnings,
-                db_requirements=db_requirements,
-            ))
-
-    python_entry = next((name for name in ("app.py", "main.py", "server.py") if (root / name).exists()), "")
-    if python_entry:
-        start_command = f"python {python_entry}"
-        if (root / "requirements.txt").exists():
-            warnings.append("Python requirements.txt detected; EC2 bootstrap will install it.")
-        package_base64, file_count, byte_count = _tar_directory(root)
-        return _persist_package(DeploymentPackage(
-            package_id=package_id,
-            source_root=str(root),
-            app_kind="python",
-            app_port=app_port,
-            health_path=health_path,
-            build_command="",
-            start_command=start_command,
-            package_base64=package_base64,
-            package_file_count=file_count,
-            package_bytes=byte_count,
-            selected_root=".",
-            package_tarball_path="",
-            manifest_path="",
-            warnings=warnings,
-            db_requirements=db_requirements,
-        ))
+    recipe = detect_bootstrappable_recipe(root)
+    if recipe is not None:
+        package_root = resolve_package_root(root, recipe)
+        build_command, start_command, recipe_warnings = infer_commands_for_recipe(root, recipe)
+        warnings.extend(recipe_warnings)
+        skip = recipe.app_kind == "node" and not start_command
+        if not skip:
+            if not start_command:
+                start_command = recipe.default_start_command
+                warnings.append(
+                    f"{recipe.display_name} detected but no start command could be inferred; "
+                    "using catalog default."
+                )
+            if start_command:
+                package_base64, file_count, byte_count = _tar_directory(package_root)
+                selected_root = package_root.relative_to(root).as_posix() if package_root != root else "."
+                volume_hint = get_runtime_recipe(recipe.app_kind)
+                if volume_hint and volume_hint.min_root_volume_gb > 35:
+                    warnings.append(
+                        f"{recipe.display_name} apps use a larger root volume "
+                        f"({volume_hint.min_root_volume_gb}GB) on EC2."
+                    )
+                return _persist_package(DeploymentPackage(
+                    package_id=package_id,
+                    source_root=str(root),
+                    app_kind=recipe.app_kind,
+                    app_port=app_port,
+                    health_path=health_path,
+                    build_command=build_command,
+                    start_command=start_command,
+                    package_base64=package_base64,
+                    package_file_count=file_count,
+                    package_bytes=byte_count,
+                    selected_root=selected_root,
+                    package_tarball_path="",
+                    manifest_path="",
+                    warnings=warnings,
+                    db_requirements=db_requirements,
+                ))
 
     warnings.append(
-        "Repository did not expose static build output, package.json with a start script, or a simple Python entrypoint; "
+        "Repository did not expose static build output, package.json with a start script, "
+        "Python/Go/Java/.NET/PHP/Ruby/Rust entrypoints, or Docker artifacts; "
         "generated a static placeholder package so Terraform infrastructure generation can continue."
     )
     package_base64, file_count, byte_count = _tar_generated_files({

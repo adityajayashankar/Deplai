@@ -4,6 +4,40 @@ DeplAI is an engineering workspace for taking an application from source code to
 
 The repository is a multi-service workspace. The primary application is the **Connector** (a Next.js application); it coordinates browser requests, identity, project ownership, and service-to-service calls. The **Agentic Layer** performs the long-running security, remediation, planning, Terraform, and AWS operations. The **Terraform Agent** is the authoritative Terraform generation and execution engine.
 
+## DeplAI at a glance
+
+### What we are
+
+DeplAI is a human-controlled, source-aware engineering platform for moving an
+application from repository to a reviewed cloud runtime. It is not an
+unattended "deploy anything" agent: it combines deterministic checks, optional
+LLM assistance, observable workflows, and explicit approval before billable
+infrastructure changes.
+
+### What we are solving
+
+Application delivery usually spans disconnected tools and handoffs: repository
+access, security reports, remediation, architecture decisions, cost review,
+infrastructure code, deployment, and runtime operations. Context is lost at
+each boundary, and cloud changes can be made before the source code or plan has
+been understood. DeplAI keeps those steps tied to one project, its source
+signals, and its authenticated owner.
+
+### Vision
+
+Make secure cloud delivery understandable and repeatable for teams that do not
+want to stitch together a separate security, planning, IaC, and operations
+workflow for every project. The product direction is an explainable path from
+repository evidence to a production-ready decision, with people retaining
+control of source changes, pull requests, plans, credentials, and apply.
+
+Read the documentation in this order:
+
+1. [Product overview](docs/product-overview.md) — users, problem, vision, goals, and current scope.
+2. [Technical architecture](docs/technical-architecture.md) — Level-1 system design, frameworks, data flows, and trust boundaries.
+3. [Agent architecture](docs/agent-architecture.md) — the detailed workflow, orchestration, validation, and fallback design.
+4. [Architecture and execution flows](docs/architecture.md) and the [API reference](docs/api-reference.md) — implementation-facing details.
+
 ## What the product supports today
 
 - GitHub OAuth login with an explicit GitHub account chooser; users can select a different GitHub account after signing out of DeplAI.
@@ -231,5 +265,8 @@ Run unit tests from the relevant service directories with the active virtual env
 
 ## Further documentation
 
+- [Product overview](docs/product-overview.md)
+- [Technical architecture](docs/technical-architecture.md)
+- [Agent and workflow architecture](docs/agent-architecture.md)
 - [Architecture and execution flows](docs/architecture.md)
 - [API reference](docs/api-reference.md)

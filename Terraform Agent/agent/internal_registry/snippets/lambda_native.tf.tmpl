@@ -1,0 +1,28 @@
+resource "aws_iam_role" "lambda" {
+  name_prefix = "${var.project_name}-${var.environment}-lambda-"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  tags = var.common_tags
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_basic" {
+  role       = aws_iam_role.lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_lambda_function" "app" {
+  function_name = "${var.project_name}-${var.environment}-fn"
+  role          = aws_iam_role.lambda.arn
+  handler       = "{{ handler }}"
+  runtime       = "{{ runtime }}"
+  filename      = var.lambda_zip_path
+  memory_size   = {{ memory_size }}
+  timeout       = {{ timeout }}
+  tags          = var.common_tags
+}

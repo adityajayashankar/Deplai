@@ -73,6 +73,11 @@ def bootstrap_environment(
     aws_session_token: str = "",
     apply_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    aws_access_key_id = str(aws_access_key_id or "").strip().strip('"').strip("'")
+    aws_secret_access_key = str(aws_secret_access_key or "").strip().strip('"').strip("'")
+    aws_session_token = str(aws_session_token or "").strip().strip('"').strip("'")
+    aws_region = str(aws_region or "").strip()
+
     session_kwargs: dict[str, str] = {"region_name": aws_region}
     if aws_access_key_id and aws_secret_access_key:
         session_kwargs["aws_access_key_id"] = aws_access_key_id
@@ -127,6 +132,8 @@ provider "aws" {{
         "AWS_DEFAULT_REGION": aws_region,
         "TF_IN_AUTOMATION": "1",
     }
+    if aws_session_token:
+        env["AWS_SESSION_TOKEN"] = aws_session_token
     init_result = run_terraform_command(
         bootstrap_dir,
         ["init", "-input=false", "-no-color"],

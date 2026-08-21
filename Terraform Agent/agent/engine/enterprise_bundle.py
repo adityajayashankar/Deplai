@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from typing import Any
 
+from ..internal_registry import get_module, load_catalog, render_snippet
 from .runtime import DEFAULT_PROVIDER_CONSTRAINT, slugify
 
 
 def _provider_expr(provider_version: str) -> str:
-    version = str(provider_version or DEFAULT_PROVIDER_CONSTRAINT).strip() or DEFAULT_PROVIDER_CONSTRAINT
+    version = str(provider_version or "").strip()
+    if not version:
+        catalog = load_catalog()
+        version = str((catalog.get("provider") or {}).get("constraint") or DEFAULT_PROVIDER_CONSTRAINT).strip()
+    # Never emit an AWS 6.x pin for the enterprise/registry stack — EC2 5.8.x + ALB 9.x break on it.
+    if re.search(r"(~>\s*|>=\s*|=)\s*6(\.|$)", version) or re.match(r"6\.", version):
+        catalog = load_catalog()
+        version = str((catalog.get("provider") or {}).get("constraint") or DEFAULT_PROVIDER_CONSTRAINT).strip()
+    version = version or DEFAULT_PROVIDER_CONSTRAINT
     return f"={version}" if version[:1].isdigit() else version
 
 
@@ -44,6 +54,100 @@ def _canonical_compute_strategy(value: str) -> str:
     return compact or "ec2"
 
 
+def _as_record(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _truthy_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return bool(value)
+
+
+def profile_wants_alb(payload: dict[str, Any]) -> bool:
+    """True when the approved profile/decision requires an Application Load Balancer."""
+    if _truthy_flag(payload.get("need_alb")):
+        return True
+    networking = _as_record(payload.get("networking"))
+    load_balancer = _as_record(networking.get("load_balancer"))
+    if load_balancer:
+        if "enabled" in load_balancer:
+            return _truthy_flag(load_balancer.get("enabled"))
+        return True
+    decision = _as_record(payload.get("consultant_decision"))
+    if _truthy_flag(decision.get("need_alb")):
+        return True
+    components = [
+        str(item or "").strip().lower()
+        for item in (decision.get("components") or [])
+        if str(item or "").strip()
+    ]
+    if any(token in components for token in ("alb", "load_balancer", "application_load_balancer")):
+        return True
+    stack = _as_record(decision.get("stack_config"))
+    alb_cfg = _as_record(stack.get("alb"))
+    return bool(alb_cfg) and _truthy_flag(alb_cfg.get("enabled", True))
+
+
+def profile_wants_eip(payload: dict[str, Any]) -> bool:
+    """True when the approved profile/decision requires an Elastic IP."""
+    if _truthy_flag(payload.get("need_eip")):
+        return True
+    networking = _as_record(payload.get("networking"))
+    elastic_ip = _as_record(networking.get("elastic_ip"))
+    if elastic_ip:
+        if "enabled" in elastic_ip:
+            return _truthy_flag(elastic_ip.get("enabled"))
+        return True
+    decision = _as_record(payload.get("consultant_decision"))
+    if _truthy_flag(decision.get("need_eip")):
+        return True
+    components = [
+        str(item or "").strip().lower()
+        for item in (decision.get("components") or [])
+        if str(item or "").strip()
+    ]
+    if any(token in components for token in ("eip", "elastic_ip", "elasticip")):
+        return True
+    stack = _as_record(decision.get("stack_config"))
+    eip_cfg = _as_record(stack.get("eip"))
+    return bool(eip_cfg) and _truthy_flag(eip_cfg.get("enabled", True))
+
+
+def assert_endpoint_decision_renderable(payload: dict[str, Any]) -> None:
+    """Refuse silent EC2-only downgrade when ALB/EIP were requested for an incompatible strategy."""
+    wants_alb = profile_wants_alb(payload)
+    wants_eip = profile_wants_eip(payload)
+    if not wants_alb and not wants_eip:
+        return
+    strategy = _canonical_compute_strategy(
+        str((_as_record(payload.get("compute")).get("strategy") or "ec2"))
+    )
+    if strategy == "s3_cloudfront":
+        requested = ", ".join(
+            part for part, enabled in (("ALB", wants_alb), ("EIP", wants_eip)) if enabled
+        )
+        raise ValueError(
+            f"Consultant decision requests {requested} but compute.strategy is s3_cloudfront. "
+            "Refusing silent EC2-only downgrade; set compute.strategy to ec2 (or ecs_fargate)."
+        )
+    if strategy == "ec2" and wants_alb:
+        networking = _as_record(payload.get("networking"))
+        public_cidrs = networking.get("public_subnet_cidrs")
+        if isinstance(public_cidrs, list) and len(public_cidrs) == 1:
+            raise ValueError(
+                "ALB was requested (need_alb) but networking.public_subnet_cidrs only lists one "
+                "subnet. Provide at least two public subnets in different AZs."
+            )
+
+
 def build_enterprise_profile_bundle(
     *,
     payload: dict[str, Any],
@@ -54,6 +158,7 @@ def build_enterprise_profile_bundle(
     context_summary: str,
     website_index_html: str,
 ) -> tuple[dict[str, str], list[str]]:
+    assert_endpoint_decision_renderable(payload)
     project_name = str(payload.get("project_name") or "deplai-project").strip() or "deplai-project"
     workspace = str(payload.get("workspace") or slugify(project_name)).strip() or slugify(project_name)
     environment = _canonical_environment(str(payload.get("environment") or "dev"))
@@ -63,6 +168,17 @@ def build_enterprise_profile_bundle(
     runtime_config = payload.get("runtime_config") if isinstance(runtime_config := payload.get("runtime_config"), dict) else {}
     data_layer = [item for item in payload.get("data_layer") or [] if isinstance(item, dict)]
     strategy = _canonical_compute_strategy(str(compute.get("strategy") or "ec2"))
+    enable_alb = strategy == "ec2" and profile_wants_alb(payload)
+    enable_eip = strategy == "ec2" and profile_wants_eip(payload)
+    alb_module = get_module("alb")
+    alb_module_source = str(alb_module.get("source") or "terraform-aws-modules/alb/aws")
+    alb_module_version = str(alb_module.get("version") or "9.17.0")
+    vpc_module = get_module("vpc")
+    vpc_module_source = str(vpc_module.get("source") or "terraform-aws-modules/vpc/aws")
+    vpc_module_version = str(vpc_module.get("version") or "5.21.0")
+    ec2_module = get_module("ec2_instance")
+    ec2_module_source = str(ec2_module.get("source") or "terraform-aws-modules/ec2-instance/aws")
+    ec2_module_version = str(ec2_module.get("version") or "5.8.0")
     app_service = next((item for item in compute.get("services") or [] if isinstance(item, dict) and str(item.get("process_type") or "") == "web"), {})
     app_port = int(app_service.get("port") or 3000)
     secrets_prefix = str(runtime_config.get("secrets_manager_prefix") or f"/{project_slug}/{environment}").strip() or f"/{project_slug}/{environment}"
@@ -76,7 +192,7 @@ def build_enterprise_profile_bundle(
     postgres_engine = str(postgres_item.get("engine") or "postgres").strip().lower() or "postgres"
     if postgres_engine not in {"postgres", "mysql", "mariadb"}:
         postgres_engine = "postgres"
-    _default_db_version = {"postgres": "15.5", "mysql": "8.0", "mariadb": "10.11"}[postgres_engine]
+    _default_db_version = {"postgres": "15.17", "mysql": "8.0", "mariadb": "10.11"}[postgres_engine]
     postgres_engine_version = str(postgres_item.get("engine_version") or _default_db_version).strip() or _default_db_version
     postgres_instance_class = str(postgres_item.get("instance_class") or "db.t4g.micro").strip() or "db.t4g.micro"
     postgres_storage = _coerce_positive_int(postgres_item.get("storage_gb"), 20)
@@ -90,9 +206,13 @@ def build_enterprise_profile_bundle(
     if cf_price_class not in {"PriceClass_100", "PriceClass_200", "PriceClass_All"}:
         cf_price_class = "PriceClass_100"
     spa_fallback = bool(static_site.get("spa_fallback"))
+    use_registry_slice = strategy == "ec2" and (enable_alb or enable_eip)
+    terraform_required = str(
+        (load_catalog().get("terraform") or {}).get("required_version") or ">= 1.6.0, < 1.12.0"
+    ).strip() or ">= 1.6.0, < 1.12.0"
 
     versions_tf = f"""terraform {{
-  required_version = ">= 1.6.0"
+  required_version = "{terraform_required}"
   required_providers {{
     aws = {{
       source  = "hashicorp/aws"
@@ -100,11 +220,11 @@ def build_enterprise_profile_bundle(
     }}
     random = {{
       source  = "hashicorp/random"
-      version = "~> 3.6"
+      version = "~> 3.6.0"
     }}
     tls = {{
       source  = "hashicorp/tls"
-      version = "~> 4.0"
+      version = "~> 4.0.0"
     }}
   }}
 }}
@@ -146,6 +266,8 @@ def build_enterprise_profile_bundle(
   enable_static_site = var.compute_strategy == "s3_cloudfront"
   enable_postgres    = var.enable_postgres
   enable_redis       = var.enable_redis
+  enable_alb         = var.enable_alb
+  enable_eip         = var.enable_eip
 }}
 """
 
@@ -265,6 +387,16 @@ variable "enable_redis" {{
   default = {str(has_redis).lower()}
 }}
 
+variable "enable_alb" {{
+  type    = bool
+  default = {str(enable_alb).lower()}
+}}
+
+variable "enable_eip" {{
+  type    = bool
+  default = {str(enable_eip).lower()}
+}}
+
 variable "redis_node_type" {{
   type    = string
   default = "{redis_node_type}"
@@ -379,7 +511,7 @@ output "redis_endpoint" {
 }
 """
     else:
-        main_tf = """module "networking" {
+        main_tf = f"""module "networking" {{
   source               = "./modules/networking"
   project_name         = var.project_name
   environment          = var.environment
@@ -387,19 +519,21 @@ output "redis_endpoint" {
   public_subnet_cidrs  = var.public_subnet_cidrs
   private_subnet_cidrs = var.private_subnet_cidrs
   use_existing_vpc     = var.use_existing_vpc || var.use_default_vpc
+  enable_nat_gateway   = {"true" if (enable_alb and (has_postgres or has_redis)) else "false"}
+  use_registry_vpc     = {"true" if use_registry_slice else "false"}
   common_tags          = local.common_tags
-}
+}}
 
-module "iam" {
+module "iam" {{
   source        = "./modules/iam"
   project_name  = var.project_name
   environment   = var.environment
   region        = var.region
   secret_prefix = var.secrets_manager_prefix
   common_tags   = local.common_tags
-}
+}}
 
-module "data" {
+module "data" {{
   source                     = "./modules/data"
   enable_postgres            = local.enable_postgres
   enable_redis               = local.enable_redis
@@ -415,170 +549,232 @@ module "data" {
   subnet_ids                 = module.networking.private_subnet_ids
   allowed_cidrs              = [var.vpc_cidr]
   common_tags                = local.common_tags
-}
+}}
 
-module "compute" {
+module "compute" {{
   source                      = "./modules/compute"
   enabled                     = local.enable_compute
   project_name                = var.project_name
   environment                 = var.environment
   vpc_id                      = module.networking.vpc_id
   subnet_id                   = module.networking.public_subnet_ids[0]
+  public_subnet_ids           = module.networking.public_subnet_ids
   ami_id                      = data.aws_ami.al2023.id
   instance_type               = var.instance_type
   app_port                    = var.app_port
+  enable_alb                  = local.enable_alb
+  enable_eip                  = local.enable_eip
   bootstrap_index_html_base64 = var.bootstrap_index_html_base64
   instance_profile_name       = module.iam.instance_profile_name
   existing_ec2_key_pair_name  = var.existing_ec2_key_pair_name
   common_tags                 = local.common_tags
-}
+}}
 """
-        outputs_tf = """output "cloudfront_url" {
+        alb_dns_output = (
+            'output "alb_dns_name" {\n  value = module.compute.alb_dns_name\n}'
+            if enable_alb
+            else 'output "alb_dns_name" {\n  value = null\n}'
+        )
+        outputs_tf = f"""output "cloudfront_url" {{
   value = null
-}
+}}
 
-output "cloudfront_domain_name" {
+output "cloudfront_domain_name" {{
   value = null
-}
+}}
 
-output "website_bucket_name" {
+output "website_bucket_name" {{
   value = null
-}
+}}
 
-output "alb_dns_name" {
-  value = null
-}
+{alb_dns_output}
 
-output "rds_endpoint" {
+output "elastic_ip" {{
+  value = module.compute.elastic_ip
+}}
+
+output "app_url" {{
+  value = module.compute.app_url
+}}
+
+output "rds_endpoint" {{
   value = module.data.rds_endpoint
-}
+}}
 
-output "redis_endpoint" {
+output "redis_endpoint" {{
   value = module.data.redis_endpoint
-}
+}}
 
-output "ec2_instance_id" {
+output "ec2_instance_id" {{
   value = module.compute.ec2_instance_id
-}
+}}
 
-output "ec2_instance_arn" {
+output "instance_id" {{
+  value = module.compute.ec2_instance_id
+}}
+
+output "ec2_instance_arn" {{
   value = module.compute.ec2_instance_arn
-}
+}}
 
-output "ec2_instance_state" {
+output "ec2_instance_state" {{
   value = module.compute.ec2_instance_state
-}
+}}
 
-output "ec2_instance_type" {
+output "ec2_instance_type" {{
   value = module.compute.ec2_instance_type
-}
+}}
 
-output "ec2_public_ip" {
+output "ec2_public_ip" {{
   value = module.compute.ec2_public_ip
-}
+}}
 
-output "ec2_private_ip" {
+output "ec2_private_ip" {{
   value = module.compute.ec2_private_ip
-}
+}}
 
-output "ec2_public_dns" {
+output "ec2_public_dns" {{
   value = module.compute.ec2_public_dns
-}
+}}
 
-output "ec2_private_dns" {
+output "ec2_private_dns" {{
   value = module.compute.ec2_private_dns
-}
+}}
 
-output "ec2_vpc_id" {
+output "ec2_vpc_id" {{
   value = module.networking.vpc_id
-}
+}}
 
-output "ec2_subnet_id" {
+output "vpc_id" {{
+  value = module.networking.vpc_id
+}}
+
+output "ec2_subnet_id" {{
   value = module.compute.ec2_subnet_id
-}
+}}
 
-output "ec2_key_name" {
+output "public_subnet_ids" {{
+  value = module.networking.public_subnet_ids
+}}
+
+output "private_subnet_ids" {{
+  value = module.networking.private_subnet_ids
+}}
+
+output "ec2_key_name" {{
   value = module.compute.ec2_key_name
-}
+}}
 
-output "generated_ec2_private_key_pem" {
+output "generated_ec2_private_key_pem" {{
   value     = module.compute.generated_ec2_private_key_pem
   sensitive = true
-}
+}}
 """
 
-    networking_main = """data "aws_availability_zones" "available" {
+    networking_main = f"""data "aws_availability_zones" "available" {{
   state = "available"
-}
+}}
 
-data "aws_vpc" "default" {
+data "aws_vpc" "default" {{
   count   = var.use_existing_vpc ? 1 : 0
   default = true
-}
+}}
 
-data "aws_subnets" "default" {
+data "aws_subnets" "default" {{
   count = var.use_existing_vpc ? 1 : 0
-  filter {
+  filter {{
     name   = "vpc-id"
     values = [data.aws_vpc.default[0].id]
-  }
-}
+  }}
+}}
 
-resource "aws_vpc" "main" {
-  count                = var.use_existing_vpc ? 0 : 1
+module "vpc" {{
+  count   = var.use_existing_vpc || !var.use_registry_vpc ? 0 : 1
+  source  = "{vpc_module_source}"
+  version = "{vpc_module_version}"
+
+  name = "${{var.project_name}}-${{var.environment}}"
+  cidr = var.vpc_cidr
+
+  azs             = slice(data.aws_availability_zones.available.names, 0, 2)
+  public_subnets  = var.public_subnet_cidrs
+  private_subnets = var.private_subnet_cidrs
+
+  enable_nat_gateway = var.enable_nat_gateway
+  single_nat_gateway = true
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = var.common_tags
+}}
+
+resource "aws_vpc" "main" {{
+  count                = var.use_existing_vpc || var.use_registry_vpc ? 0 : 1
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
-  tags                 = merge(var.common_tags, { Name = "${var.project_name}-${var.environment}-vpc" })
-}
+  tags                 = merge(var.common_tags, {{ Name = "${{var.project_name}}-${{var.environment}}-vpc" }})
+}}
 
-resource "aws_internet_gateway" "main" {
-  count  = var.use_existing_vpc ? 0 : 1
+resource "aws_internet_gateway" "main" {{
+  count  = var.use_existing_vpc || var.use_registry_vpc ? 0 : 1
   vpc_id = aws_vpc.main[0].id
-  tags   = merge(var.common_tags, { Name = "${var.project_name}-${var.environment}-igw" })
-}
+  tags   = merge(var.common_tags, {{ Name = "${{var.project_name}}-${{var.environment}}-igw" }})
+}}
 
-resource "aws_subnet" "public" {
-  count                   = var.use_existing_vpc ? 0 : 2
+resource "aws_subnet" "public" {{
+  count                   = var.use_existing_vpc || var.use_registry_vpc ? 0 : 2
   vpc_id                  = aws_vpc.main[0].id
   cidr_block              = var.public_subnet_cidrs[count.index]
   availability_zone       = data.aws_availability_zones.available.names[count.index]
   map_public_ip_on_launch = true
-  tags                    = merge(var.common_tags, { Name = "${var.project_name}-${var.environment}-public-${count.index + 1}" })
-}
+  tags                    = merge(var.common_tags, {{ Name = "${{var.project_name}}-${{var.environment}}-public-${{count.index + 1}}" }})
+}}
 
-resource "aws_subnet" "private" {
-  count             = var.use_existing_vpc ? 0 : 2
+resource "aws_subnet" "private" {{
+  count             = var.use_existing_vpc || var.use_registry_vpc ? 0 : 2
   vpc_id            = aws_vpc.main[0].id
   cidr_block        = var.private_subnet_cidrs[count.index]
   availability_zone = data.aws_availability_zones.available.names[count.index]
-  tags              = merge(var.common_tags, { Name = "${var.project_name}-${var.environment}-private-${count.index + 1}" })
-}
+  tags              = merge(var.common_tags, {{ Name = "${{var.project_name}}-${{var.environment}}-private-${{count.index + 1}}" }})
+}}
 
-resource "aws_route_table" "public" {
-  count  = var.use_existing_vpc ? 0 : 1
+resource "aws_route_table" "public" {{
+  count  = var.use_existing_vpc || var.use_registry_vpc ? 0 : 1
   vpc_id = aws_vpc.main[0].id
-  tags   = merge(var.common_tags, { Name = "${var.project_name}-${var.environment}-public-rt" })
-}
+  tags   = merge(var.common_tags, {{ Name = "${{var.project_name}}-${{var.environment}}-public-rt" }})
+}}
 
-resource "aws_route" "public_internet" {
-  count                  = var.use_existing_vpc ? 0 : 1
+resource "aws_route" "public_internet" {{
+  count                  = var.use_existing_vpc || var.use_registry_vpc ? 0 : 1
   route_table_id         = aws_route_table.public[0].id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = aws_internet_gateway.main[0].id
-}
+}}
 
-resource "aws_route_table_association" "public" {
-  count          = var.use_existing_vpc ? 0 : length(aws_subnet.public)
+resource "aws_route_table_association" "public" {{
+  count          = var.use_existing_vpc || var.use_registry_vpc ? 0 : length(aws_subnet.public)
   subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public[0].id
-}
+}}
 
-locals {
-  vpc_id            = var.use_existing_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
-  public_subnet_ids = var.use_existing_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(length(data.aws_subnets.default[0].ids), 2)) : [for subnet in aws_subnet.public : subnet.id]
-  private_subnet_ids = var.use_existing_vpc ? local.public_subnet_ids : [for subnet in aws_subnet.private : subnet.id]
-}
+locals {{
+  vpc_id = (
+    var.use_existing_vpc ? data.aws_vpc.default[0].id :
+    var.use_registry_vpc ? module.vpc[0].vpc_id :
+    aws_vpc.main[0].id
+  )
+  public_subnet_ids = (
+    var.use_existing_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(length(data.aws_subnets.default[0].ids), 2)) :
+    var.use_registry_vpc ? module.vpc[0].public_subnets :
+    [for subnet in aws_subnet.public : subnet.id]
+  )
+  private_subnet_ids = (
+    var.use_existing_vpc ? local.public_subnet_ids :
+    var.use_registry_vpc ? module.vpc[0].private_subnets :
+    [for subnet in aws_subnet.private : subnet.id]
+  )
+}}
 """
 
     networking_variables = """variable "project_name" { type = string }
@@ -587,6 +783,14 @@ variable "vpc_cidr" { type = string }
 variable "public_subnet_cidrs" { type = list(string) }
 variable "private_subnet_cidrs" { type = list(string) }
 variable "use_existing_vpc" { type = bool }
+variable "use_registry_vpc" {
+  type    = bool
+  default = false
+}
+variable "enable_nat_gateway" {
+  type    = bool
+  default = false
+}
 variable "common_tags" { type = map(string) }
 """
 
@@ -885,9 +1089,145 @@ output "website_bucket_name" {
 }
 """
 
-    compute_main = """locals {
+    if use_registry_slice:
+        alb_app_ingress = (
+            """  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb[0].id]
+  }
+
+  ingress {
+    from_port       = var.app_port
+    to_port         = var.app_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb[0].id]
+  }"""
+            if enable_alb
+            else """  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = var.app_port
+    to_port     = var.app_port
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }"""
+        )
+        compute_main = f"""locals {{
   use_existing_key = trimspace(var.existing_ec2_key_pair_name) != ""
   ec2_key_name     = local.use_existing_key ? trimspace(var.existing_ec2_key_pair_name) : aws_key_pair.generated[0].key_name
+  alb_dns          = var.enable_alb && length(module.alb) > 0 ? module.alb[0].dns_name : null
+  eip_public_ip    = var.enable_eip && length(aws_eip.app) > 0 ? aws_eip.app[0].public_ip : null
+  ec2_public_ip    = try(module.ec2[0].public_ip, null)
+  app_host         = coalesce(local.alb_dns, local.eip_public_ip, local.ec2_public_ip)
+}}
+
+resource "aws_security_group" "alb" {{
+  count       = var.enabled && var.enable_alb ? 1 : 0
+  name_prefix = "${{var.project_name}}-${{var.environment}}-alb-"
+  description = "ALB ingress"
+  vpc_id      = var.vpc_id
+  tags        = var.common_tags
+
+  ingress {{
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }}
+
+  egress {{
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }}
+}}
+
+resource "aws_security_group" "app" {{
+  count       = var.enabled ? 1 : 0
+  name_prefix = "${{var.project_name}}-${{var.environment}}-app-"
+  description = "Application traffic"
+  vpc_id      = var.vpc_id
+  tags        = var.common_tags
+
+{alb_app_ingress}
+
+  ingress {{
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }}
+
+  egress {{
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }}
+}}
+
+resource "tls_private_key" "generated" {{
+  count     = var.enabled && !local.use_existing_key ? 1 : 0
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}}
+
+resource "aws_key_pair" "generated" {{
+  count      = var.enabled && !local.use_existing_key ? 1 : 0
+  key_name   = "${{var.project_name}}-${{var.environment}}-key"
+  public_key = tls_private_key.generated[0].public_key_openssh
+}}
+"""
+        # Compose EC2 / EIP / ALB from internal registry golden snippets (pinned contracts).
+        ec2_snippet = render_snippet("ec2_instance", {"root_volume_size_gb": 8})
+        eip_snippet = render_snippet("eip")
+        alb_snippet = render_snippet("alb", {"health_path": "/"})
+        compute_main = (
+            compute_main
+            + "\n"
+            + ec2_snippet
+            + "\n\n"
+            + eip_snippet
+            + "\n\n"
+            + alb_snippet
+            + "\n"
+        )
+        compute_outputs = """output "ec2_instance_id" { value = try(module.ec2[0].id, null) }
+output "ec2_instance_arn" { value = try(module.ec2[0].arn, null) }
+output "ec2_instance_state" { value = try(module.ec2[0].instance_state, null) }
+output "ec2_instance_type" { value = try(module.ec2[0].instance_type, null) }
+output "ec2_public_ip" { value = coalesce(local.eip_public_ip, local.ec2_public_ip) }
+output "ec2_private_ip" { value = try(module.ec2[0].private_ip, null) }
+output "ec2_public_dns" { value = try(module.ec2[0].public_dns, null) }
+output "ec2_private_dns" { value = try(module.ec2[0].private_dns, null) }
+output "ec2_subnet_id" { value = try(module.ec2[0].subnet_id, null) }
+output "ec2_key_name" { value = local.ec2_key_name }
+output "alb_dns_name" { value = local.alb_dns }
+output "elastic_ip" { value = local.eip_public_ip }
+output "app_url" {
+  value = local.app_host != null ? "http://${local.app_host}" : null
+}
+output "generated_ec2_private_key_pem" {
+  value     = try(tls_private_key.generated[0].private_key_pem, null)
+  sensitive = true
+}
+"""
+    else:
+        compute_main = """locals {
+  use_existing_key = trimspace(var.existing_ec2_key_pair_name) != ""
+  ec2_key_name     = local.use_existing_key ? trimspace(var.existing_ec2_key_pair_name) : aws_key_pair.generated[0].key_name
+  alb_dns          = null
+  eip_public_ip    = null
+  ec2_public_ip    = try(aws_instance.app[0].public_ip, null)
+  app_host         = local.ec2_public_ip
 }
 
 resource "aws_security_group" "app" {
@@ -963,25 +1303,7 @@ resource "aws_instance" "app" {
   ])
 }
 """
-
-    compute_variables = """variable "enabled" { type = bool }
-variable "project_name" { type = string }
-variable "environment" { type = string }
-variable "vpc_id" { type = string }
-variable "subnet_id" { type = string }
-variable "ami_id" { type = string }
-variable "instance_type" { type = string }
-variable "app_port" { type = number }
-variable "bootstrap_index_html_base64" {
-  type      = string
-  sensitive = true
-}
-variable "instance_profile_name" { type = string }
-variable "existing_ec2_key_pair_name" { type = string }
-variable "common_tags" { type = map(string) }
-"""
-
-    compute_outputs = """output "ec2_instance_id" { value = try(aws_instance.app[0].id, null) }
+        compute_outputs = """output "ec2_instance_id" { value = try(aws_instance.app[0].id, null) }
 output "ec2_instance_arn" { value = try(aws_instance.app[0].arn, null) }
 output "ec2_instance_state" { value = try(aws_instance.app[0].instance_state, null) }
 output "ec2_instance_type" { value = try(aws_instance.app[0].instance_type, null) }
@@ -991,10 +1313,44 @@ output "ec2_public_dns" { value = try(aws_instance.app[0].public_dns, null) }
 output "ec2_private_dns" { value = try(aws_instance.app[0].private_dns, null) }
 output "ec2_subnet_id" { value = try(aws_instance.app[0].subnet_id, null) }
 output "ec2_key_name" { value = local.ec2_key_name }
+output "alb_dns_name" { value = null }
+output "elastic_ip" { value = null }
+output "app_url" {
+  value = local.app_host != null ? "http://${local.app_host}" : null
+}
 output "generated_ec2_private_key_pem" {
   value     = try(tls_private_key.generated[0].private_key_pem, null)
   sensitive = true
 }
+"""
+
+    compute_variables = """variable "enabled" { type = bool }
+variable "project_name" { type = string }
+variable "environment" { type = string }
+variable "vpc_id" { type = string }
+variable "subnet_id" { type = string }
+variable "public_subnet_ids" {
+  type    = list(string)
+  default = []
+}
+variable "ami_id" { type = string }
+variable "instance_type" { type = string }
+variable "app_port" { type = number }
+variable "enable_alb" {
+  type    = bool
+  default = false
+}
+variable "enable_eip" {
+  type    = bool
+  default = false
+}
+variable "bootstrap_index_html_base64" {
+  type      = string
+  sensitive = true
+}
+variable "instance_profile_name" { type = string }
+variable "existing_ec2_key_pair_name" { type = string }
+variable "common_tags" { type = map(string) }
 """
 
     files = {
@@ -1014,7 +1370,11 @@ output "generated_ec2_private_key_pem" {
         "terraform/backend-configs/dev.hcl": f'bucket = "{project_slug}-tfstate-dev"\nkey = "dev/terraform.tfstate"\nregion = "{region}"\ndynamodb_table = "{project_slug}-terraform-lock-dev"\nencrypt = true\n',
         "terraform/backend-configs/staging.hcl": f'bucket = "{project_slug}-tfstate-staging"\nkey = "staging/terraform.tfstate"\nregion = "{region}"\ndynamodb_table = "{project_slug}-terraform-lock-staging"\nencrypt = true\n',
         "terraform/backend-configs/prod.hcl": f'bucket = "{project_slug}-tfstate-prod"\nkey = "prod/terraform.tfstate"\nregion = "{region}"\ndynamodb_table = "{project_slug}-terraform-lock-prod"\nencrypt = true\n',
-        "terraform/.terraform.lock.hcl": "# Reviewed lock-file placeholder. Refresh with terraform init in CI.\n",
+        "terraform/.terraform.lock.hcl": (
+            "# Placeholder — replace with a real lock from `terraform providers lock` / `terraform init`\n"
+            "# after testing. Production should commit hashes for hashicorp/aws at the catalog tested_version\n"
+            "# (currently 5.100.0) and avoid -upgrade floating past the ~> 5.100.0 constraint.\n"
+        ),
         "terraform/moved.tf": "# Add moved blocks here when promoting resources into modules.\n",
         "terraform/.tflint.hcl": 'plugin "aws" { enabled = true version = "0.29.0" source = "github.com/terraform-linters/tflint-ruleset-aws" }\n',
         "terraform/policies/sentinel/enforce-tags.sentinel": 'import "tfplan/v2" as tfplan\nmain = rule { true }\n',
@@ -1064,4 +1424,15 @@ output "generated_ec2_private_key_pem" {
         warnings.append("backend.tf uses the local backend because remote state bucket/lock table values were not supplied.")
     if strategy == "s3_cloudfront":
         warnings.append("Static-site strategy disables compute resources and serves the bootstrap HTML through the storage module.")
+    if enable_alb:
+        warnings.append(
+            f"ALB enabled via pinned registry module {alb_module_source}@{alb_module_version}; alb_dns_name/app_url prefer the load balancer DNS."
+        )
+    if enable_eip:
+        warnings.append("Elastic IP enabled (aws_eip); elastic_ip/app_url fall back to the EIP when ALB is absent.")
+    if use_registry_slice:
+        warnings.append(
+            f"EC2+ALB/EIP vertical slice composes pinned registry modules "
+            f"(vpc {vpc_module_version}, ec2-instance {ec2_module_version}, alb {alb_module_version})."
+        )
     return files, warnings

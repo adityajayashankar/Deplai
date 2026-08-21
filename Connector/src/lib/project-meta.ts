@@ -51,6 +51,29 @@ export async function resolveProjectMeta(
   return rows[0] || null;
 }
 
+export async function resolveExistingProjectSourceRoot(
+  userId: string,
+  projectId: string,
+): Promise<string | null> {
+  const meta = await resolveProjectMeta(userId, projectId);
+  if (!meta) return null;
+
+  let candidate: string;
+  if (meta.project_type === 'github' && meta.repo_full_name) {
+    const [owner, repo] = meta.repo_full_name.split('/');
+    if (!owner || !repo) return null;
+    candidate = path.join(process.cwd(), 'tmp', 'repos', owner, repo);
+  } else if (meta.project_type === 'local') {
+    candidate = path.join(process.cwd(), 'tmp', 'local-projects', userId, projectId);
+  } else {
+    return null;
+  }
+
+  return fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()
+    ? candidate
+    : null;
+}
+
 export async function resolveProjectSourceRoot(
   userId: string,
   projectId: string,

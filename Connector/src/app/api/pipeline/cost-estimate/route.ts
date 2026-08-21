@@ -1,9 +1,21 @@
+import { createHash } from 'crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
+import { canonicalDecisionJson } from '@/lib/decision-hash';
+
+function hashDecisionSync(decision: Record<string, unknown>): string {
+  return createHash('sha256').update(canonicalDecisionJson(decision)).digest('hex');
+}
 
 const HOURS_PER_MONTH = 730;
 const PRICING_BASE_URL = 'https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws';
 const CACHE_TTL_MS = 10 * 60 * 1000;
+/** Active connections per LCU (ALB dimension). */
+const ALB_ACTIVE_CONNECTIONS_PER_LCU = 3000;
+/** Processed bytes (GB) per hour per LCU for EC2/IP targets. */
+const ALB_GB_PER_HOUR_PER_LCU = 1;
+/** Assumed average response size when deriving LCU from monthly request counts. */
+const ASSUMED_BYTES_PER_REQUEST = 50_000;
 
 type PricingBlob = {
   products?: Record<string, { attributes?: Record<string, string> }>;
@@ -26,6 +38,7 @@ type DecisionCostEstimateResponse = {
   currency: string;
   source: 'pricing_api' | 'fallback';
   based_on_decision: boolean;
+  decision_hash: string;
   fallback_reason?: string;
   line_items: DecisionCostLineItem[];
   subtotal_monthly_usd: number;
@@ -68,6 +81,10 @@ const FALLBACK: Record<string, number> = {
   redis_cache_t3_micro_hourly: 0.021,
   redis_cache_t3_small_hourly: 0.042,
   cloudfront_s3_blended_hourly: 0.028,
+  alb_hourly: 0.0225,
+  alb_lcu_hourly: 0.008,
+  eip_idle_hourly: 0.005,
+  ebs_gp3_gb_month: 0.08,
 };
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -96,6 +113,18 @@ function canonicalComponentId(value: unknown): string {
   if (compact === 'ecs' || compact.includes('fargate')) {
     return 'ecs';
   }
+  if (compact === 'alb' || compact.includes('load_balancer') || compact === 'application_load_balancer') {
+    return 'alb';
+  }
+  if (compact === 'eip' || compact === 'elastic_ip' || compact === 'elasticip') {
+    return 'eip';
+  }
+  if (compact === 'ebs' || compact.includes('ebs') || compact.includes('root_volume')) {
+    return 'ebs';
+  }
+  if (compact === 'nat_gateway' || compact === 'nat') {
+    return 'nat_gateway';
+  }
   if (compact.includes('vpc') || compact.includes('network')) {
     return 'vpc';
   }
@@ -110,6 +139,12 @@ function stringList(value: unknown): string[] {
 function toPositiveNumber(value: unknown, fallback: number): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function toOptionalPositiveNumber(value: unknown): number | null {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return parsed;
 }
 
@@ -207,6 +242,56 @@ function normalizeDecisionComponents(decision: Record<string, unknown>): string[
   return ordered;
 }
 
+function decisionNeedsAlb(decision: Record<string, unknown>, components: string[], stackConfig: Record<string, unknown>): boolean {
+  if (Boolean(decision.need_alb)) return true;
+  if (components.includes('alb')) return true;
+  if (Object.keys(asRecord(stackConfig.alb)).length > 0) return true;
+  const intakes = asRecord(decision.intakes);
+  return intakes.need_alb === true;
+}
+
+function decisionNeedsEip(decision: Record<string, unknown>, components: string[], stackConfig: Record<string, unknown>): boolean {
+  if (Boolean(decision.need_eip)) return true;
+  if (components.includes('eip') || components.includes('nat_gateway')) return true;
+  if (Object.keys(asRecord(stackConfig.eip)).length > 0) return true;
+  if (Object.keys(asRecord(stackConfig.nat_gateway)).length > 0) return true;
+  const vpc = asRecord(stackConfig.vpc);
+  if (Boolean(vpc.nat_gateway) || Boolean(vpc.nat_gateway_enabled)) return true;
+  const intakes = asRecord(decision.intakes);
+  return intakes.need_eip === true;
+}
+
+function estimateAssumedLcu(decision: Record<string, unknown>): { lcu: number; note: string } {
+  const intakes = asRecord(decision.intakes);
+  const peak = toOptionalPositiveNumber(intakes.peak_concurrent_users)
+    ?? toOptionalPositiveNumber(intakes.peak_users)
+    ?? toOptionalPositiveNumber(intakes.peak_traffic);
+  const monthlyTraffic = toOptionalPositiveNumber(intakes.monthly_traffic);
+
+  if (peak != null) {
+    const fromConnections = Math.max(0.25, peak / ALB_ACTIVE_CONNECTIONS_PER_LCU);
+    return {
+      lcu: Math.round(fromConnections * 100) / 100,
+      note: `assumed_lcu=${Math.round(fromConnections * 100) / 100} from peak_concurrent≈${peak}`,
+    };
+  }
+
+  if (monthlyTraffic != null) {
+    const gbPerMonth = (monthlyTraffic * ASSUMED_BYTES_PER_REQUEST) / (1024 ** 3);
+    const gbPerHour = gbPerMonth / HOURS_PER_MONTH;
+    const fromBytes = Math.max(0.25, gbPerHour / ALB_GB_PER_HOUR_PER_LCU);
+    return {
+      lcu: Math.round(fromBytes * 100) / 100,
+      note: `assumed_lcu=${Math.round(fromBytes * 100) / 100} from monthly_traffic≈${monthlyTraffic} req`,
+    };
+  }
+
+  return {
+    lcu: 0.5,
+    note: 'assumed_lcu=0.5 (no peak/monthly traffic intake; low-traffic default)',
+  };
+}
+
 function fallbackRdsHourly(instanceClass: string): { hourly: number; fallbackReason?: string; nearestType?: string } {
   const key = instanceClass.toLowerCase();
   if (key.includes('db.t3.micro')) return { hourly: FALLBACK.rds_db_t3_micro_hourly };
@@ -267,6 +352,8 @@ function fallbackEc2Hourly(instanceType: string): { hourly: number; fallbackReas
 function buildOptimizationTips(params: {
   components: string[];
   stackConfig: Record<string, unknown>;
+  needsAlb: boolean;
+  needsEip: boolean;
 }): string[] {
   const tips: string[] = [];
   const ecs = asRecord(params.stackConfig.ecs);
@@ -288,6 +375,14 @@ function buildOptimizationTips(params: {
     tips.push('If private egress is not required, disable NAT gateway to reduce networking charges.');
   }
 
+  if (params.needsAlb) {
+    tips.push('Tear down unused ALBs outside test windows; idle ALBs still incur hourly + minimum LCU charges.');
+  }
+
+  if (params.needsEip) {
+    tips.push('Release unused Elastic IPs; idle unattached EIPs incur hourly charges.');
+  }
+
   if (tips.length < 2) {
     tips.push('Schedule automated shutdown for test stacks outside working hours.');
   }
@@ -304,11 +399,15 @@ async function estimateDecisionCost(params: {
 }): Promise<DecisionCostEstimateResponse> {
   const components = normalizeDecisionComponents(params.decision);
   const stackConfig = normalizeDecisionStackConfig(params.decision);
-  const basedOnDecision = components.some((component) => Object.keys(asRecord(stackConfig[component])).length > 0);
+  const basedOnDecision = components.some((component) => Object.keys(asRecord(stackConfig[component])).length > 0)
+    || Boolean(params.decision.need_alb)
+    || Boolean(params.decision.need_eip);
   const location = REGION_LOCATION_MAP[params.awsRegion] || '';
   const lineItems: DecisionCostLineItem[] = [];
-  let pricingApiHits = 0;
   const fallbackReasons: string[] = [];
+  const decisionHash = hashDecisionSync(params.decision);
+  const needsAlb = decisionNeedsAlb(params.decision, components, stackConfig);
+  const needsEip = decisionNeedsEip(params.decision, components, stackConfig);
 
   const pushItem = (item: {
     component: string;
@@ -326,10 +425,32 @@ async function estimateDecisionCost(params: {
       note: item.note,
       source: item.source,
     });
-    if (item.source === 'pricing_api') pricingApiHits += 1;
   };
 
-  for (const component of components) {
+  const pushMonthlyItem = (item: {
+    component: string;
+    label: string;
+    monthly: number;
+    note: string;
+    source: 'pricing_api' | 'fallback';
+  }) => {
+    const safeMonthly = Math.max(0.01, item.monthly);
+    const hourly = safeMonthly / HOURS_PER_MONTH;
+    lineItems.push({
+      component: item.component,
+      label: item.label,
+      hourly_usd: roundHourly(hourly),
+      monthly_usd: roundMoney(safeMonthly),
+      note: item.note,
+      source: item.source,
+    });
+  };
+
+  const pricedComponents = new Set(components);
+  if (needsAlb) pricedComponents.add('alb');
+  if (needsEip) pricedComponents.add('eip');
+
+  for (const component of pricedComponents) {
     if (component === 'account-map') {
       pushItem({
         component,
@@ -344,9 +465,14 @@ async function estimateDecisionCost(params: {
     if (component === 'ec2-instance') {
       const ec2Cfg = asRecord(stackConfig['ec2-instance'] || stackConfig.ec2);
       const instanceType = String(ec2Cfg.instance_type || 't3.micro').trim().toLowerCase();
-      const rootVolumeSizeGb = toPositiveNumber(ec2Cfg.root_volume_size_gb, 35);
+      const rootVolumeSizeGb = toPositiveNumber(
+        ec2Cfg.root_volume_size_gb
+          ?? asRecord(params.decision.intakes).root_volume_size_gb,
+        35,
+      );
 
       let ec2Rate: number | null = null;
+      let ebsGbMonth: number | null = null;
       const ec2Payload = await fetchPricingBlob('AmazonEC2', params.awsRegion);
       if (ec2Payload && location) {
         ec2Rate = extractOnDemandHourly(ec2Payload, (attrs) => {
@@ -359,6 +485,13 @@ async function estimateDecisionCost(params: {
             && (operatingSystem.includes('linux') || !operatingSystem)
             && (preInstalledSw === 'na' || !preInstalledSw);
         });
+        ebsGbMonth = extractOnDemandHourly(ec2Payload, (attrs) => {
+          const productFamily = String(attrs.productFamily || '').toLowerCase();
+          const volumeApiName = String(attrs.volumeApiName || attrs.volumeType || '').toLowerCase();
+          return String(attrs.location || '') === location
+            && productFamily.includes('storage')
+            && volumeApiName === 'gp3';
+        });
       }
 
       const fallback = fallbackEc2Hourly(instanceType);
@@ -367,15 +500,27 @@ async function estimateDecisionCost(params: {
         component,
         label: 'ec2-instance',
         hourly: ec2Rate || fallback.hourly,
-        note: `${instanceType}, root=${rootVolumeSizeGb}GB${fallback.nearestType ? `, nearest=${fallback.nearestType}` : ''}`,
+        note: `${instanceType}${fallback.nearestType ? `, nearest=${fallback.nearestType}` : ''}`,
         source: ec2Rate ? 'pricing_api' : 'fallback',
+      });
+
+      const ebsMonthly = (ebsGbMonth || FALLBACK.ebs_gp3_gb_month) * rootVolumeSizeGb;
+      if (!ebsGbMonth) {
+        fallbackReasons.push('EBS gp3 pricing API did not return a regional GB-month match; static gp3 fallback rate was used.');
+      }
+      pushMonthlyItem({
+        component: 'ebs',
+        label: 'ebs_gp3_root',
+        monthly: ebsMonthly,
+        note: `gp3 root volume ${rootVolumeSizeGb}GB`,
+        source: ebsGbMonth ? 'pricing_api' : 'fallback',
       });
       continue;
     }
 
     if (component === 'vpc') {
       const vpcCfg = asRecord(stackConfig.vpc);
-      const natEnabled = Boolean(vpcCfg.nat_gateway_enabled);
+      const natEnabled = Boolean(vpcCfg.nat_gateway_enabled) || Boolean(vpcCfg.nat_gateway);
       let natHourly: number | null = null;
       const vpcPayload = await fetchPricingBlob('AmazonVPC', params.awsRegion);
       if (vpcPayload && location) {
@@ -395,8 +540,84 @@ async function estimateDecisionCost(params: {
         label: 'vpc/networking',
         hourly,
         note: natEnabled ? 'Includes one NAT gateway hourly estimate.' : 'Baseline VPC routing and networking estimate.',
-        source: natHourly ? 'pricing_api' : 'fallback',
+        source: natEnabled && natHourly ? 'pricing_api' : 'fallback',
       });
+      continue;
+    }
+
+    if (component === 'alb') {
+      const assumed = estimateAssumedLcu(params.decision);
+      let albHourly: number | null = null;
+      let lcuHourly: number | null = null;
+      const elbPayload = await fetchPricingBlob('AWSELB', params.awsRegion);
+      if (elbPayload && location) {
+        albHourly = extractOnDemandHourly(elbPayload, (attrs) => {
+          const usage = String(attrs.usagetype || '').toLowerCase();
+          const productFamily = String(attrs.productFamily || '').toLowerCase();
+          return String(attrs.location || '') === location
+            && productFamily.includes('load balancer')
+            && usage.includes('alb')
+            && usage.includes('hour')
+            && !usage.includes('lcu');
+        }) || extractOnDemandHourly(elbPayload, (attrs) => {
+          const usage = String(attrs.usagetype || '').toLowerCase();
+          return String(attrs.location || '') === location
+            && usage.includes('loadbalancerusage')
+            && !usage.includes('lcu');
+        });
+        lcuHourly = extractOnDemandHourly(elbPayload, (attrs) => {
+          const usage = String(attrs.usagetype || '').toLowerCase();
+          return String(attrs.location || '') === location
+            && usage.includes('lcu')
+            && (usage.includes('alb') || usage.includes('loadbalancer'));
+        });
+      }
+
+      const baseHourly = albHourly || FALLBACK.alb_hourly;
+      const perLcu = lcuHourly || FALLBACK.alb_lcu_hourly;
+      const usedApi = Boolean(albHourly && lcuHourly);
+      if (!albHourly || !lcuHourly) {
+        fallbackReasons.push('ALB hourly and/or LCU pricing API match was incomplete; static ALB fallback rates were used.');
+      }
+      pushItem({
+        component,
+        label: 'alb',
+        hourly: baseHourly + (perLcu * assumed.lcu),
+        note: `ALB hourly + ${assumed.lcu} LCU; ${assumed.note}`,
+        source: usedApi ? 'pricing_api' : 'fallback',
+      });
+      continue;
+    }
+
+    if (component === 'eip') {
+      let eipHourly: number | null = null;
+      const ec2Payload = await fetchPricingBlob('AmazonEC2', params.awsRegion);
+      if (ec2Payload && location) {
+        eipHourly = extractOnDemandHourly(ec2Payload, (attrs) => {
+          const usage = String(attrs.usagetype || '').toLowerCase();
+          const productFamily = String(attrs.productFamily || '').toLowerCase();
+          return String(attrs.location || '') === location
+            && (
+              (usage.includes('idleaddress') || usage.includes('elasticip'))
+              || productFamily.includes('ip address')
+            );
+        });
+      }
+      if (!eipHourly) {
+        fallbackReasons.push('EIP idle pricing API did not return a regional hourly match; static EIP fallback rate was used.');
+      }
+      pushItem({
+        component,
+        label: 'eip',
+        hourly: eipHourly || FALLBACK.eip_idle_hourly,
+        note: 'Elastic IP idle/associated address hourly estimate.',
+        source: eipHourly ? 'pricing_api' : 'fallback',
+      });
+      continue;
+    }
+
+    if (component === 'ebs' || component === 'nat_gateway') {
+      // Handled alongside EC2 / VPC / EIP when those flags are present.
       continue;
     }
 
@@ -513,7 +734,10 @@ async function estimateDecisionCost(params: {
   }
 
   const subtotal = roundMoney(lineItems.reduce((sum, item) => sum + Number(item.monthly_usd || 0), 0));
-  const source: 'pricing_api' | 'fallback' = pricingApiHits > 0 ? 'pricing_api' : 'fallback';
+  // Never label mixed/heuristic totals as pricing_api — only when every line item is API-backed.
+  const source: 'pricing_api' | 'fallback' = (
+    lineItems.length > 0 && lineItems.every((item) => item.source === 'pricing_api')
+  ) ? 'pricing_api' : 'fallback';
   const fallbackReason = Array.from(new Set(fallbackReasons)).join(' ');
 
   return {
@@ -521,11 +745,12 @@ async function estimateDecisionCost(params: {
     currency: 'USD',
     source,
     based_on_decision: basedOnDecision,
+    decision_hash: decisionHash,
     fallback_reason: fallbackReason || undefined,
     line_items: lineItems,
     subtotal_monthly_usd: subtotal,
     variance_note: 'Estimated monthly cost can vary by +/-20% with traffic, region updates, and usage patterns.',
-    optimization_tips: buildOptimizationTips({ components, stackConfig }),
+    optimization_tips: buildOptimizationTips({ components, stackConfig, needsAlb, needsEip }),
   };
 }
 
@@ -550,7 +775,9 @@ export async function POST(request: NextRequest) {
 
     const decision = asRecord(body.decision);
     const components = normalizeDecisionComponents(decision);
-    if (components.length === 0) {
+    const needsAlb = decisionNeedsAlb(decision, components, normalizeDecisionStackConfig(decision));
+    const needsEip = decisionNeedsEip(decision, components, normalizeDecisionStackConfig(decision));
+    if (components.length === 0 && !needsAlb && !needsEip) {
       return NextResponse.json({ success: false, error: 'decision.components, decision.deploy_sequence, or decision.stack_config is required' }, { status: 400 });
     }
 
@@ -566,6 +793,7 @@ export async function POST(request: NextRequest) {
         currency: 'USD',
         source: 'fallback',
         based_on_decision: false,
+        decision_hash: '',
         fallback_reason: 'Estimator failed and returned static fallback response payload.',
         line_items: [],
         subtotal_monthly_usd: 0,

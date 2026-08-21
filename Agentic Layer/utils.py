@@ -107,6 +107,31 @@ def resolve_host_projects_dir() -> str | None:
     return os.environ.get("HOST_PROJECTS_DIR")
 
 
+def resolve_host_mounted_path(container_path: str) -> str:
+    """Translate a path in this service to the corresponding Docker-host path."""
+    candidate = os.path.realpath(str(container_path or ""))
+    allowed_mounts = ("/repos", "/local-projects")
+    if not any(candidate == mount or candidate.startswith(f"{mount}/") for mount in allowed_mounts):
+        raise ValueError("Source path is outside supported repository mounts.")
+
+    container_id = os.environ.get("HOSTNAME")
+    if container_id:
+        container = get_docker_client().containers.get(container_id)
+        for mount in container.attrs.get("Mounts", []):
+            destination = os.path.realpath(str(mount.get("Destination") or ""))
+            if candidate != destination and not candidate.startswith(f"{destination}/"):
+                continue
+            source = str(mount.get("Source") or "").strip()
+            if source and destination in allowed_mounts:
+                relative = os.path.relpath(candidate, destination)
+                return source if relative == "." else os.path.join(source, relative)
+
+    # Local non-container development: Docker sees the same absolute path.
+    if os.path.isdir(candidate):
+        return candidate
+    raise RuntimeError(f"Unable to map repository source mount for {candidate}")
+
+
 def sanitize_name(name: str) -> str:
     """Make a project name safe for use in filenames."""
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,8 @@ import subprocess
 import threading
 import time
 from typing import Any
+import uuid
+from urllib.error import HTTPError
 from urllib import request
 
 from services.repo_service import get_tenant_repo_path
@@ -17,7 +20,9 @@ from services.repo_service import get_tenant_repo_path
 
 APP_ROOTS = ("frontend", "admin-frontend", "expert", "corporates")
 BASE_PORT = int(os.getenv("CUSTOMIZATION_PREVIEW_BASE_PORT", "3200") or "3200")
-HOST = os.getenv("CUSTOMIZATION_PREVIEW_HOST", "127.0.0.1")
+# Preview servers are loopback-only. The Connector remains the authenticated
+# gateway and no preview process may bind to an externally reachable host.
+HOST = "127.0.0.1"
 # Framework dev servers (Next.js especially) compile on first request, so the
 # default startup budget is generous. Plain static sites become ready instantly.
 START_TIMEOUT_SECONDS = int(os.getenv("CUSTOMIZATION_PREVIEW_START_TIMEOUT", "150") or "150")
@@ -31,15 +36,17 @@ AUTO_INSTALL = os.getenv("CUSTOMIZATION_PREVIEW_AUTO_INSTALL", "1").strip().lowe
 )
 INSTALL_TIMEOUT_SECONDS = int(os.getenv("CUSTOMIZATION_PREVIEW_INSTALL_TIMEOUT", "600") or "600")
 PREVIEW_LOG_TAIL_CHARS = 12000
+PREVIEW_LOG_MAX_BYTES = 2 * 1024 * 1024
 
 _PREVIEW_PROCESSES: dict[str, dict[str, Any]] = {}
 _PREVIEW_LOCK = threading.Lock()
 
 
-def _static_preview(kind: str = "static_file", status: str = "unavailable", detail: str = "") -> dict[str, Any]:
+def _static_preview(status: str = "ready", detail: str = "") -> dict[str, Any]:
     return {
-        "kind": kind,
+        "kind": "static_file",
         "status": status,
+        "url": None,
         "detail": detail,
     }
 
@@ -205,11 +212,18 @@ def _find_app_root(repo_path: Path, app_targets: list[str] | None = None) -> Pat
     targets = app_targets or list(APP_ROOTS)
     for app_root in targets:
         candidate = repo_path / app_root
-        if (candidate / "package.json").exists():
+        if _has_runnable_dev_script(candidate):
             return candidate
-    if (repo_path / "package.json").exists():
+    if _has_runnable_dev_script(repo_path):
         return repo_path
     return None
+
+
+def _has_runnable_dev_script(root: Path) -> bool:
+    package_json = _read_package_json(root)
+    scripts = package_json.get("scripts") if isinstance(package_json, dict) else {}
+    dev_script = scripts.get("dev") if isinstance(scripts, dict) else None
+    return isinstance(dev_script, str) and bool(dev_script.strip())
 
 
 def _dev_command(root: Path, port: int) -> list[str]:
@@ -221,14 +235,19 @@ def _dev_command(root: Path, port: int) -> list[str]:
         return [_npm_executable(), "run", "dev", "--", "-p", str(port), "-H", HOST]
     if "vite" in lowered:
         return [_npm_executable(), "run", "dev", "--", "--host", HOST, "--port", str(port)]
+    # PORT and HOST are also provided for custom scripts without CLI flags.
     return [_npm_executable(), "run", "dev"]
 
 
-from urllib.error import HTTPError
-
-def _healthcheck(url: str, timeout_seconds: int = START_TIMEOUT_SECONDS) -> bool:
+def _healthcheck(
+    url: str,
+    timeout_seconds: int = START_TIMEOUT_SECONDS,
+    should_continue: Any | None = None,
+) -> bool:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if should_continue is not None and not should_continue():
+            return False
         try:
             with request.urlopen(url, timeout=2) as response:
                 if 200 <= response.status < 500:
@@ -288,6 +307,10 @@ def _terminate_process(entry: dict[str, Any]) -> None:
         process.wait(timeout=8)
     except subprocess.TimeoutExpired:
         process.kill()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _process_running(entry: dict[str, Any]) -> bool:
@@ -300,29 +323,53 @@ def _thread_alive(entry: dict[str, Any]) -> bool:
     return isinstance(thread, threading.Thread) and thread.is_alive()
 
 
-def _update_entry(tenant_key: str, **fields: Any) -> None:
+def _entry_is_current(tenant_key: str, token: str) -> bool:
     with _PREVIEW_LOCK:
         entry = _PREVIEW_PROCESSES.get(tenant_key)
-        if entry is not None:
-            entry.update(fields)
+        return bool(
+            entry
+            and entry.get("token") == token
+            and entry.get("status") != "stopped"
+        )
+
+
+def _update_entry(tenant_key: str, token: str | None = None, **fields: Any) -> bool:
+    with _PREVIEW_LOCK:
+        entry = _PREVIEW_PROCESSES.get(tenant_key)
+        if entry is None or (token is not None and entry.get("token") != token):
+            return False
+        if entry.get("status") == "stopped" and fields.get("status") != "stopped":
+            return False
+        entry.update(fields)
+        return True
 
 
 def _entry_payload(entry: dict[str, Any], status: str | None = None, detail: str | None = None) -> dict[str, Any]:
     resolved_status = status or str(entry.get("status") or "ready")
     resolved_detail = detail if detail is not None else str(entry.get("detail") or "")
     return {
-        "kind": "live_server",
+        "kind": str(entry.get("kind") or "live_server"),
         "status": resolved_status,
-        "url": entry.get("url"),
         "detail": resolved_detail,
         "pid": entry.get("process").pid if _process_running(entry) else None,
         "app_root": entry.get("app_root"),
-        "port": entry.get("port"),
     }
+
+
+def _prepare_log(log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if log_path.exists() and log_path.stat().st_size > PREVIEW_LOG_MAX_BYTES:
+            previous = log_path.with_suffix(".log.previous")
+            previous.unlink(missing_ok=True)
+            log_path.replace(previous)
+    except OSError:
+        pass
 
 
 def _boot_preview_worker(
     tenant_key: str,
+    token: str,
     log_path: Path,
     app_root: Path,
     port: int,
@@ -334,26 +381,39 @@ def _boot_preview_worker(
     immediately while a framework app installs and compiles. Progress is exposed
     through the entry's ``status`` field, polled by ``preview_status``.
     """
+    _prepare_log(log_path)
     try:
         log_handle = log_path.open("a", encoding="utf-8")
     except OSError as exc:
-        _update_entry(tenant_key, status="failed", detail=f"Could not open preview log: {exc}")
+        _update_entry(tenant_key, token, status="failed", detail=f"Could not open preview log: {exc}")
         return
 
     try:
-        _update_entry(tenant_key, status="starting", detail="Installing dependencies...")
+        _update_entry(tenant_key, token, status="starting", detail="Checking preview dependencies...")
         deps_ok, deps_detail = _ensure_dependencies(app_root, log_handle)
-        if not deps_ok:
-            log_handle.close()
-            _update_entry(tenant_key, status="failed", detail=deps_detail)
+        if not _entry_is_current(tenant_key, token):
             return
-        _update_entry(tenant_key, status="starting", detail="Preparing legacy framework compatibility...")
+        if not deps_ok:
+            _update_entry(
+                tenant_key,
+                token,
+                kind="static_file",
+                status="ready",
+                url=None,
+                process=None,
+                detail=f"{deps_detail} Serving the static preview fallback.",
+            )
+            return
+        _update_entry(tenant_key, token, status="starting", detail="Preparing framework compatibility...")
         _patch_legacy_next_config(app_root, log_handle)
+        if not _entry_is_current(tenant_key, token):
+            return
 
         env = os.environ.copy()
         env["PORT"] = str(port)
         env["HOST"] = HOST
-        _update_entry(tenant_key, status="starting", detail="Launching dev server...")
+        env["HOSTNAME"] = HOST
+        _update_entry(tenant_key, token, status="starting", detail="Launching dev server...")
         try:
             process = subprocess.Popen(
                 _dev_command(app_root, port),
@@ -364,32 +424,58 @@ def _boot_preview_worker(
                 text=True,
             )
         except OSError as exc:
-            log_handle.close()
-            _update_entry(tenant_key, status="failed", detail=f"Failed to start preview process: {exc}")
+            _update_entry(
+                tenant_key,
+                token,
+                status="failed",
+                detail=f"Failed to start preview process: {exc}",
+            )
             return
 
-        _update_entry(tenant_key, process=process, status="starting", detail="Waiting for dev server to compile...")
+        if not _update_entry(
+            tenant_key,
+            token,
+            process=process,
+            status="starting",
+            detail="Waiting for dev server to compile...",
+        ):
+            _terminate_process({"process": process})
+            return
 
-        if _healthcheck(url):
-            _update_entry(tenant_key, status="ready", detail="")
+        if _healthcheck(
+            url,
+            should_continue=lambda: _entry_is_current(tenant_key, token) and process.poll() is None,
+        ):
+            _update_entry(tenant_key, token, status="ready", detail="")
+            return
+        if not _entry_is_current(tenant_key, token):
+            _terminate_process({"process": process})
             return
         log_summary = _tail_preview_log_summary(log_path)
         if process.poll() is not None:
             detail = f"Preview process exited early. See {log_path}."
             if log_summary:
                 detail = f"{detail} Latest error: {log_summary}"
-            _update_entry(tenant_key, status="failed", detail=detail)
+            _update_entry(tenant_key, token, status="failed", detail=detail)
         else:
             detail = f"Preview did not become ready within {START_TIMEOUT_SECONDS}s. See {log_path}."
             if log_summary:
                 detail = f"{detail} Latest error: {log_summary}"
+            _terminate_process({"process": process})
             _update_entry(
                 tenant_key,
+                token,
                 status="failed",
+                process=None,
                 detail=detail,
             )
     except Exception as exc:  # pragma: no cover - defensive
-        _update_entry(tenant_key, status="failed", detail=f"Preview startup error: {exc}")
+        _update_entry(tenant_key, token, status="failed", detail=f"Preview startup error: {exc}")
+    finally:
+        try:
+            log_handle.close()
+        except OSError:
+            pass
 
 
 def start_preview(
@@ -397,8 +483,89 @@ def start_preview(
     tenant_id: str,
     base_repo_path: str,
     app_targets: list[str] | None = None,
+    force_restart: bool = False,
 ) -> dict[str, Any]:
-    return {"kind": "static_sandbox", "status": "ready", "url": None, "detail": "Sandbox static preview ready."}
+    tenant_repo = Path(
+        get_tenant_repo_path(base_repo_path=base_repo_path, tenant_name=tenant_id)
+    ).resolve()
+    tenant_key = str(tenant_repo)
+    if not tenant_repo.exists() or not tenant_repo.is_dir():
+        return _static_preview(
+            status="failed",
+            detail=f"Tenant source repository is missing: {tenant_repo}",
+        )
+
+    app_root = _find_app_root(tenant_repo, app_targets)
+    old_entry: dict[str, Any] | None = None
+    with _PREVIEW_LOCK:
+        existing = _PREVIEW_PROCESSES.get(tenant_key)
+        same_app = bool(
+            existing
+            and existing.get("app_root") == (str(app_root) if app_root else None)
+        )
+        if existing and same_app and not force_restart:
+            existing_status = str(existing.get("status") or "")
+            if existing_status == "starting" and (_thread_alive(existing) or _process_running(existing)):
+                return _entry_payload(existing)
+            if existing_status == "ready":
+                if existing.get("kind") == "static_file" or (
+                    _process_running(existing) and _is_port_open(int(existing.get("port") or 0))
+                ):
+                    return _entry_payload(existing)
+        if existing:
+            existing["status"] = "stopped"
+            old_entry = existing
+
+    if old_entry and _process_running(old_entry):
+        _terminate_process(old_entry)
+
+    if app_root is None:
+        entry = {
+            "kind": "static_file",
+            "status": "ready",
+            "url": None,
+            "detail": "No runnable package dev script was found; serving the static preview fallback.",
+            "app_root": None,
+            "process": None,
+            "thread": None,
+            "token": uuid.uuid4().hex,
+        }
+        with _PREVIEW_LOCK:
+            _PREVIEW_PROCESSES[tenant_key] = entry
+        return _entry_payload(entry)
+
+    try:
+        port = _find_free_port()
+    except RuntimeError as exc:
+        return _static_preview(detail=f"{exc} Serving the static preview fallback.")
+
+    token = uuid.uuid4().hex
+    url = f"http://{HOST}:{port}"
+    safe_tenant = re.sub(r"[^a-zA-Z0-9_.-]+", "-", tenant_id).strip("-") or "tenant"
+    log_path = Path(__file__).resolve().parents[1] / "logs" / "previews" / f"{safe_tenant}.log"
+    entry = {
+        "kind": "live_server",
+        "status": "starting",
+        "url": url,
+        "detail": "Preparing preview...",
+        "app_root": str(app_root),
+        "port": port,
+        "process": None,
+        "thread": None,
+        "log_path": str(log_path),
+        "token": token,
+    }
+    thread = threading.Thread(
+        target=_boot_preview_worker,
+        args=(tenant_key, token, log_path, app_root, port, url),
+        name=f"preview-{safe_tenant}",
+        daemon=True,
+    )
+    entry["thread"] = thread
+    with _PREVIEW_LOCK:
+        _PREVIEW_PROCESSES[tenant_key] = entry
+    thread.start()
+    return _entry_payload(entry)
 
 
 def preview_status(
@@ -407,20 +574,103 @@ def preview_status(
     base_repo_path: str,
     app_targets: list[str] | None = None,
 ) -> dict[str, Any]:
-    return {"kind": "static_sandbox", "status": "ready", "url": None, "detail": "Sandbox static preview ready."}
+    tenant_repo = Path(
+        get_tenant_repo_path(base_repo_path=base_repo_path, tenant_name=tenant_id)
+    ).resolve()
+    tenant_key = str(tenant_repo)
+    if not tenant_repo.exists() or not tenant_repo.is_dir():
+        return _static_preview(
+            status="failed",
+            detail=f"Tenant source repository is missing: {tenant_repo}",
+        )
+
+    with _PREVIEW_LOCK:
+        entry = _PREVIEW_PROCESSES.get(tenant_key)
+    if entry is None:
+        if _find_app_root(tenant_repo, app_targets) is None:
+            return _static_preview(
+                detail="No runnable package dev script was found; static preview is ready.",
+            )
+        return _static_preview(
+            status="stopped",
+            detail="Live preview has not been started.",
+        )
+
+    status = str(entry.get("status") or "failed")
+    if entry.get("kind") == "static_file" or status == "stopped":
+        return _entry_payload(entry)
+
+    if status == "starting":
+        if _process_running(entry) or _thread_alive(entry):
+            return _entry_payload(entry)
+        detail = _tail_preview_log_summary(entry.get("log_path"))
+        failure = "Preview startup stopped unexpectedly."
+        if detail:
+            failure = f"{failure} Latest error: {detail}"
+        _update_entry(tenant_key, str(entry.get("token") or ""), status="failed", detail=failure)
+        return _entry_payload(entry)
+
+    if status == "ready":
+        if _process_running(entry) and _is_port_open(int(entry.get("port") or 0)):
+            return _entry_payload(entry)
+        detail = _tail_preview_log_summary(entry.get("log_path"))
+        failure = "Preview process is no longer running."
+        if detail:
+            failure = f"{failure} Latest error: {detail}"
+        if _process_running(entry):
+            _terminate_process(entry)
+        _update_entry(
+            tenant_key,
+            str(entry.get("token") or ""),
+            status="failed",
+            process=None,
+            detail=failure,
+        )
+    return _entry_payload(entry)
 
 
 def stop_preview(*, tenant_id: str, base_repo_path: str) -> dict[str, Any]:
     tenant_repo = Path(get_tenant_repo_path(base_repo_path=base_repo_path, tenant_name=tenant_id)).resolve()
     with _PREVIEW_LOCK:
-        entry = _PREVIEW_PROCESSES.pop(str(tenant_repo), None)
+        entry = _PREVIEW_PROCESSES.get(str(tenant_repo))
+        if entry:
+            entry["status"] = "stopped"
+            entry["detail"] = "Preview stopped."
     if not entry:
-        return {"kind": "live_server", "status": "unavailable", "detail": "No live preview process was running."}
+        return {"kind": "live_server", "status": "stopped", "detail": "No live preview process was running."}
 
-    # Mark stopped so an in-flight boot thread stops promoting the entry to ready.
-    entry["status"] = "stopped"
-    if not _process_running(entry):
-        return {"kind": "live_server", "status": "stopped", "detail": "Preview was not yet running.", "url": entry.get("url")}
+    if _process_running(entry):
+        _terminate_process(entry)
+        entry["process"] = None
+    return _entry_payload(entry)
 
-    _terminate_process(entry)
-    return {"kind": "live_server", "status": "stopped", "url": entry.get("url")}
+
+def get_preview_upstream_url(*, tenant_id: str, base_repo_path: str) -> str | None:
+    """Return a loopback URL for backend-internal proxying only."""
+    tenant_repo = Path(
+        get_tenant_repo_path(base_repo_path=base_repo_path, tenant_name=tenant_id)
+    ).resolve()
+    with _PREVIEW_LOCK:
+        entry = _PREVIEW_PROCESSES.get(str(tenant_repo))
+        if (
+            not entry
+            or entry.get("kind") != "live_server"
+            or entry.get("status") != "ready"
+            or not _process_running(entry)
+        ):
+            return None
+        url = str(entry.get("url") or "")
+    return url if url.startswith(f"http://{HOST}:") else None
+
+
+def _cleanup_all_previews() -> None:
+    with _PREVIEW_LOCK:
+        entries = list(_PREVIEW_PROCESSES.values())
+        for entry in entries:
+            entry["status"] = "stopped"
+    for entry in entries:
+        if _process_running(entry):
+            _terminate_process(entry)
+
+
+atexit.register(_cleanup_all_previews)

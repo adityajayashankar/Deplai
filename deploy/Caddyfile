@@ -8,10 +8,20 @@
     header {
         -Server
         X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
         Referrer-Policy "strict-origin-when-cross-origin"
         Permissions-Policy "camera=(), microphone=(), geolocation=()"
     }
+
+    # Customization previews are embedded by the same-origin dashboard.
+    @customization_preview path /api/customization/preview/*
+    header @customization_preview {
+        X-Frame-Options "SAMEORIGIN"
+        Content-Security-Policy "frame-ancestors 'self'"
+    }
+
+    # Keep every other application response protected from framing.
+    @not_customization_preview not path /api/customization/preview/*
+    header @not_customization_preview X-Frame-Options "DENY"
 
     # The browser connects to the Agentic Layer only through this WS route.
     # handle_path strips /agentic so FastAPI still receives /ws/... and /api/....

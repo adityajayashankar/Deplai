@@ -10,7 +10,9 @@ from typing import Any
 
 
 AWS_PROVIDER_SOURCE = "registry.terraform.io/hashicorp/aws"
-DEFAULT_PROVIDER_CONSTRAINT = "~> 5.40"
+# Production pin: patch-only within the tested 5.100 minor (not ~> 5 / not 6.x yet).
+# Refresh .terraform.lock.hcl in CI after bumping; do not always track latest.
+DEFAULT_PROVIDER_CONSTRAINT = "~> 5.100.0"
 
 
 def repo_root() -> Path:

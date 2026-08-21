@@ -1,10 +1,10 @@
 terraform {
-  required_version = ">= 1.6.0"
+  required_version = ">= 1.6.0, < 1.12.0"
 
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 5.100.0"
     }
   }
 }
@@ -69,7 +69,7 @@ resource "aws_security_group" "db" {
 # -----------------------------------------------------------------------------
 module "db" {
   source  = "terraform-aws-modules/rds/aws"
-  version = "~> 6.0"
+  version = "6.12.0"
 
   count = local.is_aurora ? 0 : 1
 
@@ -108,7 +108,7 @@ module "db" {
 # -----------------------------------------------------------------------------
 module "aurora" {
   source  = "terraform-aws-modules/rds-aurora/aws"
-  version = "~> 9.0"
+  version = "9.15.0"
 
   count = local.is_aurora ? 1 : 0
 

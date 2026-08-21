@@ -3,6 +3,10 @@ import { requireAuth, verifyProjectOwnership, verifyRepositoryOwnership } from '
 import { githubService } from '@/lib/github';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { query } from '@/lib/db';
+import {
+  resolveCustomizationSnapshot,
+  SnapshotResolutionError,
+} from '@/lib/customization-snapshot';
 
 interface ScanValidateBody {
   project_id?: string;
@@ -11,6 +15,8 @@ interface ScanValidateBody {
   scan_type?: 'all' | 'sast' | 'sca';
   owner?: string;
   repo?: string;
+  customization_snapshot_id?: string;
+  tenant_id?: string;
 }
 
 type ScanValidatePayload = {
@@ -21,6 +27,14 @@ type ScanValidatePayload = {
   user_id: string;
   github_token?: string;
   repository_url?: string;
+  source_override?: {
+    kind: 'customization_snapshot';
+    project_id: string;
+    tenant_id: string;
+    snapshot_id: string;
+    source_root: string;
+    source_tree_hash: string;
+  };
 };
 
 interface ProjectRow {
@@ -69,12 +83,20 @@ export async function POST(request: NextRequest) {
     const resolvedProjectType: 'local' | 'github' = body.project_type === 'github' ? 'github' : 'local';
     const resolvedScanType: 'all' | 'sast' | 'sca' =
       body.scan_type === 'sast' || body.scan_type === 'sca' ? body.scan_type : 'all';
+    const customizationSnapshotId = String(body.customization_snapshot_id || '').trim();
+    const tenantId = String(body.tenant_id || '').trim();
 
     if (!resolvedProjectId) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
     }
     if (!resolvedProjectName) {
       return NextResponse.json({ error: 'project_name is required' }, { status: 400 });
+    }
+    if (Boolean(customizationSnapshotId) !== Boolean(tenantId)) {
+      return NextResponse.json(
+        { error: 'customization_snapshot_id and tenant_id must be provided together' },
+        { status: 400 },
+      );
     }
 
     const backendPayload: ScanValidatePayload = {
@@ -84,6 +106,35 @@ export async function POST(request: NextRequest) {
       scan_type: resolvedScanType,
       user_id: String(user.id),
     };
+
+    if (customizationSnapshotId && tenantId) {
+      const ownership = await verifyProjectOwnership(user.id, resolvedProjectId);
+      if ('error' in ownership) {
+        return NextResponse.json({ error: 'Project not found or access denied' }, { status: 403 });
+      }
+      try {
+        const snapshot = await resolveCustomizationSnapshot({
+          userId: String(user.id),
+          projectId: resolvedProjectId,
+          tenantId,
+          snapshotId: customizationSnapshotId,
+        });
+        backendPayload.source_override = {
+          kind: snapshot.kind,
+          project_id: snapshot.project_id,
+          tenant_id: snapshot.tenant_id,
+          snapshot_id: snapshot.snapshot_id,
+          source_root: snapshot.agentic_source_root,
+          source_tree_hash: snapshot.source_tree_hash,
+        };
+      } catch (snapshotError) {
+        const status = snapshotError instanceof SnapshotResolutionError ? snapshotError.status : 502;
+        return NextResponse.json(
+          { error: snapshotError instanceof Error ? snapshotError.message : 'Snapshot validation failed.' },
+          { status },
+        );
+      }
+    }
 
     if (resolvedProjectType === 'github') {
       const resolvedOwner = String(body.owner || '').trim();

@@ -4,10 +4,11 @@ from urllib.parse import quote
 from fastapi import WebSocket
 
 from models import ScanContext, StreamStatus
+from repository_sources import resolve_snapshot_source_override
 from runner_base import RunnerBase
 from bearer import run_bearer_scan
 from sbom import run_syft_scan, run_grype_scan
-from utils import ensure_docker_image, get_docker_client, decode_output, VOLUME_NAMES, CODEBASE_VOLUME, SECURITY_REPORTS_VOLUME, resolve_host_projects_dir, set_current_project_id
+from utils import ensure_docker_image, get_docker_client, decode_output, VOLUME_NAMES, CODEBASE_VOLUME, SECURITY_REPORTS_VOLUME, resolve_host_mounted_path, resolve_host_projects_dir, set_current_project_id
 
 TOTAL_STEPS = 12
 CONTAINER_OP_TIMEOUT = int(os.getenv("CONTAINER_OP_TIMEOUT", "120"))  # seconds for volume/clone ops
@@ -222,6 +223,33 @@ class EnvironmentInitializer(RunnerBase):
         except Exception as e:
             return (False, str(e))
 
+    def _ingest_snapshot_source(self) -> tuple[bool, str]:
+        """Copy a validated immutable customization snapshot into the scan volume."""
+        try:
+            source = resolve_snapshot_source_override(
+                self.scan_context.source_override,
+                project_id=self.scan_context.project_id,
+            )
+            host_path = resolve_host_mounted_path(str(source))
+            output = self._docker.containers.run(
+                "alpine",
+                command=[
+                    "sh",
+                    "-c",
+                    "mkdir -p /repo/${PID} && cp -a /src/. /repo/${PID}/ && echo Success || echo Failed",
+                ],
+                environment={"PID": self.scan_context.project_id},
+                volumes={
+                    CODEBASE_VOLUME: {"bind": "/repo", "mode": "rw"},
+                    host_path: {"bind": "/src", "mode": "ro"},
+                },
+                remove=True,
+            )
+            decoded = decode_output(output)
+            return (True, "") if "Success" in decoded else (False, f"Copy failed: {decoded}")
+        except Exception as exc:
+            return (False, f"Snapshot source validation failed: {exc}")
+
     async def _run_pipeline(self) -> bool:
         self._check_cancelled()
         await self._send_message("phase", "Initializing Scan")
@@ -279,7 +307,10 @@ class EnvironmentInitializer(RunnerBase):
             await self._send_message("info", "Removed previous scan reports for this project")
             await self._send_message("success", "Setup is ready")
 
-        ingest = self._ingest_github_repo if self.scan_context.project_type == "github" else self._ingest_local_project
+        if self.scan_context.source_override is not None:
+            ingest = self._ingest_snapshot_source
+        else:
+            ingest = self._ingest_github_repo if self.scan_context.project_type == "github" else self._ingest_local_project
         success, error_msg = await self._run_step(ingest)
         if not success:
             return await self._terminate(f"Error: Terminating workflow — {error_msg}")

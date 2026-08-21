@@ -7,6 +7,11 @@ import {
   resolveProjectMeta,
   resolveProjectSourceRoot as resolveSharedProjectSourceRoot,
 } from '@/lib/project-meta';
+import {
+  resolveCustomizationSnapshot,
+  SnapshotResolutionError,
+  type CustomizationSnapshotSource,
+} from '@/lib/customization-snapshot';
 import fs from 'fs';
 import path from 'path';
 
@@ -53,6 +58,10 @@ interface IacGenerateBody {
   consultant_history?: Array<{ role?: string; content?: string }>;
   consultant_turn_count?: number;
   consultant_decision?: Record<string, unknown>;
+  selected_tier?: string;
+  requirements?: Record<string, unknown>;
+  customization_snapshot_id?: string;
+  tenant_id?: string;
 }
 
 interface GeneratedFile {
@@ -392,6 +401,8 @@ function normalizeConsultantDecisionEc2(
     components: finalComponents,
     deploy_sequence: finalSequence,
     stack_config: normalizedStackConfig,
+    need_alb: Boolean(decision.need_alb) || finalComponents.includes('alb') || Object.prototype.hasOwnProperty.call(normalizedStackConfig, 'alb'),
+    need_eip: Boolean(decision.need_eip) || finalComponents.includes('eip') || Object.prototype.hasOwnProperty.call(normalizedStackConfig, 'eip'),
   };
 }
 
@@ -582,6 +593,15 @@ function summarizeConsultantDecision(
     lines.push(`EC2: ${ec2Config.instance_type}, root=${ec2Config.root_volume_size_gb}GB, app_port=${ec2Config.app_port}`);
   }
 
+  const alb = asRecord(stackConfig.alb);
+  if (Object.keys(alb).length > 0 || Boolean(decision.need_alb) || components.includes('alb')) {
+    lines.push(`ALB: enabled (target_port=${String(alb.target_port || asRecord(stackConfig.ec2).app_port || '?')})`);
+  }
+  const eip = asRecord(stackConfig.eip);
+  if (Object.keys(eip).length > 0 || Boolean(decision.need_eip) || components.includes('eip')) {
+    lines.push('Elastic IP: enabled');
+  }
+
   if (components.includes('s3_cloudfront')) {
     lines.push(detected.has_static_assets ? 'CDN/static hosting is included.' : 'CloudFront/static hosting is included.');
   }
@@ -615,11 +635,90 @@ function buildRepoDetectionSummaryText(detected: RepoDetectionSummary): string {
   ].join('\n');
 }
 
+function parseConnectorChatIntakes(
+  history: Array<{ role?: string; content?: string }> | undefined,
+  userAnswers: Record<string, unknown> = {},
+  latestUserText = '',
+): Record<string, unknown> {
+  const answers = asRecord(userAnswers);
+  const userParts = Array.isArray(history)
+    ? history
+      .filter((item) => String(item?.role || '').trim().toLowerCase() === 'user')
+      .map((item) => String(item?.content || '').trim())
+      .filter(Boolean)
+    : [];
+  if (latestUserText.trim()) userParts.push(latestUserText.trim());
+  const search = `${userParts.join('\n')}\n${JSON.stringify(answers)}`.toLowerCase();
+  const intakes: Record<string, unknown> = {};
+
+  const parseNum = (raw: string): number | null => {
+    const cleaned = raw.trim().toLowerCase().replace(/,/g, '');
+    let multiplier = 1;
+    let body = cleaned;
+    if (body.endsWith('k')) {
+      multiplier = 1000;
+      body = body.slice(0, -1);
+    } else if (body.endsWith('m')) {
+      multiplier = 1_000_000;
+      body = body.slice(0, -1);
+    }
+    const value = Number(body);
+    return Number.isFinite(value) ? value * multiplier : null;
+  };
+
+  const monthlyMatch = search.match(/(?:monthly|per\s*month|\/\s*mo)\D{0,24}(\d+(?:\.\d+)?\s*[km]?)/i)
+    || search.match(/(\d+(?:\.\d+)?\s*[km]?)\s*(?:requests?|hits?)\s*(?:per|\/)\s*month/i);
+  if (monthlyMatch) {
+    const value = parseNum(monthlyMatch[1]);
+    if (value != null) intakes.monthly_traffic = Math.round(value);
+  } else if (answers.monthly_traffic != null) {
+    const value = parseNum(String(answers.monthly_traffic));
+    if (value != null) intakes.monthly_traffic = Math.round(value);
+  }
+
+  const peakMatch = search.match(/(?:peak(?:\s+concurrent)?(?:\s+users?)?|concurrent\s+users?)\D{0,24}(\d+(?:\.\d+)?\s*[km]?)/i)
+    || search.match(/(\d+(?:\.\d+)?\s*[km]?)\s*(?:rps|req(?:uests?)?\s*\/\s*s)/i);
+  if (peakMatch) {
+    const value = parseNum(peakMatch[1]);
+    if (value != null) {
+      intakes.peak_traffic = Math.round(value);
+      intakes.peak_concurrent_users = Math.round(value);
+    }
+  }
+
+  if (/\b(?:no|without|don'?t\s+need)\b.{0,24}\b(?:alb|load\s*balanc)/i.test(search)) intakes.need_alb = false;
+  else if (/\b(?:alb|application\s+load\s*balanc|load\s*balanc(?:er|ing)?)\b/i.test(search)) intakes.need_alb = true;
+  else if (readBoolLike(answers.need_alb) != null) intakes.need_alb = readBoolLike(answers.need_alb);
+
+  if (/\b(?:no|without|don'?t\s+need)\b.{0,24}\b(?:eip|elastic\s*ip)/i.test(search)) intakes.need_eip = false;
+  else if (/\b(?:eip|elastic\s*ip|static\s*(?:public\s*)?ip)\b/i.test(search)) intakes.need_eip = true;
+  else if (readBoolLike(answers.need_eip) != null) intakes.need_eip = readBoolLike(answers.need_eip);
+
+  if (/\b(?:ha|high\s*availability|multi[\s-]?az)\b/i.test(search)) intakes.ha = true;
+  else if (readBoolLike(answers.ha) != null) intakes.ha = readBoolLike(answers.ha);
+
+  const regionMatch = search.match(/\b((?:us|eu|ap|ca|sa)-(?:east|west|north|south|central|northeast|southeast)-\d)\b/i);
+  if (regionMatch) intakes.region = regionMatch[1].toLowerCase();
+
+  const instanceMatch = search.match(/\b((?:t2|t3|m5|c5)\.(?:micro|small|medium|large|xlarge))\b/i);
+  if (instanceMatch) intakes.instance_type = instanceMatch[1].toLowerCase();
+
+  if (/\b(?:no|without|don'?t\s+(?:need|want)|skip)\b.{0,20}\b(?:rds|database|postgres|mysql)\b/i.test(search)) intakes.need_rds = false;
+  else if (/\b(?:need|want|include|add|with)\b.{0,20}\b(?:rds|managed\s+database|postgres|mysql)\b/i.test(search)) intakes.need_rds = true;
+
+  if (/\b(?:no|without|don'?t\s+(?:need|want)|skip)\b.{0,20}\b(?:redis|elasticache|cache)\b/i.test(search)) intakes.need_redis = false;
+  else if (/\b(?:need|want|include|add|with)\b.{0,20}\b(?:redis|elasticache|cache)\b/i.test(search)) intakes.need_redis = true;
+
+  return intakes;
+}
+
 function buildDeterministicConsultantDecision(params: {
   detected: RepoDetectionSummary;
   deploymentProfile: Record<string, unknown> | null;
   userAnswers: Record<string, unknown>;
   awsRegion: string;
+  latestUserText?: string;
+  conversationHistory?: Array<{ role?: string; content?: string }>;
 }): Record<string, unknown> {
   const deployment = asRecord(params.deploymentProfile);
   const compute = asRecord(deployment.compute);
@@ -627,26 +726,55 @@ function buildDeterministicConsultantDecision(params: {
   const primaryService = services[0] || {};
   const dataLayer = asRecords(deployment.data_layer);
   const userAnswers = asRecord(params.userAnswers);
+  const intakes = parseConnectorChatIntakes(
+    params.conversationHistory,
+    userAnswers,
+    params.latestUserText || '',
+  );
+  const awsRegion = String(intakes.region || params.awsRegion || 'eu-north-1');
   const ec2Config = normalizeEc2ResourceConfig({
     ...ec2ConfigFromUserAnswers(userAnswers),
+    ...(typeof intakes.instance_type === 'string' ? { instance_type: intakes.instance_type } : {}),
     app_port: userAnswers.app_port || primaryService.port || DEFAULT_EC2_CONFIG.app_port,
   });
-  const hasRds = params.detected.has_database || dataLayer.some((item) => {
-    const type = String(item.type || '').trim().toLowerCase();
-    return ['postgresql', 'postgres', 'mysql', 'mariadb'].includes(type);
-  });
-  const hasRedis = params.detected.has_redis || dataLayer.some((item) => String(item.type || '').trim().toLowerCase() === 'redis');
-  const databaseType = String(params.detected.database_type || '').trim().toLowerCase();
-  const databaseEngine = ['mysql', 'mariadb'].includes(databaseType) ? databaseType : 'postgres';
-  const components = ['ec2'];
+
+  const hasRds = intakes.need_rds === false
+    ? false
+    : intakes.need_rds === true
+      || params.detected.has_database
+      || dataLayer.some((item) => {
+        const type = String(item.type || '').trim().toLowerCase();
+        return ['postgresql', 'postgres', 'mysql', 'mariadb'].includes(type);
+      });
+  const hasRedis = intakes.need_redis === false
+    ? false
+    : intakes.need_redis === true
+      || params.detected.has_redis
+      || dataLayer.some((item) => String(item.type || '').trim().toLowerCase() === 'redis');
+
+  const monthly = Number(intakes.monthly_traffic);
+  const peak = Number(intakes.peak_traffic || intakes.peak_concurrent_users);
+  const trafficSuggestsAlb = (Number.isFinite(monthly) && monthly >= 100_000)
+    || (Number.isFinite(peak) && peak >= 50);
+  const needAlb = intakes.need_alb === true
+    || (intakes.need_alb !== false && (Boolean(intakes.ha) || trafficSuggestsAlb));
+  const needEip = intakes.need_eip === true
+    || (intakes.need_eip !== false && !needAlb);
+
+  const components = ['vpc', 'ec2'];
+  if (needAlb) components.push('alb');
+  if (needEip) components.push('eip');
   if (hasRds) components.push('rds');
   if (hasRedis) components.push('elasticache');
 
   const stackConfig: Record<string, unknown> = {
     ec2: {
       ...ec2Config,
-      aws_region: params.awsRegion || 'eu-north-1',
-      public_http: true,
+      aws_region: awsRegion,
+      public_http: !needAlb,
+      behind_alb: needAlb,
+      associate_eip: needEip,
+      desired_count: needAlb || Boolean(intakes.ha) ? 2 : 1,
       ssh_access: ec2Config.ssh_ingress_cidr_blocks.length > 0,
       security_group_rules: [
         { type: 'ingress', from_port: 80, to_port: 80, protocol: 'tcp', cidr_blocks: ['0.0.0.0/0'] },
@@ -657,14 +785,42 @@ function buildDeterministicConsultantDecision(params: {
         { type: 'egress', from_port: 0, to_port: 0, protocol: '-1', cidr_blocks: ['0.0.0.0/0'] },
       ],
     },
+    networking: {
+      vpc: 'new',
+      public_subnets: true,
+      private_subnets: Boolean(needAlb || hasRds || hasRedis),
+      nat_gateway: Boolean(needAlb && (hasRds || hasRedis)),
+      load_balancer: needAlb ? { public: true, type: 'application' } : {},
+      ports_exposed: needAlb ? [80, 443] : [ec2Config.app_port],
+    },
   };
 
+  if (needAlb) {
+    stackConfig.alb = {
+      enabled: true,
+      scheme: 'internet-facing',
+      listeners: ['http', 'https'],
+      health_check_path: '/',
+      target_port: ec2Config.app_port,
+      need_alb: true,
+    };
+  }
+  if (needEip) {
+    stackConfig.eip = {
+      enabled: true,
+      associate_with: 'ec2',
+      need_eip: true,
+    };
+  }
+
   if (hasRds) {
+    const databaseType = String(params.detected.database_type || '').trim().toLowerCase();
+    const databaseEngine = ['mysql', 'mariadb'].includes(databaseType) ? databaseType : 'postgres';
     stackConfig.rds = {
       engine: databaseEngine,
       engine_version: databaseEngine === 'mysql' ? '8.0' : databaseEngine === 'mariadb' ? '10.11' : '15.10',
       instance_class: 'db.t3.micro',
-      multi_az: false,
+      multi_az: Boolean(needAlb || intakes.ha),
       backup_retention_period: 7,
       deletion_protection: false,
       publicly_accessible: false,
@@ -679,20 +835,28 @@ function buildDeterministicConsultantDecision(params: {
   }
 
   return {
+    provider: 'aws',
+    region: awsRegion,
     components,
     deploy_sequence: [...components],
     stack_config: stackConfig,
+    need_alb: needAlb,
+    need_eip: needEip,
+    intakes,
     outputs_to_capture: [
       'ec2_instance_id',
       'ec2_public_ip',
       'ec2_public_dns',
-      'ec2_key_name',
-      'generated_ec2_private_key_pem',
+      'app_url',
+      ...(needAlb ? ['alb_dns_name', 'load_balancer_dns_name'] : []),
+      ...(needEip ? ['elastic_ip'] : []),
       ...(hasRds ? ['rds_endpoint'] : []),
       ...(hasRedis ? ['redis_endpoint'] : []),
     ],
     consultant_notes: [
-      'Deterministic consultant fallback selected an EC2-first runtime deploy plan.',
+      'Intake-aware connector fallback selected an EC2-first runtime deploy plan.',
+      needAlb ? 'ALB enabled from chat intake, HA, or traffic threshold.' : 'No ALB requested.',
+      needEip ? 'Elastic IP enabled for a stable public front door.' : 'No Elastic IP requested.',
       params.detected.has_static_assets
         ? 'Static assets were detected, but the first-success deploy path serves them from EC2/nginx.'
         : 'No static asset bundle was required for the infrastructure decision.',
@@ -700,6 +864,7 @@ function buildDeterministicConsultantDecision(params: {
         ? 'Worker processes were detected; run them on the EC2 host until a dedicated queue/worker tier is explicitly added.'
         : 'No dedicated worker tier was detected.',
     ],
+    open_questions: [],
   };
 }
 
@@ -1305,6 +1470,7 @@ async function generateIacBundleWithTerraformAgent(params: {
   sourceRoot?: string | null;
   sourceRootCandidates?: string[];
   repositoryUrl?: string | null;
+  sourceMetadata?: Record<string, unknown> | null;
   llmProvider?: string | null;
   llmApiKey?: string | null;
   llmModel?: string | null;
@@ -1373,6 +1539,7 @@ async function generateIacBundleWithTerraformAgent(params: {
       source_root: params.sourceRoot || undefined,
       source_root_candidates: params.sourceRootCandidates || undefined,
       repository_url: params.repositoryUrl || undefined,
+      source_metadata: params.sourceMetadata || undefined,
     }),
   }, {
     timeoutMs: 600_000,
@@ -1739,6 +1906,14 @@ export async function POST(req: NextRequest) {
       : 100;
     const lowCostMode = budgetCapUsd <= 1;
     const projectName = String(owned.project?.name || owned.project?.full_name || projectId).split('/').pop() || projectId;
+    const customizationSnapshotId = String(body.customization_snapshot_id || '').trim();
+    const tenantId = String(body.tenant_id || '').trim();
+    if (Boolean(customizationSnapshotId) !== Boolean(tenantId)) {
+      return NextResponse.json(
+        { error: 'customization_snapshot_id and tenant_id must be provided together' },
+        { status: 400 },
+      );
+    }
     const qa = String(body.qa_summary || '').trim();
     const arch = String(body.architecture_context || '').trim();
     const architectureValidation = body.architecture_json
@@ -1824,10 +1999,27 @@ export async function POST(req: NextRequest) {
     ].filter(Boolean).join('\n');
 
     const iacWarnings: string[] = [];
-    const sourceRoots = provider === 'aws'
+    let snapshotSource: CustomizationSnapshotSource | null = null;
+    if (customizationSnapshotId && tenantId) {
+      try {
+        snapshotSource = await resolveCustomizationSnapshot({
+          userId: String(user.id),
+          projectId,
+          tenantId,
+          snapshotId: customizationSnapshotId,
+        });
+      } catch (snapshotError) {
+        const status = snapshotError instanceof SnapshotResolutionError ? snapshotError.status : 502;
+        return NextResponse.json(
+          { error: snapshotError instanceof Error ? snapshotError.message : 'Snapshot validation failed.' },
+          { status },
+        );
+      }
+    }
+    const sourceRoots = provider === 'aws' && !snapshotSource
       ? await resolveProjectSourceRoots(String(user.id), projectId)
       : null;
-    if (provider === 'aws' && !sourceRoots) {
+    if (provider === 'aws' && !sourceRoots && !snapshotSource) {
       return NextResponse.json(
         {
           error: 'Could not resolve repository source files for AWS website packaging. Re-sync the project repository and retry.',
@@ -1836,9 +2028,23 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
-    const connectorSourceRoot = sourceRoots?.connectorRoot || null;
-    const agenticSourceRoot = sourceRoots?.agenticRoot || connectorSourceRoot;
-    const repositoryUrl = sourceRoots?.repositoryUrl || null;
+    const connectorSourceRoot = snapshotSource?.snapshot_path || sourceRoots?.connectorRoot || null;
+    const agenticSourceRoot = snapshotSource?.agentic_source_root || sourceRoots?.agenticRoot || connectorSourceRoot;
+    // Snapshot packages must be built from the immutable source tree, never a fresh clone.
+    const repositoryUrl = snapshotSource ? null : (sourceRoots?.repositoryUrl || null);
+    const sourceMetadata = snapshotSource
+      ? {
+          kind: snapshotSource.kind,
+          project_id: snapshotSource.project_id,
+          tenant_id: snapshotSource.tenant_id,
+          snapshot_id: snapshotSource.snapshot_id,
+          snapshot_path: snapshotSource.snapshot_path,
+          agentic_source_root: snapshotSource.agentic_source_root,
+          source_tree_hash: snapshotSource.source_tree_hash,
+          created_at: snapshotSource.created_at,
+          status: snapshotSource.status,
+        }
+      : null;
 
     const websiteCollection = provider === 'aws' && connectorSourceRoot
       ? collectWebsiteAssets(connectorSourceRoot)
@@ -1912,6 +2118,164 @@ export async function POST(req: NextRequest) {
       const consultantTurnCount = Number(body.consultant_turn_count || 0);
       if (consultantAction === 'start' || consultantAction === 'reply' || consultantAction === 'force_decision') {
         const awsRegion = body.aws_region?.trim() || 'eu-north-1';
+        const workspace = String(body.workspace || terraformSafeProjectSlug(projectName) || projectId || 'default').trim();
+        const history = Array.isArray(body.consultant_history)
+          ? body.consultant_history
+            .map((item) => ({
+              role: String(item?.role || '').trim().toLowerCase() === 'assistant' ? 'assistant' : 'user',
+              content: String(item?.content || '').trim(),
+            }))
+            .filter((item) => item.content.length > 0)
+          : [];
+
+        type AgenticConsultResult = {
+          success?: boolean;
+          assistant_message?: string | null;
+          ready?: boolean;
+          decision?: Record<string, unknown> | null;
+          open_questions?: string[] | null;
+          repo_detection_summary?: string | null;
+          turn_count?: number;
+          decision_summary?: string | null;
+          source?: string | null;
+          fallback_reason?: string | null;
+          error?: string | null;
+          budget_cap_usd?: number | null;
+          selected_tier?: string | null;
+          cost_estimate?: Record<string, unknown> | null;
+          budget_gate?: Record<string, unknown> | null;
+          upgrade_suggestions?: Array<Record<string, unknown>> | null;
+          plan_tiers?: Record<string, unknown> | null;
+          requirements?: Record<string, unknown> | null;
+        };
+        let agenticConsult: AgenticConsultResult | null = null;
+        let agenticError: string | null = null;
+
+        const consultBody = {
+          architecture_json: normalizedArchitecture,
+          repository_context: repositoryContext || undefined,
+          deployment_profile: normalizedDeploymentProfile || undefined,
+          detected: detectedSummary,
+          aws_region: awsRegion,
+          conversation_history: history,
+          turn_count: Number.isFinite(consultantTurnCount) ? consultantTurnCount : 0,
+          force_decision: consultantAction === 'force_decision',
+          workspace,
+          project_id: projectId,
+          project_name: projectName,
+          user_answers: asRecord(body.user_answers),
+          prior_decision: Object.keys(asRecord(body.consultant_decision)).length > 0
+            ? asRecord(body.consultant_decision)
+            : undefined,
+          budget_cap_usd: Number(asRecord(body).budget_cap_usd || 0) || undefined,
+          selected_tier: String(asRecord(body).selected_tier || '').trim() || undefined,
+          requirements: Object.keys(asRecord(body.requirements)).length > 0
+            ? asRecord(body.requirements)
+            : undefined,
+          llm_provider: body.llm_provider || undefined,
+          llm_api_key: body.llm_api_key || undefined,
+          llm_model: body.llm_model || undefined,
+          llm_api_base_url: body.llm_api_base_url || undefined,
+        };
+
+        try {
+          const adviseResponse = await fetchAgentic('/api/infra/advise', {
+            method: 'POST',
+            headers: {
+              ...agenticHeaders(),
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(consultBody),
+          }, {
+            timeoutMs: 60_000,
+            retriesPerUrl: 1,
+          });
+          const advisePayload = await adviseResponse.json().catch(() => ({})) as Record<string, unknown>;
+          if (adviseResponse.ok && advisePayload.success !== false) {
+            agenticConsult = advisePayload as unknown as AgenticConsultResult;
+          } else {
+            agenticError = String(advisePayload.error || `Agentic advise failed with HTTP ${adviseResponse.status}`);
+          }
+        } catch (err) {
+          const classified = classifyAgenticRouteError(err, 'advise infrastructure plan');
+          agenticError = classified.message;
+        }
+
+        if (!agenticConsult) {
+          try {
+            const consultResponse = await fetchAgentic('/api/terraform/consult', {
+              method: 'POST',
+              headers: {
+                ...agenticHeaders(),
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(consultBody),
+            }, {
+              timeoutMs: 60_000,
+              retriesPerUrl: 1,
+            });
+            const consultPayload = await consultResponse.json().catch(() => ({})) as Record<string, unknown>;
+            if (!consultResponse.ok || consultPayload.success === false) {
+              agenticError = String(consultPayload.error || `Agentic consult failed with HTTP ${consultResponse.status}`);
+            } else {
+              agenticConsult = consultPayload as unknown as AgenticConsultResult;
+              agenticError = null;
+            }
+          } catch (err) {
+            const classified = classifyAgenticRouteError(err, 'consult infrastructure plan');
+            agenticError = classified.message;
+          }
+        }
+
+        if (agenticConsult && agenticConsult.success !== false && (agenticConsult.decision || agenticConsult.assistant_message)) {
+          const consultantDecision = agenticConsult.decision
+            ? normalizeConsultantDecisionEc2(
+              asRecord(agenticConsult.decision),
+              asRecord(body.user_answers),
+              latestUserMessage(body.consultant_history),
+            )
+            : null;
+          const consultantSummary = consultantDecision
+            ? (String(agenticConsult.decision_summary || '').trim()
+              || summarizeConsultantDecision(consultantDecision, detectedSummary, awsRegion))
+            : String(agenticConsult.decision_summary || '').trim();
+          const fallbackReason = String(agenticConsult.fallback_reason || '').trim() || null;
+          const assistantMessage = String(agenticConsult.assistant_message || '').trim()
+            || (consultantDecision
+              ? buildDeterministicConsultantMessage({
+                decision: consultantDecision,
+                detected: detectedSummary,
+                awsRegion,
+                fallbackReason: fallbackReason || undefined,
+              })
+              : 'Tell me your monthly budget and who will use the app — I will design the AWS setup for you.');
+          return NextResponse.json({
+            success: true,
+            detected: detectedSummary,
+            consultant_response: assistantMessage,
+            consultant_ready: Boolean(agenticConsult.ready) && Boolean(consultantDecision),
+            consultant_turn_count: Number(agenticConsult.turn_count || (Number.isFinite(consultantTurnCount) ? consultantTurnCount + 1 : 1)),
+            repo_detection_summary: String(agenticConsult.repo_detection_summary || '').trim()
+              || buildRepoDetectionSummaryText(detectedSummary),
+            consultant_decision: consultantDecision,
+            consultant_summary: consultantSummary,
+            consultant_open_questions: Array.isArray(agenticConsult.open_questions) ? agenticConsult.open_questions : [],
+            consultant_source: String(agenticConsult.source || 'infra_advisor'),
+            consultant_fallback_reason: fallbackReason,
+            budget_cap_usd: Number(agenticConsult.budget_cap_usd || 0) || null,
+            selected_tier: String(agenticConsult.selected_tier || '').trim() || null,
+            advisor_cost_estimate: agenticConsult.cost_estimate || null,
+            advisor_budget_gate: agenticConsult.budget_gate || null,
+            upgrade_suggestions: Array.isArray(agenticConsult.upgrade_suggestions) ? agenticConsult.upgrade_suggestions : [],
+            plan_tiers: agenticConsult.plan_tiers || null,
+            advisor_requirements: agenticConsult.requirements || null,
+            actual_renderer: String(agenticConsult.source || '') === 'infra_advisor' ? 'infra_advisor' : 'terraform_consult',
+            llm_iac_disabled: String(agenticConsult.source || '') !== 'llm',
+            source_metadata: sourceMetadata,
+          });
+        }
+
+        const fallbackReason = agenticError || 'agentic_consult_unavailable';
         const baseDecision = Object.keys(asRecord(body.consultant_decision)).length > 0
           ? asRecord(body.consultant_decision)
           : buildDeterministicConsultantDecision({
@@ -1919,6 +2283,8 @@ export async function POST(req: NextRequest) {
             deploymentProfile: normalizedDeploymentProfile,
             userAnswers: asRecord(body.user_answers),
             awsRegion,
+            latestUserText: latestUserMessage(body.consultant_history),
+            conversationHistory: body.consultant_history,
           });
         const consultantDecision = normalizeConsultantDecisionEc2(
           baseDecision,
@@ -1937,16 +2303,19 @@ export async function POST(req: NextRequest) {
             decision: consultantDecision,
             detected: detectedSummary,
             awsRegion,
-            fallbackReason: 'Using the DeplAI standard Terraform architecture.',
+            fallbackReason,
           }),
           consultant_ready: true,
           consultant_turn_count: Number.isFinite(consultantTurnCount) ? consultantTurnCount + 1 : 1,
           repo_detection_summary: buildRepoDetectionSummaryText(detectedSummary),
           consultant_decision: consultantDecision,
           consultant_summary: consultantSummary,
-          consultant_fallback_reason: 'standard_terraform_architecture',
+          consultant_open_questions: [],
+          consultant_source: 'connector_fallback',
+          consultant_fallback_reason: fallbackReason,
           actual_renderer: 'deplai_deterministic',
           llm_iac_disabled: true,
+          source_metadata: sourceMetadata,
         });
       }
 
@@ -1961,6 +2330,74 @@ export async function POST(req: NextRequest) {
       const effectiveTerraformRenderer: TerraformRenderer = terraformRenderer;
       const effectiveIacMode: IacMode = terraformRenderer === 'auto' || iacMode === 'llm' ? 'llm' : iacMode;
 
+      const profileCandidate = asRecord(normalizedDeploymentProfile);
+      const hasCompleteProfile = Boolean(
+        profileCandidate.document_kind === 'deployment_profile'
+        && String(profileCandidate.workspace || '').trim()
+        && String(profileCandidate.project_name || '').trim()
+        && String(profileCandidate.application_type || '').trim()
+        && String(profileCandidate.environment || '').trim()
+        && asRecord(profileCandidate.compute).strategy
+        && Object.keys(asRecord(profileCandidate.networking)).length > 0,
+      );
+      const fallbackSeedProfile: Record<string, unknown> = {
+        document_kind: 'deployment_profile',
+        profile_version: 'connector_seed_v1',
+        generated_at: new Date().toISOString(),
+        workspace: terraformSafeProjectSlug(projectName),
+        project_name: projectName,
+        provider: 'aws',
+        application_type: String(asRecord(repositoryContext.language).runtime || asRecord(repositoryContext.language).primary || 'node'),
+        environment: 'prod',
+        compute: {
+          strategy: Array.isArray(consultantDecision.components) && consultantDecision.components.includes('ecs')
+            ? 'ecs_fargate'
+            : Array.isArray(consultantDecision.components) && consultantDecision.components.includes('s3_cloudfront')
+              ? 's3_cloudfront'
+              : 'ec2',
+          services: [{
+            id: 'app',
+            process_type: 'web',
+            cpu: 512,
+            memory: 1024,
+            port: Number(asRecord(asRecord(consultantDecision.stack_config).ec2).app_port) || 3000,
+            desired_count: 1,
+          }],
+        },
+        networking: {
+          vpc: 'new',
+          layout: 'private_subnets',
+          nat_gateway: true,
+          load_balancer: consultantDecision.need_alb || (Array.isArray(consultantDecision.components) && consultantDecision.components.includes('alb'))
+            ? { public: true, scheme: 'internet-facing' }
+            : {},
+          elastic_ip: consultantDecision.need_eip || (Array.isArray(consultantDecision.components) && consultantDecision.components.includes('eip'))
+            ? { enabled: true }
+            : {},
+          ports_exposed: [80, 443, Number(asRecord(asRecord(consultantDecision.stack_config).ec2).app_port) || 3000],
+        },
+        data_layer: [],
+        warnings: ['Connector synthesized a deployment profile seed for consultant-driven Terraform generation.'],
+      };
+      const effectiveDeploymentProfile = {
+        ...(hasCompleteProfile ? profileCandidate : fallbackSeedProfile),
+        ...(hasCompleteProfile ? {} : profileCandidate),
+        document_kind: 'deployment_profile',
+        workspace: String(profileCandidate.workspace || fallbackSeedProfile.workspace),
+        project_name: String(profileCandidate.project_name || fallbackSeedProfile.project_name),
+        application_type: String(profileCandidate.application_type || fallbackSeedProfile.application_type),
+        environment: String(profileCandidate.environment || fallbackSeedProfile.environment),
+        compute: asRecord(profileCandidate.compute).strategy
+          ? asRecord(profileCandidate.compute)
+          : asRecord(fallbackSeedProfile.compute),
+        networking: Object.keys(asRecord(profileCandidate.networking)).length > 0
+          ? asRecord(profileCandidate.networking)
+          : asRecord(fallbackSeedProfile.networking),
+        detected: detectedSummary,
+        user_answers: asRecord(body.user_answers),
+        consultant_decision: consultantDecision,
+      };
+
       let agentBundle: Awaited<ReturnType<typeof generateIacBundleWithTerraformAgent>>;
       try {
         agentBundle = await generateIacBundleWithTerraformAgent({
@@ -1970,12 +2407,7 @@ export async function POST(req: NextRequest) {
           provider,
           iacMode: effectiveIacMode,
           architectureJson: normalizedArchitecture,
-          deploymentProfile: {
-            ...(normalizedDeploymentProfile || {}),
-            detected: detectedSummary,
-            user_answers: asRecord(body.user_answers),
-            consultant_decision: consultantDecision,
-          },
+          deploymentProfile: effectiveDeploymentProfile,
           approvalPayload: asRecord(body.approval_payload),
           repositoryContext,
           securityContext: sec,
@@ -2007,6 +2439,7 @@ export async function POST(req: NextRequest) {
             ...(connectorSourceRoot && connectorSourceRoot !== agenticSourceRoot ? [connectorSourceRoot] : []),
           ],
           repositoryUrl,
+          sourceMetadata,
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err || 'Terraform agent generation failed.');
@@ -2043,6 +2476,7 @@ export async function POST(req: NextRequest) {
         requested_renderer: effectiveTerraformRenderer,
         terraform_root: 'terraform',
         strategy_router_enabled: true,
+        source_metadata: sourceMetadata,
       };
       const rendererMetadata: Record<string, unknown> = {
         requested_renderer: effectiveTerraformRenderer,
@@ -2095,6 +2529,7 @@ export async function POST(req: NextRequest) {
         files,
         security_context: sec,
         source,
+        source_metadata: sourceMetadata,
         run_id: runId,
         workspace,
         provider_version: providerVersion,

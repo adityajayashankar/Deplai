@@ -53,8 +53,10 @@ if "docker.errors" not in sys.modules:
 from terraform_apply import (
     _discover_existing_ec2_key_pair_name,
     _legacy_runtime_bundle_needs_remediation,
+    _normalize_aws_provider_to_registry_pin,
     _remediate_legacy_runtime_bundle,
     _summarize_ec2_plan_changes,
+    rewrite_ec2_module_v5_compat,
 )
 
 
@@ -396,6 +398,198 @@ class TerraformApplyKeyPairDiscoveryTests(unittest.TestCase):
         ]
 
         self.assertFalse(_legacy_runtime_bundle_needs_remediation(files))
+
+
+class Ec2ModuleV5CompatTests(unittest.TestCase):
+    def test_rewrites_object_root_block_device_to_list(self) -> None:
+        source = """
+module "ec2" {
+  source = "terraform-aws-modules/ec2-instance/aws"
+  version = "5.8.0"
+  create_security_group = false
+  root_block_device = {
+    encrypted   = true
+    volume_type = "gp3"
+    volume_size = 8
+  }
+  tags = {}
+}
+
+module "alb" {
+  source = "terraform-aws-modules/alb/aws"
+  create_security_group = false
+}
+"""
+        rewritten, changed = rewrite_ec2_module_v5_compat(source)
+        self.assertTrue(changed)
+        ec2_slice = rewritten.split('module "alb"')[0]
+        self.assertNotIn("create_security_group", ec2_slice)
+        self.assertIn("root_block_device = [{", rewritten)
+        self.assertIn("create_security_group = false", rewritten.split('module "alb"')[1])
+
+    def test_detects_stale_ec2_module_for_remediation(self) -> None:
+        files = [
+            {
+                "path": "terraform/modules/compute/main.tf",
+                "content": """
+module "ec2" {
+  root_block_device = {
+    encrypted = true
+    volume_type = "gp3"
+    volume_size = 8
+  }
+}
+""",
+            }
+        ]
+        self.assertTrue(_legacy_runtime_bundle_needs_remediation(files))
+        patched, remediation = _remediate_legacy_runtime_bundle(files, {})
+        self.assertTrue(remediation.get("ec2_module_v5_compat_rewritten"))
+        content = str(patched[0]["content"])
+        self.assertIn("root_block_device = [{", content)
+
+    def test_leaves_list_root_block_device_alone(self) -> None:
+        source = """
+module "ec2" {
+  root_block_device = [{
+    encrypted = true
+    volume_type = "gp3"
+    volume_size = 8
+  }]
+}
+"""
+        rewritten, changed = rewrite_ec2_module_v5_compat(source)
+        self.assertFalse(changed)
+        self.assertEqual(rewritten, source)
+
+
+class KeyPairReuseRemediationTests(unittest.TestCase):
+    def test_key_reuse_remediation_does_not_gate_ec2_module_count(self) -> None:
+        # Bundle already has key-pair reuse locals/count; second pass must not
+        # rewrite module.ec2 count to !local.use_existing_key.
+        files = [
+            {
+                "path": "terraform/modules/compute/main.tf",
+                "content": """
+locals {
+  use_existing_key = trimspace(var.existing_ec2_key_pair_name) != ""
+  ec2_key_name     = local.use_existing_key ? trimspace(var.existing_ec2_key_pair_name) : aws_key_pair.generated[0].key_name
+}
+
+resource "tls_private_key" "generated" {
+  count     = var.enabled && !local.use_existing_key ? 1 : 0
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "aws_key_pair" "generated" {
+  count      = var.enabled && !local.use_existing_key ? 1 : 0
+  key_name   = "${var.project_name}-${var.environment}-key"
+  public_key = tls_private_key.generated[0].public_key_openssh
+}
+
+module "ec2" {
+  count    = var.enabled ? 1 : 0
+  key_name = local.ec2_key_name
+}
+""",
+            }
+        ]
+        # Force remediator path via corrupted EC2 count so needs_remediation is true.
+        files[0]["content"] = files[0]["content"].replace(
+            "count    = var.enabled ? 1 : 0",
+            "count    = var.enabled && !local.use_existing_key ? 1 : 0",
+        )
+        self.assertTrue(_legacy_runtime_bundle_needs_remediation(files))
+        patched, remediation = _remediate_legacy_runtime_bundle(files, {})
+        content = str(patched[0]["content"])
+        self.assertTrue(
+            remediation.get("legacy_ec2_count_ungated_from_key_reuse")
+            or remediation.get("ec2_module_v5_compat_rewritten")
+        )
+        ec2_slice = content.split('module "ec2"')[1]
+        self.assertRegex(ec2_slice, r"count\s*=\s*var\.enabled\s*\?\s*1\s*:\s*0")
+        self.assertNotRegex(
+            ec2_slice,
+            r"count\s*=\s*var\.enabled\s*&&\s*!local\.use_existing_key",
+        )
+        key_slice = content.split('module "ec2"')[0]
+        self.assertIn("var.enabled && !local.use_existing_key", key_slice)
+
+
+    def test_second_pass_does_not_bleed_key_count_into_ec2(self) -> None:
+        files = [
+            {
+                "path": "terraform/modules/compute/main.tf",
+                "content": """
+locals {
+  use_existing_key = trimspace(var.existing_ec2_key_pair_name) != ""
+  ec2_key_name     = local.use_existing_key ? trimspace(var.existing_ec2_key_pair_name) : aws_key_pair.generated[0].key_name
+}
+
+resource "tls_private_key" "generated" {
+  count     = var.enabled && !local.use_existing_key ? 1 : 0
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "aws_key_pair" "generated" {
+  count      = var.enabled && !local.use_existing_key ? 1 : 0
+  key_name   = "${var.project_name}-${var.environment}-key"
+  public_key = tls_private_key.generated[0].public_key_openssh
+}
+
+module "ec2" {
+  count    = var.enabled ? 1 : 0
+  key_name = local.ec2_key_name
+  root_block_device = {
+    encrypted = true
+  }
+}
+""",
+            }
+        ]
+        self.assertTrue(_legacy_runtime_bundle_needs_remediation(files))
+        patched, _ = _remediate_legacy_runtime_bundle(files, {})
+        content = str(patched[0]["content"])
+        ec2_slice = content.split('module "ec2"')[1]
+        self.assertRegex(ec2_slice, r"count\s*=\s*var\.enabled\s*\?\s*1\s*:\s*0")
+        self.assertNotRegex(
+            ec2_slice,
+            r"count\s*=\s*var\.enabled\s*&&\s*!local\.use_existing_key",
+        )
+
+
+class AwsProviderRegistryPinTests(unittest.TestCase):
+    def test_rewrites_aws_provider_6_to_registry_5x_when_ec2_v5_present(self) -> None:
+        files = [
+            {
+                "path": "terraform/versions.tf",
+                "content": """
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+""",
+            },
+            {
+                "path": "terraform/modules/compute/main.tf",
+                "content": """
+module "ec2" {
+  source  = "terraform-aws-modules/ec2-instance/aws"
+  version = "5.8.0"
+}
+""",
+            },
+        ]
+        patched = _normalize_aws_provider_to_registry_pin(files, {})
+        versions = str(patched[0]["content"])
+        self.assertIn('version = "~> 5.100.0"', versions)
+        self.assertNotIn("~> 6.0", versions)
 
 
 if __name__ == "__main__":

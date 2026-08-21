@@ -1,4 +1,7 @@
 from pathlib import Path
+from typing import Any
+
+from .module_catalog import MODULE_CATALOG, get_module
 
 # Base directory — resolved relative to this file's location
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -12,6 +15,12 @@ SERVICE_TEMPLATE_MAP: dict[str, Path] = {
     "lambda": TEMPLATES_DIR / "lambda",
     "elasticache": TEMPLATES_DIR / "elasticache",
     "alb": TEMPLATES_DIR / "alb",
+}
+
+# Pinned registry modules for the EC2/ALB/EIP vertical slice (see module_catalog.py).
+PINNED_REGISTRY_MODULES: dict[str, dict[str, Any]] = {
+    key: get_module(key)
+    for key in ("vpc", "ec2_instance", "alb", "security_group", "rds", "elasticache", "eip", "nat_gateway")
 }
 
 PARAM_SCHEMA: dict[str, list[dict]] = {
@@ -102,10 +111,21 @@ PARAM_SCHEMA: dict[str, list[dict]] = {
 
 SUPPORTED_SERVICES = list(SERVICE_TEMPLATE_MAP.keys())
 
+
 def get_template_path(service_type: str) -> Path:
     if service_type not in SERVICE_TEMPLATE_MAP:
         raise ValueError(f"Unsupported service type: {service_type}. Supported: {SUPPORTED_SERVICES}")
     return SERVICE_TEMPLATE_MAP[service_type]
 
+
 def get_param_schema(service_type: str) -> list[dict]:
     return PARAM_SCHEMA.get(service_type, [])
+
+
+def get_pinned_module(service_type: str) -> dict[str, Any]:
+    """Return curated registry pin metadata for a service (or raise KeyError)."""
+    return get_module(service_type)
+
+
+def list_module_catalog() -> dict[str, dict[str, Any]]:
+    return {key: dict(value) for key, value in MODULE_CATALOG.items()}

@@ -50,6 +50,152 @@ type NavGroup = {
 
 const DOC_PAGES: DocPage[] = [
   {
+    id: "about-deplai",
+    groupId: "overview",
+    label: "What is DeplAI?",
+    eyebrow: "Platform overview",
+    title: "A human-controlled path from source code to cloud runtime.",
+    summary: "DeplAI keeps security, architecture, cost, infrastructure, and runtime work connected to one authenticated project, with people approving the steps that change source code or cloud resources.",
+    sections: [
+      {
+        id: "what-we-are",
+        title: "What we are",
+        paragraphs: [
+          "DeplAI is a source-aware engineering workspace for taking an application from a GitHub repository or local ZIP to a reviewed, deployable AWS runtime. It combines repository onboarding, security analysis, remediation, planning, cost review, Terraform, runtime operations, and tenant customization.",
+          "It is not an unattended deploy-anything agent. The platform mixes deterministic checks, optional AI assistance, reviewable artifacts, and explicit approval before billable infrastructure changes.",
+        ],
+      },
+      {
+        id: "problem-we-solve",
+        title: "What we are trying to solve",
+        paragraphs: [
+          "Application delivery often passes through disconnected tools and handoffs: repository access, security reports, remediation, architecture, cost review, infrastructure code, deployment, and operations. Context is easily lost between those steps.",
+          "DeplAI keeps the work tied to a project, its source evidence, and its authenticated owner so you can see the rationale, progress, warnings, and review points in one workspace.",
+        ],
+      },
+      {
+        id: "vision",
+        title: "Vision",
+        paragraphs: [
+          "Make secure cloud delivery repeatable and understandable, without asking every team to stitch together a separate workflow for every project. The intended result is an explainable path from repository evidence to an approved deployment decision.",
+        ],
+        bullets: [
+          "You retain control of source changes and pull requests.",
+          "You choose the cloud account, region, budget, and operational constraints.",
+          "You review architecture, cost, warnings, and Terraform plan output before apply.",
+          "You explicitly authorize infrastructure creation and destruction.",
+        ],
+      },
+      {
+        id: "product-goals",
+        title: "Product goals",
+        table: {
+          headers: ["Goal", "How DeplAI helps"],
+          rows: [
+            ["Preserve context", "Connect source, scans, planning, deployments, and chat to one project."],
+            ["Improve security", "Turn scan findings into reviewable, validated remediation proposals."],
+            ["Make trade-offs visible", "Use source analysis, architecture review, cost estimates, and approval gates before deployment."],
+            ["Constrain IaC risk", "Use curated components, validation, plan confirmation, workspace locks, and execution status."],
+          ],
+        },
+      },
+    ],
+  },
+  {
+    id: "platform-architecture",
+    groupId: "technical",
+    label: "Platform architecture",
+    eyebrow: "Technical reference",
+    title: "One control plane, one trusted execution plane.",
+    summary: "The Connector owns browser access, identity, ownership, and project data. The Agentic Layer performs trusted long-running work, while the Terraform and customization services provide focused execution paths.",
+    sections: [
+      {
+        id: "level-one-components",
+        title: "Level-1 components",
+        table: {
+          headers: ["Component", "Responsibility"],
+          rows: [
+            ["Browser + Connector", "Next.js control plane for the dashboard, encrypted sessions, project ownership, GitHub access, API adaptation, and MySQL records."],
+            ["Agentic Layer", "FastAPI execution plane for scans, remediation, repository analysis, architecture/cost workflows, Terraform orchestration, and AWS operations."],
+            ["Terraform Agent", "Deployment profiles, curated modules, bundle validation, state/lock handling, and Terraform execution helpers."],
+            ["Customization backend", "Tenant manifest conversation, scoped repository edits, validation, previews, assets, and snapshots."],
+            ["External systems", "GitHub provides identity/source control; Docker runs workers; AWS hosts deployed resources and state/secrets."],
+          ],
+        },
+      },
+      {
+        id: "frameworks",
+        title: "Frameworks and benefits",
+        table: {
+          headers: ["Area", "Technology", "Benefit"],
+          rows: [
+            ["Control plane", "Next.js 16, React 19, TypeScript, Tailwind", "A single typed UI and server-side API boundary."],
+            ["Execution", "FastAPI, Pydantic, Python", "Typed internal contracts and asynchronous workflow endpoints."],
+            ["Workflow design", "LangGraph", "Named state, conditional routing, and observable agent stages."],
+            ["Cloud and IaC", "Docker SDK, Boto3, Terraform", "Isolated worker commands and AWS-aware deployment/runtime operations."],
+            ["Persistence", "MySQL, S3/DynamoDB where configured", "Project metadata plus recoverable Terraform artifacts and workspace locking."],
+          ],
+        },
+      },
+      {
+        id: "trust-boundaries",
+        title: "Control and trust boundaries",
+        bullets: [
+          "Browsers receive an encrypted session, never the internal Agentic service key.",
+          "Connector-to-Agentic calls use an internal API key; live workflow sockets use short-lived tokens bound to a user and project.",
+          "Terraform apply requires a reviewed plan and explicit confirmation; sensitive outputs are handled separately from public runtime output.",
+          "The Agentic Layer uses the Docker socket for workers. Treat the current production stack as suitable for trusted repositories, not arbitrary untrusted code.",
+        ],
+      },
+    ],
+  },
+  {
+    id: "agent-architecture",
+    groupId: "technical",
+    label: "Agent architecture",
+    eyebrow: "Technical reference",
+    title: "AI assistance inside explicit, reviewable workflows.",
+    summary: "DeplAI uses state graphs, typed contracts, validators, and fallbacks around optional LLM work. No workflow bypasses ownership checks or applies infrastructure without confirmation.",
+    sections: [
+      {
+        id: "source-to-runtime-flow",
+        title: "Source-to-runtime flow",
+        steps: [
+          "Analyze the repository to collect frameworks, data-store, build, runtime, health, CI, and infrastructure signals.",
+          "Use a guided architecture review or Infrastructure Advisor to produce a deployment profile, tier, and budget assessment.",
+          "Build the Stage 7 diagram/cost/approval payload, then generate and validate a Terraform bundle from the structured decision.",
+          "Inspect the plan, explicitly confirm apply, then follow runtime status and supported operations in the workspace.",
+        ],
+      },
+      {
+        id: "workflow-catalogue",
+        title: "Workflow catalogue",
+        table: {
+          headers: ["Workflow", "How it works"],
+          rows: [
+            ["Infrastructure Advisor", "LangGraph loads project context, understands the turn, asks only needed questions, designs tiers, estimates cost, applies a budget gate, and prepares a decision."],
+            ["Stage 7", "LangGraph builds a diagram, estimates cost, evaluates the budget, and packages an approval payload; a deterministic warning fallback is available."],
+            ["Terraform", "Structured context and deployment profile pass through renderer selection, optional LLM workers, deterministic rescue paths, validation, persisted artifacts, plan confirmation, and controlled apply."],
+            ["Remediation", "Findings are ingested, grouped, extracted, turned into candidate fixes, diff-validated, then handed to local changes or a GitHub PR workflow."],
+            ["Customization", "A manifest conversation is followed by source scanning, planning, modification, validation, reporting, preview, and snapshot stages."],
+            ["Chat", "A guarded coordinator validates context, intent, tool payloads, multi-step chains, and proposed actions before mapping outcomes back to the UI."],
+          ],
+        },
+      },
+      {
+        id: "agent-safeguards",
+        title: "Safeguards and fallbacks",
+        bullets: [
+          "Repository evidence and typed contracts ground recommendations before a deployment decision is generated.",
+          "LLM output is parsed and validated; supported workflows can use deterministic fallbacks or rescue renderers when a model is unavailable or fails.",
+          "The chat agent exposes only a small allowlisted tool set and challenges a proposed action before it can be executed.",
+          "Terraform uses project/workspace state, locking, temporary execution volumes, progress events, and an explicit confirmation gate.",
+        ],
+        note: "For the full implementation-level graphs, worker stages, and safety boundaries, read docs/agent-architecture.md in the repository.",
+      },
+    ],
+  },
+  {
     id: "getting-started",
     groupId: "start",
     label: "Get started",
@@ -372,9 +518,11 @@ const DOC_PAGES: DocPage[] = [
 ];
 
 const NAV_GROUPS: NavGroup[] = [
+  { id: "overview", label: "About DeplAI", icon: BookOpen, pages: ["about-deplai"] },
   { id: "start", label: "Get started", icon: Rocket, pages: ["getting-started", "connect-github", "choose-project"] },
   { id: "workflows", label: "Use DeplAI", icon: CloudCog, pages: ["security-scan", "remediate-findings", "plan-and-deploy", "manage-deployment"] },
   { id: "customize", label: "Customize", icon: Sparkles, pages: ["customize-workspace"] },
+  { id: "technical", label: "Technical", icon: Settings2, pages: ["platform-architecture", "agent-architecture"] },
   { id: "help", label: "Help", icon: Settings2, pages: ["help"] },
 ];
 
@@ -439,7 +587,7 @@ function Section({ section, number }: { section: DocSection; number: number }) {
 
 export default function DocumentationApp() {
   const router = useRouter();
-  const [activePageId, setActivePageId] = useState("getting-started");
+  const [activePageId, setActivePageId] = useState("about-deplai");
   const [openGroups, setOpenGroups] = useState<Set<string>>(() => new Set());
   const [query, setQuery] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(true);

@@ -118,6 +118,9 @@ class InfrastructureHints(BaseModel):
     kubernetes_manifests: bool = False
     serverless_config: bool = False
     monorepo: bool = False
+    has_dockerfile: bool = False
+    helm_charts: bool = False
+    compose_images: list[str] = Field(default_factory=list)
 
 
 class ConflictItem(BaseModel):
@@ -233,6 +236,7 @@ class NetworkingProfile(BaseModel):
     layout: str = "private_subnets"
     nat_gateway: bool = True
     load_balancer: dict[str, Any] = Field(default_factory=dict)
+    elastic_ip: dict[str, Any] = Field(default_factory=dict)
     ports_exposed: list[int] = Field(default_factory=list)
 
 

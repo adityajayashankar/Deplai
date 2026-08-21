@@ -2,12 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { COST_BREAKDOWN } from './data';
 import { Btn, colorize, FileNode, Header, Tag } from './ui';
 import { buildDeploymentWorkspace } from '@/lib/deployment-planning-contract';
+import {
+  readSavedAws as readSavedAwsSession,
+  writeSavedAws as writeSavedAwsSession,
+  type AwsSessionConfig,
+} from '@/features/deployment/state';
 
-export interface AwsCredentialsConfig {
-  aws_access_key_id: string;
-  aws_secret_access_key: string;
-  aws_region: string;
-}
+export type AwsCredentialsConfig = AwsSessionConfig;
 
 const REPO_CONTEXT_KEY = 'deplai.pipeline.repoContext';
 const REPO_CONTEXT_MD_KEY = 'deplai.pipeline.repoContextMd';
@@ -1204,6 +1205,7 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
   const [liveValidated, setLiveValidated] = useState<boolean>(false);
   const [awsAccessKeyId, setAwsAccessKeyId] = useState<string>(() => readSavedAws().aws_access_key_id);
   const [awsSecretAccessKey, setAwsSecretAccessKey] = useState<string>(() => readSavedAws().aws_secret_access_key);
+  const [awsSessionToken, setAwsSessionToken] = useState<string>(() => readSavedAws().aws_session_token);
   const [awsRegion, setAwsRegion] = useState<string>(() => readSavedAws().aws_region);
   const [iacMode, setIacMode] = useState<IacMode>(() => {
     if (typeof window === 'undefined') return 'deterministic';
@@ -1269,9 +1271,10 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
     writeSavedAws({
       aws_access_key_id: awsAccessKeyId,
       aws_secret_access_key: awsSecretAccessKey,
+      aws_session_token: awsSessionToken,
       aws_region: awsRegion || 'eu-north-1',
     });
-  }, [awsAccessKeyId, awsRegion, awsSecretAccessKey]);
+  }, [awsAccessKeyId, awsRegion, awsSecretAccessKey, awsSessionToken]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1320,6 +1323,7 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
         architecture_context: qaSummary,
         aws_access_key_id: awsAccessKeyId.trim() || undefined,
         aws_secret_access_key: awsSecretAccessKey.trim() || undefined,
+        aws_session_token: awsSessionToken.trim() || undefined,
         aws_region: awsRegion.trim() || 'eu-north-1',
       };
       if (iacMode === 'llm') {
@@ -1461,6 +1465,10 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
             <p className="mb-1.5 text-[11px] text-zinc-500">AWS_REGION</p>
             <input value={awsRegion} onChange={(e) => setAwsRegion(e.target.value)} placeholder="eu-north-1" className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
           </div>
+          <div className="md:col-span-3">
+            <p className="mb-1.5 text-[11px] text-zinc-500">AWS_SESSION_TOKEN (required for temporary ASIA credentials)</p>
+            <input type="password" value={awsSessionToken} onChange={(e) => setAwsSessionToken(e.target.value)} placeholder="Optional for long-lived AKIA credentials" className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
+          </div>
         </div>
         <div className="mt-4 rounded-xl border border-white/8 bg-zinc-950/70 p-4">
           <div className="flex items-center justify-between gap-4">
@@ -1592,31 +1600,12 @@ interface AuditEvent {
   ts: string;
 }
 
-function readSavedAws(): { aws_access_key_id: string; aws_secret_access_key: string; aws_region: string } {
-  if (typeof window === 'undefined') {
-    return { aws_access_key_id: '', aws_secret_access_key: '', aws_region: 'eu-north-1' };
-  }
-  try {
-    const raw = sessionStorage.getItem('pipeline.aws');
-    if (!raw) return { aws_access_key_id: '', aws_secret_access_key: '', aws_region: 'eu-north-1' };
-    const parsed = JSON.parse(raw) as { aws_access_key_id?: string; aws_secret_access_key?: string; aws_region?: string };
-    return {
-      aws_access_key_id: String(parsed.aws_access_key_id || ''),
-      aws_secret_access_key: String(parsed.aws_secret_access_key || ''),
-      aws_region: String(parsed.aws_region || 'eu-north-1'),
-    };
-  } catch {
-    return { aws_access_key_id: '', aws_secret_access_key: '', aws_region: 'eu-north-1' };
-  }
+function readSavedAws(): AwsCredentialsConfig {
+  return readSavedAwsSession();
 }
 
-function writeSavedAws(aws: { aws_access_key_id: string; aws_secret_access_key: string; aws_region: string }): void {
-  if (typeof window === 'undefined') return;
-  sessionStorage.setItem('pipeline.aws', JSON.stringify({
-    aws_access_key_id: aws.aws_access_key_id,
-    aws_secret_access_key: aws.aws_secret_access_key,
-    aws_region: aws.aws_region || 'eu-north-1',
-  }));
+function writeSavedAws(aws: AwsCredentialsConfig): void {
+  writeSavedAwsSession(aws);
 }
 
 function readSavedCost(): CostEstimateState {
@@ -1653,6 +1642,7 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
   const [overridden, setOverridden] = useState<boolean>(false);
   const [awsAccessKeyId, setAwsAccessKeyId] = useState<string>(() => readSavedAws().aws_access_key_id);
   const [awsSecretAccessKey, setAwsSecretAccessKey] = useState<string>(() => readSavedAws().aws_secret_access_key);
+  const [awsSessionToken, setAwsSessionToken] = useState<string>(() => readSavedAws().aws_session_token);
   const [awsRegion, setAwsRegion] = useState<string>(() => readSavedAws().aws_region);
   const [costState] = useState<CostEstimateState>(() => readSavedCost());
   const [criticalFindings, setCriticalFindings] = useState<number | null>(null);
@@ -1669,7 +1659,12 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
   const cap = Number(costState.budget_cap_usd || 100);
   const pct = Math.round((total / cap) * 100);
   const within = total <= cap;
-  const secretsConfigured = Boolean(awsAccessKeyId.trim() && awsSecretAccessKey.trim());
+  const needsSessionToken = awsAccessKeyId.trim().toUpperCase().startsWith('ASIA');
+  const secretsConfigured = Boolean(
+    awsAccessKeyId.trim()
+    && awsSecretAccessKey.trim()
+    && (!needsSessionToken || awsSessionToken.trim()),
+  );
   const noCriticalCves = criticalFindings === null
     ? scanStatus !== 'found'
     : criticalFindings === 0;
@@ -1716,9 +1711,10 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
     writeSavedAws({
       aws_access_key_id: awsAccessKeyId,
       aws_secret_access_key: awsSecretAccessKey,
+      aws_session_token: awsSessionToken,
       aws_region: awsRegion || 'eu-north-1',
     });
-  }, [awsAccessKeyId, awsRegion, awsSecretAccessKey]);
+  }, [awsAccessKeyId, awsRegion, awsSecretAccessKey, awsSessionToken]);
 
   const gates = [
     { label: 'Cost within budget', pass: within || overridden },
@@ -1734,6 +1730,7 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
     writeSavedAws({
       aws_access_key_id: awsAccessKeyId,
       aws_secret_access_key: awsSecretAccessKey,
+      aws_session_token: awsSessionToken,
       aws_region: awsRegion || 'eu-north-1',
     });
     setAuditTrail((prev) => [
@@ -1772,6 +1769,10 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
               <p className="text-[11px] text-zinc-500 mb-1.5">AWS_SECRET_ACCESS_KEY</p>
               <input type="password" value={awsSecretAccessKey} onChange={(e) => setAwsSecretAccessKey(e.target.value)} placeholder="Enter AWS secret access key" className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
             </div>
+            <div className="mt-3">
+              <p className="text-[11px] text-zinc-500 mb-1.5">AWS_SESSION_TOKEN {needsSessionToken ? '(required for this temporary key)' : '(optional)'}</p>
+              <input type="password" value={awsSessionToken} onChange={(e) => setAwsSessionToken(e.target.value)} placeholder="Required for ASIA / assumed-role credentials" className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
+            </div>
           </div>
 
           <div className="bg-zinc-900 rounded-2xl border border-white/5 p-5">
@@ -1796,6 +1797,7 @@ export function GitOpsPage({ onNavigate, projectId, scanStatus }: GitOpsPageProp
               {[
                 { secret: 'AWS_ACCESS_KEY_ID', status: awsAccessKeyId.trim() ? 'set' : 'missing', masked: awsAccessKeyId.trim() ? `${awsAccessKeyId.slice(0, 4)}********${awsAccessKeyId.slice(-4)}` : 'Not configured' },
                 { secret: 'AWS_SECRET_ACCESS_KEY', status: awsSecretAccessKey.trim() ? 'set' : 'missing', masked: awsSecretAccessKey.trim() ? '********************************' : 'Not configured' },
+                { secret: 'AWS_SESSION_TOKEN', status: awsSessionToken.trim() ? 'set' : needsSessionToken ? 'missing' : 'auto', masked: awsSessionToken.trim() ? '********************************' : needsSessionToken ? 'Required for temporary credentials' : 'Not required for long-lived credentials' },
                 { secret: 'GITHUB_TOKEN', status: 'auto', masked: 'Provided by Actions runner' },
               ].map((s, i) => (
                 <div key={i} className="flex items-center gap-3 p-3 bg-zinc-950 rounded-lg border border-white/5">
@@ -2044,22 +2046,8 @@ function parseIacFilesFromSession(): Array<{ path: string; content: string }> {
   }
 }
 
-function parseAwsFromSession(): { aws_access_key_id: string; aws_secret_access_key: string; aws_region: string } {
-  if (typeof window === 'undefined') {
-    return { aws_access_key_id: '', aws_secret_access_key: '', aws_region: 'eu-north-1' };
-  }
-  try {
-    const raw = sessionStorage.getItem('pipeline.aws');
-    if (!raw) return { aws_access_key_id: '', aws_secret_access_key: '', aws_region: 'eu-north-1' };
-    const parsed = JSON.parse(raw) as { aws_access_key_id?: string; aws_secret_access_key?: string; aws_region?: string };
-    return {
-      aws_access_key_id: String(parsed.aws_access_key_id || ''),
-      aws_secret_access_key: String(parsed.aws_secret_access_key || ''),
-      aws_region: String(parsed.aws_region || 'eu-north-1'),
-    };
-  } catch {
-    return { aws_access_key_id: '', aws_secret_access_key: '', aws_region: 'eu-north-1' };
-  }
+function parseAwsFromSession(): AwsCredentialsConfig {
+  return readSavedAwsSession();
 }
 
 function parseCostFromSession(): { total: number; cap: number } {
@@ -2613,6 +2601,7 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
           files: shouldUseSavedRunForDeploy ? [] : deployableIacFiles,
           aws_access_key_id: aws.aws_access_key_id,
           aws_secret_access_key: aws.aws_secret_access_key,
+          aws_session_token: aws.aws_session_token,
           aws_region: aws.aws_region,
           estimated_monthly_usd: cost.total,
           budget_limit_usd: cost.cap,
@@ -2784,6 +2773,7 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
   const liveRuntimeCounts = liveRuntimeDetails?.resource_counts;
   const cloudfrontUrl = deployResult?.cdn?.cloudfront_url || deployResult?.cloudfront_url || pickOutput(runtimeOutputs, ['cloudfront_url', 'cloudfront_domain_name']);
   const albDns = pickOutput(runtimeOutputs, ['alb_dns_name', 'load_balancer_dns_name']);
+  const elasticIp = pickOutput(runtimeOutputs, ['elastic_ip', 'eip_public_ip']);
   const rdsEndpoint = pickOutput(runtimeOutputs, ['rds_endpoint', 'database_endpoint', 'db_endpoint']);
   const websiteBucket = pickOutput(runtimeOutputs, ['website_bucket', 's3_bucket_name', 'static_bucket_name']);
   const generatedPem = deployResult?.keypair?.private_key_pem
@@ -3018,6 +3008,7 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
               {[
                 { k: 'CloudFront URL', v: cloudfrontUrl, link: true },
                 { k: 'ALB DNS Name', v: albDns, link: false },
+                { k: 'Elastic IP', v: elasticIp, link: false },
                 { k: 'RDS Endpoint', v: rdsEndpoint, link: false },
                 { k: 'S3 Website Bucket', v: websiteBucket, link: false },
               ].map((o, i) => (

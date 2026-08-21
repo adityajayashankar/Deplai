@@ -663,7 +663,7 @@ def _apply_direct_provider_patch(
 ) -> str:
     patch_script = """set -eu
 
-target_aws_version="6.41.0"
+target_aws_version="5.100.0"
 compat_failures=""
 
 normalize_version() {
@@ -1439,6 +1439,98 @@ def _is_capacity_error(text: str) -> bool:
     )
 
 
+def _is_orphan_key_pair_collision(text: str) -> bool:
+    value = text or ""
+    return "InvalidKeyPair.Duplicate" in value or (
+        "aws_key_pair" in value and "already exists" in value.lower()
+    )
+
+
+def _is_orphan_alb_collision(text: str) -> bool:
+    value = (text or "").lower()
+    return (
+        ("load balancer" in value or "aws_lb" in value or "elbv2" in value)
+        and "already exists" in value
+    )
+
+
+def _extract_duplicate_key_pair_name(text: str) -> str | None:
+    match = re.search(
+        r"ImportKeyPair.*?KeyPair[^\n]*?\(([^)]+)\)|key pair[:\s]+([A-Za-z0-9._/-]+)|InvalidKeyPair\.Duplicate[^\n]*?([A-Za-z0-9._/-]+-key)",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        match = re.search(r"EC2 Key Pair \(([^)]+)\)", text or "", flags=re.IGNORECASE)
+    if not match:
+        return None
+    for group in match.groups():
+        if group and str(group).strip():
+            return str(group).strip()
+    return None
+
+
+def _extract_duplicate_alb_name(text: str) -> str | None:
+    match = re.search(
+        r"Load Balancer \(([^)]+)\) already exists|ELBv2 Load Balancer \(([^)]+)\) already exists",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    for group in match.groups():
+        if group and str(group).strip():
+            return str(group).strip()
+    return None
+
+
+def _orphan_collision_remediation(
+    *,
+    key_name: str | None,
+    alb_name: str | None,
+    aws_region: str,
+) -> dict[str, Any]:
+    """Structured Option A (import/adopt) vs Option B (delete orphan) guidance."""
+    key = key_name or "<project>-<env>-key"
+    alb = alb_name or "<project>-<env>-alb"
+    return {
+        "class": "state_aws_divergence",
+        "summary": (
+            "Static-named resources already exist in AWS but are missing from the current "
+            "Terraform state (typical after a partial apply)."
+        ),
+        "option_a_adopt": {
+            "description": "Import existing resources into state (no AWS deletes).",
+            "commands": [
+                f"aws ec2 describe-key-pairs --key-names {key} --region {aws_region}",
+                (
+                    f"aws elbv2 describe-load-balancers --names {alb} --region {aws_region} "
+                    "--query LoadBalancers[0].LoadBalancerArn --output text"
+                ),
+                f"terraform import 'module.compute.aws_key_pair.generated[0]' {key}",
+                "terraform import 'module.compute.module.alb[0].aws_lb.this[0]' <alb-arn>",
+                "terraform plan  # review drift before apply",
+            ],
+            "note": (
+                "Prefer key reuse via existing_ec2_key_pair_name over importing a key pair "
+                "when DeplAI needs the private PEM (AWS does not return private keys)."
+            ),
+        },
+        "option_b_delete_orphans": {
+            "description": "Delete orphans only if they are not serving live traffic, then re-apply.",
+            "commands": [
+                f"aws ec2 delete-key-pair --key-name {key} --region {aws_region}",
+                f"aws elbv2 delete-load-balancer --load-balancer-arn <alb-arn> --region {aws_region}",
+            ],
+        },
+        "prevention": [
+            "Keep S3 remote state + DynamoDB lock enabled (already used by enterprise bundles).",
+            "ALB names are VPC-suffixed to avoid colliding with orphans from a prior VPC.",
+            "EC2 key pairs are reused when the project/env key already exists in-region.",
+        ],
+    }
+
+
 def _rotated_az_orders(preferred_azs: list[str]) -> list[list[str]]:
     normalized: list[str] = []
     seen: set[str] = set()
@@ -1480,6 +1572,85 @@ def _set_text_payload(item: dict[str, Any], text: str) -> dict[str, Any]:
         updated["content"] = str(text or "")
         updated["encoding"] = "utf-8"
     return updated
+
+
+def rewrite_ec2_module_v5_compat(text: str) -> tuple[str, bool]:
+    """Normalize enterprise EC2 module HCL for terraform-aws-modules/ec2-instance v5.x.
+
+    Prefers the internal registry contract implementation when available.
+    """
+    try:
+        from terraform_agent.agent.internal_registry import (
+            rewrite_ec2_module_v5_compat as _registry_rewrite,
+        )
+
+        return _registry_rewrite(text)
+    except Exception:
+        pass
+
+    if not text or 'module "ec2"' not in text:
+        return text, False
+
+    # Patch only content before module "alb" so ALB create_security_group stays intact.
+    parts = re.split(r'(?=module\s+"alb"\s*\{)', text, maxsplit=1)
+    head = parts[0]
+    tail = parts[1] if len(parts) > 1 else ""
+    updated = head
+    changed = False
+
+    stripped = re.sub(r'(?m)^\s*create_security_group\s*=\s*(?:true|false)\s*\r?\n', "", updated)
+    if stripped != updated:
+        updated = stripped
+        changed = True
+
+    if not re.search(r"root_block_device\s*=\s*\[", updated):
+        rewritten = re.sub(
+            r"(root_block_device\s*=\s*)\{(\s*(?:\r?\n[ \t]+[A-Za-z0-9_]+\s*=\s*[^\n]+)+\s*\r?\n[ \t]*)\}",
+            r"\1[{\2}]",
+            updated,
+            count=1,
+        )
+        if rewritten != updated:
+            updated = rewritten
+            changed = True
+
+    if not changed:
+        return text, False
+    return updated + tail, True
+
+
+def enforce_registry_contracts(files: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Apply internal-registry contracts across all .tf files in a bundle."""
+    remediation: dict[str, Any] = {
+        "ec2_module_v5_compat_rewritten": False,
+        "registry_contract_files": 0,
+    }
+    try:
+        from terraform_agent.agent.internal_registry import enforce_registry_contracts_on_text
+    except Exception:
+        enforce_registry_contracts_on_text = None  # type: ignore[assignment]
+
+    patched = [dict(item) for item in files]
+    for idx, item in enumerate(patched):
+        path = str(item.get("path") or "").replace("\\", "/").lower()
+        if not path.endswith(".tf"):
+            continue
+        text = _extract_text_payload(item)
+        if enforce_registry_contracts_on_text is not None:
+            new_text, details = enforce_registry_contracts_on_text(text)
+        else:
+            new_text, changed = rewrite_ec2_module_v5_compat(text)
+            details = {"ec2_module_v5_compat_rewritten": changed}
+        if new_text != text:
+            patched[idx] = _set_text_payload(item, new_text)
+            remediation["registry_contract_files"] += 1
+        if details.get("ec2_module_v5_compat_rewritten"):
+            remediation["ec2_module_v5_compat_rewritten"] = True
+        if details.get("ec2_count_ungated_from_key_reuse"):
+            remediation["ec2_count_ungated_from_key_reuse"] = True
+        if details.get("ec2_version_drift"):
+            remediation["ec2_version_drift"] = details["ec2_version_drift"]
+    return patched, remediation
 
 
 def _legacy_runtime_bundle_needs_remediation(files: list[dict[str, Any]]) -> bool:
@@ -1528,6 +1699,19 @@ def _legacy_runtime_bundle_needs_remediation(files: list[dict[str, Any]]) -> boo
             return True
         if conditional_depends_on.search(text):
             return True
+        if 'module "ec2"' in text and (
+            re.search(r"(?m)^\s*create_security_group\s*=", text.split('module "alb"')[0])
+            or (
+                re.search(r"root_block_device\s*=\s*\{", text)
+                and not re.search(r"root_block_device\s*=\s*\[", text)
+            )
+            or re.search(
+                r'module\s+"ec2"\s*\{[\s\S]*?count\s*=\s*var\.enabled\s*&&\s*!local\.use_existing_key',
+                text,
+                flags=re.IGNORECASE,
+            )
+        ):
+            return True
 
     if has_al2023_ami_reference and not has_al2023_ami_data:
         return True
@@ -1566,6 +1750,7 @@ def _remediate_legacy_runtime_bundle(
         "legacy_base64_default_rewritten": False,
         "legacy_inline_blocks_rewritten": False,
         "legacy_key_pair_reuse_support_added": False,
+        "legacy_ec2_count_ungated_from_key_reuse": False,
         "legacy_iam_name_collision_rewritten": False,
         "legacy_versions_provider_deduped": False,
         "legacy_conditional_depends_on_rewritten": False,
@@ -1574,6 +1759,7 @@ def _remediate_legacy_runtime_bundle(
         "legacy_tfvars_environment_canonicalized": False,
         "legacy_tfvars_compute_strategy_canonicalized": False,
         "legacy_nginx_ingress_port_fixed": False,
+        "ec2_module_v5_compat_rewritten": False,
     }
 
     normalized_paths = {
@@ -1802,6 +1988,18 @@ def _remediate_legacy_runtime_bundle(
         text = _rewrite_nginx_ingress_port(text)
         text = _rewrite_single_line_variable_blocks(text)
         text = _rewrite_conditional_depends_on(text)
+        try:
+            from terraform_agent.agent.internal_registry import enforce_registry_contracts_on_text
+
+            text, contract_details = enforce_registry_contracts_on_text(text)
+            if contract_details.get("ec2_module_v5_compat_rewritten"):
+                remediation["ec2_module_v5_compat_rewritten"] = True
+            if contract_details.get("ec2_count_ungated_from_key_reuse"):
+                remediation["legacy_ec2_count_ungated_from_key_reuse"] = True
+        except Exception:
+            text, ec2_rewritten = rewrite_ec2_module_v5_compat(text)
+            if ec2_rewritten:
+                remediation["ec2_module_v5_compat_rewritten"] = True
         if bundle_has_aws_region_var and not bundle_has_region_var and "var.region" in text:
             rewritten = text.replace("var.region", "var.aws_region")
             if rewritten != text:
@@ -2115,18 +2313,48 @@ output "redis_endpoint" {
                     + compute_main_text
                 )
 
-            compute_main_text = re.sub(
-                r'(resource\s+"tls_private_key"\s+"generated"\s*\{[\s\S]*?\n\s*)count\s*=\s*var\.enabled\s*\?\s*1\s*:\s*0',
-                r'\1count     = var.enabled && !local.use_existing_key ? 1 : 0',
+            # Only rewrite count inside the key/tls resource bodies — never bleed into module "ec2".
+            def _rewrite_resource_count(text: str, resource_type: str, new_count: str) -> str:
+                pattern = re.compile(
+                    rf'(resource\s+"{re.escape(resource_type)}"\s+"generated"\s*\{{)([^}}]*?)(\n\}})',
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+
+                def _patch(match: re.Match[str]) -> str:
+                    header, body, closer = match.group(1), match.group(2), match.group(3)
+                    new_body, n = re.subn(
+                        r'(?m)^(\s*)count\s*=\s*var\.enabled\s*\?\s*1\s*:\s*0\s*$',
+                        rf'\1count = {new_count}',
+                        body,
+                        count=1,
+                    )
+                    if n == 0:
+                        return match.group(0)
+                    return f"{header}{new_body}{closer}"
+
+                return pattern.sub(_patch, text, count=1)
+
+            compute_main_text = _rewrite_resource_count(
                 compute_main_text,
-                flags=re.IGNORECASE,
+                "tls_private_key",
+                "var.enabled && !local.use_existing_key ? 1 : 0",
             )
-            compute_main_text = re.sub(
-                r'(resource\s+"aws_key_pair"\s+"generated"\s*\{[\s\S]*?\n\s*)count\s*=\s*var\.enabled\s*\?\s*1\s*:\s*0',
-                r'\1count      = var.enabled && !local.use_existing_key ? 1 : 0',
+            compute_main_text = _rewrite_resource_count(
                 compute_main_text,
-                flags=re.IGNORECASE,
+                "aws_key_pair",
+                "var.enabled && !local.use_existing_key ? 1 : 0",
             )
+            # Repair prior bad remediations that accidentally gated module.ec2 on key reuse.
+            repaired_ec2, ec2_n = re.subn(
+                r'(module\s+"ec2"\s*\{[^}]*?count\s*=\s*)var\.enabled\s*&&\s*!local\.use_existing_key\s*\?\s*1\s*:\s*0',
+                r'\1var.enabled ? 1 : 0',
+                compute_main_text,
+                count=1,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if ec2_n:
+                compute_main_text = repaired_ec2
+                remediation["legacy_ec2_count_ungated_from_key_reuse"] = True
             compute_main_text = compute_main_text.replace(
                 'key_name                    = aws_key_pair.generated[0].key_name',
                 'key_name                    = local.ec2_key_name',
@@ -2151,26 +2379,39 @@ output "redis_endpoint" {
     return patched_files, remediation
 
 
-def _normalize_rds_elasticache_provider_versions(
+# Production-style pin: ~> 5.100.0 => >= 5.100.0, < 5.101.0 (patch-only within tested minor).
+# Do not float ~> 5.x or jump to 6.x until EC2 6 + ALB 10 are curated. Prefer .terraform.lock.hcl.
+_REGISTRY_AWS_PROVIDER_CONSTRAINT = "~> 5.100.0"
+_REGISTRY_AWS_PROVIDER_PATTERN = re.compile(
+    r'(source\s*=\s*"hashicorp/aws"[^}]*?version\s*=\s*")[^"]+(")',
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def _bundle_uses_ec2_module_v5(text: str) -> bool:
+    if "terraform-aws-modules/ec2-instance/aws" not in text:
+        return False
+    # Treat any 5.x pin (or missing explicit major-6 pin next to the module) as v5 stack.
+    if re.search(r'terraform-aws-modules/ec2-instance/aws[\s\S]{0,120}version\s*=\s*"6\.', text):
+        return False
+    return True
+
+
+def _normalize_aws_provider_to_registry_pin(
     files: list[dict[str, Any]],
     apply_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Normalize AWS provider version constraints in RDS/ElastiCache templates.
+    """Force AWS provider 5.x when the bundle uses EC2 module 5.x / ALB 9.x.
 
-    The new RDS and ElastiCache templates declare ``version = "~> 5.0"`` for the
-    AWS provider, but the EC2 runtime patcher targets hashicorp/aws 6.41.0.
-    When both are in the same bundle Terraform picks the most restrictive
-    constraint and can refuse to download a compatible provider version.
-
-    This function rewrites any ``~> 5.x`` / ``~> 4.x`` AWS provider version
-    constraints inside ``.tf`` files to ``~> 6.0`` so they're compatible with
-    the runtime patcher.
+    A previous runtime path rewrote constraints to ``~> 6.0``, which makes
+    ``terraform-aws-modules/ec2-instance/aws`` 5.8.0 fail with unsupported
+    ``cpu_core_count`` / ``block_duration_minutes`` arguments.
     """
+    combined = "\n".join(_extract_text_payload(item) for item in files if str(item.get("path", "")).lower().endswith(".tf"))
+    if not _bundle_uses_ec2_module_v5(combined) and "terraform-aws-modules/alb/aws" not in combined:
+        return files
+
     patched: list[dict[str, Any]] = []
-    provider_version_pattern = re.compile(
-        r'(source\s*=\s*"hashicorp/aws"[^}]*?version\s*=\s*")~>\s*[45]\.[0-9.]+(")' ,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
     changed = False
     for item in files:
         path = str(item.get("path", "")).replace("\\", "/").lower()
@@ -2178,7 +2419,17 @@ def _normalize_rds_elasticache_provider_versions(
             patched.append(item)
             continue
         text = _extract_text_payload(item)
-        rewritten = provider_version_pattern.sub(r'\1~> 6.0\2', text)
+        rewritten = _REGISTRY_AWS_PROVIDER_PATTERN.sub(
+            rf'\1{_REGISTRY_AWS_PROVIDER_CONSTRAINT}\2',
+            text,
+        )
+        # Also collapse mistaken ~> 6.0 pins written by older remediations.
+        rewritten = re.sub(
+            r'(source\s*=\s*"hashicorp/aws"[^}]*?version\s*=\s*")~>\s*6\.[0-9.]+(")',
+            rf'\1{_REGISTRY_AWS_PROVIDER_CONSTRAINT}\2',
+            rewritten,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
         if rewritten != text:
             item = _set_text_payload(dict(item), rewritten)
             changed = True
@@ -2187,25 +2438,45 @@ def _normalize_rds_elasticache_provider_versions(
         _emit_progress(
             apply_context,
             "info",
-            "Normalized AWS provider version constraints in RDS/ElastiCache files to ~> 6.0 for EC2 runtime compatibility.",
+            f"Pinned AWS provider to {_REGISTRY_AWS_PROVIDER_CONSTRAINT} for EC2 module 5.x / ALB 9.x compatibility.",
         )
     return patched
+
+
+def _normalize_rds_elasticache_provider_versions(
+    files: list[dict[str, Any]],
+    apply_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Align RDS/ElastiCache provider pins with the internal registry (AWS 5.x).
+
+    Historically this rewrote constraints to ``~> 6.0`` for an older EC2 patcher.
+    The curated registry stack uses EC2 module 5.8.0 + ALB 9.x, which require
+    AWS provider 5.x — provider 6 breaks those modules.
+    """
+    return _normalize_aws_provider_to_registry_pin(files, apply_context)
 
 
 # Map of retired/invalid RDS engine versions -> current valid replacement.
 # AWS periodically removes old minor versions from the CreateDBInstance API.
 # Keep this list updated when AWS retires more versions.
 _RETIRED_POSTGRES_VERSIONS: dict[str, str] = {
-    # PostgreSQL 15 — AWS retired 15.1-15.9; minimum available is 15.10
-    "15.1": "15.10",
-    "15.2": "15.10",
-    "15.3": "15.10",
-    "15.4": "15.10",
-    "15.5": "15.10",
-    "15.6": "15.10",
-    "15.7": "15.10",
-    "15.8": "15.10",
-    "15.9": "15.10",
+    # PostgreSQL 15 — prefer a current available minor (15.10 is not offered in all regions).
+    "15.1": "15.17",
+    "15.2": "15.17",
+    "15.3": "15.17",
+    "15.4": "15.17",
+    "15.5": "15.17",
+    "15.6": "15.17",
+    "15.7": "15.17",
+    "15.8": "15.17",
+    "15.9": "15.17",
+    "15.10": "15.17",
+    "15.11": "15.17",
+    "15.12": "15.17",
+    "15.13": "15.17",
+    "15.14": "15.17",
+    "15.15": "15.17",
+    "15.16": "15.17",
     # PostgreSQL 14 — AWS retired 14.1-14.12; minimum available is 14.15
     "14.1": "14.15",
     "14.2": "14.15",
@@ -2239,12 +2510,19 @@ _RETIRED_POSTGRES_VERSIONS: dict[str, str] = {
     "13.15": "13.18",
     "13.16": "13.18",
     "13.17": "13.18",
-    # PostgreSQL 16 — safe minimum
-    "16.1": "16.6",
-    "16.2": "16.6",
-    "16.3": "16.6",
-    "16.4": "16.6",
-    "16.5": "16.6",
+    # PostgreSQL 16 — keep on a current available minor
+    "16.1": "16.13",
+    "16.2": "16.13",
+    "16.3": "16.13",
+    "16.4": "16.13",
+    "16.5": "16.13",
+    "16.6": "16.13",
+    "16.7": "16.13",
+    "16.8": "16.13",
+    "16.9": "16.13",
+    "16.10": "16.13",
+    "16.11": "16.13",
+    "16.12": "16.13",
 }
 
 
@@ -2292,7 +2570,7 @@ def _normalize_rds_engine_versions(
         _emit_progress(
             apply_context,
             "info",
-            "Patched retired RDS engine_version values to current AWS-supported versions (e.g. 15.3 -> 15.10).",
+            "Patched retired RDS engine_version values to current AWS-supported versions (e.g. 15.5 -> 15.17).",
         )
     return patched
 
@@ -2467,33 +2745,47 @@ def _discover_existing_ec2_key_pair_name(
     )
 
     if _is_unresolved_template_value(project_name):
-        project_name = None
+        project_name = _project_slug_for_key(fallback_project_name)
     if _is_unresolved_template_value(environment):
         environment = None
 
-    if re.search(
-        r'key_name\s*=\s*"\\?\$\{var\.project_name\}-\\?\$\{var\.environment\}-key"',
-        tf_text,
-        flags=re.IGNORECASE,
-    ):
-        if project_name and environment:
-            return f"{project_name}-{environment}-key"
-        return None
+    uses_env_key = bool(
+        re.search(
+            r'key_name\s*=\s*"[^"]*\$\{var\.project_name\}-\$\{var\.environment\}-key"',
+            tf_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    uses_project_key = bool(
+        re.search(
+            r'key_name\s*=\s*"[^"]*\$\{var\.project_name\}-key"',
+            tf_text,
+            flags=re.IGNORECASE,
+        )
+    )
 
-    if re.search(
-        r'key_name\s*=\s*"\\?\$\{var\.project_name\}-key"',
-        tf_text,
-        flags=re.IGNORECASE,
-    ):
-        if project_name:
-            return f"{project_name}-key"
-        return None
-
+    if uses_env_key and project_name and environment:
+        return f"{project_name}-{environment}-key"
+    if uses_project_key and project_name:
+        return f"{project_name}-key"
+    # Enterprise default naming when template detection is ambiguous.
+    if project_name and environment:
+        return f"{project_name}-{environment}-key"
+    if project_name:
+        return f"{project_name}-key"
     return None
 
 
 def _terraform_has_aws_instance(tf_text: str) -> bool:
-    return re.search(r'resource\s+"aws_instance"\s+"[^"]+"', tf_text or "", flags=re.IGNORECASE) is not None
+    text = tf_text or ""
+    if re.search(r'resource\s+"aws_instance"\s+"[^"]+"', text, flags=re.IGNORECASE):
+        return True
+    # Enterprise vertical slice uses the registry EC2 module (no root aws_instance).
+    if "terraform-aws-modules/ec2-instance/aws" in text:
+        return True
+    if re.search(r'resource\s+"aws_key_pair"\s+"[^"]+"', text, flags=re.IGNORECASE):
+        return True
+    return bool(re.search(r'module\s+"ec2"\s*\{', text, flags=re.IGNORECASE))
 
 
 def _terraform_has_rds_or_elasticache(tf_text: str) -> bool:
@@ -3087,6 +3379,11 @@ def apply_terraform_bundle(
     if provider.lower() != "aws":
         return {"success": False, "error": "Runtime apply currently supports AWS only."}
 
+    aws_access_key_id = str(aws_access_key_id or "").strip().strip('"').strip("'")
+    aws_secret_access_key = str(aws_secret_access_key or "").strip().strip('"').strip("'")
+    aws_session_token = str(aws_session_token or "").strip().strip('"').strip("'")
+    aws_region = str(aws_region or "").strip() or "eu-north-1"
+
     if not files:
         _emit_progress(apply_context, "error", "Terraform apply aborted: no files were provided.")
         return {"success": False, "error": "No files were provided for Terraform apply."}
@@ -3094,6 +3391,16 @@ def apply_terraform_bundle(
     if not aws_access_key_id or not aws_secret_access_key:
         _emit_progress(apply_context, "error", "Terraform apply aborted: AWS credentials are missing.")
         return {"success": False, "error": "AWS credentials are required for runtime Terraform apply."}
+    if aws_access_key_id.upper().startswith("ASIA") and not aws_session_token:
+        message = "AWS_SESSION_TOKEN is required when using temporary ASIA credentials."
+        _emit_progress(apply_context, "error", f"Terraform apply aborted: {message}")
+        return {
+            "success": False,
+            "error": message,
+            "details": {
+                "hint": "Paste the session token issued with the temporary access key, or use long-lived IAM credentials.",
+            },
+        }
 
     docker = get_docker_client()
     volume_name = f"deplai_tf_apply_{uuid.uuid4().hex[:12]}"
@@ -3112,12 +3419,27 @@ def apply_terraform_bundle(
     try:
         normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
         _write_files_to_volume(volume_name, files)
+        files, contract_remediation = enforce_registry_contracts(files)
+        if any(bool(value) for value in contract_remediation.values()):
+            bundle_remediation.update(contract_remediation)
+            normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
+            _write_files_to_volume(volume_name, files)
+            _emit_progress(
+                apply_context,
+                "info",
+                "Applied internal Terraform registry contract remediations to the bundle.",
+            )
+        # Always pin AWS provider to registry 5.x when EC2 5.x / ALB 9.x are present.
+        files = _normalize_aws_provider_to_registry_pin(files, apply_context)
+        normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
+        _write_files_to_volume(volume_name, files)
         if _legacy_runtime_bundle_needs_remediation(files):
-            files, bundle_remediation = _remediate_legacy_runtime_bundle(files, apply_context)
+            files, legacy_remediation = _remediate_legacy_runtime_bundle(files, apply_context)
+            bundle_remediation = {**bundle_remediation, **legacy_remediation}
             normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
             _write_files_to_volume(volume_name, files)
         # Normalize AWS provider version constraints when bundle mixes EC2 and
-        # RDS/ElastiCache templates (which use ~> 5.0 while EC2 patcher targets 6.x).
+        # RDS/ElastiCache templates (keep registry 5.x pin — never bump to 6.x here).
         tf_text_preflight = _collect_terraform_text(files)
         bundle_has_rds_or_elasticache = _terraform_has_rds_or_elasticache(tf_text_preflight)
         bundle_has_registry_module = _terraform_has_registry_module(tf_text_preflight)
@@ -3144,10 +3466,11 @@ def apply_terraform_bundle(
         env = {
             "AWS_ACCESS_KEY_ID": aws_access_key_id,
             "AWS_SECRET_ACCESS_KEY": aws_secret_access_key,
-            "AWS_SESSION_TOKEN": aws_session_token,
             "AWS_DEFAULT_REGION": aws_region,
             "TF_IN_AUTOMATION": "1",
         }
+        if aws_session_token:
+            env["AWS_SESSION_TOKEN"] = aws_session_token
 
         auto_bootstrap_backend = str(
             os.getenv("DEPLAI_AUTO_BOOTSTRAP_TERRAFORM_BACKEND", "1")
@@ -3200,10 +3523,15 @@ def apply_terraform_bundle(
                 },
             }
 
-        # Use -upgrade when the bundle contains registry modules (e.g. terraform-aws-modules/rds)
-        # so that provider version conflicts between EC2 and RDS/ElastiCache constraints are
-        # resolved automatically by Terraform rather than causing an init failure.
-        use_upgrade_init = bundle_has_registry_module
+        # Exact module pins + lock file: never auto -upgrade (that floats modules to
+        # newest majors that often require AWS provider 6.x). Opt in via apply_context.
+        use_upgrade_init = bool(apply_context and apply_context.get("terraform_init_upgrade"))
+        if use_upgrade_init:
+            _emit_progress(
+                apply_context,
+                "warning",
+                "Running terraform init -upgrade (review .terraform.lock.hcl diff afterward).",
+            )
         try:
             init_log = _run_terraform_with_tracking(
                 volume_name,
@@ -3216,25 +3544,7 @@ def apply_terraform_bundle(
             init_error = str(init_exc)
             actual_region_from_error = _extract_actual_bucket_region(init_error)
             needs_retry = _is_missing_remote_state_error(init_error) or _is_backend_region_mismatch_error(init_error)
-            # If init failed and we haven't tried -upgrade yet, retry with -upgrade
-            # (registry module version constraint conflicts require this).
-            if not use_upgrade_init and bundle_has_registry_module:
-                _emit_progress(apply_context, "info", "Retrying terraform init with -upgrade to resolve registry module constraints.")
-                try:
-                    init_log = _run_terraform_with_tracking(
-                        volume_name,
-                        tf_root,
-                        _terraform_init_args(backend_region_override, upgrade=True),
-                        env,
-                        apply_context=apply_context,
-                    )
-                    needs_retry = False
-                    init_error = ""
-                except Exception as upgrade_exc:
-                    init_error = str(upgrade_exc)
-                    needs_retry = _is_missing_remote_state_error(init_error) or _is_backend_region_mismatch_error(init_error)
-                    if not needs_retry:
-                        raise
+            # Do not auto-retry with -upgrade: open module floors + upgrade grabs 6.x-requiring modules.
             if needs_retry:
                 if auto_bootstrap_backend:
                     backend_bootstrap = _ensure_remote_state_backend(
@@ -3336,6 +3646,31 @@ def apply_terraform_bundle(
         if not (has_ec2_resource and has_instance_type_var):
             instance_candidates = []
 
+        # Reuse orphaned project key pairs even when EC2 is module-based (no root aws_instance).
+        if has_existing_key_name_var:
+            try:
+                key_session = boto3.session.Session(
+                    aws_access_key_id=aws_access_key_id,
+                    aws_secret_access_key=aws_secret_access_key,
+                    aws_session_token=aws_session_token or None,
+                    region_name=aws_region,
+                )
+                key_ec2 = key_session.client("ec2", region_name=aws_region)
+                key_candidate = _discover_existing_ec2_key_pair_name(files, project_name)
+                if key_candidate and _ec2_key_pair_exists(key_ec2, key_candidate):
+                    existing_key_name_override = key_candidate
+                    _emit_progress(
+                        apply_context,
+                        "info",
+                        f"Reusing existing EC2 key pair '{key_candidate}' to avoid InvalidKeyPair.Duplicate.",
+                    )
+            except Exception as key_exc:
+                _emit_progress(
+                    apply_context,
+                    "warning",
+                    f"EC2 key pair preflight skipped: {key_exc}",
+                )
+
         if has_ec2_resource and enforce_free_tier and not has_instance_type_var:
             literal_types = _terraform_literal_instance_types(tf_text)
             disallowed = [itype for itype in literal_types if itype not in allowed_instance_type_set]
@@ -3363,7 +3698,7 @@ def apply_terraform_bundle(
                 region_name=aws_region,
             )
             ec2 = session.client("ec2", region_name=aws_region)
-            if has_existing_key_name_var:
+            if has_existing_key_name_var and not existing_key_name_override:
                 key_candidate = _discover_existing_ec2_key_pair_name(files, project_name)
                 if key_candidate and _ec2_key_pair_exists(ec2, key_candidate):
                     existing_key_name_override = key_candidate
@@ -3632,6 +3967,44 @@ def apply_terraform_bundle(
                         "bundle_remediation": bundle_remediation,
                         "init_log_tail": _tail(init_log),
                         "apply_log_tail": _tail(combined, 1800),
+                    },
+                }
+
+            # Orphaned static names (key pair / ALB) from a prior partial apply.
+            if _is_orphan_key_pair_collision(combined) or _is_orphan_alb_collision(combined):
+                duplicate_key = _extract_duplicate_key_pair_name(combined) or existing_key_name_override
+                if not duplicate_key and has_existing_key_name_var:
+                    duplicate_key = _discover_existing_ec2_key_pair_name(files, project_name)
+                duplicate_alb = _extract_duplicate_alb_name(combined)
+                remediation = _orphan_collision_remediation(
+                    key_name=duplicate_key,
+                    alb_name=duplicate_alb,
+                    aws_region=aws_region,
+                )
+                _emit_progress(
+                    apply_context,
+                    "error",
+                    "State/AWS divergence on static-named key pair and/or ALB. See Option A (adopt) vs Option B (delete orphans).",
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        "Terraform tried to create static-named resources that already exist in AWS "
+                        "but are missing from the current state (partial prior apply / lost state). "
+                        "See details.orphan_collision for Option A (adopt/import or key reuse) vs "
+                        "Option B (delete orphans). DeplAI now reuses existing project key pairs and "
+                        "VPC-suffixes ALB names on new generates to prevent recurrence."
+                    ),
+                    "details": {
+                        "terraform_root": tf_root,
+                        "orphan_collision": remediation,
+                        "existing_ec2_key_pair_name": existing_key_name_override,
+                        "duplicate_key_pair": duplicate_key,
+                        "duplicate_alb": duplicate_alb,
+                        "bundle_remediation": bundle_remediation,
+                        "init_log_tail": _tail(init_log),
+                        "plan_log_tail": _tail(plan_log),
+                        "apply_log_tail": _tail(combined, 2200),
                     },
                 }
 
@@ -4096,6 +4469,24 @@ def apply_saved_terraform_run(
         if not isinstance(files, list) or not files:
             return {"success": False, "error": f"Saved Terraform run {run_id} has no files."}
         metadata = saved_run.get("metadata") if isinstance(saved_run.get("metadata"), dict) else {}
+        deployment_metadata = (
+            apply_context.get("deployment_metadata")
+            if isinstance(apply_context, dict) and isinstance(apply_context.get("deployment_metadata"), dict)
+            else {}
+        )
+        expected_source = (
+            deployment_metadata.get("customization_source")
+            if isinstance(deployment_metadata.get("customization_source"), dict)
+            else None
+        )
+        if expected_source:
+            run_source = metadata.get("source_metadata") if isinstance(metadata.get("source_metadata"), dict) else {}
+            identity_fields = ("kind", "project_id", "tenant_id", "snapshot_id", "source_tree_hash")
+            if any(str(run_source.get(key) or "") != str(expected_source.get(key) or "") for key in identity_fields):
+                return {
+                    "success": False,
+                    "error": "Saved Terraform run source does not match the validated customization snapshot.",
+                }
         return apply_terraform_bundle(
             files=[item for item in files if isinstance(item, dict)],
             project_name=project_name,
@@ -4111,6 +4502,17 @@ def apply_saved_terraform_run(
             apply_context=apply_context,
         )
 
+    deployment_metadata = (
+        apply_context.get("deployment_metadata")
+        if isinstance(apply_context, dict) and isinstance(apply_context.get("deployment_metadata"), dict)
+        else {}
+    )
+    if isinstance(deployment_metadata.get("customization_source"), dict):
+        return {
+            "success": False,
+            "error": "Snapshot deployment requires a saved Terraform run with source metadata.",
+        }
+
     _ensure_agent_import_path()
     from terraform_agent.agent.engine import apply_terraform_run
 
@@ -4123,6 +4525,7 @@ def apply_saved_terraform_run(
             "state_bucket": state_bucket,
             "aws_access_key_id": aws_access_key_id,
             "aws_secret_access_key": aws_secret_access_key,
+            "aws_session_token": aws_session_token,
             "aws_region": aws_region,
         },
         apply_context=apply_context,

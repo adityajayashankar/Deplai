@@ -117,6 +117,11 @@ function buildPreviewRouteBase(context: PreviewContext, directoryPrefix = ''): s
   return `/api/customization/preview/${encodeURIComponent(context.normalizedProjectId)}/${tenantPathPrefix}${normalizedDirectoryPrefix ? `${normalizedDirectoryPrefix}/` : ''}`;
 }
 
+function setPreviewFrameHeaders(headers: Headers): void {
+  headers.set('x-frame-options', 'SAMEORIGIN');
+  headers.set('content-security-policy', "frame-ancestors 'self'");
+}
+
 function rewritePreviewHtmlBase(html: string, baseHref: string): string {
   if (/<base\s+/i.test(html)) {
     return html.replace(/<base\s+href=["'][^"']*["']\s*\/?\s*>/i, `<base href="${baseHref}">`);
@@ -165,18 +170,22 @@ function rewriteLivePreviewHtml(html: string, context: PreviewContext, servedRel
 
 async function proxyLivePreviewRequest(
   request: NextRequest,
-  backendPreviewStatus: BackendPreviewStatus,
   relativeFilePath: string,
   context: PreviewContext,
+  baseRepoPath: string,
 ) {
-  if (!backendPreviewStatus.url) {
-    return NextResponse.json({ error: 'Live preview URL is missing.' }, { status: 502 });
-  }
-
-  const liveBaseUrl = backendPreviewStatus.url.replace(/\/+$/, '');
-  const liveUrl = new URL(`${liveBaseUrl}/${relativeFilePath.replace(/^\/+/, '')}`);
+  const encodedAssetPath = relativeFilePath
+    .replace(/^\/+/, '')
+    .split('/')
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+  const contentSuffix = encodedAssetPath ? `/content/${encodedAssetPath}` : '/content';
+  const liveUrl = new URL(`${getBackendBaseUrl()}/api/tenant/preview${contentSuffix}`);
+  liveUrl.searchParams.set('tenant_id', context.requestedTenantId);
+  liveUrl.searchParams.set('base_repo_path', baseRepoPath);
   request.nextUrl.searchParams.forEach((value, key) => {
-    if (!['meta', 'v', 'tenant_id', 'tenantId', 'project_id', 'projectId'].includes(key)) {
+    if (!['meta', 'v', 'tenant_id', 'tenantId', 'base_repo_path', 'project_id', 'projectId'].includes(key)) {
       liveUrl.searchParams.append(key, value);
     }
   });
@@ -200,7 +209,7 @@ async function proxyLivePreviewRequest(
   if (upstream.status >= 300 && upstream.status < 400) {
     const location = upstream.headers.get('location');
     if (location) {
-      const redirected = new URL(location, liveBaseUrl);
+      const redirected = new URL(location, 'http://127.0.0.1/');
       const proxiedPath = redirected.pathname.replace(/^\/+/, '');
       return NextResponse.redirect(`${buildPreviewRouteBase(context)}${proxiedPath}${redirected.search}`, upstream.status);
     }
@@ -210,6 +219,7 @@ async function proxyLivePreviewRequest(
   const upstreamContentType = upstream.headers.get('content-type') || '';
   if (upstreamContentType) responseHeaders.set('content-type', upstreamContentType);
   responseHeaders.set('cache-control', 'no-store, max-age=0');
+  setPreviewFrameHeaders(responseHeaders);
 
   const upstreamBody = await upstream.arrayBuffer();
   if (upstreamContentType.startsWith('text/html')) {
@@ -310,7 +320,7 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
 
   if (metaOnly) {
     const livePreviewKnown = backendPreviewStatus?.kind === 'live_server';
-    const liveReady = livePreviewKnown && backendPreviewStatus.status === 'ready' && backendPreviewStatus.url;
+    const liveReady = livePreviewKnown && backendPreviewStatus.status === 'ready';
     // "starting" means the dev server is installing deps / compiling — surface it
     // as progress, not an error, so the UI can poll instead of showing a failure.
     const liveStarting = livePreviewKnown && backendPreviewStatus.status === 'starting';
@@ -324,7 +334,9 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
       preview_root_path: previewRootPath,
       preview_entry: detectPreviewEntry(previewRootPath, baseRepoPath),
       preview_kind: livePreviewKnown ? 'live_server' : 'static_file',
-      preview_url: liveReady ? backendPreviewStatus?.url : null,
+      preview_url: liveReady
+        ? buildPreviewRouteBase({ normalizedProjectId, requestedTenantId })
+        : null,
       preview_status: livePreviewKnown ? (backendPreviewStatus?.status || 'unavailable') : (backendPreviewStatus?.status || 'unavailable'),
       preview_error: (liveReady || liveStarting) ? null : (backendPreviewStatus?.detail || null),
       preview_detail: backendPreviewStatus?.detail || null,
@@ -339,7 +351,6 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
     if (
       backendPreviewStatus?.kind === 'live_server'
       && backendPreviewStatus.status === 'ready'
-      && backendPreviewStatus.url
     ) {
       relativeFilePath = '';
     } else {
@@ -360,13 +371,12 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
   if (
     backendPreviewStatus?.kind === 'live_server'
     && backendPreviewStatus.status === 'ready'
-    && backendPreviewStatus.url
   ) {
     return proxyLivePreviewRequest(
       request,
-      backendPreviewStatus,
       relativeFilePath,
       { normalizedProjectId, requestedTenantId },
+      baseRepoPath,
     );
   }
 
@@ -407,6 +417,7 @@ async function handlePreviewRequest(request: NextRequest, userId: string, pathSe
     'content-type': getContentTypeForFile(resolvedFilePath),
     'cache-control': 'no-store, max-age=0',
   });
+  setPreviewFrameHeaders(responseHeaders);
 
   let responseBody = fs.readFileSync(resolvedFilePath);
 
@@ -576,6 +587,18 @@ function resolveBackendPath(pathSegments: string[] = []): string[] {
     return ['api', 'tenant', 'assets', ...pathSegments.slice(1)];
   }
 
+  if (
+    pathSegments[0] === 'preview'
+    && ['start', 'restart', 'status', 'stop'].includes(pathSegments[1] || '')
+  ) {
+    return ['api', 'tenant', 'preview', pathSegments[1]];
+  }
+
+  if (pathSegments[0] === 'snapshots') {
+    const snapshotSuffix = pathSegments[1] === 'create' ? [] : pathSegments.slice(1);
+    return ['api', 'tenant', 'snapshots', ...snapshotSuffix];
+  }
+
   return pathSegments;
 }
 
@@ -605,12 +628,18 @@ async function proxyRequest(request: NextRequest, pathSegments: string[] = []) {
   const { user, error } = await requireAuth();
   if (error) return error;
 
-  const isPreviewRequest =
+  const previewControlActions = new Set(['start', 'restart', 'status', 'stop']);
+  const isPreviewControlRequest =
+    pathSegments[0] === 'preview'
+    && pathSegments.length === 2
+    && previewControlActions.has(pathSegments[1]);
+  const isPreviewContentRequest =
     request.method === 'GET'
     && pathSegments.length >= 1
-    && pathSegments[0] === 'preview';
+    && pathSegments[0] === 'preview'
+    && !isPreviewControlRequest;
 
-  if (isPreviewRequest) {
+  if (isPreviewContentRequest) {
     return handlePreviewRequest(request, String(user.id), pathSegments);
   }
 
@@ -623,7 +652,6 @@ async function proxyRequest(request: NextRequest, pathSegments: string[] = []) {
     return handleResolveRepoPathRequest(request, String(user.id));
   }
 
-  const targetUrl = buildTargetUrl(resolveBackendPath(pathSegments), request.nextUrl.search);
   const headers = new Headers();
 
   const acceptHeader = request.headers.get('accept');
@@ -638,11 +666,21 @@ async function proxyRequest(request: NextRequest, pathSegments: string[] = []) {
     cache: 'no-store',
   };
 
-  const isRepoBoundCustomizationCall =
+  let targetSearch = request.nextUrl.search;
+  const isSnapshotRequest = pathSegments[0] === 'snapshots';
+  const isBodyRepoBoundCall =
     request.method === 'POST'
-    && (pathSegments[0] === 'implement' || pathSegments[0] === 'reset-repo');
+    && (
+      pathSegments[0] === 'implement'
+      || pathSegments[0] === 'reset-repo'
+      || isSnapshotRequest
+      || (
+        isPreviewControlRequest
+        && ['start', 'restart', 'stop'].includes(pathSegments[1])
+      )
+    );
 
-  if (isRepoBoundCustomizationCall) {
+  if (isBodyRepoBoundCall) {
     let body: Record<string, unknown>;
     try {
       const parsed = await request.json();
@@ -652,6 +690,10 @@ async function proxyRequest(request: NextRequest, pathSegments: string[] = []) {
     }
 
     const projectId = String(body.project_id ?? body.projectId ?? '').trim();
+    const requiresProjectId = isSnapshotRequest || isPreviewControlRequest;
+    if (requiresProjectId && !projectId) {
+      return NextResponse.json({ error: 'project_id is required.' }, { status: 400 });
+    }
     if (projectId) {
       try {
         body.base_repo_path = await resolveProjectRepoPath(String(user.id), projectId);
@@ -666,10 +708,44 @@ async function proxyRequest(request: NextRequest, pathSegments: string[] = []) {
 
     headers.set('content-type', 'application/json');
     init.body = JSON.stringify(body);
+  } else if (
+    request.method === 'GET'
+    && (
+      isSnapshotRequest
+      || (isPreviewControlRequest && pathSegments[1] === 'status')
+    )
+  ) {
+    const projectId = String(
+      request.nextUrl.searchParams.get('project_id')
+      || request.nextUrl.searchParams.get('projectId')
+      || '',
+    ).trim();
+    if (!projectId) {
+      return NextResponse.json({ error: 'project_id is required.' }, { status: 400 });
+    }
+    let baseRepoPath: string;
+    try {
+      baseRepoPath = await resolveProjectRepoPath(String(user.id), projectId);
+    } catch (resolutionError) {
+      if (resolutionError instanceof ProxyResolutionError) {
+        return NextResponse.json({ error: resolutionError.message }, { status: resolutionError.status });
+      }
+      const message = resolutionError instanceof Error
+        ? resolutionError.message
+        : 'Failed to resolve project repository path.';
+      return NextResponse.json({ error: message }, { status: 500 });
+    }
+    const targetParams = new URLSearchParams(request.nextUrl.searchParams);
+    targetParams.delete('project_id');
+    targetParams.delete('projectId');
+    targetParams.delete('base_repo_path');
+    targetParams.set('base_repo_path', baseRepoPath);
+    targetSearch = targetParams.size ? `?${targetParams.toString()}` : '';
   } else if (request.method !== 'GET' && request.method !== 'HEAD') {
     init.body = await request.arrayBuffer();
   }
 
+  const targetUrl = buildTargetUrl(resolveBackendPath(pathSegments), targetSearch);
   let upstream: Response;
   try {
     upstream = await fetch(targetUrl, init);

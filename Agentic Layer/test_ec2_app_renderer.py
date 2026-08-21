@@ -205,6 +205,108 @@ def test_packager_detects_nested_frontend_node_app(tmp_path: Path) -> None:
     assert package.start_command == "npm run start"
 
 
+def test_packager_does_not_treat_cra_public_as_finished_static_site(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        '{"scripts":{"build":"react-scripts build","start":"react-scripts start"}}',
+        encoding="utf-8",
+    )
+    public = tmp_path / "public"
+    public.mkdir()
+    (public / "index.html").write_text(
+        "<!doctype html><html><body><div id='root'></div></body></html>",
+        encoding="utf-8",
+    )
+
+    package = build_deployment_package(
+        source_root=str(tmp_path),
+        project_name="ifca",
+        repository_context={},
+    )
+
+    assert package.app_kind == "node"
+    assert package.selected_root == "."
+    assert package.build_command == "npm run build"
+    assert package.start_command == "npm run start"
+
+
+def test_packager_prefers_docker_compose_over_node(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        '{"scripts":{"start":"node server.js"}}',
+        encoding="utf-8",
+    )
+    (tmp_path / "docker-compose.yml").write_text(
+        "services:\n  web:\n    build: .\n    ports:\n      - '3000:3000'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Dockerfile").write_text(
+        "FROM node:20-alpine\nEXPOSE 3000\nCMD [\"node\",\"server.js\"]\n",
+        encoding="utf-8",
+    )
+
+    package = build_deployment_package(
+        source_root=str(tmp_path),
+        project_name="compose-app",
+        repository_context={},
+    )
+
+    assert package.app_kind == "docker"
+    assert package.build_command == "compose"
+    assert package.start_command == "compose:docker-compose.yml"
+
+
+def test_packager_detects_dockerfile_and_expose_port(tmp_path: Path) -> None:
+    (tmp_path / "Dockerfile").write_text(
+        "FROM python:3.12-slim\nEXPOSE 8080\nCMD [\"python\",\"-m\",\"http.server\",\"8080\"]\n",
+        encoding="utf-8",
+    )
+
+    package = build_deployment_package(
+        source_root=str(tmp_path),
+        project_name="image-app",
+        repository_context={},
+    )
+
+    assert package.app_kind == "docker"
+    assert package.build_command == "docker"
+    assert package.start_command == "dockerfile:Dockerfile"
+    assert package.app_port == 8080
+
+
+def test_ec2_renderer_bootstraps_docker_engine(tmp_path: Path) -> None:
+    from deployment_packager import DeploymentPackage
+
+    package = DeploymentPackage(
+        package_id="demo-docker",
+        source_root=str(tmp_path),
+        app_kind="docker",
+        app_port=8080,
+        health_path="/",
+        build_command="docker",
+        start_command="dockerfile:Dockerfile",
+        package_base64="cGFja2FnZQ==",
+        package_file_count=1,
+        package_bytes=8,
+        selected_root=".",
+        package_tarball_path="",
+        manifest_path="",
+        warnings=[],
+    )
+    rendered = render_ec2_app_bundle(
+        project_name="demo-docker",
+        aws_region="eu-north-1",
+        deployment_package=package,
+    )
+    main_tf = next(item["content"] for item in rendered["files"] if item["path"] == "terraform/main.tf")
+    assert 'APP_KIND="${var.app_kind}"' in main_tf
+    assert "dnf install -y docker" in main_tf
+    assert "docker compose" in main_tf
+    assert "docker build -t" in main_tf
+    assert "docker run -d --name" in main_tf
+    assert "root_volume_size_gb = 40" in next(
+        item["content"] for item in rendered["files"] if item["path"] == "terraform/terraform.tfvars"
+    )
+
+
 def test_packager_falls_back_to_generated_static_package_for_unknown_app_shape(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("No deployable entrypoint yet.", encoding="utf-8")
 
@@ -218,3 +320,66 @@ def test_packager_falls_back_to_generated_static_package_for_unknown_app_shape(t
     assert package.selected_root == "generated-placeholder"
     assert package.package_file_count == 1
     assert any("generated a static placeholder" in warning for warning in package.warnings)
+
+def test_ec2_renderer_fetches_secrets_manager_and_omits_oauth_plaintext(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        '{"name":"demo","dependencies":{"next-auth":"4.24.0"}}',
+        encoding="utf-8",
+    )
+    (tmp_path / ".env.example").write_text(
+        "GOOGLE_CLIENT_ID=\nGOOGLE_CLIENT_SECRET=\nNEXTAUTH_SECRET=\n",
+        encoding="utf-8",
+    )
+    package = DeploymentPackage(
+        package_id="demo-package",
+        source_root=str(tmp_path),
+        app_kind="node",
+        app_port=3000,
+        health_path="/",
+        build_command="npm run build",
+        start_command="npm run start",
+        package_base64="ZGVtbw==",
+        package_file_count=1,
+        package_bytes=4,
+        selected_root=".",
+        package_tarball_path="",
+        manifest_path="",
+        warnings=[],
+    )
+    rendered = render_ec2_app_bundle(
+        project_name="demo-app",
+        aws_region="eu-north-1",
+        deployment_package=package,
+        deployment_profile={
+            "environment": "prod",
+            "runtime_config": {
+                "secrets_manager_prefix": "/demo-app/prod",
+                "required_secrets": ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
+            },
+        },
+        user_answers={
+            "oauth": {
+                "GOOGLE_CLIENT_ID": "should-not-appear-in-hcl",
+                "GOOGLE_CLIENT_SECRET": "plaintext-oauth-secret-must-not-land-in-tf",
+            }
+        },
+    )
+    by_path = {item["path"]: item["content"] for item in rendered["files"]}
+    main_tf = by_path["terraform/main.tf"]
+    tfvars = by_path["terraform/terraform.tfvars"]
+
+    assert "secretsmanager:GetSecretValue" in main_tf
+    assert "secrets_manager_fetch_started" in main_tf
+    assert "var.secrets_manager_prefix" in main_tf
+    assert "data.aws_caller_identity.current.account_id" in main_tf
+    assert "secret:${var.secrets_manager_prefix}*" in main_tf
+    get_idx = main_tf.find("secretsmanager:GetSecretValue")
+    assert get_idx > 0
+    scoped_slice = main_tf[get_idx : get_idx + 600]
+    assert "secrets_manager_prefix" in scoped_slice
+    assert 'secrets_manager_prefix = "/demo-app/prod"' in tfvars
+    assert "plaintext-oauth-secret-must-not-land-in-tf" not in main_tf
+    assert "plaintext-oauth-secret-must-not-land-in-tf" not in tfvars
+    assert "GOOGLE_CLIENT_SECRET=plaintext" not in main_tf
+    assert "should-not-appear-in-hcl" not in main_tf
+    assert "should-not-appear-in-hcl" not in tfvars

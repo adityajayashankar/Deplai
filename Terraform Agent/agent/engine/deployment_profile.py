@@ -4,7 +4,12 @@ import json
 from typing import Any
 
 from .bundle import build_manifest_bundle
-from .enterprise_bundle import build_enterprise_profile_bundle
+from .enterprise_bundle import (
+    assert_endpoint_decision_renderable,
+    build_enterprise_profile_bundle,
+    profile_wants_alb,
+    profile_wants_eip,
+)
 from .runtime import DEFAULT_PROVIDER_CONSTRAINT, slugify
 
 
@@ -48,6 +53,13 @@ def build_profile_manifest(payload: dict[str, Any]) -> tuple[list[dict[str, Any]
             ]
         )
         return manifest, ["website_bucket", "cdn"]
+
+    if strategy in {"ec2", "ec2-instance"}:
+        manifest.append({"id": "ec2_app", "type": "aws_instance", "strategy": "hcl", "dependencies": [], "config": {}, "doc_url": None, "knowledge_key": None})
+        if profile_wants_alb(payload):
+            manifest.append({"id": "alb", "type": "aws_lb", "strategy": "hcl", "dependencies": ["ec2_app"], "config": {}, "doc_url": None, "knowledge_key": None})
+        if profile_wants_eip(payload):
+            manifest.append({"id": "eip", "type": "aws_eip", "strategy": "hcl", "dependencies": ["ec2_app"], "config": {}, "doc_url": None, "knowledge_key": None})
 
     if strategy == "ecs_fargate":
         manifest.append({"id": "ecs_cluster", "type": "aws_ecs_cluster", "strategy": "hcl", "dependencies": [], "config": {}, "doc_url": None, "knowledge_key": None})
@@ -840,6 +852,7 @@ def build_profile_bundle(
     context_summary: str,
     website_index_html: str,
 ) -> tuple[dict[str, str], list[str]]:
+    assert_endpoint_decision_renderable(payload)
     strategy = str(((payload.get("compute") or {}) if isinstance(payload.get("compute"), dict) else {}).get("strategy") or "")
     if strategy == "ecs_fargate":
         return _ecs_bundle(
@@ -860,6 +873,9 @@ def build_profile_bundle(
             context_summary=context_summary,
             website_index_html=website_index_html,
         )
+    except ValueError:
+        # Explicit decision/render conflicts must not fall back to an EC2-only legacy bundle.
+        raise
     except Exception as exc:
         files, warnings = build_manifest_bundle(
             project_name=str(payload.get("project_name") or "deplai-project"),
