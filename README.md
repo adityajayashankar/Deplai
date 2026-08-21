@@ -31,6 +31,20 @@ workflow for every project. The product direction is an explainable path from
 repository evidence to a production-ready decision, with people retaining
 control of source changes, pull requests, plans, credentials, and apply.
 
+## High-level architecture
+
+### Frontend customization
+
+![Frontend customization flow](docs/images/frontend-customization-architecture.png)
+
+### Vulnerability detection and code remediation
+
+![Vulnerability detection and code remediation flow](docs/images/vulnerability-remediation-architecture.png)
+
+### Deployment workflow
+
+![Deployment workflow](docs/images/deployment-architecture.png)
+
 Read the documentation in this order:
 
 1. [Product overview](docs/product-overview.md) — users, problem, vision, goals, and current scope.

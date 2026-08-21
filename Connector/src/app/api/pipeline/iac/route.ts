@@ -2347,7 +2347,11 @@ export async function POST(req: NextRequest) {
         workspace: terraformSafeProjectSlug(projectName),
         project_name: projectName,
         provider: 'aws',
-        application_type: String(asRecord(repositoryContext.language).runtime || asRecord(repositoryContext.language).primary || 'node'),
+        application_type: String(
+          asRecord(asRecord(repositoryContext).language).runtime
+          || asRecord(asRecord(repositoryContext).language).primary
+          || 'node',
+        ),
         environment: 'prod',
         compute: {
           strategy: Array.isArray(consultantDecision.components) && consultantDecision.components.includes('ecs')

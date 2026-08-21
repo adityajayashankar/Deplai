@@ -475,7 +475,7 @@ export function readAppSecretsMeta(projectId: string): PersistedAppSecretMeta[] 
     const parsed = JSON.parse(raw) as unknown;
     if (!Array.isArray(parsed)) return [];
     return parsed
-      .map((item) => {
+      .map((item): PersistedAppSecretMeta | null => {
         const row = item as PersistedAppSecretMeta;
         const key = String(row?.key || '').trim();
         if (!key) return null;
@@ -485,7 +485,7 @@ export function readAppSecretsMeta(projectId: string): PersistedAppSecretMeta[] 
           required: Boolean(row.required),
         };
       })
-      .filter((row): row is PersistedAppSecretMeta => Boolean(row));
+      .filter((row): row is PersistedAppSecretMeta => row !== null);
   } catch {
     return [];
   }

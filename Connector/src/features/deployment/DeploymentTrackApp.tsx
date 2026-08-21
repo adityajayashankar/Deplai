@@ -6269,7 +6269,7 @@ export default function DeploymentTrackApp() {
                         : deployStatus === 'error' || deployUiPhase === 'error' ? 'border border-red-500/20 bg-red-500/10 text-red-400'
                         : deployIsLive ? 'animate-pulse border border-amber-500/20 bg-amber-500/10 text-amber-200'
                         : 'border border-white/10 bg-[#16161a] text-zinc-300'
-                      }`}>{deployIsLive ? 'running' : deployProgress >= 100 && deployStatus === 'running' ? 'executing build' : deployStatus}</span>
+                      }`}>{deployIsLive ? 'running' : deployStatus}</span>
                     </div>
                     <div className="mt-2 text-xs text-zinc-500">{deployPhaseLabel}</div>
                     {deployProgress >= 100 && deployStatus === 'running' && (

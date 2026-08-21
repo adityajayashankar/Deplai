@@ -44,7 +44,8 @@ Connector browser bundle, so rebuild the Connector image when they change.
 ## 3. Validate and start
 
 ```bash
-docker compose --env-file deploy/.env -f docker-compose.production.yml config --quiet
+chmod +x deploy/preflight.sh
+./deploy/preflight.sh
 docker compose --env-file deploy/.env -f docker-compose.production.yml up -d --build
 docker compose --env-file deploy/.env -f docker-compose.production.yml ps
 docker compose --env-file deploy/.env -f docker-compose.production.yml logs -f caddy connector agentic-layer
