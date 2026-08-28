@@ -1,0 +1,26 @@
+{
+  "id": "alb",
+  "pinned_version": "9.17.0",
+  "module_name": "alb",
+  "forbidden_args": [],
+  "allowed_args": {
+    "name": {"type": "string", "required": false},
+    "load_balancer_type": {"type": "string", "required": false},
+    "vpc_id": {"type": "string", "required": false},
+    "subnets": {"type": "list(string)", "required": false},
+    "internal": {"type": "bool", "required": false},
+    "security_groups": {"type": "list(string)", "required": false},
+    "create_security_group": {"type": "bool", "required": false},
+    "listeners": {"type": "any", "required": false},
+    "target_groups": {"type": "any", "required": false},
+    "tags": {"type": "map(string)", "required": false},
+    "source": {"type": "string", "required": true},
+    "version": {"type": "string", "required": true},
+    "count": {"type": "number", "required": false}
+  },
+  "edit_schema": [
+    {"name": "enable_alb", "type": "bool", "default": false},
+    {"name": "app_port", "type": "number", "default": 3000},
+    {"name": "health_path", "type": "string", "default": "/"}
+  ]
+}

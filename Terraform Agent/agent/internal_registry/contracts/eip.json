@@ -1,0 +1,15 @@
+{
+  "id": "eip",
+  "pinned_version": null,
+  "resource": "aws_eip",
+  "forbidden_args": [],
+  "allowed_args": {
+    "domain": {"type": "string", "required": false},
+    "instance": {"type": "string", "required": false},
+    "tags": {"type": "map(string)", "required": false},
+    "count": {"type": "number", "required": false}
+  },
+  "edit_schema": [
+    {"name": "enable_eip", "type": "bool", "default": false}
+  ]
+}

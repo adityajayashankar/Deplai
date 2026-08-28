@@ -75,6 +75,10 @@ Terraform-generation-plan.md
 !Customization Agent/**/*.jsonl
 !Customization Agent/**/*.mjs
 
+# Terraform Agent internal registry (catalog + module contracts)
+!Terraform Agent/agent/internal_registry/catalog.json
+!Terraform Agent/agent/internal_registry/contracts/*.json
+
 # Customization Agent runtime artifacts
 Customization Agent/SubSpace-*
 Customization Agent/CulturePlace-main/frontend/.env.local

@@ -1,0 +1,20 @@
+{
+  "id": "s3_cloudfront",
+  "kind": "native",
+  "resource": "aws_cloudfront_distribution",
+  "forbidden_args": [],
+  "allowed_args": {
+    "price_class": { "type": "string" },
+    "default_root_object": { "type": "string" }
+  },
+  "edit_schema": [
+    { "name": "price_class", "type": "string", "default": "PriceClass_100" },
+    { "name": "default_root_object", "type": "string", "default": "index.html" }
+  ],
+  "outputs": [
+    "cloudfront_url",
+    "cloudfront_domain_name",
+    "website_bucket_name",
+    "distribution_id"
+  ]
+}

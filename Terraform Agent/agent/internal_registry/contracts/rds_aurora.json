@@ -1,0 +1,21 @@
+{
+  "id": "rds_aurora",
+  "pinned_version": "9.15.0",
+  "module_name": "aurora",
+  "forbidden_args": [],
+  "allowed_args": {
+    "name": {"type": "string", "required": false},
+    "engine": {"type": "string", "required": false},
+    "engine_version": {"type": "string", "required": false},
+    "instance_class": {"type": "string", "required": false},
+    "vpc_id": {"type": "string", "required": false},
+    "subnets": {"type": "list(string)", "required": false},
+    "tags": {"type": "map(string)", "required": false},
+    "source": {"type": "string", "required": true},
+    "version": {"type": "string", "required": true}
+  },
+  "edit_schema": [
+    {"name": "engine", "type": "string", "default": "aurora-postgresql"},
+    {"name": "instance_class", "type": "string", "default": "db.t4g.medium"}
+  ]
+}

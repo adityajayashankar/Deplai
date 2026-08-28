@@ -1,0 +1,18 @@
+{
+  "id": "security_group_module",
+  "pinned_version": "5.3.0",
+  "module_name": "security_group",
+  "forbidden_args": [],
+  "allowed_args": {
+    "name": {"type": "string", "required": false},
+    "vpc_id": {"type": "string", "required": false},
+    "ingress_with_cidr_blocks": {"type": "any", "required": false},
+    "egress_with_cidr_blocks": {"type": "any", "required": false},
+    "tags": {"type": "map(string)", "required": false},
+    "source": {"type": "string", "required": true},
+    "version": {"type": "string", "required": true}
+  },
+  "edit_schema": [
+    {"name": "app_port", "type": "number", "default": 3000}
+  ]
+}

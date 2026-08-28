@@ -1,0 +1,18 @@
+{
+  "id": "elasticache_module",
+  "pinned_version": "1.6.0",
+  "module_name": "elasticache",
+  "forbidden_args": [],
+  "allowed_args": {
+    "create": {"type": "bool", "required": false},
+    "engine": {"type": "string", "required": false},
+    "engine_version": {"type": "string", "required": false},
+    "node_type": {"type": "string", "required": false},
+    "source": {"type": "string", "required": true},
+    "version": {"type": "string", "required": true}
+  },
+  "edit_schema": [
+    {"name": "node_type", "type": "string", "default": "cache.t4g.micro"},
+    {"name": "engine_version", "type": "string", "default": "7.0"}
+  ]
+}

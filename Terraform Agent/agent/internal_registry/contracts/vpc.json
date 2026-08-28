@@ -1,0 +1,26 @@
+{
+  "id": "vpc",
+  "pinned_version": "5.21.0",
+  "module_name": "vpc",
+  "forbidden_args": [],
+  "allowed_args": {
+    "name": {"type": "string", "required": false},
+    "cidr": {"type": "string", "required": false},
+    "azs": {"type": "list(string)", "required": false},
+    "public_subnets": {"type": "list(string)", "required": false},
+    "private_subnets": {"type": "list(string)", "required": false},
+    "enable_nat_gateway": {"type": "bool", "required": false},
+    "single_nat_gateway": {"type": "bool", "required": false},
+    "enable_dns_hostnames": {"type": "bool", "required": false},
+    "enable_dns_support": {"type": "bool", "required": false},
+    "tags": {"type": "map(string)", "required": false},
+    "source": {"type": "string", "required": true},
+    "version": {"type": "string", "required": true},
+    "count": {"type": "number", "required": false}
+  },
+  "edit_schema": [
+    {"name": "use_default_vpc", "type": "bool", "default": true},
+    {"name": "use_existing_vpc", "type": "bool", "default": false},
+    {"name": "enable_nat_gateway", "type": "bool", "default": false}
+  ]
+}

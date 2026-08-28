@@ -1,0 +1,23 @@
+{
+  "id": "elasticache",
+  "pinned_version": null,
+  "resource": "aws_elasticache_cluster",
+  "forbidden_args": [],
+  "allowed_args": {
+    "cluster_id": {"type": "string", "required": false},
+    "engine": {"type": "string", "required": false},
+    "engine_version": {"type": "string", "required": false},
+    "node_type": {"type": "string", "required": false},
+    "num_cache_nodes": {"type": "number", "required": false},
+    "parameter_group_name": {"type": "string", "required": false},
+    "port": {"type": "number", "required": false},
+    "security_group_ids": {"type": "list(string)", "required": false},
+    "subnet_group_name": {"type": "string", "required": false},
+    "tags": {"type": "map(string)", "required": false},
+    "count": {"type": "number", "required": false}
+  },
+  "edit_schema": [
+    {"name": "node_type", "type": "string", "default": "cache.t4g.micro"},
+    {"name": "engine_version", "type": "string", "default": "7.0"}
+  ]
+}

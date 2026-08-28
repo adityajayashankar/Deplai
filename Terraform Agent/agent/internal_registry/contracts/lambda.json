@@ -1,0 +1,23 @@
+{
+  "id": "lambda",
+  "pinned_version": null,
+  "resource": "aws_lambda_function",
+  "forbidden_args": [],
+  "allowed_args": {
+    "function_name": {"type": "string", "required": false},
+    "runtime": {"type": "string", "required": false},
+    "handler": {"type": "string", "required": false},
+    "role": {"type": "string", "required": false},
+    "filename": {"type": "string", "required": false},
+    "source_code_hash": {"type": "string", "required": false},
+    "memory_size": {"type": "number", "required": false},
+    "timeout": {"type": "number", "required": false},
+    "environment": {"type": "any", "required": false},
+    "tags": {"type": "map(string)", "required": false}
+  },
+  "edit_schema": [
+    {"name": "runtime", "type": "string", "default": "python3.12"},
+    {"name": "memory_size", "type": "number", "default": 128},
+    {"name": "timeout", "type": "number", "default": 30}
+  ]
+}

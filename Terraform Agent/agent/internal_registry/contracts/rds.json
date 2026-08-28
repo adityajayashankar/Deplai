@@ -1,0 +1,30 @@
+{
+  "id": "rds",
+  "pinned_version": "6.12.0",
+  "module_name": "db",
+  "forbidden_args": [],
+  "allowed_args": {
+    "identifier": {"type": "string", "required": false},
+    "engine": {"type": "string", "required": false},
+    "engine_version": {"type": "string", "required": false},
+    "instance_class": {"type": "string", "required": false},
+    "allocated_storage": {"type": "number", "required": false},
+    "multi_az": {"type": "bool", "required": false},
+    "db_name": {"type": "string", "required": false},
+    "username": {"type": "string", "required": false},
+    "password": {"type": "string", "required": false},
+    "vpc_security_group_ids": {"type": "list(string)", "required": false},
+    "subnet_ids": {"type": "list(string)", "required": false},
+    "tags": {"type": "map(string)", "required": false},
+    "source": {"type": "string", "required": true},
+    "version": {"type": "string", "required": true},
+    "count": {"type": "number", "required": false}
+  },
+  "edit_schema": [
+    {"name": "engine", "type": "string", "default": "postgres"},
+    {"name": "engine_version", "type": "string", "default": "15.5"},
+    {"name": "instance_class", "type": "string", "default": "db.t4g.micro"},
+    {"name": "allocated_storage", "type": "number", "default": 20},
+    {"name": "multi_az", "type": "bool", "default": false}
+  ]
+}

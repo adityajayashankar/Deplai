@@ -1,0 +1,32 @@
+{
+  "id": "ec2_instance",
+  "pinned_version": "5.8.0",
+  "module_name": "ec2",
+  "forbidden_args": ["create_security_group", "create_eip", "security_group_ingress_rules", "security_group_egress_rules"],
+  "allowed_args": {
+    "name": {"type": "string", "required": false},
+    "ami": {"type": "string", "required": false},
+    "instance_type": {"type": "string", "required": false},
+    "subnet_id": {"type": "string", "required": false},
+    "vpc_security_group_ids": {"type": "list(string)", "required": false},
+    "iam_instance_profile": {"type": "string", "required": false},
+    "key_name": {"type": "string", "required": false},
+    "associate_public_ip_address": {"type": "bool", "required": false},
+    "user_data": {"type": "string", "required": false},
+    "user_data_base64": {"type": "string", "required": false},
+    "root_block_device": {"type": "list(any)", "required": false, "coerce": "object_to_singleton_list"},
+    "metadata_options": {"type": "map(string)", "required": false},
+    "tags": {"type": "map(string)", "required": false},
+    "monitoring": {"type": "bool", "required": false},
+    "source": {"type": "string", "required": true},
+    "version": {"type": "string", "required": true},
+    "count": {"type": "number", "required": false}
+  },
+  "edit_schema": [
+    {"name": "instance_type", "type": "string", "default": "t3.micro"},
+    {"name": "root_volume_size_gb", "type": "number", "default": 8, "min": 8, "max": 200},
+    {"name": "app_port", "type": "number", "default": 3000},
+    {"name": "ssh_cidrs", "type": "list(string)", "default": []},
+    {"name": "ssh_ingress_cidr_blocks", "type": "list(string)", "default": []}
+  ]
+}

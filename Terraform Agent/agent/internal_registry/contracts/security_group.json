@@ -1,0 +1,18 @@
+{
+  "id": "security_group",
+  "pinned_version": null,
+  "resource": "aws_security_group",
+  "forbidden_args": [],
+  "allowed_args": {
+    "name_prefix": {"type": "string", "required": false},
+    "name": {"type": "string", "required": false},
+    "description": {"type": "string", "required": false},
+    "vpc_id": {"type": "string", "required": true},
+    "tags": {"type": "map(string)", "required": false},
+    "count": {"type": "number", "required": false}
+  },
+  "edit_schema": [
+    {"name": "app_port", "type": "number", "default": 3000},
+    {"name": "ssh_cidrs", "type": "list(string)", "default": []}
+  ]
+}

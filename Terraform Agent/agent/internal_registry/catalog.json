@@ -1,0 +1,221 @@
+{
+  "schema_version": 1,
+  "pin_policy": {
+    "modules": "exact",
+    "provider": "patch_bounded",
+    "notes": "Emit version = \"X.Y.Z\" for registry modules — never >= or ~> on module blocks. Provider may use ~> X.Y.0 (patch-only). Always commit .terraform.lock.hcl. Never terraform init -upgrade without reviewing the lock diff. Never change provider to >= (no ceiling)."
+  },
+  "terraform": {
+    "required_version": ">= 1.6.0, < 1.12.0",
+    "notes": "Ceiling avoids silent CI failures on older runners vs write-only attrs in newer module lines."
+  },
+  "provider": {
+    "source": "hashicorp/aws",
+    "constraint": "~> 5.100.0",
+    "tested_version": "5.100.0",
+    "notes": "Patch-bounded 5.100.x only (<6). Do NOT loosen to >= 5.100 (no ceiling). Prefer .terraform.lock.hcl. Do not jump to provider 6 without https://registry.terraform.io/providers/hashicorp/aws/latest/docs/guides/version-6-upgrade (multi-region provider config and more). EC2 6 + ALB 10 required first."
+  },
+  "aliases": {
+    "ec2": "ec2_instance",
+    "ec2instance": "ec2_instance",
+    "load_balancer": "alb",
+    "application_load_balancer": "alb",
+    "elastic_ip": "eip",
+    "elasticip": "eip",
+    "sg": "security_group",
+    "securitygroup": "security_group",
+    "redis": "elasticache",
+    "nat": "nat_gateway",
+    "cloudfront": "s3_cloudfront",
+    "cdn": "s3_cloudfront",
+    "s3cloudfront": "s3_cloudfront",
+    "s3": "s3_cloudfront",
+    "static_site": "s3_cloudfront",
+    "s3bucket": "s3_bucket",
+    "bucket": "s3_bucket"
+  },
+  "services": {
+    "vpc": {
+      "kind": "module",
+      "source": "terraform-aws-modules/vpc/aws",
+      "version": "5.21.0",
+      "constraint": "5.21.0",
+      "template": "vpc",
+      "contract": "vpc",
+      "snippet": "vpc_module.tf.tmpl",
+      "notes": "Exact pin 5.21.0. If using native aws_nat_gateway, set enable_nat_gateway=false here or you double-bill NAT and churn routes."
+    },
+    "ec2_instance": {
+      "kind": "module",
+      "source": "terraform-aws-modules/ec2-instance/aws",
+      "version": "5.8.0",
+      "constraint": "5.8.0",
+      "template": "ec2",
+      "contract": "ec2_instance",
+      "snippet": "ec2_module.tf.tmpl",
+      "notes": "Exact pin 5.8.0. create_security_group is v6-only — forbidden. Open >= 5.8.0 would pull 6.x-requiring releases."
+    },
+    "alb": {
+      "kind": "module",
+      "source": "terraform-aws-modules/alb/aws",
+      "version": "9.17.0",
+      "constraint": "9.17.0",
+      "template": "alb",
+      "contract": "alb",
+      "snippet": "alb_module.tf.tmpl",
+      "notes": "Exact pin 9.17.0. Stays on AWS provider 5.x. ALB name is VPC-suffixed (not a fixed regional name) so partial-apply orphans do not collide on retry."
+    },
+    "security_group": {
+      "kind": "module",
+      "source": "terraform-aws-modules/security-group/aws",
+      "version": "5.3.0",
+      "constraint": "5.3.0",
+      "template": null,
+      "contract": "security_group_module",
+      "snippet": null,
+      "notes": "Exact pin. Prefer one of module vs security_group_native — do not manage the same SG both ways. Attribute names differ (module.security_group_id vs aws_security_group.x.id)."
+    },
+    "security_group_native": {
+      "kind": "native",
+      "source": "hashicorp/aws",
+      "resource": "aws_security_group",
+      "version": null,
+      "constraint": null,
+      "template": null,
+      "contract": "security_group",
+      "snippet": "security_group.tf.tmpl",
+      "notes": "Native SG used by enterprise compute slice. Do not also attach the security-group module to the same resource."
+    },
+    "security_group_module": {
+      "kind": "module",
+      "source": "terraform-aws-modules/security-group/aws",
+      "version": "5.3.0",
+      "constraint": "5.3.0",
+      "template": null,
+      "contract": "security_group_module",
+      "snippet": null,
+      "notes": "Alias of security_group exact pin."
+    },
+    "rds": {
+      "kind": "module",
+      "source": "terraform-aws-modules/rds/aws",
+      "version": "6.12.0",
+      "constraint": "6.12.0",
+      "template": "rds",
+      "contract": "rds",
+      "snippet": "rds_module.tf.tmpl",
+      "notes": "Exact pin 6.12.0 (module major, not AWS provider major)."
+    },
+    "rds_aurora": {
+      "kind": "module",
+      "source": "terraform-aws-modules/rds-aurora/aws",
+      "version": "9.15.0",
+      "constraint": "9.15.0",
+      "template": "rds",
+      "contract": "rds_aurora",
+      "snippet": null,
+      "notes": "Exact pin 9.15.0."
+    },
+    "elasticache": {
+      "kind": "native",
+      "source": "hashicorp/aws",
+      "resource": "aws_elasticache_cluster",
+      "version": null,
+      "constraint": null,
+      "template": "elasticache",
+      "contract": "elasticache",
+      "snippet": "elasticache_native.tf.tmpl",
+      "notes": "Native Redis. Migrating to elasticache_module later needs moved {} / terraform state mv — not a drop-in address swap."
+    },
+    "elasticache_module": {
+      "kind": "module",
+      "source": "terraform-aws-modules/elasticache/aws",
+      "version": "1.6.0",
+      "constraint": "1.6.0",
+      "template": "elasticache",
+      "contract": "elasticache_module",
+      "snippet": null,
+      "notes": "Future migration target only. Plan state surgery from aws_elasticache_cluster before enabling."
+    },
+    "eip": {
+      "kind": "native",
+      "source": "hashicorp/aws",
+      "resource": "aws_eip",
+      "version": null,
+      "constraint": null,
+      "template": null,
+      "contract": "eip",
+      "snippet": "eip_native.tf.tmpl",
+      "notes": "Elastic IP associate with EC2 or NAT."
+    },
+    "nat_gateway": {
+      "kind": "native",
+      "source": "hashicorp/aws",
+      "resource": "aws_nat_gateway",
+      "version": null,
+      "constraint": null,
+      "template": "vpc",
+      "contract": "nat_gateway",
+      "snippet": null,
+      "notes": "Prefer VPC module enable_nat_gateway. If using native aws_nat_gateway, force VPC enable_nat_gateway=false — otherwise duplicate NAT + route churn."
+    },
+    "s3_cloudfront": {
+      "kind": "native",
+      "source": "hashicorp/aws",
+      "resource": "aws_cloudfront_distribution",
+      "version": null,
+      "constraint": null,
+      "template": "s3_cloudfront",
+      "contract": "s3_cloudfront",
+      "snippet": "s3_cloudfront_native.tf.tmpl",
+      "notes": "Static site catalogue entry: private S3 origin + CloudFront CDN with origin access control."
+    },
+    "cloudfront": {
+      "kind": "native",
+      "source": "hashicorp/aws",
+      "resource": "aws_cloudfront_distribution",
+      "version": null,
+      "constraint": null,
+      "template": "s3_cloudfront",
+      "contract": "s3_cloudfront",
+      "snippet": "s3_cloudfront_native.tf.tmpl",
+      "notes": "Listed CloudFront CDN service. Resolves to the same S3 + CloudFront static-site stack as s3_cloudfront."
+    },
+    "s3_bucket": {
+      "kind": "module",
+      "source": "terraform-aws-modules/s3-bucket/aws",
+      "version": "4.11.0",
+      "constraint": "4.11.0",
+      "template": "s3",
+      "contract": "s3_bucket",
+      "snippet": null,
+      "notes": "Exact pin 4.11.0 for provider 5.x. Do not use >= 4.11.0 / 5.15.4 (aws >= 6.42)."
+    },
+    "lambda": {
+      "kind": "native",
+      "source": "hashicorp/aws",
+      "resource": "aws_lambda_function",
+      "version": null,
+      "constraint": null,
+      "template": "lambda",
+      "contract": "lambda",
+      "snippet": "lambda_native.tf.tmpl",
+      "notes": "Lambda function + IAM execution role."
+    }
+  },
+  "stable_endpoint_outputs": [
+    "app_url",
+    "alb_dns_name",
+    "elastic_ip",
+    "ec2_public_ip",
+    "ec2_instance_id",
+    "instance_id",
+    "ec2_vpc_id",
+    "ec2_subnet_id",
+    "cloudfront_url",
+    "rds_endpoint",
+    "redis_endpoint",
+    "lambda_function_name",
+    "lambda_invoke_arn"
+  ]
+}

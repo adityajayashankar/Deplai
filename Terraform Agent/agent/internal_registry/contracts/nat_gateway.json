@@ -1,0 +1,16 @@
+{
+  "id": "nat_gateway",
+  "pinned_version": null,
+  "resource": "aws_nat_gateway",
+  "forbidden_args": [],
+  "allowed_args": {
+    "allocation_id": {"type": "string", "required": false},
+    "subnet_id": {"type": "string", "required": false},
+    "tags": {"type": "map(string)", "required": false},
+    "count": {"type": "number", "required": false}
+  },
+  "edit_schema": [
+    {"name": "enable_nat_gateway", "type": "bool", "default": false}
+  ],
+  "notes": "If using native aws_nat_gateway, set VPC module enable_nat_gateway=false. Dual NAT (module flag + native) does not error but double-bills and churns route tables."
+}
