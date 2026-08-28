@@ -126,6 +126,12 @@ import {
   nextScriptedQuestionIndex,
   resolveScriptedQuestionCursor,
 } from '@/features/deployment/decision-from-profile';
+import {
+  isRecoverableApplyTransportError,
+  isTransportFalseFailureMessage,
+  mergeAcceptedApplyResult,
+} from '@/features/deployment/apply-status';
+import { TERRAFORM_APPLY_POLL_TIMEOUT_MS } from '@/lib/terraform-apply-wait';
 
 type PipelineStageId = 'analysis' | 'qa' | 'architecture' | 'cost_estimation' | 'terraform' | 'aws_config' | 'app_secrets' | 'deploy' | 'outputs';
 
@@ -170,6 +176,7 @@ type DeploymentPlanOption = {
 
 const PIPELINE_SOCKET_RETRY_DELAYS_MS = [1000, 2000, 5000, 5000];
 const CONNECTOR_READINESS_RETRY_DELAYS_MS = [0, 500, 1_500];
+const DEPLOY_RECONCILE_POLL_INTERVAL_MS = 5_000;
 const APPROVED_DECISION_KEY = 'deplai.pipeline.approvedDecision';
 const DECISION_COST_ESTIMATE_KEY = 'deplai.pipeline.decisionCostEstimate';
 const DEPLOYMENT_PLAN_KEY = 'deplai.pipeline.deploymentPlan';
@@ -2210,16 +2217,21 @@ export default function DeploymentTrackApp() {
     return deployResult?.deployment_verified === true;
   }, [deployResult?.deployment_verified, effectiveEndpointChecks]);
   const backendErrorMessage = useMemo(() => {
+    if (deployResult?.success === true) return '';
     const direct = String(deployResult?.error || '').trim();
-    if (direct) return direct;
-    if (verificationFailed) {
-      return 'Deployment verification failed or runtime data is incomplete.';
+    if (
+      direct
+      && isTransportFalseFailureMessage(direct)
+      && !isFailedDeployAttempt({ status: deployStatus, uiPhase: deployUiPhase, result: deployResult })
+    ) {
+      return '';
     }
+    if (direct) return direct;
     if (deployStatus === 'error') {
       return 'The backend reported a deployment error.';
     }
     return '';
-  }, [deployResult?.error, deployStatus, verificationFailed]);
+  }, [deployResult?.error, deployResult?.success, deployStatus, deployUiPhase]);
   const hasEndpointTargets = useMemo(
     () => [
       deploySummary.cloudfrontUrl,
@@ -4144,7 +4156,7 @@ export default function DeploymentTrackApp() {
   }, [currentInfraConsultant, persistInfraConsultant, runInfraConsultantTurn]);
 
   const hydrateTerminalDeployResult = useCallback(async (baseResult: DeployApiResult | null) => {
-    if (!baseResult?.success || String(baseResult.error || '').trim()) {
+    if (!baseResult?.success) {
       throw new Error(String(baseResult?.error || 'Deployment runtime returned an error.'));
     }
     if (baseResult.mode === 'iac_pipeline') {
@@ -4196,7 +4208,7 @@ export default function DeploymentTrackApp() {
       : null;
     const runtimeAwaitingPlan = isAwaitingPlanConfirmation({
       result: runtimeResult,
-    }) || runtimeStatus === 'awaiting_plan_confirmation' || runtimeStatus === 'needs_review';
+    }) || runtimeStatus === 'awaiting_plan_confirmation';
 
     if (runtimeAwaitingPlan) {
       const gatedResult: DeployApiResult = {
@@ -4237,22 +4249,35 @@ export default function DeploymentTrackApp() {
       return;
     }
 
-    if (runtimeStatus === 'completed' && runtimeResult?.success) {
+    if (
+      (runtimeStatus === 'completed' || runtimeStatus === 'needs_review' || runtimeStatus === 'deployed')
+      && runtimeResult?.success
+    ) {
       try {
         const hydratedResult = await hydrateTerminalDeployResult(runtimeResult);
         const hydratedChecks = normalizeVerificationChecks(hydratedResult.verification_checks);
-        if (hydratedResult.deployment_verified === false || (hydratedChecks.length > 0 && hydratedChecks.every((check) => !check.ok))) {
-          throw new Error(hydratedResult.error || 'Deployment verification failed for the current repo.');
+        if (hydratedChecks.length > 0) {
+          setEndpointChecks(hydratedChecks);
         }
         patchState((prev) => ({
           ...prev,
           status: 'done',
           progress: 100,
-          deployResult: hydratedResult,
+          deployResult: {
+            ...hydratedResult,
+            error: undefined,
+          },
         }));
         getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
         pushDeploymentHistory(hydratedResult, 'done');
-        appendLog('Recovered completed deployment state from backend runtime.', 'success');
+        const verificationPending = hydratedResult.deployment_verified === false
+          || (hydratedChecks.length > 0 && hydratedChecks.every((check) => !check.ok));
+        appendLog(
+          verificationPending
+            ? 'Infrastructure is provisioned. HTTP verification is still pending — use Verify live endpoints when the app is ready.'
+            : 'Recovered completed deployment state from backend runtime.',
+          verificationPending ? 'info' : 'success',
+        );
       } catch (reason) {
         const message = reason instanceof Error ? reason.message : 'Deployment completed, but runtime verification failed.';
         const errorResult: DeployApiResult = {
@@ -4305,6 +4330,83 @@ export default function DeploymentTrackApp() {
     getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
     appendLog('No active deployment process found. Marking stale UI run as stopped.', 'error');
   }, [appendLog, deployResult?.run_id, hydrateTerminalDeployResult, patchState, pushDeploymentHistory, selectedProject]);
+
+  const pollDeploymentReconciliation = useCallback(async (
+    runIdOverride?: string,
+    timeoutMs = TERRAFORM_APPLY_POLL_TIMEOUT_MS,
+  ) => {
+    if (!selectedProject) {
+      return {
+        status: 'idle' as const,
+        progress: 0,
+        logs: [],
+        deployResult: null,
+        deploymentHistory: [],
+      };
+    }
+    const pollStart = Date.now();
+    while (Date.now() - pollStart < timeoutMs) {
+      await waitForDelay(DEPLOY_RECONCILE_POLL_INTERVAL_MS);
+      try {
+        await reconcileDeploymentStatus(runIdOverride);
+      } catch {
+        // keep polling through transient status fetch failures
+      }
+      const latest = getOrCreateActiveDeployment(selectedProject.id).state;
+      if (latest.status === 'done') return latest;
+      if (isAwaitingPlanConfirmation({ result: latest.deployResult })) return latest;
+      if (isFailedDeployAttempt({ status: latest.status, result: latest.deployResult })) {
+        return latest;
+      }
+    }
+    return getOrCreateActiveDeployment(selectedProject.id).state;
+  }, [reconcileDeploymentStatus, selectedProject]);
+
+  const finalizeDeployUiFromState = useCallback((latest: ActiveDeployState) => {
+    if (isAwaitingPlanConfirmation({ result: latest.deployResult })) {
+      setRequiresPlanConfirmation(true);
+      setPendingPlanSummary((latest.deployResult?.plan_summary as Record<string, unknown> | null | undefined) || null);
+      setDeployUiPhase('awaiting_plan');
+      setDeployStatus('idle');
+      return;
+    }
+    if (isFailedDeployAttempt({ status: latest.status, result: latest.deployResult })) {
+      setDeployUiPhase('error');
+      finalizeWorkspaceSession(workspaceSessionIdRef.current, { status: 'failed', current_stage: 'apply' });
+      return;
+    }
+    if (latest.status === 'done') {
+      setDeployUiPhase('done');
+      setError(null);
+      finalizeWorkspaceSession(workspaceSessionIdRef.current, { status: 'completed', current_stage: 'apply' });
+      return;
+    }
+    setDeployUiPhase('reconciling');
+  }, []);
+
+  const recoverDeployAfterTransportGap = useCallback(async (
+    payload: Record<string, unknown>,
+    runIdOverride?: string,
+  ) => {
+    const merged = mergeAcceptedApplyResult(null, payload) as DeployApiResult;
+    setError(null);
+    setDeployUiPhase('reconciling');
+    patchState((prev) => ({
+      ...prev,
+      status: 'running',
+      progress: Math.max(prev.progress, 80),
+      deployResult: merged,
+    }));
+    appendLog(
+      String(payload.error || 'Connection to the runtime dropped, but Terraform may still be applying. Reconciling…'),
+      'info',
+    );
+    const latest = await pollDeploymentReconciliation(runIdOverride);
+    if (latest.status !== 'done' && !isFailedDeployAttempt({ status: latest.status, result: latest.deployResult })) {
+      appendLog('Terraform may still be applying. Use Reconcile Backend Status or refresh this page.', 'info');
+    }
+    finalizeDeployUiFromState(latest);
+  }, [appendLog, finalizeDeployUiFromState, patchState, pollDeploymentReconciliation]);
 
   const startDeploy = useCallback(async () => {
     if (!selectedProject) {
@@ -4514,6 +4616,14 @@ export default function DeploymentTrackApp() {
         workspaceSessionIdRef.current = data.workspace_session_id;
       }
       if (!response.ok || !data.success) {
+        if (isRecoverableApplyTransportError(response.status, data as Record<string, unknown>)) {
+          clearHeartbeat();
+          await recoverDeployAfterTransportGap(
+            data as Record<string, unknown>,
+            typeof data.run_id === 'string' ? data.run_id : undefined,
+          );
+          return;
+        }
         const detail = typeof data.detail === 'string' ? data.detail.trim() : '';
         const message = [data.error || `Deployment failed (HTTP ${response.status}).`, detail].filter(Boolean).join(' ');
         clearHeartbeat();
@@ -4560,6 +4670,29 @@ export default function DeploymentTrackApp() {
         return;
       }
 
+      if (data.mode !== 'iac_pipeline' && !data.run_id) {
+        clearHeartbeat();
+        patchState((prev) => ({
+          ...prev,
+          status: 'done',
+          progress: 100,
+          deployResult: {
+            ...data,
+            error: undefined,
+          },
+        }));
+        pushDeploymentHistory(data, 'done');
+        setDeployUiPhase('done');
+        setError(null);
+        finalizeWorkspaceSession(workspaceSessionIdRef.current, { status: 'completed', current_stage: 'apply' });
+        if (data.deployment_verified === false) {
+          appendLog('Infrastructure is provisioned. HTTP verification is still pending — use Verify live endpoints when the app is ready.', 'info');
+        } else {
+          appendLog('Runtime Terraform apply completed successfully.', 'success');
+        }
+        return;
+      }
+
       setRequiresPlanConfirmation(false);
       setPendingPlanSummary(null);
       setDeployUiPhase('reconciling');
@@ -4602,20 +4735,14 @@ export default function DeploymentTrackApp() {
       }
       clearHeartbeat();
       const latest = getOrCreateActiveDeployment(selectedProject.id).state;
-      if (isFailedDeployAttempt({ status: latest.status, result: latest.deployResult })) {
-        setDeployUiPhase('error');
-      } else if (latest.status === 'done') {
-        setDeployUiPhase('done');
-      } else {
-        setDeployUiPhase('reconciling');
-      }
-      if (latest.status === 'error') {
-        finalizeWorkspaceSession(workspaceSessionIdRef.current, { status: 'failed', current_stage: 'apply' });
-      } else if (latest.status === 'done') {
-        finalizeWorkspaceSession(workspaceSessionIdRef.current, { status: 'completed', current_stage: 'apply' });
-      }
+      finalizeDeployUiFromState(latest);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : 'Deployment failed.';
+      if (isRecoverableApplyTransportError(0, null, message)) {
+        clearHeartbeat();
+        await recoverDeployAfterTransportGap({});
+        return;
+      }
       clearHeartbeat();
       setDeployUiPhase('error');
       patchState((prev) => ({
@@ -4641,7 +4768,7 @@ export default function DeploymentTrackApp() {
         deployHeartbeatRef.current = null;
       }
     }
-  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployLogs, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, hasAwsSecrets, iacFiles, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
+  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployLogs, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, finalizeDeployUiFromState, hasAwsSecrets, iacFiles, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, recoverDeployAfterTransportGap, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
 
   const stopDeployment = useCallback(async () => {
     if (!selectedProject || stopLoading || deployStatus !== 'running') return;
@@ -4868,7 +4995,11 @@ export default function DeploymentTrackApp() {
   }, [appendLog, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, deployResult?.run_id, deployStatus, destroyLoading, hasAwsSecrets, patchState, selectedProject, terraformRuntimeConfig.aws_region]);
 
   useEffect(() => {
-    if (!selectedProject || deployStatus !== 'running') return;
+    if (!selectedProject) return;
+    const transportGap = deployStatus === 'error'
+      && isTransportFalseFailureMessage(String(deployResult?.error || ''))
+      && deployResult?.success !== false;
+    if (deployStatus !== 'running' && !transportGap) return;
     if (isAwaitingPlanConfirmation({
       uiPhase: deployUiPhase,
       requiresPlanConfirmation,
@@ -4885,6 +5016,11 @@ export default function DeploymentTrackApp() {
       } catch {
         // best-effort reconciliation while backend apply is in flight
       }
+      if (cancelled) return;
+      const latest = getOrCreateActiveDeployment(selectedProject.id).state;
+      if (latest.status === 'done' || isFailedDeployAttempt({ status: latest.status, result: latest.deployResult })) {
+        finalizeDeployUiFromState(latest);
+      }
     };
 
     const timerId = window.setInterval(() => {
@@ -4897,7 +5033,7 @@ export default function DeploymentTrackApp() {
       cancelled = true;
       window.clearInterval(timerId);
     };
-  }, [deployProgress, deployResult, deployStatus, deployUiPhase, reconcileDeploymentStatus, requiresPlanConfirmation, selectedProject]);
+  }, [deployProgress, deployResult, deployStatus, deployUiPhase, finalizeDeployUiFromState, reconcileDeploymentStatus, requiresPlanConfirmation, selectedProject]);
 
   const showRegenerateTerraformButton =
     Boolean(selectedProject) &&

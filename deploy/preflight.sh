@@ -41,7 +41,6 @@ required=(
   GITHUB_PRIVATE_KEY
   GITHUB_WEBHOOK_SECRET
   DOCKER_GID
-  NEO4J_PASSWORD
 )
 
 for key in "${required[@]}"; do

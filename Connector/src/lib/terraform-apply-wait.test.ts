@@ -55,4 +55,35 @@ describe('terraform apply wait', () => {
       assert.equal(outcome.status, 'running');
       assert.equal(outcome.result, null);
     });
+
+    it('does not treat idle + container_id as a completed apply', async () => {
+      const outcome = await waitForTerraformApplyResult({
+        timeoutMs: 20,
+        intervalMs: 1,
+        sleepFn: async () => {},
+        fetchStatus: async () => ({ status: 'idle', result: { container_id: 'abc' } }),
+      });
+
+      assert.equal(outcome.timedOut, true);
+      assert.equal(outcome.status, 'idle');
+    });
+
+    it('completes when idle status carries real Terraform outputs', async () => {
+      const outcome = await waitForTerraformApplyResult({
+        timeoutMs: 200,
+        intervalMs: 1,
+        sleepFn: async () => {},
+        fetchStatus: async () => ({
+          status: 'idle',
+          result: { success: true, outputs: { app_url: 'http://example.test' } },
+        }),
+      });
+
+      assert.equal(outcome.timedOut, false);
+      assert.equal(outcome.result?.success, true);
+    });
+
+    it('treats applying as still needing a poll', () => {
+      assert.equal(terraformApplyNeedsPolling({ status: 'applying' }), true);
+    });
 });

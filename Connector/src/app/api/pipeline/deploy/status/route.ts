@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
+import { classifyUpstreamError } from '@/features/deployment/apply-status';
 
 function firstIacOutputString(outputs: unknown, keys: string[]): string | null {
   if (!outputs || typeof outputs !== 'object') return null;
@@ -30,24 +31,7 @@ function firstIacOutputString(outputs: unknown, keys: string[]): string | null {
 }
 
 function classifyStatusError(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err || 'Failed to fetch deployment status.');
-  const lowered = raw.toLowerCase();
-  if (
-    lowered.includes('fetch failed')
-    || lowered.includes('econnrefused')
-    || lowered.includes('enotfound')
-    || lowered.includes('network')
-  ) {
-    return `Agentic Layer is unavailable at ${AGENTIC_URL}.`;
-  }
-  if (
-    (err instanceof Error && err.name === 'TimeoutError')
-    || lowered.includes('aborted due to timeout')
-    || lowered.includes('timed out')
-  ) {
-    return 'Agentic Layer timed out while checking deployment status.';
-  }
-  return raw || 'Failed to fetch deployment status.';
+  return classifyUpstreamError(err).error || 'Failed to fetch deployment status.';
 }
 
 export async function POST(req: NextRequest) {

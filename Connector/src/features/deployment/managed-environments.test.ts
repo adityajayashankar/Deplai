@@ -47,9 +47,26 @@ test('failed apply is retryable even if the UI still looks in-progress', () => {
   assert.equal(isFailedDeployAttempt({ status: 'idle' }), false);
   assert.equal(isFailedDeployAttempt({ status: 'running', uiPhase: 'waiting_api' }), false);
   assert.equal(isFailedDeployAttempt({ status: 'error' }), true);
-  assert.equal(isFailedDeployAttempt({ status: 'running', uiPhase: 'error' }), true);
+  assert.equal(isFailedDeployAttempt({ status: 'running', uiPhase: 'error' }), false);
   assert.equal(isFailedDeployAttempt({ status: 'running', result: { success: false, error: 'apply failed' } }), true);
   assert.equal(isFailedDeployAttempt({ status: 'done', result: { success: true } }), false);
+  assert.equal(isFailedDeployAttempt({
+    status: 'done',
+    uiPhase: 'error',
+    result: { success: true },
+  }), false);
+  assert.equal(isFailedDeployAttempt({
+    status: 'error',
+    uiPhase: 'error',
+    result: {
+      apply_accepted: true,
+      error: 'Connector could not reach the deployment runtime service.',
+    },
+  }), false);
+  assert.equal(isFailedDeployAttempt({
+    status: 'error',
+    result: { error: 'Connector could not reach the deployment runtime service.' },
+  }), false);
 });
 
 test('applying deploys are visible as in-progress, not as managed instances', () => {

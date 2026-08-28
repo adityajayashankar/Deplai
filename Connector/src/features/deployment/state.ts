@@ -187,6 +187,7 @@ export interface DeployApiResult {
   workspace?: string;
   service_type?: string;
   status?: string;
+  apply_accepted?: boolean;
   workspace_session_id?: string;
   requires_plan_confirmation?: boolean;
   plan_summary?: Record<string, unknown> | null;
@@ -1261,8 +1262,33 @@ export function isAwaitingPlanConfirmation(args: {
 export function isFailedDeployAttempt(args: {
   status?: string | null;
   uiPhase?: string | null;
-  result?: Pick<DeployApiResult, 'success' | 'error'> | null;
+  result?: Pick<DeployApiResult, 'success' | 'error' | 'status' | 'apply_accepted' | 'details'> | null;
 }): boolean {
+  if (args.result?.success === true && args.status === 'done') return false;
+  const resultStatus = String(args.result?.status || '').trim().toLowerCase();
+  const details = args.result?.details && typeof args.result.details === 'object'
+    ? args.result.details as Record<string, unknown>
+    : null;
+  const applyStillRunning = Boolean(
+    args.result?.apply_accepted
+    || details?.apply_still_running === true
+    || resultStatus === 'running'
+    || resultStatus === 'applying'
+    || resultStatus === 'accepted'
+    || args.status === 'running'
+  );
+  if (applyStillRunning) {
+    if (args.result?.success === false && !details?.apply_still_running && !args.result?.apply_accepted) {
+      return true;
+    }
+    return false;
+  }
+  const looksLikeTransportFalseFail = /could not reach the deployment runtime|deployment runtime timed out/.test(
+    String(args.result?.error || '').toLowerCase(),
+  );
+  if (looksLikeTransportFalseFail && args.result?.success !== false) {
+    return false;
+  }
   if (args.status === 'error' || args.uiPhase === 'error') return true;
   if (args.result?.success === false) return true;
   if (args.result?.success === true) return false;

@@ -1266,7 +1266,7 @@ async def terraform_apply(request: TerraformApplyRequest):
 
 @app.post("/api/terraform/apply/status", response_model=TerraformApplyStatusResponse, dependencies=[Depends(verify_api_key)])
 async def terraform_apply_status(request: TerraformApplyStatusRequest):
-    apply_key = (request.project_id or request.project_name or "").strip()
+    apply_key = _terraform_apply_key(request.project_id, request.project_name)
     if not apply_key:
         return TerraformApplyStatusResponse(success=False, error="project_id or project_name is required")
 
@@ -1292,7 +1292,7 @@ async def terraform_apply_status(request: TerraformApplyStatusRequest):
 @app.post("/api/terraform/apply/stop", response_model=TerraformApplyStopResponse, dependencies=[Depends(verify_api_key)])
 async def terraform_apply_stop(request: TerraformApplyStopRequest):
     """Stop an active runtime Terraform apply and terminate its active container."""
-    apply_key = (request.project_id or request.project_name or "").strip()
+    apply_key = _terraform_apply_key(request.project_id, request.project_name)
     if not apply_key:
         return TerraformApplyStopResponse(success=False, error="project_id or project_name is required")
 

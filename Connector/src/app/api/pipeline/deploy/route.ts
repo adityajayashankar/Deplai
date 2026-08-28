@@ -2,9 +2,10 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { readLegacyCicdTemplate } from '@/lib/legacy-assets';
+import { classifyUpstreamError } from '@/features/deployment/apply-status';
 import {
+  TERRAFORM_APPLY_ACCEPT_GRACE_MS,
   TERRAFORM_APPLY_POLL_INTERVAL_MS,
-  TERRAFORM_APPLY_POLL_TIMEOUT_MS,
   terraformApplyNeedsPolling,
   waitForTerraformApplyResult,
 } from '@/lib/terraform-apply-wait';
@@ -75,37 +76,6 @@ function resolveAgenticOrigin(): string {
   } catch {
     return AGENTIC_URL;
   }
-}
-
-function classifyUpstreamError(err: unknown): { error: string; hint: string; upstreamError: string } {
-  const raw = err instanceof Error ? err.message : String(err || 'unknown upstream error');
-  const lowered = raw.toLowerCase();
-
-  if (lowered.includes('timeout')) {
-    return {
-      error: 'Deployment runtime timed out before Terraform apply completed.',
-      hint: 'The apply may still be in-flight. Check Connector logs and AWS console, then retry if nothing is active.',
-      upstreamError: raw,
-    };
-  }
-  if (
-    lowered.includes('fetch failed') ||
-    lowered.includes('econnrefused') ||
-    lowered.includes('enotfound') ||
-    lowered.includes('network')
-  ) {
-    return {
-      error: 'Connector could not reach the deployment runtime service.',
-      hint: 'Verify AGENTIC_LAYER_URL is reachable from the Connector runtime and that the Agentic Layer service is healthy.',
-      upstreamError: raw,
-    };
-  }
-
-  return {
-    error: 'Deployment runtime request failed before Terraform apply response was received.',
-    hint: 'Check Connector and Agentic Layer logs for transport/proxy/server timeout issues.',
-    upstreamError: raw,
-  };
 }
 
 function clampProvider(value: string | undefined): Provider {
@@ -550,7 +520,7 @@ async function waitForRecoveredApplyResult(params: {
   intervalMs?: number;
 }): Promise<{ status: string; result: Record<string, unknown> | null; timedOut: boolean }> {
   return waitForTerraformApplyResult({
-    timeoutMs: params.timeoutMs ?? TERRAFORM_APPLY_POLL_TIMEOUT_MS,
+    timeoutMs: params.timeoutMs ?? TERRAFORM_APPLY_ACCEPT_GRACE_MS,
     intervalMs: params.intervalMs ?? TERRAFORM_APPLY_POLL_INTERVAL_MS,
     fetchStatus: async () => fetchAgenticApplyStatus({
       projectId: params.projectId,

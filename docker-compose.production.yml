@@ -183,22 +183,6 @@ services:
       retries: 3
       start_period: 30s
 
-  neo4j:
-    image: ${NEO4J_IMAGE:-neo4j:5-community}
-    restart: unless-stopped
-    env_file:
-      - ./deploy/.env
-    environment:
-      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in deploy/.env}
-      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in deploy/.env}
-      NEO4J_server_memory_heap_initial__size: 512m
-      NEO4J_server_memory_heap_max__size: 1G
-    volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
-    networks:
-      - backend
-
   qdrant:
     image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.13.6}
     restart: unless-stopped
@@ -221,8 +205,6 @@ volumes:
   iac_workspaces:
   customization_state:
   customization_logs:
-  neo4j_data:
-  neo4j_logs:
   qdrant_data:
   # These exact names are used by the Docker SDK in the Agentic Layer.
   codebase_deplai:

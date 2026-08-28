@@ -24,7 +24,7 @@ function isValidIp(ip: string | undefined | null): ip is string {
   return /^[\d.]+$/.test(trimmed) || (trimmed.includes('.') && trimmed.length > 4);
 }
 
-function hasUsablePrivateKey(privateKey?: string): boolean {
+function hasUsablePrivateKey(privateKey?: string): privateKey is string {
   const trimmed = String(privateKey || '').trim();
   if (!trimmed || trimmed === 'n/a' || trimmed === 'N/A') return false;
   return trimmed.includes('BEGIN') && trimmed.includes('PRIVATE KEY');
