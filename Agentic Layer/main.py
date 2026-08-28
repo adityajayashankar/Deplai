@@ -220,6 +220,7 @@ pipeline_indices: dict[str, int] = {}
 pipeline_lock = asyncio.Lock()
 active_terraform_applies: dict[str, dict] = {}
 terraform_apply_results: dict[str, dict] = {}
+_terraform_apply_tasks: set[asyncio.Task[Any]] = set()
 remediation_orchestrator = RemediationOrchestrator()
 
 
@@ -1120,14 +1121,68 @@ async def terraform_generate(request: TerraformGenRequest):
     )
 
 
-@app.post("/api/terraform/apply", response_model=TerraformApplyResponse, dependencies=[Depends(verify_api_key)])
-async def terraform_apply(request: TerraformApplyRequest):
-    """Apply generated Terraform files to AWS using an ephemeral Docker volume."""
+def _terraform_apply_key(project_id: str | None, project_name: str | None) -> str:
+    return (str(project_id or "").strip() or str(project_name or "").strip())
+
+
+def _record_terraform_apply_result(
+    apply_key: str,
+    request: TerraformApplyRequest,
+    result: dict[str, Any] | None,
+) -> None:
+    if result is None:
+        return
+    if request.deployment_metadata:
+        details = result.get("details")
+        if not isinstance(details, dict):
+            details = {}
+        details["deployment_metadata"] = dict(request.deployment_metadata)
+        result["details"] = details
+    result_status = str(result.get("status") or "").strip()
+    terraform_apply_results[apply_key] = {
+        "status": result_status if result_status == "awaiting_plan_confirmation" else ("completed" if bool(result.get("success")) else "error"),
+        "result": result,
+    }
+
+
+def _run_runtime_terraform_apply_sync(request: TerraformApplyRequest, apply_ctx: dict[str, Any]) -> dict[str, Any]:
     from terraform_apply import apply_saved_terraform_run, apply_terraform_bundle
 
-    apply_key = (request.project_id or request.project_name or "").strip()
-    if not apply_key:
-        apply_key = request.project_name
+    request_files = [f for f in request.files if f is not None] if request.files else []
+    if request.run_id and request.workspace and not request_files:
+        return apply_saved_terraform_run(
+            run_id=request.run_id or "",
+            workspace=request.workspace or "",
+            project_name=request.project_name,
+            provider=request.provider,
+            state_bucket=request.state_bucket or "",
+            lock_table=request.lock_table or "",
+            aws_access_key_id=request.aws_access_key_id or "",
+            aws_secret_access_key=request.aws_secret_access_key or "",
+            aws_session_token=request.aws_session_token or "",
+            aws_region=request.aws_region or "eu-north-1",
+            enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
+            confirm_apply=request.confirm_plan_summary is True,
+            apply_context=apply_ctx,
+        )
+    return apply_terraform_bundle(
+        files=[{"path": f.path, "content": f.content, "encoding": f.encoding} for f in request_files],
+        project_name=request.project_name,
+        provider=request.provider,
+        aws_access_key_id=request.aws_access_key_id or "",
+        aws_secret_access_key=request.aws_secret_access_key or "",
+        aws_session_token=request.aws_session_token or "",
+        aws_region=request.aws_region or "eu-north-1",
+        state_bucket=request.state_bucket or "",
+        lock_table=request.lock_table or "",
+        enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
+        confirm_apply=request.confirm_plan_summary is True,
+        apply_context=apply_ctx,
+    )
+
+
+async def _execute_runtime_terraform_apply(request: TerraformApplyRequest, apply_key: str, apply_ctx: dict[str, Any]) -> None:
+    """Run Terraform apply off the HTTP request so RDS Multi-AZ (15–45 min) can finish after a client disconnect."""
     loop = asyncio.get_running_loop()
 
     def emit_apply_event(msg_type: str, content: str) -> None:
@@ -1142,74 +1197,21 @@ async def terraform_apply(request: TerraformApplyRequest):
         except Exception:
             pass
 
-    apply_ctx = {
-        "cancel_requested": False,
-        "container_id": None,
-        "emit": emit_apply_event,
-        "deployment_metadata": dict(request.deployment_metadata or {}),
-    }
-    active_terraform_applies[apply_key] = apply_ctx
-    terraform_apply_results[apply_key] = {"status": "running", "result": None}
-
-    result = None
+    apply_ctx["emit"] = emit_apply_event
+    result: dict[str, Any] | None = None
     try:
         emit_apply_event("info", "Terraform runtime apply started.")
         request_files = [f for f in request.files if f is not None] if request.files else []
         if request.run_id and request.workspace and not request_files:
             emit_apply_event("info", f"Reusing saved Terraform workspace '{request.workspace}'.")
-            result = await loop.run_in_executor(
-                None,
-                lambda: apply_saved_terraform_run(
-                    run_id=request.run_id or "",
-                    workspace=request.workspace or "",
-                    project_name=request.project_name,
-                    provider=request.provider,
-                    state_bucket=request.state_bucket or "",
-                    lock_table=request.lock_table or "",
-                    aws_access_key_id=request.aws_access_key_id or "",
-                    aws_secret_access_key=request.aws_secret_access_key or "",
-                    aws_session_token=request.aws_session_token or "",
-                    aws_region=request.aws_region or "eu-north-1",
-                    enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
-                    confirm_apply=request.confirm_plan_summary is True,
-                    apply_context=apply_ctx,
-                ),
-            )
         else:
             emit_apply_event("info", "Applying generated Terraform bundle.")
-            result = await loop.run_in_executor(
-                None,
-                lambda: apply_terraform_bundle(
-                    files=[{"path": f.path, "content": f.content, "encoding": f.encoding} for f in request_files],
-                    project_name=request.project_name,
-                    provider=request.provider,
-                    aws_access_key_id=request.aws_access_key_id or "",
-                    aws_secret_access_key=request.aws_secret_access_key or "",
-                    aws_session_token=request.aws_session_token or "",
-                    aws_region=request.aws_region or "eu-north-1",
-                    state_bucket=request.state_bucket or "",
-                    lock_table=request.lock_table or "",
-                    enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
-                    confirm_apply=request.confirm_plan_summary is True,
-                    apply_context=apply_ctx,
-                ),
-            )
+        result = await loop.run_in_executor(None, lambda: _run_runtime_terraform_apply_sync(request, apply_ctx))
     except Exception as exc:
         result = {"success": False, "error": f"Terraform apply runtime error: {exc}"}
     finally:
         active_terraform_applies.pop(apply_key, None)
-        if result is not None:
-            if request.deployment_metadata:
-                details = result.get("details")
-                if not isinstance(details, dict):
-                    details = {}
-                details["deployment_metadata"] = dict(request.deployment_metadata)
-                result["details"] = details
-            result_status = str(result.get("status") or "").strip()
-            terraform_apply_results[apply_key] = {
-                "status": result_status if result_status == "awaiting_plan_confirmation" else ("completed" if bool(result.get("success")) else "error"),
-                "result": result,
-            }
+        _record_terraform_apply_result(apply_key, request, result)
         if result and result.get("status") == "awaiting_plan_confirmation":
             emit_apply_event("info", "Terraform plan is awaiting confirmation before apply.")
         elif result and result.get("success"):
@@ -1217,28 +1219,48 @@ async def terraform_apply(request: TerraformApplyRequest):
         elif result:
             emit_apply_event("error", str(result.get("error") or "Terraform runtime apply failed."))
 
-    if not result.get("success"):
+
+@app.post("/api/terraform/apply", response_model=TerraformApplyResponse, dependencies=[Depends(verify_api_key)])
+async def terraform_apply(request: TerraformApplyRequest):
+    """Accept a runtime apply and run it in the background.
+
+    Multi-AZ RDS often takes 15–25 minutes. Holding the HTTP request open until
+    Terraform finishes causes Connector to see a dropped connection and treat a
+    healthy apply as a failure. Status is polled via /api/terraform/apply/status.
+    """
+    apply_key = _terraform_apply_key(request.project_id, request.project_name)
+    if not apply_key:
+        apply_key = request.project_name
+
+    if apply_key in active_terraform_applies:
         return TerraformApplyResponse(
-            success=False,
+            success=True,
             provider=request.provider,
             project_name=request.project_name,
-            error=result.get("error", "Terraform apply failed"),
-            details=result.get("details"),
+            status="running",
+            details={"apply_already_in_progress": True},
         )
+
+    apply_ctx = {
+        "cancel_requested": False,
+        "container_id": None,
+        "emit": None,
+        "deployment_metadata": dict(request.deployment_metadata or {}),
+    }
+    active_terraform_applies[apply_key] = apply_ctx
+    terraform_apply_results[apply_key] = {"status": "running", "result": None}
+
+    snapshot = request.model_copy(deep=True)
+    task = asyncio.create_task(_execute_runtime_terraform_apply(snapshot, apply_key, apply_ctx))
+    _terraform_apply_tasks.add(task)
+    task.add_done_callback(_terraform_apply_tasks.discard)
 
     return TerraformApplyResponse(
         success=True,
         provider=request.provider,
         project_name=request.project_name,
-        status=result.get("status"),
-        outputs=result.get("outputs"),
-        cloudfront_url=result.get("cloudfront_url"),
-        plan_summary=result.get("plan_summary"),
-        provisioning_report=result.get("provisioning_report"),
-        one_time_credentials=result.get("one_time_credentials"),
-        has_database_resources=result.get("has_database_resources"),
-        requires_plan_confirmation=result.get("status") == "awaiting_plan_confirmation",
-        details=result.get("details"),
+        status="running",
+        details={"accepted": True},
     )
 
 

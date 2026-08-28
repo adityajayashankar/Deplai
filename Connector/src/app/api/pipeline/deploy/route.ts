@@ -3,6 +3,12 @@ import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { readLegacyCicdTemplate } from '@/lib/legacy-assets';
 import {
+  TERRAFORM_APPLY_POLL_INTERVAL_MS,
+  TERRAFORM_APPLY_POLL_TIMEOUT_MS,
+  terraformApplyNeedsPolling,
+  waitForTerraformApplyResult,
+} from '@/lib/terraform-apply-wait';
+import {
   resolveCustomizationSnapshot,
   SnapshotResolutionError,
   type CustomizationSnapshotSource,
@@ -542,30 +548,15 @@ async function waitForRecoveredApplyResult(params: {
   projectName: string;
   timeoutMs?: number;
   intervalMs?: number;
-}): Promise<Record<string, unknown> | null> {
-  const timeoutMs = Math.max(10_000, params.timeoutMs ?? 600_000);
-  const intervalMs = Math.max(2_000, params.intervalMs ?? 5_000);
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    const statusPayload = await fetchAgenticApplyStatus({
+}): Promise<{ status: string; result: Record<string, unknown> | null; timedOut: boolean }> {
+  return waitForTerraformApplyResult({
+    timeoutMs: params.timeoutMs ?? TERRAFORM_APPLY_POLL_TIMEOUT_MS,
+    intervalMs: params.intervalMs ?? TERRAFORM_APPLY_POLL_INTERVAL_MS,
+    fetchStatus: async () => fetchAgenticApplyStatus({
       projectId: params.projectId,
       projectName: params.projectName,
-    });
-    const status = String(statusPayload.status || 'idle');
-    const result = statusPayload.result && typeof statusPayload.result === 'object'
-      ? statusPayload.result
-      : null;
-    if (status === 'completed' || status === 'error') {
-      return result;
-    }
-    if (status === 'idle' && result) {
-      return result;
-    }
-    await sleep(intervalMs);
-  }
-
-  return null;
+    }),
+  });
 }
 
 type EndpointCheck = {
@@ -1147,22 +1138,60 @@ export async function POST(req: NextRequest) {
         },
       };
       let agenticRes: Response | null = null;
-      let recoveredApplyResult: Record<string, unknown> | null = null;
       let applyTransportRecovered = false;
+      let startErr: unknown = null;
       try {
         agenticRes = await fetch(`${AGENTIC_URL}/api/terraform/apply`, {
           method: 'POST',
           headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
           body: JSON.stringify(applyRequest),
-          signal: AbortSignal.timeout(3_600_000),
+          signal: AbortSignal.timeout(120_000),
         });
       } catch (upstreamErr) {
-        recoveredApplyResult = await waitForRecoveredApplyResult({
+        startErr = upstreamErr;
+      }
+
+      let applyData: Record<string, unknown> = {};
+      if (agenticRes) {
+        const applyRaw = await agenticRes.text();
+        if (applyRaw.trim()) {
+          try {
+            applyData = JSON.parse(applyRaw) as Record<string, unknown>;
+          } catch {
+            applyData = { raw_response_tail: applyRaw.slice(-2000) };
+          }
+        }
+      }
+
+      const shouldPollApply = Boolean(startErr) || terraformApplyNeedsPolling(applyData);
+      if (shouldPollApply) {
+        const waited = await waitForRecoveredApplyResult({
           projectId,
           projectName,
-        }).catch(() => null);
-        if (!recoveredApplyResult) {
-          const classified = classifyUpstreamError(upstreamErr);
+        });
+        const recoveredTerminal = !waited.timedOut
+          && Boolean(waited.result)
+          && !terraformApplyNeedsPolling({ status: waited.status });
+        if (recoveredTerminal && waited.result) {
+          applyData = waited.result;
+          applyTransportRecovered = true;
+        } else if (terraformApplyNeedsPolling({ status: waited.status }) || waited.status === 'running') {
+          return NextResponse.json(
+            {
+              error: 'Terraform apply is still running. Multi-AZ RDS often takes 15–25 minutes (up to 45). Do not start another deploy — watch the apply log and the AWS console.',
+              status: 'running',
+              details: {
+                hint: 'The runtime accepted the apply. Leave this deploy alone until Terraform finishes. Retrying now can fight the in-progress RDS create.',
+                apply_still_running: true,
+                last_apply_status: waited.status,
+                agentic_origin: resolveAgenticOrigin(),
+                ...(startErr ? { upstream_error: startErr instanceof Error ? startErr.message : String(startErr) } : {}),
+              },
+            },
+            { status: 504 },
+          );
+        } else if (startErr) {
+          const classified = classifyUpstreamError(startErr);
           return NextResponse.json(
             {
               error: classified.error,
@@ -1174,19 +1203,20 @@ export async function POST(req: NextRequest) {
             },
             { status: 502 },
           );
-        }
-        applyTransportRecovered = true;
-      }
-
-      let applyData: Record<string, unknown> = recoveredApplyResult || {};
-      if (agenticRes) {
-        const applyRaw = await agenticRes.text();
-        if (applyRaw.trim()) {
-          try {
-            applyData = JSON.parse(applyRaw) as Record<string, unknown>;
-          } catch {
-            applyData = { raw_response_tail: applyRaw.slice(-2000) };
-          }
+        } else if (terraformApplyNeedsPolling(applyData)) {
+          return NextResponse.json(
+            {
+              error: 'Terraform apply is still running. Multi-AZ RDS often takes 15–25 minutes (up to 45). Do not start another deploy — watch the apply log and the AWS console.',
+              status: 'running',
+              details: {
+                hint: 'The runtime accepted the apply. Leave this deploy alone until Terraform finishes.',
+                apply_still_running: true,
+                last_apply_status: waited.status,
+                agentic_origin: resolveAgenticOrigin(),
+              },
+            },
+            { status: 504 },
+          );
         }
       }
       const applyDetails: Record<string, unknown> = {

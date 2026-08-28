@@ -4456,7 +4456,7 @@ export default function DeploymentTrackApp() {
       } else {
         setPendingPlanSummary(null);
       }
-      appendLog('Calling /api/pipeline/deploy — Terraform apply can take 1–5 minutes…');
+      appendLog('Calling /api/pipeline/deploy — Terraform apply can take 15–25 minutes when RDS Multi-AZ is included…');
       const retryRunId = String(deployResult?.run_id || activeSavedRun?.run_id || '').trim();
       const retryWorkspace = String(deployResult?.workspace || activeSavedRun?.workspace || '').trim();
       const canReuseSavedRun = shouldUseSavedRunForDeploy || Boolean(retryingFailedDeploy && retryRunId);
@@ -6046,7 +6046,7 @@ export default function DeploymentTrackApp() {
                   {(error || backendErrorMessage)
                     ? (error || backendErrorMessage)
                     : deployIsLive
-                      ? 'Request accepted. Waiting on `/api/pipeline/deploy` — this commonly takes 1–5 minutes. Watch deployment.log for heartbeat lines every 5s.'
+                      ? 'Request accepted. Waiting on `/api/pipeline/deploy`. Multi-AZ RDS often takes 15–25 minutes (up to 45). Watch deployment.log for apply heartbeats.'
                       : 'Review the plan summary in the log, then click Confirm Plan & Deploy.'}
                 </Callout>
               )}
