@@ -8,6 +8,22 @@ from typing import Any
 from .catalog import get_contract, get_module
 
 
+def rewrite_artifacts_iam_policy_count_known_at_plan(text: str) -> tuple[str, bool]:
+    """Stop gating aws_iam_role_policy.artifacts count on the instance role name.
+
+    The IAM module uses name_prefix, so aws_iam_role.ec2.name is unknown until
+    apply. Terraform rejects unknown values in count/for_each.
+    """
+    if not text or "instance_role_name" not in text:
+        return text, False
+    rewritten, n = re.subn(
+        r'(?m)^(\s*count\s*=\s*)var\.enabled\s*&&\s*trimspace\(\s*var\.instance_role_name\s*\)\s*!=\s*""\s*\?\s*1\s*:\s*0\s*$',
+        r"\1var.enabled ? 1 : 0",
+        text,
+    )
+    return (rewritten, True) if n else (text, False)
+
+
 def rewrite_ec2_module_count_not_gated_on_key_reuse(text: str) -> tuple[str, bool]:
     """Undo a bad remediator that set module.ec2 count = enabled && !use_existing_key.
 
@@ -122,9 +138,14 @@ def enforce_registry_contracts_on_text(text: str) -> tuple[str, dict[str, Any]]:
         "ec2_module_v5_compat_rewritten": False,
         "alb_name_vpc_unique": False,
         "ec2_count_ungated_from_key_reuse": False,
+        "artifacts_policy_count_known_at_plan": False,
         "forbidden_args_stripped": [],
     }
     updated = text
+
+    updated, artifacts_count = rewrite_artifacts_iam_policy_count_known_at_plan(updated)
+    if artifacts_count:
+        remediation["artifacts_policy_count_known_at_plan"] = True
 
     updated, ungated = rewrite_ec2_module_count_not_gated_on_key_reuse(updated)
     if ungated:

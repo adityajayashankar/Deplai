@@ -24,6 +24,7 @@ from .catalog import (
 from .edits import select_allowlisted_edits
 from .contracts import (
     enforce_registry_contracts_on_text,
+    rewrite_artifacts_iam_policy_count_known_at_plan,
     rewrite_ec2_module_count_not_gated_on_key_reuse,
     rewrite_ec2_module_v5_compat,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "module_source_block",
     "render_snippet",
     "resolve_service_id",
+    "rewrite_artifacts_iam_policy_count_known_at_plan",
     "rewrite_ec2_module_count_not_gated_on_key_reuse",
     "rewrite_ec2_module_v5_compat",
     "select_allowlisted_edits",

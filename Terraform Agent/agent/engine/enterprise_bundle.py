@@ -1393,7 +1393,10 @@ resource "aws_s3_object" "app" {
 }
 
 resource "aws_iam_role_policy" "artifacts" {
-  count       = var.enabled && trimspace(var.instance_role_name) != "" ? 1 : 0
+  # Role name comes from aws_iam_role with name_prefix, so it is unknown until
+  # apply. Terraform forbids unknown values in count; the IAM module always
+  # creates the instance role when compute is enabled.
+  count       = var.enabled ? 1 : 0
   name_prefix = substr("${var.project_name}-${var.environment}-artifacts-", 0, 38)
   role        = var.instance_role_name
   policy = jsonencode({

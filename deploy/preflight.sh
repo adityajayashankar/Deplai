@@ -29,6 +29,8 @@ required=(
   WS_TOKEN_SECRET
   SESSION_SECRET
   ADMIN_ACCESS_KEY
+  ADMIN_EMAILS
+  AI_CREDENTIAL_ENCRYPTION_KEY
   MYSQL_DATABASE
   MYSQL_USER
   MYSQL_PASSWORD
@@ -66,6 +68,25 @@ fi
 
 if ! [[ "$(value_for DOCKER_GID)" =~ ^[0-9]+$ ]]; then
   invalid+=("DOCKER_GID must be numeric")
+fi
+
+provider_keys=(
+  OPENAI_API_KEY
+  ANTHROPIC_API_KEY
+  CLAUDE_API_KEY
+  GEMINI_API_KEY
+  GROQ_API_KEY
+  OPENROUTER_API_KEY
+)
+has_provider=0
+for key in "${provider_keys[@]}"; do
+  if [[ -n "$(value_for "$key")" ]]; then
+    has_provider=1
+    break
+  fi
+done
+if (( has_provider == 0 )); then
+  invalid+=("set at least one model provider key (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY)")
 fi
 
 distinct_pairs=(

@@ -3069,6 +3069,10 @@ def _rewrite_legacy_region_var_references(files: list[dict[str, Any]]) -> list[d
     ]
     has_aws_region = any(re.search(r'variable\s+"aws_region"\s*\{', text) for text in root_contents)
     has_region = any(re.search(r'variable\s+"region"\s*\{', text) for text in root_contents)
+    # Rewrite var.region → var.aws_region only when aws_region is declared and
+    # region is not. Skip when aws_region is missing (rewrite would be undeclared)
+    # or when region exists (var.region is already valid). Equivalent to:
+    # not (has_aws_region and not has_region).
     if not has_aws_region or has_region:
         return files
     rewritten: list[dict[str, Any]] = []

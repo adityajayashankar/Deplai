@@ -108,6 +108,7 @@ from claude_deployment_pipeline import (
     _build_generation_context_summary,
     _enrich_deployment_profile_for_deterministic_rendering,
     _fallback_structure_plan,
+    _rewrite_legacy_region_var_references,
     _run_terraform_json_worker,
     generate_terraform_bundle,
 )
@@ -643,6 +644,53 @@ class TerraformDynamicPipelineTests(unittest.TestCase):
                 r'variable\s+"[^"]+"\s*\{\s*type\s*=\s*[^{}\n]+,\s*default\s*=\s*[^{}\n]+\s*\}',
             )
             self.assertNotRegex(content, r"depends_on\s*=\s*[^\n]*\?")
+
+
+class LegacyRegionVarRewriteTests(unittest.TestCase):
+    def test_rewrites_var_region_when_only_aws_region_is_declared(self) -> None:
+        files = [
+            {
+                "path": "terraform/variables.tf",
+                "content": 'variable "aws_region" {\n  type = string\n}\n',
+            },
+            {
+                "path": "terraform/providers.tf",
+                "content": 'provider "aws" {\n  region = var.region\n}\n',
+            },
+        ]
+        patched = {item["path"]: item["content"] for item in _rewrite_legacy_region_var_references(files)}
+        self.assertIn("var.aws_region", patched["terraform/providers.tf"])
+        self.assertNotRegex(patched["terraform/providers.tf"], r"\bvar\.region\b")
+
+    def test_leaves_var_region_when_region_variable_exists(self) -> None:
+        files = [
+            {
+                "path": "terraform/variables.tf",
+                "content": 'variable "aws_region" {\n  type = string\n}\nvariable "region" {\n  type = string\n}\n',
+            },
+            {
+                "path": "terraform/providers.tf",
+                "content": 'provider "aws" {\n  region = var.region\n}\n',
+            },
+        ]
+        patched = {item["path"]: item["content"] for item in _rewrite_legacy_region_var_references(files)}
+        self.assertIn("var.region", patched["terraform/providers.tf"])
+        self.assertNotIn("var.aws_region", patched["terraform/providers.tf"])
+
+    def test_does_not_rewrite_when_aws_region_is_missing(self) -> None:
+        files = [
+            {
+                "path": "terraform/variables.tf",
+                "content": 'variable "region" {\n  type = string\n}\n',
+            },
+            {
+                "path": "terraform/providers.tf",
+                "content": 'provider "aws" {\n  region = var.region\n}\n',
+            },
+        ]
+        patched = {item["path"]: item["content"] for item in _rewrite_legacy_region_var_references(files)}
+        self.assertIn("var.region", patched["terraform/providers.tf"])
+        self.assertNotIn("var.aws_region", patched["terraform/providers.tf"])
 
 
 if __name__ == "__main__":

@@ -314,6 +314,28 @@ resource "aws_eip" "app" {
         )
 
 
+    def test_artifacts_iam_policy_count_not_gated_on_role_name(self) -> None:
+        from agent.internal_registry import rewrite_artifacts_iam_policy_count_known_at_plan
+
+        source = """
+resource "aws_iam_role_policy" "artifacts" {
+  count       = var.enabled && trimspace(var.instance_role_name) != "" ? 1 : 0
+  name_prefix = substr("${var.project_name}-${var.environment}-artifacts-", 0, 38)
+  role        = var.instance_role_name
+}
+"""
+        rewritten, changed = rewrite_artifacts_iam_policy_count_known_at_plan(source)
+        self.assertTrue(changed)
+        self.assertIn("count       = var.enabled ? 1 : 0", rewritten)
+        self.assertNotIn("trimspace(var.instance_role_name)", rewritten)
+        self.assertIn("role        = var.instance_role_name", rewritten)
+
+        enforced, details = enforce_registry_contracts_on_text(source)
+        self.assertTrue(details.get("artifacts_policy_count_known_at_plan"))
+        self.assertIn("count       = var.enabled ? 1 : 0", enforced)
+        self.assertNotIn("trimspace(var.instance_role_name)", enforced)
+
+
 class EnterpriseBundleRegistryGoldenTests(unittest.TestCase):
     def test_generated_compute_uses_registry_ec2_snippet(self) -> None:
         profile = {
@@ -363,6 +385,10 @@ class EnterpriseBundleRegistryGoldenTests(unittest.TestCase):
         self.assertIn("deplai_key_rotation", compute)
         self.assertNotIn("!local.use_existing_key", compute.split('module "ec2"')[0])
         self.assertIn('resource "aws_s3_bucket" "artifacts"', compute)
+        artifacts_block = compute.split('resource "aws_iam_role_policy" "artifacts"')[1].split("resource ")[0]
+        self.assertIn("count       = var.enabled ? 1 : 0", artifacts_block)
+        self.assertNotIn("trimspace(var.instance_role_name)", artifacts_block)
+        self.assertIn("role        = var.instance_role_name", artifacts_block)
         self.assertIn("AmazonSSMManagedInstanceCore", files["terraform/modules/iam/main.tf"])
         self.assertIn("ecr:GetAuthorizationToken", files["terraform/modules/iam/main.tf"])
         self.assertIn("docker", compute)

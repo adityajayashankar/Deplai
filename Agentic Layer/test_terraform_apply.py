@@ -356,6 +356,32 @@ class TerraformApplyKeyPairDiscoveryTests(unittest.TestCase):
         self.assertIn('substr("${var.project_name}-${var.environment}-app-", 0, 38)', patched)
         self.assertIn('substr("${var.project_name}-${var.environment}-instance-profile-", 0, 38)', patched)
 
+    def test_rewrites_artifacts_iam_policy_count_away_from_unknown_role_name(self) -> None:
+        files = [
+            {
+                "path": "terraform/modules/compute/main.tf",
+                "content": "\n".join(
+                    [
+                        'resource "aws_iam_role_policy" "artifacts" {',
+                        '  count       = var.enabled && trimspace(var.instance_role_name) != "" ? 1 : 0',
+                        '  name_prefix = substr("${var.project_name}-${var.environment}-artifacts-", 0, 38)',
+                        "  role        = var.instance_role_name",
+                        "}",
+                    ]
+                ),
+            },
+        ]
+
+        self.assertTrue(_legacy_runtime_bundle_needs_remediation(files))
+
+        patched_files, remediation = _remediate_legacy_runtime_bundle(files, None)
+        patched = patched_files[0]["content"]
+
+        self.assertTrue(remediation["artifacts_policy_count_known_at_plan"])
+        self.assertIn("count       = var.enabled ? 1 : 0", patched)
+        self.assertNotIn("trimspace(var.instance_role_name)", patched)
+        self.assertIn("role        = var.instance_role_name", patched)
+
     def test_rewrites_nginx_security_group_ingress_to_port_80(self) -> None:
         files = [
             {

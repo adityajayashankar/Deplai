@@ -141,13 +141,14 @@ def remediate_text(
     if mode not in {"platform", "byok", "auto"}:
         mode = "auto"
     requested = (model or "").strip()
+    resolved_model = requested or "best_coding"
     return chat_text(
         user_id=resolved_user,
-        model=requested or "best_coding",
+        model=resolved_model,
         prompt=prompt,
         access_mode=mode,
         api_key=api_key,
-        provider=None if requested.startswith("best") else _map_provider(provider),
+        provider=None if resolved_model.startswith("best") else _map_provider(provider),
         temperature=0.1,
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,

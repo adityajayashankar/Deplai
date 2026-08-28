@@ -1402,7 +1402,7 @@ export async function POST(req: NextRequest) {
         runtimeDetails,
         oneTimeCredentials,
       });
-      });
+
       const verification = await waitForRuntimeVerification({
         cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
         albUrl: normalizedRuntime.network.alb_url,

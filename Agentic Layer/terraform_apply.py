@@ -714,12 +714,35 @@ def rewrite_ec2_module_v5_compat(text: str) -> tuple[str, bool]:
     return updated + tail, True
 
 
+_ARTIFACTS_POLICY_COUNT_PATTERN = re.compile(
+    r'(?m)^(\s*count\s*=\s*)var\.enabled\s*&&\s*trimspace\(\s*var\.instance_role_name\s*\)\s*!=\s*""\s*\?\s*1\s*:\s*0\s*$'
+)
+
+
+def rewrite_artifacts_iam_policy_count_known_at_plan(text: str) -> tuple[str, bool]:
+    """Make artifacts IAM policy count known at plan (role name is apply-time)."""
+    _ensure_agent_import_path()
+    try:
+        from terraform_agent.agent.internal_registry import (
+            rewrite_artifacts_iam_policy_count_known_at_plan as _registry_rewrite,
+        )
+
+        return _registry_rewrite(text)
+    except Exception:
+        pass
+    if not text or "instance_role_name" not in text:
+        return text, False
+    rewritten, n = _ARTIFACTS_POLICY_COUNT_PATTERN.subn(r"\1var.enabled ? 1 : 0", text)
+    return (rewritten, True) if n else (text, False)
+
+
 def enforce_registry_contracts(files: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Apply internal-registry contracts across all .tf files in a bundle."""
     remediation: dict[str, Any] = {
         "ec2_module_v5_compat_rewritten": False,
         "registry_contract_files": 0,
     }
+    _ensure_agent_import_path()
     try:
         from terraform_agent.agent.internal_registry import enforce_registry_contracts_on_text
     except Exception:
@@ -736,6 +759,9 @@ def enforce_registry_contracts(files: list[dict[str, Any]]) -> tuple[list[dict[s
         else:
             new_text, changed = rewrite_ec2_module_v5_compat(text)
             details = {"ec2_module_v5_compat_rewritten": changed}
+            new_text, artifacts_count = rewrite_artifacts_iam_policy_count_known_at_plan(new_text)
+            if artifacts_count:
+                details["artifacts_policy_count_known_at_plan"] = True
         if new_text != text:
             patched[idx] = _set_text_payload(item, new_text)
             remediation["registry_contract_files"] += 1
@@ -743,6 +769,8 @@ def enforce_registry_contracts(files: list[dict[str, Any]]) -> tuple[list[dict[s
             remediation["ec2_module_v5_compat_rewritten"] = True
         if details.get("ec2_count_ungated_from_key_reuse"):
             remediation["ec2_count_ungated_from_key_reuse"] = True
+        if details.get("artifacts_policy_count_known_at_plan"):
+            remediation["artifacts_policy_count_known_at_plan"] = True
         if details.get("ec2_version_drift"):
             remediation["ec2_version_drift"] = details["ec2_version_drift"]
     return patched, remediation
@@ -818,6 +846,8 @@ def _legacy_runtime_bundle_needs_remediation(files: list[dict[str, Any]]) -> boo
             )
         ):
             return True
+        if _ARTIFACTS_POLICY_COUNT_PATTERN.search(text):
+            return True
 
     if has_al2023_ami_reference and not has_al2023_ami_data:
         return True
@@ -867,6 +897,7 @@ def _remediate_legacy_runtime_bundle(
         "legacy_tfvars_compute_strategy_canonicalized": False,
         "legacy_nginx_ingress_port_fixed": False,
         "ec2_module_v5_compat_rewritten": False,
+        "artifacts_policy_count_known_at_plan": False,
     }
 
     normalized_paths = {
@@ -1083,6 +1114,12 @@ def _remediate_legacy_runtime_bundle(
             remediation["legacy_conditional_depends_on_rewritten"] = True
         return rewritten
 
+    def _rewrite_artifacts_policy_count(text: str) -> str:
+        rewritten, changed = rewrite_artifacts_iam_policy_count_known_at_plan(text)
+        if changed:
+            remediation["artifacts_policy_count_known_at_plan"] = True
+        return rewritten
+
     bundle_has_aws_region_var = any(_terraform_has_variable(text, "aws_region") for text in tf_texts.values())
     bundle_has_region_var = any(_terraform_has_variable(text, "region") for text in tf_texts.values())
 
@@ -1097,6 +1134,7 @@ def _remediate_legacy_runtime_bundle(
         text = _rewrite_nginx_ingress_port(text)
         text = _rewrite_single_line_variable_blocks(text)
         text = _rewrite_conditional_depends_on(text)
+        text = _rewrite_artifacts_policy_count(text)
         try:
             from terraform_agent.agent.internal_registry import enforce_registry_contracts_on_text
 
@@ -1105,6 +1143,8 @@ def _remediate_legacy_runtime_bundle(
                 remediation["ec2_module_v5_compat_rewritten"] = True
             if contract_details.get("ec2_count_ungated_from_key_reuse"):
                 remediation["legacy_ec2_count_ungated_from_key_reuse"] = True
+            if contract_details.get("artifacts_policy_count_known_at_plan"):
+                remediation["artifacts_policy_count_known_at_plan"] = True
         except Exception:
             text, ec2_rewritten = rewrite_ec2_module_v5_compat(text)
             if ec2_rewritten:
