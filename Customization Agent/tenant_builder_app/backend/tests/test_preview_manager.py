@@ -86,6 +86,23 @@ class PreviewManagerTests(unittest.TestCase):
         self.assertEqual("ready", current["status"])
         self.assertIn("static preview fallback", current["detail"])
 
+    def test_runnable_app_reports_live_server_until_started(self) -> None:
+        app_root = self.tenant_repo / "frontend"
+        app_root.mkdir()
+        (app_root / "package.json").write_text(
+            json.dumps({"scripts": {"dev": "next dev"}}),
+            encoding="utf-8",
+        )
+
+        current = preview_manager.preview_status(
+            tenant_id="acme",
+            base_repo_path=str(self.base_repo),
+        )
+
+        self.assertEqual("live_server", current["kind"])
+        self.assertEqual("stopped", current["status"])
+        self.assertIn("has not been started", current["detail"])
+
     def test_stop_status_is_retained(self) -> None:
         (self.tenant_repo / "index.html").write_text("<h1>Acme</h1>", encoding="utf-8")
         preview_manager.start_preview(

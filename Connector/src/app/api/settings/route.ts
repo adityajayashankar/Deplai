@@ -85,7 +85,17 @@ async function ensureSettingsTable() {
   );
 }
 
-async function loadUserSettings(userId: string): Promise<{ settings: UserSettingsData; updatedAt: string | null }> {
+function storedJsonLooksLikeDemo(raw: unknown): boolean {
+  const text = JSON.stringify(raw);
+  return (
+    text.includes('sess-macbook')
+    || text.includes('pk-macbook')
+    || text.includes('"githubUsername":"aj-dev"')
+    || text.includes('aj@pesuventurelabs.com')
+  );
+}
+
+async function loadUserSettings(userId: string): Promise<{ settings: UserSettingsData; updatedAt: string | null; raw: unknown }> {
   const rows = await query<SettingsRow[]>(
     `SELECT user_id, data_json, updated_at
      FROM user_settings
@@ -99,12 +109,15 @@ async function loadUserSettings(userId: string): Promise<{ settings: UserSetting
     return {
       settings: cloneDefaultUserSettings(),
       updatedAt: null,
+      raw: null,
     };
   }
 
+  const raw = parseJsonColumn(row.data_json);
   return {
-    settings: parseStoredUserSettings(parseJsonColumn(row.data_json)),
+    settings: parseStoredUserSettings(raw),
     updatedAt: toIso(row.updated_at),
+    raw,
   };
 }
 
@@ -127,7 +140,11 @@ export async function GET(request: NextRequest) {
     );
 
     await ensureSettingsTable();
-    const current = await loadUserSettings(user.id);
+    let current = await loadUserSettings(user.id);
+    if (storedJsonLooksLikeDemo(current.raw)) {
+      await saveUserSettings(user.id, current.settings);
+      current = await loadUserSettings(user.id);
+    }
 
     return NextResponse.json({
       settings: toPublicUserSettings(current.settings),

@@ -23,9 +23,11 @@
 Connector/tmp
 runtime
 Agentic Layer/runtime
+Agentic Layer/.deplai_runtime
 Customization Agent/SubSpace-*
 Customization Agent/tenant_builder_app/backend/tenants
 Customization Agent/tenant_builder_app/backend/logs
+Customization Agent/tenant_builder_app/backend/runtime
 tmp
 temp_tf_fmt_check
 tmp_tf_fmt_check

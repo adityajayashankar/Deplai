@@ -85,6 +85,8 @@ class RemediationState(TypedDict):
     llm_provider: str
     llm_api_key: str
     llm_model: str
+    user_id: str
+    llm_access_mode: str
     budget_tracker: ClaudeBudgetTracker | None
     # ── Planner output ──────────────────────────────────────────────────────────
     planned_context: dict   # targeted snippets from Planner's tool calls
@@ -123,16 +125,33 @@ def _dispatch_llm(
     model: str,
     budget_tracker: ClaudeBudgetTracker | None = None,
     stage: str = "remediation_supervisor",
+    user_id: str = "",
+    access_mode: str = "auto",
 ) -> tuple[bool, str]:
-    """Route remediation supervisor calls to the requested provider.
-
-    Groq is supported for cheap/fast remediation (used for large repos that send
-    only critical/high findings). Any other provider routes through the Claude
-    Agent SDK. The Claude SDK is also used as a safety fallback when Groq fails.
-    """
+    """Route remediation supervisor calls through the AI platform when possible."""
     provider = (provider or "").strip().lower()
     api_key = (api_key or "").strip()
     model = (model or "").strip()
+    mode = (access_mode or "auto").strip().lower() or "auto"
+
+    if user_id:
+        try:
+            from ai_gateway import remediate_text
+            ok_gw, raw_gw = remediate_text(
+                user_id=str(user_id),
+                prompt=prompt,
+                model=model or "best_coding",
+                access_mode=mode,
+                api_key=api_key,
+                provider=provider,
+            )
+            if ok_gw:
+                return ok_gw, raw_gw
+            if mode in {"platform", "byok"}:
+                return False, raw_gw
+        except Exception as exc:
+            if mode in {"platform", "byok"}:
+                return False, str(exc)
 
     def _claude(effective_key: str, effective_model: str) -> tuple[bool, str]:
         return _call_with_backoff(
@@ -455,6 +474,8 @@ def _proposer_node(state: RemediationState) -> RemediationState:
         model=state.get("llm_model", ""),
         budget_tracker=state.get("budget_tracker"),
         stage=f"supervisor_proposer_round_{int(state.get('round', 0)) + 1}",
+        user_id=state.get("user_id", ""),
+        access_mode=state.get("llm_access_mode", "auto"),
     )
     if not ok:
         return {**state, "error": f"Proposer LLM call failed: {raw_text}"}
@@ -491,6 +512,8 @@ def _critic_node(state: RemediationState) -> RemediationState:
         model=state.get("llm_model", ""),
         budget_tracker=state.get("budget_tracker"),
         stage=f"supervisor_critic_round_{int(state.get('round', 0)) + 1}",
+        user_id=state.get("user_id", ""),
+        access_mode=state.get("llm_access_mode", "auto"),
     )
 
     if not ok:
@@ -650,6 +673,8 @@ async def run_remediation_supervisor(
     llm_model: str | None = None,
     budget_tracker: ClaudeBudgetTracker | None = None,
     on_message=None,
+    user_id: str | None = None,
+    access_mode: str | None = None,
 ) -> tuple[bool, dict[str, Any] | str]:
     """
     Run the Proposer → Critic → Synthesizer negotiation loop.
@@ -690,6 +715,8 @@ async def run_remediation_supervisor(
         "llm_provider":   llm_provider or "",
         "llm_api_key":    llm_api_key or "",
         "llm_model":      llm_model or "",
+        "user_id":        str(user_id or ""),
+        "llm_access_mode": (access_mode or "auto"),
         "budget_tracker": budget_tracker,
         "round":          0,
         "proposal":       {},

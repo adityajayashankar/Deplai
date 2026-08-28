@@ -5,7 +5,7 @@ import CustomizationConsoleApp from '@/features/dashboard/CustomizationConsoleAp
 
 export default function DashboardCustomizationPage() {
   return (
-    <div className="h-screen">
+    <div className="h-full">
       <Suspense fallback={null}>
         <CustomizationConsoleApp />
       </Suspense>

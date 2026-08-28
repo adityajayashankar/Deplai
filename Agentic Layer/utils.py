@@ -7,7 +7,20 @@ import docker
 _docker_client: docker.DockerClient | None = None
 
 SEVERITY_LEVELS = ["critical", "high", "medium", "low"]
-SCANNER_SUFFIXES = ["Bearer.json", "sbom.json", "Grype.json"]
+SCANNER_SUFFIXES = [
+    "Bearer.json",
+    "sbom.json",
+    "Grype.json",
+    "Secrets.json",
+    "Checkov.json",
+    "Containers.json",
+    "Kubernetes.json",
+    "Cicd.json",
+    "Api.json",
+    "Dast.json",
+    "Cloud.json",
+    "Pipeline.json",
+]
 
 CODEBASE_VOLUME = "codebase_deplai"
 SECURITY_REPORTS_VOLUME = "security_reports"

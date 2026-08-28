@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
+import { Callout, LogConsole, Panel, ProgressBar, StatusPill } from '@/features/deployment/deployment-ui';
 
 type RunStatus =
   | 'pending'
@@ -36,65 +37,88 @@ const STATUS_LABEL: Record<RunStatus, string> = {
   failed: 'Failed',
 };
 
+function isFailedStatus(status: unknown): boolean {
+  return String(status || '').trim().toLowerCase() === 'failed';
+}
+
 export function ApplyLogViewer({ runId, onComplete, onError }: ApplyLogViewerProps) {
   const [logs, setLogs] = useState<string[]>([]);
   const [status, setStatus] = useState<RunStatus>('pending');
-  const logEndRef = useRef<HTMLDivElement>(null);
-
-  // Auto-scroll to bottom as logs arrive
-  useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [logs]);
 
   useEffect(() => {
-    // Try WebSocket first (real-time), fall back to polling
     const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/pipeline/iac-ws-proxy/${runId}`;
 
     let ws: WebSocket | null = null;
     let pollInterval: ReturnType<typeof setInterval> | null = null;
-
+    let settled = false;
     let consecutiveErrors = 0;
 
+    const finishError = (message: string) => {
+      if (settled) return;
+      settled = true;
+      if (pollInterval) clearInterval(pollInterval);
+      ws?.close();
+      onError(message);
+    };
+
+    const finishComplete = (outputs: object, keypair?: object | null) => {
+      if (settled) return;
+      settled = true;
+      if (pollInterval) clearInterval(pollInterval);
+      ws?.close();
+      onComplete(outputs, keypair);
+    };
+
+    const applyPayload = (data: {
+      logs?: string[];
+      status?: string;
+      outputs?: object;
+      keypair?: object | null;
+      error?: string | null;
+    }) => {
+      if (Array.isArray(data.logs)) {
+        setLogs(data.logs);
+      }
+      if (data.status) {
+        setStatus(data.status as RunStatus);
+      }
+      if (data.status === 'completed') {
+        finishComplete(data.outputs || {}, data.keypair ?? null);
+        return;
+      }
+      if (isFailedStatus(data.status)) {
+        finishError(data.error || 'Unknown error');
+      }
+    };
+
     function startPolling() {
+      if (pollInterval || settled) return;
       pollInterval = setInterval(async () => {
         try {
           const res = await fetch(`/api/pipeline/iac-status/${runId}`);
           if (!res.ok) {
             consecutiveErrors++;
             if (consecutiveErrors >= 5) {
-              clearInterval(pollInterval!);
-              onError(`Backend status check failed repeatedly (${res.status}).`);
+              finishError(`Backend status check failed repeatedly (${res.status}).`);
             }
             return;
           }
 
           consecutiveErrors = 0;
           const data = await res.json();
-
-          if (data.logs) {
-            setLogs(data.logs);
-          }
-          if (data.status) {
-            setStatus(data.status as RunStatus);
-          }
-
-          if (data.status === 'completed') {
-            clearInterval(pollInterval!);
-            onComplete(data.outputs, data.keypair ?? null);
-          }
-          if (data.status === 'failed') {
-            clearInterval(pollInterval!);
-            onError(data.error ?? 'Unknown error');
-          }
+          applyPayload(data);
         } catch {
           consecutiveErrors++;
           if (consecutiveErrors >= 5) {
-            clearInterval(pollInterval!);
-            onError('Network error checking status repeatedly.');
+            finishError('Network error checking status repeatedly.');
           }
         }
       }, 3000);
     }
+
+    // The Next.js iac-ws-proxy route cannot upgrade WebSockets, so polling is the
+    // reliable completion path. Keep WS as a best-effort live log stream.
+    startPolling();
 
     try {
       ws = new WebSocket(wsUrl);
@@ -107,87 +131,84 @@ export function ApplyLogViewer({ runId, onComplete, onError }: ApplyLogViewerPro
         }
         if (msg.type === 'status') {
           setStatus(msg.data as RunStatus);
+          if (isFailedStatus(msg.data)) {
+            finishError(msg.error || 'Apply failed');
+          }
         }
         if (msg.type === 'done') {
           setStatus(msg.data as RunStatus);
           if (msg.data === 'completed') {
-            onComplete(msg.outputs, msg.keypair ?? null);
+            finishComplete(msg.outputs, msg.keypair ?? null);
           } else {
-            onError(msg.error ?? 'Apply failed');
+            finishError(msg.error ?? 'Apply failed');
           }
         }
       };
 
       ws.onerror = () => {
         ws?.close();
-        startPolling();
       };
     } catch {
-      startPolling();
+      // Polling already started.
     }
 
     return () => {
+      settled = true;
       ws?.close();
       if (pollInterval) clearInterval(pollInterval);
     };
   }, [runId, onComplete, onError]);
 
   const currentStep = STATUS_STEPS.indexOf(status);
+  const visibleSteps = STATUS_STEPS.filter((s) => s !== 'pending');
+  const progress = status === 'failed'
+    ? 100
+    : Math.round((Math.max(currentStep, 0) / Math.max(STATUS_STEPS.length - 1, 1)) * 100);
 
   return (
-    <div className="flex flex-col gap-4">
-      {/* Progress stepper */}
-      <div className="flex items-center gap-2 flex-wrap">
-        {STATUS_STEPS.filter((s) => s !== 'pending').map((step, i) => {
+    <Panel className="flex flex-col gap-4" elevation="raised" glow={status === 'applying' || status === 'planning'}>
+      <ProgressBar
+        value={progress}
+        tone={status === 'failed' ? 'danger' : status === 'completed' ? 'ok' : 'accent'}
+        indeterminate={status !== 'completed' && status !== 'failed' && currentStep < 1}
+      />
+      <div className="flex flex-wrap items-center gap-2">
+        {visibleSteps.map((step, i) => {
           const stepIndex = STATUS_STEPS.indexOf(step);
           const done = currentStep > stepIndex;
           const active = currentStep === stepIndex;
           return (
             <div key={step} className="flex items-center gap-2">
-              <div
-                className={`
-                w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold
-                ${done ? 'bg-green-500 text-white' : ''}
-                ${active ? 'bg-blue-500 text-white animate-pulse' : ''}
-                ${!done && !active ? 'bg-gray-200 text-gray-500' : ''}
-              `}
+              <StatusPill
+                tone={done ? 'ok' : active ? (status === 'failed' ? 'danger' : 'accent') : 'neutral'}
+                live={active && status !== 'failed'}
               >
-                {done ? '✓' : i + 1}
-              </div>
-              <span className={`text-sm ${active ? 'font-semibold' : 'text-gray-500'}`}>
                 {STATUS_LABEL[step]}
-              </span>
-              {i < STATUS_STEPS.length - 2 && (
-                <div className={`h-px w-6 ${done ? 'bg-green-500' : 'bg-gray-200'}`} />
+              </StatusPill>
+              {i < visibleSteps.length - 1 && (
+                <span
+                  className={`h-px w-6 ${done ? 'bg-[var(--dw-accent)]' : 'bg-[var(--dw-border)]'}`}
+                  aria-hidden="true"
+                />
               )}
             </div>
           );
         })}
       </div>
 
-      {/* Terminal log viewer */}
-      <div className="bg-gray-950 rounded-lg p-4 h-64 overflow-y-auto font-mono text-xs text-green-400">
-        {logs.length === 0 && <span className="text-gray-500">Waiting for output...</span>}
-        {logs.map((line, i) => (
-          <div
-            key={i}
-            className={
-              line.startsWith('✗')
-                ? 'text-red-400'
-                : line.startsWith('✓')
-                  ? 'text-green-300'
-                  : ''
-            }
-          >
-            {line}
-          </div>
-        ))}
-        <div ref={logEndRef} />
-      </div>
+      <LogConsole
+        lines={logs.map((line) => ({
+          text: line,
+          tone: line.startsWith('✗') ? 'danger' : line.startsWith('✓') ? 'ok' : 'neutral',
+        }))}
+        streaming={status !== 'completed' && status !== 'failed'}
+        emptyLabel="Waiting for output…"
+        maxHeight="16rem"
+      />
 
       {status === 'failed' && (
-        <p className="text-red-500 text-sm">Deployment failed. See logs above for details.</p>
+        <Callout tone="danger">Deployment failed. See logs above for details.</Callout>
       )}
-    </div>
+    </Panel>
   );
 }

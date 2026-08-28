@@ -348,13 +348,25 @@ data "aws_availability_zones" "available" {{
   state = "available"
 }}
 
+data "aws_vpcs" "default" {{
+  filter {{
+    name   = "isDefault"
+    values = ["true"]
+  }}
+}}
+
+locals {{
+  deplai_prefer_default_vpc = var.use_existing_vpc
+  has_default_vpc           = local.deplai_prefer_default_vpc && length(data.aws_vpcs.default.ids) > 0
+}}
+
 data "aws_vpc" "default" {{
-  count   = var.use_existing_vpc ? 1 : 0
-  default = true
+  count = local.has_default_vpc ? 1 : 0
+  id    = data.aws_vpcs.default.ids[0]
 }}
 
 data "aws_subnets" "default" {{
-  count = var.use_existing_vpc ? 1 : 0
+  count = local.has_default_vpc ? 1 : 0
   filter {{
     name   = "vpc-id"
     values = [data.aws_vpc.default[0].id]
@@ -362,7 +374,7 @@ data "aws_subnets" "default" {{
 }}
 
 resource "aws_vpc" "main" {{
-  count                = var.use_existing_vpc ? 0 : 1
+  count                = local.has_default_vpc ? 0 : 1
   cidr_block           = "10.60.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -370,13 +382,13 @@ resource "aws_vpc" "main" {{
 }}
 
 resource "aws_internet_gateway" "main" {{
-  count  = var.use_existing_vpc ? 0 : 1
+  count  = local.has_default_vpc ? 0 : 1
   vpc_id = aws_vpc.main[0].id
   tags   = merge(local.tags, {{ Name = "${{var.project_name}}-igw" }})
 }}
 
 resource "aws_subnet" "public_a" {{
-  count                   = var.use_existing_vpc ? 0 : 1
+  count                   = local.has_default_vpc ? 0 : 1
   vpc_id                  = aws_vpc.main[0].id
   cidr_block              = "10.60.1.0/24"
   availability_zone       = data.aws_availability_zones.available.names[0]
@@ -385,7 +397,7 @@ resource "aws_subnet" "public_a" {{
 }}
 
 resource "aws_subnet" "public_b" {{
-  count                   = var.use_existing_vpc ? 0 : 1
+  count                   = local.has_default_vpc ? 0 : 1
   vpc_id                  = aws_vpc.main[0].id
   cidr_block              = "10.60.2.0/24"
   availability_zone       = data.aws_availability_zones.available.names[length(data.aws_availability_zones.available.names) > 1 ? 1 : 0]
@@ -394,7 +406,7 @@ resource "aws_subnet" "public_b" {{
 }}
 
 resource "aws_subnet" "private_a" {{
-  count             = var.use_existing_vpc ? 0 : 1
+  count             = local.has_default_vpc ? 0 : 1
   vpc_id            = aws_vpc.main[0].id
   cidr_block        = "10.60.11.0/24"
   availability_zone = data.aws_availability_zones.available.names[0]
@@ -402,7 +414,7 @@ resource "aws_subnet" "private_a" {{
 }}
 
 resource "aws_subnet" "private_b" {{
-  count             = var.use_existing_vpc ? 0 : 1
+  count             = local.has_default_vpc ? 0 : 1
   vpc_id            = aws_vpc.main[0].id
   cidr_block        = "10.60.12.0/24"
   availability_zone = data.aws_availability_zones.available.names[length(data.aws_availability_zones.available.names) > 1 ? 1 : 0]
@@ -410,71 +422,71 @@ resource "aws_subnet" "private_b" {{
 }}
 
 resource "aws_route_table" "public" {{
-  count  = var.use_existing_vpc ? 0 : 1
+  count  = local.has_default_vpc ? 0 : 1
   vpc_id = aws_vpc.main[0].id
   tags   = merge(local.tags, {{ Name = "${{var.project_name}}-public-rt" }})
 }}
 
 resource "aws_route" "public_internet" {{
-  count                  = var.use_existing_vpc ? 0 : 1
+  count                  = local.has_default_vpc ? 0 : 1
   route_table_id         = aws_route_table.public[0].id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = aws_internet_gateway.main[0].id
 }}
 
 resource "aws_route_table_association" "public_a" {{
-  count          = var.use_existing_vpc ? 0 : 1
+  count          = local.has_default_vpc ? 0 : 1
   subnet_id      = aws_subnet.public_a[0].id
   route_table_id = aws_route_table.public[0].id
 }}
 
 resource "aws_route_table_association" "public_b" {{
-  count          = var.use_existing_vpc ? 0 : 1
+  count          = local.has_default_vpc ? 0 : 1
   subnet_id      = aws_subnet.public_b[0].id
   route_table_id = aws_route_table.public[0].id
 }}
 
 resource "aws_eip" "nat" {{
-  count  = var.use_existing_vpc || !var.create_nat_gateway ? 0 : 1
+  count  = local.has_default_vpc || !var.create_nat_gateway ? 0 : 1
   domain = "vpc"
 }}
 
 resource "aws_nat_gateway" "main" {{
-  count         = var.use_existing_vpc || !var.create_nat_gateway ? 0 : 1
+  count         = local.has_default_vpc || !var.create_nat_gateway ? 0 : 1
   allocation_id = aws_eip.nat[0].id
   subnet_id     = aws_subnet.public_a[0].id
   tags          = merge(local.tags, {{ Name = "${{var.project_name}}-nat" }})
 }}
 
 resource "aws_route_table" "private" {{
-  count  = var.use_existing_vpc ? 0 : 1
+  count  = local.has_default_vpc ? 0 : 1
   vpc_id = aws_vpc.main[0].id
   tags   = merge(local.tags, {{ Name = "${{var.project_name}}-private-rt" }})
 }}
 
 resource "aws_route" "private_nat" {{
-  count                  = var.use_existing_vpc || !var.create_nat_gateway ? 0 : 1
+  count                  = local.has_default_vpc || !var.create_nat_gateway ? 0 : 1
   route_table_id         = aws_route_table.private[0].id
   destination_cidr_block = "0.0.0.0/0"
   nat_gateway_id         = aws_nat_gateway.main[0].id
 }}
 
 resource "aws_route_table_association" "private_a" {{
-  count          = var.use_existing_vpc ? 0 : 1
+  count          = local.has_default_vpc ? 0 : 1
   subnet_id      = aws_subnet.private_a[0].id
   route_table_id = var.create_nat_gateway ? aws_route_table.private[0].id : aws_route_table.public[0].id
 }}
 
 resource "aws_route_table_association" "private_b" {{
-  count          = var.use_existing_vpc ? 0 : 1
+  count          = local.has_default_vpc ? 0 : 1
   subnet_id      = aws_subnet.private_b[0].id
   route_table_id = var.create_nat_gateway ? aws_route_table.private[0].id : aws_route_table.public[0].id
 }}
 
 locals {{
-  vpc_id = var.use_existing_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
-  public_subnet_ids = var.use_existing_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(2, length(data.aws_subnets.default[0].ids))) : [aws_subnet.public_a[0].id, aws_subnet.public_b[0].id]
-  private_subnet_ids = var.use_existing_vpc ? local.public_subnet_ids : [aws_subnet.private_a[0].id, aws_subnet.private_b[0].id]
+  vpc_id = local.has_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
+  public_subnet_ids = local.has_default_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(2, length(data.aws_subnets.default[0].ids))) : [aws_subnet.public_a[0].id, aws_subnet.public_b[0].id]
+  private_subnet_ids = local.has_default_vpc ? local.public_subnet_ids : [aws_subnet.private_a[0].id, aws_subnet.private_b[0].id]
 }}
 
 resource "aws_security_group" "alb" {{
@@ -658,13 +670,6 @@ resource "aws_ecs_service" "worker" {{
 """
 
     secrets_data = ""
-    if required_secrets:
-        secrets_data = """
-data "aws_secretsmanager_secret" "runtime" {
-  for_each = toset(local.required_secret_names)
-  name     = each.value
-}
-"""
 
     main_tf = f"""{locals_block}
 {networking_tf}
@@ -851,6 +856,7 @@ def build_profile_bundle(
     aws_region: str,
     context_summary: str,
     website_index_html: str,
+    app_bootstrap: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     assert_endpoint_decision_renderable(payload)
     strategy = str(((payload.get("compute") or {}) if isinstance(payload.get("compute"), dict) else {}).get("strategy") or "")
@@ -872,6 +878,7 @@ def build_profile_bundle(
             aws_region=aws_region,
             context_summary=context_summary,
             website_index_html=website_index_html,
+            app_bootstrap=app_bootstrap,
         )
     except ValueError:
         # Explicit decision/render conflicts must not fall back to an EC2-only legacy bundle.

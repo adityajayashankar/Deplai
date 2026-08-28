@@ -12,10 +12,10 @@ import {
 } from 'lucide-react';
 import type {
   AssetOption,
-  ByokModel,
-  ByokProvider,
+  CustomizationMode,
   PipelineMode,
   PreviewDevice,
+  StudioBottomTab,
   WorkspaceTab,
   WorkflowStage,
 } from './types';
@@ -33,55 +33,6 @@ export const PIPELINE_MODE_OPTIONS = [
   { value: 'deterministic_only' as PipelineMode, label: 'Deterministic', description: 'Rule-based changes', icon: Wrench },
   { value: 'diagnostic' as PipelineMode, label: 'Diagnostic', description: 'Dry run and report', icon: Microscope },
 ];
-
-export const PROVIDER_MODEL_MAP: Record<ByokProvider, ByokModel[]> = {
-  Anthropic: [
-    { id: 'claude-opus-4-5', name: 'Claude Opus 4.5' },
-    { id: 'claude-sonnet-4-5', name: 'Claude Sonnet 4.5' },
-    { id: 'claude-haiku-3-5', name: 'Claude Haiku 3.5' },
-  ],
-  OpenAI: [
-    { id: 'gpt-4o', name: 'GPT-4o' },
-    { id: 'gpt-4.1', name: 'GPT-4.1' },
-    { id: 'o3-mini', name: 'o3-mini' },
-  ],
-  Groq: [
-    { id: 'llama-3.3-70b-versatile', name: 'Llama 3.3 70B' },
-    { id: 'meta-llama/llama-4-scout-17b-16e-instruct', name: 'Llama 4 Scout' },
-    { id: 'moonshotai/kimi-k2-instruct', name: 'Kimi K2' },
-  ],
-  OpenRouter: [
-    { id: 'nvidia/nemotron-3-ultra-550b-a55b:free', name: 'Nemotron 3 Ultra 550B' },
-    { id: 'nvidia/nemotron-3-super-120b-a12b:free', name: 'Nemotron 3 Super 120B' },
-    { id: 'qwen/qwen3-coder:free', name: 'Qwen3 Coder 480B' },
-    { id: 'openai/gpt-oss-120b:free', name: 'GPT OSS 120B' },
-    { id: 'meta-llama/llama-3.3-70b-instruct:free', name: 'Llama 3.3 70B Instruct' },
-    { id: 'nousresearch/hermes-3-llama-3.1-405b:free', name: 'Hermes 3 405B' },
-    { id: 'nex-agi/nex-n2-pro:free', name: 'Nex-N2-Pro' },
-    { id: 'qwen/qwen3-next-80b-a3b-instruct:free', name: 'Qwen3 Next 80B' },
-    { id: 'google/gemma-4-31b-it:free', name: 'Gemma 4 31B' },
-    { id: 'google/gemma-4-26b-a4b-it:free', name: 'Gemma 4 26B' },
-    { id: 'poolside/laguna-m.1:free', name: 'Laguna M.1' },
-    { id: 'poolside/laguna-xs.2:free', name: 'Laguna XS.2' },
-    { id: 'nvidia/nemotron-3-nano-30b-a3b:free', name: 'Nemotron 3 Nano 30B' },
-    { id: 'nvidia/nemotron-nano-9b-v2:free', name: 'Nemotron Nano 9B' },
-    { id: 'openai/gpt-oss-20b:free', name: 'GPT OSS 20B' },
-    { id: 'meta-llama/llama-3.2-3b-instruct:free', name: 'Llama 3.2 3B' },
-  ],
-  MiniMax: [
-    { id: 'minimax-m3', name: 'MiniMax M3' },
-    { id: 'minimax-m2.7', name: 'MiniMax M2.7' },
-    { id: 'minimax-m2.7-highspeed', name: 'MiniMax M2.7 Highspeed' },
-  ],
-};
-
-export const PROVIDER_TO_BACKEND_ID: Record<ByokProvider, string> = {
-  Anthropic: 'claude',
-  OpenAI: 'openai',
-  Groq: 'groq',
-  OpenRouter: 'openrouter',
-  MiniMax: 'minimax',
-};
 
 export const ASSET_OPTIONS: AssetOption[] = [
   { value: 'logo_light', label: 'Logo (light)' },
@@ -116,4 +67,77 @@ export const WORKFLOW_STEPS: Array<{ value: WorkflowStage; label: string; descri
   { value: 'validate', label: 'Validate', description: 'Run quality gates' },
   { value: 'preview', label: 'Preview', description: 'Verify output' },
   { value: 'ready', label: 'Ready', description: 'Handoff' },
+];
+
+export const CUSTOMIZATION_MODES: Array<{ value: CustomizationMode; label: string; description: string }> = [
+  { value: 'full_transformation', label: 'Full UI/UX transformation', description: 'Enterprise upgrade across the product' },
+  { value: 'targeted_screen', label: 'Targeted screen', description: 'Focus on selected routes' },
+  { value: 'design_system', label: 'Design system upgrade', description: 'Tokens, type, spacing, components' },
+  { value: 'responsive', label: 'Responsive upgrade', description: 'Mobile and tablet layouts' },
+  { value: 'accessibility', label: 'Accessibility upgrade', description: 'Focus, contrast, skip links, labels' },
+];
+
+export const ENGINE_STAGES: Array<{ id: string; label: string; group: 'analysis' | 'implementation' | 'qa' }> = [
+  { id: 'intake', label: 'Repository analyzed', group: 'analysis' },
+  { id: 'mapping', label: 'Frontend map created', group: 'analysis' },
+  { id: 'business_logic', label: 'Business logic boundaries identified', group: 'analysis' },
+  { id: 'ux_research', label: 'Product UX model generated', group: 'analysis' },
+  { id: 'ux_strategy', label: 'UX architecture generated', group: 'analysis' },
+  { id: 'design_system', label: 'Design system generated', group: 'analysis' },
+  { id: 'screen_planner', label: 'Screen plan created', group: 'analysis' },
+  { id: 'implement_shell', label: 'Application shell', group: 'implementation' },
+  { id: 'implement_screens', label: 'Screens updated', group: 'implementation' },
+  { id: 'implement_responsive', label: 'Responsive behavior', group: 'implementation' },
+  { id: 'implement_a11y', label: 'Accessibility', group: 'implementation' },
+  { id: 'visual_qa', label: 'Visual QA', group: 'qa' },
+  { id: 'functional_safety', label: 'Functional safety', group: 'qa' },
+  { id: 'preview_verify', label: 'Preview verification', group: 'qa' },
+  { id: 'review_gate', label: 'Final review', group: 'qa' },
+];
+
+export const STUDIO_INSPECTOR_TABS: Array<{ value: StudioBottomTab; label: string }> = [
+  { value: 'diff', label: 'Diff' },
+  { value: 'changes', label: 'Changes' },
+  { value: 'logs', label: 'Activity' },
+  { value: 'review', label: 'Review' },
+];
+
+export const STUDIO_PHASES: Array<{
+  id: 'understand' | 'design' | 'apply';
+  label: string;
+  stages: Array<{ id: string; doing: string }>;
+}> = [
+  {
+    id: 'understand',
+    label: '1. Understand the product',
+    stages: [
+      { id: 'intake', doing: 'Reading the repository and detecting the frontend.' },
+      { id: 'mapping', doing: 'Mapping screens, routes, and UI files.' },
+      { id: 'business_logic', doing: 'Locking files that must not be changed.' },
+    ],
+  },
+  {
+    id: 'design',
+    label: '2. Design the UI',
+    stages: [
+      { id: 'ux_research', doing: 'Learning how this product is used.' },
+      { id: 'ux_strategy', doing: 'Choosing layout and navigation changes.' },
+      { id: 'design_system', doing: 'Building a design system from this repo.' },
+      { id: 'screen_planner', doing: 'Planning screen-by-screen updates.' },
+    ],
+  },
+  {
+    id: 'apply',
+    label: '3. Apply and check',
+    stages: [
+      { id: 'implement_shell', doing: 'Updating the application shell.' },
+      { id: 'implement_screens', doing: 'Updating screens.' },
+      { id: 'implement_responsive', doing: 'Checking tablet and mobile layouts.' },
+      { id: 'implement_a11y', doing: 'Improving accessibility.' },
+      { id: 'visual_qa', doing: 'Checking visual quality.' },
+      { id: 'functional_safety', doing: 'Confirming business logic was not touched.' },
+      { id: 'preview_verify', doing: 'Refreshing the live preview.' },
+      { id: 'review_gate', doing: 'Preparing the final review.' },
+    ],
+  },
 ];

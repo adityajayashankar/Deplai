@@ -4,14 +4,41 @@ import path from "path";
 
 // Load shared workspace env from repo root so Connector and Agentic Layer use one file.
 loadEnvConfig(path.resolve(__dirname, ".."));
+loadEnvConfig(path.resolve(__dirname));
+
+const agenticLayerUrl = (process.env.AGENTIC_LAYER_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
 
 const nextConfig: NextConfig = {
   reactCompiler: true,
+  serverExternalPackages: ['razorpay', 'pdfkit'],
+  async redirects() {
+    return [
+      {
+        source: '/dashboard/profile',
+        destination: '/profile',
+        permanent: false,
+      },
+    ];
+  },
+  async rewrites() {
+    // Browser traffic may only reach Agentic WebSockets. HTTP APIs stay
+    // server-side via AGENTIC_LAYER_URL + X-API-Key.
+    return [
+      {
+        source: '/agentic/ws/:path*',
+        destination: `${agenticLayerUrl}/ws/:path*`,
+      },
+    ];
+  },
   images: {
     remotePatterns: [
       {
         protocol: "https",
         hostname: "avatars.githubusercontent.com",
+      },
+      {
+        protocol: "https",
+        hostname: "github.com",
       },
     ],
   },

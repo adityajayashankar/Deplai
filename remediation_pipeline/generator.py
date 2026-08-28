@@ -25,6 +25,8 @@ class FixGenerator:
         llm_api_key: str | None = None,
         llm_model: str | None = None,
         force_claude: bool = False,
+        user_id: str | None = None,
+        access_mode: str | None = None,
     ) -> Fix:
         ordered_vulns = [vuln_lookup[s.vuln_id] for s in bundle.snippets if s.vuln_id in vuln_lookup]
         deterministic_vulns = self._deterministic_sca_vulnerabilities(ordered_vulns)
@@ -50,6 +52,8 @@ class FixGenerator:
                 preferred_api_key=llm_api_key,
                 preferred_model=llm_model,
                 force_claude=force_claude,
+                user_id=user_id,
+                access_mode=access_mode,
             )
         except Exception as exc:
             return Fix(

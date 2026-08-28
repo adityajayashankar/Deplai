@@ -3,6 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { ArrowRight } from "lucide-react";
+import { AnimatedTetrahedron } from "./animated-tetrahedron";
+
+const signUpHref = "/auth/signup";
 
 export function CtaSection() {
   const [isVisible, setIsVisible] = useState(false);
@@ -42,7 +45,7 @@ export function CtaSection() {
           <div 
             className="absolute inset-0 opacity-10 pointer-events-none transition-opacity duration-300"
             style={{
-              background: `radial-gradient(600px circle at ${mousePosition.x}% ${mousePosition.y}%, rgba(0,0,0,0.15), transparent 40%)`
+              background: `radial-gradient(600px circle at ${mousePosition.x}% ${mousePosition.y}%, rgba(255,255,255,0.15), transparent 40%)`
             }}
           />
           
@@ -50,14 +53,14 @@ export function CtaSection() {
             <div className="flex flex-col lg:flex-row items-center justify-between gap-12">
               {/* Left content */}
               <div className="flex-1">
-                <h2 className="text-6xl md:text-7xl lg:text-[72px] font-display tracking-tight mb-8 leading-[0.95]">
-                  Ready to move from
+                <h2 className="text-4xl lg:text-7xl font-display tracking-tight mb-8 leading-[0.95]">
+                  Ready to deploy
                   <br />
-                  repository to runtime?
+                  with DeplAI?
                 </h2>
 
                 <p className="text-xl text-muted-foreground mb-12 leading-relaxed max-w-xl">
-                  Connect GitHub or add local files, then take your next project through security review, deployment planning, and infrastructure generation.
+                  Let DeplAI agents handle the complexity of secure deployment while your team keeps full ownership. Start free and scale with confidence.
                 </p>
 
                 <div className="flex flex-col sm:flex-row items-start gap-4">
@@ -66,30 +69,28 @@ export function CtaSection() {
                     size="lg"
                     className="bg-foreground hover:bg-foreground/90 text-background px-8 h-14 text-base rounded-full group"
                   >
-                    <a href="/api/auth/login?force=1">Launch workspace <ArrowRight className="w-4 h-4 ml-2 transition-transform group-hover:translate-x-1" /></a>
+                    <a href={signUpHref}>
+                      Start deploying free
+                      <ArrowRight className="w-4 h-4 ml-2 transition-transform group-hover:translate-x-1" />
+                    </a>
                   </Button>
                   <Button
-                    asChild
                     size="lg"
                     variant="outline"
                     className="h-14 px-8 text-base rounded-full border-foreground/20 hover:bg-foreground/5"
                   >
-                    <a href="/api/auth/login?force=1">Connect GitHub</a>
+                    Talk to sales
                   </Button>
                 </div>
 
                 <p className="text-sm text-muted-foreground mt-8 font-mono">
-                  Sign in with GitHub to launch your workspace, then add a repository or local files
+                  No credit card required
                 </p>
               </div>
 
-              {/* Right image */}
-              <div className="hidden lg:flex items-end justify-center w-[600px] h-[650px] -mr-16">
-                <img
-                  src="/images/bridge.png"
-                  alt="Two trees connected by glowing arcs"
-                  className="w-full h-full object-contain object-bottom"
-                />
+              {/* Right animation */}
+              <div className="hidden lg:flex items-center justify-center w-[500px] h-[500px] -mr-16">
+                <AnimatedTetrahedron />
               </div>
             </div>
           </div>

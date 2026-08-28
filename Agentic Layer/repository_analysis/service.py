@@ -536,7 +536,9 @@ def _data_store_scanner(root: Path, files: list[Path], dependency_names: set[str
                 signals_by_store[store].append(f"compose_image:{image}")
                 version_match = re.search(r":([\w.\-]+)$", image.strip())
                 if version_match and versions[store] is None:
-                    versions[store] = version_match.group(1)
+                    tag = version_match.group(1)
+                    if tag.lower() not in {"latest", "lts", "stable", "current", "alpine"}:
+                        versions[store] = tag
 
     for store, prefixes in DATASTORE_ENV_PREFIXES.items():
         for env in env_names:

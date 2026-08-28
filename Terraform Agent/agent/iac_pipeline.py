@@ -154,6 +154,24 @@ async def run_pipeline(
         # Phase 5: Parse outputs
         run.outputs = parse_outputs(raw_outputs, service_type)
 
+        if service_type in {"ec2", "ec2-instance"}:
+            instance_id = ""
+            public_ip = ""
+            for key, value in (raw_outputs or {}).items():
+                lowered = str(key or "").strip().lower()
+                text = str(value or "").strip()
+                if not text or text.lower() in {"none", "null", "n/a"}:
+                    continue
+                if lowered in {"instance_id", "ec2_instance_id"}:
+                    instance_id = text
+                if lowered in {"public_ip", "ec2_public_ip"}:
+                    public_ip = text
+            if not instance_id and not public_ip:
+                raise RuntimeError(
+                    "Terraform apply finished but no EC2 instance was provisioned in AWS. "
+                    "Success requires terraform-aws-modules/ec2-instance to create an instance."
+                )
+
         # EC2 only: read and scrub the keypair PEM from disk
         if service_type == "ec2":
             run.keypair = extract_keypair_details(workspace)

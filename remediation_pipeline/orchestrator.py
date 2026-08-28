@@ -7,6 +7,7 @@ import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from functools import partial
 from inspect import isawaitable
 from pathlib import Path
 from typing import Callable
@@ -65,6 +66,8 @@ class RemediationOrchestrator:
         llm_api_key: str | None = None,
         llm_model: str | None = None,
         force_claude: bool = False,
+        user_id: str | None = None,
+        access_mode: str | None = None,
     ) -> list[Fix]:
         from utils import clear_repo_file_cache
         clear_repo_file_cache()
@@ -166,6 +169,8 @@ class RemediationOrchestrator:
                             force_claude or bool(snapshot["force_claude"]),
                             on_progress,
                             loop,
+                            user_id,
+                            access_mode,
                         )
                     )
 
@@ -190,17 +195,23 @@ class RemediationOrchestrator:
         force_claude: bool,
         on_progress: Callable | None,
         loop: asyncio.AbstractEventLoop,
+        user_id: str | None = None,
+        access_mode: str | None = None,
     ) -> Fix | None:
         try:
             fix = await loop.run_in_executor(
                 None,
-                self.generator.generate,
-                bundle,
-                vuln_lookup,
-                llm_provider,
-                llm_api_key,
-                llm_model,
-                force_claude,
+                partial(
+                    self.generator.generate,
+                    bundle,
+                    vuln_lookup,
+                    llm_provider=llm_provider,
+                    llm_api_key=llm_api_key,
+                    llm_model=llm_model,
+                    force_claude=force_claude,
+                    user_id=user_id,
+                    access_mode=access_mode,
+                ),
             )
         except Exception as exc:
             if on_progress is not None:

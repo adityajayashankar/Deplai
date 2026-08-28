@@ -21,6 +21,7 @@ from .catalog import (
     render_snippet,
     resolve_service_id,
 )
+from .edits import select_allowlisted_edits
 from .contracts import (
     enforce_registry_contracts_on_text,
     rewrite_ec2_module_count_not_gated_on_key_reuse,
@@ -43,4 +44,5 @@ __all__ = [
     "resolve_service_id",
     "rewrite_ec2_module_count_not_gated_on_key_reuse",
     "rewrite_ec2_module_v5_compat",
+    "select_allowlisted_edits",
 ]

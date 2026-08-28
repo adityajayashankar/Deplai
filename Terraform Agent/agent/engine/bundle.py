@@ -161,6 +161,12 @@ variable "existing_ec2_key_pair_name" {{
   default = ""
 }}
 
+variable "ec2_key_rotation" {{
+  type        = string
+  default     = "init"
+  description = "Unique suffix so each deploy mints a new EC2 key pair. AWS never stores the private half."
+}}
+
 variable "ingress_cidr_blocks" {{
   type    = list(string)
   default = ["0.0.0.0/0"]
@@ -225,6 +231,7 @@ environment = "{workspace}"
 instance_type = "t3.micro"
 enable_ec2 = true
 existing_ec2_key_pair_name = ""
+ec2_key_rotation = "init"
 ingress_cidr_blocks = ["0.0.0.0/0"]
 ssh_ingress_cidr_blocks = []
 preferred_availability_zones = ["{aws_region}a", "{aws_region}b", "{aws_region}c"]
@@ -373,23 +380,23 @@ resource "aws_security_group" "web" {{
 }}
 
 resource "tls_private_key" "generated" {{
-  count     = var.enable_ec2 && trimspace(var.existing_ec2_key_pair_name) == "" ? 1 : 0
+  count     = var.enable_ec2 ? 1 : 0
   algorithm = "RSA"
   rsa_bits  = 4096
 }}
 
 resource "aws_key_pair" "generated" {{
-  count      = var.enable_ec2 && trimspace(var.existing_ec2_key_pair_name) == "" ? 1 : 0
-  key_name   = "${{var.project_name}}-key"
+  count      = var.enable_ec2 ? 1 : 0
+  key_name   = "${{var.project_name}}-${{var.ec2_key_rotation}}-key"
   public_key = tls_private_key.generated[0].public_key_openssh
+  tags = {{
+    Name             = "${{var.project_name}}-${{var.ec2_key_rotation}}-key"
+    "deplai:managed" = "true"
+  }}
 }}
 
 locals {{
-  selected_ec2_key_name = !var.enable_ec2 ? null : (
-    trimspace(var.existing_ec2_key_pair_name) != ""
-    ? trimspace(var.existing_ec2_key_pair_name)
-    : try(aws_key_pair.generated[0].key_name, null)
-  )
+  selected_ec2_key_name = var.enable_ec2 ? try(aws_key_pair.generated[0].key_name, null) : null
 }}
 
 data "aws_ami" "al2023" {{
@@ -415,6 +422,7 @@ resource "aws_instance" "app" {{
   vpc_security_group_ids      = [aws_security_group.web.id]
   key_name                    = local.selected_ec2_key_name
   associate_public_ip_address = true
+  user_data_replace_on_change = true
   tags                        = merge(local.tags, {{ Name = "${{var.project_name}}-app" }})
 
   metadata_options {{
@@ -429,6 +437,7 @@ resource "aws_instance" "app" {{
 
   user_data = <<-EOF
               #!/bin/bash
+              # deplai_key_rotation=${{var.ec2_key_rotation}}
               set -euo pipefail
               exec > /var/log/deplai-init.log 2>&1
 

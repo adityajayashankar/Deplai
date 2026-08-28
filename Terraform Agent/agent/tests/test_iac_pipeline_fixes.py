@@ -4,7 +4,7 @@ Covers:
 - Fix 1: NameError in _execute_run (project_id scope)
 - Fix 2: terraform_agent package importability
 - Fix 7: .env.template documents ANTHROPIC_API_KEY
-- Fix 8: All eight Terraform template directories exist
+- Fix 8: All Terraform template directories exist
 - Property 3: project_id forwarding in _execute_run (hypothesis PBT)
 """
 
@@ -113,12 +113,12 @@ class TestTerraformAgentImportable:
 # Fix 8: All eight Terraform template directories exist
 # ---------------------------------------------------------------------------
 
-EXPECTED_SERVICES = ["ec2", "s3", "rds", "vpc", "ecs", "lambda", "elasticache", "alb"]
+EXPECTED_SERVICES = ["ec2", "s3", "s3_cloudfront", "rds", "vpc", "ecs", "lambda", "elasticache", "alb"]
 TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "templates"
 
 
 class TestTemplateDirectoriesExist:
-    """Verify all eight service template directories are present and complete."""
+    """Verify all service template directories are present and complete."""
 
     @pytest.mark.parametrize("service", EXPECTED_SERVICES)
     def test_template_directory_exists(self, service: str):

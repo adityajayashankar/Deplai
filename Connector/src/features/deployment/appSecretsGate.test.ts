@@ -11,8 +11,9 @@ export function missingRequiredSecrets(meta: SecretMeta[]): string[] {
   return meta.filter((row) => row.required && !row.is_set).map((row) => row.key);
 }
 
-export function deployBlockedBySecrets(meta: SecretMeta[]): boolean {
-  return missingRequiredSecrets(meta).length > 0;
+export function deployBlockedBySecrets(_meta: SecretMeta[]): boolean {
+  // App secrets are optional — a static blog / CloudFront deploy must never be gated.
+  return false;
 }
 
 function assert(condition: unknown, message: string): void {
@@ -21,11 +22,11 @@ function assert(condition: unknown, message: string): void {
 
 function run(): void {
   assert(
-    deployBlockedBySecrets([
+    !deployBlockedBySecrets([
       { key: 'GOOGLE_CLIENT_ID', required: true, is_set: false },
       { key: 'OPTIONAL_KEY', required: false, is_set: false },
     ]),
-    'required unset key must block deploy',
+    'unset suggested keys must not block deploy',
   );
   assert(
     !deployBlockedBySecrets([

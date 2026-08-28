@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from chat_agent import ChatAgent
+from frontend_customization.api import router as frontend_customization_router
 from manifest_state import ManifestState
 from runner import run_customization
 from services.asset_service import (
@@ -28,7 +29,7 @@ from services.preview_manager import (
     start_preview,
     stop_preview,
 )
-from services.repo_service import get_tenant_repo_path, reset_tenant_repo
+from services.repo_service import containerize_connector_workspace_path, get_tenant_repo_path, reset_tenant_repo
 from services.snapshot_manager import (
     SnapshotError,
     create_snapshot,
@@ -40,16 +41,18 @@ from services.snapshot_manager import (
 
 
 class LlmConfig(BaseModel):
-    """Inbound BYOK config. api_key used in-memory only, never logged."""
-    provider: str
-    model: str
-    api_key: str
+    """Resolved platform/BYOK routing. Keys stay in the Connector vault, never here."""
+    provider: str = ""
+    model: str = ""
+    access_mode: str = "auto"
+    user_id: str | None = None
 
 
 class ChatRequest(BaseModel):
     tenant_id: str
     message: str
     llm_config: LlmConfig | None = None  # Optional BYOK override
+    user_id: str | None = None
 
 
 class ImplementRequest(BaseModel):
@@ -60,6 +63,7 @@ class ImplementRequest(BaseModel):
     pipeline_mode: str | None = None
     run_quality_gates: bool = True
     start_preview: bool = True
+    user_id: str | None = None
     llm_config: LlmConfig | None = None
 
 
@@ -94,6 +98,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(frontend_customization_router)
 
 state = ManifestState(base_dir=Path(__file__).resolve().parent)
 agent = ChatAgent(state=state)
@@ -113,6 +118,15 @@ SNAPSHOT_IGNORED_DIR_NAMES = {
     ".pytest_cache",
     ".mypy_cache",
 }
+
+
+def _bind_llm(config: LlmConfig | None, user_id: str | None) -> LlmConfig | None:
+    uid = (user_id or "").strip()
+    if config is None:
+        return LlmConfig(user_id=uid) if uid else None
+    if uid and not (config.user_id or "").strip():
+        config.user_id = uid
+    return config
 
 
 @app.get("/health")
@@ -153,10 +167,13 @@ def _load_saved_manifest(tenant_id: str) -> dict:
 
 
 def _resolve_base_repo_path(raw_base_repo_path: str | None) -> Path:
-    candidate = Path(raw_base_repo_path).expanduser().resolve() if raw_base_repo_path else BASE_REPO_PATH.resolve()
-    if not candidate.exists() or not candidate.is_dir():
-        raise HTTPException(status_code=400, detail=f"Base repository path is invalid or missing: {candidate}")
-    return candidate
+    if raw_base_repo_path:
+        candidate = Path(containerize_connector_workspace_path(raw_base_repo_path)).expanduser()
+    else:
+        candidate = BASE_REPO_PATH.resolve()
+    if candidate.exists() and candidate.is_dir():
+        return candidate.resolve()
+    raise HTTPException(status_code=400, detail=f"Base repository path is invalid or missing: {candidate}")
 
 
 def _is_within_root(root: Path, candidate: Path) -> bool:
@@ -325,7 +342,7 @@ def chat(request: ChatRequest) -> dict:
         raise HTTPException(status_code=400, detail="tenant_id is required.")
     normalized_tenant_id = state.ensure_tenant(tenant_id)
     try:
-        result = agent.handle_message(normalized_tenant_id, request.message, byok_config=request.llm_config)
+        result = agent.handle_message(normalized_tenant_id, request.message, byok_config=_bind_llm(request.llm_config, request.user_id))
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     result["confirmation"] = state.get_confirmation_state(normalized_tenant_id)
@@ -399,7 +416,7 @@ def implement_tenant(request: ImplementRequest) -> dict:
             pipeline_mode=request.pipeline_mode,
             run_quality_gates_enabled=request.run_quality_gates,
             start_preview_enabled=request.start_preview,
-            byok_config=request.llm_config,
+            byok_config=_bind_llm(request.llm_config, request.user_id),
         )
     except ManifestValidationError as exc:
         raise HTTPException(

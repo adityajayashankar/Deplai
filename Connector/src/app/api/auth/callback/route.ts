@@ -216,6 +216,13 @@ export async function GET(request: NextRequest) {
       user = { id: userId };
     }
 
+    try {
+      const { ensureUserBilling } = await import('@/lib/billing/credits');
+      await ensureUserBilling(user.id);
+    } catch (billingError) {
+      console.warn('Failed to provision free-tier credits after login:', billingError);
+    }
+
     session.user = {
       id: user.id,
       githubId: githubUser.id,

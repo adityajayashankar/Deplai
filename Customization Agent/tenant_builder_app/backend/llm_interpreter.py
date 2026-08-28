@@ -987,34 +987,58 @@ class LLMInterpreter:
         )
 
     def _call_llm(self, prompt: str, byok_config: Any | None = None) -> str:
-        # If the user provisioned their own key via BYOK, use it directly.
-        if byok_config is not None:
+        user_id = str(getattr(byok_config, "user_id", "") or "").strip() if byok_config is not None else ""
+        api_key = str(getattr(byok_config, "api_key", "") or "").strip() if byok_config is not None else ""
+        model = (str(getattr(byok_config, "model", "") or "").strip() if byok_config is not None else "") or self.MODEL
+        provider = str(getattr(byok_config, "provider", "") or "").strip() if byok_config is not None else ""
+        access_mode = str(getattr(byok_config, "access_mode", "") or "auto").strip() if byok_config is not None else "auto"
+
+        if user_id and not api_key:
+            try:
+                from services.ai_gateway import chat_via_gateway, gateway_enabled
+                if gateway_enabled():
+                    return chat_via_gateway(
+                        user_id=user_id,
+                        model=model or "best",
+                        system_prompt=(
+                            "You extract safe tenant manifest patches and must return strict JSON only. "
+                            "If the user explicitly indicates that no further changes are required, you must stop asking questions."
+                        ),
+                        user_prompt=prompt,
+                        provider=provider or None,
+                        access_mode=access_mode,
+                        temperature=0.1,
+                        max_tokens=1200,
+                    )
+            except Exception:
+                pass
+
+        if api_key:
             from services.llm_provider_config import LLMProviderConfig, GROQ_API_URL, OPENROUTER_API_URL
             ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
             OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-            MINIMAX_API_URL = "https://api.minimax.chat/v1/chat/completions"
-            provider_id = (byok_config.provider or "").strip().lower()
+            GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+            MINIMAX_API_URL = "https://api.minimax.io/v1/text/chatcompletion_v2"
+            provider_id = provider.lower()
             provider_url_map = {
                 "claude": ("anthropic", ANTHROPIC_API_URL),
                 "anthropic": ("anthropic", ANTHROPIC_API_URL),
                 "openai": ("openai", OPENAI_API_URL),
+                "google": ("google", GEMINI_API_URL),
+                "gemini": ("google", GEMINI_API_URL),
                 "groq": ("groq", GROQ_API_URL),
                 "grroq": ("groq", GROQ_API_URL),
                 "openrouter": ("openrouter", OPENROUTER_API_URL),
                 "minimax": ("openai", MINIMAX_API_URL),
             }
             provider_norm, api_url = provider_url_map.get(provider_id, (provider_id, OPENAI_API_URL))
-            # Security: key used in-memory only, never logged
             jit_config = LLMProviderConfig(
                 provider=provider_norm,
                 api_url=api_url,
-                model=byok_config.model or self.MODEL,
-                api_key=byok_config.api_key,
+                model=model or self.MODEL,
+                api_key=api_key,
             )
-            result = self._call_llm_with_config(prompt=prompt, config=jit_config)
-            # Immediately clear reference to the key-carrying object
-            jit_config = None  # type: ignore[assignment]
-            return result
+            return self._call_llm_with_config(prompt=prompt, config=jit_config)
 
         failures: list[str] = []
         for config in resolve_llm_provider_configs():

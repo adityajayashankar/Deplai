@@ -51,11 +51,31 @@ if "docker.errors" not in sys.modules:
     sys.modules["docker.errors"] = docker_errors_stub
 
 from terraform_apply import (
+    _bundle_requests_ec2,
+    _canonical_postgres_engine_version,
+    _collect_one_time_credentials,
+    _collect_root_terraform_text,
+    _collect_terraform_text,
+    _collect_tfvars_text,
+    _database_env_from_secret,
     _discover_existing_ec2_key_pair_name,
+    _ec2_addresses_from_state_list,
+    _ensure_ecr_pull_policy,
+    _ensure_unique_ec2_key_pair,
+    _is_missing_default_vpc_error,
+    _is_transient_aws_api_error,
     _legacy_runtime_bundle_needs_remediation,
+    _terraform_run_kwargs,
+    _transient_aws_api_error_message,
+    _missing_required_ec2_error,
     _normalize_aws_provider_to_registry_pin,
+    _normalize_rds_engine_versions,
+    _region_has_default_vpc,
     _remediate_legacy_runtime_bundle,
+    _rewrite_hard_default_vpc_lookup,
     _summarize_ec2_plan_changes,
+    _terraform_has_aws_instance,
+    _terraform_has_variable,
     rewrite_ec2_module_v5_compat,
 )
 
@@ -370,6 +390,40 @@ class TerraformApplyKeyPairDiscoveryTests(unittest.TestCase):
         self.assertIn("to_port     = 80", patched)
         self.assertNotIn("from_port   = var.app_port", patched)
 
+    def test_skips_nginx_ingress_rewrite_when_port_80_already_open(self) -> None:
+        files = [
+            {
+                "path": "terraform/modules/compute/main.tf",
+                "content": '\n'.join(
+                    [
+                        'resource "aws_security_group" "app" {',
+                        "  ingress {",
+                        "    from_port   = 80",
+                        "    to_port     = 80",
+                        '    protocol    = "tcp"',
+                        '    cidr_blocks = ["0.0.0.0/0"]',
+                        "  }",
+                        "  ingress {",
+                        "    from_port   = var.app_port",
+                        "    to_port     = var.app_port",
+                        '    protocol    = "tcp"',
+                        '    cidr_blocks = ["0.0.0.0/0"]',
+                        "  }",
+                        "}",
+                        'module "ec2" {',
+                        '  user_data = join("\\n", [',
+                        '    "#!/bin/bash",',
+                        '    "dnf install -y nginx"',
+                        "  ])",
+                        "}",
+                    ]
+                ),
+            },
+        ]
+        patched_files, remediation = _remediate_legacy_runtime_bundle(files, None)
+        self.assertFalse(remediation.get("legacy_nginx_ingress_port_fixed"))
+        self.assertIn("from_port   = var.app_port", patched_files[0]["content"])
+
     def test_clean_bundle_skips_legacy_runtime_remediation(self) -> None:
         files = [
             {
@@ -514,7 +568,9 @@ module "ec2" {
             r"count\s*=\s*var\.enabled\s*&&\s*!local\.use_existing_key",
         )
         key_slice = content.split('module "ec2"')[0]
-        self.assertIn("var.enabled && !local.use_existing_key", key_slice)
+        self.assertNotIn("var.enabled && !local.use_existing_key", key_slice)
+        self.assertIn("${var.project_name}-${var.environment}-${var.ec2_key_rotation}-key", key_slice)
+        self.assertIn("use_existing_key = false", key_slice)
 
 
     def test_second_pass_does_not_bleed_key_count_into_ec2(self) -> None:
@@ -558,6 +614,78 @@ module "ec2" {
             ec2_slice,
             r"count\s*=\s*var\.enabled\s*&&\s*!local\.use_existing_key",
         )
+        key_slice = content.split('module "ec2"')[0]
+        self.assertNotIn("var.enabled && !local.use_existing_key", key_slice)
+        self.assertIn("${var.project_name}-${var.environment}-${var.ec2_key_rotation}-key", key_slice)
+
+
+class UniqueEc2KeyPairTests(unittest.TestCase):
+    def test_ensure_unique_key_rewrites_static_name_and_disables_reuse(self) -> None:
+        files = [
+            {
+                "path": "terraform/variables.tf",
+                "content": 'variable "project_name" { type = string }\n',
+            },
+            {
+                "path": "terraform/modules/compute/main.tf",
+                "content": """
+locals {
+  use_existing_key = trimspace(var.existing_ec2_key_pair_name) != ""
+  ec2_key_name     = local.use_existing_key ? trimspace(var.existing_ec2_key_pair_name) : aws_key_pair.generated[0].key_name
+}
+
+resource "tls_private_key" "generated" {
+  count     = var.enabled && !local.use_existing_key ? 1 : 0
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+resource "aws_key_pair" "generated" {
+  count      = var.enabled && !local.use_existing_key ? 1 : 0
+  key_name   = "${var.project_name}-${var.environment}-key"
+  public_key = tls_private_key.generated[0].public_key_openssh
+}
+""",
+            },
+        ]
+        patched, details = _ensure_unique_ec2_key_pair(files)
+        combined = "\n".join(str(item["content"]) for item in patched)
+        self.assertTrue(details.get("unique_ec2_key_rotation_var_added"))
+        self.assertTrue(details.get("unique_ec2_key_name_rewritten"))
+        self.assertTrue(details.get("unique_ec2_key_always_generated"))
+        self.assertIn('variable "ec2_key_rotation"', combined)
+        self.assertIn("${var.project_name}-${var.environment}-${var.ec2_key_rotation}-key", combined)
+        self.assertNotIn("var.enabled && !local.use_existing_key", combined)
+        self.assertIn("use_existing_key = false", combined)
+
+    def test_database_env_from_secret_includes_url(self) -> None:
+        env = _database_env_from_secret({
+            "username": "app",
+            "password": "p@ss:word",
+            "host": "db.internal",
+            "port": 5432,
+            "dbname": "appdb",
+            "engine": "postgres",
+        })
+        self.assertIn("PGPASSWORD=p@ss:word", env)
+        self.assertIn("DATABASE_URL=postgresql://app:p%40ss%3Aword@db.internal:5432/appdb", env)
+
+    def test_collect_one_time_credentials_names_pem_with_instance_id(self) -> None:
+        creds = _collect_one_time_credentials(
+            {
+                "generated_ec2_private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----",
+                "ec2_key_name": "ifca-prod-a1b2c3d4-key",
+                "ec2_instance_id": "i-07e9f26a97ffe42ed",
+            },
+            project_name="ifca",
+            aws_region="eu-north-1",
+            aws_access_key_id="",
+            aws_secret_access_key="",
+            aws_session_token=None,
+        )
+        self.assertEqual(creds["key_file_name"], "ifca-prod-a1b2c3d4-key-i-07e9f26a97ffe42ed.pem")
+        self.assertTrue(creds["download_once"])
+        self.assertIn("BEGIN RSA PRIVATE KEY", creds["private_key_pem"])
 
 
 class AwsProviderRegistryPinTests(unittest.TestCase):
@@ -590,6 +718,374 @@ module "ec2" {
         versions = str(patched[0]["content"])
         self.assertIn('version = "~> 5.100.0"', versions)
         self.assertNotIn("~> 6.0", versions)
+
+
+class MissingDefaultVpcTests(unittest.TestCase):
+    def test_detects_no_matching_ec2_vpc_error(self) -> None:
+        self.assertTrue(
+            _is_missing_default_vpc_error(
+                "Error: no matching EC2 VPC found with data.aws_vpc.default[0], "
+                'on main.tf line 31, in data "aws_vpc" "default":'
+            )
+        )
+        self.assertTrue(_is_missing_default_vpc_error("Default VPC not found in eu-north-1"))
+        self.assertTrue(_is_missing_default_vpc_error("no default VPC in this region"))
+        self.assertFalse(_is_missing_default_vpc_error("VpcLimitExceeded"))
+        self.assertFalse(_is_missing_default_vpc_error(""))
+
+
+class TransientAwsApiErrorTests(unittest.TestCase):
+    def test_classifies_docker_dns_failure_during_rds_wait(self) -> None:
+        log = (
+            'Error: waiting for RDS DB Instance (postgres-83a1d527) create: operation error RDS: '
+            'DescribeDBInstances, https response error StatusCode: 0, RequestID: , request send failed, '
+            'Post "https://rds.eu-north-1.amazonaws.com/": dial tcp: lookup rds.eu-north-1.amazonaws.com '
+            'on 192.168.65.7:53: no such host'
+        )
+        self.assertTrue(_is_transient_aws_api_error(log))
+        message = _transient_aws_api_error_message(log)
+        self.assertIn("postgres-83a1d527", message)
+        self.assertIn("Redeploy", message)
+        self.assertIn("do not destroy", message.lower())
+
+    def test_ignores_quota_and_auth_failures(self) -> None:
+        self.assertFalse(_is_transient_aws_api_error("VcpuLimitExceeded: you have reached"))
+        self.assertFalse(_is_transient_aws_api_error("UnauthorizedOperation: not authorized"))
+        self.assertFalse(_is_transient_aws_api_error(""))
+
+    def test_terraform_containers_use_public_dns(self) -> None:
+        kwargs = _terraform_run_kwargs("vol-1", {"AWS_DEFAULT_REGION": "eu-north-1"})
+        self.assertEqual(kwargs["dns"], ["8.8.8.8", "1.1.1.1"])
+        self.assertEqual(kwargs["volumes"]["vol-1"]["bind"], "/workspace")
+
+
+class MissingDefaultVpcRuntimeTests(unittest.TestCase):
+    def test_region_has_default_vpc_true_false_or_unknown(self) -> None:
+        class Present:
+            def describe_vpcs(self, Filters=None):
+                return {"Vpcs": [{"VpcId": "vpc-123"}]}
+
+        class Absent:
+            def describe_vpcs(self, Filters=None):
+                return {"Vpcs": []}
+
+        class Denied:
+            def describe_vpcs(self, Filters=None):
+                raise RuntimeError("AccessDenied")
+
+        self.assertTrue(_region_has_default_vpc(Present()))
+        self.assertFalse(_region_has_default_vpc(Absent()))
+        self.assertIsNone(_region_has_default_vpc(Denied()))
+
+    def test_rewrites_hard_default_vpc_lookup_to_optional_list(self) -> None:
+        files = [
+            {
+                "path": "terraform/main.tf",
+                "content": """
+data "aws_vpc" "default" {
+  count   = var.use_default_vpc ? 1 : 0
+  default = true
+}
+
+data "aws_subnets" "default" {
+  count = var.use_default_vpc ? 1 : 0
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default[0].id]
+  }
+}
+
+resource "aws_vpc" "main" {
+  count                = var.use_default_vpc ? 0 : 1
+  cidr_block           = "10.52.0.0/16"
+}
+
+locals {
+  selected_vpc_id = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
+}
+""",
+            }
+        ]
+        patched, remediation = _rewrite_hard_default_vpc_lookup(files)
+        content = str(patched[0]["content"])
+        self.assertTrue(remediation["default_vpc_lookup_softened"])
+        self.assertIn('data "aws_vpcs" "default"', content)
+        self.assertIn("local.has_default_vpc", content)
+        self.assertNotIn("default = true", content)
+        self.assertIn("count = local.has_default_vpc ? 1 : 0", content)
+        self.assertIn("count                = local.has_default_vpc ? 0 : 1", content)
+        self.assertIn("selected_vpc_id = local.has_default_vpc ? data.aws_vpc.default[0].id", content)
+        self.assertIn("deplai_prefer_default_vpc = var.use_default_vpc", content)
+        self.assertNotIn("try(var.use_default_vpc, true)", content)
+
+    def test_skips_rewrite_when_default_vpc_lookup_is_already_soft(self) -> None:
+        files = [
+            {
+                "path": "terraform/main.tf",
+                "content": """
+data "aws_vpcs" "default" {
+  filter {
+    name   = "isDefault"
+    values = ["true"]
+  }
+}
+
+locals {
+  has_default_vpc = var.use_default_vpc && length(data.aws_vpcs.default.ids) > 0
+}
+
+data "aws_vpc" "default" {
+  count = local.has_default_vpc ? 1 : 0
+  id    = data.aws_vpcs.default.ids[0]
+}
+""",
+            }
+        ]
+        patched, remediation = _rewrite_hard_default_vpc_lookup(files)
+        self.assertFalse(remediation["default_vpc_lookup_softened"])
+        self.assertEqual(patched[0]["content"], files[0]["content"])
+
+    def test_rewrite_stays_inside_networking_module_for_enterprise_bundle(self) -> None:
+        files = [
+            {
+                "path": "terraform/main.tf",
+                "content": """
+module "networking" {
+  source           = "./modules/networking"
+  use_existing_vpc = var.use_existing_vpc || var.use_default_vpc
+}
+""",
+            },
+            {
+                "path": "terraform/variables.tf",
+                "content": """
+variable "use_existing_vpc" {
+  type    = bool
+  default = false
+}
+
+variable "use_default_vpc" {
+  type    = bool
+  default = false
+}
+""",
+            },
+            {
+                "path": "terraform/modules/networking/main.tf",
+                "content": """
+data "aws_vpc" "default" {
+  count   = var.use_existing_vpc ? 1 : 0
+  default = true
+}
+
+data "aws_subnets" "default" {
+  count = var.use_existing_vpc ? 1 : 0
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default[0].id]
+  }
+}
+
+resource "aws_vpc" "main" {
+  count                = var.use_existing_vpc || var.use_registry_vpc ? 0 : 1
+  cidr_block           = "10.42.0.0/16"
+}
+
+locals {
+  vpc_id = var.use_existing_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
+}
+""",
+            },
+            {
+                "path": "terraform/modules/networking/variables.tf",
+                "content": """
+variable "use_existing_vpc" { type = bool }
+variable "use_registry_vpc" {
+  type    = bool
+  default = false
+}
+""",
+            },
+        ]
+        patched, remediation = _rewrite_hard_default_vpc_lookup(files)
+        root = str(patched[0]["content"])
+        networking = str(patched[2]["content"])
+        networking_vars = str(patched[3]["content"])
+        self.assertTrue(remediation["default_vpc_lookup_softened"])
+        self.assertIn("use_existing_vpc = var.use_existing_vpc || var.use_default_vpc", root)
+        self.assertNotIn("local.has_default_vpc", root)
+        self.assertIn('data "aws_vpcs" "default"', networking)
+        self.assertIn("deplai_prefer_default_vpc = var.use_existing_vpc", networking)
+        self.assertNotIn("try(var.use_default_vpc, true)", networking)
+        self.assertNotIn("var.use_default_vpc", networking)
+        self.assertIn("count = local.has_default_vpc ? 1 : 0", networking)
+        self.assertIn("count                = local.has_default_vpc || var.use_registry_vpc ? 0 : 1", networking)
+        self.assertIn("vpc_id = local.has_default_vpc ? data.aws_vpc.default[0].id", networking)
+        self.assertIn('variable "use_existing_vpc"', networking_vars)
+
+
+class TerraformApplyRootVariableTests(unittest.TestCase):
+    def test_cli_vars_ignore_module_only_use_default_vpc(self) -> None:
+        files = [
+            {
+                "path": "terraform/variables.tf",
+                "content": 'variable "aws_region" {\n  type = string\n}\n',
+            },
+            {
+                "path": "terraform/modules/networking/variables.tf",
+                "content": 'variable "use_default_vpc" {\n  type = bool\n  default = true\n}\n',
+            },
+        ]
+        all_text = _collect_terraform_text(files)
+        root_text = _collect_root_terraform_text(files)
+        self.assertTrue(_terraform_has_variable(all_text, "use_default_vpc"))
+        self.assertFalse(_terraform_has_variable(root_text, "use_default_vpc"))
+        self.assertTrue(_terraform_has_variable(root_text, "aws_region"))
+
+
+class TerraformApplyEc2FailClosedTests(unittest.TestCase):
+    def test_detects_registry_ec2_module(self) -> None:
+        tf_text = """
+module "ec2" {
+  source  = "terraform-aws-modules/ec2-instance/aws"
+  version = "5.8.0"
+}
+"""
+        self.assertTrue(_terraform_has_aws_instance(tf_text))
+
+    def test_runtime_bundle_with_disabled_rds_still_requests_ec2(self) -> None:
+        files = [
+            {
+                "path": "terraform/main.tf",
+                "content": """
+module "ec2" {
+  source  = "terraform-aws-modules/ec2-instance/aws"
+  version = "5.8.0"
+}
+resource "aws_db_instance" "app" {
+  count = var.enable_rds ? 1 : 0
+}
+""",
+            },
+            {
+                "path": "terraform/terraform.tfvars",
+                "content": 'enable_ec2 = true\nenable_rds = false\n',
+            },
+        ]
+        tf_text = _collect_terraform_text(files)
+        tfvars = _collect_tfvars_text(files)
+        self.assertTrue(_bundle_requests_ec2(tf_text, tfvars))
+
+    def test_static_site_strategy_does_not_require_ec2(self) -> None:
+        tf_text = """
+module "ec2" {
+  source  = "terraform-aws-modules/ec2-instance/aws"
+  version = "5.8.0"
+}
+"""
+        tfvars = 'compute_strategy = "s3_cloudfront"\n'
+        self.assertFalse(_bundle_requests_ec2(tf_text, tfvars))
+
+    def test_missing_ec2_is_an_error_even_with_rds_in_bundle(self) -> None:
+        error = _missing_required_ec2_error(
+            requests_ec2=True,
+            ec2_fallback_applied=False,
+            ec2_state_resources=[],
+            ec2_output_evidence={},
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("no EC2 instance", error or "")
+
+    def test_quota_fallback_without_instance_is_an_error(self) -> None:
+        error = _missing_required_ec2_error(
+            requests_ec2=True,
+            ec2_fallback_applied=True,
+            ec2_state_resources=[],
+            ec2_output_evidence={},
+        )
+        self.assertIsNotNone(error)
+        self.assertIn("quota fallback", error or "")
+
+    def test_state_list_finds_nested_registry_instance(self) -> None:
+        rows = _ec2_addresses_from_state_list(
+            "module.compute.module.ec2[0].aws_instance.this[0]\naws_security_group.app\n"
+        )
+        self.assertEqual(rows, ["module.compute.module.ec2[0].aws_instance.this[0]"])
+
+
+class TerraformApplyRdsEngineVersionTests(unittest.TestCase):
+    def test_canonicalizes_docker_latest_and_retired_minors(self) -> None:
+        self.assertEqual(_canonical_postgres_engine_version("latest"), "15.17")
+        self.assertEqual(_canonical_postgres_engine_version("16-alpine"), "16.13")
+        self.assertEqual(_canonical_postgres_engine_version("15.5"), "15.17")
+        self.assertEqual(_canonical_postgres_engine_version("15.17"), "15.17")
+
+    def test_rewrites_latest_variable_default_before_apply(self) -> None:
+        files = [
+            {
+                "path": "terraform/variables.tf",
+                "content": 'variable "postgres_engine_version" {\n  type    = string\n  default = "latest"\n}\n',
+            },
+            {
+                "path": "terraform/modules/data/main.tf",
+                "content": 'resource "aws_db_instance" "postgres" {\n  engine_version = var.postgres_engine_version\n}\n',
+            },
+            {
+                "path": "terraform/terraform.tfvars",
+                "content": 'project_name = "demo"\n',
+            },
+        ]
+        patched = _normalize_rds_engine_versions(files)
+        variables = str(patched[0]["content"])
+        self.assertIn('default = "15.17"', variables)
+        self.assertNotIn('default = "latest"', variables)
+        data = str(patched[1]["content"])
+        self.assertIn('contains(["", "latest", "lts", "stable", "current", "alpine"]', data)
+        self.assertIn("15.17", data)
+        tfvars = str(patched[2]["content"])
+        self.assertIn('postgres_engine_version = "15.17"', tfvars)
+
+    def test_rewrites_var_engine_version_assignment_before_apply(self) -> None:
+        files = [
+            {
+                "path": "terraform/modules/data/main.tf",
+                "content": 'resource "aws_db_instance" "postgres" {\n  engine_version              = var.postgres_engine_version\n}\n',
+            },
+            {
+                "path": "terraform/variables.tf",
+                "content": 'variable "postgres_engine_version" {\n  type    = string\n  default = "latest"\n}\n',
+            },
+        ]
+        patched = _normalize_rds_engine_versions(files)
+        data = str(patched[0]["content"])
+        self.assertIn("contains([", data)
+        self.assertNotIn("engine_version              = var.postgres_engine_version", data)
+
+
+class EcrPullPolicyInjectTests(unittest.TestCase):
+    def test_injects_ecr_pull_when_instance_role_exists(self) -> None:
+        files = [
+            {
+                "path": "terraform/modules/iam/main.tf",
+                "content": 'resource "aws_iam_role" "ec2" {\n  name_prefix = "app-"\n}\n',
+                "encoding": "utf-8",
+            }
+        ]
+        patched = _ensure_ecr_pull_policy(files)
+        text = str(patched[0]["content"])
+        self.assertIn("ecr:GetAuthorizationToken", text)
+        self.assertIn("ecr:BatchGetImage", text)
+
+    def test_skips_when_ecr_permission_already_present(self) -> None:
+        files = [
+            {
+                "path": "terraform/modules/iam/main.tf",
+                "content": 'resource "aws_iam_role" "ec2" {}\n# ecr:GetAuthorizationToken already\n',
+                "encoding": "utf-8",
+            }
+        ]
+        patched = _ensure_ecr_pull_policy(files)
+        self.assertEqual(patched[0]["content"], files[0]["content"])
 
 
 if __name__ == "__main__":

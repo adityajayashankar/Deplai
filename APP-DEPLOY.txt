@@ -1,0 +1,1693 @@
+# DEPLAI — Deployment Execution Hardening & End-to-End Reliability
+
+You are continuing work on the existing Deplai codebase.
+
+A Deployment Execution Engine has already been implemented for:
+
+```text
+AWS EC2
++
+Docker
++
+Amazon ECR
++
+AWS Systems Manager (SSM)
+```
+
+The current implementation already includes:
+
+* Deployment Contract
+* Deployment Blueprint
+* allowlisted deployment operations
+* SSM execution adapter
+* SSH disabled by default
+* fake adapter for tests
+* environment locking
+* retry classification
+* secret redaction
+* rollback to previous immutable digest
+* preflight
+* deployment APIs
+* deployment UI/timeline
+* ECR artifact validation
+* Docker/SSM host setup
+* deployment state handling
+* initial tests
+
+Do NOT rebuild this system.
+
+Your job is to **audit, harden, test, and improve the existing implementation so that a real production deployment can survive failure, restart, retry, rollback, and concurrency safely.**
+
+The objective is to turn the existing v1 implementation into a reliable production deployment subsystem.
+
+---
+
+# 1. FIRST: INSPECT BEFORE MODIFYING
+
+Before changing code, inspect the existing repository and identify:
+
+```text
+Deployment Execution Engine
+Deployment Contract
+Deployment Blueprint
+State machine
+LangGraph integration
+AWS clients
+SSM adapter
+SSH adapter
+ECR integration
+Docker executor
+Database models
+Deployment APIs
+Background workers
+Queues
+Locks
+Checkpoints
+Secrets
+UI
+DAST integration
+Existing tests
+```
+
+Create an internal architecture map:
+
+```text
+Existing component
+        ↓
+Current responsibility
+        ↓
+Potential issue
+        ↓
+Required hardening
+```
+
+Reuse existing abstractions.
+
+Do not create duplicate:
+
+* deployment engines
+* AWS clients
+* state machines
+* queues
+* secret stores
+* locking systems
+* logging systems
+* UI components
+
+---
+
+# 2. PRIMARY GOAL
+
+The hardened deployment lifecycle must be:
+
+```text
+Deployment Request
+      ↓
+Deployment Contract
+      ↓
+Immutable Execution Snapshot
+      ↓
+Target Resolution
+      ↓
+Preflight
+      ↓
+Environment Lock
+      ↓
+Artifact Verification
+      ↓
+SSM Connectivity
+      ↓
+Host Capability Discovery
+      ↓
+Host Readiness
+      ↓
+Application Deployment
+      ↓
+Runtime Verification
+      ↓
+Health Check
+      ↓
+External Endpoint Verification
+      ↓
+Smoke Test
+      ↓
+Deployment Verified
+      ↓
+DAST / Post-Deploy Security
+      ↓
+Deployment Complete
+```
+
+Failure:
+
+```text
+Failure
+  ↓
+Classify
+  ↓
+Retry if safe
+  ↓
+Recover
+  ↓
+Rollback if necessary
+  ↓
+Verify rollback
+  ↓
+Final deterministic state
+```
+
+---
+
+# 3. HARD REQUIREMENT — IMMUTABLE DEPLOYMENT SNAPSHOT
+
+Once execution begins:
+
+```text
+Deployment Contract
+        ↓
+Deployment Blueprint
+        ↓
+Immutable Execution Snapshot
+```
+
+must be created.
+
+Persist:
+
+```text
+deployment_id
+contract_version
+blueprint_version
+blueprint_hash
+source_commit
+artifact_id
+image
+digest
+target
+environment
+strategy
+timestamp
+```
+
+After execution begins, UI or agents must not mutate the active deployment blueprint.
+
+Every step/event must reference the immutable snapshot.
+
+This ensures we can prove:
+
+> Exactly what was approved and exactly what was executed.
+
+---
+
+# 4. ARTIFACT INTEGRITY
+
+Harden artifact validation.
+
+The deployment must verify:
+
+```text
+project
+artifact
+registry
+repository
+image
+digest
+artifact status
+```
+
+Artifact must be:
+
+```text
+VERIFIED
+```
+
+or:
+
+```text
+PROMOTED
+```
+
+according to the existing Deplai artifact lifecycle.
+
+The executor must never deploy an arbitrary tag without verifying its immutable digest.
+
+Required lifecycle:
+
+```text
+Requested artifact
+      ↓
+Resolve digest
+      ↓
+Compare with approved digest
+      ↓
+PASS
+      ↓
+Pull image
+      ↓
+Inspect actual image digest
+      ↓
+Compare again
+      ↓
+PASS
+      ↓
+Start application
+```
+
+If any digest mismatch occurs:
+
+```text
+ARTIFACT_INTEGRITY_FAILED
+```
+
+and deployment must stop.
+
+---
+
+# 5. ENVIRONMENT ABSTRACTION
+
+Ensure the deployment operates against:
+
+```text
+Project
+   ↓
+Environment
+   ↓
+Target
+```
+
+rather than using raw EC2 IDs as the primary product abstraction.
+
+For example:
+
+```text
+Project
+ ├── Development
+ ├── Staging
+ └── Production
+```
+
+Each environment resolves its active deployment target.
+
+The EC2 instance is an implementation detail.
+
+The user-facing deployment operation should conceptually be:
+
+```text
+Deploy artifact X
+to environment Y
+```
+
+not:
+
+```text
+Run deployment on EC2 instance Z
+```
+
+---
+
+# 6. TARGET OWNERSHIP VALIDATION
+
+Before execution, verify:
+
+```text
+project
+environment
+AWS account
+AWS region
+target
+EC2 instance
+```
+
+The target must be associated with the Deplai project/environment requesting deployment.
+
+Reject:
+
+```text
+unknown instance
+wrong project
+wrong environment
+wrong account
+wrong region
+```
+
+Never trust a raw user-supplied EC2 instance ID without server-side validation.
+
+---
+
+# 7. ENVIRONMENT LOCKING
+
+Audit the existing lock implementation.
+
+Guarantee:
+
+```text
+At most one active deployment
+per environment
+```
+
+unless an explicitly supported deployment strategy permits otherwise.
+
+Test:
+
+```text
+Deployment A
+    ↓
+RUNNING
+
+Deployment B
+    ↓
+QUEUED / REJECTED
+```
+
+Prevent:
+
+```text
+deployment A modifies environment
+deployment B modifies same environment simultaneously
+```
+
+The lock must survive:
+
+```text
+worker crash
+process restart
+timeout
+deployment failure
+rollback
+```
+
+Avoid stale locks.
+
+Implement safe lease/heartbeat behavior if the existing architecture requires it.
+
+---
+
+# 8. PREVIOUS VERSION TRACKING
+
+At deployment start resolve and persist:
+
+```text
+previous_artifact
+previous_digest
+current_artifact
+current_digest
+```
+
+Do this BEFORE modifying the target.
+
+Rollback must use the actual previous immutable artifact.
+
+Do not try to reconstruct previous state from Git.
+
+---
+
+# 9. SSM HARDENING
+
+SSM remains the primary execution mechanism.
+
+Verify:
+
+```text
+EC2 running
+SSM managed instance
+PingStatus = Online
+expected AWS account
+expected region
+expected instance
+```
+
+Implement clear errors:
+
+```text
+SSM_OFFLINE
+SSM_TIMEOUT
+SSM_PERMISSION_DENIED
+SSM_COMMAND_FAILED
+```
+
+Every remote operation must have:
+
+```text
+timeout
+attempt
+execution ID
+stdout
+stderr
+exit code
+started_at
+completed_at
+```
+
+Do not allow infinite waits.
+
+---
+
+# 10. SSH MUST REMAIN DISABLED
+
+Maintain:
+
+```text
+DEPLOY_EXEC_ALLOW_SSH=0
+```
+
+Do not silently enable SSH fallback.
+
+If SSH support exists, ensure:
+
+```text
+disabled by default
+explicit feature flag required
+audited
+policy controlled
+```
+
+Tests must explicitly verify SSH remains disabled.
+
+---
+
+# 11. HOST CAPABILITY DISCOVERY
+
+Before deployment collect actual host state:
+
+```text
+OS
+OS version
+architecture
+CPU
+memory
+disk
+Docker installed
+Docker version
+Docker daemon running
+SSM connectivity
+available disk
+available memory
+current deployment
+current container
+current image digest
+runtime versions
+```
+
+The result must be structured.
+
+The LLM must not guess host state.
+
+---
+
+# 12. HOST READINESS GATE
+
+Define:
+
+```text
+HOST_READY
+```
+
+only when required prerequisites are satisfied.
+
+At minimum:
+
+```text
+SSM online
+Docker installed
+Docker daemon running
+sufficient disk
+sufficient memory
+artifact access
+required configuration available
+required port conditions satisfied
+```
+
+If Docker is missing, controlled SSM-based installation may occur.
+
+But installation must be:
+
+```text
+idempotent
+logged
+audited
+policy-controlled
+```
+
+Separate:
+
+```text
+HOST_PREPARATION
+```
+
+from:
+
+```text
+APPLICATION_DEPLOYMENT
+```
+
+in the audit trail.
+
+---
+
+# 13. SECRET HANDLING AUDIT
+
+Search the implementation for accidental secret leakage.
+
+Check:
+
+```text
+logs
+stdout
+stderr
+exceptions
+database
+events
+API responses
+frontend
+command strings
+Docker configuration
+SSM payloads
+```
+
+Secrets must never appear in plaintext.
+
+Deployment blueprints should contain references:
+
+```text
+Secrets Manager
+SSM Parameter Store
+Deplai secret reference
+```
+
+not values.
+
+Redaction should support:
+
+```text
+exact known secrets
+tokens
+API keys
+passwords
+credential-like fields
+authorization headers
+```
+
+Do not break logs while redacting sensitive data.
+
+---
+
+# 14. COMMAND EXECUTION SECURITY
+
+Audit every place where commands are constructed.
+
+Reject:
+
+```text
+arbitrary user command
+arbitrary LLM command
+raw shell string interpolation
+unsafe argument concatenation
+```
+
+Allowed operations must remain explicit.
+
+Conceptually:
+
+```text
+operation
+   ↓
+validated input
+   ↓
+deterministic adapter
+   ↓
+safe execution
+```
+
+Never:
+
+```text
+LLM output
+   ↓
+shell
+```
+
+directly.
+
+---
+
+# 15. OPERATION CONTRACTS
+
+Every allowlisted operation should expose:
+
+```text
+name
+input schema
+output schema
+preconditions
+postconditions
+timeout
+retry policy
+idempotency behavior
+security policy
+redaction rules
+```
+
+Examples:
+
+```text
+pull_artifact
+start_application
+health_check
+rollback
+```
+
+must have deterministic behavior.
+
+---
+
+# 16. IDEMPOTENCY AUDIT
+
+For every deployment operation, test:
+
+```text
+execute once
+execute twice
+execute after partial failure
+execute after worker restart
+```
+
+No operation should leave duplicated state.
+
+Examples:
+
+### Directory
+
+```text
+directory already exists
+```
+
+must be safe.
+
+### Image
+
+```text
+image already pulled
+```
+
+must be safe.
+
+### Container
+
+```text
+expected container already running
+```
+
+must be handled safely.
+
+### Deployment
+
+```text
+same deployment retried
+```
+
+must not create duplicate containers or corrupt state.
+
+---
+
+# 17. STATE MACHINE HARDENING
+
+Audit every state transition.
+
+The deployment should have explicit states similar to:
+
+```text
+CREATED
+CONTRACT_VALIDATED
+TARGET_VALIDATED
+ARTIFACT_VALIDATED
+PREFLIGHT_PASSED
+LOCK_ACQUIRED
+HOST_CONNECTIVITY_CHECK
+HOST_READY
+ARTIFACT_READY
+APPLICATION_DEPLOYING
+APPLICATION_STARTED
+RUNTIME_VERIFIED
+HEALTH_CHECK_PASSED
+EXTERNAL_ENDPOINT_VERIFIED
+SMOKE_TEST_PASSED
+POST_DEPLOYMENT_VERIFICATION
+COMPLETED
+```
+
+Failure/recovery:
+
+```text
+FAILED
+RETRYING
+RECOVERING
+ROLLING_BACK
+ROLLED_BACK
+CANCELLED
+```
+
+No ambiguous states.
+
+No state transitions that bypass required gates.
+
+---
+
+# 18. CHECKPOINTING + WORKER CRASH RECOVERY
+
+This is mandatory.
+
+Simulate:
+
+```text
+deployment step executing
+        ↓
+worker crashes
+        ↓
+worker restarts
+```
+
+Expected:
+
+```text
+persisted deployment state
+        ↓
+resume safely
+```
+
+The system must determine whether the previous operation:
+
+```text
+completed
+failed
+is still running
+needs reconciliation
+```
+
+Do not blindly repeat potentially destructive steps.
+
+Add reconciliation where necessary.
+
+Example:
+
+```text
+SSM command submitted
+worker crashes
+worker restarts
+        ↓
+check previous execution result
+        ↓
+continue
+```
+
+---
+
+# 19. RETRY ENGINE
+
+Audit retry behavior.
+
+Classify errors:
+
+### Retryable
+
+```text
+temporary SSM timeout
+temporary AWS API failure
+network interruption
+temporary ECR issue
+```
+
+### Non-retryable
+
+```text
+invalid IAM
+unauthorized target
+artifact missing
+digest mismatch
+invalid blueprint
+missing required secret
+invalid configuration
+```
+
+Implement bounded retries:
+
+```text
+max_attempts
+backoff
+timeout
+```
+
+Do not blindly retry deployment operations that can cause duplication.
+
+---
+
+# 20. DEPLOYMENT CANCELLATION
+
+Implement safe cancellation.
+
+If:
+
+```text
+deployment is running
+```
+
+and user selects:
+
+```text
+Cancel
+```
+
+the system should:
+
+```text
+persist cancel request
+        ↓
+stop at safe boundary
+        ↓
+release lock
+        ↓
+produce deterministic final state
+```
+
+Do not leave the environment half-configured without a recovery path.
+
+---
+
+# 21. ROLLBACK HARDENING
+
+Test:
+
+```text
+v41 running
+ ↓
+deploy v42
+ ↓
+v42 starts
+ ↓
+health fails
+ ↓
+rollback v41
+ ↓
+v41 healthy
+```
+
+Also test:
+
+```text
+v42 deployment fails
+ ↓
+rollback fails
+```
+
+The system must distinguish:
+
+```text
+DEPLOYMENT_FAILED
+```
+
+from:
+
+```text
+ROLLBACK_FAILED
+```
+
+The latter should be treated as a critical recovery state.
+
+Do not falsely report:
+
+```text
+ROLLED_BACK
+```
+
+unless rollback was actually verified.
+
+---
+
+# 22. RUNTIME VERIFICATION
+
+After application start, validate:
+
+```text
+container exists
+container running
+expected image digest
+process state
+expected port
+```
+
+The application should not be marked successful merely because:
+
+```text
+docker run
+```
+
+returned successfully.
+
+---
+
+# 23. HEALTH CHECK
+
+Perform:
+
+```text
+local/container health
+```
+
+and where available:
+
+```text
+external/public health
+```
+
+Expected:
+
+```text
+200 OK
+```
+
+Support:
+
+```text
+timeout
+interval
+retries
+expected status
+endpoint
+```
+
+---
+
+# 24. END-TO-END TRAFFIC VERIFICATION
+
+Where the architecture contains:
+
+```text
+DNS
+ ↓
+Load Balancer
+ ↓
+Security Group
+ ↓
+EC2
+ ↓
+Container
+ ↓
+Application
+```
+
+perform an external endpoint validation.
+
+This is distinct from a local container health check.
+
+Example:
+
+```text
+https://staging.example.com/health
+```
+
+must be tested from the appropriate external execution context.
+
+---
+
+# 25. SMOKE TESTS
+
+After health checks, execute safe, non-destructive smoke tests.
+
+Examples:
+
+```text
+homepage
+health endpoint
+safe API endpoint
+critical read-only endpoint
+```
+
+Tests should be configurable per project/environment.
+
+No destructive operations.
+
+---
+
+# 26. POST-DEPLOYMENT SECURITY
+
+After successful staging deployment:
+
+```text
+Deployment
+ ↓
+Runtime verification
+ ↓
+Smoke tests
+ ↓
+DAST
+ ↓
+Security result
+```
+
+Do not force DAST implementation into the deployment executor itself.
+
+Use the existing Deplai DAST system.
+
+Pass:
+
+```text
+project_id
+environment_id
+deployment_id
+deployed_url
+authorization context
+```
+
+The DAST subsystem should be able to associate findings with the exact deployment.
+
+For v1, preserve existing behavior if DAST is currently only recorded as context.
+
+Do not break existing security functionality.
+
+---
+
+# 27. CI/CD BOUNDARY
+
+The deployment engine should behave as a service that CI/CD can invoke.
+
+Conceptually:
+
+```text
+GitHub Actions
+GitLab CI
+Jenkins
+Azure DevOps
+Deplai workflow
+      ↓
+Deplai Deployment API
+      ↓
+Deployment Execution Engine
+      ↓
+Result
+```
+
+The executor should return machine-readable deployment results such as:
+
+```text
+SUCCESS
+FAILED
+ROLLED_BACK
+ROLLBACK_FAILED
+CANCELLED
+SECURITY_BLOCKED
+```
+
+Do not implement a Jenkins replacement.
+
+---
+
+# 28. DEPLOYMENT QUEUE
+
+Ensure deployments execute as background jobs.
+
+The HTTP request must not remain responsible for the entire deployment lifecycle.
+
+Architecture:
+
+```text
+Frontend/API
+    ↓
+Create Deployment
+    ↓
+Persist
+    ↓
+Queue
+    ↓
+Worker
+    ↓
+Execution Engine
+```
+
+The frontend observes state.
+
+A browser closing must not terminate deployment.
+
+---
+
+# 29. DEPLOYMENT EVENT STREAM
+
+Ensure the backend produces structured events.
+
+Example:
+
+```text
+DEPLOYMENT_CREATED
+CONTRACT_VALIDATED
+TARGET_VALIDATED
+ARTIFACT_VALIDATED
+PREFLIGHT_PASSED
+LOCK_ACQUIRED
+SSM_CONNECTED
+HOST_DISCOVERED
+HOST_READY
+ARTIFACT_PULL_STARTED
+ARTIFACT_PULL_COMPLETED
+APPLICATION_STARTING
+APPLICATION_STARTED
+RUNTIME_VERIFIED
+HEALTH_CHECK_STARTED
+HEALTH_CHECK_PASSED
+SMOKE_TEST_STARTED
+SMOKE_TEST_PASSED
+DEPLOYMENT_VERIFIED
+DAST_STARTED
+DAST_COMPLETED
+DEPLOYMENT_COMPLETED
+```
+
+Failure events:
+
+```text
+STEP_FAILED
+RETRY_STARTED
+RECOVERY_STARTED
+ROLLBACK_STARTED
+ROLLBACK_COMPLETED
+ROLLBACK_FAILED
+DEPLOYMENT_FAILED
+```
+
+Every event should contain safe structured metadata.
+
+---
+
+# 30. FRONTEND HARDENING
+
+Audit the existing deployment UI.
+
+The UI should accurately reflect backend state.
+
+Example:
+
+```text
+Infrastructure
+✓ Ready
+
+Target
+✓ Validated
+
+Artifact
+✓ Verified
+
+Host
+✓ Ready
+
+Application
+● Deploying
+
+Health
+○ Pending
+
+Smoke Test
+○ Pending
+
+DAST
+○ Pending
+```
+
+Do not allow stale frontend state to imply deployment success.
+
+Actions must be state-aware:
+
+```text
+Preflight
+Deploy
+Cancel
+Retry
+Rollback
+View Logs
+```
+
+Disable actions when unsafe.
+
+---
+
+# 31. PLAN PREVIEW
+
+Before deployment display:
+
+```text
+Environment
+AWS account
+Region
+Target
+Artifact
+Image
+Digest
+Runtime
+Ports
+Health endpoint
+Deployment strategy
+Previous version
+Rollback availability
+Execution adapter
+```
+
+The displayed plan should correspond exactly to the immutable execution snapshot.
+
+---
+
+# 32. AUDIT TRAIL
+
+Every deployment must capture:
+
+```text
+initiator
+project
+environment
+source commit
+artifact ID
+image
+digest
+target
+AWS account
+AWS region
+blueprint hash
+execution adapter
+operations
+attempts
+timestamps
+failures
+rollback
+final state
+```
+
+No sensitive secret values.
+
+---
+
+# 33. OBSERVABILITY
+
+Measure:
+
+```text
+deployment duration
+step duration
+retry count
+failure rate
+rollback rate
+health-check time
+artifact pull duration
+SSM execution latency
+```
+
+Use existing telemetry infrastructure if available.
+
+---
+
+# 34. REAL-WORLD FAILURE TEST MATRIX
+
+Build automated tests for all of these:
+
+```text
+1. Fresh EC2 deployment
+2. Second deployment
+3. Existing container
+4. Existing image
+5. Missing Docker
+6. Docker daemon stopped
+7. SSM offline
+8. SSM timeout
+9. ECR authentication failure
+10. Artifact missing
+11. Digest mismatch
+12. Insufficient disk
+13. Port conflict
+14. Bad container
+15. Missing secret
+16. Bad configuration
+17. Health endpoint failure
+18. External endpoint failure
+19. Smoke test failure
+20. Worker crash during deployment
+21. Worker crash after SSM command submission
+22. Environment lock conflict
+23. Deployment cancellation
+24. Deployment timeout
+25. Rollback success
+26. Rollback failure
+27. Unauthorized target
+28. Wrong AWS account
+29. Wrong environment
+30. SSH remains disabled
+```
+
+Every failure should produce a deterministic and explainable state.
+
+---
+
+# 35. GOLDEN END-TO-END TEST
+
+Create a disposable test environment and verify:
+
+```text
+Fresh AWS EC2
+       ↓
+SSM online
+       ↓
+Docker ready
+       ↓
+ECR image available
+       ↓
+Artifact verified
+       ↓
+Preflight passes
+       ↓
+Deployment starts
+       ↓
+Image pulled
+       ↓
+Container started
+       ↓
+Runtime verified
+       ↓
+Health passes
+       ↓
+External endpoint passes
+       ↓
+Smoke tests pass
+       ↓
+Deployment completed
+```
+
+Then:
+
+```text
+Deploy v2
+       ↓
+v2 healthy
+       ↓
+Deploy broken v3
+       ↓
+Health fails
+       ↓
+Rollback v2
+       ↓
+v2 healthy
+       ↓
+ROLLED_BACK
+```
+
+Then:
+
+```text
+Deploy v4
+       ↓
+kill worker midway
+       ↓
+restart worker
+       ↓
+deployment resumes
+       ↓
+correct final state
+```
+
+Then:
+
+```text
+Deployment A
+       ↓
+RUNNING
+
+Deployment B
+       ↓
+blocked / queued
+```
+
+---
+
+# 36. DO NOT EXPAND TARGETS YET
+
+Do not implement:
+
+```text
+ECS
+EKS
+Lambda
+Blue/Green
+Canary
+Multi-cloud
+```
+
+except for maintaining clean interfaces/stubs.
+
+Fully stabilize:
+
+```text
+AWS EC2
++
+Docker
++
+ECR
++
+SSM
+```
+
+first.
+
+---
+
+# 37. IMPORTANT SECURITY CONSTRAINT
+
+The deployment system must NEVER become:
+
+```text
+LLM
+ ↓
+arbitrary shell
+ ↓
+EC2
+```
+
+The required architecture remains:
+
+```text
+LLM / Agents
+      ↓
+Deployment Contract
+      ↓
+Immutable Blueprint
+      ↓
+Policy Validation
+      ↓
+Deterministic Executor
+      ↓
+Allowlisted Operation
+      ↓
+SSM
+      ↓
+EC2
+```
+
+---
+
+# 38. FINAL SUCCESS CRITERIA
+
+Consider the implementation complete only when:
+
+```text
+A real Dockerized application
+```
+
+can be deployed to:
+
+```text
+AWS EC2
+```
+
+through:
+
+```text
+ECR
+SSM
+```
+
+without manual SSH.
+
+The system must support:
+
+```text
+preflight
+immutable artifact validation
+host readiness
+safe execution
+state persistence
+retries
+worker restart recovery
+environment locking
+health checks
+external verification
+smoke tests
+rollback
+rollback verification
+audit trail
+secret redaction
+frontend status
+```
+
+and must correctly handle failed deployments.
+
+---
+
+# 39. WHAT TO REPORT AFTER IMPLEMENTATION
+
+After making changes, provide:
+
+## Architecture
+
+```text
+What already existed
+What was hardened
+What was added
+```
+
+## Execution flow
+
+Show the exact:
+
+```text
+API
+→ queue
+→ worker
+→ contract
+→ blueprint
+→ executor
+→ SSM
+→ EC2
+→ Docker
+→ verification
+```
+
+flow.
+
+## State machine
+
+Show every state and failure transition.
+
+## Security
+
+Explain:
+
+```text
+target validation
+artifact validation
+secret handling
+command allowlisting
+SSM
+IAM
+SSH disabled
+```
+
+## Reliability
+
+Explain:
+
+```text
+locking
+idempotency
+retries
+checkpoints
+worker crash recovery
+rollback
+```
+
+## Tests
+
+Report:
+
+```text
+tests added
+tests modified
+tests passed
+tests not executable
+known limitations
+```
+
+## Real deployment test
+
+Provide exact commands/steps needed to perform the disposable AWS end-to-end test.
+
+---
+
+# FINAL INSTRUCTION
+
+Do not treat this as a greenfield rewrite.
+
+The current implementation already solves the basic architecture.
+
+Your responsibility now is to make it **production-reliable**.
+
+Prioritize in this order:
+
+```text
+1. Correctness
+2. Security
+3. Failure recovery
+4. Determinism
+5. Observability
+6. Auditability
+7. UX
+8. Future extensibility
+```
+
+Do not add unnecessary abstractions simply for architectural purity.
+
+Do not add LLM calls where deterministic code is sufficient.
+
+Do not expand to new AWS deployment targets until the EC2 deployment path survives the complete failure matrix above.
+
+The final golden path must be:
+
+```text
+Verified Artifact
+      ↓
+Verified Environment
+      ↓
+Verified Target
+      ↓
+Preflight
+      ↓
+Deployment Lock
+      ↓
+SSM
+      ↓
+Host Ready
+      ↓
+ECR
+      ↓
+Docker
+      ↓
+Application
+      ↓
+Runtime Verification
+      ↓
+Health
+      ↓
+External Verification
+      ↓
+Smoke Test
+      ↓
+DAST / Security
+      ↓
+Deployment Complete
+```
+
+with a fully tested:
+
+```text
+Failure
+ ↓
+Retry
+ ↓
+Recovery
+ ↓
+Rollback
+ ↓
+Verification
+```
+
+path.

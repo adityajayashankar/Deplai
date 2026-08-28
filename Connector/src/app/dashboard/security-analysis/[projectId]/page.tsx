@@ -6,31 +6,69 @@ import * as THREE from 'three';
 import {
   AlertCircle,
   Bot,
-  CheckCircle2,
-  CircleDashed,
+  ChevronDown,
   ExternalLink,
   Eye,
   FileCode2,
   FileJson,
   GitPullRequest,
-  Play,
   RefreshCw,
+  ScanSearch,
+  Shield,
   ShieldCheck,
   Sparkles,
   TerminalSquare,
 } from 'lucide-react';
 import { useScan, type VulnStatus } from '@/lib/scan-context';
-import { useLLM, LLM_PROVIDERS, type LLMProvider } from '@/lib/llm-context';
+import { WorkspaceShell } from '@/features/workspace/WorkspaceNav';
+import { SecurityStageRail } from '@/features/workspace/SecurityStageRail';
+import {
+  ApiExplorer,
+  AssetExplorer,
+  AttackPathExplorer,
+  CloudExplorer,
+  DynamicTestingExplorer,
+  FindingTable,
+  InfrastructureExplorer,
+  PipelineConfig,
+  RemediationModelPicker,
+  RiskExplorer,
+  RiskScore,
+  ScanProgress,
+  ScanReportDownloadButton,
+  SecretsExplorer,
+  SecurityKPI,
+  SecurityModuleGrid,
+  SupplyChainExplorer,
+  defaultEnabledModules,
+  mergeModules,
+  modulesForScan,
+  looksLikePublicHttpUrl,
+  parseModuleEvents,
+  pipelineModulesSettled,
+  pipelineProducedWork,
+  uniqueFindingIds,
+  RESULTS_SURFACES,
+  type FindingCategory,
+  type RemediationModelValue,
+  type ResultsSurface,
+  type ScanResultsPayload,
+  type SecurityModuleId,
+  type UnifiedFinding,
+} from '@/features/security';
+import { readStoredDastAsset, readStoredDastTarget, storeDastAsset, storeDastTarget } from '@/features/security/dastTarget';
+import { projectHasSuccessfulDeploy, readSavedAws, writeSavedAws } from '@/features/deployment/state';
+import { appBtnInk, appBtnPaper, appInput, secPaper } from '@/features/workspace/theme';
 
 type PipelineStageId = 'scan' | 'results' | 'remediate_setup' | 'remediate_run' | 'approval' | 'pr_rescan';
 
 const SIDEBAR_STAGES: Array<{ id: PipelineStageId; label: string; details: string }> = [
-  { id: 'scan', label: 'SAST / SCA Scan', details: 'Full codebase analysis' },
-  { id: 'results', label: 'Vulnerability Results', details: 'Findings & KPIs' },
-  { id: 'remediate_setup', label: 'AI Remediation', details: 'Configure Agent' },
-  { id: 'remediate_run', label: 'Agent Execution', details: 'Live patching' },
-  { id: 'approval', label: 'Review & Approval', details: 'Diff validation gate' },
-  { id: 'pr_rescan', label: 'GitOps & Rescan', details: 'PR creation & verification' },
+  { id: 'scan', label: 'Scan', details: 'Repository validation' },
+  { id: 'results', label: 'Results', details: 'Findings & KPIs' },
+  { id: 'remediate_setup', label: 'Agent setup', details: 'Configure remediation agent' },
+  { id: 'remediate_run', label: 'Remediation', details: 'Live agent patching' },
+  { id: 'approval', label: 'Review', details: 'Diff validation gate' },
+  { id: 'pr_rescan', label: 'GitHub & verify', details: 'PR push & verification' },
 ];
 
 const STAGE_INDEX: Record<PipelineStageId, number> = {
@@ -43,9 +81,9 @@ const STAGE_INDEX: Record<PipelineStageId, number> = {
 };
 
 const RESULTS_HEARTBEAT_MS = 30_000;
-const REMEDIATION_DEFAULT_MODEL = 'claude-sonnet-4-5';
+const REMEDIATION_DEFAULT_MODEL = 'best_coding';
 
-const EMPTY_STATS = { total: 0, critical: 0, high: 0, autoFixable: 0 };
+const EMPTY_STATS = { total: 0, critical: 0, high: 0, medium: 0, low: 0, autoFixable: 0 };
 
 interface Occurrence {
   filename: string;
@@ -72,7 +110,7 @@ interface SupplyChainVuln {
   cve_id: string;
 }
 
-interface ScanResults {
+interface ScanResults extends ScanResultsPayload {
   supply_chain: SupplyChainVuln[];
   code_security: CWEGroup[];
 }
@@ -81,6 +119,8 @@ interface ScanStats {
   total: number;
   critical: number;
   high: number;
+  medium: number;
+  low: number;
   autoFixable: number;
 }
 
@@ -101,6 +141,29 @@ interface ChangedFileEntry {
 function computeStats(data: ScanResults): ScanStats {
   const sc = Array.isArray(data.supply_chain) ? data.supply_chain : [];
   const cs = Array.isArray(data.code_security) ? data.code_security : [];
+  const findings = Array.isArray(data.findings) ? data.findings : [];
+  const autoFixable = sc.filter((item) => item.fix_version !== null).length;
+  if (data.posture) {
+    return {
+      total: data.posture.total,
+      critical: data.posture.critical,
+      high: data.posture.high,
+      medium: data.posture.medium,
+      low: data.posture.low,
+      autoFixable,
+    };
+  }
+  if (findings.length > 0) {
+    const count = (severity: string) => findings.filter((item) => String(item.severity || '').toLowerCase() === severity).length;
+    return {
+      total: findings.length,
+      critical: count('critical'),
+      high: count('high'),
+      medium: count('medium'),
+      low: count('low'),
+      autoFixable,
+    };
+  }
   return {
     total: sc.length + cs.reduce((sum, group) => sum + Number(group.count || 0), 0),
     critical:
@@ -109,41 +172,14 @@ function computeStats(data: ScanResults): ScanStats {
     high:
       sc.filter((item) => item.severity.toLowerCase() === 'high').length +
       cs.filter((item) => item.severity.toLowerCase() === 'high').reduce((sum, group) => sum + Number(group.count || 0), 0),
-    autoFixable: sc.filter((item) => item.fix_version !== null).length,
+    medium:
+      sc.filter((item) => item.severity.toLowerCase() === 'medium').length +
+      cs.filter((item) => item.severity.toLowerCase() === 'medium').reduce((sum, group) => sum + Number(group.count || 0), 0),
+    low:
+      sc.filter((item) => item.severity.toLowerCase() === 'low').length +
+      cs.filter((item) => item.severity.toLowerCase() === 'low').reduce((sum, group) => sum + Number(group.count || 0), 0),
+    autoFixable,
   };
-}
-
-function flattenCodeSecurity(groups: CWEGroup[]) {
-  const out: Array<{ location: string; issue: string; severity: string; description: string }> = [];
-  for (const group of groups || []) {
-    const severity = String(group.severity || 'low');
-    if (Array.isArray(group.occurrences) && group.occurrences.length > 0) {
-      for (const occ of group.occurrences) {
-        out.push({
-          location: `${occ.filename || 'unknown'}:${occ.line_number || 0}`,
-          issue: `CWE-${group.cwe_id}`,
-          severity,
-          description: group.title || occ.code_extract || '',
-        });
-      }
-      continue;
-    }
-    out.push({
-      location: 'multiple locations',
-      issue: `CWE-${group.cwe_id}`,
-      severity,
-      description: group.title || '',
-    });
-  }
-  return out;
-}
-
-function getSeverityBadgeClasses(severity: string) {
-  const value = String(severity || '').toLowerCase();
-  if (value === 'critical') return 'bg-rose-500/10 text-rose-500 border border-rose-500/20';
-  if (value === 'high') return 'bg-amber-500/10 text-amber-500 border border-amber-500/20';
-  if (value === 'medium') return 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20';
-  return 'bg-sky-500/10 text-sky-400 border border-sky-500/20';
 }
 
 function parseHSL(hslStr: string): { h: number; s: number; l: number } {
@@ -737,10 +773,10 @@ function RunButton({
         colors="#3f3f46,#27272a,#18181b"
         gap={4}
         speed={35}
-        className={`h-full w-full rounded-md transition-all ${
+        className={`h-full w-full rounded-none transition-all ${
           disabled
-            ? 'cursor-not-allowed border border-[#1A1A1A] bg-[#000000] opacity-50'
-            : 'cursor-pointer border border-[#262626] bg-[#050505] shadow-[0_4px_15px_rgba(0,0,0,0.5)] hover:border-[#3f3f46] hover:bg-[#111111]'
+            ? 'cursor-not-allowed border-[3px] border-black bg-white opacity-50'
+            : 'cursor-pointer border-[3px] border-black bg-black shadow-[4px_4px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none'
         }`}
       >
         <button
@@ -748,7 +784,7 @@ function RunButton({
           onClick={disabled ? undefined : onClick}
           disabled={disabled}
           className={`flex h-full w-full items-center justify-center gap-2 text-sm font-semibold outline-none transition-colors ${
-            disabled ? 'text-zinc-600' : 'text-zinc-100'
+            disabled ? 'text-neutral-400' : 'text-white'
           }`}
         >
           {children}
@@ -760,7 +796,7 @@ function RunButton({
 
 function SpinnerCard({ label }: { label: string }) {
   return (
-    <div className="flex min-h-70 items-center justify-center rounded-lg border border-[#1A1A1A] bg-[#050505]">
+    <div className={`flex min-h-70 items-center justify-center ${secPaper}`}>
       <div className="flex items-center gap-3 text-sm text-zinc-400">
         <RefreshCw className="h-4 w-4 animate-spin" />
         <span>{label}</span>
@@ -782,12 +818,12 @@ function AlertCard({
 }) {
   const toneClasses =
     tone === 'error'
-      ? 'border-rose-500/20 bg-rose-500/10 text-rose-300'
+      ? 'text-rose-800'
       : tone === 'warning'
-        ? 'border-amber-500/20 bg-amber-500/10 text-amber-300'
-        : 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300';
+        ? 'text-amber-800'
+        : 'text-emerald-800';
   return (
-    <div className={`rounded-lg border p-5 ${toneClasses}`}>
+    <div className={`${secPaper} p-5 ${toneClasses}`}>
       <div className="flex items-start gap-3">
         <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
         <div className="min-w-0 flex-1">
@@ -803,7 +839,7 @@ function AlertCard({
 function DiffViewer({ diff }: { diff: string }) {
   const lines = diff.split('\n');
   return (
-    <div className="overflow-hidden rounded-lg border border-[#1A1A1A] bg-black">
+    <div className="overflow-hidden border-[3px] border-black bg-black">
       <div className="border-b border-[#1A1A1A] px-4 py-2 text-[11px] font-medium uppercase tracking-widest text-zinc-500">
         Unified Diff
       </div>
@@ -869,7 +905,14 @@ export default function SecurityAnalysisPage() {
     setCachedResults,
     resetRemediation,
   } = useScan();
-  const { provider, setProvider, currentConfig, apiKeys, setApiKey, selectedModels, setModel } = useLLM();
+  const [agentModel, setAgentModel] = useState<RemediationModelValue>({
+    accessMode: 'platform',
+    model: REMEDIATION_DEFAULT_MODEL,
+    provider: null,
+    ready: false,
+    blockedReason: 'Loading model options…',
+    sourceLabel: 'Platform',
+  });
 
   const { state: scanState, messages: scanMessages, projectName: scanProjectName } = getScanState(projectId);
   const { state: remediationState, messages: remMessages } = getRemediationState(projectId);
@@ -887,36 +930,74 @@ export default function SecurityAnalysisPage() {
   const [scanActive, setScanActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rerunInProgress, setRerunInProgress] = useState(false);
+  const [verificationScanRequested, setVerificationScanRequested] = useState(false);
 
   const [setupOpen, setSetupOpen] = useState(false);
   const [githubToken, setGithubToken] = useState('');
-  const [keyInput, setKeyInput] = useState('');
-  const [modelInput, setModelInput] = useState('');
   const [approved, setApproved] = useState(false);
   const [locallyApproved, setLocallyApproved] = useState(false);
   const [prUrl, setPrUrl] = useState<string | null>(null);
   const [selectedDiffPath, setSelectedDiffPath] = useState<string | null>(null);
   const [activeStage, setActiveStage] = useState<PipelineStageId>('scan');
-  const [resultsTab, setResultsTab] = useState<'sca' | 'sast'>('sca');
+  const [resultsSurface, setResultsSurface] = useState<ResultsSurface>('overview');
+  const [findingsCategory, setFindingsCategory] = useState<FindingCategory | 'all'>('all');
   const [resultsQuery, setResultsQuery] = useState('');
   const [resultsSeverity, setResultsSeverity] = useState<'all' | 'critical' | 'high' | 'medium' | 'low'>('all');
+  const [enabledModules, setEnabledModules] = useState<SecurityModuleId[]>(defaultEnabledModules);
+  const [dastTargetUrl, setDastTargetUrl] = useState('');
+  const [dastAssetId, setDastAssetId] = useState('');
+  const [dastProfile, setDastProfile] = useState<'BASELINE' | 'FULL' | 'API'>('BASELINE');
+  const setDastTarget = useCallback((value: string, assetId?: string) => {
+    setDastTargetUrl(value);
+    storeDastTarget(projectId, value);
+    if (assetId !== undefined) {
+      setDastAssetId(assetId);
+      storeDastAsset(projectId, assetId);
+    }
+    if (value.trim()) {
+      setEnabledModules((current) => (current.includes('dast') ? current : [...current, 'dast']));
+    }
+  }, [projectId]);
+  const [expandedFindingId, setExpandedFindingId] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
     setMounted(true);
   }, []);
-  const [resultsLimit, setResultsLimit] = useState(100);
+
+  useEffect(() => {
+    const surface = searchParams.get('surface') as ResultsSurface | null;
+    if (surface && RESULTS_SURFACES.some((item) => item.id === surface)) {
+      setResultsSurface(surface);
+    }
+    const target = (searchParams.get('dastTarget') || readStoredDastTarget(projectId)).trim();
+    const asset = (searchParams.get('dastAsset') || readStoredDastAsset(projectId)).trim();
+    const profile = searchParams.get('dastProfile');
+    setDastTargetUrl(target);
+    setDastAssetId(asset);
+    if (profile === 'FULL' || profile === 'API' || profile === 'BASELINE') {
+      setDastProfile(profile);
+    }
+    if (target) {
+      setEnabledModules((current) => (current.includes('dast') ? current : [...current, 'dast']));
+    }
+  }, [projectId, searchParams]);
   const [lastResultsSyncAt, setLastResultsSyncAt] = useState<string | null>(null);
+  const [projectOptions, setProjectOptions] = useState<Array<{ id: string; name: string }>>([]);
 
   const scanLogEndRef = useRef<HTMLDivElement>(null);
   const remediateLogEndRef = useRef<HTMLDivElement>(null);
   const fetchVersionRef = useRef(0);
   const previousBaseStageRef = useRef<PipelineStageId>('scan');
+  const userStartedScanRef = useRef(false);
+  const dastAutoStartRef = useRef(false);
+  const cloudAutoStartRef = useRef(false);
+  const scopedRunRef = useRef<SecurityModuleId[] | null>(null);
+  const [scopedRun, setScopedRun] = useState<SecurityModuleId[] | null>(null);
+  const scanStateRef = useRef(scanState);
+  const modulesSettledRef = useRef(false);
+  scanStateRef.current = scanState;
 
-  useEffect(() => {
-    setKeyInput(apiKeys[provider] || '');
-    setModelInput(selectedModels[provider] || currentConfig.flagship || REMEDIATION_DEFAULT_MODEL);
-  }, [apiKeys, currentConfig.flagship, provider, selectedModels]);
 
   useEffect(() => {
     scanLogEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -925,6 +1006,25 @@ export default function SecurityAnalysisPage() {
   useEffect(() => {
     remediateLogEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [remMessages.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadProjects() {
+      try {
+        const res = await fetch('/api/projects', { cache: 'no-store' });
+        const data = (await res.json().catch(() => ({}))) as { projects?: Array<{ id: string; name: string }> };
+        if (cancelled) return;
+        const projects = Array.isArray(data.projects) ? data.projects : [];
+        setProjectOptions(projects.map((p) => ({ id: p.id, name: p.name || p.id })));
+      } catch {
+        if (!cancelled) setProjectOptions([]);
+      }
+    }
+    void loadProjects();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -975,6 +1075,12 @@ export default function SecurityAnalysisPage() {
     };
   }, [projectId, scanProjectName]);
 
+  useEffect(() => {
+    userStartedScanRef.current = false;
+    setScanActive(false);
+    setVerificationScanRequested(false);
+  }, [projectId]);
+
   const fetchPrUrl = useCallback(async () => {
     if (!projectId || projectMeta?.type !== 'github') {
       setPrUrl(null);
@@ -997,6 +1103,51 @@ export default function SecurityAnalysisPage() {
   const fetchStatusAndResults = useCallback(
     async (options?: { trackError?: boolean }) => {
       const requestId = ++fetchVersionRef.current;
+      const applyResults = async (nextStatus: VulnStatus) => {
+        setLoading(false);
+        setLoadingResults(true);
+        const resultsRes = await fetch(`/api/scan/results?project_id=${encodeURIComponent(projectId)}`, {
+          cache: 'no-store',
+          signal: AbortSignal.timeout(30_000),
+        });
+        if (!resultsRes.ok) {
+          if (nextStatus === 'not_found') {
+            setResults(null);
+            setScanStats(EMPTY_STATS);
+            setCachedResults(projectId, { status: nextStatus, data: null });
+            setLoadingResults(false);
+            setLastResultsSyncAt(new Date().toISOString());
+            setError(null);
+            return true;
+          }
+          const body = (await resultsRes.json().catch(() => ({}))) as { error?: string };
+          throw new Error(body.error || 'Failed to fetch scan results');
+        }
+        const resultsPayload = (await resultsRes.json()) as { data?: ScanResults };
+        if (requestId !== fetchVersionRef.current) return true;
+        const nextResults = resultsPayload.data || { supply_chain: [], code_security: [] };
+        const derivedStatus: VulnStatus = nextStatus === 'found' || nextStatus === 'not_found'
+          ? nextStatus
+          : (
+            (Array.isArray(nextResults.findings) && nextResults.findings.length > 0)
+            || (nextResults.supply_chain?.length || 0) > 0
+            || (nextResults.code_security?.length || 0) > 0
+            || (nextResults.secrets?.length || 0) > 0
+            || (nextResults.iac?.length || 0) > 0
+            || (nextResults.containers?.length || 0) > 0
+              ? 'found'
+              : 'not_found'
+          );
+        setVulnStatus(derivedStatus);
+        setResults(nextResults);
+        setScanStats(computeStats(nextResults));
+        setCachedResults(projectId, { status: derivedStatus, data: nextResults });
+        setLoadingResults(false);
+        setLastResultsSyncAt(new Date().toISOString());
+        setError(null);
+        return true;
+      };
+
       try {
         const statusRes = await fetch(`/api/scan/status?project_id=${encodeURIComponent(projectId)}`, {
           cache: 'no-store',
@@ -1005,65 +1156,53 @@ export default function SecurityAnalysisPage() {
         const statusPayload = (await statusRes.json().catch(() => ({}))) as { status?: VulnStatus | 'running' | 'error'; detail?: string };
         if (requestId !== fetchVersionRef.current) return;
 
-        if (statusPayload.status === 'running') {
-          setScanActive(true);
+        const rawStatus = statusPayload.status || 'not_initiated';
+        const finishedLocally = scanStateRef.current === 'completed'
+          || scanStateRef.current === 'error'
+          || modulesSettledRef.current;
+
+        if (rawStatus === 'running' && !finishedLocally) {
+          // Only attach to a live backend scan after this visit's Scan click.
+          // Leftover agentic runs should not make opening Security Agent look like a new scan started.
+          if (userStartedScanRef.current) {
+            setScanActive(true);
+          } else {
+            setScanActive(false);
+          }
           setLoading(false);
           setLoadingResults(false);
           return;
         }
 
         setScanActive(false);
-        const rawStatus = statusPayload.status || 'not_initiated';
-        if (rawStatus === 'error') {
-          setLoading(false);
-          setLoadingResults(false);
-          setResults(null);
-          setScanStats(null);
-          setVulnStatus('not_initiated');
-          setLastResultsSyncAt(null);
-          if (options?.trackError) setError(statusPayload.detail || 'Unexpected scan status error');
+
+        if (rawStatus === 'found' || rawStatus === 'not_found') {
+          setVulnStatus(rawStatus);
+          await applyResults(rawStatus);
           return;
         }
 
-        const nextStatus = rawStatus as VulnStatus;
-        setVulnStatus(nextStatus);
-
-        if (nextStatus === 'not_found') {
-          setResults(null);
-          setScanStats(EMPTY_STATS);
-          setCachedResults(projectId, { status: nextStatus, data: null });
-          setLoading(false);
-          setLoadingResults(false);
-          setLastResultsSyncAt(new Date().toISOString());
-          setError(null);
-          return;
-        }
-
-        if (nextStatus === 'found') {
-          setLoading(false);
-          setLoadingResults(true);
-          const resultsRes = await fetch(`/api/scan/results?project_id=${encodeURIComponent(projectId)}`, {
-            cache: 'no-store',
-            signal: AbortSignal.timeout(30_000),
-          });
-          if (!resultsRes.ok) {
-            const body = (await resultsRes.json().catch(() => ({}))) as { error?: string };
-            throw new Error(body.error || 'Failed to fetch scan results');
+        if (finishedLocally || rawStatus === 'error') {
+          try {
+            await applyResults('not_initiated');
+            return;
+          } catch (loadError) {
+            setLoading(false);
+            setLoadingResults(false);
+            if (options?.trackError) {
+              setError(
+                rawStatus === 'error'
+                  ? (statusPayload.detail || 'Unexpected scan status error')
+                  : (loadError instanceof Error ? loadError.message : 'Failed to load scan results'),
+              );
+            }
+            return;
           }
-          const resultsPayload = (await resultsRes.json()) as { data?: ScanResults };
-          if (requestId !== fetchVersionRef.current) return;
-          const nextResults = resultsPayload.data || { supply_chain: [], code_security: [] };
-          setResults(nextResults);
-          setScanStats(computeStats(nextResults));
-          setCachedResults(projectId, { status: 'found', data: nextResults });
-          setLoadingResults(false);
-          setLastResultsSyncAt(new Date().toISOString());
-          setError(null);
-          return;
         }
 
         setResults(null);
         setScanStats(null);
+        setVulnStatus('not_initiated');
         setLoading(false);
         setLoadingResults(false);
         setLastResultsSyncAt(null);
@@ -1091,8 +1230,14 @@ export default function SecurityAnalysisPage() {
         setScanStats(computeStats(cachedResults));
         setLastResultsSyncAt(new Date().toISOString());
       } else if (cached.status === 'not_found') {
-        setResults(null);
-        setScanStats(EMPTY_STATS);
+        if (cached.data) {
+          const cachedResults = cached.data as ScanResults;
+          setResults(cachedResults);
+          setScanStats(computeStats(cachedResults));
+        } else {
+          setResults(null);
+          setScanStats(EMPTY_STATS);
+        }
         setLastResultsSyncAt(new Date().toISOString());
       }
       setLoading(false);
@@ -1107,17 +1252,21 @@ export default function SecurityAnalysisPage() {
     if (scanState !== 'running') return;
     fetchVersionRef.current += 1;
     setSetupOpen(false);
-    setLocallyApproved(false);
-    setApproved(false);
-    setPrUrl(null);
+    if (!verificationScanRequested) {
+      setLocallyApproved(false);
+      setApproved(false);
+      setPrUrl(null);
+    }
     setError(null);
-    setResults(null);
-    setScanStats(null);
-    setVulnStatus('not_initiated');
+    if (!scopedRunRef.current) {
+      setResults(null);
+      setScanStats(null);
+      setVulnStatus('not_initiated');
+    }
     setLoading(false);
     setLoadingResults(false);
     setScanActive(false);
-  }, [scanState]);
+  }, [scanState, verificationScanRequested]);
 
   useEffect(() => {
     if (!scanActive || !projectId || scanState === 'running') return;
@@ -1127,27 +1276,27 @@ export default function SecurityAnalysisPage() {
     return () => window.clearInterval(intervalId);
   }, [fetchStatusAndResults, projectId, scanActive, scanState]);
 
+  const liveModules = useMemo(() => parseModuleEvents(scanMessages), [scanMessages]);
+  const modulesSettled = useMemo(() => pipelineModulesSettled(liveModules), [liveModules]);
+  const scanProducedWork = useMemo(() => pipelineProducedWork(liveModules), [liveModules]);
+  modulesSettledRef.current = modulesSettled;
+
   useEffect(() => {
-    if (!projectId || scanState !== 'completed') return;
+    const scanFinished = scanState === 'completed'
+      || modulesSettled
+      || (scanState === 'error' && scanProducedWork);
+    if (!projectId || !scanFinished) return;
     const cached = getCachedResults(projectId);
     if (cached) return;
     setLoading(true);
     setError(null);
     void fetchStatusAndResults({ trackError: true });
-  }, [fetchStatusAndResults, getCachedResults, projectId, scanState]);
+  }, [fetchStatusAndResults, getCachedResults, modulesSettled, projectId, scanProducedWork, scanState]);
 
   useEffect(() => {
     if (!projectId || remediationState !== 'completed') return;
-    fetchVersionRef.current += 1;
-    setResults(null);
-    setScanStats(null);
-    setVulnStatus('not_initiated');
-    setLoading(true);
-    setLoadingResults(false);
-    setSetupOpen(false);
-    void fetchStatusAndResults({ trackError: true });
     void fetchPrUrl();
-  }, [fetchPrUrl, fetchStatusAndResults, projectId, remediationState]);
+  }, [fetchPrUrl, projectId, remediationState]);
 
   const approvalSent = useMemo(() => {
     if (locallyApproved || remediationState === 'completed') return true;
@@ -1197,7 +1346,14 @@ export default function SecurityAnalysisPage() {
     }
   }, [changedFiles, selectedDiffPath]);
 
-  const hasScanOutcome = useMemo(() => vulnStatus !== 'not_initiated' || scanState === 'completed' || results !== null || loadingResults, [loadingResults, results, scanState, vulnStatus]);
+  const hasScanOutcome = useMemo(() => (
+    vulnStatus !== 'not_initiated'
+    || scanState === 'completed'
+    || results !== null
+    || loadingResults
+    || modulesSettled
+    || (scanState === 'error' && scanProducedWork)
+  ), [loadingResults, modulesSettled, results, scanProducedWork, scanState, vulnStatus]);
   const deploymentPath = useMemo(
     () => {
       const query = new URLSearchParams({ projectId, entry: 'run-all' });
@@ -1217,31 +1373,26 @@ export default function SecurityAnalysisPage() {
   );
   const hasVulnerabilities = useMemo(() => {
     if (!results) return vulnStatus === 'found';
-    return (results.supply_chain?.length || 0) > 0 || (results.code_security?.length || 0) > 0;
+    if (Array.isArray(results.findings) && results.findings.length > 0) return true;
+    return (results.supply_chain?.length || 0) > 0 || (results.code_security?.length || 0) > 0
+      || (results.secrets?.length || 0) > 0 || (results.iac?.length || 0) > 0 || (results.containers?.length || 0) > 0
+      || (results.kubernetes?.length || 0) > 0 || (results.cicd?.length || 0) > 0 || (results.api?.length || 0) > 0
+      || (results.dast?.length || 0) > 0;
   }, [results, vulnStatus]);
-  const flatCodeFindings = useMemo(() => flattenCodeSecurity(results?.code_security || []), [results]);
-  const normalizedResultsQuery = useMemo(() => resultsQuery.trim().toLowerCase(), [resultsQuery]);
-  const filteredSupplyChain = useMemo(() => {
-    const entries = results?.supply_chain || [];
-    return entries.filter((item) => {
-      const severityMatches = resultsSeverity === 'all' || String(item.severity || '').toLowerCase() === resultsSeverity;
-      if (!severityMatches) return false;
-      if (!normalizedResultsQuery) return true;
-      const haystack = [item.name, item.cve_id, item.version, item.fix_version].filter(Boolean).join(' ').toLowerCase();
-      return haystack.includes(normalizedResultsQuery);
-    });
-  }, [normalizedResultsQuery, results?.supply_chain, resultsSeverity]);
-  const filteredCodeFindings = useMemo(() => {
-    return flatCodeFindings.filter((item) => {
-      const severityMatches = resultsSeverity === 'all' || String(item.severity || '').toLowerCase() === resultsSeverity;
-      if (!severityMatches) return false;
-      if (!normalizedResultsQuery) return true;
-      const haystack = [item.location, item.issue, item.description].filter(Boolean).join(' ').toLowerCase();
-      return haystack.includes(normalizedResultsQuery);
-    });
-  }, [flatCodeFindings, normalizedResultsQuery, resultsSeverity]);
-  const visibleSupplyChain = useMemo(() => filteredSupplyChain.slice(0, resultsLimit), [filteredSupplyChain, resultsLimit]);
-  const visibleCodeFindings = useMemo(() => filteredCodeFindings.slice(0, resultsLimit), [filteredCodeFindings, resultsLimit]);
+  const unifiedFindings = useMemo<UnifiedFinding[]>(() => (
+    uniqueFindingIds(Array.isArray(results?.findings) ? results.findings : [])
+  ), [results]);
+  const pipelineModules = useMemo(
+    () => mergeModules(results?.modules, liveModules, {
+      scanning: scanState === 'running' || scanActive,
+      scopedTo: (scanState === 'running' || scanActive) ? scopedRun : null,
+    }),
+    [liveModules, results?.modules, scanActive, scanState, scopedRun],
+  );
+  const scannerLogMessages = useMemo(
+    () => scanMessages.filter((message) => message.type !== 'module'),
+    [scanMessages],
+  );
   const remediatingThisProject = remediationState === 'running';
   const remediationFinished = remediationState === 'completed';
   const remediationCanStart = !['running', 'waiting_decision', 'waiting_approval'].includes(remediationState);
@@ -1250,16 +1401,12 @@ export default function SecurityAnalysisPage() {
   const canLaunchRemediation = canOpenRemediationSetup;
 
   useEffect(() => {
-    setResultsLimit(100);
-  }, [resultsQuery, resultsSeverity, resultsTab, results]);
-
-  useEffect(() => {
-    if (activeStage !== 'results' || !hasScanOutcome || scanState === 'running') return;
+    if (activeStage !== 'results' || !hasScanOutcome || (scanState === 'running' && !modulesSettled)) return;
     const intervalId = window.setInterval(() => {
       void fetchStatusAndResults();
     }, RESULTS_HEARTBEAT_MS);
     return () => window.clearInterval(intervalId);
-  }, [activeStage, fetchStatusAndResults, hasScanOutcome, scanState]);
+  }, [activeStage, fetchStatusAndResults, hasScanOutcome, modulesSettled, scanState]);
 
   const baseStage = inferBaseStage({
     setupOpen,
@@ -1269,8 +1416,10 @@ export default function SecurityAnalysisPage() {
     hasVulnerabilities,
     scanState,
   });
+  const canOpenResults = hasScanOutcome && (scanState !== 'running' || modulesSettled);
   const maxUnlockedIndex = Math.max(
     STAGE_INDEX[baseStage],
+    canOpenResults ? STAGE_INDEX.results : STAGE_INDEX.scan,
     canOpenRemediationSetup ? STAGE_INDEX.remediate_setup : STAGE_INDEX.scan,
   );
 
@@ -1296,35 +1445,110 @@ export default function SecurityAnalysisPage() {
     setActiveStage(stageId);
   }, [maxUnlockedIndex]);
 
-  const handleStartScan = useCallback(async () => {
-    console.log("=== START SCAN CLICKED ===");
-    console.log({
-      loadingProject,
-      projectMeta,
-      projectAuthError,
-      scanState,
-      rerunInProgress,
-    });
+  const handleSelectModule = useCallback((id: SecurityModuleId) => {
+    if (!canOpenResults) return;
+    setActiveStage('results');
+    if (id === 'sbom') {
+      setResultsSurface('supply-chain');
+      return;
+    }
+    if (id === 'secrets') {
+      setResultsSurface('secrets');
+      setFindingsCategory('secrets');
+      return;
+    }
+    if (id === 'iac' || id === 'containers' || id === 'kubernetes' || id === 'cicd') {
+      setResultsSurface('infrastructure');
+      setFindingsCategory(id);
+      return;
+    }
+    if (id === 'api') {
+      setResultsSurface('apis');
+      setFindingsCategory('api');
+      return;
+    }
+    if (id === 'dast') {
+      setResultsSurface('dynamic');
+      setFindingsCategory('dast');
+      return;
+    }
+    if (id === 'cloud') {
+      setResultsSurface('cloud');
+      setFindingsCategory('cloud');
+      return;
+    }
+    setResultsSurface('findings');
+    setFindingsCategory(id);
+  }, [canOpenResults]);
 
+  const handleStartScan = useCallback(async (options?: {
+    dastOnly?: boolean;
+    cloudOnly?: boolean;
+    target?: string;
+    assetId?: string;
+    profile?: 'BASELINE' | 'FULL' | 'API';
+    aws?: {
+      aws_access_key_id: string;
+      aws_secret_access_key: string;
+      aws_session_token: string;
+      aws_region: string;
+    };
+  }) => {
     if (loadingProject) {
-      console.log("Blocked: loadingProject");
       setError('Project metadata is still loading. Wait a moment, then retry.');
       return;
     }
 
     if (!projectMeta || projectAuthError) {
-      console.log("Blocked: missing projectMeta or auth error");
-      console.log({ projectMeta, projectAuthError });
       setError(projectAuthError || 'Project access could not be verified.');
       return;
     }
 
-    console.log("About to POST /api/scan/validate");
-
     if (scanState === 'running' || rerunInProgress) return;
 
+    const target = (options?.target ?? dastTargetUrl).trim();
+    const assetId = (options?.assetId ?? dastAssetId).trim();
+    const profile = options?.profile || dastProfile;
+    if (options?.dastOnly && !assetId && !target) {
+      setError('Verify a project target before running dynamic testing.');
+      return;
+    }
+    if (target && !looksLikePublicHttpUrl(target) && !assetId) {
+      setError('Dynamic testing only accepts a public http(s) URL you own. Internal and localhost addresses are rejected.');
+      return;
+    }
+    if (options?.cloudOnly) {
+      if (!projectHasSuccessfulDeploy(projectId)) {
+        setError('Cloud scanning is available after IaC is configured and deployed for this project.');
+        return;
+      }
+      const aws = options.aws || readSavedAws();
+      if (!aws.aws_access_key_id.trim() || !aws.aws_secret_access_key.trim()) {
+        setError('Enter the AWS operator credentials used to deploy this project.');
+        return;
+      }
+    }
+
+    const scopedTo: SecurityModuleId[] | null = options?.dastOnly
+      ? ['dast']
+      : options?.cloudOnly
+        ? ['cloud']
+        : null;
+    scopedRunRef.current = scopedTo;
+    setScopedRun(scopedTo);
+
+    userStartedScanRef.current = true;
+    setVerificationScanRequested(false);
     setRerunInProgress(true);
     setError(null);
+    if (target) setDastTarget(target, assetId);
+    if (assetId) {
+      setDastAssetId(assetId);
+      storeDastAsset(projectId, assetId);
+    }
+
+    const aws = options?.cloudOnly ? (options.aws || readSavedAws()) : null;
+    if (aws) writeSavedAws(aws);
 
     try {
       const validateRes = await fetch('/api/scan/validate', {
@@ -1338,29 +1562,41 @@ export default function SecurityAnalysisPage() {
           owner: projectMeta.owner,
           repo: projectMeta.repo,
           scan_type: 'all',
+          enabled_modules: options?.dastOnly
+            ? ['dast']
+            : options?.cloudOnly
+              ? ['cloud']
+              : modulesForScan(enabledModules, target),
+          dast_target_url: options?.cloudOnly ? undefined : (target || undefined),
+          dast_asset_id: options?.cloudOnly ? undefined : (assetId || undefined),
+          dast_scan_profile: options?.cloudOnly ? undefined : (assetId || target ? profile : undefined),
+          aws_access_key_id: aws?.aws_access_key_id || undefined,
+          aws_secret_access_key: aws?.aws_secret_access_key || undefined,
+          aws_session_token: aws?.aws_session_token || undefined,
+          aws_region: aws?.aws_region || undefined,
           customization_snapshot_id: customizationSnapshotId || undefined,
           tenant_id: tenantId || undefined,
         }),
       });
 
-      console.log("validate response", validateRes.status);
-
       if (!validateRes.ok) {
         const body = await validateRes.json().catch(() => ({}));
-        console.log(body);
         throw new Error(body.error || 'Failed to validate scan');
       }
 
-      console.log("Calling startScan()");
+      await startScan(projectId, projectName || projectId, (options?.dastOnly || options?.cloudOnly) ? { preserveRemediation: true } : undefined);
 
-      await startScan(projectId, projectName || projectId);
-
-      console.log("startScan returned");
-
-      resetRemediation(projectId);
+      if (!options?.dastOnly && !options?.cloudOnly) {
+        resetRemediation(projectId);
+      }
       setActiveStage('scan');
+      if (options?.dastOnly) {
+        setResultsSurface('dynamic');
+      }
+      if (options?.cloudOnly) {
+        setResultsSurface('cloud');
+      }
     } catch (err) {
-      console.error("START SCAN ERROR:", err);
       setError(err instanceof Error ? err.message : 'Failed to start scan');
     } finally {
       setRerunInProgress(false);
@@ -1377,15 +1613,65 @@ export default function SecurityAnalysisPage() {
     scanState,
     startScan,
     tenantId,
+    enabledModules,
+    dastTargetUrl,
+    dastAssetId,
+    dastProfile,
+    setDastTarget,
+  ]);
+
+  useEffect(() => {
+    if (searchParams.get('run') !== 'dast') return;
+    if (dastAutoStartRef.current) return;
+    if (loadingProject || !projectMeta || projectAuthError) return;
+    if (scanState === 'running' || rerunInProgress) return;
+    const asset = (searchParams.get('dastAsset') || dastAssetId).trim();
+    const target = (searchParams.get('dastTarget') || dastTargetUrl).trim();
+    if (!asset && !target) return;
+    dastAutoStartRef.current = true;
+    const next = new URLSearchParams(searchParams.toString());
+    next.delete('run');
+    const suffix = next.toString();
+    router.replace(`/dashboard/security-analysis/${encodeURIComponent(projectId)}${suffix ? `?${suffix}` : ''}`);
+    void handleStartScan({ dastOnly: true, target, assetId: asset, profile: dastProfile });
+  }, [
+    dastTargetUrl,
+    handleStartScan,
+    loadingProject,
+    projectAuthError,
+    projectId,
+    projectMeta,
+    rerunInProgress,
+    router,
+    scanState,
+    searchParams,
+  ]);
+
+  useEffect(() => {
+    if (searchParams.get('run') !== 'cloud') return;
+    if (cloudAutoStartRef.current) return;
+    if (loadingProject || !projectMeta || projectAuthError) return;
+    if (scanState === 'running' || rerunInProgress) return;
+    cloudAutoStartRef.current = true;
+    const next = new URLSearchParams(searchParams.toString());
+    next.delete('run');
+    const suffix = next.toString();
+    router.replace(`/dashboard/security-analysis/${encodeURIComponent(projectId)}${suffix ? `?${suffix}` : ''}`);
+    void handleStartScan({ cloudOnly: true, aws: readSavedAws() });
+  }, [
+    handleStartScan,
+    loadingProject,
+    projectAuthError,
+    projectId,
+    projectMeta,
+    rerunInProgress,
+    router,
+    scanState,
+    searchParams,
   ]);
 
   const handleStartRemediation = useCallback(async () => {
-    const trimmedKey = keyInput.trim();
-    const trimmedModel = modelInput.trim() || selectedModels[provider] || currentConfig.flagship || REMEDIATION_DEFAULT_MODEL;
     const trimmedToken = githubToken.trim();
-
-    if (trimmedKey && trimmedKey !== apiKeys[provider]) setApiKey(provider, trimmedKey);
-    if (trimmedModel && trimmedModel !== selectedModels[provider]) setModel(provider, trimmedModel);
 
     if (loadingProject) {
       setError('Project metadata is still loading. Wait a moment, then retry remediation.');
@@ -1399,27 +1685,34 @@ export default function SecurityAnalysisPage() {
       setError('Run a successful scan with current project access before starting remediation.');
       return;
     }
+    if (!agentModel.ready) {
+      setError(agentModel.blockedReason || 'Choose a platform model or a saved BYOK credential before starting remediation.');
+      return;
+    }
 
     setError(null);
     setSetupOpen(false);
     setLocallyApproved(false);
     setApproved(false);
     setPrUrl(null);
+    setVerificationScanRequested(false);
     setActiveStage('remediate_run');
 
     try {
       await startRemediation(
         projectId,
         trimmedToken || undefined,
-        provider,
-        trimmedKey || apiKeys[provider] || undefined,
-        trimmedModel,
+        agentModel.provider || undefined,
+        undefined,
+        agentModel.model,
+        'all',
+        agentModel.accessMode,
       );
       setGithubToken('');
     } catch (remediationError) {
       setError(remediationError instanceof Error ? remediationError.message : 'Failed to start remediation');
     }
-  }, [apiKeys, canLaunchRemediation, currentConfig.flagship, githubToken, keyInput, loadingProject, modelInput, projectAuthError, projectId, projectMeta, provider, selectedModels, setApiKey, setModel, startRemediation]);
+  }, [agentModel, canLaunchRemediation, githubToken, loadingProject, projectAuthError, projectId, projectMeta, startRemediation]);
 
   const handleContinueRound = useCallback(() => {
     continueRemediationRound(projectId);
@@ -1435,47 +1728,208 @@ export default function SecurityAnalysisPage() {
     approveRemediationPush(projectId);
   }, [approveRemediationPush, projectId]);
 
+  const handleVerificationRerun = useCallback(async () => {
+    if (loadingProject) {
+      setError('Project metadata is still loading. Wait a moment, then retry.');
+      return;
+    }
+    if (!projectMeta || projectAuthError) {
+      setError(projectAuthError || 'Project access could not be verified.');
+      return;
+    }
+    if (scanState === 'running' || rerunInProgress) return;
+
+    userStartedScanRef.current = true;
+    setVerificationScanRequested(true);
+    setRerunInProgress(true);
+    setError(null);
+
+    try {
+      const validateRes = await fetch('/api/scan/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: projectId,
+          project_name: projectName || projectId,
+          project_type: projectMeta.type,
+          installation_id: projectMeta.installationId,
+          owner: projectMeta.owner,
+          repo: projectMeta.repo,
+          scan_type: 'all',
+          enabled_modules: modulesForScan(enabledModules, dastTargetUrl),
+          dast_target_url: dastTargetUrl.trim() || undefined,
+          dast_asset_id: dastAssetId.trim() || undefined,
+          customization_snapshot_id: customizationSnapshotId || undefined,
+          tenant_id: tenantId || undefined,
+        }),
+      });
+
+      if (!validateRes.ok) {
+        const body = await validateRes.json().catch(() => ({}));
+        throw new Error(body.error || 'Failed to validate scan');
+      }
+
+      await startScan(projectId, projectName || projectId, { preserveRemediation: true });
+      setActiveStage('pr_rescan');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to start verification scan');
+    } finally {
+      setRerunInProgress(false);
+    }
+  }, [
+    customizationSnapshotId,
+    loadingProject,
+    projectAuthError,
+    projectId,
+    projectMeta,
+    projectName,
+    rerunInProgress,
+    scanState,
+    startScan,
+    tenantId,
+    enabledModules,
+    dastTargetUrl,
+  ]);
+
   const selectedDiff = useMemo(() => changedFiles.find((item) => item.path === selectedDiffPath) || changedFiles[0] || null, [changedFiles, selectedDiffPath]);
 
-  const renderScanView = () => {
-    const scanRunning = scanState === 'running' || scanActive;
-    return (
-      <div className="relative z-10 mx-auto flex min-h-full w-full max-w-5xl animate-fade-in flex-col space-y-6 p-8">
-        <div className="mb-6 border-b border-[#1A1A1A] pb-6">
-          <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Codebase Security Scan</h1>
-          <p className="text-sm text-zinc-400">Execute comprehensive SAST and SCA engines over {projectName}.</p>
-        </div>
+  const scanRunning = scanState === 'running' || scanActive;
+  const scanBusy = scanRunning || loadingProject || rerunInProgress;
 
+  const renderSecurityToolbar = () => (
+    <div className="mb-8 flex flex-col gap-4 border-b-[3px] border-black pb-8 sm:flex-row sm:items-start sm:justify-between">
+      <div>
+        <h1 className="font-display text-2xl font-semibold tracking-tight text-black sm:text-[28px]">Security &amp; Remediation</h1>
+        <p className="mt-2 max-w-2xl text-[14px] leading-6 text-neutral-600">
+          Scan repositories across code, dependencies, secrets, infrastructure, APIs, and authorized dynamic testing.
+        </p>
+      </div>
+      <div className="flex shrink-0 flex-col gap-3 sm:flex-row sm:items-center">
+        <div className="relative min-w-[220px]">
+          <select
+            value={projectId}
+            onChange={(event) => {
+              const nextId = event.target.value;
+              if (!nextId || nextId === projectId) return;
+              const query = searchParams.toString();
+              router.push(`/dashboard/security-analysis/${encodeURIComponent(nextId)}${query ? `?${query}` : ''}`);
+            }}
+            className={appInput}
+          >
+            {projectOptions.length === 0 ? (
+              <option value={projectId}>{projectName || 'Select repository…'}</option>
+            ) : (
+              projectOptions.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.name}
+                </option>
+              ))
+            )}
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-neutral-500" />
+        </div>
+        <button
+          type="button"
+          onClick={() => void handleStartScan()}
+          disabled={scanBusy}
+          className={appBtnInk}
+        >
+          <ScanSearch className="h-4 w-4" />
+          {scanRunning ? 'Scanning…' : 'Run scan'}
+        </button>
+      </div>
+    </div>
+  );
+
+  const renderScanView = () => {
+    const showEmptyState = scanMessages.length === 0 && !scanRunning && !hasScanOutcome;
+
+    return (
+      <div className="animate-fade-in space-y-6">
         {error && scanState !== 'running' ? <AlertCard tone="error" title="Scan Error" message={error} /> : null}
 
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-          <div className="lg:col-span-2">
-            <BorderGlow backgroundColor="#050505" colors={['#6366f1', '#050505']} glowColor="250 80 50" borderRadius={8} className="flex h-105 flex-col overflow-hidden border border-[#1A1A1A] shadow-xl">
-              <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-[#000000] px-4 py-2.5">
-                <div className="flex items-center gap-2 text-xs font-mono text-zinc-400">
+        {showEmptyState ? (
+          <div className={`flex min-h-[420px] flex-col items-center justify-center ${secPaper} px-8 py-16 text-center`}>
+            <div className="mb-6 flex h-16 w-16 items-center justify-center border-[3px] border-black bg-white">
+              <Shield className="h-8 w-8 text-black" strokeWidth={1.25} />
+            </div>
+            <h2 className="font-display text-xl font-semibold text-black">No scan results yet</h2>
+            <p className="mt-3 max-w-md text-[14px] leading-6 text-neutral-500">
+              Pick a repository, choose pipeline modules, then run a scan. Matching files are scanned; the rest are skipped with a reason.
+            </p>
+            <div className="mt-8 w-full max-w-2xl text-left">
+              <PipelineConfig
+                enabled={enabledModules}
+                onToggle={(id) => {
+                  setEnabledModules((current) => (
+                    current.includes(id) ? current.filter((item) => item !== id) : [...current, id]
+                  ));
+                }}
+                dastTargetUrl={dastTargetUrl}
+                onDastTargetUrlChange={setDastTarget}
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => void handleStartScan()}
+              disabled={scanBusy}
+              className={`mt-8 ${appBtnPaper}`}
+            >
+              <ScanSearch className="h-4 w-4" />
+              Run first scan
+            </button>
+          </div>
+        ) : (
+          <>
+            <div>
+              <h2 className="mb-1 text-lg font-semibold text-zinc-100">Pipeline modules</h2>
+              <p className="mb-4 text-sm text-zinc-500">
+                {scopedRun?.length
+                  ? `This run is limited to ${scopedRun.join(', ')}. Other scanners are not started.`
+                  : 'Live status for this run. Skipped modules mean the project has no matching files or the module was not selected.'}
+              </p>
+              <div className="space-y-3">
+                <ScanProgress modules={pipelineModules} />
+                <SecurityModuleGrid modules={pipelineModules} onSelect={handleSelectModule} />
+              </div>
+            </div>
+            {!scanRunning ? (
+              <PipelineConfig
+                enabled={enabledModules}
+                onToggle={(id) => {
+                  setEnabledModules((current) => (
+                    current.includes(id) ? current.filter((item) => item !== id) : [...current, id]
+                  ));
+                }}
+                dastTargetUrl={dastTargetUrl}
+                onDastTargetUrlChange={setDastTarget}
+              />
+            ) : null}
+            <div className={`${secPaper} overflow-hidden`}>
+              <div className="flex items-center justify-between border-b-[3px] border-black px-4 py-3">
+                <div className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-[0.14em] text-neutral-500">
                   <TerminalSquare className="h-4 w-4" />
-                  <span>scanner-output</span>
+                  Scanner output
                 </div>
                 {scanRunning ? (
                   <span className="relative flex h-2 w-2">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-indigo-400 opacity-75" />
-                    <span className="relative inline-flex h-2 w-2 rounded-full bg-indigo-500" />
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-black opacity-75" />
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-black" />
                   </span>
                 ) : null}
               </div>
-              <div className="custom-scrollbar flex-1 overflow-y-auto bg-[#000000] p-6 font-mono text-[13px] leading-relaxed">
-                {scanMessages.length === 0 && !scanRunning ? <p className="text-zinc-600">Scan not initiated. Awaiting command...</p> : null}
-                {scanMessages.map((message, index) => {
+              <div className="sec-terminal custom-scrollbar max-h-[480px] overflow-y-auto bg-[#0d1117] p-6 font-mono text-[13px] leading-relaxed text-[#e6edf3]">
+                {scannerLogMessages.map((message, index) => {
                   const toneClass =
                     message.type === 'success'
                       ? 'text-emerald-400 font-medium'
                       : message.type === 'error'
                         ? 'text-rose-400'
                         : message.type === 'phase'
-                          ? 'text-indigo-300'
+                          ? 'text-lime-300'
                           : 'text-zinc-300';
                   return (
-                    <div key={`${message.timestamp}-${index}`} className="mb-1 flex gap-4 animate-fade-in">
+                    <div key={`${message.timestamp}-${index}`} className="mb-1 flex gap-4">
                       <span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span>
                       <span className={toneClass}>{message.content}</span>
                     </div>
@@ -1484,34 +1938,21 @@ export default function SecurityAnalysisPage() {
                 {scanRunning ? <div className="mt-2 animate-pulse text-zinc-600">_</div> : null}
                 <div ref={scanLogEndRef} />
               </div>
-            </BorderGlow>
-          </div>
-
-          <div className="flex flex-col space-y-6">
-            <BorderGlow backgroundColor="#050505" colors={['#27272a', '#050505']} borderRadius={8} className="flex-1 border border-[#1A1A1A] p-6 shadow-lg">
-              <h3 className="mb-4 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Scan Configuration</h3>
-              <div className="space-y-4 text-sm">
-                <div>
-                  <span className="mb-1 block text-zinc-500">Target</span>
-                  <span className="inline-flex rounded bg-[#111111] px-2 py-1 font-mono text-zinc-200">{projectMeta?.repo || projectName}</span>
-                </div>
-                <div>
-                  <span className="mb-1 block text-zinc-500">Source</span>
-                  <span className="text-zinc-200">{projectMeta?.type === 'github' ? 'GitHub repository' : 'Local upload'}</span>
-                </div>
-                <div>
-                  <span className="mb-1 block text-zinc-500">Engines</span>
-                  <span className="text-zinc-200">Bearer (SAST), Syft/Grype (SCA)</span>
-                </div>
+            </div>
+            {canOpenResults ? (
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => setActiveStage('results')}
+                  className={appBtnInk}
+                >
+                  <Eye className="h-4 w-4" />
+                  View results
+                </button>
               </div>
-            </BorderGlow>
-
-            <RunButton onClick={() => void handleStartScan()} disabled={scanRunning || loadingProject || rerunInProgress}>
-              <Play className="h-4 w-4" />
-              {scanRunning ? 'Running...' : hasScanOutcome ? 'Run New Validation Scan' : 'Start Validation Scan'}
-            </RunButton>
-          </div>
-        </div>
+            ) : null}
+          </>
+        )}
       </div>
     );
   };
@@ -1521,8 +1962,8 @@ export default function SecurityAnalysisPage() {
       return (
         <div className="relative z-10 mx-auto flex min-h-full w-full max-w-5xl animate-fade-in flex-col space-y-6 p-8">
           <div>
-            <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Vulnerability Results</h1>
-            <p className="text-sm text-zinc-400">Loading latest findings and verification data.</p>
+            <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Security Overview</h1>
+            <p className="text-sm text-zinc-400">Loading latest findings and pipeline status.</p>
           </div>
           <SpinnerCard label="Loading scan results..." />
         </div>
@@ -1533,10 +1974,27 @@ export default function SecurityAnalysisPage() {
       return (
         <div className="relative z-10 mx-auto flex min-h-full w-full max-w-5xl animate-fade-in flex-col space-y-6 p-8">
           <div>
-            <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Vulnerability Results</h1>
+            <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Security Overview</h1>
             <p className="text-sm text-zinc-400">The latest scan could not be loaded.</p>
           </div>
           <AlertCard tone="error" title="Results Unavailable" message={error} action={<RunButton className="max-w-65" onClick={() => void fetchStatusAndResults({ trackError: true })}>Retry Loading Results</RunButton>} />
+        </div>
+      );
+    }
+
+    if (!results) {
+      return (
+        <div className="relative z-10 mx-auto flex min-h-full w-full max-w-5xl animate-fade-in flex-col space-y-6 p-8">
+          <div>
+            <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Security Overview</h1>
+            <p className="text-sm text-zinc-400">Findings are ready to load from the latest pipeline run.</p>
+          </div>
+          <AlertCard
+            tone="warning"
+            title="Results not loaded yet"
+            message="The scan finished, but findings have not been fetched yet. Load results to continue."
+            action={<RunButton className="max-w-65" onClick={() => void fetchStatusAndResults({ trackError: true })}>Load results</RunButton>}
+          />
         </div>
       );
     }
@@ -1546,39 +2004,86 @@ export default function SecurityAnalysisPage() {
 
     return (
       <div className="relative z-10 mx-auto flex min-h-full w-full max-w-5xl animate-fade-in flex-col space-y-6 p-8">
+        <div className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Security Overview</h1>
+            <p className="text-sm text-zinc-400">
+              {lastResultsSyncAt
+                ? `Latest pipeline run synced ${new Date(lastResultsSyncAt).toLocaleTimeString()}`
+                : 'Posture, modules, and findings from the latest pipeline run.'}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {RESULTS_SURFACES.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setResultsSurface(item.id)}
+                className={`border-[3px] border-black px-3 py-2 text-xs font-bold transition-transform hover:translate-x-0.5 hover:translate-y-0.5 ${resultsSurface === item.id ? 'bg-black text-white shadow-none' : 'bg-white text-black shadow-[4px_4px_0_0_#000]'}`}
+              >
+                {item.label}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => void fetchStatusAndResults({ trackError: true })}
+              className={appBtnPaper}
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Refresh
+            </button>
+            <ScanReportDownloadButton projectId={projectId} disabled={!results} />
+          </div>
+        </div>
+
         <div>
-          <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Vulnerability Results</h1>
-          <p className="text-sm text-zinc-400">Total findings across Static Analysis and Supply Chain.</p>
+          <p className="mb-3 font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-zinc-500">Security posture</p>
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+            <SecurityKPI label="Critical" value={stats.critical} tone="critical" />
+            <SecurityKPI label="High" value={stats.high} tone="high" />
+            <SecurityKPI label="Medium" value={stats.medium} tone="medium" />
+            <SecurityKPI label="Low" value={stats.low} tone="low" />
+          </div>
         </div>
 
-        <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-          <BorderGlow backgroundColor="#050505" colors={['#27272a', '#050505']} borderRadius={8} className="border border-[#1A1A1A] p-5"><h3 className="mb-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Total Findings</h3><div className="text-3xl font-bold text-zinc-100">{stats.total}</div></BorderGlow>
-          <BorderGlow backgroundColor="#050505" colors={['#f43f5e', '#050505']} glowColor="340 80 50" borderRadius={8} className="border border-[#1A1A1A] p-5"><h3 className="mb-2 text-[10px] font-bold uppercase tracking-widest text-rose-500">Critical</h3><div className="text-3xl font-bold text-rose-500">{stats.critical}</div></BorderGlow>
-          <BorderGlow backgroundColor="#050505" colors={['#f59e0b', '#050505']} glowColor="35 100 50" borderRadius={8} className="border border-[#1A1A1A] p-5"><h3 className="mb-2 text-[10px] font-bold uppercase tracking-widest text-amber-500">High</h3><div className="text-3xl font-bold text-amber-500">{stats.high}</div></BorderGlow>
-          <BorderGlow backgroundColor="#050505" colors={['#10b981', '#050505']} glowColor="150 80 50" borderRadius={8} className="border border-[#1A1A1A] p-5"><h3 className="mb-2 text-[10px] font-bold uppercase tracking-widest text-emerald-500">Auto-Fixable</h3><div className="text-3xl font-bold text-emerald-500">{stats.autoFixable}</div></BorderGlow>
-        </div>
-
-        {cleanState ? (
-          <AlertCard
-            tone="success"
-            title="No Vulnerabilities Detected"
-            message="This project passed the current security scan. Continue to deployment or return to the dashboard."
-            action={(
-              <div className="flex flex-wrap gap-3">
-                <RunButton className="max-w-65" onClick={() => router.push(`/dashboard/deploy?projectId=${encodeURIComponent(projectId)}&entry=card`)}>
-                  Continue to Delivery
-                </RunButton>
-                <button
-                  type="button"
-                  onClick={() => router.push('/dashboard')}
-                  className="inline-flex items-center justify-center rounded-md border border-[#262626] bg-[#050505] px-4 py-3 text-sm font-medium text-zinc-200 transition-colors hover:bg-[#111111]"
-                >
-                  Return to Dashboard
-                </button>
+        {resultsSurface === 'overview' ? (
+          <>
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
+              <RiskScore risk={results.risk} onExplain={() => setResultsSurface('risk')} />
+              <div className="grid grid-cols-2 gap-4">
+                <SecurityKPI label="Total findings" value={stats.total} />
+                <SecurityKPI label="Auto-fixable" value={stats.autoFixable} tone="success" />
+                <SecurityKPI label="Attack paths" value={results.attack_paths?.length || 0} />
+                <SecurityKPI label="Exploitable" value={unifiedFindings.filter((item) => Number(item.metadata?.epss_score || 0) >= 0.5 || item.category === 'dast').length} />
               </div>
-            )}
-          />
-        ) : (
+            </div>
+            <div>
+              <p className="mb-3 font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-zinc-500">Pipeline modules</p>
+              <SecurityModuleGrid modules={pipelineModules} onSelect={handleSelectModule} />
+            </div>
+            {cleanState ? (
+              <AlertCard
+                tone="success"
+                title="No vulnerabilities detected"
+                message="This project passed the current security scan. Continue to deployment or return to the dashboard."
+                action={(
+                  <div className="flex flex-wrap gap-3">
+                    <RunButton className="max-w-65" onClick={() => router.push(`/dashboard/deploy?projectId=${encodeURIComponent(projectId)}&entry=card`)}>
+                      Continue to Delivery
+                    </RunButton>
+                    <button
+                      type="button"
+                      onClick={() => router.push('/dashboard')}
+                      className={appBtnPaper}
+                    >
+                      Return to Dashboard
+                    </button>
+                  </div>
+                )}
+              />
+            ) : null}
+          </>
+        ) : resultsSurface === 'findings' ? (
           <>
             {projectAuthError ? (
               <AlertCard
@@ -1587,159 +2092,84 @@ export default function SecurityAnalysisPage() {
                 message={projectAuthError}
               />
             ) : null}
-            <div className="overflow-hidden rounded-xl border border-[#1A1A1A] bg-[#050505] shadow-xl">
-              <div className="flex flex-wrap items-center justify-between gap-4 border-b border-[#1A1A1A] bg-[#000000] px-6 py-4">
-                <div>
-                  <h3 className="text-base font-semibold text-zinc-100">Live Findings Explorer</h3>
-                  <p className="mt-1 text-xs text-zinc-500">
-                    {lastResultsSyncAt
-                      ? `Synced ${new Date(lastResultsSyncAt).toLocaleTimeString()} from live scan results`
-                      : 'Showing the latest live scan payload'}
-                  </p>
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setResultsTab('sca')}
-                    className={`rounded-md px-3 py-2 text-xs font-semibold transition-colors ${resultsTab === 'sca' ? 'bg-indigo-500/15 text-indigo-300' : 'bg-[#111111] text-zinc-400 hover:text-zinc-200'}`}
-                  >
-                    Supply Chain ({filteredSupplyChain.length})
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setResultsTab('sast')}
-                    className={`rounded-md px-3 py-2 text-xs font-semibold transition-colors ${resultsTab === 'sast' ? 'bg-indigo-500/15 text-indigo-300' : 'bg-[#111111] text-zinc-400 hover:text-zinc-200'}`}
-                  >
-                    Code Security ({filteredCodeFindings.length})
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void fetchStatusAndResults({ trackError: true })}
-                    className="inline-flex items-center gap-2 rounded-md border border-[#262626] bg-[#111111] px-3 py-2 text-xs font-medium text-zinc-300 transition-colors hover:bg-[#1A1A1A]"
-                  >
-                    <RefreshCw className="h-3.5 w-3.5" />
-                    Refresh
-                  </button>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 gap-3 border-b border-[#1A1A1A] px-6 py-4 md:grid-cols-[minmax(0,1fr)_180px]">
-                <input
-                  value={resultsQuery}
-                  onChange={(event) => setResultsQuery(event.target.value)}
-                  placeholder={resultsTab === 'sca' ? 'Search package, CVE, version, fix version...' : 'Search file, CWE, issue, description...'}
-                  className="w-full rounded-md border border-[#262626] bg-[#000000] px-4 py-2.5 text-sm text-zinc-200 outline-none transition-colors focus:border-indigo-500/50"
-                />
-                <select
-                  value={resultsSeverity}
-                  onChange={(event) => setResultsSeverity(event.target.value as typeof resultsSeverity)}
-                  className="w-full rounded-md border border-[#262626] bg-[#000000] px-4 py-2.5 text-sm text-zinc-200 outline-none transition-colors focus:border-indigo-500/50"
-                >
-                  <option value="all">All severities</option>
-                  <option value="critical">Critical</option>
-                  <option value="high">High</option>
-                  <option value="medium">Medium</option>
-                  <option value="low">Low</option>
-                </select>
-              </div>
-
-              {resultsTab === 'sca' ? (
-                <div className="custom-scrollbar max-h-[55vh] overflow-auto">
-                  <table className="w-full border-collapse text-left text-sm">
-                    <thead className="sticky top-0 z-10 bg-[#050505]">
-                      <tr className="border-b border-[#1A1A1A]">
-                        <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500">Package</th>
-                        <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500">Version</th>
-                        <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500">CVE</th>
-                        <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500">Fix Version</th>
-                        <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500">Severity</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {visibleSupplyChain.map((item, index) => (
-                        <tr key={`${item.cve_id}-${item.name}-${index}`} className="border-b border-[#1A1A1A] transition-colors hover:bg-[#111111]">
-                          <td className="px-4 py-3 font-mono text-zinc-300">{item.name}</td>
-                          <td className="px-4 py-3 font-mono text-xs text-zinc-400">{item.version || '-'}</td>
-                          <td className="px-4 py-3 text-xs text-zinc-400">{item.cve_id || '-'}</td>
-                          <td className="px-4 py-3 text-xs text-zinc-400">{item.fix_version || 'No fix published'}</td>
-                          <td className="px-4 py-3"><span className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase ${getSeverityBadgeClasses(item.severity)}`}>{item.severity}</span></td>
-                        </tr>
-                      ))}
-                      {visibleSupplyChain.length === 0 ? (
-                        <tr>
-                          <td colSpan={5} className="px-4 py-8 text-center text-sm text-zinc-500">No supply-chain findings match the current filters.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-              ) : (
-                <div className="custom-scrollbar max-h-[55vh] overflow-auto">
-                  <table className="w-full border-collapse text-left text-sm">
-                    <thead className="sticky top-0 z-10 bg-[#050505]">
-                      <tr className="border-b border-[#1A1A1A]">
-                        <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500">Location</th>
-                        <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500">Issue</th>
-                        <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500">Description</th>
-                        <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500">Severity</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {visibleCodeFindings.map((item, index) => (
-                        <tr key={`${item.location}-${item.issue}-${index}`} className="border-b border-[#1A1A1A] transition-colors hover:bg-[#111111]">
-                          <td className="px-4 py-3 font-mono text-xs text-zinc-300">{item.location}</td>
-                          <td className="px-4 py-3 text-xs text-zinc-400">{item.issue}</td>
-                          <td className="px-4 py-3 text-xs text-zinc-400">{item.description || '-'}</td>
-                          <td className="px-4 py-3"><span className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase ${getSeverityBadgeClasses(item.severity)}`}>{item.severity}</span></td>
-                        </tr>
-                      ))}
-                      {visibleCodeFindings.length === 0 ? (
-                        <tr>
-                          <td colSpan={4} className="px-4 py-8 text-center text-sm text-zinc-500">No code-security findings match the current filters.</td>
-                        </tr>
-                      ) : null}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#1A1A1A] px-6 py-4 text-xs text-zinc-500">
-                <div>
-                  {resultsTab === 'sca'
-                    ? `Showing ${visibleSupplyChain.length} of ${filteredSupplyChain.length} supply-chain findings`
-                    : `Showing ${visibleCodeFindings.length} of ${filteredCodeFindings.length} code-security findings`}
-                </div>
-                {((resultsTab === 'sca' && visibleSupplyChain.length < filteredSupplyChain.length) || (resultsTab === 'sast' && visibleCodeFindings.length < filteredCodeFindings.length)) ? (
-                  <button
-                    type="button"
-                    onClick={() => setResultsLimit((value) => value + 100)}
-                    className="rounded-md border border-[#262626] bg-[#111111] px-3 py-2 text-xs font-medium text-zinc-300 transition-colors hover:bg-[#1A1A1A]"
-                  >
-                    Load 100 More
-                  </button>
-                ) : null}
-              </div>
-            </div>
-
-            {canLaunchRemediation ? (
-              <PixelCard
-                noFocus
-                colors="#4338ca,#312e81,#18181b"
-                gap={5}
-                speed={28}
-                className="mt-6 overflow-hidden rounded-xl border border-[#1A1A1A] bg-[#050505] shadow-xl"
-              >
-                <div className="relative z-10 flex items-center justify-between bg-linear-to-r from-indigo-500/10 to-transparent p-6">
-                  <div>
-                    <h3 className="mb-1 flex items-center gap-2 text-base font-bold text-indigo-400"><Sparkles className="h-4 w-4" />AI Auto-Remediation Available</h3>
-                    <p className="text-[13px] text-zinc-400">Deploy the remediation agent to patch these vulnerabilities, create a PR, and verify with a re-scan.</p>
-                  </div>
-                  <div className="w-55"><RunButton onClick={() => { setSetupOpen(true); setActiveStage('remediate_setup'); }}>Setup AI Agent</RunButton></div>
-                </div>
-              </PixelCard>
-            ) : null}
+            {cleanState ? (
+              <AlertCard
+                tone="success"
+                title="No findings in this run"
+                message="The latest pipeline run did not report vulnerabilities. Module status is still available on Overview."
+              />
+            ) : (
+              <FindingTable
+                findings={unifiedFindings}
+                category={findingsCategory}
+                onCategoryChange={setFindingsCategory}
+                query={resultsQuery}
+                onQueryChange={setResultsQuery}
+                severity={resultsSeverity}
+                onSeverityChange={setResultsSeverity}
+                correlations={results.correlations}
+                expandedId={expandedFindingId}
+                onExpandedIdChange={setExpandedFindingId}
+              />
+            )}
           </>
+        ) : resultsSurface === 'secrets' ? (
+          <SecretsExplorer findings={unifiedFindings} />
+        ) : resultsSurface === 'supply-chain' ? (
+          <SupplyChainExplorer findings={unifiedFindings} results={results} />
+        ) : resultsSurface === 'infrastructure' ? (
+          <InfrastructureExplorer findings={unifiedFindings} modules={pipelineModules} />
+        ) : resultsSurface === 'apis' ? (
+          <ApiExplorer findings={unifiedFindings} module={pipelineModules.find((item) => item.id === 'api')} />
+        ) : resultsSurface === 'dynamic' ? (
+          <DynamicTestingExplorer
+            findings={unifiedFindings}
+            module={pipelineModules.find((item) => item.id === 'dast')}
+            projectId={projectId}
+            selectedAssetId={dastAssetId}
+            onSelectAsset={(asset) => setDastTarget(asset?.target_url || '', asset?.id || '')}
+            profile={dastProfile}
+            onProfileChange={setDastProfile}
+            onRun={() => void handleStartScan({ dastOnly: true })}
+            busy={scanBusy}
+            error={error}
+          />
+        ) : resultsSurface === 'cloud' ? (
+          <CloudExplorer
+            findings={unifiedFindings}
+            module={pipelineModules.find((item) => item.id === 'cloud')}
+            deployed={projectHasSuccessfulDeploy(projectId)}
+            onRun={(aws) => void handleStartScan({ cloudOnly: true, aws })}
+            busy={scanBusy}
+            error={error}
+            deployHref={`/dashboard/deploy?projectId=${encodeURIComponent(projectId)}`}
+          />
+        ) : resultsSurface === 'risk' ? (
+          <RiskExplorer results={results} findings={unifiedFindings} />
+        ) : resultsSurface === 'assets' ? (
+          <AssetExplorer findings={unifiedFindings} />
+        ) : (
+          <AttackPathExplorer
+            paths={results.attack_paths || []}
+            onSelectFinding={(id) => {
+              setExpandedFindingId(id);
+              setResultsSurface('findings');
+              setFindingsCategory('all');
+            }}
+          />
         )}
+
+        {canLaunchRemediation ? (
+          <div className={`${secPaper} overflow-hidden`}>
+            <div className="relative z-10 flex flex-col gap-4 p-6 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <h3 className="mb-1 flex items-center gap-2 text-base font-bold text-black"><Sparkles className="h-4 w-4" />AI Auto-Remediation Available</h3>
+                <p className="text-[13px] text-neutral-600">Deploy the remediation agent to patch these vulnerabilities, create a PR, and verify with a re-scan.</p>
+              </div>
+              <div className="w-55"><RunButton onClick={() => { setSetupOpen(true); setActiveStage('remediate_setup'); }}>Setup AI Agent</RunButton></div>
+            </div>
+          </div>
+        ) : null}
 
         {runAll && cleanState ? (
           <div className="flex justify-center pt-2">
@@ -1760,54 +2190,26 @@ export default function SecurityAnalysisPage() {
       </div>
       {projectAuthError ? <AlertCard tone="error" title="Project Access Required" message={projectAuthError} /> : null}
       {error && remediationState === 'error' ? <AlertCard tone="error" title="Remediation Error" message={error} /> : null}
-        <div className="space-y-6 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6 shadow-xl">
+        <div className={`${secPaper} space-y-6 p-6`}>
         <div className="space-y-4">
           <div>
             <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">Remediation Agent</label>
-            <div className="rounded-md border border-orange-500/20 bg-orange-500/10 px-4 py-3">
-              <div className="text-sm font-semibold text-orange-200">Remediation Pipeline Engine</div>
-              <p className="mt-1 text-xs text-orange-100/70">Security track now runs through the new remediation pipeline modules with provider routing in backend.</p>
+            <div className="border-[3px] border-black bg-white px-4 py-3">
+              <div className="text-sm font-semibold text-black">Remediation Pipeline Engine</div>
+              <p className="mt-1 text-xs text-neutral-600">
+                Choose a subscription-hosted platform model or a vaulted BYOK key. API keys are not pasted on this page.
+              </p>
             </div>
           </div>
-          <div>
-            <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">LLM Provider</label>
-            <select
-              value={provider}
-              onChange={(event) => setProvider(event.target.value as LLMProvider)}
-              className="w-full rounded-md border border-[#262626] bg-[#000000] px-4 py-2.5 text-sm text-zinc-200 outline-none transition-colors focus:border-indigo-500/50"
-            >
-              {LLM_PROVIDERS.map((entry) => (
-                <option key={entry.id} value={entry.id}>{entry.label}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">Model</label>
-            <input
-              value={modelInput}
-              onChange={(event) => setModelInput(event.target.value)}
-              placeholder={selectedModels[provider] || currentConfig.flagship || REMEDIATION_DEFAULT_MODEL}
-              className="w-full rounded-md border border-[#262626] bg-[#000000] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none transition-colors focus:border-indigo-500/50"
-            />
-          </div>
-          <div>
-            <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">{currentConfig.label} API Key</label>
-            <input
-              type="password"
-              value={keyInput}
-              onChange={(event) => setKeyInput(event.target.value)}
-              placeholder={currentConfig.placeholder || 'API key'}
-              className="w-full rounded-md border border-[#262626] bg-[#000000] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none transition-colors focus:border-indigo-500/50"
-            />
-          </div>
+          <RemediationModelPicker value={agentModel} onChange={setAgentModel} />
           <div className="border-t border-[#1A1A1A] pt-4">
             <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">GitHub PAT (Optional)</label>
-            <input type="password" value={githubToken} onChange={(event) => setGithubToken(event.target.value)} placeholder="ghp_..." className="w-full rounded-md border border-[#262626] bg-[#000000] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none transition-colors focus:border-indigo-500/50" />
+            <input type="password" value={githubToken} onChange={(event) => setGithubToken(event.target.value)} placeholder="ghp_..." className={appInput} />
             <p className="mt-2 text-[11px] text-zinc-500">Required only for pushing the fix branch automatically. Not stored persistently.</p>
           </div>
         </div>
         <div className="pt-6">
-          <RunButton onClick={() => void handleStartRemediation()} disabled={remediatingThisProject || !canLaunchRemediation}>
+          <RunButton onClick={() => void handleStartRemediation()} disabled={remediatingThisProject || !canLaunchRemediation || !agentModel.ready}>
             <Sparkles className="h-4 w-4" />
             <span>Start Remediation Engine</span>
           </RunButton>
@@ -1816,64 +2218,137 @@ export default function SecurityAnalysisPage() {
     </div>
   );
 
-  const renderRemediateRunView = () => (
-    <div className="relative z-10 mx-auto flex min-h-full w-full max-w-5xl animate-fade-in flex-col space-y-6 p-8">
-      <div className="mb-2 flex items-center justify-between">
-        <h1 className="text-2xl font-semibold text-zinc-100">{remediatingThisProject ? 'Agent Executing...' : remediationState === 'error' ? 'Execution Failed' : 'Execution Paused'}</h1>
-        {remediatingThisProject ? <span className="relative flex h-2 w-2"><span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-indigo-400 opacity-75" /><span className="relative inline-flex h-2 w-2 rounded-full bg-indigo-500" /></span> : null}
+  const renderRemediateRunView = () => {
+    const latestMessage = [...remMessages].reverse().find((message) => message.type !== 'changed_files');
+    const agentStatusLabel =
+      remediationState === 'running'
+        ? 'Patching vulnerabilities'
+        : remediationState === 'waiting_decision'
+          ? 'Awaiting your decision'
+          : remediationState === 'waiting_approval'
+            ? 'Awaiting final approval'
+            : remediationState === 'completed'
+              ? 'Remediation complete'
+              : remediationState === 'error'
+                ? 'Run failed'
+                : 'Standing by';
+
+    return (
+      <div className="animate-fade-in space-y-6">
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,320px)_1fr]">
+          <div className={`${secPaper} p-5`}>
+            <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">Active agent</p>
+            <div className="mt-3 flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-none border-[3px] border-black bg-white">
+                <Bot className="h-5 w-5 text-black" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-white">Remediation agent</p>
+                <p className="text-[12px] text-zinc-500">{agentModel.sourceLabel} · {agentModel.model || REMEDIATION_DEFAULT_MODEL}</p>
+              </div>
+            </div>
+            <div className="mt-5 space-y-3 border-t border-white/10 pt-4 text-[13px]">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-zinc-500">Status</span>
+                <span
+                  className={`font-semibold ${
+                    remediationState === 'error'
+                      ? 'text-rose-700'
+                      : remediationState === 'waiting_decision' || remediationState === 'waiting_approval'
+                        ? 'text-amber-800'
+                        : 'text-emerald-800'
+                  }`}
+                >
+                  {agentStatusLabel}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-zinc-500">Changed files</span>
+                <span className="font-mono text-zinc-300">{changedFiles.length}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-zinc-500">Project</span>
+                <span className="truncate font-mono text-zinc-300">{projectName}</span>
+              </div>
+            </div>
+            {latestMessage ? (
+              <div className="mt-4 border-[3px] border-black bg-white p-3">
+                <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-zinc-600">Latest activity</p>
+                <p className="mt-2 text-[12px] leading-5 text-zinc-400">{String(latestMessage.content).slice(0, 220)}{String(latestMessage.content).length > 220 ? '…' : ''}</p>
+              </div>
+            ) : null}
+          </div>
+
+          <div className={`${secPaper} overflow-hidden`}>
+            <div className="flex items-center justify-between border-b-[3px] border-black px-5 py-4">
+              <div className="flex items-center gap-2">
+                <TerminalSquare className="h-4 w-4 text-lime-300" />
+                <h3 className="text-sm font-semibold text-zinc-200">Agent execution log</h3>
+              </div>
+              {remediatingThisProject ? (
+                <span className="relative flex h-2 w-2">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-black opacity-75" />
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-black" />
+                </span>
+              ) : null}
+            </div>
+            <div className="sec-terminal custom-scrollbar max-h-[420px] overflow-y-auto bg-[#0d1117] p-6 font-mono text-[13px] leading-relaxed text-[#e6edf3]">
+              {remMessages.map((message, index) => {
+                if (message.type === 'changed_files') return null;
+                const logText = String(message.content || '');
+                const toneClass = logText.includes('[waiting_approval]') || logText.includes('[waiting_decision]') || message.type === 'warning'
+                  ? 'text-amber-400 font-medium'
+                  : message.type === 'success'
+                    ? 'text-emerald-400'
+                    : message.type === 'error'
+                      ? 'text-rose-400'
+                      : 'text-zinc-400';
+                return (
+                  <div key={`${message.timestamp}-${index}`} className="mb-2 flex gap-4">
+                    <span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span>
+                    <span className={toneClass}>{logText}</span>
+                  </div>
+                );
+              })}
+              {remediatingThisProject ? <div className="mt-2 animate-pulse text-zinc-600">_</div> : null}
+              <div ref={remediateLogEndRef} />
+            </div>
+          </div>
+        </div>
+
+        {remediationState === 'error' ? (
+          <AlertCard tone="error" title="Remediation Failed" message={[...remMessages].reverse().find((message) => message.type === 'error')?.content || error || 'The remediation run failed.'} />
+        ) : null}
       </div>
-      {remediationState === 'error' ? <AlertCard tone="error" title="Remediation Failed" message={[...remMessages].reverse().find((message) => message.type === 'error')?.content || error || 'The remediation run failed.'} /> : null}
-
-      <BorderGlow backgroundColor="#000000" colors={['#a855f7', '#000000']} glowColor="280 80 50" borderRadius={8} className="flex h-125 flex-col overflow-hidden border border-[#1A1A1A] shadow-2xl">
-        <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-[#0A0A0A] px-5 py-4">
-          <div className="flex items-center gap-2"><Bot className="h-4 w-4 text-purple-400" /><h3 className="text-sm font-semibold text-zinc-200">Agent Terminal</h3></div>
-        </div>
-        <div className="custom-scrollbar flex-1 overflow-y-auto bg-[#000000] p-6 font-mono text-[13px] leading-relaxed">
-          {remMessages.map((message, index) => {
-            const logText = String(message.content || '');
-            const toneClass = logText.includes('[waiting_approval]') || logText.includes('[waiting_decision]') || message.type === 'warning' ? 'text-amber-400 font-medium' : message.type === 'success' ? 'text-emerald-400' : message.type === 'error' ? 'text-rose-400' : 'text-zinc-400';
-            return <div key={`${message.timestamp}-${index}`} className="mb-2 flex gap-4 animate-fade-in"><span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span><span className={toneClass}>{logText}</span></div>;
-          })}
-          {remediatingThisProject ? <div className="mt-2 animate-pulse text-zinc-600">_</div> : null}
-          <div ref={remediateLogEndRef} />
-        </div>
-      </BorderGlow>
-
-    </div>
-  );
+    );
+  };
 
   const renderApprovalView = () => {
     const waitingForDecision = remediationState === 'waiting_decision';
 
     return (
       <div className="relative z-10 mx-auto flex min-h-full w-full max-w-4xl animate-fade-in flex-col space-y-6 p-8">
-        <div className="mb-6 mt-4 flex items-center justify-between border-b border-[#1A1A1A] pb-6">
-          <div>
-            <h1 className="mb-2 text-2xl font-semibold text-zinc-100">{waitingForDecision ? 'Choose Next Step' : 'Approve & Push Fixes'}</h1>
-            <p className="text-sm text-zinc-400">
-              {waitingForDecision
-                ? 'The first remediation round finished. Review the patch set and decide whether to push these fixes or run one more remediation round.'
-                : 'Review the current patch set one last time, then approve persistence, PR creation, and the verification re-scan.'}
-            </p>
-          </div>
-          <div className="inline-flex items-center gap-2 rounded border border-amber-500/20 bg-amber-500/10 px-3 py-1 text-[11px] font-bold uppercase text-amber-500">
-            <CheckCircle2 className="h-3.5 w-3.5" />
-            {waitingForDecision ? 'Decision Required' : 'Final Approval'}
-          </div>
+        <div className="mb-6 mt-4 border-b border-[#1A1A1A] pb-6">
+          <h1 className="mb-2 text-2xl font-semibold text-zinc-100">{waitingForDecision ? 'Choose Next Step' : 'Approve & Push Fixes'}</h1>
+          <p className="text-sm text-zinc-400">
+            {waitingForDecision
+              ? 'The first remediation round finished. Review the patch set and decide whether to push these fixes or run one more remediation round.'
+              : 'Review the current patch set one last time, then approve persistence and PR creation. You can rerun a verification scan after the PR exists.'}
+          </p>
         </div>
 
-        <div className="overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505] shadow-xl">
-          <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-[#000000] p-4"><span className="text-sm font-semibold text-zinc-200">Changed Files</span><span className="text-xs font-mono text-zinc-500">{changedFiles.length} modification{changedFiles.length === 1 ? '' : 's'}</span></div>
+        <div className={`${secPaper} overflow-hidden`}>
+          <div className="flex items-center justify-between border-b-[3px] border-black p-4"><span className="text-sm font-semibold text-black">Changed Files</span><span className="font-mono text-xs text-neutral-600">{changedFiles.length} modification{changedFiles.length === 1 ? '' : 's'}</span></div>
           <div className="p-0">
             {changedFiles.length === 0 ? (
-              <div className="p-4 text-sm text-zinc-500">No changed file metadata is available for this remediation run.</div>
+              <div className="p-4 text-sm text-neutral-600">No changed file metadata is available for this remediation run.</div>
             ) : changedFiles.map((item) => (
-              <div key={item.path} className="flex items-center justify-between border-b border-[#1A1A1A] p-4 transition-colors last:border-b-0 hover:bg-[#111111]">
+              <div key={item.path} className="flex items-center justify-between border-b-[3px] border-black p-4 transition-colors last:border-b-0 hover:bg-white/70">
                 <div className="flex min-w-0 items-center gap-3">
-                  {item.path.endsWith('.json') ? <FileJson className="h-4 w-4 text-zinc-400" /> : <FileCode2 className="h-4 w-4 text-zinc-400" />}
-                  <div className="min-w-0"><span className="block truncate text-sm font-mono text-zinc-300">{item.path}</span>{item.reason ? <span className="mt-0.5 block text-xs text-zinc-500">{item.reason}</span> : null}</div>
+                  {item.path.endsWith('.json') ? <FileJson className="h-4 w-4 text-black" /> : <FileCode2 className="h-4 w-4 text-black" />}
+                  <div className="min-w-0"><span className="block truncate font-mono text-sm text-black">{item.path}</span>{item.reason ? <span className="mt-0.5 block text-xs text-neutral-600">{item.reason}</span> : null}</div>
                 </div>
-                <button type="button" onClick={() => setSelectedDiffPath(item.path)} className="flex items-center gap-2 rounded bg-[#1A1A1A] px-3 py-1 text-xs font-medium text-zinc-300 transition-colors hover:bg-[#262626]"><Eye className="h-3 w-3" />View Diff</button>
+                <button type="button" onClick={() => setSelectedDiffPath(item.path)} className="flex items-center gap-2 border-[3px] border-black bg-white px-3 py-1 text-xs font-bold text-black shadow-[3px_3px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none"><Eye className="h-3 w-3" />View Diff</button>
               </div>
             ))}
           </div>
@@ -1882,28 +2357,28 @@ export default function SecurityAnalysisPage() {
         {selectedDiff ? <div className="space-y-3"><div className="flex items-center justify-between"><div className="text-sm font-semibold text-zinc-200">{selectedDiff.path}</div>{selectedDiff.reason ? <div className="text-xs text-zinc-500">{selectedDiff.reason}</div> : null}</div>{selectedDiff.diff ? <DiffViewer diff={selectedDiff.diff} /> : <AlertCard tone="warning" title="Diff Unavailable" message="This file change did not include a diff payload." />}</div> : null}
 
         {waitingForDecision ? (
-          <div className="grid gap-4 rounded-lg border border-[#1A1A1A] bg-[#050505] p-6 md:grid-cols-2">
-            <div className="rounded-md border border-[#1A1A1A] bg-[#000000] p-4">
-              <div className="text-sm font-semibold text-zinc-100">Push current fixes</div>
-              <p className="mt-2 text-sm leading-relaxed text-zinc-400">Stop after this patch set, move to final approval, and then create the PR with the current changes.</p>
+          <div className={`grid gap-4 ${secPaper} p-6 md:grid-cols-2`}>
+            <div className="border-[3px] border-black bg-white p-4">
+              <div className="text-sm font-semibold text-black">Push current fixes</div>
+              <p className="mt-2 text-sm leading-relaxed text-neutral-600">Stop after this patch set, move to final approval, and then create the PR with the current changes.</p>
               <div className="mt-4">
                 <RunButton onClick={handlePushCurrentFixes}>Use These Fixes</RunButton>
               </div>
             </div>
-            <div className="rounded-md border border-[#1A1A1A] bg-[#000000] p-4">
-              <div className="text-sm font-semibold text-zinc-100">Run another round</div>
-              <p className="mt-2 text-sm leading-relaxed text-zinc-400">Re-scan the updated codebase and let the remediation agent take one more pass before final approval.</p>
+            <div className="border-[3px] border-black bg-white p-4">
+              <div className="text-sm font-semibold text-black">Run another round</div>
+              <p className="mt-2 text-sm leading-relaxed text-neutral-600">Re-scan the updated codebase and let the remediation agent take one more pass before final approval.</p>
               <div className="mt-4">
                 <RunButton onClick={handleContinueRound}>Run Another Round</RunButton>
               </div>
             </div>
           </div>
         ) : (
-          <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
-            <div className="mb-6 rounded-md border border-[#1A1A1A] bg-[#000000] p-4">
+          <div className={`${secPaper} p-6`}>
+            <div className="mb-6 border-[3px] border-black bg-white p-4">
               <label className="flex cursor-pointer items-start gap-3">
-                <input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)} className="mt-1 h-4 w-4 rounded border-[#4B5563] bg-[#111111] text-indigo-600" />
-                <span className="text-sm leading-relaxed text-zinc-400">I approve these code modifications. Persist the fix branch, open a Pull Request automatically if this is a GitHub project, and trigger the verification re-scan.</span>
+                <input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)} className="mt-1 h-4 w-4 rounded-none border-black bg-white text-black" />
+                <span className="text-sm leading-relaxed text-neutral-600">I approve these code modifications. Persist the fix branch and open a Pull Request automatically if this is a GitHub project. Verification scan is optional after the PR is created.</span>
               </label>
             </div>
             <RunButton disabled={!approved} onClick={handleApproveAndPush}>Approve &amp; Push PR</RunButton>
@@ -1914,47 +2389,95 @@ export default function SecurityAnalysisPage() {
   };
 
   const renderPrRescanView = () => {
-    const verificationPending = !remediationFinished || loading || loadingResults;
     const stats = scanStats || EMPTY_STATS;
     const cleanVerification = stats.critical === 0 && stats.high === 0;
     const githubProject = projectMeta?.type === 'github';
+    const persistComplete = Boolean(prUrl)
+      || remMessages.some((message) => (
+        typeof message.content === 'string'
+        && (
+          message.content.startsWith('Remediation PR created: ')
+          || message.content.includes('No GitHub changes detected')
+          || message.content.includes('Remediation changes written to local')
+          || message.content.includes('Remediation persisted.')
+        )
+      ))
+      || remediationFinished;
+    const prCreating = githubProject && !prUrl && !persistComplete && remediationState !== 'error';
+    const verificationRunning = verificationScanRequested && (scanRunning || loading || loadingResults);
+    const verificationDone = verificationScanRequested && !verificationRunning && (results !== null || vulnStatus === 'found' || vulnStatus === 'not_found');
+    const canRerunVerification = persistComplete && !verificationRunning && !rerunInProgress && !loadingProject;
+
+    let verificationTitle = 'Verification scan is optional';
+    let verificationCopy = githubProject
+      ? (prUrl
+        ? 'The PR is ready. Click rerun if you want a fresh scan of the remediated branch.'
+        : 'Wait until the pull request exists, then click rerun to scan the remediated code.')
+      : 'Persistence finished. Click rerun if you want a fresh scan of the local workspace.';
+    if (verificationRunning) {
+      verificationTitle = 'Verification scan running…';
+      verificationCopy = 'Rescanning to confirm the latest vulnerability state after remediation.';
+    } else if (verificationDone) {
+      verificationTitle = cleanVerification ? 'Verification complete' : 'Verification found remaining risk';
+      verificationCopy = cleanVerification
+        ? '0 Critical and 0 High vulnerabilities remain after the verification run.'
+        : `${stats.critical} Critical and ${stats.high} High findings remain after verification.`;
+    }
 
     return (
       <div className="relative z-10 mx-auto flex min-h-full w-full max-w-5xl animate-fade-in flex-col space-y-6 p-8">
-        <div className="mb-8 mt-4 flex items-center justify-between border-b border-[#1A1A1A] pb-6">
+        <div className="mb-8 mt-4 flex flex-wrap items-center justify-between gap-4 border-b border-[#1A1A1A] pb-6">
           <div>
             <h1 className="mb-2 text-2xl font-semibold text-zinc-100">Remediation Complete</h1>
             <p className="text-sm text-zinc-400">{githubProject ? 'PR creation and verification status are shown below.' : 'Local remediation persistence and verification status are shown below.'}</p>
           </div>
+          <ScanReportDownloadButton projectId={projectId} disabled={!results} />
         </div>
 
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-          <BorderGlow backgroundColor="#050505" colors={['#10b981', '#050505']} glowColor="150 80 50" borderRadius={8} className="border border-[#1A1A1A] p-8 shadow-xl">
-            <div className="mb-6 flex h-12 w-12 items-center justify-center rounded-full border border-emerald-500/20 bg-emerald-500/10"><GitPullRequest className="h-6 w-6 text-emerald-400" /></div>
-            <h3 className="mb-2 text-lg font-semibold text-zinc-100">{githubProject ? (prUrl ? 'Pull Request Created' : 'Creating Pull Request...') : 'Changes Persisted Locally'}</h3>
-            <p className="mb-6 text-sm text-zinc-400">{githubProject ? (prUrl ? 'The remediation branch was pushed successfully. Open the PR to review or merge it in GitHub.' : 'The remediation engine is still persisting changes to GitHub and creating the Pull Request.') : 'The remediation engine wrote the approved changes back to the local project workspace.'}</p>
+          <div className={`${secPaper} p-8`}>
+            <div className="mb-6 flex h-12 w-12 items-center justify-center border-[3px] border-black bg-white"><GitPullRequest className="h-6 w-6 text-black" /></div>
+            <h3 className="mb-2 text-lg font-semibold text-black">{githubProject ? (prUrl ? 'Pull Request Created' : prCreating ? 'Creating Pull Request...' : 'No Pull Request Created') : 'Changes Persisted Locally'}</h3>
+            <p className="mb-6 text-sm text-neutral-600">{githubProject ? (prUrl ? 'The remediation branch was pushed successfully. Open the PR to review or merge it in GitHub.' : prCreating ? 'The remediation engine is still persisting changes to GitHub and creating the Pull Request.' : 'No GitHub PR was created for this run. You can still rerun a verification scan if you want.') : 'The remediation engine wrote the approved changes back to the local project workspace.'}</p>
             {githubProject ? (
-              <button type="button" onClick={() => prUrl && window.open(prUrl, '_blank', 'noopener,noreferrer')} disabled={!prUrl} className="flex w-full items-center justify-center gap-2 rounded-md border border-[#262626] bg-[#111111] py-2.5 text-sm font-medium text-zinc-200 transition-colors hover:bg-[#1A1A1A] disabled:cursor-not-allowed disabled:opacity-50">
+              <button type="button" onClick={() => prUrl && window.open(prUrl, '_blank', 'noopener,noreferrer')} disabled={!prUrl} className={`${appBtnInk} w-full disabled:cursor-not-allowed disabled:opacity-50`}>
                 View PR on GitHub <ExternalLink className="h-4 w-4" />
               </button>
             ) : (
-              <div className="rounded-md border border-[#262626] bg-[#111111] px-4 py-3 text-sm text-zinc-300">No GitHub PR is required for local projects.</div>
+              <div className="border-[3px] border-black bg-white px-4 py-3 text-sm text-black">No GitHub PR is required for local projects.</div>
             )}
-          </BorderGlow>
+          </div>
 
-          <BorderGlow backgroundColor="#050505" colors={['#6366f1', '#050505']} glowColor="240 80 50" borderRadius={8} className="border border-[#1A1A1A] p-8 shadow-xl">
-            <div className="mb-6 flex h-12 w-12 items-center justify-center rounded-full border border-indigo-500/20 bg-indigo-500/10">{verificationPending ? <RefreshCw className="h-6 w-6 animate-spin text-indigo-400" /> : <ShieldCheck className="h-6 w-6 text-indigo-400" />}</div>
-            <h3 className="mb-2 text-lg font-semibold text-zinc-100">{verificationPending ? 'Verification Scan Running...' : cleanVerification ? 'Verification Complete' : 'Verification Found Remaining Risk'}</h3>
-            <p className="mb-6 text-sm text-zinc-400">{verificationPending ? 'Automatically rescanning to confirm the latest vulnerability state after remediation.' : cleanVerification ? '0 Critical and 0 High vulnerabilities remain after the verification run.' : `${stats.critical} Critical and ${stats.high} High findings remain after verification.`}</p>
-            {!verificationPending ? <div className="w-full"><RunButton onClick={() => router.push('/dashboard')}>Return to Dashboard</RunButton></div> : null}
-          </BorderGlow>
+          <div className={`${secPaper} p-8`}>
+            <div className="mb-6 flex h-12 w-12 items-center justify-center border-[3px] border-black bg-white">{verificationRunning ? <RefreshCw className="h-6 w-6 animate-spin text-black" /> : <ShieldCheck className="h-6 w-6 text-black" />}</div>
+            <h3 className="mb-2 text-lg font-semibold text-black">{verificationTitle}</h3>
+            <p className="mb-6 text-sm text-neutral-600">{verificationCopy}</p>
+            {error && verificationScanRequested ? <p className="mb-4 text-sm text-rose-700">{error}</p> : null}
+            <div className="flex w-full flex-col gap-3">
+              <RunButton disabled={!canRerunVerification} onClick={() => void handleVerificationRerun()}>
+                {verificationRunning || rerunInProgress ? 'Scanning…' : 'Rerun scan'}
+              </RunButton>
+              {!verificationRunning ? (
+                <RunButton onClick={() => router.push('/dashboard')}>Return to Dashboard</RunButton>
+              ) : null}
+            </div>
+          </div>
         </div>
 
-        {runAll ? (
-          <div className="flex justify-center pt-2">
-            <RunButton className="max-w-65" disabled={!canProceedToDeployment} onClick={() => router.push(deploymentPath)}>
-              Proceed to Deployment
-            </RunButton>
+        {persistComplete ? (
+          <div className={`${secPaper} p-8 text-center`}>
+          <h3 className="font-display text-xl font-semibold text-black">Get your application deployed</h3>
+            <p className="mx-auto mt-2 max-w-lg text-[14px] leading-6 text-zinc-400">
+              Security remediation is complete. Continue to the deployment pipeline to ship this repository to AWS.
+            </p>
+            <button
+              type="button"
+              disabled={!canProceedToDeployment}
+              onClick={() => router.push(deploymentPath)}
+              className={`mt-6 ${appBtnInk}`}
+            >
+              Continue to deployment
+            </button>
           </div>
         ) : null}
       </div>
@@ -1971,63 +2494,31 @@ export default function SecurityAnalysisPage() {
   };
 
   return (
-    <div className="relative flex h-screen overflow-hidden bg-[#000000] font-sans text-zinc-300 selection:bg-indigo-500/30">
-      <div className="pointer-events-none absolute inset-0 z-0 opacity-20">
-        <PixelBlast pixelSize={4} color="#3f3f46" noiseAmount={0.03} />
+    <WorkspaceShell
+      embedded
+      active="security"
+      section="Security"
+      workspaceName={projectName || 'deplai-demo'}
+      projectId={projectId}
+      onNavigate={(href) => router.push(href)}
+      onExit={() => router.push('/dashboard')}
+      stageRail={(
+        <SecurityStageRail
+          activeStage={activeStage}
+          maxUnlockedIndex={maxUnlockedIndex}
+          onSelectStage={handleStageClick}
+        />
+      )}
+    >
+      <div className="security-workspace mx-auto w-full max-w-6xl px-5 py-8 sm:px-8">
+        {renderSecurityToolbar()}
+        {renderContent()}
       </div>
-
-      <aside className="relative z-20 flex h-full w-65 shrink-0 flex-col border-r border-[#1A1A1A] bg-[#050505]">
-        <div className="flex h-16 items-center border-b border-[#1A1A1A] px-6">
-          <div className="flex items-center gap-3">
-            <div className="flex h-6 w-6 items-center justify-center rounded border border-[#262626] bg-[#111111] text-xs font-bold text-white">N</div>
-            <span className="text-sm font-semibold tracking-wide text-white">DepLAI Sec</span>
-          </div>
-        </div>
-        <div className="border-b border-[#1A1A1A] p-5">
-          <div className="mb-2 flex items-center justify-between"><span className="text-xs font-medium text-zinc-400">Track Progress</span><span className="text-xs font-bold text-indigo-400">{mounted ? `${progressPercentage}%` : '...'}</span></div>
-          <div className="h-1 w-full overflow-hidden rounded-full bg-[#111111]"><div className="h-full bg-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.5)] transition-all duration-500" style={{ width: mounted ? `${progressPercentage}%` : '0%' }} /></div>
-        </div>
-        <div className="custom-scrollbar flex-1 space-y-1 overflow-y-auto px-3 py-6">
-          {SIDEBAR_STAGES.map((stage) => {
-            const status = getStageStatus(stage.id);
-            const isLocked = status === 'locked';
-            const isActive = status === 'active';
-            const isCompleted = status === 'completed';
-            return (
-              <div key={stage.id} onClick={() => handleStageClick(stage.id)} className={`flex items-center gap-3 rounded-md px-3 py-2 transition-colors ${isLocked ? 'cursor-not-allowed opacity-40' : 'cursor-pointer'} ${isActive ? 'bg-[#111111] text-zinc-100' : 'text-zinc-400 hover:bg-[#0A0A0A]'}`}>
-                <div className="flex shrink-0 items-center justify-center">
-                  {isCompleted ? <CheckCircle2 className="h-4 w-4 text-emerald-500" /> : isActive ? <CircleDashed className="h-4 w-4 animate-spin text-indigo-500" /> : <div className="h-4 w-4 rounded-full border border-zinc-700" />}
-                </div>
-                <span className="text-[13px] font-medium">{stage.label}</span>
-              </div>
-            );
-          })}
-        </div>
-      </aside>
-
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent">
-        <header className="relative z-20 flex h-16 items-center justify-between border-b border-[#1A1A1A] bg-[#050505]/90 px-8 backdrop-blur-md">
-          <div className="flex items-center gap-2 text-sm"><span className="font-medium text-zinc-500">{SIDEBAR_STAGES.find((stage) => stage.id === activeStage)?.label}</span></div>
-          <div className="flex items-center gap-3">
-            <span className="rounded-md border border-[#262626] bg-[#111111] px-3 py-1.5 font-mono text-xs text-zinc-400">{loadingProject ? 'Loading project...' : projectName}</span>
-            <button type="button" onClick={() => router.push('/dashboard')} className="text-xs font-semibold text-zinc-400 transition-colors hover:text-white">Exit</button>
-          </div>
-        </header>
-
-        <div className="custom-scrollbar min-h-0 flex-1 overflow-y-auto">
-          {renderContent()}
-        </div>
-      </div>
-
       <style dangerouslySetInnerHTML={{ __html: `
-        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #262626; border-radius: 10px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background-color: #3f3f46; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
         .animate-fade-in { animation: fadeIn 0.3s ease-out forwards; }
       ` }} />
-    </div>
+    </WorkspaceShell>
   );
 }
 

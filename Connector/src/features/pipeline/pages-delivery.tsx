@@ -2776,11 +2776,13 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
   const elasticIp = pickOutput(runtimeOutputs, ['elastic_ip', 'eip_public_ip']);
   const rdsEndpoint = pickOutput(runtimeOutputs, ['rds_endpoint', 'database_endpoint', 'db_endpoint']);
   const websiteBucket = pickOutput(runtimeOutputs, ['website_bucket', 's3_bucket_name', 'static_bucket_name']);
-  const generatedPem = deployResult?.keypair?.private_key_pem
+  const generatedPem = (deployResult as { one_time_credentials?: { private_key_pem?: string | null } } | null)?.one_time_credentials?.private_key_pem
+    || deployResult?.keypair?.private_key_pem
     || deployResult?.generated_ec2_private_key_pem
     || pickOutputRaw(runtimeOutputs, ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem'])
     || pickNestedOutputRaw((deployResult?.details as Record<string, unknown> | undefined), ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem']);
-  const keyName = deployResult?.keypair?.key_name
+  const keyName = (deployResult as { one_time_credentials?: { key_name?: string | null; key_file_name?: string | null } } | null)?.one_time_credentials?.key_name
+    || deployResult?.keypair?.key_name
     || deployResult?.ec2_key_name
     || pickOutputRaw(runtimeOutputs, ['ec2_key_name', 'generated_ec2_key_name', 'key_name'])
     || pickNestedOutputRaw((deployResult?.details as Record<string, unknown> | undefined), ['ec2_key_name', 'generated_ec2_key_name', 'key_name'])
@@ -3027,11 +3029,11 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
                       <span className="text-[11px] text-zinc-500 font-mono">{keyName}</span>
                     </div>
                     <p className="text-[11px] text-amber-300">
-                      Private key material is generated one time. Download it now and keep it in a secure location.
+                      Download this PEM now. DeplAI mints a new key on every deploy and does not keep the private half after you leave.
                     </p>
                   </div>
                 ) : (
-                  <p className="text-[11px] text-zinc-500">No generated private key found in deployment outputs. This usually means an existing key pair was reused. AWS does not return private key material again; use the original PEM created at key generation time.</p>
+                  <p className="text-[11px] text-zinc-500">No generated private key found in this result. Each deploy creates a new key; AWS never stores the private half.</p>
                 )}
               </div>
               <div className="pt-3 border-t border-white/5">

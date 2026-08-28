@@ -3,6 +3,7 @@ import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { validateTerraformArchitectureInput } from '@/lib/deployment-planning-contract';
 import { type RepoPersistenceResult } from '@/lib/iac-pr';
+import { coerceHttpAppPort } from '@/features/deployment/http-ports';
 import {
   resolveProjectMeta,
   resolveProjectSourceRoot as resolveSharedProjectSourceRoot,
@@ -12,6 +13,10 @@ import {
   SnapshotResolutionError,
   type CustomizationSnapshotSource,
 } from '@/lib/customization-snapshot';
+import {
+  resolveOrCreateSession,
+  tryAppendSessionLogs,
+} from '@/lib/sessions/store';
 import fs from 'fs';
 import path from 'path';
 
@@ -62,6 +67,7 @@ interface IacGenerateBody {
   requirements?: Record<string, unknown>;
   customization_snapshot_id?: string;
   tenant_id?: string;
+  workspace_session_id?: string;
 }
 
 interface GeneratedFile {
@@ -91,6 +97,42 @@ function classifyAgenticRouteError(err: unknown, action: string): { message: str
     message: raw || `${action} failed.`,
     status: 500,
   };
+}
+
+async function attachIacWorkspaceSession(
+  userId: string,
+  projectId: string,
+  projectName: string,
+  existingId: string,
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  try {
+    const files = Array.isArray(payload.files) ? payload.files : [];
+    const session = await resolveOrCreateSession(existingId, {
+      userId,
+      projectId,
+      service: 'deploy',
+      title: `Generate infrastructure · ${projectName}`,
+      repo: projectName,
+      status: 'completed',
+      currentStage: 'terraform_generation',
+      triggeredBy: userId,
+      changedFilesCount: files.length,
+      externalId: typeof payload.run_id === 'string' ? payload.run_id : null,
+      metadata: { source: 'iac_generate', run_id: payload.run_id || null },
+    });
+    if (session) {
+      await tryAppendSessionLogs(session.id, [{
+        level: 'info',
+        message: String(payload.summary || `Generated ${files.length} Terraform files.`),
+        stage: 'terraform_generation',
+      }]);
+    }
+    return { ...payload, workspace_session_id: session?.id ?? (existingId || null) };
+  } catch (error) {
+    console.error('[sessions] iac hook failed', error);
+    return { ...payload, workspace_session_id: existingId || null };
+  }
 }
 
 function normalizeAgenticBaseUrl(raw: string): string {
@@ -316,7 +358,7 @@ function normalizeEc2ResourceConfig(value: unknown): typeof DEFAULT_EC2_CONFIG {
       ? requestedInstanceType
       : DEFAULT_EC2_CONFIG.instance_type,
     root_volume_size_gb: clampInteger(record.root_volume_size_gb, DEFAULT_EC2_CONFIG.root_volume_size_gb, 20, 200),
-    app_port: clampInteger(record.app_port, DEFAULT_EC2_CONFIG.app_port, 1, 65535),
+    app_port: coerceHttpAppPort(record.app_port, DEFAULT_EC2_CONFIG.app_port),
     ssh_ingress_cidr_blocks: normalizeCidrList(record.ssh_ingress_cidr_blocks),
   };
 }
@@ -343,7 +385,10 @@ function patchEc2ConfigFromText(config: typeof DEFAULT_EC2_CONFIG, text: string)
   if (diskMatch) patch.root_volume_size_gb = Number(diskMatch[1]);
 
   const portMatch = lower.match(/\b(?:port|app\s+port)\D{0,10}(\d{1,5})\b/);
-  if (portMatch) patch.app_port = Number(portMatch[1]);
+  if (portMatch) {
+    const parsed = coerceHttpAppPort(portMatch[1], 0);
+    if (parsed) patch.app_port = parsed;
+  }
 
   const cidrs = normalizeCidrList(lower.match(/\b(?:\d{1,3}\.){3}\d{1,3}\/\d{1,2}\b/g) || []);
   if (cidrs.length > 0 && /\bssh\b/.test(lower)) patch.ssh_ingress_cidr_blocks = cidrs;
@@ -735,7 +780,7 @@ function buildDeterministicConsultantDecision(params: {
   const ec2Config = normalizeEc2ResourceConfig({
     ...ec2ConfigFromUserAnswers(userAnswers),
     ...(typeof intakes.instance_type === 'string' ? { instance_type: intakes.instance_type } : {}),
-    app_port: userAnswers.app_port || primaryService.port || DEFAULT_EC2_CONFIG.app_port,
+    app_port: coerceHttpAppPort(userAnswers.app_port || primaryService.port, DEFAULT_EC2_CONFIG.app_port),
   });
 
   const hasRds = intakes.need_rds === false
@@ -1392,6 +1437,24 @@ function hasRequiredAwsCoreFiles(files: GeneratedFile[]): boolean {
   return required.size === 0;
 }
 
+function isTerraformRootTf(path: string): boolean {
+  const rel = normalizeRepoWritePath(path);
+  return /^terraform\/[^/]+\.tf$/.test(rel);
+}
+
+function rewriteLegacyRegionVarReferences(files: GeneratedFile[]): GeneratedFile[] {
+  const rootTfFiles = files.filter((file) => isTerraformRootTf(file.path));
+  const hasAwsRegionVar = rootTfFiles.some((file) => /variable\s+"aws_region"\s*\{/.test(String(file.content || '')));
+  const hasRegionVar = rootTfFiles.some((file) => /variable\s+"region"\s*\{/.test(String(file.content || '')));
+  if (!hasAwsRegionVar || hasRegionVar) return files;
+  return files.map((file) => {
+    if (!isTerraformRootTf(file.path)) return file;
+    const content = String(file.content || '');
+    if (!/\bvar\.region\b/.test(content)) return file;
+    return { ...file, content: content.replace(/\bvar\.region\b/g, 'var.aws_region') };
+  });
+}
+
 function validateAwsTerraformBundle(files: GeneratedFile[]): { valid: boolean; errors: string[] } {
   const errors: string[] = [];
   if (!hasRequiredAwsCoreFiles(files)) {
@@ -1412,8 +1475,8 @@ function validateAwsTerraformBundle(files: GeneratedFile[]): { valid: boolean; e
 
   const singleLineVariableBlock = /variable\s+"[^"]+"\s*\{\s*type\s*=\s*[^{}\n]+,\s*default\s*=\s*[^{}\n]+\s*\}/;
   const conditionalDependsOn = /depends_on\s*=\s*[^\n]*\?/;
-  const bundleHasAwsRegionVar = tfFiles.some((file) => /variable\s+"aws_region"\s*\{/.test(String(file.content || '')));
-  const bundleHasRegionVar = tfFiles.some((file) => /variable\s+"region"\s*\{/.test(String(file.content || '')));
+  const bundleHasAwsRegionVar = tfFiles.some((file) => isTerraformRootTf(file.path) && /variable\s+"aws_region"\s*\{/.test(String(file.content || '')));
+  const bundleHasRegionVar = tfFiles.some((file) => isTerraformRootTf(file.path) && /variable\s+"region"\s*\{/.test(String(file.content || '')));
   for (const file of tfFiles) {
     const relPath = normalizeRepoWritePath(file.path);
     const content = String(file.content || '');
@@ -1426,7 +1489,7 @@ function validateAwsTerraformBundle(files: GeneratedFile[]): { valid: boolean; e
     if (conditionalDependsOn.test(content)) {
       errors.push(`${relPath} contains conditional depends_on syntax Terraform does not accept`);
     }
-    if (bundleHasAwsRegionVar && !bundleHasRegionVar && /var\.region\b/.test(content)) {
+    if (isTerraformRootTf(relPath) && bundleHasAwsRegionVar && !bundleHasRegionVar && /var\.region\b/.test(content)) {
       errors.push(`${relPath} references var.region even though only aws_region is declared`);
     }
   }
@@ -1446,6 +1509,7 @@ function mergeGeneratedFiles(primary: GeneratedFile[], secondary: GeneratedFile[
 }
 
 async function generateIacBundleWithTerraformAgent(params: {
+  userId?: string;
   projectId: string;
   projectName: string;
   workspace: string;
@@ -1540,6 +1604,7 @@ async function generateIacBundleWithTerraformAgent(params: {
       source_root_candidates: params.sourceRootCandidates || undefined,
       repository_url: params.repositoryUrl || undefined,
       source_metadata: params.sourceMetadata || undefined,
+      user_id: params.userId || undefined,
     }),
   }, {
     timeoutMs: 600_000,
@@ -2364,7 +2429,7 @@ export async function POST(req: NextRequest) {
             process_type: 'web',
             cpu: 512,
             memory: 1024,
-            port: Number(asRecord(asRecord(consultantDecision.stack_config).ec2).app_port) || 3000,
+            port: coerceHttpAppPort(asRecord(asRecord(consultantDecision.stack_config).ec2).app_port, 3000),
             desired_count: 1,
           }],
         },
@@ -2378,7 +2443,7 @@ export async function POST(req: NextRequest) {
           elastic_ip: consultantDecision.need_eip || (Array.isArray(consultantDecision.components) && consultantDecision.components.includes('eip'))
             ? { enabled: true }
             : {},
-          ports_exposed: [80, 443, Number(asRecord(asRecord(consultantDecision.stack_config).ec2).app_port) || 3000],
+          ports_exposed: [80, 443, coerceHttpAppPort(asRecord(asRecord(consultantDecision.stack_config).ec2).app_port, 3000)],
         },
         data_layer: [],
         warnings: ['Connector synthesized a deployment profile seed for consultant-driven Terraform generation.'],
@@ -2405,6 +2470,7 @@ export async function POST(req: NextRequest) {
       let agentBundle: Awaited<ReturnType<typeof generateIacBundleWithTerraformAgent>>;
       try {
         agentBundle = await generateIacBundleWithTerraformAgent({
+          userId: String(user.id),
           projectId,
           projectName,
           workspace: terraformSafeProjectSlug(projectName),
@@ -2459,7 +2525,7 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const files = agentBundle.files;
+      const files = rewriteLegacyRegionVarReferences(agentBundle.files);
       const source = agentBundle.source || agentBundle.actualRenderer || 'terraform_agent';
       const displayRenderer = source.startsWith('terraform_agent')
         ? source
@@ -2524,7 +2590,12 @@ export async function POST(req: NextRequest) {
         reason: 'manual_trigger_required',
       };
 
-      return NextResponse.json({
+      return NextResponse.json(await attachIacWorkspaceSession(
+        String(user.id),
+        projectId,
+        projectName,
+        String(body.workspace_session_id || ''),
+        {
         success: true,
         provider,
         project_id: projectId,
@@ -2558,7 +2629,8 @@ export async function POST(req: NextRequest) {
           entrypoint: websiteEntrypoint.relativePath,
         },
         frontend_entrypoint_detection: frontendDetection,
-      });
+      },
+      ));
 
     }
 
@@ -2588,7 +2660,12 @@ export async function POST(req: NextRequest) {
         : `Generated ${files.length} IaC files for ${provider.toUpperCase()}.`
     );
 
-    return NextResponse.json({
+    return NextResponse.json(await attachIacWorkspaceSession(
+      String(user.id),
+      projectId,
+      projectName,
+      String(body.workspace_session_id || ''),
+      {
       success: true,
       provider,
       project_id: projectId,
@@ -2610,7 +2687,8 @@ export async function POST(req: NextRequest) {
       decision_drift: [],
       website_asset_stats: null,
       frontend_entrypoint_detection: null,
-    });
+    },
+    ));
   } catch (err) {
     const classified = classifyAgenticRouteError(err, 'generate Terraform and Ansible files');
     return NextResponse.json({ error: classified.message }, { status: classified.status });

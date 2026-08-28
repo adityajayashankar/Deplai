@@ -6,13 +6,11 @@ import {
   Check,
   ChevronRight,
   Circle,
-  Command,
   ExternalLink,
   GitPullRequest,
   Loader2,
   PanelLeftClose,
   PanelLeftOpen,
-  Play,
   RotateCcw,
   ShieldCheck,
 } from 'lucide-react';
@@ -26,93 +24,32 @@ import type {
 } from './types';
 
 const focusRing =
-  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-300 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0a0a0b]';
+  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-black/35 focus-visible:ring-offset-2 focus-visible:ring-offset-white';
 
 export function CommandHeader({
-  projectLabel,
-  tenantId,
-  onTenantChange,
   onBack,
-  onConfirm,
-  onApply,
-  onOpenHandoff,
-  isConfirmed,
-  hasManifest,
-  isBusy,
 }: {
-  projectLabel: string;
-  tenantId: string;
-  onTenantChange: (value: string) => void;
   onBack: () => void;
-  onConfirm: () => void;
-  onApply: () => void;
-  onOpenHandoff: () => void;
-  isConfirmed: boolean;
-  hasManifest: boolean;
-  isBusy: boolean;
 }) {
   return (
-    <header className="flex min-h-14 shrink-0 flex-wrap items-center gap-3 border-b border-white/8 bg-[#0a0a0b] px-3 py-2 sm:px-4">
-      <button
-        type="button"
-        onClick={onBack}
-        aria-label="Back to dashboard"
-        className={`rounded-md p-2 text-zinc-500 transition hover:bg-white/5 hover:text-zinc-200 ${focusRing}`}
-      >
-        <ArrowLeft className="h-4 w-4" />
-      </button>
-      <div className="flex min-w-0 items-center gap-2">
-        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-white/10 bg-zinc-100 text-zinc-950">
-          <Command className="h-3.5 w-3.5" />
-        </span>
-        <div className="min-w-0">
-          <p className="truncate text-xs font-semibold text-zinc-100">Customization workspace</p>
-          <p className="truncate text-[10px] text-zinc-600">{projectLabel || 'Unlinked project'}</p>
+    <header className="workspace-command-header flex h-12 shrink-0 items-center justify-between border-b border-white/10 bg-[var(--app-canvas,#05060a)] px-5 sm:px-6 md:pr-20">
+      <div className="flex items-center gap-2 text-[13px]">
+        <span className="font-mono uppercase tracking-[0.16em] text-white/40">deplai</span>
+        <ChevronRight className="h-3.5 w-3.5 text-white/30" />
+        <span className="font-display font-semibold text-white">Customization</span>
+      </div>
+      <div className="flex items-center gap-3 text-sm">
+        <div className="hidden items-center gap-2 border-2 border-white/20 px-3 py-1.5 font-mono text-[11px] text-white/50 sm:flex">
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+          all systems operational
         </div>
-      </div>
-      <div className="order-3 flex w-full flex-1 sm:order-none sm:ml-3 sm:w-auto">
-        <label className="sr-only" htmlFor="customization-workspace-id">
-          Workspace ID
-        </label>
-        <input
-          id="customization-workspace-id"
-          value={tenantId}
-          onChange={(event) => onTenantChange(event.target.value)}
-          placeholder="Workspace ID"
-          autoComplete="off"
-          className={`h-8 w-full min-w-0 rounded-md border border-white/10 bg-[#111113] px-3 text-xs text-zinc-200 placeholder:text-zinc-600 sm:max-w-64 ${focusRing}`}
-        />
-      </div>
-      <div className="ml-auto flex items-center gap-2">
-        {!isConfirmed ? (
-          <button
-            type="button"
-            onClick={onConfirm}
-            disabled={!hasManifest || isBusy}
-            className={`hidden h-8 items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-3 text-xs font-medium text-zinc-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40 sm:inline-flex ${focusRing}`}
-          >
-            {isBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
-            Confirm manifest
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={onApply}
-            disabled={isBusy}
-            className={`inline-flex h-8 items-center gap-1.5 rounded-md bg-zinc-100 px-3 text-xs font-semibold text-zinc-950 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-40 ${focusRing}`}
-          >
-            {isBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
-            Apply changes
-          </button>
-        )}
         <button
           type="button"
-          onClick={onOpenHandoff}
-          className={`inline-flex h-8 items-center gap-1.5 rounded-md border border-white/10 px-3 text-xs text-zinc-400 transition hover:bg-white/5 hover:text-zinc-200 ${focusRing}`}
+          onClick={onBack}
+          className="inline-flex items-center gap-2 border-2 border-white/20 px-3 py-1.5 text-[12px] font-bold text-white/80 transition hover:border-white hover:bg-white hover:text-black"
         >
-          <span className="hidden sm:inline">Review handoff</span>
-          <span className="sm:hidden">Handoff</span>
-          <ChevronRight className="h-3.5 w-3.5" />
+          <ArrowLeft className="h-3.5 w-3.5" />
+          Back
         </button>
       </div>
     </header>
@@ -134,15 +71,15 @@ export function WorkflowRail({
   return (
     <aside
       aria-label="Customization workflow"
-      className={`${collapsed ? 'w-12' : 'w-44'} hidden shrink-0 border-r border-white/8 bg-[#0c0c0e] transition-[width] duration-200 md:flex md:flex-col`}
+      className={`${collapsed ? 'w-12' : 'w-44'} hidden shrink-0 border-r-[3px] border-black bg-white transition-[width] duration-200 md:flex md:flex-col`}
     >
-      <div className={`flex h-11 items-center border-b border-white/8 ${collapsed ? 'justify-center' : 'justify-between px-3'}`}>
+      <div className={`flex h-11 items-center border-b-[3px] border-black ${collapsed ? 'justify-center' : 'justify-between px-3'}`}>
         {!collapsed && <span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-600">Workflow</span>}
         <button
           type="button"
           onClick={onToggle}
           aria-label={collapsed ? 'Expand workflow rail' : 'Collapse workflow rail'}
-          className={`rounded p-1.5 text-zinc-600 hover:bg-white/5 hover:text-zinc-300 ${focusRing}`}
+          className={`rounded p-1.5 text-neutral-500 hover:bg-black hover:text-white ${focusRing}`}
         >
           {collapsed ? <PanelLeftOpen className="h-3.5 w-3.5" /> : <PanelLeftClose className="h-3.5 w-3.5" />}
         </button>
@@ -158,21 +95,21 @@ export function WorkflowRail({
                 onClick={() => onSelectStage(step.value)}
                 title={collapsed ? `${step.label}: ${step.description}` : undefined}
                 aria-current={active ? 'step' : undefined}
-                className={`flex w-full items-center rounded-md border text-left transition ${
+                className={`flex w-full items-center rounded-none border-[3px] text-left transition ${
                   collapsed ? 'justify-center p-2' : 'gap-2.5 px-2 py-2'
                 } ${
                   active
-                    ? 'border-white/10 bg-white/7 text-zinc-100'
-                    : 'border-transparent text-zinc-600 hover:bg-white/4 hover:text-zinc-300'
+                    ? 'border-black bg-black text-white'
+                    : 'border-transparent text-neutral-600 hover:border-black hover:text-black'
                 } ${focusRing}`}
               >
                 <span
-                  className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-full border ${
+                  className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-none border-2 ${
                     complete
-                      ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-400'
+                      ? 'border-black bg-black text-white'
                       : active
-                        ? 'border-zinc-300 text-zinc-200'
-                        : 'border-zinc-700 text-zinc-700'
+                        ? 'border-white text-white'
+                        : 'border-neutral-400 text-neutral-400'
                   }`}
                 >
                   {complete ? <Check className="h-2.5 w-2.5" /> : <Circle className="h-1.5 w-1.5 fill-current" />}
@@ -180,7 +117,7 @@ export function WorkflowRail({
                 {!collapsed && (
                   <span className="min-w-0">
                     <span className="block text-[11px] font-medium">{step.label}</span>
-                    <span className="block truncate text-[9px] text-zinc-600">{step.description}</span>
+                    <span className="block truncate text-[9px] text-neutral-500">{step.description}</span>
                   </span>
                 )}
               </button>
@@ -216,13 +153,13 @@ export function StatusBar({
   return (
     <footer
       aria-live="polite"
-      className="flex min-h-8 shrink-0 items-center justify-between gap-3 border-t border-white/8 bg-[#0a0a0b] px-3 text-[10px] text-zinc-500"
+      className="flex min-h-8 shrink-0 items-center justify-between gap-3 border-t-[3px] border-black bg-white px-3 text-[10px] text-neutral-500"
     >
       <div className="flex min-w-0 items-center gap-3">
         <button
           type="button"
           onClick={onToggleAgent}
-          className={`rounded p-1 text-zinc-500 hover:bg-white/5 hover:text-zinc-200 ${focusRing}`}
+          className={`rounded p-1 text-neutral-500 hover:bg-black hover:text-white ${focusRing}`}
           aria-label="Toggle agent panel"
         >
           <PanelLeftClose className="h-3.5 w-3.5" />
@@ -238,7 +175,7 @@ export function StatusBar({
         <button
           type="button"
           onClick={onResetSession}
-          className={`rounded px-2 py-1 hover:bg-white/5 hover:text-zinc-300 ${focusRing}`}
+          className={`rounded px-2 py-1 hover:bg-black hover:text-white ${focusRing}`}
         >
           Reset session
         </button>
@@ -306,11 +243,11 @@ export function HandoffDialog({
         aria-modal="true"
         aria-labelledby="handoff-title"
         onMouseDown={(event) => event.stopPropagation()}
-        className="w-full max-w-lg rounded-xl border border-white/10 bg-[#111113] shadow-2xl"
+        className="app-paper w-full max-w-lg"
       >
-        <div className="border-b border-white/8 px-5 py-4">
-          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-zinc-600">Preflight</p>
-          <h2 id="handoff-title" className="mt-1 text-base font-semibold text-zinc-100">
+        <div className="border-b-[3px] border-black px-5 py-4">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-neutral-500">Preflight</p>
+          <h2 id="handoff-title" className="mt-1 text-base font-semibold text-black">
             Finalize deployment snapshot
           </h2>
           <p className="mt-1 text-xs text-zinc-500">
@@ -319,7 +256,7 @@ export function HandoffDialog({
         </div>
         <div className="space-y-2 p-5">
           {rows.map((row) => (
-            <div key={row.label} className="flex items-center justify-between rounded-md border border-white/7 bg-black/20 px-3 py-2.5">
+            <div key={row.label} className="flex items-center justify-between rounded-none border-[3px] border-black bg-white px-3 py-2.5">
               <span className="text-xs text-zinc-500">{row.label}</span>
               <span className={`flex items-center gap-1.5 text-xs ${row.ok ? 'text-zinc-200' : 'text-amber-300'}`}>
                 {row.ok ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <AlertTriangle className="h-3.5 w-3.5" />}
@@ -366,7 +303,7 @@ export function HandoffDialog({
             </a>
           ) : null}
         </div>
-        <div className="flex flex-wrap justify-end gap-2 border-t border-white/8 px-5 py-4">
+        <div className="flex flex-wrap justify-end gap-2 border-t-[3px] border-black px-5 py-4">
           <button type="button" onClick={onClose} className={`rounded-md px-3 py-2 text-xs text-zinc-400 hover:bg-white/5 ${focusRing}`}>
             Close
           </button>
@@ -375,7 +312,7 @@ export function HandoffDialog({
               type="button"
               onClick={onCreateGitPr}
               disabled={creatingGitPr || gitPrResult?.success}
-              className={`inline-flex items-center gap-2 rounded-md border border-white/10 bg-white/5 px-3 py-2 text-xs font-medium text-zinc-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40 ${focusRing}`}
+              className={`inline-flex items-center gap-2 border-[3px] border-black bg-white px-3 py-2 text-xs font-bold text-black shadow-[4px_4px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none disabled:cursor-not-allowed disabled:opacity-40 ${focusRing}`}
             >
               {creatingGitPr ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <GitPullRequest className="h-3.5 w-3.5" />}
               {creatingGitPr ? 'Creating Git PR…' : gitPrResult?.success ? 'Git PR created' : 'Create Git PR'}
@@ -385,7 +322,7 @@ export function HandoffDialog({
             type="button"
             onClick={onContinue}
             disabled={!canContinue || finalizing}
-            className={`inline-flex items-center gap-2 rounded-md bg-zinc-100 px-3 py-2 text-xs font-semibold text-zinc-950 disabled:cursor-not-allowed disabled:opacity-40 ${focusRing}`}
+            className={`inline-flex items-center gap-2 border-[3px] border-black bg-black px-3 py-2 text-xs font-bold text-white shadow-[4px_4px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none disabled:cursor-not-allowed disabled:opacity-40 ${focusRing}`}
           >
             {finalizing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5" />}
             {finalizing ? 'Creating immutable snapshot…' : 'Create snapshot and scan'}

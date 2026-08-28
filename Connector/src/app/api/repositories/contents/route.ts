@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { githubService } from '@/lib/github';
-import { query } from '@/lib/db';
+import { requireAuth, verifyRepositoryOwnership } from '@/lib/auth';
 
 export async function GET(request: NextRequest) {
   try {
+    const { user, error } = await requireAuth();
+    if (error) return error;
+
     const { searchParams } = new URL(request.url);
     const owner = searchParams.get('owner');
     const repo = searchParams.get('repo');
@@ -16,23 +19,15 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    // Get installation ID for this repo
-    const [repoData] = await query<any[]>(
-      `SELECT r.installation_id, i.id as installation_uuid, i.suspended_at
-       FROM github_repositories r
-       JOIN github_installations i ON i.id = r.installation_id
-       WHERE r.full_name = ?`,
-      [`${owner}/${repo}`]
-    );
-
-    if (!repoData) {
+    const repoAccess = await verifyRepositoryOwnership(user.id, owner, repo);
+    if (!repoAccess) {
       return NextResponse.json(
-        { error: 'Repository not found' },
-        { status: 404 }
+        { error: 'Forbidden: You do not own this repository' },
+        { status: 403 }
       );
     }
 
-    if (repoData.suspended_at) {
+    if (repoAccess.suspended) {
       return NextResponse.json(
         { error: 'GitHub App installation is suspended. Unsuspend it from your GitHub settings to restore access.', suspended: true },
         { status: 403 }
@@ -40,17 +35,18 @@ export async function GET(request: NextRequest) {
     }
 
     const contents = await githubService.getDirectoryContents(
-      repoData.installation_uuid,
+      repoAccess.installationId,
       owner,
       repo,
       path
     );
 
     return NextResponse.json({ contents });
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Failed to fetch contents';
     console.error('Error fetching contents:', error);
     return NextResponse.json(
-      { error: error.message || 'Failed to fetch contents' },
+      { error: message },
       { status: 500 }
     );
   }

@@ -1,6 +1,43 @@
 export type StatusLevel = 'info' | 'success' | 'warning' | 'error';
 export type StatusState = { level: StatusLevel; text: string; details?: string };
 export type ChatMessage = { role: 'user' | 'agent'; content: string; timestamp: string };
+export type CustomizationAgent = 'workspace' | 'uiux_refactor';
+export type UiuxAgentHealth = {
+  available: boolean;
+  ready?: boolean;
+  detail?: string;
+  workflow?: string;
+};
+export type UiuxStepRequirement = {
+  step_id?: string;
+  step_name?: string;
+  requires_user_input?: boolean;
+  requires_confirmation?: boolean;
+  user_input_message?: string;
+  user_input_schema?: Array<{ name: string; type?: string; required?: boolean }>;
+  user_input?: Record<string, string>;
+  confirmed?: boolean;
+};
+export type UiuxRefactorRunResponse = {
+  run_id?: string;
+  session_id?: string;
+  status?: string;
+  message?: string;
+  content?: string;
+  detail?: string;
+  step_requirements?: UiuxStepRequirement[];
+  requires_user_input?: boolean;
+  user_input_message?: string;
+  user_input_schema?: UiuxStepRequirement['user_input_schema'];
+};
+export type UiuxRefactorContinueRequest = {
+  project_id: string;
+  run_id: string;
+  session_id: string;
+  step_requirements?: UiuxStepRequirement[];
+  user_input?: Record<string, string>;
+  confirmed?: boolean;
+};
 export type ConfirmationState = {
   confirmed_tenant_id?: string;
   has_unconfirmed_changes?: boolean;
@@ -157,6 +194,122 @@ export type DiffEntry = {
 export type PreviewDevice = 'desktop' | 'tablet' | 'mobile';
 export type WorkspaceTab = 'preview' | 'changes' | 'quality' | 'manifest' | 'assets' | 'settings';
 export type WorkflowStage = 'draft' | 'review' | 'apply' | 'validate' | 'preview' | 'ready';
-export type ByokProvider = 'Anthropic' | 'OpenAI' | 'OpenRouter' | 'Groq' | 'MiniMax';
-export type ByokModel = { id: string; name: string };
-export type ByokConfig = { provider: ByokProvider; modelId: string; apiKey: string };
+export type CustomizationMode =
+  | 'full_transformation'
+  | 'targeted_screen'
+  | 'design_system'
+  | 'responsive'
+  | 'accessibility';
+export type StudioBottomTab = 'changes' | 'diff' | 'logs' | 'review';
+export type FrontendRunStatus = 'queued' | 'running' | 'awaiting_review' | 'completed' | 'failed' | 'blocked';
+export type FrontendRunEvent = { stage?: string; summary?: string; at?: string };
+export type FrontendCheckpoint = {
+  checkpoint_id: string;
+  stage?: string;
+  summary?: string;
+  created_at?: string;
+  files_changed?: number;
+};
+export type FrontendChangeset = {
+  file: string;
+  agent?: string;
+  classification?: string;
+  status?: string;
+  diff?: string;
+};
+export type FrontendScreenPlan = {
+  screen?: string;
+  goal?: string;
+  primary_action?: string;
+  layout?: string;
+  components?: string[];
+};
+export type FrontendTask = {
+  id?: string;
+  screen?: string;
+  priority?: number;
+  agent?: string;
+  files_to_modify?: string[];
+  acceptance_criteria?: string[];
+};
+export type FrontendQualityScores = {
+  ui_quality?: number;
+  consistency?: number;
+  accessibility?: number;
+  responsive_design?: number;
+  navigation?: number;
+  functional_safety?: number;
+};
+export type FrontendRunView = {
+  run_id?: string;
+  status?: FrontendRunStatus | string;
+  workspace_session_id?: string;
+  mode?: string;
+  goal?: string;
+  current_stage?: string;
+  completed_nodes?: string[];
+  interrupt_required?: boolean;
+  interrupt_kind?: string;
+  interrupt_reason?: string;
+  interrupt_schema?: Array<{ name: string; type?: string; required?: boolean }>;
+  repository_manifest?: Record<string, unknown>;
+  frontend_manifest?: {
+    stack_summary?: string;
+    routes?: Array<{ path?: string; file?: string; purpose?: string }>;
+    important_directories?: string[];
+    frontend_files?: string[];
+  };
+  business_logic_boundary?: {
+    protected_file_count?: number;
+    allowed_file_count?: number;
+    protected_directories?: string[];
+  };
+  product_ux_model?: Record<string, unknown>;
+  design_system_plan?: {
+    existing_system?: string;
+    css_strategy?: string;
+    reuse?: string[];
+    improve?: string[];
+    color?: Record<string, string>;
+  };
+  screen_plans?: FrontendScreenPlan[];
+  tasks?: FrontendTask[];
+  changesets?: FrontendChangeset[];
+  checkpoints?: FrontendCheckpoint[];
+  validation_results?: Array<Record<string, unknown>>;
+  quality_scores?: FrontendQualityScores;
+  final_review?: {
+    gate_passed?: boolean;
+    checks?: Record<string, string>;
+    failed?: string[];
+    strengths?: string[];
+    remaining_issues?: string[];
+    summary?: string;
+    business_logic_protection?: string;
+    files_changed?: string[];
+  };
+  github?: {
+    branch?: string;
+    commit_title?: string;
+    pr_title?: string;
+    state?: string;
+  };
+  preview_state?: Record<string, unknown>;
+  warnings?: string[];
+  errors?: Array<{ class?: string; detail?: string; stage?: string }>;
+  events?: FrontendRunEvent[];
+  gate_passed?: boolean;
+  zip_available?: boolean;
+};
+export type FrontendFileListing = {
+  files_changed?: Array<{ file: string; status?: string }>;
+  files_added?: Array<{ file: string; status?: string }>;
+  files_deleted?: Array<{ file: string; status?: string }>;
+  tree?: Array<{ file: string; status?: string }>;
+  changesets?: FrontendChangeset[];
+};
+export type EngineLlmSelection = {
+  accessMode: 'platform' | 'byok' | 'auto';
+  model: string;
+  provider: string | null;
+};

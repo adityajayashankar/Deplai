@@ -44,8 +44,8 @@ Connector -- authenticated proxy --> Customization backend
 ```
 
 In production, Caddy is the only public ingress. It forwards normal application
-traffic to the Connector and exposes the Agentic WebSocket/API path under
-`/agentic/*`; MySQL and the internal services remain on the Docker network.
+traffic to the Connector and authenticated Agentic WebSockets under
+`/agentic/ws/*`; MySQL and the internal services remain on the Docker network.
 Local `compose.yaml` exposes the Connector and Agentic Layer for development.
 
 ## Architectural responsibilities

@@ -3,18 +3,17 @@
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Menu, X } from "lucide-react";
+import { DeplaiLogo } from "@/components/deplai-logo";
 
 const navLinks = [
-  { name: "Capabilities", href: "#features" },
-  { name: "Process", href: "#how-it-works" },
-  { name: "Security", href: "#security" },
-  { name: "Infra", href: "#infra" },
-  { name: "Integrations", href: "#integrations" },
-  { name: "Pricings", href: "#pricing" },
-  { name: "Documentation", href: "/dashboard/documentation" },
+  { name: "Features", href: "#features" },
+  { name: "How it works", href: "#how-it-works" },
+  { name: "Developers", href: "#developers" },
+  { name: "Pricing", href: "#pricing" },
 ];
 
-const githubLoginHref = "/api/auth/login?force=1";
+const signInHref = "/auth/login";
+const signUpHref = "/auth/signup";
 
 export function Navigation() {
   const [isScrolled, setIsScrolled] = useState(false);
@@ -50,42 +49,46 @@ export function Navigation() {
         >
           {/* Logo */}
           <a href="#" className="flex items-center gap-2 group">
-            <span className={`brand-wordmark transition-all duration-500 ${isScrolled ? "text-lg text-foreground" : "text-xl text-white"}`}>DEPLAI</span>
-            <span className={`font-mono transition-all duration-500 ${isScrolled ? "text-[10px] mt-0.5 text-muted-foreground" : "text-xs mt-1 text-white/60"}`}>TM</span>
+            <DeplaiLogo
+              size={isScrolled ? 28 : 36}
+              priority
+              wordmarkClassName={`font-display tracking-tight transition-all duration-500 ${isScrolled ? "text-xl" : "text-2xl"}`}
+            />
+            <span className={`text-muted-foreground font-mono transition-all duration-500 ${isScrolled ? "text-[10px] mt-0.5" : "text-xs mt-1"}`}>TM</span>
           </a>
 
           {/* Desktop Navigation */}
-          <div className="hidden md:flex items-center gap-7">
+          <div className="hidden md:flex items-center gap-12">
             {navLinks.map((link) => (
               <a
                 key={link.name}
                 href={link.href}
-                className={`text-sm transition-colors duration-300 relative group ${isScrolled ? "text-foreground/70 hover:text-foreground" : "text-white/70 hover:text-white"}`}
+                className="text-sm text-foreground/70 hover:text-foreground transition-colors duration-300 relative group"
               >
                 {link.name}
-                <span className={`absolute -bottom-1 left-0 w-0 h-px transition-all duration-300 group-hover:w-full ${isScrolled ? "bg-foreground" : "bg-white"}`} />
+                <span className="absolute -bottom-1 left-0 w-0 h-px bg-foreground transition-all duration-300 group-hover:w-full" />
               </a>
             ))}
           </div>
 
           {/* Desktop CTA */}
           <div className="hidden md:flex items-center gap-4">
-            <a href={githubLoginHref} className={`transition-all duration-500 ${isScrolled ? "text-xs text-foreground/70 hover:text-foreground" : "text-sm text-white/70 hover:text-white"}`}>
+            <a href={signInHref} className={`text-foreground/70 hover:text-foreground transition-all duration-500 ${isScrolled ? "text-xs" : "text-sm"}`}>
               Sign in
             </a>
             <Button
               asChild
               size="sm"
-              className={`rounded-full transition-all duration-500 ${isScrolled ? "bg-foreground hover:bg-foreground/90 text-background px-4 h-8 text-xs" : "bg-white hover:bg-white/90 text-black px-6"}`}
+              className={`bg-foreground hover:bg-foreground/90 text-background rounded-full transition-all duration-500 ${isScrolled ? "px-4 h-8 text-xs" : "px-6"}`}
             >
-              <a href={githubLoginHref}>Launch workspace</a>
+              <a href={signUpHref}>Start deploying</a>
             </Button>
           </div>
 
           {/* Mobile Menu Button */}
           <button
             onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-            className={`md:hidden p-2 transition-colors duration-500 ${isScrolled || isMobileMenuOpen ? "text-foreground" : "text-white"}`}
+            className="md:hidden p-2"
             aria-label="Toggle menu"
           >
             {isMobileMenuOpen ? (
@@ -140,13 +143,13 @@ export function Navigation() {
               variant="outline" 
               className="flex-1 rounded-full h-14 text-base"
             >
-              <a href={githubLoginHref} onClick={() => setIsMobileMenuOpen(false)}>Sign in</a>
+              <a href={signInHref} onClick={() => setIsMobileMenuOpen(false)}>Sign in</a>
             </Button>
             <Button 
               asChild
               className="flex-1 bg-foreground text-background rounded-full h-14 text-base"
             >
-              <a href={githubLoginHref} onClick={() => setIsMobileMenuOpen(false)}>Launch workspace</a>
+              <a href={signUpHref} onClick={() => setIsMobileMenuOpen(false)}>Start deploying</a>
             </Button>
           </div>
         </div>

@@ -2,12 +2,13 @@
 
 import { ScanProvider } from '@/lib/scan-context';
 import { LLMProviderContext } from '@/lib/llm-context';
+import { DashboardWorkspaceFrame } from '@/features/workspace/WorkspaceNav';
 
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   return (
     <LLMProviderContext>
       <ScanProvider>
-        {children}
+        <DashboardWorkspaceFrame>{children}</DashboardWorkspaceFrame>
       </ScanProvider>
     </LLMProviderContext>
   );

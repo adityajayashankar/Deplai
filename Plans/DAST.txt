@@ -1,0 +1,2685 @@
+# Cursor Agent Task: Build a Production-Grade LangGraph DAST Agent for the Existing DAST Pipeline
+
+## Objective
+
+Extend the **existing DAST pipeline** in this repository by introducing a **LangGraph-based DAST orchestration agent** that makes the current DAST functionality production-grade, compliance-aware, authorization-safe, auditable, fault-tolerant, and capable of executing real security scans using **OWASP ZAP**.
+
+The core business/security requirement is:
+
+> **The platform must NEVER allow a user to enter an arbitrary public URL such as `google.com`, `facebook.com`, `example.com`, or any unrelated third-party website and scan it. A DAST scan may only execute against a target that is explicitly associated with the user's project OR against a domain/hostname for which the user has successfully demonstrated control/ownership.**
+
+This is a hard security boundary.
+
+Do NOT treat a user-provided URL as sufficient authorization.
+
+Do NOT implement this as a UI-only restriction.
+
+The enforcement must happen server-side immediately before a scan job is allowed to make any outbound request.
+
+---
+
+# 1. First: Understand the Existing Repository
+
+Before changing anything:
+
+1. Inspect the complete repository.
+2. Identify:
+
+   * Existing DAST backend/service.
+   * Existing DAST UI.
+   * Scan/job models.
+   * Project model.
+   * User/team/organization model.
+   * Authentication/authorization middleware.
+   * Existing background worker/queue architecture.
+   * Docker infrastructure.
+   * Existing scanner abstraction.
+   * Existing findings/vulnerability schema.
+   * Existing reporting/dashboard infrastructure.
+   * Existing audit-log implementation.
+   * Existing asset/domain/project association logic.
+3. Reuse existing abstractions wherever practical.
+4. Do NOT create duplicate project, user, scan, finding, or job systems if existing ones already exist.
+5. Preserve existing APIs and UI behavior unless an extension is required.
+6. Do not modify unrelated application/business logic.
+
+Before implementation, create an internal architecture map of the existing DAST flow.
+
+---
+
+# 2. Target Architecture
+
+Implement the following logical flow:
+
+```text
+User
+  |
+  v
+DAST UI
+  |
+  v
+DAST Scan API
+  |
+  v
+Authorization / Ownership Gate
+  |
+  +----> Project Association Verification
+  |
+  +----> Domain Ownership Verification
+  |
+  +----> Target Scope Validation
+  |
+  +----> SSRF / Network Safety Validation
+  |
+  v
+LangGraph DAST Agent
+  |
+  +----> Prepare Scan
+  |
+  +----> Resolve Target
+  |
+  +----> Validate Scope
+  |
+  +----> Generate ZAP Plan
+  |
+  +----> Launch Isolated ZAP Worker
+  |
+  +----> Monitor
+  |
+  +----> Collect Results
+  |
+  +----> Normalize Findings
+  |
+  +----> Compliance Evaluation
+  |
+  +----> Persist Evidence
+  |
+  +----> Finalize Scan
+  |
+  v
+Existing DAST Findings / Dashboard / Reports
+```
+
+Use **LangGraph as the orchestration/state-machine layer**, NOT as the security enforcement layer.
+
+Security-critical validations must remain deterministic application code.
+
+The LLM/agent must never be trusted to decide whether a target is authorized.
+
+---
+
+# 3. LangGraph State Model
+
+Create a strongly typed state object, preferably using the repository's existing typing/model conventions.
+
+Conceptually:
+
+```text
+DASTAgentState
+
+scan_id
+project_id
+organization_id
+requested_by_user_id
+
+target_url
+normalized_target_url
+target_hostname
+target_port
+target_scheme
+
+asset_id
+asset_type
+asset_scope
+
+authorization_status
+authorization_reason
+
+ownership_status
+ownership_method
+
+dns_resolution
+resolved_ips
+
+scope_validation_status
+ssrf_validation_status
+
+scan_profile
+zap_plan
+zap_container_id
+
+scan_started_at
+scan_finished_at
+
+scan_status
+scan_stage
+
+findings
+finding_count
+
+errors
+warnings
+
+evidence
+audit_events
+
+retry_count
+checkpoint_id
+```
+
+Never allow the agent to silently mutate authorization state.
+
+Authorization must be represented explicitly:
+
+```text
+PENDING
+VERIFIED
+REJECTED
+EXPIRED
+REVOKED
+```
+
+---
+
+# 4. LangGraph Nodes
+
+Implement the workflow as deterministic nodes with clear transitions.
+
+Recommended graph:
+
+```text
+START
+  |
+  v
+load_scan_context
+  |
+  v
+validate_project_access
+  |
+  v
+resolve_target_asset
+  |
+  v
+validate_target_authorization
+  |
+  +---- REJECT ----> authorization_failed
+  |
+  v
+verify_target_scope
+  |
+  +---- REJECT ----> scope_failed
+  |
+  v
+perform_ssrf_safety_validation
+  |
+  +---- REJECT ----> safety_failed
+  |
+  v
+build_scan_plan
+  |
+  v
+checkpoint_before_scan
+  |
+  v
+launch_zap
+  |
+  v
+monitor_zap
+  |
+  +---- RETRY ----> retry_scan
+  |
+  v
+collect_zap_results
+  |
+  v
+normalize_findings
+  |
+  v
+evaluate_compliance
+  |
+  v
+persist_results
+  |
+  v
+persist_audit_evidence
+  |
+  v
+finalize_scan
+  |
+  v
+END
+```
+
+The graph must support resumability/checkpoints.
+
+A failed scanner container must not force the entire workflow to lose state.
+
+Use LangGraph checkpointing/persistence compatible with the application's infrastructure.
+
+---
+
+# 5. HARD SECURITY RULE: Target Authorization
+
+Implement an explicit target authorization service.
+
+Example interface:
+
+```text
+TargetAuthorizationService.authorizeTarget(
+    user,
+    project,
+    requestedTarget
+)
+```
+
+The result should contain:
+
+```text
+authorized: boolean
+reason: enum
+assetId
+scope
+verificationMethod
+verificationTimestamp
+verificationExpiry
+```
+
+Possible reasons:
+
+```text
+PROJECT_ASSET
+VERIFIED_DOMAIN
+VERIFIED_HOST
+NOT_ASSOCIATED_WITH_PROJECT
+DOMAIN_NOT_VERIFIED
+VERIFICATION_EXPIRED
+VERIFICATION_REVOKED
+TARGET_OUTSIDE_SCOPE
+UNSAFE_NETWORK_TARGET
+INVALID_TARGET
+```
+
+The rule is:
+
+```text
+ALLOW SCAN
+only if
+
+(
+    target belongs to a verified project asset
+    OR
+    target is covered by a verified domain/hostname
+)
+
+AND
+
+target passes strict scope validation
+
+AND
+
+target passes SSRF/network safety checks
+```
+
+Everything else must be rejected.
+
+---
+
+# 6. Project Association Mechanism
+
+Support the cleanest possible workflow:
+
+### Option A — Existing Project Deployment
+
+If the project already contains deployment metadata, automatically identify URLs associated with the project.
+
+Examples may include:
+
+```text
+deployment URL
+preview URL
+production URL
+environment URL
+configured application URL
+```
+
+Reuse existing project/deployment models where available.
+
+### Option B — Explicit Project Asset
+
+Allow an authenticated project member to associate:
+
+```text
+https://app.example.com
+https://staging.example.com
+https://api.example.com
+```
+
+with the project.
+
+Persist these as security assets.
+
+Example:
+
+```text
+ProjectAsset
+-------------------------
+id
+project_id
+organization_id
+type
+hostname
+scheme
+port
+path_prefix
+environment
+status
+verification_method
+verified_at
+expires_at
+created_by
+created_at
+revoked_at
+```
+
+Do not allow arbitrary targets to become authorized merely because a user created a database record.
+
+Project assets must still pass validation.
+
+---
+
+# 7. Domain Ownership Verification
+
+Implement first-class domain verification.
+
+A user should be able to say:
+
+> "I want to scan `example.com`."
+
+The platform responds with a verification challenge.
+
+Generate a cryptographically random verification token.
+
+Example:
+
+```text
+deplai-domain-verification=<random-token>
+```
+
+Store only what is necessary to validate the challenge securely.
+
+Recommended model:
+
+```text
+DomainVerification
+-----------------------------
+id
+organization_id
+project_id
+domain
+normalized_domain
+verification_token_hash
+verification_method
+status
+created_by
+created_at
+verified_at
+expires_at
+last_checked_at
+revoked_at
+```
+
+Never store plaintext verification secrets when unnecessary.
+
+---
+
+# 8. DNS TXT Verification
+
+Primary recommended ownership mechanism:
+
+```text
+_deplai-verify.example.com
+```
+
+TXT value:
+
+```text
+deplai-domain-verification=<token>
+```
+
+Implement a verification service:
+
+```text
+DomainVerificationService.verifyDns(domain)
+```
+
+Requirements:
+
+1. Normalize hostname/domain.
+2. Validate the domain syntax.
+3. Determine the registrable domain safely.
+4. Query DNS TXT records.
+5. Compare against the expected challenge.
+6. Record:
+
+   * timestamp
+   * resolver result
+   * verification method
+   * result
+   * evidence hash/details
+7. Mark the domain VERIFIED only after successful validation.
+
+Do not use a single uncontrolled DNS string comparison without normalization.
+
+Support DNS propagation delays.
+
+Verification should be safely repeatable.
+
+Add explicit expiration/revocation behavior.
+
+---
+
+# 9. HTTP Ownership Verification
+
+Add a second mechanism for users who cannot manage DNS.
+
+Expected location:
+
+```text
+https://example.com/.well-known/deplai-verification/<token>
+```
+
+The verification endpoint must return the exact expected verification value.
+
+Requirements:
+
+* HTTPS preferred.
+* Follow only a tightly controlled redirect policy.
+* Every redirect must itself be validated.
+* Do not follow redirects into private/internal networks.
+* Do not allow arbitrary ports.
+* Record verification evidence.
+* Mark the exact hostname verified.
+* Make the token single-purpose and expirable.
+
+Example result:
+
+```text
+VERIFIED_HOST
+```
+
+Do NOT automatically interpret verification of:
+
+```text
+example.com
+```
+
+as permission to scan arbitrary unrelated infrastructure.
+
+Represent the allowed scope explicitly.
+
+---
+
+# 10. Verification Scope
+
+Implement scope semantics carefully.
+
+For example:
+
+```text
+Verified domain:
+example.com
+```
+
+May permit:
+
+```text
+example.com
+www.example.com
+app.example.com
+api.example.com
+```
+
+only according to the configured policy.
+
+But do NOT automatically assume:
+
+```text
+evil-example.com
+example.com.attacker.com
+```
+
+are valid.
+
+Use proper hostname/domain boundary matching.
+
+Do not implement:
+
+```text
+hostname.endsWith("example.com")
+```
+
+as the authorization logic.
+
+Use canonical domain parsing and label-aware comparisons.
+
+---
+
+# 11. Exact Host Verification
+
+Support stricter verification for high-security environments:
+
+```text
+VERIFIED_DOMAIN
+VERIFIED_HOST
+PROJECT_ASSET
+```
+
+Example:
+
+```text
+app.example.com
+```
+
+can be verified specifically without authorizing the entire domain.
+
+This should be useful for customers that want very narrow scan authorization.
+
+---
+
+# 12. Target URL Normalization
+
+Before any network access:
+
+1. Parse using a standards-compliant URL parser.
+2. Normalize hostname casing.
+3. Normalize IDNs appropriately.
+4. Reject credentials embedded in URLs.
+5. Allow only:
+
+   * `https`
+   * optionally `http` where explicitly enabled.
+6. Reject:
+
+   * `file:`
+   * `ftp:`
+   * `gopher:`
+   * `data:`
+   * `javascript:`
+   * `dict:`
+   * `smb:`
+   * custom protocols.
+7. Validate ports.
+8. Normalize trailing path behavior.
+9. Reject malformed URLs.
+10. Reject unexpected URL components.
+
+Do not use regex as the primary URL parser.
+
+---
+
+# 13. SSRF Protection
+
+This is mandatory.
+
+OWASP specifically calls out DNS rebinding, redirect abuse, alternate IP formats, IPv6-mapped addresses, and private/internal targets as important SSRF risks.
+
+Create a dedicated:
+
+```text
+OutboundTargetSecurityService
+```
+
+It must validate every outbound target immediately before connection.
+
+Block at minimum:
+
+```text
+127.0.0.0/8
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
+169.254.0.0/16
+0.0.0.0/8
+100.64.0.0/10
+224.0.0.0/4
+::1/128
+fc00::/7
+fe80::/10
+IPv4-mapped private IPv6
+IPv4-compatible/private representations
+cloud metadata endpoints
+localhost
+local hostnames
+internal-only DNS names
+```
+
+Also protect against:
+
+* DNS rebinding.
+* DNS resolution changing between validation and connection.
+* Decimal/octal/hexadecimal IP tricks.
+* IPv6 representations.
+* URL parser inconsistencies.
+* DNS aliases resolving to internal addresses.
+
+---
+
+# 14. Redirect Security
+
+ZAP can encounter redirects and application-generated URLs.
+
+Every redirect MUST go through scope validation again.
+
+Example:
+
+```text
+https://approved.example.com
+        |
+        v
+https://approved.example.com/login
+        |
+        v
+https://127.0.0.1/
+```
+
+The final request must be blocked.
+
+Likewise:
+
+```text
+approved.example.com
+        |
+        v
+internal-service.local
+```
+
+must be blocked.
+
+Never rely only on the initial hostname.
+
+Use a redirect policy such as:
+
+```text
+max_redirects = configurable
+redirect_target -> normalize -> resolve -> authorize -> connect
+```
+
+---
+
+# 15. Network Isolation
+
+ZAP must run in an isolated worker/container.
+
+Do not execute ZAP directly inside the main API server process.
+
+Recommended architecture:
+
+```text
+API
+ |
+ +--> Queue
+       |
+       +--> DAST Worker
+              |
+              +--> Security Gateway / Egress Policy
+                     |
+                     +--> ZAP Container
+```
+
+The container should have:
+
+* minimal filesystem permissions
+* no privileged mode
+* no host networking
+* no access to cloud metadata
+* restricted outbound networking
+* CPU limits
+* memory limits
+* execution timeout
+* process limits where supported
+* ephemeral workspace
+
+Do not give the scanner unnecessary credentials or infrastructure access.
+
+---
+
+# 16. Defense in Depth: Network Egress
+
+Application-level SSRF checks are mandatory but should NOT be the only control.
+
+Add infrastructure-level controls where the current deployment environment allows:
+
+```text
+deny-by-default outbound policy
++
+explicit allowed destination
++
+private network blocking
++
+cloud metadata blocking
+```
+
+The DAST worker should have no reason to communicate with internal databases, Kubernetes APIs, metadata services, or control-plane services.
+
+---
+
+# 17. ZAP Selection
+
+Use **OWASP ZAP** as the primary scanner.
+
+Do NOT replace it unless the repository already has a scanner abstraction making multiple engines easy to support.
+
+ZAP currently provides Dockerized Baseline, Full and API scanning modes, and the Automation Framework provides a YAML-based orchestration model suitable for more complex integrations.
+
+Recommended implementation:
+
+```text
+DAST Agent
+    |
+    v
+ZAP Automation Framework
+    |
+    v
+Ephemeral Docker container
+```
+
+Do not build the entire DAST engine yourself.
+
+---
+
+# 18. Scanner Abstraction
+
+Create a scanner interface:
+
+```text
+DastScanner
+```
+
+with operations conceptually equivalent to:
+
+```text
+prepare()
+validate()
+start()
+status()
+stop()
+collectResults()
+cleanup()
+```
+
+Implement:
+
+```text
+ZapScanner
+```
+
+This leaves the architecture open for future scanners.
+
+Potential future adapters:
+
+```text
+Burp Enterprise
+Nuclei
+Caido
+custom internal scanner
+```
+
+Do not implement unnecessary additional scanners now.
+
+---
+
+# 19. ZAP Scan Profiles
+
+Support at least:
+
+```text
+BASELINE
+FULL
+API
+```
+
+### BASELINE
+
+Passive-focused discovery suitable for lower-risk/fast checks.
+
+ZAP's documented baseline scan spiders the target and performs passive scanning without active attacks.
+
+### FULL
+
+For authorized targets where active scanning is explicitly enabled.
+
+ZAP's full scan includes spidering followed by active scanning.
+
+### API
+
+For OpenAPI/SOAP/GraphQL targets.
+
+ZAP provides an API scan mode specifically designed around API definitions.
+
+Do not silently run FULL scan when the user selected BASELINE.
+
+---
+
+# 20. Scan Risk Classification
+
+Add explicit scan intent:
+
+```text
+PASSIVE
+ACTIVE
+API_ACTIVE
+```
+
+Require appropriate authorization for active scanning.
+
+The UI should clearly distinguish:
+
+```text
+Passive DAST
+Active DAST
+API DAST
+```
+
+Active scanning can create higher load and potentially mutate application state.
+
+---
+
+# 21. Scope Configuration
+
+The DAST scan must have an explicit scope object.
+
+Example:
+
+```text
+DastScope
+---------------------
+scheme
+hostname
+ports
+allowed_subdomains
+path_prefixes
+excluded_paths
+excluded_hosts
+max_depth
+max_urls
+max_duration
+max_concurrency
+```
+
+Everything outside scope must be rejected.
+
+Do not rely exclusively on ZAP's own concept of scope.
+
+The platform owns authorization.
+
+---
+
+# 22. Scope Examples
+
+If the verified asset is:
+
+```text
+https://app.example.com
+```
+
+these may be allowed:
+
+```text
+https://app.example.com/
+https://app.example.com/login
+https://app.example.com/api/users
+```
+
+but these must NOT automatically be allowed:
+
+```text
+https://admin.example.com
+https://api.example.com
+https://example.com
+https://other-domain.com
+```
+
+unless the configured asset/domain verification policy explicitly authorizes them.
+
+---
+
+# 23. ZAP URLs Discovered During Scanning
+
+This is extremely important.
+
+ZAP may discover:
+
+```text
+<img src="https://cdn.example.com/...">
+<script src="https://other-domain.com/...">
+<form action="https://evil.example/...">
+```
+
+Do NOT let discovered URLs automatically become scan targets.
+
+Every discovered URL must be filtered through:
+
+```text
+ScopePolicy
++
+TargetAuthorization
++
+OutboundTargetSecurityService
+```
+
+before it is fetched.
+
+This is a hard boundary against scanner abuse/SSRF.
+
+---
+
+# 24. Authentication for DAST
+
+Design the agent so authenticated DAST can be added without changing the core architecture.
+
+Possible future inputs:
+
+```text
+anonymous
+session_cookie
+bearer_token
+OIDC
+test_user
+credential vault reference
+```
+
+Never store raw secrets inside LangGraph state/checkpoints unless absolutely necessary.
+
+Prefer:
+
+```text
+secret_reference
+```
+
+and resolve secrets only inside the scanner worker.
+
+Never place secrets in:
+
+* logs
+* findings
+* traces
+* checkpoint payloads
+* scan reports
+* UI responses
+
+---
+
+# 25. Agent Intelligence Boundaries
+
+Do not use an LLM for:
+
+* domain ownership decisions
+* authorization decisions
+* SSRF validation
+* scope decisions
+* permission checks
+* credential handling
+* vulnerability severity calculation where deterministic mappings exist
+* deciding whether a target belongs to a user.
+
+The agent may assist with:
+
+* choosing the appropriate scan profile
+* interpreting scan results
+* grouping findings
+* generating remediation summaries
+* generating executive summaries
+* prioritization recommendations
+
+Security policy always wins over agent output.
+
+Implement:
+
+```text
+policy -> deterministic
+orchestration -> LangGraph
+scanner -> ZAP
+reasoning/enrichment -> optional LLM
+```
+
+---
+
+# 26. Checkpointing / Time Travel
+
+Before expensive or destructive stages, checkpoint state.
+
+At minimum:
+
+```text
+checkpoint:
+authorization_verified
+
+checkpoint:
+scope_verified
+
+checkpoint:
+pre_scan
+
+checkpoint:
+zap_started
+
+checkpoint:
+zap_results_collected
+
+checkpoint:
+findings_persisted
+```
+
+The scan should be resumable after:
+
+* API restart
+* worker crash
+* ZAP crash
+* transient queue failure
+* network failure
+* database connection interruption
+
+Do not restart a completed expensive phase unnecessarily.
+
+Make state transitions idempotent.
+
+---
+
+# 27. Retry Policy
+
+Use controlled retries.
+
+Example:
+
+```text
+DNS failure             -> retry
+queue failure           -> retry
+ZAP startup failure     -> retry
+temporary network error -> retry
+authorization failure   -> NEVER retry automatically
+ownership failure       -> NEVER retry continuously
+unsafe target           -> NEVER retry
+scope violation         -> NEVER retry
+```
+
+Add:
+
+```text
+max_attempts
+backoff
+jitter
+reason
+```
+
+Do not create infinite retries.
+
+---
+
+# 28. ZAP Container Lifecycle
+
+Implement a reliable lifecycle:
+
+```text
+create job
+  |
+  v
+generate isolated workspace
+  |
+  v
+generate ZAP plan
+  |
+  v
+start container
+  |
+  v
+monitor
+  |
+  v
+timeout?
+  |
+  +--> stop
+  |
+  v
+collect reports
+  |
+  v
+validate reports
+  |
+  v
+persist
+  |
+  v
+destroy container/workspace
+```
+
+Always execute cleanup in a finally-equivalent path.
+
+No abandoned containers.
+
+No abandoned temporary secrets.
+
+No stale scan workspaces.
+
+---
+
+# 29. ZAP Automation Plan
+
+Generate the ZAP Automation Framework configuration dynamically based on the validated scan scope.
+
+Do not allow users to directly supply arbitrary ZAP configuration that bypasses platform controls.
+
+The generated plan should be based on:
+
+```text
+validated target
+validated scope
+scan profile
+timeouts
+limits
+authentication reference
+policy configuration
+```
+
+Use ZAP Automation Framework rather than a hard-coded shell command for complex scanning. ZAP documents the Automation Framework as the flexible automation path for non-trivial integrations.
+
+---
+
+# 30. Resource Controls
+
+Every scan must have configurable limits.
+
+At minimum:
+
+```text
+max_scan_duration
+max_urls
+max_depth
+max_concurrent_requests
+max_request_size
+max_response_size
+container_memory
+container_cpu
+max_redirects
+```
+
+Defaults must be safe.
+
+Prevent one customer's scan from consuming all worker capacity.
+
+---
+
+# 31. Concurrency
+
+Support multiple independent DAST scans.
+
+Architecture:
+
+```text
+Queue
+ |
+ +--> Worker 1 -> ZAP Container
+ +--> Worker 2 -> ZAP Container
+ +--> Worker 3 -> ZAP Container
+```
+
+But introduce organization/project quotas.
+
+Example:
+
+```text
+global concurrency
+organization concurrency
+project concurrency
+user concurrency
+```
+
+Use the existing platform queue if already available.
+
+Do not introduce a second queue unless necessary.
+
+---
+
+# 32. Scan Database Model
+
+Reuse existing scan models if present.
+
+Otherwise introduce something conceptually like:
+
+```text
+DastScan
+---------------------
+id
+project_id
+organization_id
+requested_by
+asset_id
+target_url
+target_hostname
+scan_profile
+authorization_status
+authorization_method
+scope_snapshot
+status
+stage
+started_at
+finished_at
+duration
+zap_version
+scanner_version
+finding_count
+error_code
+error_message
+created_at
+updated_at
+```
+
+Store a **scope snapshot** so historical scans remain auditable even if the project configuration later changes.
+
+---
+
+# 33. Authorization Evidence
+
+For every scan store evidence indicating why it was allowed.
+
+Example:
+
+```text
+authorizationEvidence:
+
+{
+  assetId,
+  authorizationType,
+  domain,
+  verificationMethod,
+  verifiedAt,
+  verificationId,
+  scopeSnapshot,
+  policyVersion
+}
+```
+
+This is necessary for compliance/auditability.
+
+---
+
+# 34. Audit Logging
+
+Every security-sensitive action must produce an audit event.
+
+Examples:
+
+```text
+DAST_SCAN_REQUESTED
+DAST_TARGET_REJECTED
+DAST_PROJECT_ASSET_AUTHORIZED
+DAST_DOMAIN_VERIFICATION_STARTED
+DAST_DOMAIN_VERIFICATION_SUCCEEDED
+DAST_DOMAIN_VERIFICATION_FAILED
+DAST_TARGET_SCOPE_REJECTED
+DAST_SSRF_TARGET_REJECTED
+DAST_SCAN_AUTHORIZED
+DAST_SCAN_STARTED
+DAST_ZAP_STARTED
+DAST_ZAP_FAILED
+DAST_SCAN_COMPLETED
+DAST_SCAN_CANCELLED
+DAST_SCAN_TIMED_OUT
+DAST_SCAN_RESULTS_PERSISTED
+DAST_DOMAIN_REVOKED
+```
+
+Audit records should contain:
+
+```text
+actor
+organization
+project
+scan
+target
+action
+decision
+timestamp
+correlation_id
+reason
+policy_version
+```
+
+Never log sensitive credentials.
+
+---
+
+# 35. Compliance Status
+
+The DAST system should expose compliance-oriented states.
+
+Example:
+
+```text
+COMPLIANT
+NON_COMPLIANT
+BLOCKED_UNAUTHORIZED
+BLOCKED_UNSAFE_TARGET
+PENDING_VERIFICATION
+SCAN_FAILED
+SCAN_INCOMPLETE
+```
+
+Important distinction:
+
+```text
+BLOCKED_UNAUTHORIZED
+```
+
+is NOT the same as:
+
+```text
+SCAN_FAILED
+```
+
+The former is a deliberate policy enforcement decision.
+
+---
+
+# 36. Findings Normalization
+
+Create a normalized finding format independent of ZAP.
+
+Example:
+
+```text
+DastFinding
+---------------------
+id
+scan_id
+asset_id
+rule_id
+title
+description
+severity
+confidence
+cwe
+owasp_category
+url
+method
+parameter
+evidence
+solution
+references
+first_seen
+last_seen
+status
+fingerprint
+```
+
+Calculate a stable finding fingerprint.
+
+Example conceptual identity:
+
+```text
+hash(
+    rule_id +
+    normalized_url +
+    method +
+    parameter +
+    relevant_evidence
+)
+```
+
+This allows:
+
+```text
+new
+reopened
+resolved
+persistent
+```
+
+tracking across scans.
+
+---
+
+# 37. Severity Mapping
+
+Use a deterministic mapping.
+
+Do not let an LLM freely decide:
+
+```text
+Critical / High / Medium / Low
+```
+
+unless it is only providing supplementary analysis.
+
+Prefer:
+
+```text
+ZAP risk
++
+confidence
++
+organization policy
+=
+platform severity
+```
+
+Make the mapping configurable.
+
+---
+
+# 38. Compliance Policy Engine
+
+Add a small deterministic policy layer after findings normalization.
+
+Example:
+
+```text
+BLOCK deployment if:
+    critical_findings > 0
+
+WARN if:
+    high_findings > configurable threshold
+
+PASS if:
+    no policy violations
+```
+
+Keep this separate from LangGraph orchestration.
+
+---
+
+# 39. Scan Cancellation
+
+The UI/API should allow:
+
+```text
+cancel scan
+```
+
+Cancellation flow:
+
+```text
+API
+ ->
+LangGraph state
+ ->
+worker
+ ->
+ZAP termination
+ ->
+cleanup
+ ->
+persist CANCELLED
+```
+
+Cancellation must be idempotent.
+
+---
+
+# 40. Authorization Race Conditions
+
+Re-check authorization immediately before starting ZAP.
+
+Example:
+
+```text
+12:00 target verified
+
+12:03 user requests scan
+
+12:03 authorization checked
+
+12:04 verification revoked
+
+12:04 worker about to launch
+```
+
+The worker MUST revalidate security-critical authorization before network execution.
+
+Do not trust an old queue payload as authorization.
+
+Use:
+
+```text
+request-time authorization
++
+execution-time authorization
+```
+
+---
+
+# 41. DNS TOCTOU Protection
+
+Prevent:
+
+```text
+DNS validation
+     |
+     v
+safe IP
+     |
+     v
+DNS changes
+     |
+     v
+internal IP
+```
+
+Where technically possible:
+
+* resolve immediately before connection
+* validate all answers
+* prevent direct use of attacker-controlled alternate resolution
+* pin/retain the approved resolution for the execution window where practical
+* revalidate when connections change
+* ensure the network layer cannot bypass application policy
+
+OWASP explicitly identifies DNS rebinding and TOCTOU as concerns for autonomous security tooling.
+
+---
+
+# 42. Redirect and Scope Enforcement Architecture
+
+Create a reusable function:
+
+```text
+authorizeOutboundRequest(url, scanContext)
+```
+
+This function must perform:
+
+```text
+parse
+normalize
+scheme validation
+hostname validation
+scope validation
+DNS resolution
+IP classification
+authorization validation
+redirect policy validation
+```
+
+No scanner request should bypass this mechanism.
+
+Where ZAP networking makes direct per-request interception difficult, enforce an additional network egress layer around the ZAP worker so the scanner cannot bypass the application's target policy.
+
+---
+
+# 43. UI Extensions
+
+The DAST frontend already exists.
+
+Extend it rather than rebuilding it.
+
+Add target states such as:
+
+```text
+Verified
+Pending Verification
+Verification Expired
+Unauthorized
+Revoked
+Unsafe Target
+```
+
+When adding a target:
+
+```text
+Add Target
+```
+
+show:
+
+```text
+Target URL
+Environment
+Verification status
+Ownership method
+Scope
+Verification expiry
+```
+
+Example:
+
+```text
+https://app.example.com
+
+✓ Domain verified
+Method: DNS TXT
+Verified: 27 Aug 2026
+Scope: app.example.com
+```
+
+For an unverified domain:
+
+```text
+Verification required
+
+Add this TXT record:
+
+_deplai-verify.example.com
+
+TXT:
+deplai-domain-verification=********
+```
+
+Also provide:
+
+```text
+Verify DNS
+Verify HTTP
+Revoke Verification
+Refresh Status
+```
+
+---
+
+# 44. Unsafe URL UX
+
+When a user tries:
+
+```text
+https://google.com
+```
+
+the API should return a clear policy error.
+
+Example:
+
+```text
+DAST_TARGET_NOT_AUTHORIZED
+
+This target is not associated with the selected project
+and ownership has not been verified.
+```
+
+Do NOT tell the user:
+
+```text
+scanner rejected this URL
+```
+
+because the actual failure is an authorization policy decision.
+
+---
+
+# 45. Scan Creation UX
+
+When the user creates a scan:
+
+```text
+Select Project
+        |
+        v
+Select Verified Asset
+        |
+        v
+Select Environment
+        |
+        v
+Select Scan Type
+        |
+        v
+Review Scope
+        |
+        v
+Confirm Authorization
+        |
+        v
+Start Scan
+```
+
+Never provide a raw free-form URL field as the sole mechanism to start a scan.
+
+A URL may be entered when registering an asset, but it must pass verification.
+
+---
+
+# 46. Admin Controls
+
+Add admin controls where the current DAST frontend already has admin functionality.
+
+Admin should be able to:
+
+```text
+view scan
+view target
+view ownership evidence
+view authorization decision
+view scope
+view audit trail
+view verification history
+revoke asset
+cancel scan
+retry scan
+view ZAP execution metadata
+view compliance state
+```
+
+Admins should not be able to silently bypass authorization without an explicit audited override mechanism.
+
+If an emergency override is implemented, make it:
+
+```text
+explicit
+time-limited
+permission-gated
+strongly audited
+```
+
+Do not create hidden admin bypasses.
+
+---
+
+# 47. API Design
+
+Inspect existing API conventions first.
+
+Then add endpoints equivalent to:
+
+```text
+POST   /dast/assets
+GET    /dast/assets
+GET    /dast/assets/:id
+DELETE /dast/assets/:id
+
+POST   /dast/assets/:id/verify
+POST   /dast/assets/:id/reverify
+POST   /dast/assets/:id/revoke
+
+POST   /dast/scans
+GET    /dast/scans/:id
+POST   /dast/scans/:id/cancel
+POST   /dast/scans/:id/retry
+
+GET    /dast/scans/:id/findings
+GET    /dast/scans/:id/audit
+```
+
+Adapt these to existing API conventions rather than blindly creating these exact paths.
+
+---
+
+# 48. Idempotency
+
+Scan creation must support idempotency.
+
+Example:
+
+```text
+Idempotency-Key: <uuid>
+```
+
+The same request must not accidentally launch multiple scans.
+
+Also make worker execution idempotent around:
+
+```text
+job creation
+ZAP start
+result persistence
+finding persistence
+audit events
+```
+
+---
+
+# 49. Error Taxonomy
+
+Create typed errors such as:
+
+```text
+DAST_TARGET_INVALID
+DAST_TARGET_NOT_AUTHORIZED
+DAST_DOMAIN_NOT_VERIFIED
+DAST_VERIFICATION_EXPIRED
+DAST_TARGET_OUT_OF_SCOPE
+DAST_SSRF_BLOCKED
+DAST_PRIVATE_IP_BLOCKED
+DAST_REDIRECT_OUT_OF_SCOPE
+DAST_ZAP_START_FAILED
+DAST_ZAP_TIMEOUT
+DAST_ZAP_RESULT_INVALID
+DAST_SCAN_CANCELLED
+DAST_SCAN_QUOTA_EXCEEDED
+DAST_SCAN_CONCURRENCY_LIMIT
+```
+
+Map them consistently to API/UI statuses.
+
+---
+
+# 50. Observability
+
+Every workflow execution should have:
+
+```text
+trace_id
+correlation_id
+scan_id
+project_id
+organization_id
+worker_id
+zap_container_id
+```
+
+Add metrics such as:
+
+```text
+dast_scan_total
+dast_scan_success_total
+dast_scan_failure_total
+dast_scan_blocked_total
+
+dast_authorization_denied_total
+dast_ssrf_blocked_total
+dast_scope_violation_total
+
+dast_scan_duration
+zap_scan_duration
+
+dast_queue_depth
+dast_active_workers
+```
+
+Never put secrets in traces.
+
+---
+
+# 51. Security Tests — Mandatory
+
+Create comprehensive tests.
+
+### Authorization Tests
+
+Test:
+
+```text
+Google.com -> blocked
+Facebook.com -> blocked
+arbitrary public site -> blocked
+unverified custom domain -> blocked
+verified domain -> allowed
+verified host -> allowed
+project-associated target -> allowed
+revoked domain -> blocked
+expired verification -> blocked
+wrong organization -> blocked
+wrong project -> blocked
+```
+
+### Scope Tests
+
+Test:
+
+```text
+example.com
+www.example.com
+evil-example.com
+example.com.attacker.com
+attackerexample.com
+```
+
+and subdomain edge cases.
+
+### SSRF Tests
+
+Test:
+
+```text
+127.0.0.1
+localhost
+0.0.0.0
+169.254.169.254
+10.x.x.x
+172.16.x.x
+192.168.x.x
+IPv6 loopback
+IPv6 link-local
+IPv6 private
+IPv4-mapped IPv6
+decimal IPv4
+hex IPv4
+octal representations
+```
+
+### DNS Rebinding Tests
+
+Simulate:
+
+```text
+safe IP -> internal IP
+```
+
+and ensure the scan is blocked.
+
+### Redirect Tests
+
+Test:
+
+```text
+approved -> approved
+approved -> private IP
+approved -> localhost
+approved -> different domain
+approved -> cloud metadata
+```
+
+### ZAP Tests
+
+Test:
+
+```text
+startup
+timeout
+crash
+invalid report
+partial report
+cancel
+retry
+cleanup
+duplicate job
+```
+
+### LangGraph Tests
+
+Test:
+
+```text
+checkpoint restore
+node retry
+node failure
+worker restart
+state persistence
+idempotent execution
+```
+
+---
+
+# 52. Security Integration Tests
+
+Build an integration test where:
+
+```text
+User creates project
+   |
+   v
+Adds example test domain
+   |
+   v
+Verification challenge generated
+   |
+   v
+DNS/HTTP verification succeeds
+   |
+   v
+User creates DAST scan
+   |
+   v
+Authorization passes
+   |
+   v
+Scope passes
+   |
+   v
+SSRF checks pass
+   |
+   v
+ZAP container starts
+   |
+   v
+Results returned
+   |
+   v
+Findings persisted
+   |
+   v
+Audit trail generated
+```
+
+Then test the negative path:
+
+```text
+User requests google.com
+   |
+   v
+Authorization rejected
+   |
+   v
+NO ZAP CONTAINER IS STARTED
+   |
+   v
+Audit event created
+```
+
+This last property is extremely important.
+
+A blocked target must be rejected **before the scanner gets an opportunity to connect to it**.
+
+---
+
+# 53. No-Bypass Requirement
+
+Search the entire repository for every place where outbound HTTP requests can originate.
+
+Identify:
+
+```text
+fetch
+axios
+requests
+http clients
+curl
+wget
+ZAP
+browser automation
+Playwright
+Puppeteer
+headless browsers
+worker networking
+```
+
+Ensure the DAST workflow cannot bypass the new target authorization layer.
+
+Do not secure only the primary API endpoint.
+
+---
+
+# 54. Dependency Review
+
+Before adding dependencies:
+
+1. Check whether the repository already provides equivalent functionality.
+2. Reuse existing packages.
+3. Prefer stable maintained packages.
+4. Avoid unnecessary agent-framework dependencies.
+5. Pin scanner container versions appropriately.
+6. Document required Docker/ZAP versions.
+
+---
+
+# 55. Docker Requirements
+
+Add or modify Docker configuration only where necessary.
+
+Required scanner environment:
+
+```text
+DAST API / Agent
+DAST Worker
+ZAP Runner
+```
+
+The main API container should not contain ZAP.
+
+Use a dedicated ZAP image.
+
+Mount only an ephemeral workspace.
+
+Do not expose ZAP's administrative API publicly.
+
+If ZAP daemon/API mode is used, bind it only to an internal isolated interface and authenticate/protect access appropriately.
+
+---
+
+# 56. ZAP Version Metadata
+
+Persist the scanner version for every scan:
+
+```text
+scanner_name = OWASP ZAP
+scanner_version = <actual runtime version>
+```
+
+This is required for reproducibility and compliance evidence.
+
+Do not hard-code an outdated version without checking the repository's dependency/image strategy.
+
+---
+
+# 57. Report Storage
+
+Persist:
+
+```text
+raw ZAP report
+normalized findings
+scan metadata
+authorization evidence
+scope snapshot
+audit events
+```
+
+Prefer object storage for large reports if the project already has object storage support.
+
+Database should store metadata and references rather than unnecessarily large blobs.
+
+---
+
+# 58. Compliance Evidence Package
+
+For each completed scan make it possible to reconstruct:
+
+```text
+Who requested it?
+Which project?
+Which organization?
+Which target?
+Why was the target authorized?
+How was ownership proven?
+When was ownership verified?
+What scope was authorized?
+What policy version applied?
+What scanner/version ran?
+When did scanning begin?
+When did scanning end?
+What findings were discovered?
+What was the final compliance result?
+```
+
+This should be exportable through the existing reporting system if available.
+
+---
+
+# 59. Policy Versioning
+
+Create a versioned DAST authorization/security policy.
+
+Example:
+
+```text
+dast-policy-v1
+```
+
+Persist the policy version with every scan.
+
+This ensures that historical scans remain explainable when rules evolve.
+
+---
+
+# 60. Security Defaults
+
+The following defaults must be fail-closed:
+
+```text
+No verification -> reject
+No project asset -> reject
+Unknown authorization state -> reject
+Unknown scope -> reject
+DNS resolution failure -> reject
+Unsafe IP -> reject
+Unsafe redirect -> reject
+Unsupported protocol -> reject
+Expired verification -> reject
+Revoked verification -> reject
+Missing project context -> reject
+Missing organization context -> reject
+```
+
+Never fall back to:
+
+```text
+"try scanning anyway"
+```
+
+---
+
+# 61. Do Not Modify Business Logic
+
+This implementation is part of the DAST/security domain.
+
+Do NOT modify unrelated business logic.
+
+Do NOT change:
+
+* billing
+* subscription behavior
+* application domain logic
+* user entitlements
+* unrelated API contracts
+* unrelated UI
+
+unless strictly required for integration.
+
+---
+
+# 62. Performance / Token Efficiency
+
+The LangGraph implementation should be deterministic and cheap.
+
+Do not invoke an LLM for every scan node.
+
+Use normal application code for:
+
+```text
+validation
+authorization
+DNS checks
+scope
+SSRF
+ZAP execution
+database persistence
+state transitions
+```
+
+Use LLM calls only where they provide actual value.
+
+Persist summaries rather than repeatedly sending full scan reports to an LLM.
+
+For large ZAP reports:
+
+```text
+raw report
+    |
+    v
+structured parser
+    |
+    v
+normalized findings
+    |
+    v
+small evidence chunks
+    |
+    v
+LLM enrichment only when required
+```
+
+Never send unnecessary raw application secrets to the LLM.
+
+---
+
+# 63. Recommended LangGraph Separation
+
+Use the following boundaries:
+
+```text
+Graph / Orchestrator
+    |
+    +-- Authorization Service
+    |
+    +-- Asset Service
+    |
+    +-- Verification Service
+    |
+    +-- Scope Engine
+    |
+    +-- SSRF Security Service
+    |
+    +-- Scanner Adapter
+    |
+    +-- Result Parser
+    |
+    +-- Compliance Engine
+    |
+    +-- Audit Service
+    |
+    +-- Persistence
+```
+
+LangGraph coordinates these components.
+
+It should not contain all of their business logic.
+
+---
+
+# 64. Required Deliverables
+
+Implement the following end-to-end:
+
+### Backend
+
+* LangGraph DAST agent.
+* Typed graph state.
+* Checkpointing.
+* Target authorization service.
+* Project asset association.
+* Domain verification.
+* DNS TXT verification.
+* HTTP verification.
+* Scope engine.
+* SSRF protection.
+* Redirect validation.
+* DNS safety validation.
+* ZAP scanner adapter.
+* ZAP Automation Framework plan generation.
+* Dockerized scanner worker.
+* Retry handling.
+* Cancellation.
+* Cleanup.
+* Findings normalization.
+* Compliance evaluation.
+* Audit events.
+* Metrics/logging.
+* Database migrations/models.
+* API endpoints.
+* Comprehensive unit/integration/security tests.
+
+### Frontend
+
+Extend the existing DAST UI with:
+
+* Asset management.
+* Verification UI.
+* Verification state.
+* Ownership method.
+* Scope display.
+* Scan profile selection.
+* Authorization status.
+* Scan state machine.
+* Compliance status.
+* Audit/evidence visibility.
+* Admin controls.
+
+---
+
+# 65. Acceptance Criteria
+
+The implementation is NOT complete until all of the following are true.
+
+### Test 1 — Public Website
+
+User enters:
+
+```text
+https://google.com
+```
+
+Result:
+
+```text
+BLOCKED
+DAST_TARGET_NOT_AUTHORIZED
+```
+
+and:
+
+```text
+NO ZAP CONTAINER STARTED
+```
+
+### Test 2 — Unverified Domain
+
+User enters:
+
+```text
+https://mycompany.example
+```
+
+without verification.
+
+Result:
+
+```text
+BLOCKED
+DAST_DOMAIN_NOT_VERIFIED
+```
+
+### Test 3 — Verified Domain
+
+User verifies the domain using DNS TXT.
+
+Result:
+
+```text
+VERIFIED
+```
+
+Then:
+
+```text
+https://app.mycompany.example
+```
+
+can be scanned if within the configured scope.
+
+### Test 4 — Revocation
+
+Verification is revoked.
+
+Next scan:
+
+```text
+BLOCKED
+```
+
+### Test 5 — Private IP
+
+Target resolves to:
+
+```text
+10.0.0.5
+```
+
+Result:
+
+```text
+BLOCKED
+DAST_PRIVATE_IP_BLOCKED
+```
+
+### Test 6 — Redirect Attack
+
+Approved target redirects to:
+
+```text
+http://127.0.0.1
+```
+
+Result:
+
+```text
+BLOCKED
+DAST_REDIRECT_OUT_OF_SCOPE
+```
+
+### Test 7 — DNS Rebinding
+
+DNS changes from approved public IP to internal IP during execution.
+
+Result:
+
+```text
+BLOCKED
+```
+
+### Test 8 — Successful Scan
+
+Verified target:
+
+```text
+https://authorized-test-app.example.com
+```
+
+Result:
+
+```text
+AUTHORIZED
+ZAP STARTED
+ZAP COMPLETED
+FINDINGS NORMALIZED
+AUDIT TRAIL CREATED
+COMPLIANCE RESULT CREATED
+```
+
+### Test 9 — Worker Crash
+
+Kill the ZAP worker.
+
+Result:
+
+```text
+LangGraph state survives
+scan status becomes recoverable
+retry policy executes
+no duplicate logical scan
+```
+
+### Test 10 — Unauthorized Discovered URL
+
+ZAP discovers:
+
+```text
+https://other-domain.com
+```
+
+Result:
+
+```text
+NOT SCANNED
+```
+
+unless explicitly authorized by the scope policy.
+
+---
+
+# 66. Important Architectural Principle
+
+The final system MUST follow this order:
+
+```text
+IDENTITY
+   ↓
+PROJECT AUTHORIZATION
+   ↓
+ASSET ASSOCIATION
+   ↓
+OWNERSHIP VERIFICATION
+   ↓
+TARGET NORMALIZATION
+   ↓
+SCOPE VALIDATION
+   ↓
+DNS VALIDATION
+   ↓
+SSRF VALIDATION
+   ↓
+EXECUTION-TIME REVALIDATION
+   ↓
+ZAP
+   ↓
+RESULT NORMALIZATION
+   ↓
+COMPLIANCE
+   ↓
+AUDIT EVIDENCE
+```
+
+Never:
+
+```text
+USER URL
+   ↓
+ZAP
+```
+
+---
+
+# 67. Implementation Strategy
+
+Work in this order:
+
+```text
+Phase 1
+Repository discovery and architecture mapping
+
+Phase 2
+Asset + ownership verification
+
+Phase 3
+Target authorization + scope engine
+
+Phase 4
+SSRF and network safety layer
+
+Phase 5
+LangGraph orchestration
+
+Phase 6
+ZAP worker integration
+
+Phase 7
+Result normalization + compliance
+
+Phase 8
+Frontend integration
+
+Phase 9
+Observability + audit
+
+Phase 10
+Security/integration testing
+```
+
+Do not implement a fake/mock DAST flow and call the task complete.
+
+The production path must actually launch ZAP in Docker.
+
+---
+
+# 68. Cursor Execution Rules
+
+While implementing:
+
+1. Inspect before modifying.
+2. Reuse existing infrastructure.
+3. Make incremental changes.
+4. Keep security controls centralized.
+5. Do not duplicate authorization logic.
+6. Add tests alongside each security component.
+7. Run the repository's existing test/lint/type-check/build commands.
+8. Run Docker/ZAP integration tests where available.
+9. Fix regressions before proceeding.
+10. Do not remove existing DAST features.
+11. Do not weaken security to make tests pass.
+12. Do not add an authorization bypass for development convenience.
+
+At the end, provide a concise implementation summary containing:
+
+```text
+Files changed
+New services/classes
+New database migrations
+New API endpoints
+New UI components
+New Docker components
+New LangGraph nodes
+Security controls implemented
+Tests added
+Known limitations
+Environment variables required
+How to run the DAST worker locally
+How to execute a verified end-to-end scan
+```
+
+---
+
+# 69. Final Security Requirement
+
+Treat the DAST agent itself as a high-risk security component because it performs controlled outbound security testing on behalf of users.
+
+The platform MUST assume that a malicious user will attempt to:
+
+```text
+scan unrelated public websites
+scan internal IPs
+scan cloud metadata
+use DNS rebinding
+abuse redirects
+bypass domain verification
+use subdomain confusion
+use alternate IP representations
+abuse Unicode/IDN hostname parsing
+trigger scanner SSRF
+escape configured scope
+reuse expired verification
+race revocation
+inject malicious scanner configuration
+abuse scan concurrency
+cause resource exhaustion
+```
+
+Design and test specifically against these threats.
+
+The implementation should be **fail-closed, auditable, resumable, isolated, and compliance-ready**.
+
+Do not consider the feature complete until the security controls are enforced server-side and the negative tests demonstrate that unauthorized targets never reach ZAP.

@@ -63,6 +63,7 @@ services:
       args:
         NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:?Set NEXT_PUBLIC_APP_URL in deploy/.env}
         NEXT_PUBLIC_AGENTIC_WS_URL: ${NEXT_PUBLIC_AGENTIC_WS_URL:?Set NEXT_PUBLIC_AGENTIC_WS_URL in deploy/.env}
+        NEXT_PUBLIC_BILLING_ENFORCEMENT: ${NEXT_PUBLIC_BILLING_ENFORCEMENT:-false}
     restart: unless-stopped
     env_file:
       - ./deploy/.env
@@ -77,8 +78,12 @@ services:
       AGENTIC_LAYER_URL: http://agentic-layer:8000
       CUSTOMIZATION_AGENT_BASE_URL: http://customization:8010
       CUSTOMIZATION_BACKEND_URL: http://customization:8010
+      DEPLAI_AI_GATEWAY_URL: http://connector:3000
+      AI_PLATFORM_ENABLED: ${AI_PLATFORM_ENABLED:-true}
+      BILLING_ENFORCEMENT: ${BILLING_ENFORCEMENT:-false}
+      NEXT_PUBLIC_BILLING_ENFORCEMENT: ${NEXT_PUBLIC_BILLING_ENFORCEMENT:-false}
     # Keep the Connector private. Caddy is the sole public ingress and also
-    # proxies browser WebSockets to the Agentic Layer at /agentic.
+    # proxies authenticated browser WebSockets to Agentic at /agentic/ws/*.
     expose:
       - "3000"
     volumes:
@@ -91,6 +96,12 @@ services:
         condition: service_healthy
       customization:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
 
   agentic-layer:
     build:
@@ -101,9 +112,11 @@ services:
       - ./deploy/.env
     environment:
       APP_ENV: production
+      DAST_ALLOW_HTTP: "false"
       DEPLAI_LOCAL_PROJECTS_ROOT: /local-projects
       DEPLAI_GITHUB_REPOS_ROOT: /repos
       IAC_WORKSPACE_ROOT: /workspace/iac-workspaces
+      DEPLAI_AI_GATEWAY_URL: http://connector:3000
     expose:
       - "8000"
     # The current scanner, remediation, and Terraform implementations create
@@ -128,6 +141,12 @@ services:
     depends_on:
       connector:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
 
   customization:
     build:
@@ -140,6 +159,7 @@ services:
       APP_ENV: production
       CUSTOMIZATION_PREVIEW_HOST: 127.0.0.1
       CUSTOMIZATION_PREVIEW_AUTO_INSTALL: "0"
+      DEPLAI_AI_GATEWAY_URL: http://connector:3000
     expose:
       - "8010"
     volumes:

@@ -423,14 +423,7 @@ class TerraformDynamicPipelineTests(unittest.TestCase):
                         "unresolved_dependencies": [],
                         "summary": "root generated",
                     }
-                return {
-                    "group_id": "compute",
-                    "files": [
-                        {"path": "terraform/modules/compute/main.tf", "role": "module", "content": 'resource "aws_ecs_cluster" "main" { name = "demo" }\n', "references": [], "exports": ["aws_ecs_cluster.main"]},
-                    ],
-                    "unresolved_dependencies": [],
-                    "summary": "compute generated",
-                }
+                raise AssertionError("module groups must not be rewritten by the LLM worker")
             if stage == "terraform_validation":
                 return {
                     "approved": True,
@@ -545,24 +538,9 @@ class TerraformDynamicPipelineTests(unittest.TestCase):
                 }
             if stage == "terraform_file_generation":
                 group_id = kwargs["prompt_payload"]["current_group"]["id"]
-                if group_id == "root":
-                    return {
-                        "group_id": "root",
-                        "files": [
-                            {"path": "README.md", "role": "readme", "content": "# demo\n", "references": [], "exports": []},
-                            {"path": "terraform/versions.tf", "role": "versions", "content": "terraform {}\n", "references": [], "exports": []},
-                            {"path": "terraform/providers.tf", "role": "provider", "content": 'provider "aws" {}\n', "references": [], "exports": []},
-                            {"path": "terraform/backend.tf", "role": "backend", "content": "terraform {}\n", "references": [], "exports": []},
-                            {"path": "terraform/locals.tf", "role": "locals", "content": "locals {}\n", "references": [], "exports": []},
-                            {"path": "terraform/variables.tf", "role": "variables", "content": 'variable "project_name" { type = string }\n', "references": [], "exports": []},
-                            {"path": "terraform/main.tf", "role": "root", "content": 'module "compute" { source = "./modules/compute" }\n', "references": ["module.compute"], "exports": []},
-                            {"path": "terraform/terraform.tfvars", "role": "tfvars", "content": 'project_name = "demo"\n', "references": [], "exports": []},
-                            {"path": "terraform/outputs.tf", "role": "outputs", "content": 'output "alb_dns_name" { value = null }\n', "references": [], "exports": ["output.alb_dns_name"]},
-                        ],
-                        "unresolved_dependencies": [],
-                        "summary": "root generated",
-                    }
-                raise RuntimeError("compute worker failed")
+                if group_id in {"compute", "networking", "iam", "data", "storage"}:
+                    raise AssertionError("module groups must not be rewritten by the LLM worker")
+                raise RuntimeError("root worker failed")
             if stage == "terraform_validation":
                 return {
                     "approved": True,
@@ -652,6 +630,9 @@ class TerraformDynamicPipelineTests(unittest.TestCase):
         versions_tf = by_path.get("terraform/versions.tf", "")
         providers_tf = by_path.get("terraform/providers.tf", "")
         self.assertFalse('provider "aws"' in versions_tf and 'provider "aws"' in providers_tf)
+        self.assertIn("var.aws_region", providers_tf)
+        self.assertNotRegex(providers_tf, r"\bvar\.region\b")
+        self.assertRegex(by_path.get("terraform/variables.tf", ""), r'variable\s+"aws_region"\s*\{')
 
         for path, content in by_path.items():
             if not path.endswith(".tf"):

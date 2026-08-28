@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { DeplaiLogo } from '@/components/deplai-logo';
 import { SEVERITY_CFG } from './data';
 import type { FileNodeData, PipelineProject, Severity, Stage } from './types';
 
@@ -21,10 +22,6 @@ export function colorize(code: string) {
 
 export const GlobalStyles = () => (
   <style>{`
-    .custom-scrollbar::-webkit-scrollbar { width: 5px; height: 5px; }
-    .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-    .custom-scrollbar::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
-    .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #52525b; }
     .fade-in { animation: fadeIn 0.18s ease; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
     .pulse-dot { animation: pulseDot 1.4s ease-in-out infinite; }
@@ -214,12 +211,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     <aside className="w-72 shrink-0 bg-[#09090b] border-r border-white/5 flex flex-col overflow-hidden">
       <div className="px-4 py-4 border-b border-white/5">
         <button onClick={onBackToDashboard} className="mb-4 flex items-center gap-2.5 text-left hover:opacity-90 transition-opacity">
-          <div className="w-7 h-7 rounded-lg bg-cyan-500/15 border border-cyan-500/25 flex items-center justify-center">
-            <svg viewBox="0 0 28 28" className="w-4 h-4" fill="none">
-              <polygon points="14,2 25,8 25,20 14,26 3,20 3,8" stroke="#06b6d4" strokeWidth="1.5" />
-              <circle cx="14" cy="14" r="3" fill="#06b6d4" />
-            </svg>
-          </div>
+          <DeplaiLogo showWordmark={false} size={28} />
           <div>
             <p className="text-sm font-semibold text-zinc-100 leading-none">DeplAI</p>
             <p className="text-[10px] text-zinc-500 mt-0.5">Enterprise Pipeline</p>

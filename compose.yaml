@@ -55,8 +55,26 @@ services:
       DEPLAI_SERVICE_KEY: local-only-service-key-change-before-production
       WS_TOKEN_SECRET: local-only-websocket-secret-change-before-production
       SESSION_SECRET: local-only-session-secret-change-before-production
-      ADMIN_EMAILS: admin@local.test
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-admin@local.test}
       ADMIN_ACCESS_KEY: local-only-admin-key-change-before-production
+      BILLING_ENFORCEMENT: ${BILLING_ENFORCEMENT:-false}
+      NEXT_PUBLIC_BILLING_ENFORCEMENT: ${NEXT_PUBLIC_BILLING_ENFORCEMENT:-false}
+      AI_PLATFORM_ENABLED: ${AI_PLATFORM_ENABLED:-true}
+      AI_CREDENTIAL_ENCRYPTION_KEY: ${AI_CREDENTIAL_ENCRYPTION_KEY:-local-only-session-secret-change-before-production}
+      DEPLAI_AI_GATEWAY_URL: http://connector:3000
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_API_KEY: ${CLAUDE_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      KIMI_API_KEY: ${KIMI_API_KEY:-}
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
+      GLM_API_KEY: ${GLM_API_KEY:-}
+      ZAI_API_KEY: ${ZAI_API_KEY:-}
       # Dummy values let the UI start. Replace all GitHub variables to enable
       # sign-in, GitHub App installation, cloning, and PR creation locally.
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-local-client-id}
@@ -67,8 +85,8 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - github_repos:/app/tmp/repos
-      - local_projects:/app/tmp/local-projects
+      - ./Connector/tmp/repos:/app/tmp/repos
+      - ./Connector/tmp/local-projects:/app/tmp/local-projects
     depends_on:
       mysql:
         condition: service_healthy
@@ -87,16 +105,31 @@ services:
       DEPLAI_SERVICE_KEY: local-only-service-key-change-before-production
       WS_TOKEN_SECRET: local-only-websocket-secret-change-before-production
       CORS_ORIGINS: http://localhost:3000
+      DEPLAI_AI_GATEWAY_URL: http://connector:3000
+      AI_PLATFORM_ENABLED: ${AI_PLATFORM_ENABLED:-true}
       DEPLAI_LOCAL_PROJECTS_ROOT: /local-projects
       DEPLAI_GITHUB_REPOS_ROOT: /repos
       IAC_WORKSPACE_ROOT: /workspace/iac-workspaces
       ALLOW_GLOBAL_CLEANUP: "false"
     ports:
       - "8000:8000"
+    command:
+      [
+        "uvicorn",
+        "main:app",
+        "--reload",
+        "--reload-dir",
+        "/workspace/Agentic Layer",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
     volumes:
+      - "./Agentic Layer:/workspace/Agentic Layer"
       - /var/run/docker.sock:/var/run/docker.sock
-      - local_projects:/local-projects:ro
-      - github_repos:/repos:ro
+      - ./Connector/tmp/local-projects:/local-projects:ro
+      - ./Connector/tmp/repos:/repos:ro
       - agentic_runtime:/workspace/runtime
       - iac_workspaces:/workspace/iac-workspaces
       - codebase_deplai:/var/lib/deplai/codebase:ro
@@ -110,15 +143,24 @@ services:
       context: .
       dockerfile: Customization Agent/tenant_builder_app/backend/Dockerfile
     restart: unless-stopped
+    # Local-only: root can install preview dependencies into the bind-mounted
+    # Connector clone tree. Production compose keeps the non-root user.
+    user: "0:0"
     environment:
       APP_ENV: development
       CUSTOMIZATION_PREVIEW_HOST: 127.0.0.1
-      CUSTOMIZATION_PREVIEW_AUTO_INSTALL: "0"
+      CUSTOMIZATION_PREVIEW_AUTO_INSTALL: "1"
+      DEPLAI_AI_GATEWAY_URL: http://connector:3000
+      AI_PLATFORM_ENABLED: ${AI_PLATFORM_ENABLED:-true}
+      DEPLAI_SERVICE_KEY: local-only-service-key-change-before-production
+    ports:
+      - "8010:8010"
     volumes:
-      - github_repos:/app/tmp/repos
-      - local_projects:/app/tmp/local-projects
+      - ./Connector/tmp/repos:/app/tmp/repos
+      - ./Connector/tmp/local-projects:/app/tmp/local-projects
       - customization_state:/app/tenant_builder_app/backend/tenants
       - customization_logs:/app/tenant_builder_app/backend/logs
+      - "./Customization Agent/tenant_builder_app/backend:/app/tenant_builder_app/backend"
 
 volumes:
   mysql_data:

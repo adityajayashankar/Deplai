@@ -8,8 +8,25 @@ from typing import Any
 
 from deployment_packager import DeploymentPackage
 
-
-PROVIDER_VERSION = "~> 5.54"
+try:
+    from terraform_agent.agent.internal_registry import get_module, load_catalog
+    _EC2_MODULE = get_module("ec2_instance")
+    EC2_MODULE_SOURCE = str(_EC2_MODULE.get("source") or "terraform-aws-modules/ec2-instance/aws")
+    EC2_MODULE_VERSION = str(_EC2_MODULE.get("version") or "5.8.0")
+    PROVIDER_VERSION = str((load_catalog().get("provider") or {}).get("constraint") or "~> 5.100.0")
+    TERRAFORM_REQUIRED_VERSION = str(
+        (load_catalog().get("terraform") or {}).get("required_version") or ">= 1.6.0, < 1.12.0"
+    )
+except Exception:
+    EC2_MODULE_SOURCE = "terraform-aws-modules/ec2-instance/aws"
+    EC2_MODULE_VERSION = "5.8.0"
+    PROVIDER_VERSION = "~> 5.100.0"
+    TERRAFORM_REQUIRED_VERSION = ">= 1.6.0, < 1.12.0"
+# The builder and CLI version are part of the certified executor registry.  A
+# manifest can select the buildpack executor, but cannot supply an arbitrary
+# builder image or a remote shell script.
+CERTIFIED_BUILDPACK_BUILDER = "paketobuildpacks/builder-jammy-base@sha256:5799343cd316c1a03fa3ff7ab0915d9e6d134e95df4583016d70c6f5330d3898"
+CERTIFIED_PACK_VERSION = "0.35.1"
 
 
 def _hcl_string(value: Any) -> str:
@@ -86,8 +103,11 @@ def _ec2_config_from_source(source: dict[str, Any] | None) -> dict[str, Any]:
 def _ec2_settings(
     user_answers: dict[str, Any] | None,
     deployment_profile: dict[str, Any] | None,
+    *,
+    app_kind: str = "",
+    start_command: str = "",
+    app_port: int | None = None,
 ) -> dict[str, Any]:
-    allowed = {"t3.micro", "t3.small", "t3.medium", "t3.large"}
     profile = deployment_profile or {}
     decision = _record(profile.get("consultant_decision"))
     stack_config = _record(decision.get("stack_config"))
@@ -95,22 +115,34 @@ def _ec2_settings(
         **_record(stack_config.get("ec2-instance")),
         **_record(stack_config.get("ec2")),
     }
-    merged = {
-        "instance_type": "t3.micro",
-        "root_volume_size_gb": 35,
-        "app_port": 3000,
-        "ssh_ingress_cidr_blocks": [],
+    merged_access = {
         **_ec2_config_from_source(user_answers),
         **decision_ec2,
     }
-    instance_type = str(merged.get("instance_type") or "").strip().lower()
-    if instance_type not in allowed:
+    try:
+        from terraform_agent.agent.internal_registry import select_allowlisted_edits
+
+        agent_ec2 = select_allowlisted_edits(
+            profile,
+            app_bootstrap={
+                "app_kind": app_kind,
+                "start_command": start_command,
+                "app_port": app_port,
+            },
+        ).get("ec2_instance") or {}
+    except Exception:
+        agent_ec2 = {}
+    instance_type = str(agent_ec2.get("instance_type") or "t3.micro").strip().lower()
+    if instance_type not in {"t3.micro", "t3.small", "t3.medium", "t3.large"}:
         instance_type = "t3.micro"
+    port = _int(agent_ec2.get("app_port") or merged_access.get("app_port"), 3000, minimum=1, maximum=65535)
+    if port in {5432, 3306, 6379, 27017, 1433, 1521}:
+        port = 3000
     return {
         "instance_type": instance_type,
-        "root_volume_size_gb": _int(merged.get("root_volume_size_gb"), 35, minimum=20, maximum=200),
-        "app_port": _int(merged.get("app_port"), 3000, minimum=1, maximum=65535),
-        "ssh_ingress_cidr_blocks": _cidr_list(merged.get("ssh_ingress_cidr_blocks")),
+        "root_volume_size_gb": _int(agent_ec2.get("root_volume_size_gb"), 35, minimum=20, maximum=200),
+        "app_port": port,
+        "ssh_ingress_cidr_blocks": _cidr_list(merged_access.get("ssh_ingress_cidr_blocks")),
     }
 
 
@@ -135,6 +167,15 @@ def _data_layer_item(deployment_profile: dict[str, Any] | None, kinds: set[str])
     return {}
 
 
+def _agent_data_edits(deployment_profile: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    try:
+        from terraform_agent.agent.internal_registry import select_allowlisted_edits
+
+        return select_allowlisted_edits(deployment_profile or {})
+    except Exception:
+        return {}
+
+
 def _database_settings(deployment_profile: dict[str, Any] | None) -> dict[str, Any]:
     config = {**_data_layer_item(deployment_profile, {"postgres", "postgresql", "mysql", "mariadb"}), **_component_config(deployment_profile, "rds")}
     if not config:
@@ -144,13 +185,14 @@ def _database_settings(deployment_profile: dict[str, Any] | None) -> dict[str, A
         engine = "postgres"
     if engine not in {"postgres", "mysql", "mariadb"}:
         engine = "postgres"
+    rds = (_agent_data_edits(deployment_profile).get("rds") or {})
     return {
         "enabled": True,
-        "engine": engine,
-        "engine_version": str(config.get("engine_version") or "").strip(),
-        "instance_class": str(config.get("instance_class") or "db.t3.micro").strip(),
-        "allocated_storage": _int(config.get("storage_gb"), 20, minimum=20, maximum=200),
-        "multi_az": _bool(config.get("multi_az"), False),
+        "engine": str(rds.get("engine") or engine),
+        "engine_version": str(rds.get("engine_version") or "").strip(),
+        "instance_class": str(rds.get("instance_class") or "db.t4g.micro").strip(),
+        "allocated_storage": _int(rds.get("allocated_storage"), 20, minimum=20, maximum=200),
+        "multi_az": _bool(rds.get("multi_az"), False),
         "backup_retention_period": _int(config.get("backup_retention_period") or config.get("backup_retention_days"), 7, minimum=0, maximum=35),
         "deletion_protection": _bool(config.get("deletion_protection"), False),
     }
@@ -160,10 +202,11 @@ def _redis_settings(deployment_profile: dict[str, Any] | None) -> dict[str, Any]
     config = {**_data_layer_item(deployment_profile, {"redis", "elasticache"}), **_component_config(deployment_profile, "elasticache")}
     if not config:
         return {"enabled": False}
+    cache = (_agent_data_edits(deployment_profile).get("elasticache") or {})
     return {
         "enabled": True,
-        "node_type": str(config.get("node_type") or "cache.t4g.micro").strip(),
-        "engine_version": str(config.get("engine_version") or "").strip(),
+        "node_type": str(cache.get("node_type") or "cache.t4g.micro").strip(),
+        "engine_version": str(cache.get("engine_version") or "7.0").strip(),
     }
 
 
@@ -234,9 +277,19 @@ def render_ec2_app_bundle(
 ) -> dict[str, Any]:
     project_slug = _safe_slug(project_name)
     environment = str((deployment_profile or {}).get("environment") or "production").strip().lower() or "production"
-    ec2_settings = _ec2_settings(user_answers, deployment_profile)
+    ec2_settings = _ec2_settings(
+        user_answers,
+        deployment_profile,
+        app_kind=str(deployment_package.app_kind or ""),
+        start_command=str(deployment_package.start_command or ""),
+        app_port=int(deployment_package.app_port or 3000),
+    )
     instance_type = str(ec2_settings["instance_type"])
     app_port = int(ec2_settings["app_port"])
+    # Preserve the legacy profile default (3000), but prefer an explicit
+    # manifest/Docker EXPOSE port when the profile did not choose another one.
+    if app_port == 3000 and int(deployment_package.app_port or 3000) != 3000:
+        app_port = int(deployment_package.app_port)
     root_volume_size_gb = int(ec2_settings["root_volume_size_gb"])
     try:
         from runtime_catalog import get_runtime_recipe
@@ -261,7 +314,7 @@ def render_ec2_app_bundle(
             "enabled": True,
             "engine": repo_db.engine or "postgres",
             "engine_version": "",
-            "instance_class": "db.t3.micro",
+            "instance_class": str((_agent_data_edits(deployment_profile).get("rds") or {}).get("instance_class") or "db.t4g.micro"),
             "allocated_storage": 20,
             "multi_az": False,
             "backup_retention_period": 7,
@@ -277,6 +330,10 @@ def render_ec2_app_bundle(
     jwt_secret = _hashlib.sha256(f"deplai-jwt-{project_slug}".encode()).hexdigest()
 
     app_env_vars = _build_app_env_vars(deployment_package, database)
+    for item in deployment_package.environment:
+        key, _, value = str(item).partition("=")
+        if key and key not in {"PORT", "DATABASE_URL", "DB_PASSWORD"}:
+            app_env_vars.setdefault(key, value)
     # Bootstrap-only non-secret defaults. Operator OAuth/API secrets come from
     # AWS Secrets Manager at boot — never embed plaintext into HCL/userdata.
     app_env_vars.setdefault("JWT_SECRET", jwt_secret)
@@ -333,7 +390,7 @@ def render_ec2_app_bundle(
 '''
 
     providers_tf = f'''terraform {{
-  required_version = ">= 1.5.0"
+  required_version = "{TERRAFORM_REQUIRED_VERSION}"
   required_providers {{
     aws = {{
       source  = "hashicorp/aws"
@@ -385,6 +442,33 @@ variable "instance_type" {{
 variable "app_kind" {{
   type    = string
   default = {_hcl_string(deployment_package.app_kind)}
+}}
+
+variable "deployment_strategy" {{
+  type    = string
+  default = {_hcl_string(deployment_package.strategy)}
+  validation {{
+    condition     = contains(["docker", "buildpack", "cloud_init"], var.deployment_strategy)
+    error_message = "deployment_strategy must be a certified DeplAI executor."
+  }}
+}}
+
+variable "buildpack_builder" {{
+  type    = string
+  default = {_hcl_string(CERTIFIED_BUILDPACK_BUILDER)}
+  validation {{
+    condition     = var.buildpack_builder == {_hcl_string(CERTIFIED_BUILDPACK_BUILDER)}
+    error_message = "buildpack_builder must use the certified DeplAI builder."
+  }}
+}}
+
+variable "buildpack_pack_version" {{
+  type    = string
+  default = {_hcl_string(CERTIFIED_PACK_VERSION)}
+  validation {{
+    condition     = var.buildpack_pack_version == {_hcl_string(CERTIFIED_PACK_VERSION)}
+    error_message = "buildpack_pack_version must use the certified DeplAI pack CLI."
+  }}
 }}
 
 variable "app_port" {{
@@ -457,8 +541,9 @@ variable "ssh_ingress_cidr_blocks" {{
 }}
 
 variable "use_default_vpc" {{
-  type    = bool
-  default = true
+  type        = bool
+  default     = true
+  description = "Prefer the account default VPC when one exists. If the region has no default VPC, a dedicated VPC is created automatically."
 }}
 
 variable "enable_ec2" {{
@@ -469,6 +554,12 @@ variable "enable_ec2" {{
 variable "existing_ec2_key_pair_name" {{
   type    = string
   default = ""
+}}
+
+variable "ec2_key_rotation" {{
+  type        = string
+  default     = "init"
+  description = "Unique suffix so each deploy mints a new EC2 key pair. AWS never stores the private half."
 }}
 
 variable "enable_rds" {{
@@ -575,6 +666,9 @@ aws_region = {_hcl_string(aws_region)}
 environment = {_hcl_string(environment)}
 instance_type = {_hcl_string(instance_type)}
 app_kind = {_hcl_string(deployment_package.app_kind)}
+deployment_strategy = {_hcl_string(deployment_package.strategy)}
+buildpack_builder = {_hcl_string(CERTIFIED_BUILDPACK_BUILDER)}
+buildpack_pack_version = {_hcl_string(CERTIFIED_PACK_VERSION)}
 app_port = {app_port}
 health_path = {_hcl_string(deployment_package.health_path)}
 build_command = {_hcl_string(deployment_package.build_command)}
@@ -589,6 +683,7 @@ ssh_ingress_cidr_blocks = {_hcl_string_list(ssh_ingress_cidr_blocks)}
 use_default_vpc = true
 enable_ec2 = true
 existing_ec2_key_pair_name = ""
+ec2_key_rotation = "init"
 app_archive_base64 = {_hcl_string(deployment_package.package_base64)}
 root_volume_size_gb = {root_volume_size_gb}
 enable_rds = {str(bool(database["enabled"])).lower()}
@@ -635,13 +730,25 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
+data "aws_vpcs" "default" {
+  filter {
+    name   = "isDefault"
+    values = ["true"]
+  }
+}
+
+locals {
+  prefer_default_vpc = var.use_default_vpc
+  has_default_vpc    = local.prefer_default_vpc && length(data.aws_vpcs.default.ids) > 0
+}
+
 data "aws_vpc" "default" {
-  count   = var.use_default_vpc ? 1 : 0
-  default = true
+  count = local.has_default_vpc ? 1 : 0
+  id    = data.aws_vpcs.default.ids[0]
 }
 
 data "aws_subnets" "default" {
-  count = var.use_default_vpc ? 1 : 0
+  count = local.has_default_vpc ? 1 : 0
   filter {
     name   = "vpc-id"
     values = [data.aws_vpc.default[0].id]
@@ -649,7 +756,7 @@ data "aws_subnets" "default" {
 }
 
 resource "aws_vpc" "main" {
-  count                = var.use_default_vpc ? 0 : 1
+  count                = local.has_default_vpc ? 0 : 1
   cidr_block           = "10.52.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -657,13 +764,13 @@ resource "aws_vpc" "main" {
 }
 
 resource "aws_internet_gateway" "main" {
-  count  = var.use_default_vpc ? 0 : 1
+  count  = local.has_default_vpc ? 0 : 1
   vpc_id = aws_vpc.main[0].id
   tags   = merge(local.tags, { Name = "${var.project_name}-igw" })
 }
 
 resource "aws_subnet" "public" {
-  count                   = var.use_default_vpc ? 0 : 1
+  count                   = local.has_default_vpc ? 0 : 1
   vpc_id                  = aws_vpc.main[0].id
   cidr_block              = "10.52.1.0/24"
   availability_zone       = data.aws_availability_zones.available.names[0]
@@ -672,27 +779,27 @@ resource "aws_subnet" "public" {
 }
 
 resource "aws_route_table" "public" {
-  count  = var.use_default_vpc ? 0 : 1
+  count  = local.has_default_vpc ? 0 : 1
   vpc_id = aws_vpc.main[0].id
   tags   = merge(local.tags, { Name = "${var.project_name}-public-rt" })
 }
 
 resource "aws_route" "internet_access" {
-  count                  = var.use_default_vpc ? 0 : 1
+  count                  = local.has_default_vpc ? 0 : 1
   route_table_id         = aws_route_table.public[0].id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = aws_internet_gateway.main[0].id
 }
 
 resource "aws_route_table_association" "public" {
-  count          = var.use_default_vpc ? 0 : 1
+  count          = local.has_default_vpc ? 0 : 1
   subnet_id      = aws_subnet.public[0].id
   route_table_id = aws_route_table.public[0].id
 }
 
 locals {
-  selected_vpc_id     = var.use_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
-  selected_subnet_ids = var.use_default_vpc ? data.aws_subnets.default[0].ids : aws_subnet.public[*].id
+  selected_vpc_id     = local.has_default_vpc ? data.aws_vpc.default[0].id : aws_vpc.main[0].id
+  selected_subnet_ids = local.has_default_vpc ? data.aws_subnets.default[0].ids : aws_subnet.public[*].id
   selected_subnet_id  = local.selected_subnet_ids[0]
 }
 
@@ -885,29 +992,29 @@ resource "aws_elasticache_cluster" "app" {
 resource "random_id" "key_suffix" {
   byte_length = 4
   keepers = {
-    project_name = var.project_name
+    project_name     = var.project_name
+    ec2_key_rotation = var.ec2_key_rotation
   }
 }
 
 resource "tls_private_key" "generated" {
-  count     = var.enable_ec2 && trimspace(var.existing_ec2_key_pair_name) == "" ? 1 : 0
+  count     = var.enable_ec2 ? 1 : 0
   algorithm = "RSA"
   rsa_bits  = 4096
 }
 
 resource "aws_key_pair" "generated" {
-  count      = var.enable_ec2 && trimspace(var.existing_ec2_key_pair_name) == "" ? 1 : 0
-  key_name   = "${var.project_name}-${random_id.key_suffix.hex}"
+  count      = var.enable_ec2 ? 1 : 0
+  key_name   = "${var.project_name}-${var.ec2_key_rotation}-${random_id.key_suffix.hex}"
   public_key = tls_private_key.generated[0].public_key_openssh
-  tags       = local.tags
+  tags = merge(local.tags, {
+    Name             = "${var.project_name}-${var.ec2_key_rotation}-${random_id.key_suffix.hex}"
+    "deplai:managed" = "true"
+  })
 }
 
 locals {
-  selected_key_name = !var.enable_ec2 ? null : (
-    trimspace(var.existing_ec2_key_pair_name) != ""
-    ? trimspace(var.existing_ec2_key_pair_name)
-    : try(aws_key_pair.generated[0].key_name, null)
-  )
+  selected_key_name = var.enable_ec2 ? try(aws_key_pair.generated[0].key_name, null) : null
 }
 
 data "aws_ami" "al2023" {
@@ -955,6 +1062,17 @@ resource "aws_iam_role_policy" "ec2_logs" {
         Resource = "*"
       },
       {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:DescribeImages"
+        ]
+        Resource = "*"
+      },
+      {
         # ListSecrets cannot be resource-scoped; Get/Describe are limited to this app prefix.
         Effect = "Allow"
         Action = [
@@ -981,8 +1099,43 @@ resource "aws_iam_instance_profile" "ec2" {
   role        = aws_iam_role.ec2.name
 }
 
-resource "aws_instance" "app" {
-  count                       = var.enable_ec2 ? 1 : 0
+# Certified, versioned verification command. It has no command-text
+# parameter: callers can verify a deployment but cannot turn SSM into a live
+# terminal.
+resource "aws_iam_role_policy_attachment" "ec2_ssm_core" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_ssm_document" "deployment_verify" {
+  name            = "${var.project_name}-deployment-verify"
+  document_type   = "Command"
+  document_format = "JSON"
+  content = jsonencode({
+    schemaVersion = "2.2"
+    description   = "DeplAI certified deployment health verification; no free-text shell commands are accepted."
+    mainSteps = [{
+      action = "aws:runShellScript"
+      name   = "verifyBootstrapHealth"
+      inputs = {
+        runCommand = [
+          "set -euo pipefail",
+          "STATUS_FILE=/var/log/deplai-bootstrap-status.json",
+          "test -s $STATUS_FILE",
+          "grep -Eq ready $STATUS_FILE",
+          "curl --fail --silent --show-error http://127.0.0.1:${var.app_port}${var.health_path} || curl --fail --silent --show-error http://127.0.0.1/"
+        ]
+      }
+    }]
+  })
+}
+
+module "ec2" {
+  count  = var.enable_ec2 ? 1 : 0
+  source  = "terraform-aws-modules/ec2-instance/aws"
+  version = "5.8.0"
+
+  name                        = var.project_name
   ami                         = data.aws_ami.al2023.id
   instance_type               = var.instance_type
   subnet_id                   = local.selected_subnet_id
@@ -990,9 +1143,11 @@ resource "aws_instance" "app" {
   key_name                    = local.selected_key_name
   iam_instance_profile        = aws_iam_instance_profile.ec2.name
   associate_public_ip_address = true
+  user_data_replace_on_change = true
 
   user_data_base64 = base64encode(<<-USERDATA
 #!/bin/bash
+# deplai_key_rotation=${var.ec2_key_rotation}
 set -euxo pipefail
 exec > >(tee -a /var/log/deplai-bootstrap.log) 2>&1
 
@@ -1006,6 +1161,9 @@ fi
 APP_NAME="${var.project_name}-frontend"
 APP_PORT="${var.app_port}"
 APP_KIND="${var.app_kind}"
+DEPLOYMENT_STRATEGY="${var.deployment_strategy}"
+BUILDPACK_BUILDER="${var.buildpack_builder}"
+BUILDPACK_PACK_VERSION="${var.buildpack_pack_version}"
 REPOSITORY_URL=${jsonencode(var.repository_url)}
 BUILD_COMMAND=${jsonencode(var.build_command)}
 START_COMMAND=${jsonencode(var.start_command)}
@@ -1018,13 +1176,12 @@ write_status() {
 
 write_status "starting"
 
-dnf update -y
 dnf install -y git nginx tar gzip cloud-utils-growpart xfsprogs
 growpart /dev/nvme0n1 1 || true
 xfs_growfs -d / || resize2fs /dev/nvme0n1p1 || true
 df -h || true
 
-if [ "$APP_KIND" = "node" ]; then
+if [ "$APP_KIND" = "node" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ]; then
   dnf install -y nodejs npm
   swapoff /swapfile || true
   rm -f /swapfile
@@ -1034,38 +1191,38 @@ if [ "$APP_KIND" = "node" ]; then
   swapon /swapfile
   grep -q '^/swapfile ' /etc/fstab || echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
 fi
-if [ "$APP_KIND" = "python" ]; then
+if [ "$APP_KIND" = "python" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ]; then
   dnf install -y python3 python3-pip
 fi
-if [ "$APP_KIND" = "go" ]; then
+if [ "$APP_KIND" = "go" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ]; then
   dnf install -y golang
 fi
-if [ "$APP_KIND" = "java" ]; then
+if [ "$APP_KIND" = "java" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ]; then
   dnf install -y java-17-amazon-corretto-devel maven
 fi
-if [ "$APP_KIND" = "dotnet" ]; then
+if [ "$APP_KIND" = "dotnet" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ]; then
   rpm --import https://packages.microsoft.com/keys/microsoft.asc || true
   curl -fsSL -o /tmp/packages-microsoft-prod.rpm https://packages.microsoft.com/config/centos/7/packages-microsoft-prod.rpm || true
   rpm -Uvh /tmp/packages-microsoft-prod.rpm || true
   dnf install -y dotnet-sdk-8.0 || dnf install -y dotnet-sdk-6.0 || true
 fi
-if [ "$APP_KIND" = "php" ]; then
+if [ "$APP_KIND" = "php" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ]; then
   dnf install -y php php-cli php-fpm php-mbstring php-xml php-mysqlnd unzip
   if ! command -v composer >/dev/null 2>&1; then
     curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
   fi
 fi
-if [ "$APP_KIND" = "ruby" ]; then
+if [ "$APP_KIND" = "ruby" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ]; then
   dnf install -y ruby ruby-devel gcc make redhat-rpm-config
   gem install bundler --no-document || true
 fi
-if [ "$APP_KIND" = "rust" ]; then
+if [ "$APP_KIND" = "rust" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ]; then
   if ! command -v cargo >/dev/null 2>&1; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
     . "$HOME/.cargo/env"
   fi
 fi
-if [ "$APP_KIND" = "docker" ]; then
+if [ "$APP_KIND" = "docker" ] || [ "$DEPLOYMENT_STRATEGY" = "buildpack" ]; then
   dnf install -y docker
   systemctl enable --now docker
   usermod -aG docker ec2-user || true
@@ -1078,6 +1235,16 @@ if [ "$APP_KIND" = "docker" ]; then
   docker version
   docker compose version || true
   write_status "docker_engine_ready"
+fi
+if [ "$DEPLOYMENT_STRATEGY" = "buildpack" ]; then
+  PACK_VERSION="$BUILDPACK_PACK_VERSION"
+  curl --fail --location --retry 3 \
+    "https://github.com/buildpacks/pack/releases/download/v$PACK_VERSION/pack-v$PACK_VERSION-linux.tgz" \
+    -o /tmp/deplai-pack.tgz
+  tar -xzf /tmp/deplai-pack.tgz -C /usr/local/bin pack
+  chmod 0755 /usr/local/bin/pack
+  pack --version
+  write_status "buildpack_executor_ready"
 fi
 write_status "runtime_packages_installed"
 
@@ -1119,7 +1286,40 @@ else
 fi
 
 cd "$APP_DIR"
-if [ "$APP_KIND" = "node" ]; then
+SKIP_NODE_BUILD=0
+WORKSPACE=0
+WEB_DIR=""
+API_DIR=""
+for rel in frontend web client; do
+  if [ -f "$APP_ROOT/$rel/package.json" ]; then WEB_DIR="$APP_ROOT/$rel"; break; fi
+done
+for rel in backend server api; do
+  if [ -f "$APP_ROOT/$rel/package.json" ]; then API_DIR="$APP_ROOT/$rel"; break; fi
+done
+if [ -n "$WEB_DIR" ] && [ -n "$API_DIR" ]; then
+  WORKSPACE=1
+  APP_KIND="node"
+  SKIP_NODE_BUILD=1
+  write_status "node_workspace_detected"
+fi
+# Prebuilt artifacts skip hour-long compiles on t3.micro. Still fall back to npm if absent.
+if [ "$APP_KIND" = "node" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ]; then
+  for candidate in build dist out; do
+    if [ -d "$APP_DIR/$candidate" ] && [ -f "$APP_DIR/$candidate/index.html" ]; then
+      APP_KIND="static"
+      APP_DIR="$APP_DIR/$candidate"
+      APP_PORT="80"
+      SKIP_NODE_BUILD=1
+      write_status "prebuilt_static_$candidate"
+      break
+    fi
+  done
+  if [ "$SKIP_NODE_BUILD" != "1" ] && [ -d "$APP_DIR/.next" ]; then
+    SKIP_NODE_BUILD=1
+    write_status "prebuilt_next_build"
+  fi
+fi
+if [ "$APP_KIND" = "node" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ] && [ "$SKIP_NODE_BUILD" != "1" ]; then
   npm install -g pm2 || true
   pm2 delete "$APP_NAME" || true
   rm -rf .next
@@ -1137,7 +1337,7 @@ if [ "$APP_KIND" = "node" ]; then
     fi
   done
 fi
-if [ "$APP_KIND" = "python" ]; then
+if [ "$APP_KIND" = "python" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ]; then
   if [ -f requirements.txt ]; then
     python3 -m pip install -r requirements.txt
   elif [ -f pyproject.toml ]; then
@@ -1147,7 +1347,7 @@ if [ "$APP_KIND" = "python" ]; then
     bash -lc "$BUILD_COMMAND" || true
   fi
 fi
-if [ "$APP_KIND" = "go" ] || [ "$APP_KIND" = "java" ] || [ "$APP_KIND" = "dotnet" ] || [ "$APP_KIND" = "php" ] || [ "$APP_KIND" = "ruby" ] || [ "$APP_KIND" = "rust" ]; then
+if [ "$DEPLOYMENT_STRATEGY" != "buildpack" ] && { [ "$APP_KIND" = "go" ] || [ "$APP_KIND" = "java" ] || [ "$APP_KIND" = "dotnet" ] || [ "$APP_KIND" = "php" ] || [ "$APP_KIND" = "ruby" ] || [ "$APP_KIND" = "rust" ]; }; then
   if [ -n "$BUILD_COMMAND" ]; then
     write_status "language_build_started"
     bash -lc "cd '$APP_DIR' && $BUILD_COMMAND"
@@ -1200,7 +1400,7 @@ __DEPLAI_PUBLIC_URL_BOOTSTRAP__
 
 # ── Prisma: generate client and run migrations ───────────────────────────────
 # Run only for node apps that have a prisma directory (detected at build time).
-if [ "$APP_KIND" = "node" ] && [ "${var.has_prisma}" = "true" ]; then
+if [ "$WORKSPACE" != "1" ] && [ "$APP_KIND" = "node" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ] && [ "${var.has_prisma}" = "true" ]; then
   export $(grep -v '^#' "$APP_DIR/.env" | xargs) 2>/dev/null || true
   # Generate Prisma client (may already be done in node_modules from npm install)
   npx prisma generate --schema="$APP_DIR/prisma/schema.prisma" 2>/dev/null \
@@ -1219,10 +1419,145 @@ if [ "$APP_KIND" = "node" ] && [ "${var.has_prisma}" = "true" ]; then
   fi
 fi
 
+if [ "$WORKSPACE" = "1" ]; then
+  infer_package_port() {
+    python3 - "$1" "$2" <<'PY'
+import json, re, sys
+path, default = sys.argv[1], int(sys.argv[2])
+blocked = {5432, 3306, 6379, 27017, 1433, 1521}
+try:
+    data = json.load(open(path, encoding="utf-8"))
+except Exception:
+    print(default)
+    raise SystemExit(0)
+scripts = data.get("scripts") or {}
+blob = " ".join(str(v) for v in scripts.values())
+match = re.search(r"(?:-p|--port)\s+(\d{2,5})", blob)
+if match:
+    port = int(match.group(1))
+    if 1 <= port <= 65535 and port not in blocked:
+        print(port)
+        raise SystemExit(0)
+print(default)
+PY
+  }
+  npm_in_dir() {
+    local dir="$1"
+    (
+      cd "$dir"
+      if [ -f package-lock.json ]; then npm ci --legacy-peer-deps || npm install --legacy-peer-deps; else npm install --legacy-peer-deps; fi
+      if grep -q '"build"' package.json 2>/dev/null; then
+        export NODE_OPTIONS="--max-old-space-size=2048"
+        npm run build
+      fi
+    )
+  }
+  start_pm2_dir() {
+    local dir="$1" name="$2" port="$3"
+    (
+      cd "$dir"
+      if [ -x node_modules/next/dist/bin/next ]; then
+        PORT="$port" pm2 start node_modules/next/dist/bin/next --name "$name" -- start -p "$port"
+      elif grep -q '"start"' package.json 2>/dev/null; then
+        PORT="$port" pm2 start npm --name "$name" --cwd "$dir" -- start
+      elif [ -f server.js ]; then
+        PORT="$port" pm2 start server.js --name "$name"
+      elif [ -f index.js ]; then
+        PORT="$port" pm2 start index.js --name "$name"
+      else
+        echo "No start command in $dir" >&2
+        return 1
+      fi
+    )
+  }
+  dnf install -y nodejs npm || true
+  npm install -g pm2 || true
+  WEB_PORT="$(infer_package_port "$WEB_DIR/package.json" 3000)"
+  API_PORT="$(infer_package_port "$API_DIR/package.json" 5000)"
+  mkdir -p "$API_DIR" "$WEB_DIR"
+  if [ -f "$APP_DIR/.env" ]; then
+    cp "$APP_DIR/.env" "$API_DIR/.env"
+    cp "$APP_DIR/.env" "$WEB_DIR/.env"
+  fi
+  printf '\nPORT=%s\nHOST=0.0.0.0\n' "$API_PORT" >> "$API_DIR/.env"
+  printf '\nPORT=%s\nHOST=0.0.0.0\nNEXT_PUBLIC_API_URL=/api\n' "$WEB_PORT" >> "$WEB_DIR/.env"
+  chmod 600 "$API_DIR/.env" "$WEB_DIR/.env" || true
+  npm_in_dir "$API_DIR"
+  if [ -d "$API_DIR/prisma" ]; then
+    (
+      cd "$API_DIR"
+      set -a
+      [ -f .env ] && . ./.env
+      set +a
+      npx prisma generate || true
+      if [ -d prisma/migrations ] && [ "$(ls -A prisma/migrations 2>/dev/null)" ]; then
+        npx prisma migrate deploy || true
+      else
+        npx prisma db push || true
+      fi
+    )
+  fi
+  npm_in_dir "$WEB_DIR"
+  pm2 delete "$APP_NAME-api" >/dev/null 2>&1 || true
+  pm2 delete "$APP_NAME-web" >/dev/null 2>&1 || true
+  start_pm2_dir "$API_DIR" "$APP_NAME-api" "$API_PORT"
+  start_pm2_dir "$WEB_DIR" "$APP_NAME-web" "$WEB_PORT"
+  pm2 save || true
+  cat >/etc/nginx/conf.d/deplai-app.conf <<NGINX
+server {
+  listen 80 default_server;
+  server_name _;
+  location /api/ {
+    proxy_pass http://127.0.0.1:$API_PORT;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+  location / {
+    proxy_pass http://127.0.0.1:$WEB_PORT;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+  }
+}
+NGINX
+  rm -f /etc/nginx/conf.d/default.conf /usr/share/nginx/html/index.html || true
+  systemctl enable nginx
+  systemctl restart nginx
+  write_status "node_workspace_running"
+  exit 0
+fi
 if [ "$APP_KIND" = "static" ]; then
   rm -rf /usr/share/nginx/html/*
   cp -R "$APP_DIR"/. /usr/share/nginx/html/
   write_status "static_site_staged"
+elif [ "$DEPLOYMENT_STRATEGY" = "buildpack" ]; then
+  cd "$APP_DIR"
+  write_status "buildpack_build_started"
+  pack build "$APP_NAME:latest" --path "$APP_DIR" --builder "$BUILDPACK_BUILDER"
+  write_status "buildpack_build_done"
+  docker rm -f "$APP_NAME" || true
+  docker run -d --name "$APP_NAME" --restart unless-stopped \
+    -p "127.0.0.1:$APP_PORT:$APP_PORT" \
+    --env-file "$APP_DIR/.env" \
+    -e PORT="$APP_PORT" \
+    "$APP_NAME:latest"
+  cat >/etc/nginx/conf.d/deplai-app.conf <<NGINX
+server {
+  listen 80 default_server;
+  server_name _;
+  location / {
+    proxy_pass http://127.0.0.1:$APP_PORT;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+NGINX
+  write_status "buildpack_container_started"
+  write_status "application_service_started"
 elif [ "$APP_KIND" = "docker" ]; then
   cd "$APP_DIR"
   ENV_FILE_ARGS=()
@@ -1236,9 +1571,11 @@ elif [ "$APP_KIND" = "docker" ]; then
     done
     write_status "docker_compose_up_started"
     if [ -f "$APP_DIR/.env" ]; then
-      docker compose -f "$COMPOSE_FILE" --env-file "$APP_DIR/.env" up -d --build
+      docker compose -f "$COMPOSE_FILE" --env-file "$APP_DIR/.env" up -d --no-build \
+        || docker compose -f "$COMPOSE_FILE" --env-file "$APP_DIR/.env" up -d --build
     else
-      docker compose -f "$COMPOSE_FILE" up -d --build
+      docker compose -f "$COMPOSE_FILE" up -d --no-build \
+        || docker compose -f "$COMPOSE_FILE" up -d --build
     fi
     # Compose typically publishes its own host ports; avoid fighting nginx on :80.
     systemctl stop nginx || true
@@ -1340,12 +1677,26 @@ for attempt in $(seq 1 30); do
     || curl -fsS "http://127.0.0.1:$APP_PORT/" \
     || curl -fsS "http://127.0.0.1$HEALTH_PATH" \
     || curl -fsS "http://127.0.0.1/"; then
+    write_status "health_check_passed"
     write_status "ready"
     exit 0
   fi
   sleep 5
 done
 write_status "health_check_failed"
+rollback_unhealthy_release() {
+  # This function only invokes a certified local service/container name.  It
+  # never receives a free-text command from the API or an LLM.
+  if [ "$APP_KIND" = "docker" ] || [ "$DEPLOYMENT_STRATEGY" = "buildpack" ]; then
+    docker rm -f "$APP_NAME" || true
+  elif [ "$APP_KIND" = "node" ]; then
+    pm2 delete "$APP_NAME" || true
+  else
+    systemctl stop deplai-app || true
+  fi
+}
+rollback_unhealthy_release
+write_status "rolled_back_after_failed_health_check"
 curl -v "http://127.0.0.1:$APP_PORT$HEALTH_PATH" || true
 curl -v "http://127.0.0.1:$APP_PORT/" || true
 curl -v "http://127.0.0.1/" || true
@@ -1359,10 +1710,19 @@ exit 1
 USERDATA
   )
 
-  root_block_device {
-    volume_size           = var.root_volume_size_gb
-    volume_type           = "gp3"
-    delete_on_termination = true
+  root_block_device = [
+    {
+      volume_size           = var.root_volume_size_gb
+      volume_type           = "gp3"
+      delete_on_termination = true
+      encrypted             = true
+    }
+  ]
+
+  metadata_options = {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
   }
 
   tags = merge(local.tags, { Name = var.project_name })
@@ -1370,15 +1730,15 @@ USERDATA
 '''
 
     outputs_tf = '''output "ec2_instance_id" {
-  value = try(aws_instance.app[0].id, null)
+  value = try(module.ec2[0].id, null)
 }
 
 output "ec2_instance_arn" {
-  value = try(aws_instance.app[0].arn, null)
+  value = try(module.ec2[0].arn, null)
 }
 
 output "ec2_instance_state" {
-  value = try(aws_instance.app[0].instance_state, null)
+  value = try(module.ec2[0].instance_state, null)
 }
 
 output "ec2_instance_type" {
@@ -1386,19 +1746,19 @@ output "ec2_instance_type" {
 }
 
 output "ec2_public_ip" {
-  value = try(aws_instance.app[0].public_ip, null)
+  value = try(module.ec2[0].public_ip, null)
 }
 
 output "ec2_private_ip" {
-  value = try(aws_instance.app[0].private_ip, null)
+  value = try(module.ec2[0].private_ip, null)
 }
 
 output "ec2_public_dns" {
-  value = try(aws_instance.app[0].public_dns, null)
+  value = try(module.ec2[0].public_dns, null)
 }
 
 output "ec2_private_dns" {
-  value = try(aws_instance.app[0].private_dns, null)
+  value = try(module.ec2[0].private_dns, null)
 }
 
 output "ec2_vpc_id" {
@@ -1407,6 +1767,10 @@ output "ec2_vpc_id" {
 
 output "ec2_subnet_id" {
   value = local.selected_subnet_id
+}
+
+output "deployment_verify_ssm_document" {
+  value = aws_ssm_document.deployment_verify.name
 }
 
 output "rds_endpoint" {
@@ -1443,11 +1807,11 @@ output "generated_ec2_private_key_pem" {
 }
 
 output "app_url" {
-  value = try("http://${aws_instance.app[0].public_ip}", null)
+  value = try("http://${module.ec2[0].public_ip}", null)
 }
 
 output "health_check_url" {
-  value = try("http://${aws_instance.app[0].public_ip}${var.health_path}", null)
+  value = try("http://${module.ec2[0].public_ip}${var.health_path}", null)
 }
 
 output "app_kind" {
@@ -1466,6 +1830,10 @@ output "cloudfront_url" {
     main_tf_resources = main_tf_resources.replace(
         "__DEPLAI_PUBLIC_URL_BOOTSTRAP__",
         public_url_bash.strip() if public_url_bash else 'write_status "public_url_skipped"',
+    )
+    main_tf_resources = main_tf_resources.replace(
+        'source  = "terraform-aws-modules/ec2-instance/aws"\n  version = "5.8.0"',
+        f'source  = "{EC2_MODULE_SOURCE}"\n  version = "{EC2_MODULE_VERSION}"',
     )
 
     auth_readme = ""
@@ -1490,6 +1858,7 @@ Generated by the deterministic `deplai_ec2_app` renderer. No LLM generated Terra
 
 - Project: `{project_slug}`
 - App kind: `{deployment_package.app_kind}`
+- Executor strategy: `{deployment_package.strategy}`
 - EC2 instance type: `{instance_type}`
 - Root volume: `{root_volume_size_gb}GB`
 - App port: `{app_port}`
@@ -1526,7 +1895,7 @@ Generated by the deterministic `deplai_ec2_app` renderer. No LLM generated Terra
                 "id": "ec2_app",
                 "type": "aws_instance",
                 "strategy": "deplai_ec2_app",
-                "dependencies": ["default_vpc", "security_group", "iam_instance_profile"],
+                "dependencies": ["default_vpc", "security_group", "iam_instance_profile", "deployment_verify_ssm_document"],
                 "config": package_manifest,
             }
         ],

@@ -1402,7 +1402,7 @@ export default function AgentChat({
           }
           if (typeof window !== 'undefined') {
             localStorage.setItem('deplai.pipeline.selectedProjectId', project_id);
-            localStorage.setItem(`deplai.pipeline.currentStage.${project_id}`, 'arch');
+            localStorage.setItem(`deplai.pipeline.currentStage.${project_id}`, 'qa');
             sessionStorage.setItem('deplai.pipeline.planningProjectId', project_id);
             sessionStorage.setItem('deplai.pipeline.repoContext', JSON.stringify(data.context_json));
             sessionStorage.setItem('deplai.pipeline.repoContextMd', JSON.stringify(String(data.context_md || '')));
@@ -1416,10 +1416,10 @@ export default function AgentChat({
             role: 'assistant',
             content:
               `Repository analysis is ready for **${resolvedProjectName}**.\n` +
-              `Opening the shared deployment review wizard now.`,
+              `Opening the deployment pipeline now.`,
           });
           setBusy(false);
-          router.push('/dashboard/pipeline');
+          router.push('/dashboard/deploy');
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : 'Failed to start deployment planning.';
           addActivity({ type: 'error', icon: '❌', label: `Deployment planning error: ${msg}` });

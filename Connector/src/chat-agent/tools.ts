@@ -38,7 +38,7 @@ export const TOOL_REGISTRY: Record<ToolName, ToolDefinition> = {
   },
   plan_deployment: {
     name: 'plan_deployment',
-    description: 'Launch the repository analyzer and open the deployment planning wizard for a project.',
+    description: 'Launch the repository analyzer and open /dashboard/deploy for a project.',
     required_params: ['project_id', 'project_name'],
     optional_params: [],
     security_sensitive_params: [],

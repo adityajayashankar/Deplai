@@ -546,7 +546,7 @@ class RemediationRunner(RunnerBase):
                 return
             self._pending_action = "approve_push"
             self._command_event.set()
-            await self._send_message("success", "Final approval received. Persisting approved remediation changes and starting verification re-scan.")
+            await self._send_message("success", "Final approval received. Persisting approved remediation changes.")
 
     def _clear_pending_action(self):
         self._pending_action = None
@@ -885,7 +885,7 @@ echo "PUSHED"
         await self._send_message("phase", "Awaiting Human Approval")
         await self._send_message(
             "warning",
-            "Review remediation changes and approve to persist the fixes, create the PR if applicable, and rerun Bearer, Syft, and Grype.",
+            "Review remediation changes and approve to persist the fixes and create the PR if applicable. Verification scan is optional after the PR exists.",
         )
         await self._send_status(StreamStatus.waiting_approval)
 
@@ -978,10 +978,11 @@ echo "PUSHED"
             effective_llm_api_key = self.context.llm_api_key or ""
             effective_llm_model = self.context.llm_model or ""
             requested_provider = str(self.context.llm_provider or "").strip().lower()
+            requested_access = str(getattr(self.context, "llm_access_mode", "auto") or "auto").strip().lower()
             lean_metadata = bool(cycle_strategy.get("lean_metadata"))
             preferred_provider = str(cycle_strategy.get("preferred_provider") or "").strip().lower()
 
-            if preferred_provider == "groq":
+            if preferred_provider == "groq" and requested_access not in {"platform", "byok"}:
                 # Large repo: send only critical/high findings to Groq with ~90%
                 # of finding metadata stripped out (handled below per batch).
                 effective_llm_provider = "groq"
@@ -1095,6 +1096,8 @@ echo "PUSHED"
                         llm_model=effective_llm_model,
                         budget_tracker=budget_tracker,
                         on_message=_on_supervisor_message,
+                        user_id=getattr(self.context, "user_id", None),
+                        access_mode=getattr(self.context, "llm_access_mode", None),
                     )
                 except Exception as _sup_exc:
                     success = False
@@ -1121,6 +1124,8 @@ echo "PUSHED"
                                 llm_api_key=effective_llm_api_key,
                                 llm_model=effective_llm_model,
                                 budget_tracker=budget_tracker,
+                                user_id=getattr(self.context, "user_id", None),
+                                access_mode=getattr(self.context, "llm_access_mode", None),
                             )
                         )
                             if fb_ok:
@@ -1366,7 +1371,7 @@ echo "PUSHED"
                         scan_data = rescan_data
                         continue
 
-            # Step 5: Wait for explicit human approval before persisting & rescanning
+            # Step 5: Wait for explicit human approval before persisting
             await self._wait_for_human_approval()
 
             # Step 6: Persist changes to source of truth (after approval)
@@ -1385,122 +1390,11 @@ echo "PUSHED"
                     return await self._terminate(f"Failed to persist local remediation changes: {error_msg}")
                 await self._send_message("success", "Remediation changes written to local project files")
 
-            self._check_cancelled()
-
-            # Step 7: Rerun scanners after approval
-            await self._send_message("info", "Invalidating previous scan cache")
-            await self._run_step(lambda: invalidate_cache(self.project_id))
-
-            rescanned = await self._run_rescan()
-            if not rescanned:
-                return await self._terminate("Security re-scan failed after remediation.")
-
-            # Reset approval state for next cycle
-            self._approval_event.clear()
-            self._approval_requested = False
-
-            # Check if high/critical findings remain — if none, exit loop early
-            rescan_ok, rescan_data = await self._run_step(partial(get_scan_results, self.project_id))
-            if not rescan_ok:
-                await self._send_message("warning", "Could not reload rescan results for vuln check.")
-                break
-
-            overall_remaining = self._count_findings_for_scope(rescan_data, remediation_scope)
-            remaining_vulns = _count_findings_for_severities(rescan_data, target_severities)
-            if remaining_vulns == 0:
-                if overall_remaining == 0:
-                    await self._send_message(
-                        "success",
-                        f"{cycle_label} No remaining findings in scope ({remediation_scope}). Remediation loop complete.",
-                    )
-                else:
-                    next_scan_data, next_cycle_strategy = _select_cycle_scan_strategy(rescan_data, remediation_scope)
-                    _ = next_scan_data
-                    if next_cycle_strategy.get("mode") == "large_repo_major_complete":
-                        await self._send_message(
-                            "success",
-                            (
-                                f"{cycle_label} No remaining critical or high findings. "
-                                "Stopping remediation before medium/low severities."
-                            ),
-                        )
-                    elif cycle_strategy.get("mode") == "large_repo_severity_staged":
-                        next_stage = str(next_cycle_strategy.get("stage_severity") or "").upper() or "NEXT"
-                        await self._send_message(
-                            "success",
-                            (
-                                f"{cycle_label} No remaining {target_label}. "
-                                f"{overall_remaining} finding(s) still remain in scope; the next remediation run will target {next_stage} findings."
-                            ),
-                        )
-                    else:
-                        await self._send_message(
-                            "success",
-                            f"{cycle_label} No remaining findings in the current remediation target ({target_label}).",
-                        )
-            else:
-                await self._send_message(
-                    "info",
-                    f"{cycle_label} {remaining_vulns} finding(s) remain in {target_label} after remediation.",
-                )
-
-            if remaining_vulns >= cycle_remaining_baseline:
-                no_progress_cycles += 1
-                await self._send_message(
-                    "warning",
-                    (
-                        f"{cycle_label} Remaining {target_label} did not decrease "
-                        f"({remaining_vulns} >= {cycle_remaining_baseline}). "
-                        f"No-progress streak: {no_progress_cycles}/{REMEDIATION_NO_PROGRESS_LIMIT}."
-                    ),
-                )
-                if no_progress_cycles >= REMEDIATION_NO_PROGRESS_LIMIT:
-                    await self._send_message(
-                        "warning",
-                        "Stopping remediation due to repeated no-progress after rescans.",
-                    )
-                    break
-            else:
-                no_progress_cycles = 0
-            if remaining_vulns < cycle_remaining_baseline:
-                no_progress_cycles = 0
-
-            if budget_exhausted:
-                await self._send_message(
-                    "warning",
-                    "Ending remediation after the current approval/rescan cycle because the Claude budget cap has been reached.",
-                )
-                break
-
-            _, next_cycle_strategy = _select_cycle_scan_strategy(rescan_data, remediation_scope)
-            if overall_remaining == 0 or next_cycle_strategy.get("mode") == "large_repo_major_complete":
-                await self._send_message(
-                    "info",
-                    "Approved remediation changes have been verified. Ending the remediation loop.",
-                )
-                break
-
-            if no_progress_cycles >= REMEDIATION_NO_PROGRESS_LIMIT:
-                await self._send_message(
-                    "warning",
-                    "Ending remediation because the latest verification scan did not show enough progress for another cycle.",
-                )
-                break
-
-            if cycle + 1 < MAX_REMEDIATION_CYCLES:
-                await self._send_message(
-                    "info",
-                    f"Starting next remediation cycle ({cycle + 2}/{MAX_REMEDIATION_CYCLES})...",
-                )
-                scan_data = rescan_data
-                continue
-            else:
-                await self._send_message(
-                    "warning",
-                    f"Maximum remediation cycles ({MAX_REMEDIATION_CYCLES}) reached. "
-                    f"{overall_remaining} finding(s) may still remain in scope ({remediation_scope}).",
-                )
-                break
+            await self._send_message(
+                "success",
+                "Remediation persisted. Verification scan is optional; rerun it from Security Agent after the PR is ready.",
+            )
+            break
 
         await self._send_message(
             "success",

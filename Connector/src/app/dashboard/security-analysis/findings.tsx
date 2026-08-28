@@ -115,22 +115,22 @@ const supplyChainColumns: ColumnDef<SupplyChainVuln>[] = [
   {
     accessorKey: 'name',
     header: 'Package',
-    cell: (info) => <span className="font-medium text-white">{info.getValue<string>()}</span>,
+    cell: (info) => <span className="font-medium text-black">{info.getValue<string>()}</span>,
   },
   {
     accessorKey: 'cve_id',
     header: 'CVE',
-    cell: (info) => <span className="font-mono text-xs text-white/50">{info.getValue<string>()}</span>,
+    cell: (info) => <span className="font-mono text-xs text-black/50">{info.getValue<string>()}</span>,
   },
   {
     accessorKey: 'type',
     header: 'Type',
-    cell: (info) => <span className="text-white/40 text-xs">{info.getValue<string>()}</span>,
+    cell: (info) => <span className="text-black/40 text-xs">{info.getValue<string>()}</span>,
   },
   {
     accessorKey: 'version',
     header: 'Version',
-    cell: (info) => <span className="font-mono text-xs text-white/60">{info.getValue<string>()}</span>,
+    cell: (info) => <span className="font-mono text-xs text-black/60">{info.getValue<string>()}</span>,
   },
   {
     accessorKey: 'severity',
@@ -147,7 +147,7 @@ const supplyChainColumns: ColumnDef<SupplyChainVuln>[] = [
     header: 'EPSS',
     cell: (info) => {
       const val = info.getValue<number | null>();
-      return <span className="text-white/40 text-xs">{val !== null ? `${(val * 100).toFixed(1)}%` : '—'}</span>;
+      return <span className="text-black/40 text-xs">{val !== null ? `${(val * 100).toFixed(1)}%` : '—'}</span>;
     },
   },
   {
@@ -164,7 +164,7 @@ const supplyChainColumns: ColumnDef<SupplyChainVuln>[] = [
           {val}
         </span>
       ) : (
-        <span className="text-white/20 text-xs italic">None</span>
+        <span className="text-black/30 text-xs italic">None</span>
       );
     },
   },
@@ -184,10 +184,10 @@ function SupplyChainTable({ vulnerabilities }: { vulnerabilities: SupplyChainVul
   });
 
   return (
-    <div className="bg-[#101012]/90 border border-white/10 rounded-2xl overflow-hidden">
-      <div className="px-6 py-4 border-b border-white/8">
-        <h2 className="text-sm font-semibold text-white/80">Supply Chain Vulnerabilities</h2>
-        <p className="text-xs text-white/40 mt-0.5">{vulnerabilities.length} issue{vulnerabilities.length !== 1 ? 's' : ''} detected</p>
+    <div className="app-paper overflow-hidden">
+      <div className="border-b-[3px] border-black px-6 py-4">
+        <h2 className="text-sm font-semibold text-black">Supply Chain Vulnerabilities</h2>
+        <p className="text-xs text-neutral-500 mt-0.5">{vulnerabilities.length} issue{vulnerabilities.length !== 1 ? 's' : ''} detected</p>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm text-left whitespace-nowrap">
@@ -199,8 +199,8 @@ function SupplyChainTable({ vulnerabilities }: { vulnerabilities: SupplyChainVul
                   return (
                     <th
                       key={header.id}
-                      className={`py-3 px-5 text-xs font-medium text-white/40 uppercase tracking-wider select-none ${
-                        header.column.getCanSort() ? 'cursor-pointer hover:text-white/70 transition-colors' : ''
+                      className={`py-3 px-5 text-xs font-medium text-neutral-500 uppercase tracking-wider select-none ${
+                        header.column.getCanSort() ? 'cursor-pointer hover:text-black transition-colors' : ''
                       } ${align === 'right' ? 'text-right' : ''}`}
                       onClick={header.column.getToggleSortingHandler()}
                     >
@@ -562,7 +562,7 @@ export default function Findings({
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
           </div>
-          <h3 className="text-xl font-bold text-white tracking-tight">Review AI Changes</h3>
+          <h3 className="text-xl font-bold text-black tracking-tight">Review AI Changes</h3>
         </div>
         <p className="text-zinc-400 text-sm text-center mb-8 max-w-md">
           The remediation agent has applied fixes. Review the changed files below, then approve to push a PR and re-run the security scan.
@@ -572,8 +572,8 @@ export default function Findings({
         {/* Changed Files */}
         <div className="w-full max-w-2xl mb-8">
           {changedFiles.length > 0 ? (
-            <div className="rounded-2xl border border-white/10 bg-black/30 backdrop-blur-md overflow-hidden">
-              <div className="px-5 py-3 border-b border-white/10 flex items-center gap-2">
+            <div className="app-paper overflow-hidden">
+              <div className="px-5 py-3 border-b-[3px] border-black flex items-center gap-2">
                 <svg className="w-4 h-4 text-zinc-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                 </svg>
@@ -588,7 +588,7 @@ export default function Findings({
                       <span className="text-indigo-400 font-bold text-[10px]">M</span>
                     </div>
                     <div className="min-w-0">
-                      <span className="font-mono text-sm text-white block truncate">{f.path}</span>
+                      <span className="font-mono text-sm text-black block truncate">{f.path}</span>
                       {f.reason && (
                         <span className="text-zinc-400 text-xs block mt-0.5 leading-relaxed">{f.reason}</span>
                       )}
@@ -598,7 +598,7 @@ export default function Findings({
               </ul>
             </div>
           ) : (
-            <div className="rounded-2xl border border-white/10 bg-black/30 p-6 text-center">
+            <div className="app-paper p-6 text-center">
               <p className="text-zinc-400 text-sm">No file change details available. Check the monitor log for the full output.</p>
             </div>
           )}
@@ -607,7 +607,7 @@ export default function Findings({
         {/* Approve Button */}
         <button
           onClick={onApproveRescan}
-          className="inline-flex items-center gap-2.5 px-7 py-3 bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white font-semibold rounded-xl transition-all shadow-[0_0_20px_-4px_rgba(99,102,241,0.5)] hover:shadow-[0_0_30px_-4px_rgba(99,102,241,0.7)] text-sm"
+          className="inline-flex items-center gap-2.5 border-[3px] border-black bg-black px-7 py-3 text-sm font-bold text-white shadow-[4px_4px_0_0_#000] transition-transform hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none"
         >
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
@@ -722,7 +722,6 @@ export default function Findings({
           <div
             ref={terminalRef}
             className="flex-1 overflow-y-auto bg-[#0d1117] p-4 font-mono text-sm leading-relaxed"
-            style={{ scrollbarWidth: 'thin', scrollbarColor: '#3b3b4f transparent' }}
           >
             {scanMessages.length === 0 ? (
               <span className="text-green-400 animate-pulse">&#x2588;</span>

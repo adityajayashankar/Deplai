@@ -59,6 +59,10 @@ def list_services() -> list[str]:
 def catalog_summary() -> list[dict[str, Any]]:
     catalog = load_catalog()
     services = catalog.get("services") if isinstance(catalog.get("services"), dict) else {}
+    aliases = catalog.get("aliases") if isinstance(catalog.get("aliases"), dict) else {}
+    also_known: dict[str, list[str]] = {}
+    for alias, target in aliases.items():
+        also_known.setdefault(str(target), []).append(str(alias))
     return [
         {
             "id": key,
@@ -69,8 +73,10 @@ def catalog_summary() -> list[dict[str, Any]]:
             "resource": value.get("resource"),
             "kind": value.get("kind"),
             "contract": value.get("contract"),
+            "aliases": sorted(also_known.get(key, [])),
         }
         for key, value in services.items()
+        if isinstance(value, dict)
     ]
 
 
@@ -178,7 +184,7 @@ def render_snippet(name: str, params: dict[str, Any] | None = None) -> str:
     values.setdefault("root_volume_size_gb", 8)
     values.setdefault("health_path", "/")
     values.setdefault("engine", "postgres")
-    values.setdefault("engine_version", "15.5")
+    values.setdefault("engine_version", "15.17")
     values.setdefault("instance_class", "db.t4g.micro")
     values.setdefault("allocated_storage", 20)
     values.setdefault("multi_az", "false")
@@ -226,6 +232,10 @@ def _module_catalog_dict() -> dict[str, dict[str, Any]]:
         "elasticache",
         "eip",
         "nat_gateway",
+        "s3_cloudfront",
+        "cloudfront",
+        "s3_bucket",
+        "lambda",
     )
     out: dict[str, dict[str, Any]] = {}
     for key in legacy_keys:

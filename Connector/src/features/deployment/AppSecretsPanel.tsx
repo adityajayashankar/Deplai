@@ -3,10 +3,17 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Plus, RefreshCw, Trash2 } from 'lucide-react';
 import {
+  Callout,
+  Chip,
+  EmptyState,
+  Panel,
+  SectionLabel,
   StageHeader,
-  Surface,
-  SurfaceLabel,
+  StickyActionBar,
   accentButtonClass,
+  buttonClass,
+  fieldClass,
+  paperInsetClass,
   secondaryButtonClass,
 } from '@/features/deployment/deployment-ui';
 import { isValidEnvSecretKey, parseEnvSecretBlock } from '@/features/deployment/parseEnvSecretBlock';
@@ -221,7 +228,8 @@ export function AppSecretsPanel({
       mergeMetaIntoDrafts(meta, clearDraftsAfterSaveRef.current);
       clearDraftsAfterSaveRef.current = false;
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to list secrets');
+      const message = err instanceof Error ? err.message : 'Failed to list secrets';
+      setError(`${message} You can skip this step if the app does not need secrets.`);
     } finally {
       setLoading(false);
     }
@@ -378,6 +386,15 @@ export function AppSecretsPanel({
     }
   };
 
+  const handleSkip = async () => {
+    if (!hasAwsCredentials) {
+      onBackToAwsConfig?.();
+      return;
+    }
+    if (!canContinueToDeploy) return;
+    await onContinueToDeploy();
+  };
+
   const handleContinue = async () => {
     if (!hasAwsCredentials) {
       onBackToAwsConfig?.();
@@ -442,13 +459,14 @@ export function AppSecretsPanel({
   return (
     <div className="mx-auto max-w-5xl space-y-6">
       <StageHeader
-        title="App Secrets"
-        description={`Store OAuth and API keys in your AWS Secrets Manager for ${projectName}. Values are write-only after save — never committed to git or Terraform.`}
+        eyebrow="Stage 06 · Secrets (optional)"
+        title="App secrets"
+        description={`Optional. Store OAuth and API keys in AWS Secrets Manager for ${projectName} when the app needs them. Skip this step for static sites, blogs, or CloudFront-only deploys — values are write-only after save and never committed to git or Terraform.`}
       />
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-        <Surface className="space-y-4 xl:col-span-2">
+      <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+        <Panel className="space-y-4 xl:col-span-2" elevation="raised">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="font-mono text-xs text-zinc-500">Prefix: {secretsPrefix || '—'}</div>
+            <div className="font-mono text-[11px] text-[var(--dw-muted)]">Prefix: {secretsPrefix || '—'}</div>
             <button
               type="button"
               onClick={() => void refresh()}
@@ -461,31 +479,29 @@ export function AppSecretsPanel({
           </div>
 
           {!hasAwsCredentials && (
-            <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-              Complete AWS Config with access key and secret key first.
-            </div>
+            <Callout tone="warn">Complete AWS Config with access key and secret key first. You can still skip this step after credentials are saved.</Callout>
           )}
 
           {error && (
-            <div className="rounded-md border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-200">{error}</div>
+            <Callout tone="warn">{error}</Callout>
           )}
 
           {missingRequired.length > 0 && (
-            <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-              Suggested secrets not set yet: {missingRequired.join(', ')}. You can continue anyway — login/features that need them may fail until you add them later.
-            </div>
+            <Callout tone="info">
+              Suggested secrets not set yet: {missingRequired.join(', ')}. Skip if this app does not need them (for example a static site or CloudFront blog). Login/features that need these keys may fail until you add them later.
+            </Callout>
           )}
 
           {pendingSaveCount > 0 && (
-            <div className="rounded-md border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
+            <Callout tone="ok">
               {pendingSaveCount} secret{pendingSaveCount === 1 ? '' : 's'} ready in the form. “Save & continue” will store them in AWS, then open Deploy.
-            </div>
+            </Callout>
           )}
 
-          <div className="space-y-2 rounded-md border border-white/10 bg-[#09090b] p-3">
+          <div className={`space-y-2 ${paperInsetClass} p-3.5`}>
             <div className="flex items-center justify-between gap-2">
-              <span className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">Paste all secrets</span>
-              <span className="text-[11px] text-zinc-600">Paste fills the form automatically</span>
+              <span className="font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--dw-faint)]">Paste all secrets</span>
+              <span className="text-[11px] text-[var(--dw-faint)]">Paste fills the form automatically</span>
             </div>
             <textarea
               value={bulkPaste}
@@ -503,7 +519,7 @@ export function AppSecretsPanel({
               placeholder={'DB_HOST=...\nDB_PASSWORD=...\nGOOGLE_CLIENT_ID=...\nGOOGLE_CLIENT_SECRET=...'}
               rows={6}
               spellCheck={false}
-              className="w-full resize-y rounded-md border border-white/10 bg-black px-3 py-2 font-mono text-sm leading-relaxed text-zinc-200 outline-none focus:border-white/25"
+              className={`${fieldClass()} resize-y leading-relaxed`}
               autoComplete="off"
             />
             <div className="flex flex-wrap gap-2">
@@ -525,7 +541,7 @@ export function AppSecretsPanel({
               </button>
             </div>
             {bulkHint && (
-              <div className="text-xs text-zinc-300">{bulkHint}</div>
+              <div className="text-[12px] text-[var(--dw-fg-soft)]">{bulkHint}</div>
             )}
           </div>
 
@@ -535,17 +551,15 @@ export function AppSecretsPanel({
               const filled = Boolean(row.value.trim());
               const saved = Boolean(meta?.is_set) || knownSetKeysRef.current.has(row.key);
               return (
-                <div key={row.key} className="grid grid-cols-1 gap-2 rounded-md border border-white/10 bg-[#09090b] p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto]">
+                <div key={row.key} className={`grid grid-cols-1 gap-2 ${paperInsetClass} p-3.5 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto]`}>
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="font-mono text-sm text-zinc-200">{row.key}</span>
+                      <span className="font-mono text-[13px] text-[var(--dw-fg)]">{row.key}</span>
                       {row.required && (
-                        <span className="rounded border border-amber-500/30 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-300">
-                          Suggested
-                        </span>
+                        <Chip tone="warn">Suggested</Chip>
                       )}
                     </div>
-                    <div className={`mt-1 text-[11px] ${filled || saved ? 'text-emerald-400' : 'text-zinc-500'}`}>
+                    <div className={`mt-1 text-[11px] ${filled || saved ? 'text-[var(--dw-ok)]' : 'text-[var(--dw-muted)]'}`}>
                       {rowStatusLabel(row, saved)}
                     </div>
                   </div>
@@ -557,14 +571,14 @@ export function AppSecretsPanel({
                       setDrafts((prev) => prev.map((item) => (item.key === row.key ? { ...item, value } : item)));
                     }}
                     placeholder={saved ? 'Enter new value to rotate' : 'Enter secret value'}
-                    className="w-full rounded-md border border-white/10 bg-black px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-white/25"
+                    className={fieldClass()}
                     autoComplete="off"
                   />
                   <button
                     type="button"
                     onClick={() => void deleteKey(row.key)}
                     disabled={saving || (!saved && !row.value)}
-                    className="inline-flex items-center justify-center rounded-md border border-white/10 px-3 py-2 text-zinc-400 hover:border-red-500/30 hover:text-red-300 disabled:opacity-40"
+                    className={buttonClass('ghost', { disabled: saving || (!saved && !row.value) })}
                     title="Delete"
                   >
                     <Trash2 className="h-4 w-4" />
@@ -573,91 +587,97 @@ export function AppSecretsPanel({
               );
             })}
             {drafts.length === 0 && !loading && (
-              <div className="rounded-md border border-dashed border-white/10 px-3 py-6 text-center text-sm text-zinc-500">
-                No secrets detected yet. Paste a .env block above or add keys manually.
-              </div>
+              <EmptyState
+                title="No secrets yet — that's fine"
+                description="Skip this step for a static site or CloudFront blog. Paste a .env block or add keys only if the app needs them."
+              />
             )}
           </div>
 
-          <div className="grid grid-cols-1 gap-2 border-t border-white/10 pt-4 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto]">
+          <div className="grid grid-cols-1 gap-2 border-t border-[var(--dw-border)] pt-4 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto]">
             <input
               value={newKey}
               onChange={(event) => setNewKey(event.target.value)}
               placeholder="NEW_SECRET_KEY"
-              className="w-full rounded-md border border-white/10 bg-[#09090b] px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-white/25"
+              className={fieldClass()}
             />
             <input
               type="password"
               value={newValue}
               onChange={(event) => setNewValue(event.target.value)}
               placeholder="value"
-              className="w-full rounded-md border border-white/10 bg-[#09090b] px-3 py-2 font-mono text-sm text-zinc-200 outline-none focus:border-white/25"
+              className={fieldClass()}
               autoComplete="off"
             />
             <button type="button" onClick={addRow} className={`${secondaryButtonClass(false)} inline-flex items-center justify-center gap-2`}>
               <Plus className="h-4 w-4" /> Add
             </button>
           </div>
-
-          <div className="flex flex-wrap gap-3 pt-2">
-            <button
-              type="button"
-              onClick={() => void saveDrafts()}
-              disabled={saving || !hasAwsCredentials || pendingSaveCount === 0}
-              className={`${secondaryButtonClass(saving || !hasAwsCredentials || pendingSaveCount === 0)} min-w-[140px]`}
-            >
-              {saving ? 'Saving…' : pendingSaveCount > 0 ? `Save ${pendingSaveCount} to AWS` : 'Save to AWS'}
-            </button>
-            <button
-              type="button"
-              onClick={() => void handleContinue()}
-              disabled={!continueEnabled}
-              className={`${accentButtonClass(!continueEnabled)} min-w-[180px]`}
-            >
-              {saving
-                ? 'Saving…'
-                : !hasAwsCredentials
-                  ? 'Re-enter AWS credentials'
-                  : pendingSaveCount > 0
-                    ? 'Save & continue to Deploy'
-                    : 'Continue to Deploy'}
-            </button>
-          </div>
           {proceedBlocker && (
-            <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-              {proceedBlocker}
-            </div>
+            <Callout tone="warn">{proceedBlocker}</Callout>
           )}
-        </Surface>
+        </Panel>
 
         <div className="space-y-4">
-          <Surface>
-            <SurfaceLabel>How it works</SurfaceLabel>
-            <ul className="mt-2 space-y-2 text-xs leading-relaxed text-zinc-400">
-              <li>Paste a full <span className="font-mono text-zinc-300">.env</span> block — rows fill immediately.</li>
-              <li>Use <span className="text-zinc-300">Continue to Deploy</span> anytime — secrets are optional. Save what you have; add more later if needed.</li>
+          <Panel>
+            <SectionLabel>How it works</SectionLabel>
+            <ul className="mt-2 space-y-2 text-[12.5px] leading-relaxed text-[var(--dw-muted)]">
+              <li>Paste a full <span className="font-mono text-[var(--dw-fg-soft)]">.env</span> block — rows fill immediately.</li>
+              <li>Secrets are optional. Use <span className="text-[var(--dw-fg)]">Skip secrets</span> for a blog or CloudFront-only deploy, or continue after saving what you have.</li>
               <li>After save, values stay marked as set (plaintext is cleared from this page).</li>
             </ul>
-          </Surface>
+          </Panel>
           {(publicAppUrl || oauthCallbackPaths.length > 0) && (
-            <Surface>
-              <SurfaceLabel>OAuth callbacks</SurfaceLabel>
+            <Panel>
+              <SectionLabel>OAuth callbacks</SectionLabel>
               {publicAppUrl ? (
-                <p className="mt-2 break-all font-mono text-xs text-zinc-300">{publicAppUrl}</p>
+                <p className="mt-2 break-all font-mono text-[12px] text-[var(--dw-fg-soft)]">{publicAppUrl}</p>
               ) : (
-                <p className="mt-2 text-xs text-zinc-500">Public URL appears on Outputs after the first deploy.</p>
+                <p className="mt-2 text-[12px] text-[var(--dw-muted)]">Public URL appears on Outputs after the first deploy.</p>
               )}
               {oauthCallbackPaths.length > 0 && (
-                <ul className="mt-3 space-y-1 font-mono text-[11px] text-zinc-400">
+                <ul className="mt-3 space-y-1 font-mono text-[11px] text-[var(--dw-muted)]">
                   {oauthCallbackPaths.map((path) => (
                     <li key={path}>{publicAppUrl ? `${publicAppUrl.replace(/\/$/, '')}${path}` : path}</li>
                   ))}
                 </ul>
               )}
-            </Surface>
+            </Panel>
           )}
         </div>
       </div>
+      <StickyActionBar hint={proceedBlocker || (pendingSaveCount > 0 ? `${pendingSaveCount} unsaved value${pendingSaveCount === 1 ? '' : 's'} will be written to AWS on continue. Skip leaves them unsaved.` : 'Secrets are optional. Skip whenever you are ready to deploy.')}>
+        <button
+          type="button"
+          onClick={() => void saveDrafts()}
+          disabled={saving || !hasAwsCredentials || pendingSaveCount === 0}
+          className={secondaryButtonClass(saving || !hasAwsCredentials || pendingSaveCount === 0)}
+        >
+          {saving ? 'Saving…' : pendingSaveCount > 0 ? `Save ${pendingSaveCount} to AWS` : 'Save to AWS'}
+        </button>
+        <button
+          type="button"
+          onClick={() => void handleSkip()}
+          disabled={!continueEnabled}
+          className={secondaryButtonClass(!continueEnabled)}
+        >
+          Skip secrets
+        </button>
+        <button
+          type="button"
+          onClick={() => void handleContinue()}
+          disabled={!continueEnabled}
+          className={accentButtonClass(!continueEnabled)}
+        >
+          {saving
+            ? 'Saving…'
+            : !hasAwsCredentials
+              ? 'Re-enter AWS credentials'
+              : pendingSaveCount > 0
+                ? 'Save & continue to deploy'
+                : 'Continue to deploy'}
+        </button>
+      </StickyActionBar>
     </div>
   );
 }

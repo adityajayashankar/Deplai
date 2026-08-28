@@ -23,9 +23,12 @@
     @not_customization_preview not path /api/customization/preview/*
     header @not_customization_preview X-Frame-Options "DENY"
 
-    # The browser connects to the Agentic Layer only through this WS route.
-    # handle_path strips /agentic so FastAPI still receives /ws/... and /api/....
-    handle_path /agentic/* {
+    # Browser WebSockets only. HTTP Agentic APIs stay on the Docker network
+    # and are called by Connector with X-API-Key. Strip /agentic so FastAPI
+    # still receives /ws/scan|remediate|pipeline/...
+    @agentic_ws path /agentic/ws /agentic/ws/*
+    handle @agentic_ws {
+        uri strip_prefix /agentic
         reverse_proxy agentic-layer:8000
     }
 

@@ -20,7 +20,7 @@ class AutoEc2AppRendererSelectionTests(unittest.TestCase):
         self.assertEqual(normalize_terraform_renderer("deplai_ec2_app"), "deplai_ec2_app")
         self.assertEqual(normalize_terraform_renderer("weird"), "auto")
 
-    def test_auto_selects_node_app_for_ec2_strategy(self) -> None:
+    def test_auto_keeps_enterprise_bundle_for_node_ec2(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "package.json").write_text(
@@ -40,10 +40,8 @@ class AutoEc2AppRendererSelectionTests(unittest.TestCase):
                 user_answers_json={},
             )
 
-            self.assertTrue(selected)
-            self.assertIsNotNone(package)
-            assert package is not None
-            self.assertEqual(package.app_kind, "node")
+            self.assertFalse(selected)
+            self.assertIsNone(package)
 
     def test_auto_skips_static_cloudfront_strategy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -78,7 +76,7 @@ class AutoEc2AppRendererSelectionTests(unittest.TestCase):
         self.assertIsNone(package)
 
 
-    def test_auto_selects_docker_app_for_ec2_strategy(self) -> None:
+    def test_auto_keeps_enterprise_bundle_for_docker_ec2(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "Dockerfile").write_text(
@@ -94,10 +92,8 @@ class AutoEc2AppRendererSelectionTests(unittest.TestCase):
                 repository_context_json={},
                 user_answers_json={},
             )
-            self.assertTrue(selected)
-            self.assertIsNotNone(package)
-            assert package is not None
-            self.assertEqual(package.app_kind, "docker")
+            self.assertFalse(selected)
+            self.assertIsNone(package)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import ThemeToggle from '@/components/theme-toggle';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { PopupProvider, usePopup } from '@/components/popup';
+import { LOGIN_HREF } from '@/lib/auth-providers';
 
 interface FileItem {
   name: string;
@@ -91,14 +92,14 @@ function RepositoryBrowserContent() {
       const session = await res.json();
       
       if (!session.isLoggedIn) {
-        router.push('/');
+        router.push(LOGIN_HREF);
         return;
       }
       
       setAuthLoading(false);
     } catch (error) {
       console.error('Auth check failed:', error);
-      router.push('/');
+      router.push(LOGIN_HREF);
     }
   }
 

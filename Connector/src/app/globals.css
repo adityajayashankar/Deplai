@@ -1,8 +1,10 @@
 /* Import custom fonts */
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans:ital,wght@0,100..900;1,100..900&display=swap');
 @import url('https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wdth,wght@0,75..100,400..700;1,75..100,400..700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@100..900&display=swap');
 
 @import "../../node_modules/tailwindcss/index.css";
+@import "../../node_modules/tw-animate-css/dist/tw-animate.css";
 
 @custom-variant dark (&:where(.dark, .dark *));
 
@@ -73,6 +75,49 @@
   line-height: 1;
 }
 
+.compute-landing.noise-overlay {
+  position: relative;
+}
+
+.compute-landing.noise-overlay::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  opacity: 0.03;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* The auth screens (login, signup, forgot password, thank you) ship with their
+   own dark token set from the auth UI kit. Scoping them the same way as
+   .compute-landing keeps the kit's design intact without leaking into the
+   authenticated dashboard. */
+.deplai-auth {
+  --background: oklch(0 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.1 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.1 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.985 0 0);
+  --primary-foreground: oklch(0 0 0);
+  --secondary: oklch(0.18 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.18 0 0);
+  --muted-foreground: oklch(0.6 0 0);
+  --accent: oklch(0.18 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(0.25 0 0);
+  --input: oklch(0.18 0 0);
+  --ring: oklch(0.5 0 0);
+  color: var(--foreground);
+  background: var(--background);
+  font-family: 'Geist', system-ui, sans-serif;
+}
+
 @theme inline {
   --color-card: var(--card);
   --color-card-foreground: var(--card-foreground);
@@ -86,8 +131,650 @@
   --color-muted-foreground: var(--muted-foreground);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
   --color-input: var(--input);
   --color-ring: var(--ring);
+}
+
+/* Signed-in product: dark chrome (nav/header) + white paper workspace. */
+.deplai-app {
+  --app-canvas: oklch(0.06 0.008 260);
+  --app-canvas-raised: oklch(0.09 0.008 260);
+  --app-fg: #111111;
+  --app-muted: #525252;
+  --app-hairline: #000000;
+  --app-ink: #000000;
+  --app-paper: #ffffff;
+  --app-sheet: #ffffff;
+  --app-hatch: repeating-linear-gradient(
+    45deg,
+    #ffffff 0 10px,
+    #f2f2f2 10px 20px
+  );
+  --app-shadow: 6px 6px 0 0 #000000;
+  --app-shadow-sm: 3px 3px 0 0 #000000;
+  --font-sans: 'Instrument Sans', 'Noto Sans', system-ui, sans-serif;
+  --font-display: 'Space Grotesk', 'Avenir Next', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --background: #ffffff;
+  --foreground: #111111;
+  --surface: #ffffff;
+  --surface-alt: #ffffff;
+  --card: #ffffff;
+  --border: #000000;
+  --muted: #525252;
+  color: var(--app-fg);
+  background: var(--app-sheet);
+  color-scheme: light;
+  font-family: var(--font-sans);
+}
+
+.deplai-app h1,
+.deplai-app h2,
+.deplai-app h3,
+.deplai-app .font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+}
+
+.deplai-app .font-mono,
+.deplai-app code,
+.deplai-app kbd {
+  font-family: var(--font-mono);
+}
+
+.deplai-app .workspace-nav,
+.deplai-app .workspace-command-header {
+  color-scheme: dark;
+}
+
+.deplai-app .app-paper,
+.sec-paper-card {
+  background-color: #ffffff !important;
+  background-image: var(--app-hatch, repeating-linear-gradient(45deg, #ffffff 0 10px, #f2f2f2 10px 20px)) !important;
+  color: #000000;
+  border: 3px solid #000000;
+  border-radius: 0;
+  box-shadow: 6px 6px 0 0 #000000;
+}
+
+/* Page copy inside the scrollable workspace sits on white paper. */
+.deplai-app .custom-scrollbar .text-white {
+  color: #000000;
+}
+
+.deplai-app .custom-scrollbar .text-white\/40,
+.deplai-app .custom-scrollbar .placeholder\:text-white\/40::placeholder {
+  color: rgb(0 0 0 / 0.4);
+}
+
+.deplai-app .custom-scrollbar .text-white\/55,
+.deplai-app .custom-scrollbar .text-white\/60 {
+  color: rgb(0 0 0 / 0.55);
+}
+
+.deplai-app .custom-scrollbar .border-white,
+.deplai-app .custom-scrollbar .border-white\/10,
+.deplai-app .custom-scrollbar .border-white\/20 {
+  border-color: #000000;
+}
+
+.deplai-app .custom-scrollbar .bg-black,
+.deplai-app .custom-scrollbar .bg-black.text-white,
+.deplai-app .custom-scrollbar .bg-black .text-white,
+.deplai-app .custom-scrollbar .bg-rose-600,
+.deplai-app .custom-scrollbar .bg-rose-600.text-white,
+.deplai-app .custom-scrollbar .bg-rose-500.text-white {
+  color: #ffffff;
+}
+
+.deplai-app .app-paper .text-white,
+.deplai-app .app-paper .text-zinc-50,
+.deplai-app .app-paper .text-zinc-100,
+.deplai-app .app-paper .text-zinc-200,
+.deplai-app .app-paper .text-slate-50,
+.deplai-app .app-paper .text-slate-100,
+.deplai-app .app-paper .text-slate-200,
+.deplai-app .app-paper .text-\[\#F4EBD0\],
+.deplai-app .app-paper .text-\[\#FFF8E6\],
+.deplai-app .app-paper .text-\[\#E7DCC2\] {
+  color: var(--app-ink);
+}
+
+.deplai-app .app-paper .text-zinc-300,
+.deplai-app .app-paper .text-zinc-400,
+.deplai-app .app-paper .text-slate-300,
+.deplai-app .app-paper .text-\[\#C4B99E\],
+.deplai-app .app-paper .text-\[\#8E856F\] {
+  color: #444444;
+}
+
+.deplai-app .app-paper .bg-black,
+.deplai-app .app-paper .bg-black.text-white,
+.deplai-app .app-paper .bg-rose-600,
+.deplai-app .app-paper .bg-rose-500 {
+  color: #ffffff;
+}
+
+.deplai-app .app-paper .bg-black .text-white,
+.deplai-app .app-paper .bg-rose-600 .text-white,
+.deplai-app .app-paper .bg-rose-500 .text-white {
+  color: #ffffff;
+}
+
+.deplai-app .app-paper .border-white\/10,
+.deplai-app .app-paper .border-white\/20,
+.deplai-app .app-paper .border-white\/\[0\.08\],
+.deplai-app .app-paper .border-white\/\[0\.1\],
+.deplai-app .app-paper .border-\[\#322F26\] {
+  border-color: #000000;
+}
+
+.deplai-app .custom-scrollbar::-webkit-scrollbar-track {
+  background: #ffffff;
+}
+
+.deplai-app .custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #1a1a1a;
+  border-radius: 999px;
+  border: 3px solid #ffffff;
+  background-clip: padding-box;
+}
+
+/* Deploy / security / customizer leftover dark utilities → paper sheet. */
+.deplai-app .security-workspace,
+.deplai-app .customization-workspace,
+.deplai-app .instances-workspace {
+  --background: #ffffff;
+  --foreground: #111111;
+  --surface: #ffffff;
+  --card: #ffffff;
+  --border: #000000;
+  color: #111111;
+  background: #ffffff;
+}
+
+.deplai-app .security-workspace .text-white,
+.deplai-app .customization-workspace .text-white,
+.deplai-app .instances-workspace .text-white,
+.deplai-app .security-workspace .text-zinc-50,
+.deplai-app .customization-workspace .text-zinc-50,
+.deplai-app .instances-workspace .text-zinc-50,
+.deplai-app .security-workspace .text-zinc-100,
+.deplai-app .customization-workspace .text-zinc-100,
+.deplai-app .instances-workspace .text-zinc-100,
+.deplai-app .security-workspace .text-zinc-200,
+.deplai-app .customization-workspace .text-zinc-200,
+.deplai-app .instances-workspace .text-zinc-200 {
+  color: #111111;
+}
+
+.deplai-app .security-workspace .text-zinc-300,
+.deplai-app .customization-workspace .text-zinc-300,
+.deplai-app .instances-workspace .text-zinc-300 {
+  color: #333333;
+}
+
+.deplai-app .security-workspace .text-zinc-400,
+.deplai-app .customization-workspace .text-zinc-400,
+.deplai-app .instances-workspace .text-zinc-400,
+.deplai-app .security-workspace .text-white\/40,
+.deplai-app .customization-workspace .text-white\/40,
+.deplai-app .instances-workspace .text-white\/40,
+.deplai-app .security-workspace .text-white\/50,
+.deplai-app .security-workspace .text-white\/55,
+.deplai-app .security-workspace .text-white\/60 {
+  color: #525252;
+}
+
+.deplai-app .security-workspace .bg-black .text-zinc-300,
+.deplai-app .security-workspace .bg-black .text-zinc-400,
+.deplai-app .security-workspace .bg-black .text-zinc-500,
+.deplai-app .security-workspace .bg-black .text-neutral-500,
+.deplai-app .security-workspace .bg-black .text-neutral-600,
+.deplai-app .customization-workspace .bg-black .text-zinc-300,
+.deplai-app .customization-workspace .bg-black .text-zinc-400,
+.deplai-app .customization-workspace .bg-black .text-zinc-500,
+.deplai-app .instances-workspace .bg-black .text-zinc-300,
+.deplai-app .instances-workspace .bg-black .text-zinc-400,
+.deplai-app .instances-workspace .bg-black .text-zinc-500 {
+  color: #e5e5e5 !important;
+}
+
+.deplai-app .security-workspace .border-white\/10,
+.deplai-app .customization-workspace .border-white\/10,
+.deplai-app .instances-workspace .border-white\/10,
+.deplai-app .security-workspace .border-white\/8,
+.deplai-app .customization-workspace .border-white\/8,
+.deplai-app .customization-workspace .border-white\/7,
+.deplai-app .security-workspace .border-white\/15,
+.deplai-app .customization-workspace .border-white\/15,
+.deplai-app .security-workspace .border-\[\#1A1A1A\],
+.deplai-app .instances-workspace .border-\[\#1A1A1A\],
+.deplai-app .security-workspace .border-\[\#262626\],
+.deplai-app .instances-workspace .border-\[\#262626\],
+.deplai-app .instances-workspace .border-\[\#333333\] {
+  border-color: #000000;
+}
+
+.deplai-app .security-workspace .bg-\[\#050505\],
+.deplai-app .security-workspace .bg-\[\#0d0d10\],
+.deplai-app .security-workspace .bg-\[\#000000\],
+.deplai-app .security-workspace .bg-\[\#111111\],
+.deplai-app .security-workspace .bg-\[\#080808\],
+.deplai-app .instances-workspace .bg-\[\#050505\],
+.deplai-app .instances-workspace .bg-\[\#0b0f14\],
+.deplai-app .instances-workspace .bg-\[\#000000\],
+.deplai-app .instances-workspace .bg-\[\#111111\],
+.deplai-app .instances-workspace .bg-\[\#0A0A0A\],
+.deplai-app .customization-workspace .bg-\[\#09090b\],
+.deplai-app .customization-workspace .bg-\[\#0d0d10\],
+.deplai-app .customization-workspace .bg-\[\#0d0d0f\],
+.deplai-app .customization-workspace .bg-\[\#0c0c0f\],
+.deplai-app .customization-workspace .bg-\[\#0c0c0e\],
+.deplai-app .customization-workspace .bg-\[\#0b0b0d\],
+.deplai-app .customization-workspace .bg-\[\#0a0a0c\],
+.deplai-app .customization-workspace .bg-\[\#0a0a0b\],
+.deplai-app .customization-workspace .bg-\[\#111113\] {
+  background-color: #ffffff;
+}
+
+.deplai-app .security-workspace .bg-black,
+.deplai-app .customization-workspace .bg-black,
+.deplai-app .instances-workspace .bg-black,
+.deplai-app .security-workspace .bg-black.text-white,
+.deplai-app .customization-workspace .bg-black.text-white,
+.deplai-app .instances-workspace .bg-black.text-white,
+.deplai-app .security-workspace .bg-black .text-white,
+.deplai-app .customization-workspace .bg-black .text-white,
+.deplai-app .instances-workspace .bg-black .text-white {
+  color: #ffffff !important;
+  background-color: #000000;
+}
+
+.deplai-app .instances-workspace .hover\:text-white:hover,
+.deplai-app .security-workspace .hover\:text-white:hover,
+.deplai-app .customization-workspace .hover\:text-white:hover {
+  color: #111111;
+}
+
+.deplai-app .instances-workspace .bg-black.hover\:text-white:hover,
+.deplai-app .security-workspace .bg-black.hover\:text-white:hover,
+.deplai-app .customization-workspace .bg-black.hover\:text-white:hover,
+.deplai-app .instances-workspace .hover\:bg-white:hover {
+  color: #ffffff;
+}
+
+.deplai-app .instances-workspace .hover\:bg-white:hover {
+  color: #000000;
+  background-color: #ffffff;
+}
+
+.deplai-app .security-workspace .bg-\[\#101012\],
+.deplai-app .security-workspace .bg-\[\#101012\]\/90 {
+  background-color: #ffffff;
+}
+
+.deplai-app .security-workspace .bg-lime-300 {
+  background-color: #000000 !important;
+  color: #ffffff !important;
+}
+
+.deplai-app .customization-workspace .bg-lime-700,
+.deplai-app .customization-workspace .bg-lime-600 {
+  background-color: #000000 !important;
+  color: #ffffff !important;
+}
+
+.deplai-app .security-workspace .text-lime-300,
+.deplai-app .customization-workspace .text-lime-300,
+.deplai-app .security-workspace .text-lime-200,
+.deplai-app .customization-workspace .text-lime-200,
+.deplai-app .security-workspace .text-lime-100,
+.deplai-app .customization-workspace .text-lime-100 {
+  color: #3f6212;
+}
+
+.deplai-app .workspace-command-header {
+  background-color: var(--app-canvas, #05060a) !important;
+  color: #ffffff;
+  color-scheme: dark;
+}
+
+.deplai-app .workspace-command-header .text-white,
+.deplai-app .workspace-command-header .text-zinc-100,
+.deplai-app .workspace-command-header .font-display,
+.deplai-app .workspace-command-header .font-semibold {
+  color: #ffffff !important;
+}
+
+.deplai-app .workspace-command-header .text-zinc-300,
+.deplai-app .workspace-command-header .text-zinc-500,
+.deplai-app .workspace-command-header .text-zinc-600,
+.deplai-app .workspace-command-header .text-white\/40 {
+  color: rgb(255 255 255 / 0.55) !important;
+}
+
+.deplai-app .workspace-command-header .border-white\/10,
+.deplai-app .workspace-command-header .border-white\/20,
+.deplai-app .workspace-command-header .border-white\/\[0\.06\],
+.deplai-app .workspace-command-header .border-white\/\[0\.07\] {
+  border-color: rgb(255 255 255 / 0.2) !important;
+}
+
+.deplai-app .sec-terminal,
+.deplai-app .dw-panel-recessed {
+  background-color: #0d1117 !important;
+  color: #e6edf3 !important;
+  color-scheme: dark;
+  --dw-fg: #e6edf3;
+  --dw-fg-soft: #c9d1d9;
+  --dw-muted: #8b949e;
+  --dw-faint: #8b949e;
+  --dw-accent: #f0f6fc;
+  --dw-ok: #3fb950;
+  --dw-warn: #d29922;
+  --dw-danger: #f85149;
+  --dw-info: #58a6ff;
+  --dw-agent: #e6edf3;
+}
+
+.deplai-app .sec-terminal .text-white,
+.deplai-app .sec-terminal .text-zinc-100,
+.deplai-app .sec-terminal .text-zinc-200,
+.deplai-app .sec-terminal .text-zinc-300 {
+  color: #e6edf3 !important;
+}
+
+.deplai-app .sec-terminal .text-lime-300 {
+  color: #bef264 !important;
+}
+
+/* Auth kit animations (confetti on the thank-you screen, drifting gradient
+   orbs on the auth side panel). */
+@keyframes auth-confetti-fall {
+  0% {
+    transform: translateY(0) rotate(0deg);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(100vh) rotate(720deg);
+    opacity: 0;
+  }
+}
+
+.deplai-auth .animate-confetti,
+.animate-confetti {
+  animation: auth-confetti-fall 3s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards;
+}
+
+@keyframes auth-gradient-shift {
+  0%, 100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+.deplai-auth .animate-gradient {
+  background-size: 200% 200%;
+  animation: auth-gradient-shift 15s ease infinite;
+}
+
+/* ── Deployment workspace ────────────────────────────────────────────────────
+   Same hybrid as the rest of the signed-in product: white paper canvas,
+   3px black borders, hard offset shadows. Recessed surfaces stay dark so
+   logs and terminals remain readable. */
+.deployment-workspace {
+  --font-sans: 'Instrument Sans', 'Noto Sans', sans-serif;
+  --font-display: 'Space Grotesk', 'Avenir Next', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --dw-canvas: #ffffff;
+  --dw-canvas-raised: #ffffff;
+  --dw-recessed: #0d1117;
+  --dw-panel: #ffffff;
+  --dw-panel-raised: #ffffff;
+  --dw-panel-hover: #f4f4f5;
+
+  --dw-border: #000000;
+  --dw-border-strong: #000000;
+  --dw-highlight: transparent;
+
+  --dw-fg: #111111;
+  --dw-fg-soft: #444444;
+  --dw-muted: #525252;
+  --dw-faint: #525252;
+
+  --dw-accent: #000000;
+  --dw-accent-soft: #f4f4f5;
+  --dw-accent-line: #000000;
+  --dw-accent-glow: transparent;
+
+  --dw-ok: #15803d;
+  --dw-warn: #a16207;
+  --dw-danger: #be123c;
+  --dw-info: #1d4ed8;
+  --dw-agent: #111111;
+
+  --dw-shadow-sm: 3px 3px 0 0 #000000;
+  --dw-shadow: 6px 6px 0 0 #000000;
+  --dw-shadow-lg: 6px 6px 0 0 #000000;
+
+  color: var(--dw-fg);
+  background: var(--dw-canvas);
+  color-scheme: light;
+  font-family: var(--font-sans);
+}
+
+.deployment-workspace h1,
+.deployment-workspace h2,
+.deployment-workspace h3 {
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+}
+
+.deployment-workspace .font-mono,
+.deployment-workspace code,
+.deployment-workspace pre {
+  font-family: var(--font-mono);
+}
+
+/* Paper panel: hatched sheet, 3px black border, hard offset shadow. */
+.deployment-workspace .dw-panel {
+  position: relative;
+  background-color: var(--dw-panel);
+  background-image: var(--app-hatch, repeating-linear-gradient(45deg, #ffffff 0 10px, #f2f2f2 10px 20px));
+  border: 3px solid var(--dw-border);
+  border-radius: 0;
+  backdrop-filter: none;
+  box-shadow: var(--dw-shadow);
+}
+
+.deployment-workspace .dw-panel::before {
+  display: none;
+}
+
+.deployment-workspace .dw-panel-raised {
+  background-color: var(--dw-panel-raised);
+  box-shadow: var(--dw-shadow);
+}
+
+.deployment-workspace .dw-panel-recessed {
+  background: var(--dw-recessed);
+  color: #e6edf3;
+  border: 3px solid var(--dw-border);
+  border-radius: 0;
+  box-shadow: var(--dw-shadow-sm);
+  color-scheme: dark;
+  --dw-fg: #e6edf3;
+  --dw-fg-soft: #c9d1d9;
+  --dw-muted: #8b949e;
+  --dw-faint: #8b949e;
+  --dw-accent: #f0f6fc;
+  --dw-ok: #3fb950;
+  --dw-warn: #d29922;
+  --dw-danger: #f85149;
+  --dw-info: #58a6ff;
+  --dw-agent: #e6edf3;
+}
+
+.deployment-workspace .dw-panel-recessed::before {
+  display: none;
+}
+
+.deployment-workspace .dw-glow {
+  box-shadow: var(--dw-shadow);
+}
+
+.deployment-workspace .dw-scrollbar,
+.deployment-workspace .dw-panel-recessed.dw-scrollbar {
+  scrollbar-width: auto;
+  scrollbar-color: #111111 #ffffff;
+}
+
+/* Terraform / file viewer: always black type on white paper, never inherit
+   recessed terminal colors. */
+.deployment-workspace .dw-code-surface,
+.deployment-workspace .dw-code-surface textarea,
+.deployment-workspace .dw-code-surface pre {
+  color: #111111 !important;
+  background-color: #ffffff !important;
+  background-image: none !important;
+  color-scheme: light;
+}
+
+.deployment-workspace .dw-code-surface textarea::placeholder {
+  color: #525252 !important;
+  opacity: 1;
+}
+
+/* Legacy scrollbar hook kept so existing markup keeps a styled scrollbar. */
+.deployment-scrollbar {
+  scrollbar-width: auto;
+  scrollbar-color: #111111 #ffffff;
+}
+
+/* Stage transition: content rises and fades as the stage changes. */
+@keyframes dw-stage-enter {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.deployment-workspace .dw-stage-enter {
+  animation: dw-stage-enter 0.34s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Shimmer used by loading skeletons. */
+@keyframes dw-shimmer {
+  from {
+    background-position: -180% 0;
+  }
+  to {
+    background-position: 180% 0;
+  }
+}
+
+.deployment-workspace .dw-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.03) 0%,
+    rgba(255, 255, 255, 0.09) 50%,
+    rgba(255, 255, 255, 0.03) 100%
+  );
+  background-size: 180% 100%;
+  animation: dw-shimmer 1.6s ease-in-out infinite;
+}
+
+/* Indeterminate progress sweep. */
+@keyframes dw-progress-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+.deployment-workspace .dw-progress-sweep {
+  animation: dw-progress-sweep 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+/* Blinking caret at the tail of a streaming log. */
+@keyframes dw-caret {
+  0%, 45% {
+    opacity: 1;
+  }
+  50%, 95% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.deployment-workspace .dw-caret {
+  animation: dw-caret 1.1s steps(1, end) infinite;
+}
+
+/* Slow pulse for live status dots. */
+@keyframes dw-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.85);
+  }
+}
+
+.deployment-workspace .dw-pulse {
+  animation: dw-pulse 1.8s ease-in-out infinite;
+}
+
+/* Live terminals/logs must not steal the page scroller via CSS overflow-anchor. */
+.deployment-workspace .dw-no-scroll-anchor {
+  overflow-anchor: none;
+}
+
+/* Halo ring that radiates from a live status dot. */
+@keyframes dw-ping {
+  0% {
+    opacity: 0.5;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(2.4);
+  }
+}
+
+.deployment-workspace .dw-ping {
+  animation: dw-ping 1.8s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .deployment-workspace *,
+  .deployment-workspace *::before,
+  .deployment-workspace *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .deployment-workspace .dw-edge-packet {
+    display: none;
+  }
 }
 
 @media (prefers-color-scheme: dark) {
@@ -142,6 +829,94 @@ body {
   font-family: 'Noto Sans', sans-serif;
 }
 
+body:has(.deplai-app) {
+  background: #ffffff;
+  color: #111111;
+}
+
+html {
+  color-scheme: light;
+  scrollbar-width: auto;
+  scrollbar-color: #111111 #ffffff;
+}
+
+.compute-landing,
+.deplai-auth {
+  color-scheme: dark;
+}
+
+/* Black scrollbar everywhere: white track, charcoal pill thumb, black arrows. */
+*,
+*::before,
+*::after {
+  scrollbar-width: auto;
+  scrollbar-color: #111111 #ffffff;
+}
+
+::-webkit-scrollbar {
+  width: 14px;
+  height: 14px;
+}
+
+::-webkit-scrollbar-track {
+  background: #ffffff;
+  border-left: 1px solid #000000;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1a1a1a;
+  border-radius: 999px;
+  border: 3px solid #ffffff;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #000000;
+  border: 3px solid #ffffff;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: #ffffff;
+}
+
+::-webkit-scrollbar-button:single-button {
+  display: block;
+  background-color: #ffffff;
+  background-repeat: no-repeat;
+  background-position: center;
+  border-left: 1px solid #000000;
+}
+
+::-webkit-scrollbar-button:single-button:vertical:decrement {
+  height: 14px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='6' viewBox='0 0 8 6'%3E%3Cpath fill='%23000' d='M4 0L8 6H0z'/%3E%3C/svg%3E");
+}
+
+::-webkit-scrollbar-button:single-button:vertical:increment {
+  height: 14px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='6' viewBox='0 0 8 6'%3E%3Cpath fill='%23000' d='M0 0h8L4 6z'/%3E%3C/svg%3E");
+}
+
+::-webkit-scrollbar-button:single-button:horizontal:decrement {
+  width: 14px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='6' height='8' viewBox='0 0 6 8'%3E%3Cpath fill='%23000' d='M6 0v8L0 4z'/%3E%3C/svg%3E");
+}
+
+::-webkit-scrollbar-button:single-button:horizontal:increment {
+  width: 14px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='6' height='8' viewBox='0 0 6 8'%3E%3Cpath fill='%23000' d='M0 0l6 4-6 4z'/%3E%3C/svg%3E");
+}
+
+.custom-scrollbar,
+.customization-scrollbar,
+.deployment-scrollbar,
+.dw-scrollbar,
+.monitor-terminal {
+  scrollbar-width: auto;
+  scrollbar-color: #111111 #ffffff;
+}
+
 @keyframes landing-progress {
   from { width: 0%; }
   to { width: 100%; }
@@ -166,9 +941,48 @@ body {
   animation: landing-fade-slide-in 0.5s ease-out forwards;
 }
 
-.compute-landing .landing-text-stroke {
+.compute-landing .landing-text-stroke,
+.compute-landing .text-stroke {
   -webkit-text-stroke: 1.5px currentColor;
   -webkit-text-fill-color: transparent;
+}
+
+.compute-landing .marquee {
+  animation: landing-marquee 30s linear infinite;
+}
+
+.compute-landing .marquee-reverse {
+  animation: landing-marquee-reverse 25s linear infinite;
+}
+
+@keyframes landing-marquee {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+@keyframes landing-marquee-reverse {
+  0% { transform: translateX(-50%); }
+  100% { transform: translateX(0); }
+}
+
+.compute-landing .animate-char-in {
+  animation: landing-char-in 0.5s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  opacity: 0;
+  filter: blur(40px);
+  transform: translateY(100%);
+}
+
+@keyframes landing-char-in {
+  0% {
+    opacity: 0;
+    filter: blur(40px);
+    transform: translateY(100%);
+  }
+  100% {
+    opacity: 1;
+    filter: blur(0);
+    transform: translateY(0);
+  }
 }
 
 @keyframes flowLine {
@@ -236,4 +1050,64 @@ body {
     grid-template-columns: repeat(5, minmax(0, 1fr));
   }
 }
+
+/* Signed-in theme invert. Greyscale paper/chrome swap; colored badges keep hue.
+   Preview iframes, images, video, and canvases are double-inverted so they stay true. */
+html[data-deplai-theme="inverted"] .deplai-app {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+html[data-deplai-theme="inverted"] .deplai-app img,
+html[data-deplai-theme="inverted"] .deplai-app video,
+html[data-deplai-theme="inverted"] .deplai-app iframe,
+html[data-deplai-theme="inverted"] .deplai-app canvas,
+html[data-deplai-theme="inverted"] .deplai-app .theme-invert-exempt {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+html[data-deplai-theme="inverted"] body:has(.deplai-app) {
+  background: #000000;
+  color: #f4f4f5;
+}
+
+html:has(.deplai-app) {
+  --deplai-density: 1;
+  --deplai-type: 1;
+  font-size: calc(16px * var(--deplai-density) * var(--deplai-type));
+}
+
+html[data-density="comfortable"]:has(.deplai-app) { --deplai-density: 1.08; }
+html[data-density="compact"]:has(.deplai-app) { --deplai-density: 0.9; }
+html[data-font-size="small"]:has(.deplai-app) { --deplai-type: 0.9; }
+html[data-font-size="large"]:has(.deplai-app) { --deplai-type: 1.12; }
+
+html[data-reduced-motion="1"] .deplai-app *,
+html[data-reduced-motion="1"] .deplai-app *::before,
+html[data-reduced-motion="1"] .deplai-app *::after {
+  animation: none !important;
+  transition: none !important;
+  scroll-behavior: auto !important;
+}
+
+html[data-high-contrast="1"] .deplai-app {
+  background: #ffffff;
+  color: #000000;
+}
+
+html[data-high-contrast="1"] .deplai-app .app-paper,
+html[data-high-contrast="1"] .deplai-app input,
+html[data-high-contrast="1"] .deplai-app select,
+html[data-high-contrast="1"] .deplai-app textarea,
+html[data-high-contrast="1"] .deplai-app button {
+  border-color: #000000;
+  border-width: 3px;
+}
+
+html[data-high-contrast="1"] .deplai-app .text-zinc-500,
+html[data-high-contrast="1"] .deplai-app .text-zinc-600,
+html[data-high-contrast="1"] .deplai-app .text-neutral-500,
+html[data-high-contrast="1"] .deplai-app .text-neutral-600 {
+  color: #111111;
+}
+
 

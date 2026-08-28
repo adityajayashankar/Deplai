@@ -1,6 +1,8 @@
 'use client';
 
 import { createContext, useContext, useState, useRef, useCallback, useMemo, useEffect } from 'react';
+import { createWorkspaceSession, persistSessionProgress } from '@/lib/sessions/client';
+import type { SessionLogLevel, SessionStatus } from '@/lib/sessions/types';
 
 const WS_BASE_URL = (process.env.NEXT_PUBLIC_AGENTIC_WS_URL || '').trim();
 const SCAN_CONTEXT_STORAGE_KEY = 'deplai.scan-context.v1';
@@ -10,6 +12,20 @@ const MAX_STORED_REMEDIATION_MESSAGES = 160;
 const MAX_STORED_MESSAGE_CONTENT_CHARS = 2_000;
 const WEBSOCKET_CONNECT_TIMEOUT_MS = 15_000;
 
+function scanMessageLevel(type: string): SessionLogLevel {
+  if (type === 'error') return 'error';
+  if (type === 'warning') return 'warn';
+  return 'info';
+}
+
+function operationToSessionStatus(state: string): SessionStatus | null {
+  if (state === 'running') return 'running';
+  if (state === 'completed') return 'completed';
+  if (state === 'error') return 'failed';
+  if (state === 'waiting_decision' || state === 'waiting_approval') return 'needs_review';
+  return null;
+}
+
 type OperationState = 'idle' | 'running' | 'waiting_decision' | 'waiting_approval' | 'completed' | 'error';
 export type ScanState = OperationState;
 export type RemediationState = OperationState;
@@ -17,7 +33,7 @@ export type VulnStatus = 'not_initiated' | 'found' | 'not_found';
 
 export interface CachedScanResults {
   status: VulnStatus;
-  data: { supply_chain: unknown[]; code_security: unknown[] } | null;
+  data: unknown;
 }
 
 export interface ScanMessage {
@@ -53,7 +69,7 @@ interface PersistedScanContextSnapshot {
 }
 
 interface ScanContextValue {
-  startScan: (projectId: string, projectName: string) => Promise<void>;
+  startScan: (projectId: string, projectName: string, options?: { preserveRemediation?: boolean }) => Promise<void>;
   getScanState: (projectId: string) => ProjectScanState;
   activeScanIds: string[];
   resetAll: () => void;
@@ -64,6 +80,7 @@ interface ScanContextValue {
     llmApiKey?: string,
     llmModel?: string,
     remediationScope?: 'major' | 'all',
+    accessMode?: 'platform' | 'byok' | 'auto',
   ) => Promise<void>;
   continueRemediationRound: (projectId: string) => void;
   pushCurrentRemediationChanges: (projectId: string) => void;
@@ -115,12 +132,17 @@ function browserWsFallbackBase(): string {
   return `${protocol}//${window.location.host}`;
 }
 
+function isMixedContentWs(wsBase: string): boolean {
+  if (typeof window === 'undefined') return false;
+  return window.location.protocol === 'https:' && wsBase.startsWith('ws://');
+}
+
+function sameOriginAgenticBase(): string {
+  return `${normalizeWsBase(browserWsFallbackBase())}/agentic`;
+}
+
 async function resolveWsBaseUrl(): Promise<string> {
-  if (resolvedWsBaseCache) return resolvedWsBaseCache;
-  if (WS_BASE_URL) {
-    resolvedWsBaseCache = normalizeWsBase(WS_BASE_URL);
-    return resolvedWsBaseCache;
-  }
+  if (resolvedWsBaseCache && !isMixedContentWs(resolvedWsBaseCache)) return resolvedWsBaseCache;
   if (wsBaseFetchInFlight) return wsBaseFetchInFlight;
 
   wsBaseFetchInFlight = (async () => {
@@ -128,16 +150,21 @@ async function resolveWsBaseUrl(): Promise<string> {
       const res = await fetch('/api/pipeline/ws-config', { cache: 'no-store' });
       if (res.ok) {
         const data = await res.json() as { ws_base?: string };
-        const fromServer = String(data.ws_base || '').trim();
-        if (fromServer) {
-          resolvedWsBaseCache = normalizeWsBase(fromServer);
+        const fromServer = normalizeWsBase(String(data.ws_base || '').trim());
+        if (fromServer && !isMixedContentWs(fromServer)) {
+          resolvedWsBaseCache = fromServer;
           return resolvedWsBaseCache;
         }
       }
     } catch {
       // ignore and fallback
     }
-    resolvedWsBaseCache = normalizeWsBase(browserWsFallbackBase());
+    const publicWs = normalizeWsBase(WS_BASE_URL);
+    if (publicWs.endsWith('/agentic') && !isMixedContentWs(publicWs)) {
+      resolvedWsBaseCache = publicWs;
+      return resolvedWsBaseCache;
+    }
+    resolvedWsBaseCache = sameOriginAgenticBase();
     return resolvedWsBaseCache;
   })();
 
@@ -146,6 +173,24 @@ async function resolveWsBaseUrl(): Promise<string> {
   } finally {
     wsBaseFetchInFlight = null;
   }
+}
+
+function messagesIndicateSettledScan(messages: ScanMessage[]): boolean {
+  const latest = new Map<string, string>();
+  for (const message of messages) {
+    if (message.type !== 'module') continue;
+    try {
+      const payload = JSON.parse(message.content) as { module?: string; status?: string };
+      if (payload.module && payload.status) latest.set(payload.module, payload.status);
+    } catch {
+      // Ignore malformed live module payloads.
+    }
+  }
+  if (latest.size === 0) return false;
+  const terminal = new Set(['COMPLETED', 'FAILED', 'SKIPPED', 'CANCELLED', 'TIMED OUT']);
+  const statuses = [...latest.values()];
+  return statuses.every((status) => terminal.has(status))
+    && statuses.some((status) => status === 'COMPLETED' || status === 'FAILED');
 }
 
 function connectWebSocket(
@@ -158,7 +203,7 @@ function connectWebSocket(
   onClose: (projectId: string, detail?: { code?: number; reason?: string }) => void,
   wsToken: string,
 ): WebSocket {
-  const base = `${normalizeWsBase(wsBaseUrl)}${path}/${projectId}`;
+  const base = `${normalizeWsBase(wsBaseUrl)}${path}/${encodeURIComponent(projectId)}`;
   const workflowLabel = path.includes('/remediate') ? 'remediation' : 'scan';
   const ws = new WebSocket(wsToken ? `${base}?token=${encodeURIComponent(wsToken)}` : base);
   let opened = false;
@@ -308,6 +353,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
   const [storageHydrated, setStorageHydrated] = useState(false);
   const wsRefs = useRef<Record<string, WebSocket>>({});
   const remWsRefs = useRef<Record<string, WebSocket>>({});
+  const securitySessionIdsRef = useRef<Record<string, string>>({});
 
   const trimMessages = useCallback((messages: ScanMessage[]) => {
     return trimMessageList(messages);
@@ -321,10 +367,14 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     const out: Record<string, ProjectScanState> = {};
     for (const [projectId, state] of Object.entries(input || {})) {
       if (!projectId || !state) continue;
+      const restored = state.state || 'idle';
+      const wasOrphanedRun = restored === 'running';
       out[projectId] = {
-        state: state.state || 'idle',
+        // Restored "running" is leftover from a previous visit, not a live websocket.
+        // Drop it so Security Agent opens idle until the user clicks Scan.
+        state: wasOrphanedRun ? 'idle' : restored,
         projectName: String(state.projectName || ''),
-        messages: trimMessages(Array.isArray(state.messages) ? state.messages : []),
+        messages: wasOrphanedRun ? [] : trimMessages(Array.isArray(state.messages) ? state.messages : []),
       };
     }
     return clampMapSize(out);
@@ -428,6 +478,17 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       if (!existing) return prev;
       return { ...prev, [projectId]: { ...existing, messages: trimMessages([...existing.messages, message]) } };
     });
+    const sessionId = securitySessionIdsRef.current[projectId];
+    if (sessionId && message.content) {
+      persistSessionProgress(sessionId, {
+        line: {
+          level: scanMessageLevel(message.type),
+          message: message.content,
+          ts: message.timestamp,
+          stage: 'scan',
+        },
+      });
+    }
   }, [trimMessages]);
 
   const updateScanStatus = useCallback((projectId: string, status: string) => {
@@ -436,54 +497,84 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       if (!existing) return prev;
       return { ...prev, [projectId]: { ...existing, state: status as ScanState } };
     });
+    const sessionId = securitySessionIdsRef.current[projectId];
+    const mapped = operationToSessionStatus(status);
+    if (sessionId && mapped) {
+      persistSessionProgress(sessionId, {
+        status: mapped,
+        current_stage: mapped === 'completed' ? 'results' : mapped === 'failed' ? 'scan' : 'scan',
+        completed: mapped === 'completed' || mapped === 'failed',
+      });
+    }
   }, []);
 
   const reconcileScanStatusAfterSocketClose = useCallback(async (projectId: string) => {
+    const markFromMessages = () => {
+      setScanStates(prev => {
+        const existing = prev[projectId];
+        if (!existing) return prev;
+        if (existing.state === 'completed') return prev;
+        if (messagesIndicateSettledScan(existing.messages)) {
+          return { ...prev, [projectId]: { ...existing, state: 'completed' } };
+        }
+        if (existing.state !== 'running') return prev;
+        const alreadyLogged = existing.messages.some((entry) => (
+          entry.type === 'error' && entry.content.includes('Scan connection closed before the backend reported progress')
+        ));
+        const closedMessage = 'Scan connection closed before the backend reported progress. Results stay available if this run already finished.';
+        if (!alreadyLogged) {
+          const sessionId = securitySessionIdsRef.current[projectId];
+          if (sessionId) {
+            persistSessionProgress(sessionId, {
+              status: 'failed',
+              current_stage: 'scan',
+              completed: true,
+              line: { level: 'error', message: closedMessage, stage: 'scan' },
+            });
+          }
+        }
+        const nextMessages = alreadyLogged ? existing.messages : trimMessages([
+          ...existing.messages,
+          {
+            index: existing.messages.length + 1,
+            total: 0,
+            type: 'error',
+            content: closedMessage,
+            timestamp: new Date().toISOString(),
+          },
+        ]);
+        return {
+          ...prev,
+          [projectId]: {
+            ...existing,
+            state: 'error',
+            messages: nextMessages,
+          },
+        };
+      });
+    };
+
     try {
       const res = await fetch(`/api/scan/status?project_id=${encodeURIComponent(projectId)}`, { cache: 'no-store' });
-      if (!res.ok) {
-        updateScanStatus(projectId, 'error');
-        return;
-      }
-      const payload = await res.json() as { status?: string };
-      const status = String(payload.status || 'not_initiated');
+      const payload = await res.json().catch(() => ({})) as { status?: string };
+      const status = String(payload.status || (res.ok ? 'not_initiated' : 'error'));
       if (status === 'running') {
         updateScanStatus(projectId, 'running');
       } else if (status === 'found' || status === 'not_found') {
         updateScanStatus(projectId, 'completed');
-      } else if (status === 'error') {
-        updateScanStatus(projectId, 'error');
       } else {
-        setScanStates(prev => {
-          const existing = prev[projectId];
-          if (!existing) return prev;
-          if (existing.state !== 'running') return prev;
-          const nextMessages = trimMessages([
-            ...existing.messages,
-            {
-              index: existing.messages.length + 1,
-              total: 0,
-              type: 'error',
-              content: 'Scan connection closed before the backend reported progress. Please retry once.',
-              timestamp: new Date().toISOString(),
-            },
-          ]);
-          return {
-            ...prev,
-            [projectId]: {
-              ...existing,
-              state: 'error',
-              messages: nextMessages,
-            },
-          };
-        });
+        markFromMessages();
       }
     } catch {
-      updateScanStatus(projectId, 'error');
+      markFromMessages();
     }
   }, [trimMessages, updateScanStatus]);
 
-  const startScan = useCallback(async (projectId: string, projectName: string) => {
+  const startScan = useCallback(async (
+    projectId: string,
+    projectName: string,
+    options?: { preserveRemediation?: boolean },
+  ) => {
     const existingWs = wsRefs.current[projectId];
     if (existingWs && existingWs.readyState === WebSocket.OPEN) existingWs.close();
 
@@ -501,14 +592,33 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
 
     // Reset any prior remediation state so stale remediationDone=true doesn't
     // interfere with rendering the new scan's results or terminal.
-    setRemediationStates(prev => {
-      if (!prev[projectId]) return prev;
-      const next = { ...prev };
-      delete next[projectId];
-      return next;
-    });
+    // Verification reruns after a PR keep remediation/PR state intact.
+    if (!options?.preserveRemediation) {
+      setRemediationStates(prev => {
+        if (!prev[projectId]) return prev;
+        const next = { ...prev };
+        delete next[projectId];
+        return next;
+      });
+    }
 
     try {
+      const sessionId = await createWorkspaceSession({
+        service: 'security_agent',
+        project_id: projectId,
+        title: `Security scan · ${projectName}`,
+        repo: projectName,
+        status: 'running',
+        current_stage: 'scan',
+      });
+      if (sessionId) securitySessionIdsRef.current[projectId] = sessionId;
+      appendScanMessage(projectId, {
+        index: Date.now(),
+        total: Date.now(),
+        type: 'info',
+        content: 'Connecting to the live scanner…',
+        timestamp: new Date().toISOString(),
+      });
       const wsBaseUrl = await resolveWsBaseUrl();
       const wsToken = await fetchWsToken(projectId);
       wsRefs.current[projectId] = connectWebSocket(
@@ -566,6 +676,17 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       if (!existing) return prev;
       return { ...prev, [projectId]: { ...existing, messages: trimMessages([...existing.messages, message]) } };
     });
+    const sessionId = securitySessionIdsRef.current[projectId];
+    if (sessionId && message.content && message.type !== 'changed_files') {
+      persistSessionProgress(sessionId, {
+        line: {
+          level: scanMessageLevel(message.type),
+          message: message.content,
+          ts: message.timestamp,
+          stage: 'remediate_run',
+        },
+      });
+    }
   }, [trimMessages]);
 
   const updateRemediationStatus = useCallback((projectId: string, status: string) => {
@@ -574,6 +695,20 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       if (!existing) return prev;
       return { ...prev, [projectId]: { ...existing, state: status as RemediationState } };
     });
+    const sessionId = securitySessionIdsRef.current[projectId];
+    const mapped = operationToSessionStatus(status);
+    if (sessionId && mapped) {
+      const stage = mapped === 'needs_review'
+        ? 'approval'
+        : mapped === 'completed'
+          ? 'pr_rescan'
+          : 'remediate_run';
+      persistSessionProgress(sessionId, {
+        status: mapped,
+        current_stage: stage,
+        completed: mapped === 'completed' || mapped === 'failed',
+      });
+    }
   }, []);
 
   const startRemediation = useCallback(async (
@@ -583,6 +718,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     llmApiKey?: string,
     llmModel?: string,
     remediationScope: 'major' | 'all' = 'all',
+    accessMode: 'platform' | 'byok' | 'auto' = 'auto',
   ) => {
     const existingRemWs = remWsRefs.current[projectId];
     if (existingRemWs && existingRemWs.readyState === WebSocket.OPEN) existingRemWs.close();
@@ -602,6 +738,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
           llm_provider: llmProvider || null,
           llm_api_key: llmApiKey || null,
           llm_model: llmModel || null,
+          llm_access_mode: accessMode || 'auto',
           remediation_scope: remediationScope,
         }),
       });
@@ -622,6 +759,18 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
         });
         updateRemediationStatus(projectId, 'error');
         return;
+      }
+      const startPayload = await res.json().catch(() => ({})) as { workspace_session_id?: string };
+      const remSessionId = typeof startPayload.workspace_session_id === 'string'
+        ? startPayload.workspace_session_id
+        : securitySessionIdsRef.current[projectId];
+      if (remSessionId) {
+        securitySessionIdsRef.current[projectId] = remSessionId;
+        persistSessionProgress(remSessionId, {
+          status: 'running',
+          current_stage: 'remediate_run',
+          line: { level: 'info', message: 'Remediation started.', stage: 'remediate_run' },
+        });
       }
     } catch (error) {
       appendRemediationMessage(projectId, {
@@ -665,6 +814,17 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
                 ? `WebSocket closed unexpectedly (${detail?.code || 1006}): ${reason}`
                 : `WebSocket closed unexpectedly (${detail?.code || 1006}).`;
               const alreadyLogged = cur.messages.some((entry) => entry.type === 'error' && entry.content === message);
+              if (!alreadyLogged) {
+                const remSessionId = securitySessionIdsRef.current[id];
+                if (remSessionId) {
+                  persistSessionProgress(remSessionId, {
+                    status: 'failed',
+                    current_stage: 'remediate_run',
+                    completed: true,
+                    line: { level: 'error', message, stage: 'remediate_run' },
+                  });
+                }
+              }
               return {
                 ...prev,
                 [id]: {

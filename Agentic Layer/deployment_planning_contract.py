@@ -211,6 +211,7 @@ class ComputeProfile(BaseModel):
 
     strategy: str
     services: list[ComputeServiceProfile] = Field(default_factory=list)
+    root_volume_gb: int | None = None
 
 
 class DataLayerProfile(BaseModel):
@@ -238,6 +239,35 @@ class NetworkingProfile(BaseModel):
     load_balancer: dict[str, Any] = Field(default_factory=dict)
     elastic_ip: dict[str, Any] = Field(default_factory=dict)
     ports_exposed: list[int] = Field(default_factory=list)
+
+    @field_validator("vpc", mode="before")
+    @classmethod
+    def _coerce_vpc(cls, value: Any) -> str:
+        if isinstance(value, bool):
+            return "new" if value else "existing"
+        text = str(value or "").strip()
+        if not text:
+            return "new"
+        lowered = text.lower()
+        if lowered in {"true", "1", "yes"}:
+            return "new"
+        if lowered in {"false", "0", "no"}:
+            return "existing"
+        return text
+
+    @field_validator("elastic_ip", mode="before")
+    @classmethod
+    def _coerce_elastic_ip(cls, value: Any) -> dict[str, Any]:
+        if isinstance(value, bool):
+            return {"enabled": True, "associate_with": "ec2"} if value else {}
+        return value if isinstance(value, dict) else {}
+
+    @field_validator("load_balancer", mode="before")
+    @classmethod
+    def _coerce_load_balancer(cls, value: Any) -> dict[str, Any]:
+        if isinstance(value, bool):
+            return {"public": True, "type": "alb"} if value else {}
+        return value if isinstance(value, dict) else {}
 
 
 class BuildPipelineProfile(BaseModel):

@@ -54,6 +54,19 @@ services:
             mysql = result["data_stores"][0]
             self.assertEqual(mysql.version, "8.4")
 
+    def test_postgres_latest_tag_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = _data_store_scanner(
+                root,
+                [],
+                dependency_names={"pg"},
+                compose_images=["postgres:latest"],
+                env_names={"POSTGRES_PASSWORD"},
+            )
+            postgres = next(item for item in result["data_stores"] if item.type == "postgresql")
+            self.assertIsNone(postgres.version)
+
     def test_prisma_mysql_provider_not_postgresql(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

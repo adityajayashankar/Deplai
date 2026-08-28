@@ -21,17 +21,26 @@ class ProjectLLMClient:
     DEFAULT_MODEL = DEFAULT_HF_MODEL
 
     def __init__(self, byok_config: Any | None = None) -> None:
+        self.user_id = str(getattr(byok_config, 'user_id', '') or os.getenv('DEPLAI_AI_USER_ID', '')).strip()
+        self.access_mode = str(getattr(byok_config, 'access_mode', '') or 'auto').strip() or 'auto'
+        provider_id = (getattr(byok_config, 'provider', '') or '').strip().lower() if byok_config is not None else ''
+        inbound_key = str(getattr(byok_config, 'api_key', getattr(byok_config, 'apiKey', '')) or '').strip() if byok_config is not None else ''
+        requested_model = ''
         if byok_config is not None:
-            # Map BYOK config to LLMProviderConfig just like llm_interpreter
-            provider_id = (getattr(byok_config, 'provider', '') or '').strip().lower()
+            requested_model = str(getattr(byok_config, 'model', getattr(byok_config, 'modelId', '')) or '').strip()
+        if inbound_key:
             OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions'
             ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages'
+            GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'
             OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'
-            MINIMAX_API_URL = 'https://api.minimax.chat/v1/text/chatcompletion_v2'
+            MINIMAX_API_URL = 'https://api.minimax.io/v1/text/chatcompletion_v2'
             
             provider_url_map = {
                 'openai': ('openai', OPENAI_API_URL),
                 'anthropic': ('anthropic', ANTHROPIC_API_URL),
+                'claude': ('anthropic', ANTHROPIC_API_URL),
+                'google': ('google', GEMINI_API_URL),
+                'gemini': ('google', GEMINI_API_URL),
                 'groq': ('groq', 'https://api.groq.com/openai/v1/chat/completions'),
                 'grroq': ('groq', 'https://api.groq.com/openai/v1/chat/completions'),
                 'openrouter': ('openrouter', OPENROUTER_API_URL),
@@ -42,17 +51,24 @@ class ProjectLLMClient:
             jit_config = LLMProviderConfig(
                 provider=provider_norm,
                 api_url=api_url,
-                model=getattr(byok_config, 'model', getattr(byok_config, 'modelId', self.DEFAULT_MODEL)),
-                api_key=getattr(byok_config, 'api_key', getattr(byok_config, 'apiKey', '')),
+                model=requested_model or self.DEFAULT_MODEL,
+                api_key=inbound_key,
             )
             self.provider_configs = [jit_config]
+        elif self.user_id:
+            self.provider_configs = []
+            self.api_url = ''
+            self.model = requested_model or 'best'
+            self.api_key = ''
+            self.provider = provider_id
         else:
             self.provider_configs = resolve_llm_provider_configs()
-        first_config = self.provider_configs[0]
-        self.api_url = first_config.api_url
-        self.model = first_config.model
-        self.api_key = first_config.api_key
-        self.provider = first_config.provider
+        if self.provider_configs:
+            first_config = self.provider_configs[0]
+            self.api_url = first_config.api_url
+            self.model = first_config.model
+            self.api_key = first_config.api_key
+            self.provider = first_config.provider
         self.use_response_format = os.getenv("LLM_USE_RESPONSE_FORMAT", "true").strip().lower() in {
             "1",
             "true",
@@ -79,7 +95,15 @@ class ProjectLLMClient:
         self.provider = config.provider
 
     def is_configured(self) -> bool:
-        return bool(self.api_url and self.model)
+        try:
+            from services.ai_gateway import gateway_enabled
+            if gateway_enabled() and bool(self.user_id):
+                return True
+        except Exception:
+            pass
+        if bool(self.api_key and self.api_url and self.model):
+            return True
+        return any(bool(getattr(config, "api_key", "")) for config in (self.provider_configs or []))
 
     def _build_payload(
         self,
@@ -170,6 +194,26 @@ class ProjectLLMClient:
     ) -> Any:
         if not self.is_configured():
             raise RuntimeError("LLM client is not configured: set LLM_API_URL and LLM_MODEL_ID.")
+
+        try:
+            from services.ai_gateway import chat_via_gateway, gateway_enabled
+            if gateway_enabled() and self.user_id:
+                text = chat_via_gateway(
+                    user_id=self.user_id,
+                    model=self.model or "best",
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    api_key=self.api_key or None,
+                    provider=self.provider or None,
+                    access_mode=self.access_mode,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout_seconds=self.request_timeout_seconds,
+                )
+                return json.loads(text) if text.lstrip().startswith("{") or text.lstrip().startswith("[") else {"text": text}
+        except Exception as extra:
+            if not self.provider_configs:
+                raise RuntimeError(f"AI gateway failed: {extra}") from extra
 
         failures: list[str] = []
         for config in self.provider_configs:

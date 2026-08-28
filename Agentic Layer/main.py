@@ -25,10 +25,11 @@ if str(ROOT_DIR) not in sys.path:
 
 from functools import partial
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Depends
+from service_auth import api_key_matches
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from models import (
-    ScanValidationRequest, ScanValidationResponse,
+    ScanValidationRequest, ScanValidationResponse, public_scan_validation,
     WebSocketCommand, StreamStatus,
     RemediationRequest, RemediationResponse,
     ArchitectureGenRequest, ArchitectureGenResponse,
@@ -45,6 +46,8 @@ from models import (
     AwsInstanceActionRequest, AwsInstanceActionResponse,
     AwsAppSecretsListRequest, AwsAppSecretsUpsertRequest, AwsAppSecretsDeleteRequest, AwsAppSecretsResponse,
 )
+from dast_agent.api import router as dast_router
+from deploy_exec.api import router as deploy_exec_router
 from environment import EnvironmentInitializer
 from cleanup import cleanup_volumes, cleanup_project_reports
 from result_parser import get_scan_results, get_scan_status, invalidate_cache
@@ -109,10 +112,16 @@ def _instance_matches_project(instance: dict[str, Any], project_name: str) -> bo
         return False
     return name_slug == requested_slug or name_slug.startswith(f"{requested_slug}-")
 
+_app_env = (os.getenv("APP_ENV") or os.getenv("ENVIRONMENT") or "").strip().lower()
+_enable_docs = _app_env in {"development", "dev", "local"}
+
 app = FastAPI(
     title="DEPLAI Agentic Layer",
     description="Backend API for scan validation",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url="/docs" if _enable_docs else None,
+    redoc_url="/redoc" if _enable_docs else None,
+    openapi_url="/openapi.json" if _enable_docs else None,
 )
 
 API_KEY = os.environ.get("DEPLAI_SERVICE_KEY")
@@ -166,7 +175,7 @@ def _extract_ws_token_sub(token: str) -> str | None:
 
 
 async def verify_api_key(x_api_key: str = Header(None)):
-    if x_api_key != API_KEY:
+    if not api_key_matches(x_api_key, API_KEY):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 app.add_middleware(
@@ -178,7 +187,10 @@ app.add_middleware(
 )
 
 if iac_router is not None:
-    app.include_router(iac_router)
+    app.include_router(iac_router, dependencies=[Depends(verify_api_key)])
+
+app.include_router(dast_router, dependencies=[Depends(verify_api_key)])
+app.include_router(deploy_exec_router, dependencies=[Depends(verify_api_key)])
 
 
 # Startup event handler
@@ -215,12 +227,18 @@ def _normalize_remediation_request(request: RemediationRequest) -> RemediationRe
     raw_provider = str(request.llm_provider or "").strip().lower() or None
     raw_api_key = str(request.llm_api_key or "").strip() or None
     raw_model = str(request.llm_model or "").strip() or None
+    raw_access = str(request.llm_access_mode or "auto").strip().lower() or "auto"
+    if raw_access not in {"platform", "byok", "auto"}:
+        raw_access = "auto"
+    if raw_provider == "claude":
+        raw_provider = "anthropic"
 
     return request.model_copy(
         update={
             "llm_provider": raw_provider,
             "llm_api_key": raw_api_key,
             "llm_model": raw_model,
+            "llm_access_mode": raw_access,
         }
     )
 
@@ -284,9 +302,15 @@ async def _handle_websocket(
 ):
     """Shared WebSocket handler for scan and remediation endpoints."""
     token_sub: str | None = None
+    await websocket.accept()
     if API_KEY is not None:
         token = websocket.query_params.get("token")
         if not token or not _verify_ws_token(token, project_id):
+            await websocket.send_json({
+                "type": "status",
+                "status": StreamStatus.error.value,
+                "error": "Invalid or missing websocket token. Reopen the project and retry the scan.",
+            })
             await websocket.close(code=1008, reason="Invalid or missing token")
             return
         # Extract the user identity claim so we can validate it against the
@@ -294,7 +318,7 @@ async def _handle_websocket(
         # to drive a pipeline that belongs to user B.
         token_sub = _extract_ws_token_sub(token)
 
-    await websocket.accept()
+    logger.info("WebSocket connected path=%s project=%s", websocket.url.path, project_id)
 
     def _context_matches_token(context) -> bool:
         if token_sub is None:
@@ -454,7 +478,7 @@ async def validate_scan(request: ScanValidationRequest):
     return ScanValidationResponse(
         success=True,
         message="Scan validation request received successfully",
-        data=request
+        data=public_scan_validation(request),
     )
 
 
@@ -625,13 +649,17 @@ async def remediation_navigate(request: RemediationNavigateRequest):
 @app.websocket("/ws/pipeline/{project_id}")
 async def websocket_pipeline(websocket: WebSocket, project_id: str):
     """Project-scoped websocket bus for dashboard pipeline monitor events."""
+    await websocket.accept()
     if API_KEY is not None:
         token = websocket.query_params.get("token")
         if not token or not _verify_ws_token(token, project_id):
+            await websocket.send_json({
+                "type": "status",
+                "status": StreamStatus.error.value,
+                "error": "Invalid or missing websocket token.",
+            })
             await websocket.close(code=1008, reason="Invalid or missing token")
             return
-
-    await websocket.accept()
 
     async with pipeline_lock:
         bucket = pipeline_subscribers.setdefault(project_id, set())
@@ -907,6 +935,11 @@ async def terraform_generate(request: TerraformGenRequest):
     architecture_json = dict(request.architecture_json or {})
     repository_context_json = dict(request.repository_context or {})
     project_id = str(request.project_id or "").strip()
+    try:
+        from ai_gateway import bind_user
+        bind_user(request.user_id)
+    except Exception:
+        pass
 
     def progress_callback(event: dict[str, Any]) -> None:
         if not project_id:
@@ -975,6 +1008,7 @@ async def terraform_generate(request: TerraformGenRequest):
                 llm_model=request.llm_model,
                 llm_api_base_url=request.llm_api_base_url,
                 terraform_renderer=request.terraform_renderer,
+                user_id=request.user_id,
                 progress_callback=progress_callback,
             ),
         )
@@ -1200,6 +1234,9 @@ async def terraform_apply(request: TerraformApplyRequest):
         outputs=result.get("outputs"),
         cloudfront_url=result.get("cloudfront_url"),
         plan_summary=result.get("plan_summary"),
+        provisioning_report=result.get("provisioning_report"),
+        one_time_credentials=result.get("one_time_credentials"),
+        has_database_resources=result.get("has_database_resources"),
         requires_plan_confirmation=result.get("status") == "awaiting_plan_confirmation",
         details=result.get("details"),
     )

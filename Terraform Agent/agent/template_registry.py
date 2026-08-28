@@ -9,6 +9,7 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 SERVICE_TEMPLATE_MAP: dict[str, Path] = {
     "ec2": TEMPLATES_DIR / "ec2",
     "s3": TEMPLATES_DIR / "s3",
+    "s3_cloudfront": TEMPLATES_DIR / "s3_cloudfront",
     "rds": TEMPLATES_DIR / "rds",
     "vpc": TEMPLATES_DIR / "vpc",
     "ecs": TEMPLATES_DIR / "ecs",
@@ -17,10 +18,17 @@ SERVICE_TEMPLATE_MAP: dict[str, Path] = {
     "alb": TEMPLATES_DIR / "alb",
 }
 
+SERVICE_TYPE_ALIASES: dict[str, str] = {
+    "cloudfront": "s3_cloudfront",
+    "cdn": "s3_cloudfront",
+    "s3cloudfront": "s3_cloudfront",
+    "static_site": "s3_cloudfront",
+}
+
 # Pinned registry modules for the EC2/ALB/EIP vertical slice (see module_catalog.py).
 PINNED_REGISTRY_MODULES: dict[str, dict[str, Any]] = {
     key: get_module(key)
-    for key in ("vpc", "ec2_instance", "alb", "security_group", "rds", "elasticache", "eip", "nat_gateway")
+    for key in ("vpc", "ec2_instance", "alb", "security_group", "rds", "elasticache", "eip", "nat_gateway", "s3_cloudfront")
 }
 
 PARAM_SCHEMA: dict[str, list[dict]] = {
@@ -42,6 +50,14 @@ PARAM_SCHEMA: dict[str, list[dict]] = {
         {"name": "force_destroy", "type": "bool", "default": True},
         {"name": "environment", "type": "string", "default": "production"},
         {"name": "project_id", "type": "string", "required": True},
+    ],
+    "s3_cloudfront": [
+        {"name": "bucket_name", "type": "string", "required": True},
+        {"name": "aws_region", "type": "string", "default": "us-east-1"},
+        {"name": "environment", "type": "string", "default": "production"},
+        {"name": "project_id", "type": "string", "required": True},
+        {"name": "price_class", "type": "string", "default": "PriceClass_100"},
+        {"name": "default_root_object", "type": "string", "default": "index.html"},
     ],
     "rds": [
         {"name": "db_name", "type": "string", "required": True},
@@ -109,22 +125,28 @@ PARAM_SCHEMA: dict[str, list[dict]] = {
     ],
 }
 
-SUPPORTED_SERVICES = list(SERVICE_TEMPLATE_MAP.keys())
+SUPPORTED_SERVICES = list(SERVICE_TEMPLATE_MAP.keys()) + list(SERVICE_TYPE_ALIASES.keys())
+
+
+def canonical_service_type(service_type: str) -> str:
+    key = str(service_type or "").strip().lower().replace("-", "_")
+    return SERVICE_TYPE_ALIASES.get(key, key)
 
 
 def get_template_path(service_type: str) -> Path:
-    if service_type not in SERVICE_TEMPLATE_MAP:
-        raise ValueError(f"Unsupported service type: {service_type}. Supported: {SUPPORTED_SERVICES}")
-    return SERVICE_TEMPLATE_MAP[service_type]
+    key = canonical_service_type(service_type)
+    if key not in SERVICE_TEMPLATE_MAP:
+        raise ValueError(f"Unsupported service type: {service_type}. Supported: {sorted(SERVICE_TEMPLATE_MAP)}")
+    return SERVICE_TEMPLATE_MAP[key]
 
 
 def get_param_schema(service_type: str) -> list[dict]:
-    return PARAM_SCHEMA.get(service_type, [])
+    return PARAM_SCHEMA.get(canonical_service_type(service_type), [])
 
 
 def get_pinned_module(service_type: str) -> dict[str, Any]:
     """Return curated registry pin metadata for a service (or raise KeyError)."""
-    return get_module(service_type)
+    return get_module(canonical_service_type(service_type))
 
 
 def list_module_catalog() -> dict[str, dict[str, Any]]:

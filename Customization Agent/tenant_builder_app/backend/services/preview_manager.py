@@ -591,10 +591,14 @@ def preview_status(
             return _static_preview(
                 detail="No runnable package dev script was found; static preview is ready.",
             )
-        return _static_preview(
-            status="stopped",
-            detail="Live preview has not been started.",
-        )
+        return {
+            "kind": "live_server",
+            "status": "stopped",
+            "url": None,
+            "detail": "Live preview has not been started.",
+            "pid": None,
+            "app_root": str(_find_app_root(tenant_repo, app_targets) or ""),
+        }
 
     status = str(entry.get("status") or "failed")
     if entry.get("kind") == "static_file" or status == "stopped":

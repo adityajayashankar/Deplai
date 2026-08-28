@@ -148,3 +148,33 @@ class DeploymentProfileTests(unittest.TestCase):
                 website_index_html="<html></html>",
             )
         self.assertIn("Refusing silent EC2-only downgrade", str(raised.exception))
+
+    def test_postgres_latest_tag_is_not_emitted_as_rds_engine_version(self) -> None:
+        files, _warnings = build_profile_bundle(
+            payload={
+                "document_kind": "deployment_profile",
+                "workspace": "demo",
+                "project_name": "demo",
+                "environment": "prod",
+                "compute": {"strategy": "ec2", "services": [{"id": "app", "process_type": "web", "port": 3000}]},
+                "networking": {"vpc": "new", "nat_gateway": False, "load_balancer": {}, "ports_exposed": [3000]},
+                "data_layer": [{"id": "primary_db", "type": "postgresql", "engine_version": "latest"}],
+                "runtime_config": {},
+            },
+            provider_version="~> 5.0",
+            state_bucket="",
+            lock_table="",
+            aws_region="eu-north-1",
+            context_summary="demo",
+            website_index_html="<html></html>",
+        )
+        variables = files["terraform/variables.tf"]
+        data_main = files["terraform/modules/data/main.tf"]
+        tfvars = files["terraform/terraform.tfvars"]
+        self.assertIn('variable "postgres_engine_version"', variables)
+        self.assertIn('default = "15.17"', variables)
+        self.assertNotIn('default = "latest"', variables)
+        self.assertIn("local.postgres_engine_version", data_main)
+        self.assertIn("postgres_engine_sentinels", data_main)
+        self.assertIn('postgres_engine_version = "15.17"', tfvars)
+        self.assertNotIn('postgres_engine_version = "latest"', tfvars)

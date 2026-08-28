@@ -1,0 +1,21 @@
+# agno[os] — Agno framework + AgentOS runtime
+agno[os]>=1.0
+# LLM providers
+anthropic
+# MongoDB driver (sync for Tier 0; swap to motor for async in Phase 5)
+pymongo>=4.7
+# Native AgentOS tracing (required when tracing=True)
+opentelemetry-api>=1.0
+opentelemetry-sdk>=1.0
+openinference-instrumentation-agno
+# AST parsing — zero-LLM code analysis
+tree-sitter>=0.23
+tree-sitter-typescript>=0.23
+tree-sitter-css>=0.23
+# Schema validation
+pydantic>=2.0
+# Validation tools (called as subprocesses, not imported)
+# tsc, eslint, stylelint — assumed installed in Connector/node_modules
+# Testing
+pytest>=8.0
+pytest-asyncio>=0.23

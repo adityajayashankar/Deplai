@@ -101,8 +101,8 @@ const UI_MAP: Record<
   plan_deployment: {
     pending: (_o, _ctx) => ({ events: [], route_push: null, cards: [], buttons: [] }),
     success: (o, _ctx) => ({
-      events: [{ type: 'navigate', payload: { path: '/dashboard/pipeline', project_id: o.result?.project_id } }],
-      route_push: '/dashboard/pipeline',
+          events: [{ type: 'navigate', payload: { path: '/dashboard/deploy', project_id: o.result?.project_id } }],
+          route_push: '/dashboard/deploy',
       cards: [],
       buttons: [],
     }),

@@ -12,6 +12,8 @@ from terraform_agent.agent.iac_pipeline import (
 )
 
 router = APIRouter(prefix="/api/iac", tags=["iac"])
+# HTTP routes on this router require X-API-Key (wired in main.py).
+# The WebSocket is not reachable on the public origin; Connector polls status.
 
 # Maps run_id -> list of active WebSocket connections
 # When a log line is emitted, it is sent to all connected clients for that run.
@@ -93,6 +95,7 @@ async def get_status(run_id: str):
     response = {
         "run_id": run.run_id,
         "status": run.status,
+        "service_type": run.service_type,
         "plan_summary": run.plan_summary,
         "logs": run.apply_logs[-50:],
     }

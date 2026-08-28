@@ -1220,6 +1220,8 @@ def run_claude_remediation(
     llm_api_key: str | None = None,
     llm_model: str | None = None,
     budget_tracker: ClaudeBudgetTracker | None = None,
+    user_id: str | None = None,
+    access_mode: str | None = None,
 ) -> tuple[bool, dict[str, Any] | str]:
     """Generate and apply remediation edits in the codebase volume."""
     contexts = _collect_context_files(scan_data)
@@ -1227,6 +1229,26 @@ def run_claude_remediation(
         return (False, "No readable source files were available for remediation.")
 
     def _run_chain(prompt: str) -> tuple[bool, str]:
+        if user_id:
+            try:
+                from ai_gateway import remediate_text
+                ok_gw, raw_gw = remediate_text(
+                    user_id=str(user_id),
+                    model=llm_model or "best_coding",
+                    prompt=prompt,
+                    access_mode=access_mode or "auto",
+                    api_key=llm_api_key,
+                    provider=llm_provider,
+                    max_tokens=MAX_COMPLETION_TOKENS,
+                )
+                if ok_gw:
+                    return (True, raw_gw)
+                if str(access_mode or "").strip().lower() in {"platform", "byok"}:
+                    return (False, raw_gw)
+            except Exception as exc:
+                if str(access_mode or "").strip().lower() in {"platform", "byok"}:
+                    return (False, str(exc))
+
         provider_lower = (llm_provider or "").strip().lower()
 
         # Groq remediation path (cheap/fast; used for large repos with only

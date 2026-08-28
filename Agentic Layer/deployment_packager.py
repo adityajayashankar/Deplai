@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from deployment_manifest import DATASTORE_PORTS, ManifestResolutionError, resolve_deployment_manifest
+
 
 IGNORED_DIRS = {
     ".git",
@@ -122,6 +124,11 @@ class DeploymentPackage:
             enabled=False, engine="", has_prisma=False, has_migrations=False
         )
     )
+    strategy: str = "cloud_init"
+    environment: list[str] = field(default_factory=list)
+    deployment_manifest: dict[str, Any] = field(default_factory=dict)
+    manifest_cache_hit: bool = False
+    manifest_fingerprint: str = ""
 
     def as_manifest(self) -> dict[str, Any]:
         return {
@@ -132,6 +139,8 @@ class DeploymentPackage:
             "health_path": self.health_path,
             "build_command": self.build_command,
             "start_command": self.start_command,
+            "strategy": self.strategy,
+            "environment": list(self.environment),
             "package_file_count": self.package_file_count,
             "package_bytes": self.package_bytes,
             "selected_root": self.selected_root,
@@ -139,6 +148,9 @@ class DeploymentPackage:
             "manifest_path": self.manifest_path,
             "warnings": self.warnings,
             "db_requirements": self.db_requirements.as_dict(),
+            "deployment_manifest": self.deployment_manifest,
+            "manifest_cache_hit": self.manifest_cache_hit,
+            "manifest_fingerprint": self.manifest_fingerprint,
         }
 
 
@@ -370,35 +382,70 @@ def _script_command(package_json: dict[str, Any], name: str) -> str:
     return ""
 
 
+_APP_PORT_KEYS = frozenset({
+    "app_port",
+    "http_port",
+    "listen_port",
+    "target_port",
+    "container_port",
+    "web_port",
+    "port",
+})
+_DATASTORE_PORT_KEY_TOKENS = (
+    "rds",
+    "db_",
+    "_db",
+    "database",
+    "postgres",
+    "mysql",
+    "mariadb",
+    "redis",
+    "cache",
+    "mongo",
+    "smtp",
+)
+
+
+def _coerce_http_port(value: Any) -> int | None:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= port <= 65535 or port in DATASTORE_PORTS:
+        return None
+    return port
+
+
+def _looks_like_http_app_port_key(key: str) -> bool:
+    lowered = str(key).strip().lower()
+    if "port" not in lowered:
+        return False
+    if any(token in lowered for token in _DATASTORE_PORT_KEY_TOKENS):
+        return False
+    return lowered in _APP_PORT_KEYS or lowered.endswith("_app_port")
+
+
 def _infer_port(repository_context: dict[str, Any], deployment_profile: dict[str, Any], user_answers: dict[str, Any]) -> int:
-    for source in (user_answers,):
-        for key, value in source.items():
-            lowered = str(key).lower()
-            if "port" not in lowered:
-                continue
-            try:
-                port = int(value)
-                if 1 <= port <= 65535:
-                    return port
-            except Exception:
-                continue
+    for key, value in (user_answers or {}).items():
+        if not _looks_like_http_app_port_key(str(key)):
+            continue
+        port = _coerce_http_port(value)
+        if port is not None:
+            return port
 
     compute = _record(deployment_profile.get("compute"))
     for service in _records(compute.get("services")):
-        try:
-            port = int(service.get("port"))
-            if 1 <= port <= 65535:
-                return port
-        except Exception:
+        process = str(service.get("process_type") or "").strip().lower()
+        if process and process not in {"web", "http", "api"}:
             continue
+        port = _coerce_http_port(service.get("port"))
+        if port is not None:
+            return port
 
     build = _record(repository_context.get("build"))
-    try:
-        port = int(build.get("dockerfile_port"))
-        if 1 <= port <= 65535:
-            return port
-    except Exception:
-        pass
+    port = _coerce_http_port(build.get("dockerfile_port"))
+    if port is not None:
+        return port
     return 3000
 
 
@@ -511,6 +558,32 @@ def _persist_package(package: DeploymentPackage) -> DeploymentPackage:
     return package
 
 
+def load_persisted_app_tarball(
+    *,
+    package_id: str = "",
+    project_slug: str = "",
+) -> tuple[str, bytes] | None:
+    """Load app.tgz from the local package store for Terraform S3 delivery."""
+    store = PACKAGE_STORE_ROOT
+    wanted = str(package_id or "").strip()
+    if wanted:
+        path = store / wanted / "app.tgz"
+        if path.is_file():
+            return wanted, path.read_bytes()
+    slug = re.sub(r"[^a-z0-9]+", "-", str(project_slug or "").lower()).strip("-")
+    if not slug or not store.is_dir():
+        return None
+    matches = sorted(
+        store.glob(f"{slug}*/app.tgz"),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    if not matches:
+        return None
+    latest = matches[0]
+    return latest.parent.name, latest.read_bytes()
+
+
 def _select_static_root(source_root: Path) -> Path | None:
     for rel in STATIC_DIR_CANDIDATES:
         candidate = source_root / rel
@@ -585,6 +658,112 @@ def _source_root_candidates(source_root: str) -> list[Path]:
     return deduped
 
 
+def _build_deterministic_package(
+    *,
+    source_root: str,
+    source_roots: list[str] | tuple[str, ...] | None,
+    project_name: str,
+    repository_context: dict[str, Any] | None,
+    deployment_profile: dict[str, Any] | None,
+    user_answers: dict[str, Any] | None,
+) -> DeploymentPackage:
+    """Build an archive from exactly one resolved, certified deployment manifest."""
+    attempted: list[str] = []
+    root: Path | None = None
+    for candidate_input in [source_root, *(source_roots or [])]:
+        for candidate in _source_root_candidates(candidate_input):
+            resolved = candidate.resolve(strict=False)
+            attempted.append(str(resolved))
+            if resolved.is_dir():
+                root = resolved
+                break
+        if root is not None:
+            break
+    if root is None:
+        detail = f" Attempted: {', '.join(attempted)}" if attempted else ""
+        raise ManifestResolutionError(f"repository source is not readable.{detail}")
+
+    repo_context = repository_context or {}
+    profile = deployment_profile or {}
+    answers = user_answers or {}
+    manifest, cache_hit, fingerprint = resolve_deployment_manifest(root, project_name)
+    selected_root = (root / manifest.app_root).resolve()
+    try:
+        selected_root.relative_to(root)
+    except ValueError as exc:
+        raise ManifestResolutionError("manifest app_root escapes the repository", source_root=root) from exc
+    if not selected_root.is_dir():
+        raise ManifestResolutionError(f"manifest app_root {manifest.app_root!r} is not a directory", source_root=root)
+
+    app_port = int(manifest.port or _infer_port(repo_context, profile, answers))
+    if manifest.runtime == "static" and manifest.port is None:
+        app_port = 80
+    health_path = (
+        manifest.health_check_path
+        if manifest.is_user_supplied
+        else _infer_health_path(repo_context, profile)
+    )
+    warnings: list[str] = []
+    if cache_hit:
+        warnings.append("Deployment manifest cache hit; repository stack detection was skipped.")
+    elif manifest.is_user_supplied:
+        warnings.append("Validated user-supplied deplai.yaml; no repository stack guessing was used.")
+    else:
+        warnings.append("Generated a deterministic deployment manifest from certified repository signals.")
+
+    db_requirements = detect_database_requirements(root)
+    if db_requirements.enabled and db_requirements.detection_sources:
+        warnings.append(
+            f"Database detected ({db_requirements.engine}): "
+            + "; ".join(db_requirements.detection_sources)
+            + ". RDS will be provisioned automatically."
+        )
+
+    if manifest.runtime == "docker":
+        dockerfile = next((selected_root / name for name in DOCKERFILE_CANDIDATES if (selected_root / name).is_file()), None)
+        compose = next((selected_root / name for name in DOCKER_COMPOSE_CANDIDATES if (selected_root / name).is_file()), None)
+        if dockerfile is None and compose is None:
+            raise ManifestResolutionError("runtime docker requires a Dockerfile or Compose file in app_root", source_root=root)
+        if manifest.port is None and dockerfile is not None:
+            exposed = _dockerfile_exposed_port(dockerfile)
+            if exposed is not None:
+                app_port = exposed
+        warnings.append("Certified Docker executor selected; no application commands are generated at deploy time.")
+    elif manifest.strategy == "buildpack":
+        warnings.append("Certified Paketo buildpack executor selected from the manifest registry.")
+    elif manifest.runtime == "static":
+        if not (selected_root / "index.html").is_file():
+            raise ManifestResolutionError("static app_root must contain index.html", source_root=root)
+        warnings.append("Certified cloud-init static-site executor selected.")
+    else:
+        warnings.append("Certified cloud-init runtime executor selected from the manifest registry.")
+
+    package_base64, file_count, byte_count = _tar_directory(selected_root)
+    package = DeploymentPackage(
+        package_id=f"{_safe_slug(project_name)}-{fingerprint[:12]}",
+        source_root=str(root),
+        app_kind=manifest.runtime,
+        app_port=app_port,
+        health_path=health_path,
+        build_command=manifest.build_command,
+        start_command=manifest.start_command,
+        package_base64=package_base64,
+        package_file_count=file_count,
+        package_bytes=byte_count,
+        selected_root=manifest.app_root,
+        package_tarball_path="",
+        manifest_path="",
+        warnings=warnings,
+        db_requirements=db_requirements,
+        strategy=manifest.strategy,
+        environment=list(manifest.env),
+        deployment_manifest=manifest.as_dict(),
+        manifest_cache_hit=cache_hit,
+        manifest_fingerprint=fingerprint,
+    )
+    return _persist_package(package)
+
+
 def build_deployment_package(
     *,
     source_root: str,
@@ -594,6 +773,18 @@ def build_deployment_package(
     deployment_profile: dict[str, Any] | None = None,
     user_answers: dict[str, Any] | None = None,
 ) -> DeploymentPackage:
+    """Resolve and package an app without any model or terminal fallback."""
+    return _build_deterministic_package(
+        source_root=source_root,
+        source_roots=source_roots,
+        project_name=project_name,
+        repository_context=repository_context,
+        deployment_profile=deployment_profile,
+        user_answers=user_answers,
+    )
+
+    # Kept below temporarily for compatibility with downstream patch sets. It
+    # is intentionally unreachable: placeholder generation is prohibited.
     attempted: list[str] = []
     root: Path | None = None
     candidate_inputs = [source_root, *(source_roots or [])]

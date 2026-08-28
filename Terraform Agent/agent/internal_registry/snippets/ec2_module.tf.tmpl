@@ -10,6 +10,8 @@ module "ec2" {
   iam_instance_profile        = var.instance_profile_name
   key_name                    = local.ec2_key_name
   associate_public_ip_address = !var.enable_eip
+  user_data_replace_on_change = true
+  depends_on                  = [aws_s3_object.app, aws_iam_role_policy.artifacts]
 
   root_block_device = [
     {
@@ -25,17 +27,411 @@ module "ec2" {
     http_put_response_hop_limit = 1
   }
 
-  user_data = join("\n", [
-    "#!/bin/bash",
-    "set -euxo pipefail",
-    "dnf install -y nginx",
-    "mkdir -p /usr/share/nginx/html",
-    "cat <<'HTML' > /usr/share/nginx/html/index.html",
-    "${base64decode(var.bootstrap_index_html_base64)}",
-    "HTML",
-    "systemctl enable nginx",
-    "systemctl restart nginx"
-  ])
+  user_data_base64 = base64encode(<<-USERDATA
+#!/bin/bash
+# deplai_key_rotation=${var.ec2_key_rotation}
+set -euxo pipefail
+exec > >(tee -a /var/log/deplai-bootstrap.log) 2>&1
+
+APP_ROOT="/opt/${var.project_name}"
+APP_SUBDIR="${var.app_subdir}"
+if [ -z "$APP_SUBDIR" ] || [ "$APP_SUBDIR" = "." ]; then
+  APP_DIR="$APP_ROOT"
+else
+  APP_DIR="$APP_ROOT/$APP_SUBDIR"
+fi
+APP_NAME="${var.project_name}-app"
+APP_PORT="${var.app_port}"
+APP_KIND="${var.app_kind}"
+BUILD_COMMAND="${var.build_command}"
+START_COMMAND="${var.start_command}"
+ARTIFACT_BUCKET="${try(aws_s3_bucket.artifacts[0].id, "")}"
+ARTIFACT_KEY="app.tgz"
+DATABASE_SECRET_ARN="${var.database_secret_arn}"
+RDS_ENDPOINT="${var.database_endpoint}"
+
+dnf install -y nginx tar gzip unzip python3 docker git
+systemctl enable --now docker || true
+systemctl enable --now amazon-ssm-agent || true
+
+write_placeholder() {
+  mkdir -p /usr/share/nginx/html
+  cat <<'HTML' > /usr/share/nginx/html/index.html
+${base64decode(var.bootstrap_index_html_base64)}
+HTML
+  systemctl enable nginx
+  systemctl restart nginx
+}
+
+unpack_from_s3() {
+  if [ -z "$ARTIFACT_BUCKET" ]; then
+    return 1
+  fi
+  command -v aws >/dev/null 2>&1 || dnf install -y awscli || true
+  mkdir -p "$APP_DIR"
+  for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if aws s3 cp "s3://$ARTIFACT_BUCKET/$ARTIFACT_KEY" /tmp/deplai-app.tgz; then
+      tar -xzf /tmp/deplai-app.tgz -C "$APP_DIR"
+      chown -R ec2-user:ec2-user "$APP_ROOT" || true
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+clone_from_git() {
+  REPOSITORY_URL="${var.repository_url}"
+  if [ -z "$REPOSITORY_URL" ] || [ "$REPOSITORY_URL" = "null" ]; then
+    return 1
+  fi
+  command -v git >/dev/null 2>&1 || dnf install -y git
+  mkdir -p "$(dirname "$APP_ROOT")"
+  rm -rf "$APP_ROOT"
+  git clone --depth 1 "$REPOSITORY_URL" "$APP_ROOT"
+  chown -R ec2-user:ec2-user "$APP_ROOT" || true
+  return 0
+}
+
+if ! unpack_from_s3 || [ ! -d "$APP_DIR" ]; then
+  if ! clone_from_git || [ ! -d "$APP_DIR" ]; then
+    write_placeholder
+    exit 0
+  fi
+fi
+
+write_app_env() {
+  local dest="$${1:-$APP_DIR}"
+  mkdir -p "$dest"
+  cat > "$dest/.env" <<ENV
+PORT=$APP_PORT
+NODE_ENV=production
+HOST=0.0.0.0
+ENV
+  if [ -n "$RDS_ENDPOINT" ] && [ "$RDS_ENDPOINT" != "null" ]; then
+    echo "PGHOST=$RDS_ENDPOINT" >> "$dest/.env"
+  fi
+  if [ -n "$DATABASE_SECRET_ARN" ] && [ "$DATABASE_SECRET_ARN" != "null" ]; then
+    cat > /tmp/deplai-db-env.py <<'PY'
+import json, sys, urllib.parse
+raw = sys.stdin.read().strip()
+if not raw or raw == "None":
+    raise SystemExit(0)
+d = json.loads(raw)
+user = urllib.parse.quote(str(d.get("username") or ""), safe="")
+pw = urllib.parse.quote(str(d.get("password") or ""), safe="")
+host = str(d.get("host") or "")
+port = d.get("port") or 5432
+db = str(d.get("dbname") or "appdb")
+print(f"DATABASE_URL=postgresql://{user}:{pw}@{host}:{port}/{db}")
+print(f"PGHOST={host}")
+print(f"PGPORT={port}")
+print(f"PGUSER={d.get('username') or ''}")
+print(f"PGPASSWORD={d.get('password') or ''}")
+print(f"PGDATABASE={db}")
+PY
+    aws secretsmanager get-secret-value --secret-id "$DATABASE_SECRET_ARN" --query SecretString --output text 2>/dev/null \
+      | python3 /tmp/deplai-db-env.py >> "$dest/.env" || true
+  fi
+  chmod 600 "$dest/.env" || true
+}
+
+write_app_env
+cd "$APP_DIR"
+
+ensure_swap() {
+  if [ -f /swapfile ]; then
+    return 0
+  fi
+  dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none || return 0
+  chmod 600 /swapfile
+  mkswap /swapfile || true
+  swapon /swapfile || true
+}
+
+start_nginx_proxy() {
+  cat >/etc/nginx/conf.d/deplai-app.conf <<NGINX
+server {
+  listen 80 default_server;
+  server_name _;
+  location / {
+    proxy_pass http://127.0.0.1:$APP_PORT;
+    proxy_http_version 1.1;
+    proxy_set_header Host $$host;
+    proxy_set_header X-Real-IP $$remote_addr;
+  }
+}
+NGINX
+  systemctl enable nginx
+  systemctl restart nginx
+}
+
+serve_static() {
+  mkdir -p /usr/share/nginx/html
+  cp -R "$APP_DIR"/. /usr/share/nginx/html/ || true
+  systemctl enable nginx
+  systemctl restart nginx
+}
+
+infer_package_port() {
+  python3 - "$1" "$2" <<'PY'
+import json, re, sys
+path, default = sys.argv[1], int(sys.argv[2])
+blocked = {5432, 3306, 6379, 27017, 1433, 1521}
+try:
+    data = json.load(open(path, encoding="utf-8"))
+except Exception:
+    print(default)
+    raise SystemExit(0)
+scripts = data.get("scripts") or {}
+blob = " ".join(str(v) for v in scripts.values())
+match = re.search(r"(?:-p|--port)\s+(\d{2,5})", blob)
+if match:
+    port = int(match.group(1))
+    if 1 <= port <= 65535 and port not in blocked:
+        print(port)
+        raise SystemExit(0)
+print(default)
+PY
+}
+
+npm_in_dir() {
+  local dir="$1"
+  (
+    cd "$dir"
+    if [ -f package-lock.json ]; then
+      npm ci --legacy-peer-deps || npm install --legacy-peer-deps
+    else
+      npm install --legacy-peer-deps
+    fi
+    if grep -q '"build"' package.json 2>/dev/null; then
+      export NODE_OPTIONS="--max-old-space-size=2048"
+      npm run build
+    fi
+  )
+}
+
+start_pm2_dir() {
+  local dir="$1" name="$2" port="$3"
+  (
+    cd "$dir"
+    if [ -x node_modules/next/dist/bin/next ]; then
+      PORT="$port" pm2 start node_modules/next/dist/bin/next --name "$name" -- start -p "$port"
+    elif grep -q '"start"' package.json 2>/dev/null; then
+      PORT="$port" pm2 start npm --name "$name" --cwd "$dir" -- start
+    elif [ -f server.js ]; then
+      PORT="$port" HOST=0.0.0.0 pm2 start server.js --name "$name"
+    elif [ -f index.js ]; then
+      PORT="$port" HOST=0.0.0.0 pm2 start index.js --name "$name"
+    else
+      echo "No start command in $dir" >&2
+      return 1
+    fi
+  )
+}
+
+deploy_node_workspace() {
+  local web_dir="" api_dir=""
+  local rel
+  for rel in frontend web client; do
+    if [ -f "$APP_ROOT/$rel/package.json" ]; then
+      web_dir="$APP_ROOT/$rel"
+      break
+    fi
+  done
+  for rel in backend server api; do
+    if [ -f "$APP_ROOT/$rel/package.json" ]; then
+      api_dir="$APP_ROOT/$rel"
+      break
+    fi
+  done
+  if [ -z "$web_dir" ] || [ -z "$api_dir" ]; then
+    return 1
+  fi
+
+  dnf install -y nodejs npm git
+  npm install -g pm2 || true
+  ensure_swap
+  WEB_PORT="$(infer_package_port "$web_dir/package.json" 3000)"
+  API_PORT="$(infer_package_port "$api_dir/package.json" 5000)"
+  SAVED_PORT="$APP_PORT"
+  APP_PORT="$API_PORT"
+  write_app_env "$api_dir"
+  APP_PORT="$WEB_PORT"
+  write_app_env "$web_dir"
+  cat >> "$web_dir/.env" <<WEBENV
+NEXT_PUBLIC_API_URL=/api
+WEBENV
+  APP_PORT="$SAVED_PORT"
+
+  npm_in_dir "$api_dir"
+  if [ -d "$api_dir/prisma" ]; then
+    (
+      cd "$api_dir"
+      set -a
+      [ -f .env ] && . ./.env
+      set +a
+      npx prisma generate || true
+      if [ -d prisma/migrations ] && [ "$(ls -A prisma/migrations 2>/dev/null)" ]; then
+        npx prisma migrate deploy || true
+      else
+        npx prisma db push || true
+      fi
+    )
+  fi
+  npm_in_dir "$web_dir"
+
+  pm2 delete "$APP_NAME-api" >/dev/null 2>&1 || true
+  pm2 delete "$APP_NAME-web" >/dev/null 2>&1 || true
+  start_pm2_dir "$api_dir" "$APP_NAME-api" "$API_PORT"
+  start_pm2_dir "$web_dir" "$APP_NAME-web" "$WEB_PORT"
+  pm2 save || true
+  env PATH="$PATH" pm2 startup systemd -u root --hp /root >/dev/null 2>&1 || true
+
+  cat >/etc/nginx/conf.d/deplai-app.conf <<NGINX
+server {
+  listen 80 default_server;
+  server_name _;
+  location /api/ {
+    proxy_pass http://127.0.0.1:$API_PORT;
+    proxy_http_version 1.1;
+    proxy_set_header Host $$host;
+    proxy_set_header X-Real-IP $$remote_addr;
+    proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $$scheme;
+  }
+  location / {
+    proxy_pass http://127.0.0.1:$WEB_PORT;
+    proxy_http_version 1.1;
+    proxy_set_header Host $$host;
+    proxy_set_header X-Real-IP $$remote_addr;
+    proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $$scheme;
+  }
+}
+NGINX
+  rm -f /etc/nginx/conf.d/default.conf /usr/share/nginx/html/index.html || true
+  systemctl enable nginx
+  systemctl restart nginx
+  return 0
+}
+
+if deploy_node_workspace; then
+  exit 0
+fi
+
+if [ -d "$APP_DIR/dist" ] && [ -f "$APP_DIR/dist/index.html" ]; then
+  APP_DIR="$APP_DIR/dist"
+  serve_static
+  exit 0
+fi
+if [ -d "$APP_DIR/build" ] && [ -f "$APP_DIR/build/index.html" ]; then
+  APP_DIR="$APP_DIR/build"
+  serve_static
+  exit 0
+fi
+if [ -d "$APP_DIR/out" ] && [ -f "$APP_DIR/out/index.html" ]; then
+  APP_DIR="$APP_DIR/out"
+  serve_static
+  exit 0
+fi
+if [ -f "$APP_DIR/index.html" ] && [ "$APP_KIND" = "static" ]; then
+  serve_static
+  exit 0
+fi
+
+if [ "$APP_KIND" = "docker" ]; then
+  dnf install -y docker
+  systemctl enable --now docker
+  mkdir -p /usr/local/lib/docker/cli-plugins
+  if [ ! -x /usr/local/lib/docker/cli-plugins/docker-compose ]; then
+    curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64" \
+      -o /usr/local/lib/docker/cli-plugins/docker-compose
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+  fi
+  if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
+    docker compose up -d --build || true
+    systemctl stop nginx || true
+    exit 0
+  elif [ -f Dockerfile ]; then
+    docker build -t "$APP_NAME:latest" .
+    docker run -d --name "$APP_NAME" --restart unless-stopped -p "127.0.0.1:$APP_PORT:$APP_PORT" --env-file "$APP_DIR/.env" -e PORT="$APP_PORT" "$APP_NAME:latest"
+    start_nginx_proxy
+    exit 0
+  fi
+fi
+
+if [ "$APP_KIND" = "node" ]; then
+  dnf install -y nodejs npm
+  npm install -g pm2 || true
+  pm2 delete "$APP_NAME" || true
+  if [ ! -d "$APP_DIR/.next" ] && [ ! -d "$APP_DIR/node_modules" ]; then
+    ensure_swap
+    if [ -f package-lock.json ]; then npm ci --legacy-peer-deps || npm install --legacy-peer-deps; else npm install --legacy-peer-deps; fi
+    if [ -n "$BUILD_COMMAND" ]; then export NODE_OPTIONS="--max-old-space-size=2048"; bash -lc "$BUILD_COMMAND" || true; fi
+  fi
+  if [ -x node_modules/next/dist/bin/next ]; then
+    PORT="$APP_PORT" pm2 start node_modules/next/dist/bin/next --name "$APP_NAME" -- start -p "$APP_PORT"
+  elif [ -n "$START_COMMAND" ]; then
+    PORT="$APP_PORT" pm2 start bash --name "$APP_NAME" -- -lc "cd '$APP_DIR' && set -a && [ -f .env ] && . ./.env && set +a && PORT='$APP_PORT' $START_COMMAND"
+  fi
+  pm2 save || true
+  start_nginx_proxy
+  exit 0
+fi
+
+if [ "$APP_KIND" = "python" ]; then
+  dnf install -y python3 python3-pip
+  if [ -f requirements.txt ]; then python3 -m pip install -r requirements.txt; elif [ -f pyproject.toml ]; then python3 -m pip install .; fi
+  if [ -n "$BUILD_COMMAND" ]; then bash -lc "$BUILD_COMMAND" || true; fi
+  cat >/etc/systemd/system/deplai-app.service <<SERVICE
+[Unit]
+Description=DeplAI app
+After=network.target
+[Service]
+WorkingDirectory=$APP_DIR
+Environment=PORT=$APP_PORT
+EnvironmentFile=-$APP_DIR/.env
+ExecStart=/bin/bash -lc "cd '$APP_DIR' && $START_COMMAND"
+Restart=always
+[Install]
+WantedBy=multi-user.target
+SERVICE
+  systemctl daemon-reload
+  systemctl enable --now deplai-app
+  start_nginx_proxy
+  exit 0
+fi
+
+if [ -n "$START_COMMAND" ]; then
+  if [ -n "$BUILD_COMMAND" ]; then bash -lc "$BUILD_COMMAND" || true; fi
+  cat >/etc/systemd/system/deplai-app.service <<SERVICE
+[Unit]
+Description=DeplAI app
+After=network.target
+[Service]
+WorkingDirectory=$APP_DIR
+Environment=PORT=$APP_PORT
+EnvironmentFile=-$APP_DIR/.env
+ExecStart=/bin/bash -lc "cd '$APP_DIR' && $START_COMMAND"
+Restart=always
+[Install]
+WantedBy=multi-user.target
+SERVICE
+  systemctl daemon-reload
+  systemctl enable --now deplai-app
+  start_nginx_proxy
+  exit 0
+fi
+
+if [ -f "$APP_ROOT/frontend/package.json" ] || [ -f "$APP_ROOT/backend/package.json" ]; then
+  echo "refusing to copy a Node source tree into nginx html" >&2
+  exit 1
+fi
+
+serve_static
+USERDATA
+  )
 
   tags = merge(var.common_tags, { Name = "${var.project_name}-${var.environment}-app" })
 }

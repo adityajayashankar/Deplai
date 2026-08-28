@@ -27,32 +27,6 @@ def call_advisor_chat(
     llm_api_base_url: str | None = None,
 ) -> str | None:
     """Answer the latest user message using plan context. Returns plain text or None."""
-    try:
-        from terraform_consult import _llm_available, _resolve_openai_compatible
-    except Exception:
-        return None
-
-    ok, _reason = _llm_available(
-        llm_provider=llm_provider,
-        llm_api_key=llm_api_key,
-        llm_api_base_url=llm_api_base_url,
-    )
-    if not ok:
-        return None
-
-    config: dict[str, str] | None = None
-    if _text(llm_api_key) and _text(llm_api_base_url):
-        config = {
-            "provider": _text(llm_provider) or "custom",
-            "api_key": _text(llm_api_key),
-            "model": _text(llm_model) or "gpt-4o-mini",
-            "base_url": _text(llm_api_base_url).rstrip("/"),
-        }
-    else:
-        config = _resolve_openai_compatible()
-    if not config:
-        return None
-
     stack = dict((decision or {}).get("stack_config") or {})
     ec2 = dict(stack.get("ec2") or {})
     rds = dict(stack.get("rds") or {})
@@ -91,6 +65,51 @@ def call_advisor_chat(
         f"{json.dumps(context, ensure_ascii=True, default=str)}\n\n"
         "Answer the latest user message in recent_messages."
     )
+
+    try:
+        from ai_gateway import chat_text, gateway_ready
+        if gateway_ready():
+            ok, text = chat_text(
+                model=_text(llm_model) or "best",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                api_key=_text(llm_api_key) or None,
+                provider=_text(llm_provider) or None,
+                temperature=0.3,
+                max_tokens=700,
+            )
+            if ok:
+                return text
+    except Exception:
+        pass
+
+    try:
+        from terraform_consult import _llm_available, _resolve_openai_compatible
+    except Exception:
+        return None
+
+    ok, _reason = _llm_available(
+        llm_provider=llm_provider,
+        llm_api_key=llm_api_key,
+        llm_api_base_url=llm_api_base_url,
+    )
+    if not ok:
+        return None
+
+    config: dict[str, str] | None = None
+    if _text(llm_api_key) and _text(llm_api_base_url):
+        config = {
+            "provider": _text(llm_provider) or "custom",
+            "api_key": _text(llm_api_key),
+            "model": _text(llm_model) or "gpt-4o-mini",
+            "base_url": _text(llm_api_base_url).rstrip("/"),
+        }
+    else:
+        config = _resolve_openai_compatible()
+    if not config:
+        return None
 
     endpoint = f"{config['base_url']}/chat/completions"
     payload = {

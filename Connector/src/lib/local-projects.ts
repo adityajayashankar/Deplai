@@ -19,15 +19,26 @@ export function getZipPath(userId: string, projectId: string): string {
 }
 
 /** Prevent directory traversal attacks */
-function validatePath(projectPath: string, requestedPath: string): string {
-  const fullPath = path.join(projectPath, requestedPath);
-  const normalizedPath = path.normalize(fullPath);
-
-  if (!normalizedPath.startsWith(projectPath)) {
+export function resolveSafeProjectPath(projectPath: string, requestedPath: string): string {
+  if (String(requestedPath || '').includes('\0')) {
     throw new Error('Invalid path: directory traversal detected');
   }
-  
-  return normalizedPath;
+
+  const base = path.resolve(projectPath);
+  const target = path.resolve(base, String(requestedPath || '').replace(/\\/g, '/'));
+  const relative = path.relative(base, target);
+  const escaped = relative === '..'
+    || relative.startsWith(`..${path.sep}`)
+    || path.isAbsolute(relative);
+  if (escaped) {
+    throw new Error('Invalid path: directory traversal detected');
+  }
+
+  return target;
+}
+
+function validatePath(projectPath: string, requestedPath: string): string {
+  return resolveSafeProjectPath(projectPath, requestedPath);
 }
 
 function getDirectoryStats(dirPath: string): { size: number; fileCount: number } {
@@ -96,19 +107,23 @@ export async function extractZipToProject(
     for (const entry of zipEntries) {
       if (entry.isDirectory) continue;
       
-      let relativePath = entry.entryName;
+      let relativePath = String(entry.entryName || '').replace(/\\/g, '/');
       
       // Strip root folder if it exists
       if (rootFolder && relativePath.startsWith(rootFolder + '/')) {
         relativePath = relativePath.substring(rootFolder.length + 1);
+      }
+
+      if (!relativePath) {
+        continue;
       }
       
       // Skip hidden files and common build directories
       if (shouldSkipFile(relativePath)) {
         continue;
       }
-      
-      const targetPath = path.join(projectPath, relativePath);
+
+      const targetPath = resolveSafeProjectPath(projectPath, relativePath);
       const targetDir = path.dirname(targetPath);
       
       // Create directory structure
@@ -215,13 +230,21 @@ export function getFileContents(
 }
 
 const SKIP_PATTERNS = [
-  /^\./, /\/\./,
   /node_modules/, /\.git\//, /dist\//, /build\//, /\.next\//,
   /coverage\//, /__pycache__\//, /\.pytest_cache\//, /\.venv\//, /venv\//,
   /\.vscode\//, /\.idea\//,
   /\.DS_Store/, /Thumbs\.db/,
 ];
 
+function isSkippedHiddenSegment(segment: string): boolean {
+  return segment.startsWith('.') && segment !== '.' && segment !== '..';
+}
+
 function shouldSkipFile(filePath: string): boolean {
-  return SKIP_PATTERNS.some(pattern => pattern.test(filePath));
+  const normalized = String(filePath || '').replace(/\\/g, '/');
+  const segments = normalized.split('/').filter(Boolean);
+  if (segments.some(isSkippedHiddenSegment)) {
+    return true;
+  }
+  return SKIP_PATTERNS.some((pattern) => pattern.test(normalized));
 }

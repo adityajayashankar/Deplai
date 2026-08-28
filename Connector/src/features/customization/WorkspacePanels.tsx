@@ -27,7 +27,7 @@ import type {
 import { diffLineClassName } from './utils';
 
 const focusRing =
-  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-300 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0a0a0b]';
+  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-black/35 focus-visible:ring-offset-2 focus-visible:ring-offset-white';
 
 export function WorkspaceTabs({
   active,
@@ -41,7 +41,7 @@ export function WorkspaceTabs({
   pendingAssetCount: number;
 }) {
   return (
-    <nav aria-label="Workspace views" className="customization-scrollbar flex h-11 shrink-0 overflow-x-auto border-b border-white/8 bg-[#0d0d0f] px-1">
+    <nav aria-label="Workspace views" className="customization-scrollbar flex h-11 shrink-0 overflow-x-auto border-b-[3px] border-black bg-white px-1">
       {WORKSPACE_TABS.map((tab) => {
         const Icon = tab.icon;
         const badge = tab.value === 'quality' ? errorCount : tab.value === 'assets' ? pendingAssetCount : 0;
@@ -52,7 +52,7 @@ export function WorkspaceTabs({
             onClick={() => onChange(tab.value)}
             aria-current={active === tab.value ? 'page' : undefined}
             className={`relative flex h-full shrink-0 items-center gap-1.5 px-3 text-[11px] transition ${
-              active === tab.value ? 'text-zinc-100' : 'text-zinc-600 hover:text-zinc-300'
+              active === tab.value ? 'font-bold text-black' : 'text-neutral-500 hover:text-black'
             } ${focusRing}`}
           >
             <Icon className="h-3.5 w-3.5" />
@@ -62,7 +62,7 @@ export function WorkspaceTabs({
                 {badge}
               </span>
             )}
-            {active === tab.value && <span className="absolute inset-x-2 bottom-0 h-px bg-zinc-200" />}
+            {active === tab.value && <span className="absolute inset-x-2 bottom-0 h-0.5 bg-black" />}
           </button>
         );
       })}
@@ -74,7 +74,7 @@ function EmptyState({ title, detail }: { title: string; detail: string }) {
   return (
     <div className="flex h-full min-h-64 flex-col items-center justify-center p-8 text-center">
       <FileCode2 className="h-7 w-7 text-zinc-700" />
-      <h2 className="mt-3 text-sm font-medium text-zinc-300">{title}</h2>
+      <h2 className="mt-3 text-sm font-medium text-black">{title}</h2>
       <p className="mt-1 max-w-sm text-xs leading-5 text-zinc-600">{detail}</p>
     </div>
   );
@@ -88,8 +88,8 @@ export function ChangesPanel({ entries }: { entries: DiffEntry[] }) {
     <section aria-label="Applied code changes" className="customization-scrollbar h-full overflow-auto p-3 sm:p-5">
       <div className="mx-auto max-w-5xl space-y-3">
         {entries.map((entry) => (
-          <article key={entry.file} className="overflow-hidden rounded-lg border border-white/8 bg-[#0d0d0f]">
-            <header className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 px-3 py-2.5">
+          <article key={entry.file} className="overflow-hidden rounded-lg border border-black bg-white">
+            <header className="flex flex-wrap items-center justify-between gap-2 border-b border-black px-3 py-2.5">
               <span className="min-w-0 truncate font-mono text-[10px] text-zinc-300">{entry.file}</span>
               <div className="flex items-center gap-1.5">
                 {entry.source && (
@@ -98,7 +98,7 @@ export function ChangesPanel({ entries }: { entries: DiffEntry[] }) {
                   </span>
                 )}
                 {entry.operation && (
-                  <span className="rounded border border-white/8 px-1.5 py-0.5 text-[9px] text-zinc-500">{entry.operation}</span>
+                  <span className="rounded border border-black px-1.5 py-0.5 text-[9px] text-zinc-500">{entry.operation}</span>
                 )}
                 {entry.truncated && <span className="text-[9px] text-amber-400">Truncated</span>}
               </div>
@@ -159,18 +159,18 @@ export function QualityPanel({
             { label: 'Errors', value: `${errors.length}` },
             { label: 'Warnings', value: `${warnings.length}` },
           ].map((item) => (
-            <div key={item.label} className="rounded-lg border border-white/8 bg-[#0d0d0f] p-3">
+            <div key={item.label} className="rounded-lg border border-black bg-white p-3">
               <p className="text-[9px] uppercase tracking-wider text-zinc-600">{item.label}</p>
               <p className="mt-1 font-mono text-sm text-zinc-200">{item.value}</p>
             </div>
           ))}
         </div>
         {checks.length > 0 && (
-          <div className="overflow-hidden rounded-lg border border-white/8">
+          <div className="overflow-hidden rounded-lg border border-black">
             {checks.map((check, index) => {
               const passed = check.status === 'passed' || check.status === 'success';
               return (
-                <div key={`${check.name}-${index}`} className="flex gap-3 border-b border-white/7 bg-[#0d0d0f] p-3 last:border-0">
+                <div key={`${check.name}-${index}`} className="flex gap-3 border-b border-black bg-white p-3 last:border-0">
                   {passed ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" /> : <ShieldAlert className="h-4 w-4 shrink-0 text-amber-400" />}
                   <div>
                     <p className="text-xs font-medium text-zinc-300">{check.name || `Check ${index + 1}`}</p>
@@ -216,7 +216,7 @@ export function ManifestPanel({
 }) {
   return (
     <section aria-label="Manifest inspector" className="flex h-full min-h-0 flex-col">
-      <header className="flex min-h-12 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-white/8 px-4 py-2">
+      <header className="flex min-h-12 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-black px-4 py-2">
         <div className="flex items-center gap-2">
           <h2 className="text-xs font-medium text-zinc-200">manifest.json</h2>
           {manifest && (
@@ -289,7 +289,7 @@ export function AssetsPanel({
             </button>
           )}
         </div>
-        <div className="grid gap-3 rounded-lg border border-white/8 bg-[#0d0d0f] p-4 sm:grid-cols-[220px_1fr]">
+        <div className="grid gap-3 rounded-lg border border-black bg-white p-4 sm:grid-cols-[220px_1fr]">
           <div>
             <label htmlFor="asset-type" className="mb-1.5 block text-[10px] font-medium text-zinc-500">
               Asset type
@@ -298,7 +298,7 @@ export function AssetsPanel({
               id="asset-type"
               value={assetType}
               onChange={(event) => onAssetTypeChange(event.target.value as AssetType)}
-              className={`h-9 w-full rounded-md border border-white/10 bg-[#111113] px-2 text-xs text-zinc-200 ${focusRing}`}
+              className={`h-9 w-full rounded-md border border-white/10 bg-white px-2 text-xs text-zinc-200 ${focusRing}`}
             >
               {ASSET_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>
@@ -323,13 +323,13 @@ export function AssetsPanel({
         </div>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {assets.map((asset) => (
-            <article key={asset.assetType} className="overflow-hidden rounded-lg border border-white/8 bg-[#0d0d0f]">
+            <article key={asset.assetType} className="overflow-hidden rounded-lg border border-black bg-white">
               <div className="flex h-32 items-center justify-center bg-black/25 p-4">
                 {/* Backend assets are authenticated same-origin URLs and may be SVG. */}
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src={asset.previewUrl} alt={`${asset.assetType}: ${asset.fileName}`} className="max-h-full max-w-full object-contain" />
               </div>
-              <div className="flex items-center justify-between border-t border-white/7 px-3 py-2.5">
+              <div className="flex items-center justify-between border-t border-black px-3 py-2.5">
                 <div className="min-w-0">
                   <p className="truncate text-xs text-zinc-300">{asset.assetType}</p>
                   <p className="truncate text-[9px] text-zinc-700">{asset.fileName}</p>
@@ -377,7 +377,7 @@ export function SettingsPanel({
               const Icon = mode.icon;
               const selected = run.pipelineMode === mode.value;
               return (
-                <label key={mode.value} className={`flex cursor-pointer gap-3 rounded-lg border p-3 ${selected ? 'border-zinc-500 bg-white/5' : 'border-white/8 bg-[#0d0d0f]'}`}>
+                <label key={mode.value} className={`flex cursor-pointer gap-3 rounded-lg border p-3 ${selected ? 'border-zinc-500 bg-white/5' : 'border-black bg-white'}`}>
                   <input
                     type="radio"
                     name="pipeline-mode"
@@ -400,7 +400,7 @@ export function SettingsPanel({
           <legend className="text-xs font-medium text-zinc-300">Application targets</legend>
           <div className="mt-3 grid gap-2 sm:grid-cols-2">
             {DEFAULT_APP_TARGETS.map((target) => (
-              <label key={target} className="flex cursor-pointer items-center gap-2 rounded-md border border-white/8 bg-[#0d0d0f] px-3 py-2.5 text-xs text-zinc-400">
+              <label key={target} className="flex cursor-pointer items-center gap-2 rounded-md border border-black bg-white px-3 py-2.5 text-xs text-zinc-400">
                 <input
                   type="checkbox"
                   checked={run.appTargets.includes(target)}
@@ -417,7 +417,7 @@ export function SettingsPanel({
             ))}
           </div>
         </fieldset>
-        <div className="rounded-lg border border-white/8 bg-[#0d0d0f] p-4">
+        <div className="rounded-lg border border-black bg-white p-4">
           <label className="flex cursor-pointer items-start justify-between gap-4">
             <span>
               <span className="block text-xs font-medium text-zinc-300">Auto-apply approved changes</span>
@@ -428,7 +428,7 @@ export function SettingsPanel({
             <input type="checkbox" checked={autoApply} onChange={(event) => onAutoApplyChange(event.target.checked)} className="mt-1 h-4 w-4 accent-zinc-100" />
           </label>
         </div>
-        <div className="rounded-lg border border-white/8 bg-[#0d0d0f] p-4">
+        <div className="rounded-lg border border-black bg-white p-4">
           <p className="text-[10px] uppercase tracking-wider text-zinc-600">Resolved repository</p>
           <p className="mt-2 break-all font-mono text-[10px] leading-5 text-zinc-400">{resolvedRepoPath || 'Repository path unavailable.'}</p>
         </div>

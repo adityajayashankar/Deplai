@@ -13,6 +13,14 @@ interface ScanValidateBody {
   project_name?: string;
   project_type?: 'local' | 'github';
   scan_type?: 'all' | 'sast' | 'sca';
+  enabled_modules?: string[];
+  dast_target_url?: string;
+  dast_asset_id?: string;
+  dast_scan_profile?: string;
+  aws_access_key_id?: string;
+  aws_secret_access_key?: string;
+  aws_session_token?: string;
+  aws_region?: string;
   owner?: string;
   repo?: string;
   customization_snapshot_id?: string;
@@ -24,6 +32,17 @@ type ScanValidatePayload = {
   project_name: string;
   project_type: 'local' | 'github';
   scan_type: 'all' | 'sast' | 'sca';
+  enabled_modules?: string[];
+  dast_target_url?: string;
+  dast_asset_id?: string;
+  dast_scan_id?: string;
+  dast_scan_profile?: string;
+  dast_scan_intent?: string;
+  dast_authorization?: Record<string, unknown>;
+  aws_access_key_id?: string;
+  aws_secret_access_key?: string;
+  aws_session_token?: string;
+  aws_region?: string;
   user_id: string;
   github_token?: string;
   repository_url?: string;
@@ -52,6 +71,26 @@ interface GitHubRepoRow {
   installation_uuid: string;
   user_id: string | null;
   suspended_at: string | null;
+}
+
+function formatBackendError(errorBody: { error?: unknown; detail?: unknown } | null): string {
+  const error = errorBody?.error;
+  if (typeof error === 'string' && error.trim()) return error;
+  const detail = errorBody?.detail;
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object' && 'msg' in item) {
+          return String((item as { msg?: unknown }).msg || '');
+        }
+        return '';
+      })
+      .filter(Boolean);
+    if (parts.length) return parts.join(' ');
+  }
+  return 'Backend scan validation failed';
 }
 
 function isBackendConnectivityError(error: unknown): boolean {
@@ -106,6 +145,60 @@ export async function POST(request: NextRequest) {
       scan_type: resolvedScanType,
       user_id: String(user.id),
     };
+    if (Array.isArray(body.enabled_modules) && body.enabled_modules.length > 0) {
+      backendPayload.enabled_modules = body.enabled_modules.map((item) => String(item));
+    }
+    const requestedModules = Array.isArray(body.enabled_modules)
+      ? body.enabled_modules.map((item) => String(item).trim().toLowerCase())
+      : [];
+    const dastTarget = String(body.dast_target_url || '').trim();
+    const dastAssetId = String(body.dast_asset_id || '').trim();
+    const dastOnly = requestedModules.length === 1 && requestedModules[0] === 'dast';
+    if (dastTarget || dastAssetId || dastOnly) {
+      try {
+        const { createScanRecord, resolveAuthorizedAsset } = await import('@/lib/dast/store');
+        const resolved = await resolveAuthorizedAsset({
+          userId: String(user.id),
+          projectId: resolvedProjectId,
+          assetId: dastAssetId || undefined,
+          targetUrl: dastTarget || undefined,
+        });
+        const profile = String(body.dast_scan_profile || 'BASELINE').toUpperCase();
+        const intent = profile === 'FULL' ? 'ACTIVE' : profile === 'API' ? 'API_ACTIVE' : 'PASSIVE';
+        const scanId = await createScanRecord({
+          userId: String(user.id),
+          projectId: resolvedProjectId,
+          asset: resolved.asset,
+          targetUrl: resolved.targetUrl,
+          profile: profile === 'FULL' || profile === 'API' ? profile : 'BASELINE',
+          intent,
+        });
+        backendPayload.dast_target_url = resolved.targetUrl;
+        backendPayload.dast_asset_id = resolved.asset.id;
+        backendPayload.dast_scan_id = scanId;
+        backendPayload.dast_scan_profile = profile === 'FULL' || profile === 'API' ? profile : 'BASELINE';
+        backendPayload.dast_scan_intent = intent;
+        backendPayload.dast_authorization = resolved.grant;
+      } catch (dastError) {
+        const code = (dastError as { code?: string }).code || 'DAST_TARGET_NOT_AUTHORIZED';
+        const status = Number((dastError as { status?: number }).status || 403);
+        return NextResponse.json(
+          {
+            error: dastError instanceof Error
+              ? dastError.message
+              : 'This target is not associated with the selected project and ownership has not been verified.',
+            code,
+          },
+          { status },
+        );
+      }
+    }
+    if (requestedModules.includes('cloud')) {
+      backendPayload.aws_access_key_id = String(body.aws_access_key_id || '').trim() || undefined;
+      backendPayload.aws_secret_access_key = String(body.aws_secret_access_key || '').trim() || undefined;
+      backendPayload.aws_session_token = String(body.aws_session_token || '').trim() || undefined;
+      backendPayload.aws_region = String(body.aws_region || '').trim() || undefined;
+    }
 
     if (customizationSnapshotId && tenantId) {
       const ownership = await verifyProjectOwnership(user.id, resolvedProjectId);
@@ -241,10 +334,16 @@ export async function POST(request: NextRequest) {
     });
 
     if (!response.ok) {
-      const errorBody = await response.json().catch(() => ({ error: 'Backend request failed' }));
+      const raw = await response.text();
+      let errorBody: { error?: unknown; detail?: unknown } | null = null;
+      try {
+        errorBody = raw ? JSON.parse(raw) : null;
+      } catch {
+        errorBody = { error: `Agentic Layer returned HTTP ${response.status}` };
+      }
       console.error('Scan validate backend error:', response.status, errorBody);
       return NextResponse.json(
-        { error: errorBody?.error || errorBody?.detail || 'Backend scan validation failed' },
+        { error: formatBackendError(errorBody) },
         { status: response.status },
       );
     }

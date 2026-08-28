@@ -1,0 +1,1829 @@
+# UI/UX WORKSTREAM — FULL-LIFECYCLE APPSEC EXPANSION
+
+The existing product contains a **Security Pipeline** subspace.
+
+This subspace is already part of the product experience.
+
+DO NOT replace it with a new navigation architecture.
+
+Extend the existing Security Pipeline UX so it becomes the central operational interface for all security controls introduced by this roadmap.
+
+The UI/UX implementation must happen alongside backend/scanner development.
+
+Do not defer UI/UX until the end.
+
+---
+
+# UI/UX OBJECTIVE
+
+Transform the existing Security Pipeline from a primarily:
+
+```
+SAST
+SCA
+SBOM
+```
+
+workflow into a complete:
+
+```
+CODE
+SUPPLY CHAIN
+SECRETS
+INFRASTRUCTURE
+CONTAINER
+API
+DYNAMIC TESTING
+CLOUD
+KUBERNETES
+CI/CD
+RUNTIME
+RISK
+ATTACK PATH
+REMEDIATION
+```
+
+security operations experience.
+
+The user should feel like they are using ONE security platform.
+
+Do NOT make it feel like:
+
+```
+Semgrep page
+Gitleaks page
+ZAP page
+Checkov page
+Trivy page
+Prowler page
+```
+
+Each tool is an implementation detail.
+
+The product UX should represent security concepts, not vendor tools.
+
+---
+
+# CURRENT UX ASSUMPTION
+
+There is an existing:
+
+```
+Security Pipeline
+```
+
+subspace.
+
+First inspect:
+
+* current route
+* current page layout
+* navigation
+* components
+* cards
+* tables
+* filters
+* scan state UI
+* finding detail pages
+* existing visual language
+* existing design system
+* responsive behavior
+* loading states
+* empty states
+* error states
+* charts
+* icons
+* color semantics
+
+Reuse these components and patterns.
+
+Do NOT introduce a second design system.
+
+---
+
+# TARGET INFORMATION ARCHITECTURE
+
+Extend the current Security Pipeline into:
+
+```
+Security Pipeline
+│
+├── Overview
+│
+├── Pipeline Runs
+│
+├── Findings
+│
+├── Assets
+│
+├── Applications
+│
+├── Dependencies
+│
+├── Secrets
+│
+├── Infrastructure
+│     ├── IaC
+│     ├── Containers
+│     ├── Kubernetes
+│     └── Cloud
+│
+├── APIs
+│
+├── Dynamic Testing
+│     ├── DAST
+│     └── API Testing
+│
+├── Supply Chain
+│     ├── SBOM
+│     ├── Dependencies
+│     └── Package Risk
+│
+├── Attack Paths
+│
+├── Risk
+│
+└── Remediation
+```
+
+Adapt naming to the existing product's conventions.
+
+---
+
+# PRINCIPLE 1 — PIPELINE-FIRST UX
+
+The Security Pipeline must remain the main control surface.
+
+Example:
+
+```
+Security Pipeline #128
+
+┌─────────────────────────────────────────────┐
+│ Repository: payments-api                    │
+│ Commit: a8f21e                              │
+│ Environment: Production                    │
+│ Started: 14:22                             │
+└─────────────────────────────────────────────┘
+
+┌───────────┬────────────┬───────────┬────────┐
+│ SAST      │ SCA        │ Secrets   │ IaC    │
+│ ✓ 12      │ ✓ 8        │ ✓ 2       │ ✓ 5    │
+├───────────┼────────────┼───────────┼────────┤
+│ SBOM      │ Container  │ DAST      │ API    │
+│ ✓         │ ✓ 3        │ ⟳         │ ⟳      │
+└───────────┴────────────┴───────────┴────────┘
+```
+
+The user must be able to understand the complete pipeline status without opening eight separate pages.
+
+---
+
+# PRINCIPLE 2 — REAL-TIME PIPELINE STATUS
+
+The pipeline UI should display scanner execution state in real time.
+
+States:
+
+```
+QUEUED
+STARTING
+RUNNING
+COMPLETED
+FAILED
+CANCELLED
+TIMED OUT
+SKIPPED
+```
+
+Each module should show:
+
+* status
+* elapsed time
+* findings count
+* scanner name only where useful
+* retry status
+* failure reason
+
+Example:
+
+```
+SAST
+● Running
+Semgrep 1.95.0
+00:32 elapsed
+
+SBOM
+✓ Completed
+4,381 components
+00:14
+
+DAST
+● Running
+27 endpoints discovered
+```
+
+Avoid showing low-level Docker details unless the user is an administrator/debugging a failure.
+
+---
+
+# PRINCIPLE 3 — SECURITY MODULE CARDS
+
+Create a reusable:
+
+```
+SecurityModuleCard
+```
+
+Do not hand-build each scanner panel.
+
+Properties:
+
+```
+module
+status
+finding_count
+severity_breakdown
+duration
+last_scan
+error
+capabilities
+```
+
+Modules:
+
+```
+SAST
+SCA
+SBOM
+Secrets
+IaC
+Containers
+DAST
+API Security
+API Fuzzing
+CI/CD
+Kubernetes
+Cloud
+Threat Modeling
+Runtime
+```
+
+The card should support:
+
+* hover
+* click
+* status
+* summary
+* drill-down
+
+---
+
+# PRINCIPLE 4 — DON'T EXPOSE TOOL COMPLEXITY
+
+The UI should generally say:
+
+```
+Secret Scanning
+```
+
+not:
+
+```
+Gitleaks
+```
+
+It should say:
+
+```
+Container Security
+```
+
+not:
+
+```
+Trivy + Syft + Grype
+```
+
+It should say:
+
+```
+Dynamic Application Security Testing
+```
+
+not:
+
+```
+OWASP ZAP
+```
+
+The scanner name can appear in:
+
+```
+Finding details
+Scan diagnostics
+Administrator tooling
+"Evidence source"
+```
+
+This creates vendor-neutral product UX.
+
+---
+
+# OVERVIEW PAGE
+
+The Security Pipeline Overview should answer five questions immediately:
+
+1. What is happening?
+2. What is broken?
+3. What is critical?
+4. What is exploitable?
+5. What should I fix first?
+
+Top section:
+
+```
+Security Posture
+
+Critical     7
+High        19
+Medium      43
+Low         71
+```
+
+Then:
+
+```
+Exploitable
+Internet Exposed
+Production
+Active Runtime
+Attack Paths
+```
+
+Use compact KPI cards consistent with the existing design system.
+
+---
+
+# RISK OVERVIEW
+
+Add a risk visualization.
+
+Display:
+
+```
+Overall Risk Score
+───────────────
+      82
+   CRITICAL
+```
+
+Then show why:
+
+```
++ Internet-exposed assets
++ Exploitable vulnerabilities
++ Production workloads
++ Sensitive data
++ Known exploited CVEs
+```
+
+Do not hide risk calculation.
+
+Provide:
+
+```
+"Why is this Critical?"
+```
+
+interaction.
+
+---
+
+# FINDINGS EXPERIENCE
+
+The existing findings UI should become unified.
+
+Add filters:
+
+```
+Severity
+Scanner
+Category
+Application
+Repository
+Asset
+Environment
+Production
+Internet Exposure
+Exploitability
+Runtime Activity
+Owner
+Status
+First Seen
+Last Seen
+```
+
+Add saved views.
+
+Examples:
+
+```
+Critical Production
+Exploitable Internet-facing
+Developer Assigned
+New This Week
+SLA Breached
+Active Runtime Vulnerabilities
+```
+
+---
+
+# FINDINGS TABLE
+
+Use a normalized finding representation.
+
+Columns:
+
+```
+Severity
+Finding
+Category
+Asset
+Environment
+Risk
+Exploitability
+Owner
+Status
+Last Seen
+```
+
+Do NOT put every metadata field into the table.
+
+Allow expandable row details.
+
+---
+
+# FINDING DETAIL PAGE
+
+This becomes one of the most important UX surfaces.
+
+Structure:
+
+## Header
+
+```
+CRITICAL
+
+Server-Side Request Forgery
+
+/api/proxy
+
+Production
+```
+
+Then:
+
+```
+Risk Score: 96
+```
+
+Then:
+
+```
+Why this matters
+```
+
+Then:
+
+```
+Evidence
+```
+
+Then:
+
+```
+Attack Path
+```
+
+Then:
+
+```
+Root Cause
+```
+
+Then:
+
+```
+Remediation
+```
+
+Then:
+
+```
+Verification
+```
+
+---
+
+# FINDING DETAIL — EVIDENCE
+
+Show evidence grouped by source.
+
+Example:
+
+```
+Static Analysis
+Semgrep
+Potential SSRF
+
+Dynamic Testing
+DAST
+SSRF confirmed
+
+Runtime
+Endpoint actively used
+
+Cloud
+Service Internet exposed
+```
+
+This is the key value proposition of the unified platform.
+
+Do not show four unrelated cards.
+
+Show:
+
+```
+ONE FINDING
+   ↓
+MULTIPLE EVIDENCE SOURCES
+```
+
+---
+
+# FINDING DETAIL — CORRELATION
+
+Add:
+
+```
+Correlated Evidence
+```
+
+Example:
+
+```
+┌──────────┐
+│  SAST    │
+│ Potential│
+│  SSRF    │
+└────┬─────┘
+     │
+     ▼
+┌──────────┐
+│   DAST   │
+│ Confirmed │
+└────┬─────┘
+     │
+     ▼
+┌──────────┐
+│ Runtime  │
+│ Observed │
+└──────────┘
+```
+
+This visualization should use the existing UI visual language.
+
+Do NOT require a complex graph library unless genuinely useful.
+
+---
+
+# ATTACK PATH UX
+
+Create a dedicated:
+
+```
+Attack Paths
+```
+
+subspace.
+
+Show:
+
+```
+Internet
+   ↓
+API Gateway
+   ↓
+Vulnerable Endpoint
+   ↓
+Kubernetes Pod
+   ↓
+Service Account
+   ↓
+Cloud IAM
+   ↓
+Sensitive Storage
+```
+
+Each node should be clickable.
+
+Clicking a node opens:
+
+* asset details
+* related findings
+* owner
+* environment
+* exposure
+* remediation
+
+---
+
+# ATTACK PATH LIST
+
+Table/card view:
+
+```
+Critical Attack Paths
+
+Internet
+  ↓
+API
+  ↓
+Pod
+  ↓
+Database
+
+Risk: 97
+Production
+Exploitable
+```
+
+Sort by:
+
+```
+risk
+exposure
+business impact
+number of hops
+```
+
+---
+
+# ASSET EXPLORER
+
+Create a unified asset view.
+
+Asset types:
+
+```
+Application
+Repository
+Service
+API
+Endpoint
+Dependency
+Package
+Container
+Kubernetes Resource
+Cloud Resource
+Domain
+```
+
+Asset detail should show:
+
+```
+Overview
+Findings
+Dependencies
+Exposures
+Runtime
+Attack Paths
+History
+```
+
+Example:
+
+```
+payments-api
+
+Production
+Internet-facing
+
+Risk: 89
+
+Findings: 23
+Critical: 3
+High: 8
+
+Dependencies: 164
+APIs: 41
+Containers: 7
+
+Attack Paths: 2
+```
+
+---
+
+# DEPENDENCY / SBOM UX
+
+The existing SBOM experience should evolve into:
+
+```
+Supply Chain
+```
+
+Show:
+
+```
+Total Components
+Direct Dependencies
+Transitive Dependencies
+Vulnerable Components
+Reachable Vulnerabilities
+High-Risk Packages
+License Issues
+```
+
+Add:
+
+```
+Component Explorer
+```
+
+with:
+
+```
+Package
+Version
+Ecosystem
+Risk
+Vulnerabilities
+Used By
+Fixed Version
+```
+
+---
+
+# SECRET SCANNING UX
+
+Create:
+
+```
+Secrets
+```
+
+Overview:
+
+```
+Active Secrets
+Newly Detected
+Historical
+Revoked
+High Confidence
+```
+
+Finding detail must NEVER reveal the secret.
+
+Show:
+
+```
+AWS Credential
+****7K2D
+
+Detected:
+repository X
+
+Commit:
+3ab24f
+
+Status:
+Active
+```
+
+Possible actions:
+
+```
+Mark Revoked
+Assign
+Ignore
+Create Remediation
+```
+
+---
+
+# IaC UX
+
+Create:
+
+```
+Infrastructure → IaC
+```
+
+Group findings by:
+
+```
+Terraform
+Kubernetes
+Helm
+CloudFormation
+Dockerfile
+```
+
+Show:
+
+```
+Resource
+Policy
+Severity
+Environment
+Remediation
+```
+
+Example:
+
+```
+S3 Bucket
+
+Publicly Accessible
+
+Production
+
+Critical
+```
+
+---
+
+# CONTAINER UX
+
+Create:
+
+```
+Infrastructure → Containers
+```
+
+Show:
+
+```
+Image
+Version
+Risk
+Vulnerabilities
+OS Packages
+Application Packages
+Configuration Issues
+```
+
+Container detail:
+
+```
+Image
+   ↓
+SBOM
+   ↓
+Vulnerabilities
+   ↓
+Runtime Usage
+```
+
+---
+
+# API SECURITY UX
+
+Create:
+
+```
+APIs
+```
+
+Overview:
+
+```
+Total APIs
+Unknown APIs
+Authenticated APIs
+Critical Endpoints
+API Findings
+```
+
+Endpoint explorer:
+
+```
+/users/{id}
+GET
+Authenticated
+
+Risk:
+High
+```
+
+Then:
+
+```
+Authorization
+Parameters
+Responses
+Findings
+Tests
+Traffic
+```
+
+---
+
+# API TESTING UX
+
+For a running API:
+
+```
+API Security Test
+```
+
+Show:
+
+```
+Discovery
+   ✓
+
+Authentication
+   ✓
+
+Authorization
+   ●
+
+BOLA
+   17 endpoints tested
+
+Fuzzing
+   ⟳
+```
+
+Avoid exposing raw fuzzing data by default.
+
+Allow:
+
+```
+View Request
+View Response
+Reproduce
+```
+
+---
+
+# CI/CD SECURITY UX
+
+Create:
+
+```
+Infrastructure → CI/CD
+```
+
+Show:
+
+```
+Pipeline
+Risk
+Findings
+Permissions
+Secrets
+Deployment Protection
+```
+
+Example:
+
+```
+GitHub Actions
+
+14 Workflows
+3 High Risk
+1 Critical
+```
+
+Finding:
+
+```
+Pull request workflow executes untrusted code
+```
+
+---
+
+# KUBERNETES UX
+
+Create:
+
+```
+Infrastructure → Kubernetes
+```
+
+Show:
+
+```
+Clusters
+Namespaces
+Workloads
+Services
+RBAC
+Network Policies
+Findings
+```
+
+Cluster detail:
+
+```
+Cluster
+   ↓
+Namespace
+   ↓
+Workload
+   ↓
+Pod
+   ↓
+Service Account
+   ↓
+Cloud Role
+```
+
+Use this structure later for attack-path correlation.
+
+---
+
+# CLOUD UX
+
+Create:
+
+```
+Infrastructure → Cloud
+```
+
+Initial AWS view.
+
+Show:
+
+```
+Accounts
+Regions
+Resources
+Public Resources
+IAM Risks
+Critical Findings
+```
+
+Resource detail:
+
+```
+Resource
+Environment
+Exposure
+Owner
+Findings
+Related Application
+Attack Paths
+```
+
+The user should be able to navigate:
+
+```
+Application
+   ↓
+Kubernetes
+   ↓
+Cloud
+   ↓
+Sensitive Resource
+```
+
+---
+
+# THREAT MODEL UX
+
+Create:
+
+```
+Architecture → Threat Model
+```
+
+Provide:
+
+```
+Architecture
+Assets
+Trust Boundaries
+Data Flows
+Threats
+Controls
+```
+
+Threat detail:
+
+```
+Threat
+Evidence
+Confidence
+Affected Component
+Suggested Control
+```
+
+AI-generated results MUST be clearly labeled.
+
+---
+
+# DYNAMIC TESTING UX
+
+Create:
+
+```
+Dynamic Testing
+```
+
+Sections:
+
+```
+DAST
+API Testing
+API Fuzzing
+```
+
+Show:
+
+```
+Target
+Status
+Progress
+Endpoints
+Tests
+Findings
+Duration
+```
+
+Provide safe reproduction controls.
+
+Never expose a generic "Attack this target" control.
+
+---
+
+# PIPELINE CREATION UX
+
+Allow the user to configure:
+
+```
+Security Pipeline
+```
+
+Modules:
+
+```
+☑ SAST
+☑ SCA
+☑ SBOM
+☑ Secrets
+☑ IaC
+☑ Container
+☐ DAST
+☐ API Security
+☐ Kubernetes
+☐ Cloud
+```
+
+Then configure:
+
+```
+Trigger
+Branch
+Environment
+Schedule
+Severity Gate
+Failure Policy
+Resource Limits
+```
+
+Use the existing Security Pipeline configuration UX.
+
+---
+
+# SMART PIPELINE
+
+The UI should explain when scanners are skipped.
+
+Example:
+
+```
+IaC
+Skipped
+
+Reason:
+No supported infrastructure files detected.
+```
+
+This is better than appearing broken.
+
+---
+
+# PIPELINE FAILURE UX
+
+Show actionable errors.
+
+Bad:
+
+```
+Scanner failed.
+```
+
+Good:
+
+```
+DAST failed
+
+Target application could not be reached.
+
+Target:
+https://staging.example.com
+
+Error:
+Connection timeout after 30 seconds
+
+Actions:
+Retry
+View Logs
+Edit Target
+```
+
+Do not expose raw internal stack traces to ordinary users.
+
+---
+
+# REMEDIATION UX
+
+Every important finding should eventually support:
+
+```
+Fix
+
+Explain
+
+Assign
+
+Suppress
+
+Verify
+```
+
+Developer-friendly remediation:
+
+```
+Problem
+↓
+Why
+↓
+Suggested Fix
+↓
+Apply / Open PR
+↓
+Re-scan
+↓
+Verified
+```
+
+Do not automatically modify source code without explicit user action.
+
+---
+
+# DEVELOPER EXPERIENCE
+
+Where file/line information exists:
+
+Show:
+
+```
+repository
+commit
+file
+line
+code context
+```
+
+For dependency issues:
+
+Show:
+
+```
+Package
+Current Version
+Vulnerable Version
+Fixed Version
+```
+
+For IaC:
+
+Show:
+
+```
+Resource
+Current Configuration
+Secure Configuration
+```
+
+For secrets:
+
+Never reveal the actual secret.
+
+---
+
+# FILTERING AND SEARCH
+
+Create global security search.
+
+Search examples:
+
+```
+CVE-2026-1234
+payments-api
+public S3
+semgrep finding
+production
+internet-facing
+Kubernetes
+critical
+AWS credential
+```
+
+Use existing search architecture where available.
+
+---
+
+# REPORTING
+
+Add reporting views:
+
+```
+Executive
+Engineering
+Security
+Compliance
+```
+
+Executive:
+
+```
+Risk trend
+Critical vulnerabilities
+Attack paths
+SLA
+```
+
+Engineering:
+
+```
+findings
+remediation
+affected code
+```
+
+Security:
+
+```
+exploitability
+exposure
+correlation
+runtime
+```
+
+---
+
+# UI DESIGN SYSTEM
+
+Use the existing application's:
+
+* typography
+* spacing
+* colors
+* buttons
+* cards
+* tables
+* modals
+* navigation
+* charting
+* notifications
+
+Do not introduce a second design system.
+
+Extend reusable components.
+
+Create reusable components such as:
+
+```
+SecurityModuleCard
+ScanStatus
+SeverityBadge
+RiskScore
+FindingTable
+FindingDetail
+AssetCard
+AttackPathGraph
+PipelineTimeline
+EvidencePanel
+RemediationPanel
+ScanProgress
+SecurityKPI
+```
+
+---
+
+# COLOR SEMANTICS
+
+Respect the existing product color system.
+
+Do not introduce arbitrary colors.
+
+Maintain consistent semantic meaning:
+
+```
+Critical
+High
+Medium
+Low
+Informational
+```
+
+The existing theme should determine actual colors.
+
+---
+
+# RESPONSIVE UX
+
+All new security views must work at:
+
+* desktop
+* tablet
+* smaller laptop widths
+
+Prioritize desktop because this is a security engineering product, but avoid layouts that break at intermediate widths.
+
+Tables should support horizontal scrolling or responsive column selection.
+
+---
+
+# LOADING STATES
+
+Every asynchronous view must have:
+
+* skeleton/loading state
+* empty state
+* error state
+* retry state
+
+Avoid blank screens while scanners are running.
+
+---
+
+# EMPTY STATES
+
+Example:
+
+```
+No API security findings
+
+Your latest API security scan found no issues.
+```
+
+Not:
+
+```
+No data.
+```
+
+For modules that are not configured:
+
+```
+API security is not configured.
+
+Configure an authorized API target to enable testing.
+```
+
+---
+
+# DESIGN FOR LARGE DATASETS
+
+The platform may eventually contain millions of findings/components.
+
+Therefore:
+
+* server-side pagination
+* server-side filtering
+* server-side search
+* virtualized tables where required
+* lazy-load expensive graph data
+* avoid rendering thousands of DOM nodes
+* fetch attack-path graph incrementally
+
+Do not load all findings into the browser.
+
+---
+
+# PERFORMANCE TARGETS
+
+Target:
+
+```
+dashboard initial render
+< reasonable interactive threshold
+
+finding table
+pagination < reasonable interactive threshold
+
+pipeline progress
+near-real-time updates
+```
+
+Use the existing application architecture to determine actual measurable thresholds.
+
+Measure before optimizing.
+
+---
+
+# ACCESSIBILITY
+
+Maintain:
+
+* keyboard navigation
+* focus states
+* accessible labels
+* sufficient semantic structure
+* accessible status announcements for scan progress
+
+Do not make color the only indicator of severity/status.
+
+---
+
+# SECURITY UX
+
+Never expose:
+
+* secrets
+* cloud credentials
+* raw API credentials
+* internal infrastructure details
+* scanner tokens
+
+unless explicitly authorized and absolutely necessary.
+
+Mask sensitive information.
+
+---
+
+# UI/UX IMPLEMENTATION ORDER
+
+Implement UI/UX alongside backend work.
+
+## UI PHASE 1
+
+Extend existing Security Pipeline:
+
+* pipeline overview
+* module cards
+* live progress
+* scan history
+* unified status
+
+Modules:
+
+```
+SAST
+SCA
+SBOM
+Secrets
+IaC
+Containers
+```
+
+---
+
+## UI PHASE 2
+
+Add:
+
+```
+DAST
+API Security
+API Fuzzing
+```
+
+New views:
+
+```
+APIs
+Dynamic Testing
+```
+
+---
+
+## UI PHASE 3
+
+Add:
+
+```
+CI/CD
+Kubernetes
+Cloud
+```
+
+Extend:
+
+```
+Infrastructure
+```
+
+---
+
+## UI PHASE 4
+
+Add:
+
+```
+Assets
+Correlation
+Risk
+```
+
+---
+
+## UI PHASE 5
+
+Add:
+
+```
+Attack Paths
+Threat Modeling
+Runtime
+Remediation
+```
+
+---
+
+# DESIGN PRINCIPLE FOR ATTACK PATHS
+
+The attack-path UI is not merely decorative.
+
+Every graph node must map to a real internal asset.
+
+For example:
+
+```
+Internet
+   ↓
+Endpoint
+   ↓
+Service
+   ↓
+Pod
+   ↓
+Service Account
+   ↓
+Cloud Resource
+```
+
+Clicking each node must retrieve actual platform data.
+
+Never create fake graph relationships for demonstration purposes in production.
+
+---
+
+# UI/UX TESTING
+
+For each new module:
+
+Test:
+
+* rendering
+* loading
+* empty
+* failed
+* completed
+* filters
+* pagination
+* navigation
+* permissions
+* responsive behavior
+
+Add end-to-end tests for:
+
+1. Create scan
+2. Watch scan progress
+3. Scan completes
+4. Findings appear
+5. Finding opens
+6. Evidence appears
+7. Remediation appears
+8. Finding status changes
+9. Rescan updates finding
+
+---
+
+# UI/UX DEFINITION OF DONE
+
+A security module is NOT complete until:
+
+1. backend scanner works
+2. scanner output is normalized
+3. API exposes it
+4. pipeline shows its status
+5. module has a usable overview
+6. findings appear in unified findings
+7. finding details work
+8. filtering works
+9. loading/error/empty states exist
+10. permissions work
+11. tests exist
+12. responsive layout works
+13. accessibility requirements are met
+14. sensitive information is properly masked
+
+---
+
+# FINAL UI PRINCIPLE
+
+The user should experience:
+
+```
+ONE SECURITY PIPELINE
+```
+
+powered by:
+
+```
+MANY SECURITY ENGINES
+```
+
+and producing:
+
+```
+ONE SECURITY MODEL
+```
+
+with:
+
+```
+ONE FINDING EXPERIENCE
+ONE ASSET MODEL
+ONE RISK MODEL
+ONE REMEDIATION WORKFLOW
+ONE ATTACK-PATH VIEW
+```
+
+Do not let the number of scanners dictate the information architecture.
+
+The UX represents:
+
+```
+security concepts
+```
+
+not:
+
+```
+scanner implementations.
+```
+
+---
+
+# FINAL IMPLEMENTATION INSTRUCTION
+
+Inspect the existing Security Pipeline UI before changing it.
+
+Identify:
+
+* existing routes
+* components
+* design system
+* state management
+* API integration
+* tables
+* charts
+* pipeline status
+* scan history
+* finding details
+
+Extend them.
+
+Do not create a parallel UI system.
+
+Implement UI and backend features incrementally.
+
+Every backend module must have its corresponding UI states.
+
+Every UI module must be backed by real API data.
+
+Do not create fake hardcoded security results.
+
+At every milestone verify:
+
+```
+Docker execution
+scanner
+normalization
+database
+API
+Security Pipeline UI
+Finding UI
+tests
+```
+
+The final experience must feel like a cohesive AppSec platform rather than a collection of scanner integrations.

@@ -1,108 +1,13 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { ArrowRight } from "lucide-react";
+import { AnimatedSphere } from "./animated-sphere";
+import { DeplaiLogo } from "@/components/deplai-logo";
 
-const words = ["analyze", "remediate", "deploy", "operate"];
-
-function BlurWord({ word, trigger }: { word: string; trigger: number }) {
-  const letters = word.split("");
-  const STAGGER = 45;      // ms between each letter
-  const DURATION = 500;    // blur+opacity fade duration per letter
-  const GRADIENT_HOLD = STAGGER * letters.length + DURATION + 200;
-
-  const [letterStates, setLetterStates] = useState<{ opacity: number; blur: number }[]>(
-    letters.map(() => ({ opacity: 0, blur: 20 }))
-  );
-  const [showGradient, setShowGradient] = useState(true);
-  const framesRef = useRef<number[]>([]);
-  const timersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
-
-  useEffect(() => {
-    // reset
-    framesRef.current.forEach(cancelAnimationFrame);
-    timersRef.current.forEach(clearTimeout);
-    framesRef.current = [];
-    timersRef.current = [];
-
-    setLetterStates(letters.map(() => ({ opacity: 0, blur: 20 })));
-    setShowGradient(true);
-
-    // stagger each letter
-    letters.forEach((_, i) => {
-      const t = setTimeout(() => {
-        const start = performance.now();
-        const tick = (now: number) => {
-          const progress = Math.min((now - start) / DURATION, 1);
-          const eased = 1 - Math.pow(1 - progress, 3);
-          setLetterStates(prev => {
-            const next = [...prev];
-            next[i] = { opacity: eased, blur: 20 * (1 - eased) };
-            return next;
-          });
-          if (progress < 1) {
-            const id = requestAnimationFrame(tick);
-            framesRef.current.push(id);
-          }
-        };
-        const id = requestAnimationFrame(tick);
-        framesRef.current.push(id);
-      }, i * STAGGER);
-      timersRef.current.push(t);
-    });
-
-    // remove gradient once all letters are settled
-    const gt = setTimeout(() => setShowGradient(false), GRADIENT_HOLD);
-    timersRef.current.push(gt);
-
-    return () => {
-      framesRef.current.forEach(cancelAnimationFrame);
-      timersRef.current.forEach(clearTimeout);
-    };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [trigger]);
-
-  // gradient colours cycling across letter positions
-  const gradientColors = ["#eca8d6", "#a78bfa", "#67e8f9", "#fbbf24", "#eca8d6"];
-
-  return (
-    <>
-      {letters.map((char, i) => {
-        const colorIndex = (i / Math.max(letters.length - 1, 1)) * (gradientColors.length - 1);
-        const lower = Math.floor(colorIndex);
-        const upper = Math.min(lower + 1, gradientColors.length - 1);
-        const t = colorIndex - lower;
-
-        // lerp hex colours
-        const hex2rgb = (hex: string) => {
-          const r = parseInt(hex.slice(1, 3), 16);
-          const g = parseInt(hex.slice(3, 5), 16);
-          const b = parseInt(hex.slice(5, 7), 16);
-          return [r, g, b];
-        };
-        const [r1, g1, b1] = hex2rgb(gradientColors[lower]);
-        const [r2, g2, b2] = hex2rgb(gradientColors[upper]);
-        const r = Math.round(r1 + (r2 - r1) * t);
-        const g = Math.round(g1 + (g2 - g1) * t);
-        const b = Math.round(b1 + (b2 - b1) * t);
-
-        return (
-          <span
-            key={i}
-            style={{
-              display: "inline-block",
-              opacity: letterStates[i]?.opacity ?? 0,
-              filter: `blur(${letterStates[i]?.blur ?? 20}px)`,
-              color: showGradient ? `rgb(${r},${g},${b})` : "white",
-              transition: "color 0.4s ease",
-            }}
-          >
-            {char}
-          </span>
-        );
-      })}
-    </>
-  );
-}
+const words = ["deploy", "secure", "scale", "ship"];
+const signUpHref = "/auth/signup";
 
 export function HeroSection() {
   const [isVisible, setIsVisible] = useState(false);
@@ -120,30 +25,18 @@ export function HeroSection() {
   }, []);
 
   return (
-    <section className="relative min-h-screen flex flex-col justify-center items-start overflow-hidden bg-black">
-      {/* Background video */}
-      <div className="absolute inset-0 z-0">
-        <video
-          autoPlay
-          muted
-          loop
-          playsInline
-          aria-hidden="true"
-          className="w-full h-full object-cover object-center opacity-80"
-        >
-          <source src="https://hebbkx1anhila5yf.public.blob.vercel-storage.com/bg-hero-0BnFGdr81Ifnj3WbBZoNt1KE4D5DMT.mp4" type="video/mp4" />
-        </video>
-        {/* Subtle overlay to ensure text readability on the left */}
-        <div className="absolute inset-0 bg-gradient-to-r from-black/70 via-black/30 to-transparent" />
-        <div className="absolute inset-0 bg-gradient-to-b from-black/20 via-transparent to-black/60" />
+    <section className="relative min-h-screen flex flex-col justify-center overflow-hidden">
+      {/* Animated sphere background */}
+      <div className="absolute right-0 top-1/2 -translate-y-1/2 w-[600px] h-[600px] lg:w-[800px] lg:h-[800px] opacity-40 pointer-events-none">
+        <AnimatedSphere />
       </div>
-
+      
       {/* Subtle grid lines */}
-      <div className="absolute inset-0 z-[2] overflow-hidden pointer-events-none opacity-20">
+      <div className="absolute inset-0 overflow-hidden pointer-events-none opacity-30">
         {[...Array(8)].map((_, i) => (
           <div
             key={`h-${i}`}
-            className="absolute h-px bg-white/10"
+            className="absolute h-px bg-foreground/10"
             style={{
               top: `${12.5 * (i + 1)}%`,
               left: 0,
@@ -154,7 +47,7 @@ export function HeroSection() {
         {[...Array(12)].map((_, i) => (
           <div
             key={`v-${i}`}
-            className="absolute w-px bg-white/10"
+            className="absolute w-px bg-foreground/10"
             style={{
               left: `${8.33 * (i + 1)}%`,
               top: 0,
@@ -164,38 +57,120 @@ export function HeroSection() {
         ))}
       </div>
       
-      <div className="relative z-10 w-full max-w-[1400px] mx-auto px-6 lg:px-12 py-32 lg:py-40">
-        <div className="lg:max-w-[55%]">
+      <div className="relative z-10 max-w-[1400px] mx-auto px-6 lg:px-12 py-32 lg:py-40">
         {/* Eyebrow */}
         <div 
           className={`mb-8 transition-all duration-700 ${
             isVisible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"
           }`}
         >
-          <span className="inline-flex items-center gap-3 text-sm font-mono text-white/60">
-            <span className="w-8 h-px bg-white/30" />
-            AI-assisted security and deployment workflows
+          <span className="inline-flex items-center gap-3 text-sm font-mono text-muted-foreground">
+            <DeplaiLogo showWordmark={false} size={28} />
+            <span className="w-8 h-px bg-foreground/30" />
+            The agentic deployment platform
           </span>
         </div>
         
         {/* Main headline */}
         <div className="mb-12">
           <h1 
-            className={`text-left text-[clamp(2rem,6vw,7rem)] font-display leading-[0.92] tracking-tight text-white transition-all duration-1000 ${
+            className={`text-[clamp(3rem,12vw,10rem)] font-display leading-[0.9] tracking-tight transition-all duration-1000 ${
               isVisible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-8"
             }`}
           >
-            <span className="block whitespace-nowrap">Repository intelligence,</span>
-            <span className="block whitespace-nowrap">
-              workflows that{" "}
+            <span className="block">The platform</span>
+            <span className="block">
+              to{" "}
               <span className="relative inline-block">
-                <BlurWord word={words[wordIndex]} trigger={wordIndex} />
+                <span 
+                  key={wordIndex}
+                  className="inline-flex"
+                >
+                  {words[wordIndex].split("").map((char, i) => (
+                    <span
+                      key={`${wordIndex}-${i}`}
+                      className="inline-block animate-char-in"
+                      style={{
+                        animationDelay: `${i * 50}ms`,
+                      }}
+                    >
+                      {char}
+                    </span>
+                  ))}
+                </span>
+                <span className="absolute -bottom-2 left-0 right-0 h-3 bg-foreground/10" />
               </span>
             </span>
           </h1>
         </div>
+        
+        {/* Description */}
+        <div className="grid lg:grid-cols-2 gap-12 lg:gap-24 items-end">
+          <p 
+            className={`text-xl lg:text-2xl text-muted-foreground leading-relaxed max-w-xl transition-all duration-700 delay-200 ${
+              isVisible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"
+            }`}
+          >
+            From repo to production. Agents handle the rest. You own everything.
+          </p>
+          
+          {/* CTAs */}
+          <div 
+            className={`flex flex-col sm:flex-row items-start gap-4 transition-all duration-700 delay-300 ${
+              isVisible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"
+            }`}
+          >
+            <Button 
+              asChild
+              size="lg" 
+              className="bg-foreground hover:bg-foreground/90 text-background px-8 h-14 text-base rounded-full group"
+            >
+              <a href={signUpHref}>
+                Start deploying free
+                <ArrowRight className="w-4 h-4 ml-2 transition-transform group-hover:translate-x-1" />
+              </a>
+            </Button>
+            <Button 
+              size="lg" 
+              variant="outline" 
+              className="h-14 px-8 text-base rounded-full border-foreground/20 hover:bg-foreground/5"
+            >
+              Watch demo
+            </Button>
+          </div>
+        </div>
+        
+      </div>
+      
+      {/* Stats marquee - full width outside container */}
+      <div 
+        className={`absolute bottom-10 left-0 right-0 lg:bottom-12 transition-all duration-700 delay-500 ${
+          isVisible ? "opacity-100" : "opacity-0"
+        }`}
+      >
+        <div className="flex gap-16 marquee whitespace-nowrap">
+          {[...Array(2)].map((_, i) => (
+            <div key={i} className="flex gap-16">
+              {[
+                { value: "20 days", label: "saved on builds", company: "NETFLIX" },
+                { value: "98%", label: "faster deployment", company: "STRIPE" },
+                { value: "300%", label: "throughput increase", company: "LINEAR" },
+                { value: "6x", label: "faster to ship", company: "NOTION" },
+              ].map((stat) => (
+                <div key={`${stat.company}-${i}`} className="flex items-baseline gap-4">
+                  <span className="text-4xl lg:text-5xl font-display">{stat.value}</span>
+                  <span className="text-sm text-muted-foreground">
+                    {stat.label}
+                    <span className="block font-mono text-xs mt-1">{stat.company}</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+          ))}
         </div>
       </div>
+      
+      {/* Scroll indicator */}
       
     </section>
   );

@@ -36,25 +36,26 @@ function safeSecretEquals(a: string, b: string): boolean {
   return timingSafeEqual(left, right);
 }
 
+export function matchesConfiguredAdminUnlockKey(providedSecret?: string | null): boolean {
+  const key = normalizeSecret(providedSecret);
+  if (!key) return false;
+
+  const adminKey = normalizeSecret(process.env.ADMIN_ACCESS_KEY);
+  return Boolean(adminKey) && safeSecretEquals(key, adminKey);
+}
+
 export async function hasWorkspaceAdminAccess(
   user: SessionData['user'] | null | undefined,
   providedSecret?: string | null
 ): Promise<boolean> {
   if (isAdminUser(user)) return true;
 
+  if (matchesConfiguredAdminUnlockKey(providedSecret)) {
+    return true;
+  }
+
   const key = normalizeSecret(providedSecret);
   if (!key) return false;
-
-  const configuredSecrets = [
-    normalizeSecret(process.env.ADMIN_ACCESS_KEY),
-    normalizeSecret(process.env.DEPLAI_SERVICE_KEY),
-  ].filter(Boolean);
-
-  for (const secret of configuredSecrets) {
-    if (safeSecretEquals(key, secret)) {
-      return true;
-    }
-  }
 
   // Allow workspace unlock with a platform-generated key saved in workspace settings.
   try {
@@ -114,6 +115,12 @@ async function reconcileSessionUserRecord(session: SessionData & { save: () => P
         String(sessionUser.name || sessionUser.login || 'GitHub User').trim(),
       ]
     );
+    try {
+      const { ensureUserBilling } = await import('@/lib/billing/credits');
+      await ensureUserBilling(sessionUser.id);
+    } catch (billingError) {
+      console.warn('Failed to provision free-tier credits during user reconcile:', billingError);
+    }
   } catch (error) {
     // Keep auth non-blocking if reconciliation fails; downstream handlers can surface DB issues.
     console.warn('Failed to reconcile authenticated user record:', error);
@@ -128,6 +135,24 @@ export async function requireAuth(): Promise<
     return { error: NextResponse.json({ error: 'Unauthorized' }, { status: 401 }) };
   }
   return { user };
+}
+
+export function requireServiceKey(request: Request): NextResponse | null {
+  const configured = normalizeSecret(process.env.DEPLAI_SERVICE_KEY);
+  if (!configured) {
+    return NextResponse.json({ error: 'Service key not configured' }, { status: 503 });
+  }
+
+  const provided = normalizeSecret(
+    request.headers.get('x-deplai-service-key')
+    || request.headers.get('x-api-key')
+    || request.headers.get('authorization')?.replace(/^Bearer\s+/i, '')
+    || '',
+  );
+  if (!provided || !safeSecretEquals(provided, configured)) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  return null;
 }
 
 export async function requireAdmin(): Promise<

@@ -58,12 +58,19 @@ Verify:
 
 ```bash
 curl -fsS https://<APP_DOMAIN>/api/health
-curl -fsS https://<APP_DOMAIN>/agentic/ready
 ```
 
 The MySQL initialization script runs only when `mysql_data` is empty. Do not
-delete that volume during upgrades. Apply future schema changes through an
+delete that volume during upgrades. Application code also creates missing DAST
+tables on first use, so an existing database does not need a manual DAST
+migration before this rollout. Apply other future schema changes through an
 explicit migration before rolling out new application code.
+
+Billing enforcement is **off** by default (`BILLING_ENFORCEMENT=false`). Scan,
+remediation, deploy, and platform models are available to every signed-in user.
+Razorpay checkout can stay unconfigured; set `BILLING_ENFORCEMENT=true` and
+rebuild the Connector image with `NEXT_PUBLIC_BILLING_ENFORCEMENT=true` when
+payments go live.
 
 ## 4. Operate safely
 

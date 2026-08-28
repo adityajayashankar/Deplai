@@ -187,11 +187,24 @@ _DEFAULT_CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-7-sonnet-latest")
 
 
 async def _call_llm_json(system: str, user: str, provider: str = "", api_key: str = "", model: str = "") -> dict:
-    """Route through user-specified provider, then Groq, then OpenRouter."""
+    """Route through the DeplAI gateway, then user-specified provider, then Groq/OpenRouter."""
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+
+    try:
+        from ai_gateway import chat_json, gateway_ready
+        if gateway_ready():
+            return chat_json(
+                model=model or "best",
+                messages=messages,
+                task="coding",
+                api_key=api_key or None,
+                provider=provider or None,
+            )
+    except Exception as exc:
+        logger.warning("AI gateway failed in arch gen: %s", exc)
 
     # 1. User-specified provider
     if provider and api_key:

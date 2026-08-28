@@ -212,7 +212,7 @@ export interface PublicUserSettings {
 
 export const DEFAULT_USER_SETTINGS: UserSettingsData = {
   integrations: {
-    githubAppActive: true,
+    githubAppActive: false,
     githubAppId: '',
     githubPrivateKey: '',
     webhookSecret: '',
@@ -238,41 +238,27 @@ export const DEFAULT_USER_SETTINGS: UserSettingsData = {
   },
   user: {
     account: {
-      avatarInitials: 'AJ',
-      displayName: 'AJ',
-      roleTitle: 'AI Infrastructure Engineer',
-      bio: 'Building DeplAI - multi-agent AWS deployment automation.',
-      contactEmail: 'aj@pesuventurelabs.com',
+      avatarInitials: 'D',
+      displayName: '',
+      roleTitle: '',
+      bio: '',
+      contactEmail: '',
       language: 'English (US)',
-      timezone: 'Asia/Kolkata (IST)',
+      timezone: 'UTC',
       dateFormat: 'DD/MM/YYYY',
       numberFormat: '1,234.56',
     },
     security: {
-      mfaEnabled: true,
-      recoveryCodes: 8,
-      passkeys: [
-        {
-          id: 'pk-macbook',
-          name: 'MacBook Pro',
-          detail: 'Chrome - Added 10 days ago - Last used today',
-        },
-      ],
+      mfaEnabled: false,
+      recoveryCodes: 0,
+      passkeys: [],
     },
     notifications: {
-      events: [
-        { id: 'deploy-started', label: 'Deployment started', email: true, inApp: true, slack: false },
-        { id: 'deploy-succeeded', label: 'Deployment succeeded', email: true, inApp: true, slack: true },
-        { id: 'deploy-failed', label: 'Deployment failed', email: true, inApp: true, slack: true },
-        { id: 'remediation-completed', label: 'Remediation completed', email: false, inApp: true, slack: false },
-        { id: 'remediation-approval', label: 'Remediation requires approval', email: true, inApp: true, slack: true },
-        { id: 'budget-warning', label: 'Budget warning threshold hit', email: true, inApp: true, slack: true },
-        { id: 'security-finding', label: 'Security finding detected', email: true, inApp: true, slack: false },
-      ],
-      quietHoursEnabled: true,
+      events: [],
+      quietHoursEnabled: false,
       startTime: '22:00',
       endTime: '08:00',
-      timezone: 'IST',
+      timezone: 'UTC',
     },
     preferences: {
       theme: 'dark',
@@ -291,8 +277,8 @@ export const DEFAULT_USER_SETTINGS: UserSettingsData = {
       keyLastUsed: 'Never',
     },
     integrations: {
-      githubConnected: true,
-      githubUsername: 'aj-dev',
+      githubConnected: false,
+      githubUsername: '',
       personalPat: '',
     },
     privacy: {
@@ -301,30 +287,13 @@ export const DEFAULT_USER_SETTINGS: UserSettingsData = {
       productEmails: false,
     },
     billing: {
-      deployments: 12,
-      tokensUsed: 847000,
-      apiCalls: 234,
-      estimatedCostUsd: 3.21,
+      deployments: 0,
+      tokensUsed: 0,
+      apiCalls: 0,
+      estimatedCostUsd: 0,
     },
     sessions: {
-      rows: [
-        {
-          id: 'sess-macbook',
-          deviceType: 'laptop',
-          name: 'MacBook Pro - Chrome',
-          location: 'Bengaluru, IN',
-          time: 'Active now',
-          current: true,
-        },
-        {
-          id: 'sess-iphone',
-          deviceType: 'phone',
-          name: 'iPhone 15 - Safari',
-          location: 'Bengaluru, IN',
-          time: '2 hours ago',
-          current: false,
-        },
-      ],
+      rows: [],
     },
   },
 };
@@ -409,6 +378,51 @@ function normalizeSecretPatch(current: string, value: unknown): string {
 
 export function cloneDefaultUserSettings(): UserSettingsData {
   return JSON.parse(JSON.stringify(DEFAULT_USER_SETTINGS)) as UserSettingsData;
+}
+
+function stripKnownDemoPlaceholders(settings: UserSettingsData): UserSettingsData {
+  const account = settings.user.account;
+  if (
+    account.displayName === 'AJ'
+    && account.contactEmail === 'aj@pesuventurelabs.com'
+    && account.roleTitle === 'AI Infrastructure Engineer'
+  ) {
+    account.displayName = '';
+    account.contactEmail = '';
+    account.roleTitle = '';
+    account.bio = '';
+    account.avatarInitials = 'D';
+  }
+  if (account.timezone.includes('(IST)') || account.timezone === 'IST') {
+    account.timezone = 'Asia/Kolkata';
+  }
+
+  settings.user.security.passkeys = settings.user.security.passkeys.filter((passkey) => passkey.id !== 'pk-macbook');
+  if (settings.user.security.passkeys.length === 0) {
+    settings.user.security.mfaEnabled = false;
+    settings.user.security.recoveryCodes = 0;
+  }
+
+  settings.user.sessions.rows = settings.user.sessions.rows.filter(
+    (row) => row.id !== 'sess-macbook' && row.id !== 'sess-iphone',
+  );
+
+  if (settings.user.integrations.githubUsername === 'aj-dev') {
+    settings.user.integrations.githubUsername = '';
+    settings.user.integrations.githubConnected = false;
+  }
+
+  const billing = settings.user.billing;
+  if (billing.deployments === 12 && billing.tokensUsed === 847000 && billing.apiCalls === 234) {
+    settings.user.billing = {
+      deployments: 0,
+      tokensUsed: 0,
+      apiCalls: 0,
+      estimatedCostUsd: 0,
+    };
+  }
+
+  return settings;
 }
 
 export function parseStoredUserSettings(input: unknown): UserSettingsData {
@@ -531,7 +545,7 @@ export function parseStoredUserSettings(input: unknown): UserSettingsData {
     });
   }
 
-  return base;
+  return stripKnownDemoPlaceholders(base);
 }
 
 export function mergeUserSettingsPatch(current: UserSettingsData, patchInput: unknown): UserSettingsData {

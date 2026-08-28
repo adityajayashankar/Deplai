@@ -267,7 +267,7 @@ All routes in this table require `X-API-Key` unless marked otherwise.
 | `/ws/scan/{project_id}?token=…` | Scan progress and interactive scan actions. | `{ "action": "start" }` |
 | `/ws/remediate/{project_id}?token=…` | Remediation progress and decision/approval actions. | `{ "action": "start" }` |
 | `/ws/pipeline/{project_id}?token=…` | Dashboard pipeline-event stream. | Connect with a valid token. |
-| `/api/iac/ws/{run_id}` | IaC runner log/status stream. | Connect after `generate-and-apply`. |
+| `/api/iac/ws/{run_id}` | IaC runner log/status stream. Requires `X-API-Key`. Not exposed on the public origin; Connector polls `/api/pipeline/iac-status` instead. | Connect after `generate-and-apply`. |
 
 Shared scan/remediation command frames use:
 
@@ -297,6 +297,20 @@ and timestamped message frames such as:
 ```
 
 The asynchronous IaC WebSocket sends `{ "type": "log", "data": "…" }` frames and finishes with a `done` frame containing status, optional outputs/keypair, and error when applicable.
+
+## AI platform
+
+The Connector owns the multi-provider AI gateway. Browser clients use the session cookie. Agentic and customization services use `X-API-Key` plus `x-deplai-user-id`. See `docs/ai-platform.md` for the full catalog, BYOK, routing, and environment reference.
+
+| Method | Route | Description |
+| --- | --- | --- |
+| GET | `/api/ai/providers` | Provider registry |
+| GET | `/api/ai/models` | Normalized model catalog |
+| POST | `/api/ai/chat` | Alias-aware chat with fallback |
+| GET/POST | `/api/ai/credentials` | Vaulted BYOK credentials |
+| GET | `/api/ai/health` | Provider health |
+| GET | `/api/ai/usage` | Metering |
+| GET | `/api/ai/audit` | Credential and routing audit |
 
 ## Error handling and safe client behavior
 

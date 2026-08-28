@@ -5,6 +5,9 @@ import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { query } from '@/lib/db';
 import pool from '@/lib/db';
+import { isAiPlatformEnabled } from '@/lib/ai-platform/config';
+import { aiChat } from '@/lib/ai-platform/client';
+import { canonicalizeProviderId } from '@/lib/ai-platform/providers/registry';
 
 const GROQ_API = 'https://api.groq.com/openai/v1/chat/completions';
 const OPENAI_API = 'https://api.openai.com/v1/chat/completions';
@@ -310,7 +313,7 @@ RULES:
 - Before creating a repo, clearly ask for a GitHub token with permissions:
   - Classic PAT: repo
   - Fine-grained token: Contents (read/write), Pages (read/write), Metadata (read-only)
-- For repository deployment requests that should go through the delivery pipeline, use plan_deployment instead of generate_architecture.
+- For repository deployment requests that should go through the delivery pipeline, use plan_deployment instead of generate_architecture. plan_deployment opens /dashboard/deploy.
 - After start_remediation, stop — UI shows progress card.
 - For architecture design requests ("design an architecture", "what services should I use", "plan my infra"), use generate_architecture.
 - After generate_architecture succeeds, offer to estimate costs using estimate_cost.
@@ -327,7 +330,31 @@ async function callLLM(
   maxTokens = 2048,
   temperature = 0.7,
   clientConfig?: LLMConfig | null,
+  userId?: string,
 ): Promise<string | null> {
+  if (isAiPlatformEnabled() && userId) {
+    try {
+      const result = await aiChat({
+        userId,
+        model: clientConfig?.model || 'best',
+        messages: messages.map((message) => ({
+          role: message.role === 'assistant' ? 'assistant' : 'user',
+          content: message.content,
+        })),
+        system,
+        accessMode: 'auto',
+        apiKey: clientConfig?.api_key,
+        provider: canonicalizeProviderId(clientConfig?.provider || '') || undefined,
+        source: 'chat',
+        temperature,
+        maxTokens,
+      });
+      if (result.output?.trim()) return result.output.trim();
+    } catch (error) {
+      console.error('[chat/ai-platform]', error instanceof Error ? error.message : error);
+    }
+  }
+
   const normalizedMessages = [
     { role: 'system', content: system },
     ...messages.map(m => ({
@@ -687,6 +714,7 @@ function assessGeneratedFiles(files: GeneratedFile[], appType: string): string[]
 async function generateArchitecturePlan(
   params: Record<string, string>,
   clientConfig?: LLMConfig | null,
+  userId?: string,
 ): Promise<string> {
   const { app_type = 'static', name = 'my-app', description = '', requirements = '' } = params;
   const planningPrompt =
@@ -703,6 +731,7 @@ async function generateArchitecturePlan(
     1500,
     0.1,
     clientConfig,
+    userId,
   );
 
   return text?.trim() || '';
@@ -711,10 +740,11 @@ async function generateArchitecturePlan(
 async function generateCode(
   params: Record<string, string>,
   clientConfig?: LLMConfig | null,
+  userId?: string,
 ): Promise<CodeGenResult> {
   const { app_type = 'static', name = 'MyApp', description = '', style = 'dark', requirements = '' } = params;
   const normalizedAppType = normalizeAppType(app_type);
-  const architecturePlan = await generateArchitecturePlan(params, clientConfig);
+  const architecturePlan = await generateArchitecturePlan(params, clientConfig, userId);
   const MAX_ATTEMPTS = 3;
   let lastFiles: GeneratedFile[] = [];
   let lastIssues: string[] = ['No generation attempt performed yet'];
@@ -749,7 +779,7 @@ async function generateCode(
       `- README with setup and deployment instructions\n\n` +
       `Return ONLY the JSON array.`;
 
-    const raw = await callLLM([{ role: 'user', content: prompt }], codegenSystem, 16000, 0.15, clientConfig);
+    const raw = await callLLM([{ role: 'user', content: prompt }], codegenSystem, 16000, 0.15, clientConfig, userId);
     if (!raw) {
       lastIssues = ['LLM returned no output'];
       continue;
@@ -1006,7 +1036,7 @@ async function runReAct(
   let repeatedStepCount = 0;
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
-    const raw = await callLLM(history, system, 2048, 0.7, clientConfig);
+    const raw = await callLLM(history, system, 2048, 0.7, clientConfig, userId);
     if (!raw) break;
 
     const step = parseStep(raw);
@@ -1090,7 +1120,7 @@ async function runReAct(
       const obs = `Iteration ${i + 1}: calling generate_code for "${String(params.name)}"…`;
       observations.push(obs);
 
-      const codegen = await generateCode(params as Record<string, string>, clientConfig);
+      const codegen = await generateCode(params as Record<string, string>, clientConfig, userId);
       const files = codegen.files;
 
       if (files.length > 0) {

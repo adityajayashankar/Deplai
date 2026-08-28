@@ -28,6 +28,31 @@ TENANT_FRONTEND_PORT = 3002
 BASE_BACKEND_PORT = 8001
 TENANT_BACKEND_PORT = 8002
 
+CONTAINER_REPOS_PREFIX = "/app/tmp/repos/"
+CONTAINER_LOCAL_PROJECTS_PREFIX = "/app/tmp/local-projects/"
+
+
+def containerize_connector_workspace_path(raw_path: str) -> str:
+    """Map a host Connector clone path onto the customization container mounts.
+
+    The Connector running on the host sends Windows paths such as
+    ``C:\\Users\\...\\Connector\\tmp\\repos\\owner\\repo``. Inside Docker those
+    trees are mounted at ``/app/tmp/repos`` and ``/app/tmp/local-projects``.
+    Paths that are already container-local are returned unchanged.
+    """
+    normalized = str(raw_path or "").replace("\\", "/").strip()
+    if not normalized:
+        return normalized
+    lowered = normalized.lower()
+    for marker, prefix in (
+        ("/tmp/repos/", CONTAINER_REPOS_PREFIX),
+        ("/tmp/local-projects/", CONTAINER_LOCAL_PROJECTS_PREFIX),
+    ):
+        index = lowered.rfind(marker)
+        if index >= 0:
+            return f"{prefix}{normalized[index + len(marker):]}"
+    return normalized
+
 
 def ignore_repo_artifacts(_directory: str, contents: list[str]) -> list[str]:
     ignored: list[str] = []

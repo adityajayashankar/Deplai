@@ -71,23 +71,6 @@ export default function MonitorPopup({ projectId, isOpen, onClose }: MonitorPopu
       className="fixed z-50 flex flex-col"
       style={{ top: headerBottom, left: 0, right: 0, bottom: 0 }}
     >
-      {/* Scoped scrollbar styles for the terminal */}
-      <style>{`
-        .monitor-terminal::-webkit-scrollbar {
-          width: 6px;
-        }
-        .monitor-terminal::-webkit-scrollbar-track {
-          background: transparent;
-        }
-        .monitor-terminal::-webkit-scrollbar-thumb {
-          background: #3b3b4f;
-          border-radius: 3px;
-        }
-        .monitor-terminal::-webkit-scrollbar-thumb:hover {
-          background: #555570;
-        }
-      `}</style>
-
       {/* Header bar */}
       <div
         className="flex items-center justify-between px-4 py-2.5 bg-surface border border-border select-none"
@@ -117,7 +100,6 @@ export default function MonitorPopup({ projectId, isOpen, onClose }: MonitorPopu
       <div
         ref={terminalRef}
         className="monitor-terminal bg-[#0d1117] border border-t-0 border-border p-4 font-mono text-sm leading-relaxed overflow-y-auto flex-1"
-        style={{ scrollbarWidth: 'thin', scrollbarColor: '#3b3b4f transparent' }}
       >
         {messages.length === 0 && (activeState === 'idle' || activeState === 'running') && (
           <div className="flex gap-3">

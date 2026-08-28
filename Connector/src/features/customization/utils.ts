@@ -15,6 +15,16 @@ export function sanitizeTenantId(raw: string): string {
     .slice(0, 63);
 }
 
+export function buildCustomizationHref(projectId?: string | null, projectName?: string | null): string {
+  if (!projectId) return '/dashboard/customization';
+  const params = new URLSearchParams();
+  params.set('projectId', projectId);
+  if (projectName) params.set('projectName', projectName);
+  const tenantId = sanitizeTenantId(projectName || '') || sanitizeTenantId(projectId);
+  if (tenantId) params.set('tenantId', tenantId);
+  return `/dashboard/customization?${params.toString()}`;
+}
+
 export function isAssetType(value: string): value is AssetType {
   return ASSET_OPTIONS.some((option) => option.value === value);
 }

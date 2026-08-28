@@ -1,7 +1,7 @@
 import re
 from enum import Enum
 from datetime import datetime, timezone
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Any, Literal, Optional
 from architecture_contract import ArchitectureDocument
 
@@ -40,16 +40,127 @@ class ScanValidationRequest(BaseModel):
         return _validate_project_id(v)
     # Which scanners to run: sast (Bearer), sca (Syft+Grype), or all
     scan_type: Literal["sast", "sca", "all"] = "all"
+    enabled_modules: Optional[list[str]] = None
+    dast_target_url: Optional[str] = None
+    dast_asset_id: Optional[str] = None
+    dast_scan_id: Optional[str] = None
+    dast_scan_profile: Optional[Literal["BASELINE", "FULL", "API"]] = None
+    dast_scan_intent: Optional[Literal["PASSIVE", "ACTIVE", "API_ACTIVE"]] = None
+    dast_api_spec_url: Optional[str] = None
+    dast_authorization: Optional[dict[str, Any]] = None
+    aws_access_key_id: Optional[str] = None
+    aws_secret_access_key: Optional[str] = None
+    aws_session_token: Optional[str] = None
+    aws_region: Optional[str] = None
     # GitHub-specific fields (only for github projects)
     github_token: Optional[str] = None
     repository_url: Optional[str] = None
     source_override: Optional[RepositorySourceOverride] = None
 
+    @field_validator("enabled_modules")
+    @classmethod
+    def modules_safe(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        allowed = {
+            "sast", "sca", "sbom", "secrets", "iac", "containers",
+            "kubernetes", "cicd", "api", "dast", "cloud",
+        }
+        if not v:
+            return None
+        cleaned: list[str] = []
+        for item in v:
+            name = str(item or "").strip().lower()
+            if name in allowed and name not in cleaned:
+                cleaned.append(name)
+        return cleaned or None
+
+    @field_validator("dast_target_url")
+    @classmethod
+    def dast_target_safe(cls, v: Optional[str]) -> Optional[str]:
+        raw = str(v or "").strip()
+        if not raw:
+            return None
+        from dast_scan import validate_dast_target
+        ok, error = validate_dast_target(raw)
+        if not ok:
+            raise ValueError(error)
+        return raw
+
+    @model_validator(mode="after")
+    def dast_requires_authorization(self):
+        url = str(self.dast_target_url or "").strip()
+        requested = self.enabled_modules or []
+        if not url and "dast" not in requested:
+            self.dast_authorization = None
+            return self
+        if not url:
+            return self
+        from dast_agent.authorization import authorize_target
+        from dast_agent.codes import DAST_TARGET_NOT_AUTHORIZED, USER_NOT_AUTHORIZED
+        grant = self.dast_authorization if isinstance(self.dast_authorization, dict) else None
+        result = authorize_target(
+            project_id=self.project_id,
+            requested_target=url,
+            grant=grant,
+        )
+        if not result.authorized:
+            raise ValueError(f"{result.code or DAST_TARGET_NOT_AUTHORIZED}: {result.message or USER_NOT_AUTHORIZED}")
+        profile = str(self.dast_scan_profile or "BASELINE").upper()
+        intent = str(self.dast_scan_intent or "PASSIVE").upper()
+        if profile == "FULL" and intent != "ACTIVE":
+            raise ValueError("Active DAST requires explicit ACTIVE intent.")
+        if profile == "API" and intent != "API_ACTIVE":
+            raise ValueError("API DAST requires explicit API_ACTIVE intent.")
+        if profile == "BASELINE":
+            self.dast_scan_profile = "BASELINE"
+            self.dast_scan_intent = "PASSIVE"
+        spec = str(self.dast_api_spec_url or "").strip()
+        if spec:
+            from dast_agent.ssrf import inspect_outbound_target
+            check = inspect_outbound_target(spec)
+            if not check.ok:
+                raise ValueError(f"{check.code}: {check.message}")
+            if result.scope and not result.scope.covers_url(check.normalized.url if check.normalized else spec):
+                raise ValueError("API specification URL is outside the authorized scan scope.")
+        return self
+
+    @model_validator(mode="after")
+    def cloud_credentials_when_requested(self):
+        requested = self.enabled_modules or []
+        if "cloud" not in requested:
+            self.aws_access_key_id = None
+            self.aws_secret_access_key = None
+            self.aws_session_token = None
+            return self
+        from cloud_scan import validate_cloud_scan_request
+        ok, error, region = validate_cloud_scan_request(
+            self.aws_access_key_id,
+            self.aws_secret_access_key,
+            self.aws_region,
+        )
+        if not ok:
+            raise ValueError(error)
+        self.aws_region = region
+        return self
+
+
+def public_scan_validation(request: ScanValidationRequest) -> dict[str, Any]:
+    """Serialize a scan request for HTTP responses without re-running inbound validators.
+
+    Cloud/DAST model validators require secrets. Echoing them is wrong, but
+    constructing ScanValidationRequest with those fields cleared raises
+    ValidationError and becomes an HTML 500 in the UI.
+    """
+    payload = request.model_dump(mode="json")
+    payload["aws_secret_access_key"] = None
+    payload["aws_session_token"] = None
+    payload["dast_authorization"] = None
+    return payload
+
 
 class ScanValidationResponse(BaseModel):
     success: bool
     message: str
-    data: ScanValidationRequest
+    data: dict[str, Any]
 
 
 class WebSocketCommand(BaseModel):
@@ -102,6 +213,7 @@ class RemediationRequest(BaseModel):
     llm_provider: Optional[str] = None
     llm_api_key: Optional[str] = None
     llm_model: Optional[str] = None
+    llm_access_mode: Optional[Literal["platform", "byok", "auto"]] = "auto"
     remediation_scope: Literal["major", "all"] = "all"
 
 
@@ -188,6 +300,7 @@ class TerraformGenRequest(BaseModel):
     source_root_candidates: Optional[list[str]] = None
     repository_url: Optional[str] = None
     source_metadata: Optional[dict[str, Any]] = None
+    user_id: Optional[str] = None
 
 
 class TerraformConsultRequest(BaseModel):
@@ -334,6 +447,9 @@ class TerraformApplyResponse(BaseModel):
     outputs: Optional[dict] = None
     cloudfront_url: Optional[str] = None
     plan_summary: Optional[dict] = None
+    provisioning_report: Optional[dict] = None
+    one_time_credentials: Optional[dict] = None
+    has_database_resources: Optional[bool] = None
     requires_plan_confirmation: Optional[bool] = None
     details: Optional[dict] = None
     error: Optional[str] = None

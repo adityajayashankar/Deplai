@@ -1,0 +1,1304 @@
+# Deplai Profile Section — Full UI/UX + Functional Provisioning Prompt
+
+## Objective
+
+Provision a complete, production-ready **Profile** section inside Deplai based on the supplied reference screenshots.
+
+This provisioning must cover both:
+
+1. **Functional implementation** — routing, state, APIs, persistence, billing, integrations, security, and account actions.
+2. **UI/UX implementation** — visual fidelity, component hierarchy, responsive layouts, interaction states, animations, accessibility, empty states, loading states, error states, dialogs, toasts, and design-system integration.
+
+The result must feel like a native Deplai product surface rather than a standalone settings page.
+
+---
+
+# 1. Critical Navigation Requirement
+
+This is a hard requirement.
+
+When the user clicks:
+
+* `Profile`
+* `Your Profile`
+* The user/account area in the sidebar
+
+the application must navigate to the Profile screen.
+
+Preferred route:
+
+```text
+/profile
+```
+
+The Profile route must:
+
+* Render inside the existing Deplai application shell.
+* Preserve the existing sidebar/header.
+* Mark `Your Profile` as active.
+* Open at the top of the Profile page.
+* Work with browser Back/Forward.
+* Work on direct URL navigation.
+* Work after browser refresh.
+* Not open as a modal unless the application's existing architecture specifically requires it.
+* Never be intercepted by another navigation handler.
+
+---
+
+# 2. Reference UI — Source of Truth
+
+Use all supplied reference screenshots as the primary visual reference.
+
+Reproduce the overall visual language:
+
+* Dark SaaS dashboard.
+* Near-black page background.
+* Slightly elevated dark cards.
+* Thin, subtle borders.
+* Rounded corners.
+* High-contrast white headings.
+* Muted gray supporting text.
+* Green success/status treatments.
+* Yellow primary CTA treatment.
+* Red destructive actions.
+* Compact controls.
+* Generous section spacing.
+* Strong typographic hierarchy.
+* Minimal decorative UI.
+
+Do not redesign the page into a generic settings template.
+
+Preserve the visual character of the reference while adapting it to the actual Deplai design system.
+
+---
+
+# 3. UI Provisioning Requirements
+
+The agent must provision the complete UI, not just static components.
+
+For every interactive element implement:
+
+```text
+Default
+Hover
+Focus
+Active
+Selected
+Disabled
+Loading
+Success
+Error
+Empty
+Validation error
+```
+
+where applicable.
+
+Every component must have a defined visual state.
+
+No interactive element may appear visually unfinished.
+
+---
+
+# 4. Application Shell UI
+
+Keep the existing Deplai shell.
+
+## Sidebar
+
+The existing sidebar must remain visible on desktop.
+
+Profile navigation:
+
+```text
+Dashboard
+Your Profile
+Organizations
+Usage
+```
+
+Cloud navigation should remain intact.
+
+The Profile item must have:
+
+### Default state
+
+Subtle text/icon treatment.
+
+### Hover state
+
+Slightly elevated/background-highlighted treatment.
+
+### Active state
+
+Clearly selected background, icon and text emphasis matching Deplai's navigation system.
+
+### Focus state
+
+Visible keyboard focus ring.
+
+The user/account area at the bottom of the sidebar should also act as a Profile shortcut.
+
+---
+
+# 5. Profile Page Layout System
+
+Provision the page with a responsive content container.
+
+Desktop structure:
+
+```text
+┌──────────────────────────────────────────────────┐
+│ Profile                                           │
+│                                                  │
+│ ┌──────────────────────┐ ┌────────────────────┐ │
+│ │ User Information     │ │ Remaining Credits  │ │
+│ └──────────────────────┘ └────────────────────┘ │
+│                                                  │
+│ ┌──────────────────────────────────────────────┐ │
+│ │ Kilo Pass                                    │ │
+│ │                                              │ │
+│ │ Monthly / Yearly                             │ │
+│ │                                              │ │
+│ │ Starter │ Pro │ Expert                       │ │
+│ └──────────────────────────────────────────────┘ │
+│                                                  │
+│ ┌──────────────────────────────────────────────┐ │
+│ │ Buy Credits                                 │ │
+│ └──────────────────────────────────────────────┘ │
+│                                                  │
+│ ┌──────────────────────────────────────────────┐ │
+│ │ Automatic Top Up                             │ │
+│ └──────────────────────────────────────────────┘ │
+│                                                  │
+│ ┌──────────────────────────────────────────────┐ │
+│ │ Auto Routing                                │ │
+│ └──────────────────────────────────────────────┘ │
+│                                                  │
+│ ┌──────────────────────────────────────────────┐ │
+│ │ Redeem Promotional Code                      │ │
+│ └──────────────────────────────────────────────┘ │
+│                                                  │
+│ ┌──────────────────────────────────────────────┐ │
+│ │ Integrations                                │ │
+│ └──────────────────────────────────────────────┘ │
+│                                                  │
+│ ┌──────────────────────────────────────────────┐ │
+│ │ Danger Zone                                 │ │
+│ └──────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────┘
+```
+
+Use the exact layout proportions and spacing from the screenshots where practical.
+
+---
+
+# 6. Profile Header UI
+
+Create:
+
+```text
+[Profile Icon] Profile
+```
+
+Use:
+
+* Existing Deplai iconography.
+* Page title typography.
+* Correct vertical alignment.
+* Consistent top margin.
+* Responsive positioning.
+
+The heading must not compete visually with the primary content cards.
+
+---
+
+# 7. Account Summary UI
+
+## Profile Information Card
+
+Create an elevated card with:
+
+```text
+[Avatar]
+
+ADITYA J
+email@example.com
+
+LinkedIn
+Not set
+
+GitHub
+github.com/...
+
+                                      [Edit icon]
+```
+
+Actual account data must be dynamic.
+
+### Avatar
+
+Support:
+
+* Existing profile image.
+* Fallback initials.
+* Loading skeleton.
+* Broken image fallback.
+
+### Edit Button
+
+Icon-only button with:
+
+* Tooltip.
+* Hover state.
+* Focus state.
+* Loading state.
+* Accessible label.
+
+---
+
+# 8. Edit Profile UI
+
+Clicking Edit opens a modal or dedicated edit surface consistent with Deplai.
+
+Fields should be presented in a clean form layout.
+
+Example:
+
+```text
+Edit Profile
+
+Full name
+[________________________]
+
+Email
+[________________________]
+
+LinkedIn
+[________________________]
+
+GitHub
+[________________________]
+
+                     Cancel   Save changes
+```
+
+UI requirements:
+
+* Form validation.
+* Inline validation messages.
+* Disabled Save until appropriate.
+* Saving spinner.
+* Success state.
+* Error state.
+* Unsaved-change protection where required.
+
+Modal requirements:
+
+* Proper focus trap.
+* Escape-to-close.
+* Backdrop.
+* Keyboard accessibility.
+* Scroll support for smaller screens.
+
+---
+
+# 9. Remaining Credits UI
+
+Create a high-visibility credit card.
+
+Structure:
+
+```text
+Remaining Credits
+
+-$0.13
+```
+
+Use actual current balance.
+
+### Visual states
+
+Positive:
+
+* Neutral/positive balance styling.
+
+Near zero:
+
+* Warning treatment.
+
+Negative:
+
+* Red amount.
+
+Loading:
+
+* Skeleton amount.
+
+Unavailable:
+
+* Error state with retry.
+
+Add subtle supporting context where available, such as the account's credit status.
+
+---
+
+# 10. Kilo Pass UI
+
+Create a large feature card with distinct internal zones.
+
+### Header
+
+```text
+👑 Kilo Pass
+
+Unlock up to 50% free credits.
+Checkout securely with Stripe.
+
+[Refer & earn] [NEW]
+```
+
+### Referral CTA
+
+Yellow CTA.
+
+States:
+
+```text
+Default
+Hover
+Pressed
+Loading
+Copied/Success where applicable
+Error
+```
+
+---
+
+# 11. Billing Toggle UI
+
+Provision a segmented control:
+
+```text
+[ Monthly ] [ Yearly ]
+```
+
+The selected option should have a clear visual fill/border treatment.
+
+Interaction requirements:
+
+* Animated selection transition.
+* Keyboard navigation.
+* Clear selected state.
+* Immediate price update.
+* Loading indication if pricing must be fetched.
+
+Do not rely solely on color to show selection.
+
+---
+
+# 12. Subscription Plan Cards
+
+Provision three cards.
+
+```text
+Starter
+$19 / month
+
+Pro                         Recommended
+$49 / month
+
+Expert
+$199 / month
+```
+
+Cards must have a consistent grid.
+
+## Recommended plan
+
+The Pro card should have:
+
+* Recommended badge.
+* Stronger border/emphasis.
+* Stronger CTA treatment.
+
+### Card interaction
+
+Hovering a plan can provide a subtle elevation/border transition.
+
+Do not use excessive motion.
+
+### CTA
+
+```text
+Buy now →
+```
+
+Button states:
+
+* Default.
+* Hover.
+* Pressed.
+* Loading.
+* Disabled.
+* Error.
+
+When checkout starts, prevent duplicate clicks.
+
+---
+
+# 13. Buy Credits UI
+
+Create:
+
+```text
+Buy Credits
+
+[$20] [$50] [$100] [Custom]
+```
+
+Each option must be a visually clear selectable/purchasable control.
+
+Selected state:
+
+* Strong border/background treatment.
+* Clear focus state.
+
+Custom selection opens:
+
+```text
+Buy Custom Credits
+
+Amount
+[$ __________]
+
+Minimum: $X
+Maximum: $Y
+
+                         Cancel   Continue
+```
+
+Validation must appear inline.
+
+---
+
+# 14. Automatic Top Up UI
+
+Create an expandable/configuration card.
+
+Default:
+
+```text
+Automatic Top Up
+
+Automatically add credits when your balance
+falls below $5.
+
+[Configure automatic top-up]
+```
+
+Configuration UI:
+
+```text
+Automatic Top Up
+
+Enable automatic top-up             [ Toggle ]
+
+When balance falls below
+[$5]
+
+Add
+[$20]
+
+Payment method
+[•••• 4242       ▼]
+
+                    Cancel   Save
+```
+
+Where supported by the backend.
+
+Use the platform's existing form controls.
+
+Toggle behavior must have immediate visual feedback but persistence should be explicit if required.
+
+---
+
+# 15. Auto Routing UI
+
+Create a large configuration card.
+
+Header:
+
+```text
+Auto routing
+
+Choose how Deplai ranks models for kilo-auto/efficient
+and which models belong in the Efficient pool.
+```
+
+## Routing Mode
+
+Use a proper select/dropdown:
+
+```text
+Routing mode
+[ Use default setting ▼ ]
+```
+
+Supporting copy:
+
+```text
+Uses best accuracy per dollar.
+```
+
+Dropdown UI must include:
+
+* Open state.
+* Hover state.
+* Selected state.
+* Keyboard navigation.
+* Escape behavior.
+* Disabled/loading state.
+
+---
+
+# 16. Efficient Model Pool UI
+
+Provide:
+
+```text
+Efficient model pool
+
+Up to 10 exact model and variant pairs.
+Leave empty to inherit.
+
+[ + Add model ]
+```
+
+Empty state:
+
+```text
+No custom pool.
+Efficient uses the platform model pool.
+```
+
+When models exist:
+
+```text
+Model                        Variant           Remove
+────────────────────────────────────────────────────
+Model A                      variant-x         [×]
+Model B                      variant-y         [×]
+Model C                      variant-z         [×]
+```
+
+Add-model interaction should use a searchable/selectable control.
+
+Example:
+
+```text
+Add model
+
+Search models...
+[________________________]
+
+Available models
+○ Model A
+○ Model B
+○ Model C
+
+Variant
+[ Default ▼ ]
+
+                           Cancel   Add model
+```
+
+Prevent adding more than 10 entries.
+
+---
+
+# 17. Auto Routing Save UI
+
+Primary CTA:
+
+```text
+Save auto routing
+```
+
+The UI must visually communicate:
+
+```text
+No changes
+↓
+Save button disabled/subdued
+
+Changes detected
+↓
+Save button enabled
+
+Saving
+↓
+Spinner + disabled controls
+
+Success
+↓
+Saved confirmation/toast
+
+Error
+↓
+Error message + retry
+```
+
+---
+
+# 18. Promo Code UI
+
+Create:
+
+```text
+Redeem Promotional Code
+
+Enter a promotional code to add credits to your account.
+
+[ Enter promo code              ] [Redeem Code]
+```
+
+States:
+
+### Empty
+
+Normal input.
+
+### Focus
+
+Visible focus state.
+
+### Invalid
+
+Red border + inline error.
+
+### Loading
+
+Button spinner.
+
+### Success
+
+Green success state and updated credits.
+
+### Expired/used
+
+Specific actionable error.
+
+Do not show generic success for failed redemption.
+
+---
+
+# 19. Integrations UI
+
+Create an integrations card with tab navigation:
+
+```text
+[ VS Code ] [ JetBrains ] [ CLI ]
+```
+
+Tabs should support:
+
+* Active.
+* Hover.
+* Focus.
+* Disabled where applicable.
+
+Example:
+
+```text
+VS Code
+last used
+```
+
+The selected integration content should update without a full page reload.
+
+---
+
+# 20. API Key UI
+
+Create a secure API key control.
+
+```text
+API Key
+
+••••••••••••••••••••
+
+[Show] [Copy]
+
+[Reset API Token]
+```
+
+### Show/hide
+
+Default:
+
+Masked.
+
+On Show:
+
+Display the key securely for the shortest practical period.
+
+### Copy
+
+Show temporary confirmation:
+
+```text
+Copied
+```
+
+Do not expose the copied value in toast messages.
+
+### Reset
+
+Use destructive secondary styling.
+
+---
+
+# 21. Reset API Token Confirmation Dialog
+
+Provision:
+
+```text
+Reset API Token?
+
+Your current API token will stop working immediately.
+Applications using this token will need to be updated.
+
+                    Cancel   Reset token
+```
+
+Use a red/destructive confirm button.
+
+After success:
+
+```text
+API token reset successfully.
+```
+
+Refresh the UI with the newly generated masked token.
+
+---
+
+# 22. Danger Zone UI
+
+At the bottom of the page create a visually separate section.
+
+Use:
+
+* Red/danger border.
+* Subdued dark red background treatment where consistent.
+* Clear destructive hierarchy.
+
+Example:
+
+```text
+Danger Zone
+
+Account deletion is permanent.
+Cancel active subscriptions before starting.
+
+Your account data will be deleted and anonymized.
+You will be signed out after the deletion request starts.
+
+[ Delete account ]
+```
+
+The Delete Account button must never visually resemble a normal CTA.
+
+---
+
+# 23. Delete Account Confirmation UI
+
+First click:
+
+```text
+Delete Account
+```
+
+opens a confirmation modal.
+
+Example:
+
+```text
+Delete your account?
+
+This action is permanent.
+Your account data will be deleted and
+anonymized.
+
+Active subscriptions must be cancelled first.
+
+Type DELETE to confirm
+
+[________________]
+
+                 Cancel   Delete account
+```
+
+The destructive button must remain disabled until all required confirmation conditions are satisfied.
+
+During deletion:
+
+```text
+Deleting account...
+```
+
+After successful initiation:
+
+* Show appropriate confirmation.
+* Invalidate session.
+* Redirect to login/signed-out page.
+
+---
+
+# 24. Responsive UI Provisioning
+
+## Desktop
+
+Use the screenshot layout as the baseline.
+
+* Persistent sidebar.
+* Two-column account summary.
+* Three-column subscription cards.
+* Wide configuration cards.
+* Comfortable horizontal spacing.
+
+## Tablet
+
+* Preserve sidebar where application shell permits.
+* Reduce grid columns.
+* Subscription cards may switch to two columns.
+* Forms remain readable.
+* Avoid cramped controls.
+
+## Mobile
+
+Transform into a single-column layout.
+
+Expected order:
+
+```text
+Profile
+Account
+Credits
+Kilo Pass
+Plans
+Buy Credits
+Automatic Top Up
+Auto Routing
+Promo Code
+Integrations
+API Key
+Danger Zone
+```
+
+Do not simply scale down desktop cards.
+
+Buttons should become full-width or appropriately sized for touch.
+
+Minimum practical touch target should follow the application's accessibility conventions.
+
+---
+
+# 25. Mobile Navigation
+
+When the application uses a mobile sidebar/drawer:
+
+* Profile must remain accessible.
+* Clicking Profile should close the navigation drawer.
+* The Profile route should open immediately.
+* Active navigation state should update.
+* Back gesture/browser back should behave normally.
+
+---
+
+# 26. UI Animation & Motion
+
+Use subtle production-quality transitions.
+
+Recommended:
+
+* Card hover: 120–180ms.
+* Button hover/press: 100–150ms.
+* Tabs/segmented control: 150–220ms.
+* Modal enter/exit: 150–220ms.
+* Toast: short slide/fade.
+* Loading indicators: application-standard animation.
+
+Avoid:
+
+* Excessive bouncing.
+* Large page transitions.
+* Decorative animation.
+* Animation that delays task completion.
+
+Respect:
+
+```text
+prefers-reduced-motion
+```
+
+---
+
+# 27. Skeleton Loading UI
+
+Provision skeletons that preserve the final layout.
+
+Example:
+
+```text
+┌─────────────────────────────────────┐
+│ ██████████                          │
+│ ███████████████                     │
+│ █████████                            │
+└─────────────────────────────────────┘
+```
+
+Do not show an empty page while account data is loading.
+
+Each major section should independently support loading where appropriate.
+
+---
+
+# 28. Error UI
+
+Provision recoverable inline error states.
+
+Example:
+
+```text
+Unable to load billing information.
+
+Please try again.
+
+[ Retry ]
+```
+
+Errors should appear in the relevant section rather than replacing the entire Profile page unless the entire page cannot function.
+
+---
+
+# 29. Empty States
+
+Explicitly design empty states for:
+
+* No custom efficient models.
+* No LinkedIn.
+* No GitHub.
+* No API integrations.
+* No payment method where relevant.
+* No promotional history where applicable.
+
+Do not leave blank card areas without explanation.
+
+---
+
+# 30. Toast UI
+
+Use the existing Deplai toast component.
+
+Examples:
+
+```text
+✓ Profile updated
+✓ Auto routing saved
+✓ Credits purchased
+✓ Promotional code redeemed
+✓ API key copied
+✓ API token reset
+```
+
+Errors:
+
+```text
+Unable to save profile
+Payment failed
+Unable to redeem promotional code
+Unable to save routing configuration
+```
+
+Toasts must not expose secrets.
+
+---
+
+# 31. Form UX
+
+Every form must support:
+
+* Labels.
+* Placeholder text where appropriate.
+* Validation.
+* Inline error messages.
+* Disabled state.
+* Loading state.
+* Success feedback.
+* Keyboard submission.
+* Escape/cancel where appropriate.
+
+Do not validate every field aggressively while the user is typing unless the existing Deplai UX uses that pattern.
+
+---
+
+# 32. Accessibility Provisioning
+
+Implement:
+
+* Semantic headings.
+* Semantic buttons.
+* Proper form labels.
+* Accessible select/dropdown controls.
+* ARIA only where necessary.
+* Keyboard navigation.
+* Visible focus indicators.
+* Focus trapping inside dialogs.
+* Screen-reader accessible icon-only controls.
+* Accessible error messaging.
+* Accessible status announcements for important async events.
+* Reduced motion support.
+
+Do not rely solely on color for:
+
+* Selected state.
+* Errors.
+* Success.
+* Warnings.
+* Destructive actions.
+
+---
+
+# 33. Design Token Integration
+
+Do not hard-code arbitrary styles throughout the Profile implementation.
+
+Map the UI to existing Deplai design tokens/components for:
+
+* Background.
+* Surface.
+* Border.
+* Text.
+* Muted text.
+* Accent.
+* Success.
+* Warning.
+* Danger.
+* Radius.
+* Spacing.
+* Typography.
+* Shadows.
+* Focus rings.
+
+Only introduce new tokens when the reference UI requires something genuinely missing.
+
+---
+
+# 34. Component Reuse
+
+Before creating a new component, inspect the existing Deplai component library.
+
+Reuse existing:
+
+* Sidebar.
+* Page shell.
+* Cards.
+* Buttons.
+* Inputs.
+* Selects.
+* Tabs.
+* Dialogs.
+* Tooltips.
+* Toasts.
+* Avatar.
+* Badge.
+* Skeleton.
+* Toggle.
+* Currency input.
+* Model selector.
+
+Do not create duplicate versions of existing components.
+
+---
+
+# 35. Backend/UI State Contract
+
+Every UI state must map to a real application state.
+
+Do not create UI-only fake states that imply backend success.
+
+Examples:
+
+```text
+Payment loading → checkout request in progress
+Payment success → confirmed backend/payment result
+Promo success → confirmed redemption
+Token reset → confirmed token rotation
+Routing saved → confirmed persisted configuration
+Account deleted → confirmed deletion workflow started
+```
+
+---
+
+# 36. Security UI Requirements
+
+The UI must treat secrets as sensitive.
+
+Never:
+
+* Display API keys by default.
+* Put API keys in logs.
+* Put API keys in analytics events.
+* Include tokens in toast messages.
+* Persist secrets unnecessarily in localStorage.
+* Render secrets into unrelated components.
+
+For destructive/security-sensitive operations, use explicit confirmation patterns.
+
+---
+
+# 37. Data/API Provisioning
+
+Wire the UI to the application's actual services for:
+
+```text
+User profile
+Credit balance
+Subscription plans
+Billing cadence
+Checkout
+Credit purchase
+Automatic top-up
+Auto routing
+Efficient model pool
+Promo code redemption
+Integration status
+API token
+API token rotation
+Account deletion
+```
+
+Use loading/error/success states from actual asynchronous operations.
+
+No mock production flows.
+
+---
+
+# 38. Routing Acceptance Test
+
+The implementation is not complete until this sequence succeeds:
+
+```text
+Dashboard
+   ↓
+Click "Your Profile"
+   ↓
+/profile
+   ↓
+Profile page renders
+   ↓
+Profile navigation active
+   ↓
+Refresh browser
+   ↓
+Profile still renders
+   ↓
+Browser Back
+   ↓
+Previous page
+   ↓
+Browser Forward
+   ↓
+Profile page
+```
+
+Repeat this from desktop and mobile navigation.
+
+---
+
+# 39. Visual QA Requirements
+
+After implementation, compare the rendered Profile page to the supplied screenshots.
+
+Check:
+
+* Overall page proportions.
+* Sidebar width.
+* Content width.
+* Card dimensions.
+* Card spacing.
+* Section spacing.
+* Text hierarchy.
+* Button dimensions.
+* Border visibility.
+* Radius.
+* Alignment.
+* Grid behavior.
+* Responsive behavior.
+* Empty states.
+* Modal positioning.
+* Toast positioning.
+
+Correct deviations rather than simply accepting functional completion.
+
+---
+
+# 40. Final Definition of Done
+
+The Profile provisioning is complete only when:
+
+* [ ] Profile navigation opens `/profile`.
+* [ ] Profile is active in the sidebar.
+* [ ] Direct `/profile` navigation works.
+* [ ] Refresh works.
+* [ ] Desktop UI matches the reference design language.
+* [ ] Tablet layout works.
+* [ ] Mobile layout works.
+* [ ] Account card is dynamic.
+* [ ] Credits are dynamic.
+* [ ] Profile editing works.
+* [ ] Kilo Pass UI is provisioned.
+* [ ] Monthly/yearly selector works.
+* [ ] Subscription plans are dynamic.
+* [ ] Checkout is wired.
+* [ ] Buy Credits UI works.
+* [ ] Custom credit input works.
+* [ ] Automatic Top Up UI works.
+* [ ] Auto Routing UI works.
+* [ ] Efficient Model Pool works.
+* [ ] Maximum 10 models is enforced.
+* [ ] Save state is implemented.
+* [ ] Promo code UI works.
+* [ ] Integration tabs work.
+* [ ] API key is masked by default.
+* [ ] Copy API key works.
+* [ ] Reset token confirmation works.
+* [ ] Danger Zone is implemented.
+* [ ] Delete Account confirmation works.
+* [ ] Loading states are implemented.
+* [ ] Error states are implemented.
+* [ ] Empty states are implemented.
+* [ ] Success states are implemented.
+* [ ] Toasts are implemented.
+* [ ] Keyboard accessibility works.
+* [ ] Modal accessibility works.
+* [ ] Reduced-motion behavior works.
+* [ ] Existing Deplai components/design tokens are reused.
+* [ ] No fake backend success flows exist.
+* [ ] Sensitive tokens are handled securely.
+* [ ] Final rendered UI has been visually QA'd against the supplied screenshots.
+
+## Final Instruction to the Agent
+
+Do not treat this as only a frontend page request.
+
+**Provision the complete Profile product surface — UI, UX, routing, state, backend integration, interaction states, responsive layouts, accessibility, security, and visual QA.**
+
+The most important navigation behavior remains:
+
+> **Whenever the user clicks Profile / Your Profile, open the fully provisioned Profile screen at `/profile`.**
+
+The supplied screenshots are the visual reference, while the existing Deplai application and design system remain the implementation source of truth.

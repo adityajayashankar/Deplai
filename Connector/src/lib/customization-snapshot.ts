@@ -136,6 +136,41 @@ export function mapConnectorSourceToAgentic(
   );
 }
 
+export function mapConnectorSourceToCustomization(
+  sourcePath: string,
+  connectorRoot = process.cwd(),
+): string {
+  const mappings = [
+    {
+      connector: path.resolve(connectorRoot, 'tmp', 'repos'),
+      mount: '/app/tmp/repos',
+    },
+    {
+      connector: path.resolve(connectorRoot, 'tmp', 'local-projects'),
+      mount: '/app/tmp/local-projects',
+    },
+  ];
+
+  const resolved = path.resolve(sourcePath);
+  for (const mapping of mappings) {
+    if (!isWithin(mapping.connector, resolved)) continue;
+    const relative = path.relative(mapping.connector, resolved);
+    return path.posix.join(mapping.mount, ...relative.split(path.sep).filter(Boolean));
+  }
+
+  const normalized = sourcePath.replace(/\\/g, '/');
+  if (
+    normalized.startsWith('/app/tmp/repos/')
+    || normalized.startsWith('/app/tmp/local-projects/')
+    || normalized === '/app/tmp/repos'
+    || normalized === '/app/tmp/local-projects'
+  ) {
+    return normalized;
+  }
+
+  return normalized;
+}
+
 export async function resolveCustomizationSnapshot(params: {
   userId: string;
   projectId: string;
@@ -158,7 +193,7 @@ export async function resolveCustomizationSnapshot(params: {
     CUSTOMIZATION_AGENT_URL,
   );
   url.searchParams.set('tenant_id', tenantId);
-  url.searchParams.set('base_repo_path', sourceRoot);
+  url.searchParams.set('base_repo_path', mapConnectorSourceToCustomization(sourceRoot));
 
   let response: Response;
   try {

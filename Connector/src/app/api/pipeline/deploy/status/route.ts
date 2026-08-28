@@ -2,6 +2,33 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 
+function firstIacOutputString(outputs: unknown, keys: string[]): string | null {
+  if (!outputs || typeof outputs !== 'object') return null;
+  const rec = outputs as Record<string, unknown>;
+  const bags: Record<string, unknown>[] = [rec];
+  if (rec.raw && typeof rec.raw === 'object') {
+    bags.push(rec.raw as Record<string, unknown>);
+  }
+  if (Array.isArray(rec.outputs)) {
+    const flat: Record<string, unknown> = {};
+    for (const item of rec.outputs) {
+      if (!item || typeof item !== 'object') continue;
+      const row = item as { key?: unknown; value?: unknown };
+      if (typeof row.key === 'string') flat[row.key] = row.value;
+    }
+    bags.push(flat);
+  }
+  for (const bag of bags) {
+    for (const key of keys) {
+      const value = bag[key];
+      if (typeof value === 'string' && value.trim() && value.trim().toLowerCase() !== 'n/a' && value.trim().toLowerCase() !== 'null') {
+        return value.trim();
+      }
+    }
+  }
+  return null;
+}
+
 function classifyStatusError(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err || 'Failed to fetch deployment status.');
   const lowered = raw.toLowerCase();
@@ -66,20 +93,29 @@ export async function POST(req: NextRequest) {
       const rawStatus = String(data.status || 'pending');
       const terminalSuccess = rawStatus === 'completed' || rawStatus === 'destroyed';
       const terminalFailure = rawStatus === 'failed';
-      const status = terminalSuccess ? 'completed' : terminalFailure ? 'error' : rawStatus;
+      const serviceType = String(data.service_type || '');
+      const wantsEc2 = /^(ec2|ec2-instance)$/i.test(serviceType);
+      const instanceId = firstIacOutputString(data.outputs, ['instance_id', 'ec2_instance_id']);
+      const publicIp = firstIacOutputString(data.outputs, ['public_ip', 'ec2_public_ip']);
+      const emptyEc2Success = terminalSuccess && wantsEc2 && !instanceId && !publicIp;
+      const status = emptyEc2Success
+        ? 'error'
+        : terminalSuccess ? 'completed' : terminalFailure ? 'error' : rawStatus;
       return NextResponse.json({
         success: true,
         status,
         result: {
-          success: !terminalFailure,
+          success: terminalSuccess && !emptyEc2Success && !terminalFailure,
           mode: 'iac_pipeline',
           run_id: runId,
           service_type: data.service_type,
-          status: rawStatus,
+          status: emptyEc2Success ? 'failed' : rawStatus,
           plan_summary: data.plan_summary ? { summary: data.plan_summary } : null,
           outputs: data.outputs || {},
           raw_outputs: data.outputs || {},
-          error: data.error || undefined,
+          error: emptyEc2Success
+            ? 'IaC pipeline completed but no EC2 instance was provisioned in AWS.'
+            : (data.error || undefined),
         },
       });
     }

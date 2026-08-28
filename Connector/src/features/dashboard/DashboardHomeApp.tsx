@@ -1,44 +1,28 @@
 'use client';
 
 import React, {
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
   type CSSProperties,
-  type ReactNode,
 } from 'react';
 import { useRouter } from 'next/navigation';
 import * as THREE from 'three';
 import {
-  ArrowRight,
-  Book,
   Check,
   ChevronDown,
-  Cpu,
-  FileText,
-  Github,
-  Grid,
-  LayoutGrid,
-  List,
-  LogOut,
-  Play,
-  Plus,
-  RefreshCw,
-  Rocket,
-  Search,
-  Server,
-  Settings,
-  Trash2,
-  Upload,
-  Zap,
-  GitBranch,
 } from 'lucide-react';
-import type { LucideIcon } from 'lucide-react';
 import { useScan } from '@/lib/scan-context';
+import { LOGIN_HREF } from '@/lib/auth-providers';
 import ManageInstancesApp from '@/features/deployment/ManageInstancesApp';
 import SettingsApp from '@/features/dashboard/SettingsApp';
+import IntegrationsApp from '@/features/dashboard/IntegrationsApp';
+import { WorkspaceCommandHeader } from '@/features/workspace/WorkspaceNav';
+import { ProjectSourceThumb } from '@/components/project-icons';
+import { buildCustomizationHref } from '@/features/customization/utils';
 
 type ViewMode = 'list' | 'grid';
 type PixelBlastVariant = 'square' | 'circle' | 'triangle' | 'diamond';
@@ -87,21 +71,6 @@ interface TextTypeProps extends React.HTMLAttributes<HTMLElement> {
   textColors?: string[];
 }
 
-interface BorderGlowProps {
-  children: ReactNode;
-  className?: string;
-  edgeSensitivity?: number;
-  glowColor?: string;
-  backgroundColor?: string;
-  borderRadius?: number;
-  glowRadius?: number;
-  glowIntensity?: number;
-  coneSpread?: number;
-  animated?: boolean;
-  colors?: string[];
-  fillOpacity?: number;
-}
-
 type PixelBlastProps = {
   variant?: PixelBlastVariant;
   pixelSize?: number;
@@ -135,12 +104,41 @@ type DashboardRepository = {
   canDelete: boolean;
 };
 
-const DASHBOARD_TABS: Array<{ key: string; label: string; icon: LucideIcon }> = [
-  { key: 'overview', label: 'Overview', icon: LayoutGrid },
-  { key: 'deployments', label: 'Deployments', icon: Rocket },
-  { key: 'instances', label: 'Manage Instance', icon: Cpu },
-  { key: 'documentation', label: 'Documentation', icon: Book },
-  { key: 'settings', label: 'Settings', icon: Settings },
+type SidebarItem = { key: string; label: string };
+
+const SIDEBAR_SECTIONS: Array<{ label: string; items: SidebarItem[] }> = [
+  {
+    label: 'Dashboard',
+    items: [
+      { key: 'overview', label: 'Dashboard' },
+      { key: 'organizations', label: 'Organizations' },
+      { key: 'usage', label: 'Usage' },
+    ],
+  },
+  {
+    label: 'Services',
+    items: [
+      { key: 'agents', label: 'Agents' },
+      { key: 'sessions', label: 'Sessions' },
+      { key: 'deployments', label: 'Deployment' },
+      { key: 'instances', label: 'Instance Management' },
+      { key: 'scans', label: 'Scans' },
+      { key: 'customization', label: 'UIUX customizer' },
+    ],
+  },
+  {
+    label: 'Account',
+    items: [
+      { key: 'subscription', label: 'Subscription' },
+      { key: 'invoices', label: 'Invoices' },
+      { key: 'credits', label: 'Credits' },
+      { key: 'byok', label: 'AI credentials' },
+      { key: 'integrations', label: 'Integrations' },
+      { key: 'settings', label: 'Settings' },
+      { key: 'documentation', label: 'Documentation' },
+      { key: 'api-reference', label: 'API reference' },
+    ],
+  },
 ];
 
 const SELECTED_PROJECT_STORAGE_KEY = 'deplai.pipeline.selectedProjectId';
@@ -154,8 +152,6 @@ const SHAPE_MAP: Record<PixelBlastVariant, number> = {
   diamond: 3,
 };
 const MAX_CLICKS = 10;
-const GRADIENT_POSITIONS = ['80% 55%', '69% 34%', '8% 6%', '41% 38%', '86% 85%', '82% 18%', '51% 4%'];
-const COLOR_MAP = [0, 1, 2, 0, 1, 2, 1];
 const VERTEX_SRC = `
 void main() {
   gl_Position = vec4(position, 1.0);
@@ -284,93 +280,12 @@ void main(){
 }
 `;
 
-function parseHSL(hslStr: string): { h: number; s: number; l: number } {
-  const match = hslStr.match(/([\d.]+)\s*([\d.]+)%?\s*([\d.]+)%?/);
-  if (!match) return { h: 40, s: 80, l: 80 };
-  return { h: Number.parseFloat(match[1]), s: Number.parseFloat(match[2]), l: Number.parseFloat(match[3]) };
-}
-
-function buildBoxShadow(glowColor: string, intensity: number): string {
-  const { h, s, l } = parseHSL(glowColor);
-  const base = `${h}deg ${s}% ${l}%`;
-  const layers: Array<[number, number, number, number, number, boolean]> = [
-    [0, 0, 0, 1, 100, true], [0, 0, 1, 0, 60, true], [0, 0, 3, 0, 50, true],
-    [0, 0, 6, 0, 40, true], [0, 0, 15, 0, 30, true], [0, 0, 25, 2, 20, true],
-    [0, 0, 50, 2, 10, true], [0, 0, 1, 0, 60, false], [0, 0, 3, 0, 50, false],
-    [0, 0, 6, 0, 40, false], [0, 0, 15, 0, 30, false], [0, 0, 25, 2, 20, false],
-    [0, 0, 50, 2, 10, false],
-  ];
-  return layers.map(([x, y, blur, spread, alpha, inset]) => {
-    const a = Math.min(alpha * intensity, 100);
-    return `${inset ? 'inset ' : ''}${x}px ${y}px ${blur}px ${spread}px hsl(${base} / ${a}%)`;
-  }).join(', ');
-}
-
-function easeOutCubic(x: number) { return 1 - Math.pow(1 - x, 3); }
-function easeInCubic(x: number) { return x * x * x; }
-
-function animateValue({
-  start = 0,
-  end = 100,
-  duration = 1000,
-  delay = 0,
-  ease = easeOutCubic,
-  onUpdate,
-  onEnd,
-}: {
-  start?: number;
-  end?: number;
-  duration?: number;
-  delay?: number;
-  ease?: (t: number) => number;
-  onUpdate: (value: number) => void;
-  onEnd?: () => void;
-}) {
-  const t0 = performance.now() + delay;
-  function tick() {
-    const elapsed = performance.now() - t0;
-    const t = Math.min(elapsed / duration, 1);
-    onUpdate(start + (end - start) * ease(t));
-    if (t < 1) requestAnimationFrame(tick);
-    else onEnd?.();
-  }
-  window.setTimeout(() => requestAnimationFrame(tick), delay);
-}
-
-function buildMeshGradients(colors: string[]): string[] {
-  const gradients: string[] = [];
-  for (let i = 0; i < 7; i += 1) {
-    const color = colors[Math.min(COLOR_MAP[i], colors.length - 1)];
-    gradients.push(`radial-gradient(at ${GRADIENT_POSITIONS[i]}, ${color} 0px, transparent 50%)`);
-  }
-  gradients.push(`linear-gradient(${colors[0]} 0 100%)`);
-  return gradients;
-}
-
 function writeStoredString(key: string, value: string) {
   try {
     localStorage.setItem(key, value);
   } catch {
     // ignore storage failures
   }
-}
-
-function deriveTenantId(projectId: string, projectName: string): string {
-  const normalizedFromName = projectName
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 63);
-
-  const normalizedFromId = projectId
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 63);
-
-  return normalizedFromName || normalizedFromId || 'draft-tenant';
 }
 
 const TextType = ({
@@ -443,144 +358,6 @@ const TextType = ({
         {cursorCharacter}
       </span>
     ),
-  );
-};
-
-const BorderGlow = ({
-  children,
-  className = '',
-  edgeSensitivity = 30,
-  glowColor = '40 80 80',
-  backgroundColor = '#060010',
-  borderRadius = 28,
-  glowRadius = 40,
-  glowIntensity = 1,
-  coneSpread = 25,
-  animated = false,
-  colors = ['#c084fc', '#f472b6', '#38bdf8'],
-  fillOpacity = 0.5,
-}: BorderGlowProps) => {
-  const cardRef = useRef<HTMLDivElement>(null);
-  const [isHovered, setIsHovered] = useState(false);
-  const [cursorAngle, setCursorAngle] = useState(45);
-  const [edgeProximity, setEdgeProximity] = useState(0);
-  const [sweepActive, setSweepActive] = useState(false);
-
-  const getCenterOfElement = useCallback((element: HTMLElement) => {
-    const { width, height } = element.getBoundingClientRect();
-    return [width / 2, height / 2];
-  }, []);
-
-  const getEdgeProximity = useCallback((element: HTMLElement, x: number, y: number) => {
-    const [cx, cy] = getCenterOfElement(element);
-    const dx = x - cx;
-    const dy = y - cy;
-    let kx = Number.POSITIVE_INFINITY;
-    let ky = Number.POSITIVE_INFINITY;
-    if (dx !== 0) kx = cx / Math.abs(dx);
-    if (dy !== 0) ky = cy / Math.abs(dy);
-    return Math.min(Math.max(1 / Math.min(kx, ky), 0), 1);
-  }, [getCenterOfElement]);
-
-  const getCursorAngle = useCallback((element: HTMLElement, x: number, y: number) => {
-    const [cx, cy] = getCenterOfElement(element);
-    const dx = x - cx;
-    const dy = y - cy;
-    if (dx === 0 && dy === 0) return 0;
-    const radians = Math.atan2(dy, dx);
-    let degrees = radians * (180 / Math.PI) + 90;
-    if (degrees < 0) degrees += 360;
-    return degrees;
-  }, [getCenterOfElement]);
-
-  const handlePointerMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
-    const card = cardRef.current;
-    if (!card) return;
-    const rect = card.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
-    setEdgeProximity(getEdgeProximity(card, x, y));
-    setCursorAngle(getCursorAngle(card, x, y));
-  }, [getCursorAngle, getEdgeProximity]);
-
-  useEffect(() => {
-    if (!animated) return;
-    const angleStart = 110;
-    const angleEnd = 465;
-    const frameId = requestAnimationFrame(() => {
-      setSweepActive(true);
-      setCursorAngle(angleStart);
-    });
-    animateValue({ duration: 500, onUpdate: (value) => setEdgeProximity(value / 100) });
-    animateValue({ ease: easeInCubic, duration: 1500, end: 50, onUpdate: (value) => setCursorAngle((angleEnd - angleStart) * (value / 100) + angleStart) });
-    animateValue({ ease: easeOutCubic, delay: 1500, duration: 2250, start: 50, end: 100, onUpdate: (value) => setCursorAngle((angleEnd - angleStart) * (value / 100) + angleStart) });
-    animateValue({ ease: easeInCubic, delay: 2500, duration: 1500, start: 100, end: 0, onUpdate: (value) => setEdgeProximity(value / 100), onEnd: () => setSweepActive(false) });
-    return () => cancelAnimationFrame(frameId);
-  }, [animated]);
-
-  const colorSensitivity = edgeSensitivity + 20;
-  const isVisible = isHovered || sweepActive;
-  const borderOpacity = isVisible ? Math.max(0, (edgeProximity * 100 - colorSensitivity) / (100 - colorSensitivity)) : 0;
-  const glowOpacity = isVisible ? Math.max(0, (edgeProximity * 100 - edgeSensitivity) / (100 - edgeSensitivity)) : 0;
-  const meshGradients = buildMeshGradients(colors);
-  const borderBg = meshGradients.map((gradient) => `${gradient} border-box`);
-  const fillBg = meshGradients.map((gradient) => `${gradient} padding-box`);
-  const angleDeg = `${cursorAngle.toFixed(3)}deg`;
-
-  return (
-    <div
-      ref={cardRef}
-      onPointerMove={handlePointerMove}
-      onPointerEnter={() => setIsHovered(true)}
-      onPointerLeave={() => setIsHovered(false)}
-      className={`relative grid isolate ${className}`}
-      style={{
-        background: backgroundColor,
-        borderRadius: `${borderRadius}px`,
-        transform: 'translate3d(0, 0, 0.01px)',
-        boxShadow: 'rgba(0,0,0,0.2) 0 4px 12px',
-      }}
-    >
-      <div
-        className="absolute inset-0 rounded-[inherit] -z-1"
-        style={{
-          border: '1px solid transparent',
-          background: [`linear-gradient(${backgroundColor} 0 100%) padding-box`, 'linear-gradient(rgb(255 255 255 / 0%) 0% 100%) border-box', ...borderBg].join(', '),
-          opacity: borderOpacity,
-          maskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
-          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black ${coneSpread}%, transparent ${coneSpread + 15}%, transparent ${100 - coneSpread - 15}%, black ${100 - coneSpread}%)`,
-          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
-        }}
-      />
-      <div
-        className="absolute inset-0 rounded-[inherit] -z-1"
-        style={{
-          border: '1px solid transparent',
-          background: fillBg.join(', '),
-          maskImage: ['linear-gradient(to bottom, black, black)', 'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)', 'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)', `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`].join(', '),
-          WebkitMaskImage: ['linear-gradient(to bottom, black, black)', 'radial-gradient(ellipse at 50% 50%, black 40%, transparent 65%)', 'radial-gradient(ellipse at 66% 66%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 33% 33%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 66% 33%, black 5%, transparent 40%)', 'radial-gradient(ellipse at 33% 66%, black 5%, transparent 40%)', `conic-gradient(from ${angleDeg} at center, transparent 5%, black 15%, black 85%, transparent 95%)`].join(', '),
-          maskComposite: 'subtract, add, add, add, add, add',
-          WebkitMaskComposite: 'source-out, source-over, source-over, source-over, source-over, source-over',
-          opacity: borderOpacity * fillOpacity,
-          mixBlendMode: 'soft-light',
-          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
-        } as CSSProperties}
-      />
-      <span
-        className="absolute pointer-events-none z-1 rounded-[inherit]"
-        style={{
-          inset: `${-glowRadius}px`,
-          maskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
-          WebkitMaskImage: `conic-gradient(from ${angleDeg} at center, black 2.5%, transparent 10%, transparent 90%, black 97.5%)`,
-          opacity: glowOpacity,
-          mixBlendMode: 'plus-lighter',
-          transition: isVisible ? 'opacity 0.25s ease-out' : 'opacity 0.75s ease-in-out',
-        } as CSSProperties}
-      >
-        <span className="absolute rounded-[inherit]" style={{ inset: `${glowRadius}px`, boxShadow: buildBoxShadow(glowColor, glowIntensity) }} />
-      </span>
-      <div className="relative z-1 flex h-full w-full flex-col">{children}</div>
-    </div>
   );
 };
 
@@ -797,15 +574,15 @@ function BranchDropdown({
             void loadBranches();
           }
         }}
-        className={`group relative flex min-w-30 cursor-pointer items-center rounded-md border bg-[#111111] py-1 pl-2.5 pr-7 transition-colors ${isOpen ? 'border-white/40' : 'border-[#1A1A1A] hover:border-[#2A2A2A]'}`}
+        className="group relative flex min-w-30 cursor-pointer items-center border-[3px] border-black bg-white py-1 pl-2.5 pr-7"
       >
-        <GitBranch className={`mr-2 h-3.5 w-3.5 transition-colors ${isOpen ? 'text-white' : 'text-[#71717a] group-hover:text-white'}`} />
-        <span className="flex-1 truncate font-mono text-[12px] leading-none text-slate-300">{selected}</span>
-        <ChevronDown className={`pointer-events-none absolute right-2 h-3.5 w-3.5 transition-transform duration-200 ${isOpen ? 'rotate-180 text-white' : 'text-[#71717a] group-hover:text-slate-300'}`} />
+        <span className="mr-2 font-mono text-[9px] font-semibold uppercase tracking-[0.14em] text-neutral-500">br</span>
+        <span className="flex-1 truncate font-mono text-[12px] leading-none text-black">{selected}</span>
+        <ChevronDown className={`pointer-events-none absolute right-2 h-3.5 w-3.5 text-black transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`} />
       </div>
-      <div className={`absolute left-0 top-[calc(100%+6px)] z-80 min-w-40 origin-top overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#0A0C12] shadow-[0_10px_40px_-10px_rgba(0,0,0,0.8)] transition-all duration-200 ${isOpen ? 'translate-y-0 scale-y-100 opacity-100' : 'pointer-events-none -translate-y-2 scale-y-95 opacity-0'}`}>
+      <div className={`absolute left-0 top-[calc(100%+6px)] z-80 min-w-40 origin-top border-[3px] border-black bg-white shadow-[4px_4px_0_0_#000] transition-all duration-200 ${isOpen ? 'translate-y-0 scale-y-100 opacity-100' : 'pointer-events-none -translate-y-2 scale-y-95 opacity-0'}`}>
         <div className="p-1">
-          {loading && <div className="px-3 py-2 text-[12px] text-slate-400">Loading branches...</div>}
+          {loading && <div className="px-3 py-2 text-[12px] text-neutral-500">Loading branches…</div>}
           {branches.map((branch) => (
             <div
               key={branch}
@@ -813,12 +590,9 @@ function BranchDropdown({
                 setSelected(branch);
                 setIsOpen(false);
               }}
-              className={`flex cursor-pointer items-center justify-between rounded-md px-3 py-2 font-mono text-[12px] transition-colors ${selected === branch ? 'bg-white/10 font-medium text-white' : 'text-slate-300 hover:bg-[#141414] hover:text-white'}`}
+              className={`flex cursor-pointer items-center justify-between px-3 py-2 font-mono text-[12px] ${selected === branch ? 'bg-black font-medium text-white' : 'text-black hover:bg-neutral-100'}`}
             >
-              <div className="flex items-center gap-2">
-                <GitBranch className={`h-3 w-3 ${selected === branch ? 'text-white' : 'text-transparent'}`} />
-                {branch}
-              </div>
+              <span className="truncate">{branch}</span>
               {selected === branch && <Check className="h-3.5 w-3.5 text-white" />}
             </div>
           ))}
@@ -832,13 +606,11 @@ function PixelNoiseButton({
   onClick,
   children,
   className = '',
-  theme = 'light',
   disabled = false,
 }: {
   onClick: () => void;
   children: React.ReactNode;
   className?: string;
-  theme?: 'light' | 'orange';
   disabled?: boolean;
 }) {
   class PixelButtonNode {
@@ -951,9 +723,7 @@ function PixelNoiseButton({
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.scale(dpr, dpr);
 
-    const colors = theme === 'orange'
-      ? ['#FF9900', '#FFB84D', '#F97316']
-      : ['#111111', '#3f3f46', '#52525b'];
+    const colors = ['#111111', '#3f3f46', '#52525b'];
     const gap = 5;
     const speed = 35 * 0.001;
     const nextPixels: PixelButtonNode[] = [];
@@ -966,7 +736,7 @@ function PixelNoiseButton({
       }
     }
     pixelsRef.current = nextPixels;
-  }, [theme]);
+  }, []);
 
   const animate = useCallback((mode: 'appear' | 'disappear') => {
     animationRef.current = requestAnimationFrame(() => animate(mode));
@@ -1010,9 +780,7 @@ function PixelNoiseButton({
     };
   }, [initPixels]);
 
-  const buttonThemeClass = theme === 'orange'
-    ? 'border-[#FF9900]/50 bg-[#FF9900]/15 text-[#FF9900] shadow-[0_0_15px_rgba(255,153,0,0.18)] hover:bg-[#FF9900]/25'
-    : 'border-zinc-200/80 bg-zinc-100 text-black shadow-[0_2px_10px_rgba(255,255,255,0.15)] hover:bg-white';
+  const buttonThemeClass = 'border-[3px] border-black bg-black text-white shadow-[4px_4px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none';
 
   return (
     <button
@@ -1023,9 +791,11 @@ function PixelNoiseButton({
       onMouseLeave={() => triggerAnimation('disappear')}
       onFocus={() => triggerAnimation('appear')}
       onBlur={() => triggerAnimation('disappear')}
-      className={`group/pixel relative overflow-hidden rounded-md border px-4 py-1.5 text-[12px] font-semibold transition-all ${buttonThemeClass} ${disabled ? 'cursor-not-allowed opacity-60' : ''} ${className}`}
+      className={`group/pixel relative rounded-none border px-4 py-1.5 text-[12px] font-semibold transition-all ${buttonThemeClass} ${disabled ? 'cursor-not-allowed opacity-60' : ''} ${className}`}
     >
-      <canvas ref={canvasRef} aria-hidden className="pointer-events-none absolute inset-0 h-full w-full" />
+      <span className="pointer-events-none absolute inset-0 overflow-hidden">
+        <canvas ref={canvasRef} aria-hidden className="h-full w-full" />
+      </span>
       <span className="relative z-10 flex items-center gap-1.5">{children}</span>
     </button>
   );
@@ -1046,11 +816,11 @@ function mapProjectsToRepositories(projects: ProjectRecord[]): DashboardReposito
   }));
 }
 
-export default function DashboardHomeApp() {
+export default function DashboardHomeApp({ initialTab = 'overview' }: { initialTab?: string }) {
   const router = useRouter();
   const { startScan } = useScan();
   const uploadInputRef = useRef<HTMLInputElement>(null);
-  const [activeTab, setActiveTab] = useState('overview');
+  const [activeTab, setActiveTab] = useState(initialTab);
   const [viewMode, setViewMode] = useState<ViewMode>('list');
   const [typingTrigger, setTypingTrigger] = useState(0);
   const [hasScrolledDown, setHasScrolledDown] = useState(false);
@@ -1072,14 +842,14 @@ export default function DashboardHomeApp() {
       if (sessionRes.ok) {
         const session = await sessionRes.json() as SessionResponse;
         if (!session.isLoggedIn || !session.user) {
-          window.location.assign('/api/auth/login?force=1');
+          window.location.assign(LOGIN_HREF);
           return;
         }
         const nextUser = session.user.login || session.user.name;
         setUserName(nextUser || 'Signed in');
         setUserAvatarUrl(session.user.avatarUrl || '');
       } else {
-        window.location.assign('/api/auth/login?force=1');
+        window.location.assign(LOGIN_HREF);
         return;
       }
 
@@ -1090,7 +860,7 @@ export default function DashboardHomeApp() {
         setRepositories(mapProjectsToRepositories(projects));
         setProjectsById(Object.fromEntries(projects.map((project) => [project.id, project])));
       } else if (projectsRes.status === 401) {
-        window.location.assign('/api/auth/login?force=1');
+        window.location.assign(LOGIN_HREF);
       }
     } finally {
       setRefreshing(false);
@@ -1160,17 +930,50 @@ export default function DashboardHomeApp() {
   }, [primePipelineState, projectsById, router, validateAndStartScan]);
 
   const handleOpenCustomization = useCallback((repo: DashboardRepository) => {
-    const tenantId = deriveTenantId(repo.id, repo.name);
-    router.push(
-      `/dashboard/customization?projectId=${encodeURIComponent(repo.id)}&projectName=${encodeURIComponent(repo.name)}&tenantId=${encodeURIComponent(tenantId)}`,
-    );
+    router.push(buildCustomizationHref(repo.id, repo.name));
   }, [router]);
+
+  const handleSidebarNavigation = useCallback((key: string) => {
+    if (key === 'settings') {
+      router.push('/dashboard/settings');
+      return;
+    }
+    if (key === 'organizations') {
+      router.push('/dashboard/projects');
+      return;
+    }
+    if (key === 'deployments') {
+      router.push('/dashboard/deploy');
+      return;
+    }
+    if (key === 'instances') {
+      router.push('/dashboard/instances');
+      return;
+    }
+    if (key === 'documentation' || key === 'api-reference') {
+      router.push('/dashboard/documentation');
+      return;
+    }
+    if (key === 'customization') {
+      const repo = repositories[0];
+      if (repo) handleOpenCustomization(repo);
+      return;
+    }
+    if (key === 'byok') {
+      router.push('/dashboard/ai');
+      return;
+    }
+    if (key === 'credits') {
+      router.push('/dashboard/credits');
+      return;
+    }
+    setActiveTab(key);
+  }, [handleOpenCustomization, repositories, router]);
 
   const handleRunAll = useCallback((repo: DashboardRepository) => {
     if (runAllProjectId) return;
     setRunAllProjectId(repo.id);
-    const tenantId = deriveTenantId(repo.id, repo.name);
-    const url = `/dashboard/customization?projectId=${encodeURIComponent(repo.id)}&projectName=${encodeURIComponent(repo.name)}&tenantId=${encodeURIComponent(tenantId)}&runAll=1`;
+    const url = `${buildCustomizationHref(repo.id, repo.name)}&runAll=1`;
     router.push(url);
     window.setTimeout(() => {
       setRunAllProjectId((current) => (current === repo.id ? null : current));
@@ -1258,183 +1061,83 @@ export default function DashboardHomeApp() {
   const githubCount = repositories.filter((repo) => repo.type === 'github').length;
   const localCount = repositories.filter((repo) => repo.type === 'local').length;
   const firstRepository = repositories[0];
+  const activeSidebarItem = SIDEBAR_SECTIONS.flatMap((section) => section.items)
+    .find((item) => item.key === activeTab);
   const headerTitle = activeTab === 'instances'
-    ? 'Manage Instance'
+    ? 'Instance Management'
     : activeTab === 'settings'
       ? 'Settings'
-      : 'Command Center';
+      : activeTab === 'integrations'
+        ? 'Integrations'
+        : activeSidebarItem?.label || 'Command Center';
 
   return (
-    <div className="relative flex h-screen overflow-hidden bg-[#050505] font-sans text-slate-300 selection:bg-white/30">
-      <div className="pointer-events-none absolute inset-0 z-0 opacity-40">
-        <PixelBlast
-          variant="diamond"
-          color="#ffffff"
-          pixelSize={4}
-          patternScale={2}
-          patternDensity={0.6}
-          speed={0.2}
-          noiseAmount={0.05}
-          transparent
+    <div className="relative flex h-full overflow-hidden bg-transparent font-sans">
+      <style>{`
+        .dashboard-shell { --font-sans: 'Instrument Sans', 'Noto Sans', sans-serif; --font-display: 'Space Grotesk', sans-serif; --font-mono: 'JetBrains Mono', monospace; }
+        .dashboard-shell h1, .dashboard-shell h2, .dashboard-shell .font-display { font-family: var(--font-display); }
+      `}</style>
+      <main className="relative z-10 flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-transparent">
+        <WorkspaceCommandHeader
+          section={headerTitle}
+          onExit={() => router.push('/')}
         />
-      </div>
-
-      <aside className="relative z-20 flex w-64 shrink-0 flex-col border-r border-[#1A1A1A] bg-[#050505]">
-        <div className="group flex h-16 cursor-pointer items-center border-b border-[#1A1A1A] px-8" onMouseEnter={() => setTypingTrigger((prev) => prev + 1)}>
-          <TextType
-            key={typingTrigger}
-            text="DEPL_AI"
-            as="h1"
-            className="text-lg font-bold tracking-widest text-white"
-            typingSpeed={100}
-            loop={false}
-            showCursor
-            cursorCharacter="|"
-            cursorClassName="animate-[customBlink_1s_step-end_infinite] font-light text-white"
-          />
-        </div>
-
-        <nav className="flex-1 space-y-1 px-3 py-6">
-          {DASHBOARD_TABS.map(({ key, label, icon: Icon }) => (
-            <button
-              key={key}
-              onClick={() => {
-                if (key === 'documentation') {
-                  router.push('/dashboard/documentation');
-                  return;
-                }
-                setActiveTab(key);
-                if (key === 'deployments') router.push('/dashboard/deploy');
-                if (key === 'instances') return;
-              }}
-              className={`relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-all ${activeTab === key ? 'border border-white/25 bg-linear-to-r from-white/10 to-transparent text-white' : 'text-[#a1a1aa] hover:bg-[#0A0A0A] hover:text-slate-200'}`}
-            >
-              {activeTab === key && <div className="absolute -left-px top-2 bottom-2 w-0.75 rounded-r-md bg-white shadow-[0_0_12px_rgba(255,255,255,0.8)]" />}
-              <Icon className={`h-4 w-4 ${activeTab === key ? 'text-white' : ''}`} />
-              {label}
-            </button>
-          ))}
-        </nav>
-
-        <div className="border-t border-[#1A1A1A] p-4">
-          <button onClick={handleLogout} disabled={loggingOut} className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left transition-colors hover:bg-[#0A0A0A]">
-            {userAvatarUrl ? (
-              <img
-                src={userAvatarUrl}
-                alt={`${userName} avatar`}
-                className="h-8 w-8 rounded-full border border-[#1A1A1A] object-cover"
-                loading="lazy"
-                referrerPolicy="no-referrer"
-              />
-            ) : (
-              <div className="flex h-8 w-8 items-center justify-center rounded-full bg-[#71D08C]">
-                <div className="flex h-6 w-6 items-center justify-center rounded-full bg-white/20 text-xs font-bold text-[#050505]">
-                  {(userName || 'U').charAt(0).toUpperCase()}
-                </div>
-              </div>
-            )}
-            <div className="flex-1 overflow-hidden">
-              <p className="truncate text-sm font-medium text-white">{userName}</p>
-              <div className="mt-0.5 flex items-center gap-1 text-[11px] text-[#a1a1aa]">
-                <LogOut className="h-3 w-3" />
-                <span>{loggingOut ? 'Signing out...' : 'Sign out'}</span>
-              </div>
-            </div>
-          </button>
-        </div>
-      </aside>
-
-      <main className="relative z-10 flex h-full flex-1 flex-col overflow-hidden bg-transparent">
-        <header className="flex h-16 items-center justify-between border-b border-[#1A1A1A]/50 bg-[#050505]/60 px-8 backdrop-blur-md">
-          <div className="flex items-center gap-2 text-[13px] text-[#a1a1aa]">
-            <span className="cursor-pointer transition-colors hover:text-slate-200">Dashboard</span>
-            <span className="text-[#71717a]">/</span>
-            <span className="font-medium text-white">{headerTitle}</span>
-          </div>
-          <div className="flex items-center gap-3">
-            <button onClick={() => router.push('/dashboard/projects')} className="flex items-center gap-2 rounded-md border border-[#1A1A1A] px-3 py-1.5 text-[13px] font-medium text-slate-300 transition-all hover:bg-[#111111]">
-              <Server className="h-3.5 w-3.5" />
-              Manage Org
-            </button>
-            <div className="mx-1 h-4 w-px bg-[#1A1A1A]" />
-            <button onClick={() => void loadDashboardData()} className="rounded-md p-1.5 text-[#a1a1aa] transition-all hover:bg-[#111111] hover:text-white" title="Refresh">
-              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
-            </button>
-          </div>
-        </header>
 
         {activeTab === 'instances' ? (
-          <ManageInstancesApp embedded />
+          <Suspense fallback={<div className="flex-1 bg-white" />}>
+            <ManageInstancesApp embedded />
+          </Suspense>
         ) : activeTab === 'settings' ? (
         <div className="custom-scrollbar relative z-10 flex-1 overflow-y-auto p-8" onScroll={handleMainScroll}>
           <SettingsApp />
         </div>
+        ) : activeTab === 'integrations' ? (
+        <div className="custom-scrollbar relative z-10 flex-1 overflow-y-auto p-8">
+          <IntegrationsApp />
+        </div>
         ) : (
         <div className="custom-scrollbar relative z-10 flex-1 overflow-y-auto p-8" onScroll={handleMainScroll}>
-          <div className="mb-10 grid grid-cols-1 gap-5 md:grid-cols-2 lg:grid-cols-4">
-            <BorderGlow backgroundColor="#000000" colors={['#ffffff', '#d4d4d8', '#a1a1aa']} glowColor="0 0 100" glowIntensity={1} glowRadius={15} fillOpacity={0} borderRadius={16} className="p-6 shadow-lg">
-              <div className="mb-4 flex items-center justify-between">
-                <h3 className="text-xs font-semibold uppercase tracking-widest text-[#a1a1aa]">Repositories</h3>
-                <div className="flex gap-1">
-                  <div className="h-1 w-6 rounded-full bg-[#1A1A1A]" />
-                  <div className="h-1 w-6 rounded-full bg-[#1A1A1A]" />
-                </div>
-              </div>
-              <div className="mt-2 mb-6 flex items-end gap-3">
-                <span className="text-5xl leading-none tracking-tight text-white">{activeCount}</span>
-                <span className="mb-1 text-[13px] font-medium text-[#a1a1aa]">tracked</span>
+          <div className="mb-10 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+            <div className="app-paper p-6">
+              <p className="font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-neutral-500">Repositories</p>
+              <div className="mt-4 mb-5 flex items-end gap-2.5">
+                <span className="font-display text-5xl font-semibold leading-none tracking-tight text-black">{activeCount}</span>
+                <span className="mb-1 text-[13px] font-medium text-neutral-500">tracked</span>
               </div>
               <div className="mt-auto flex gap-2">
-                <span className="flex items-center gap-1.5 rounded-md border border-[#1A1A1A] bg-[#111111] px-2.5 py-1 text-[11px] font-medium text-[#a1a1aa]"><Github className="h-3.5 w-3.5" /> {githubCount} remote</span>
-                <span className="flex items-center gap-1.5 rounded-md border border-[#1A1A1A] bg-[#111111] px-2.5 py-1 text-[11px] font-medium text-[#a1a1aa]"><FileText className="h-3.5 w-3.5" /> {localCount} local</span>
+                <span className="border-2 border-black px-2.5 py-1 font-mono text-[11px] font-bold">{githubCount} remote</span>
+                <span className="border-2 border-black px-2.5 py-1 font-mono text-[11px] font-bold">{localCount} local</span>
               </div>
-            </BorderGlow>
+            </div>
 
-            <BorderGlow backgroundColor="#000000" colors={['#818CF8', '#C084FC', '#38BDF8']} glowColor="260 70 60" glowIntensity={1} glowRadius={15} fillOpacity={0} borderRadius={16} animated className="group cursor-pointer p-6 shadow-lg">
-              <button onClick={() => router.push('/dashboard/projects')} className="flex h-full w-full flex-col items-start text-left">
-                <div className="mb-3 mt-1 flex items-center gap-3">
-                  <div className="flex h-8 w-8 items-center justify-center rounded-md border border-white/10 bg-white/5">
-                    <Plus className="h-4 w-4 text-white" />
-                  </div>
-                  <h3 className="text-base font-semibold text-white">Add Project</h3>
-                </div>
-                <p className="mb-4 text-[13px] leading-relaxed text-zinc-300">Connect more GitHub repositories to secure your supply chain.</p>
-                <div className="mt-auto flex items-center gap-1 text-[13px] font-medium text-white transition-colors group-hover:text-zinc-200">
-                  Connect now <ArrowRight className="ml-1 h-3.5 w-3.5" />
-                </div>
-              </button>
-            </BorderGlow>
+            <button type="button" onClick={() => router.push('/dashboard/projects')} className="app-paper group flex h-full w-full flex-col items-start p-6 text-left">
+              <p className="font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-neutral-500">Connect</p>
+              <h3 className="mt-3 font-display text-lg font-semibold text-black">Add Project</h3>
+              <p className="mt-2 mb-5 text-[13px] leading-relaxed text-neutral-600">Link GitHub repositories to your deployment workspace.</p>
+              <div className="mt-auto text-[13px] font-bold">
+                Connect now →
+              </div>
+            </button>
 
-            <BorderGlow backgroundColor="#000000" colors={['#FF9900', '#FFB84D', '#FF7300']} glowColor="35 100 50" glowIntensity={1} glowRadius={15} fillOpacity={0} borderRadius={16} animated className="group flex cursor-pointer flex-col overflow-hidden p-6 shadow-lg">
-              <div className="pointer-events-none absolute top-0 right-0 h-28 w-28 text-[#FF9900] opacity-10">
-                <svg viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M50 0C77.6 0 100 22.4 100 50C100 77.6 77.6 100 50 100C22.4 100 0 77.6 0 50" stroke="currentColor" strokeWidth="10" strokeDasharray="20 10" />
-                  <path d="M50 20C66.5 20 80 33.5 80 50C80 66.5 66.5 80 50 80C33.5 80 20 66.5 20 50" stroke="currentColor" strokeWidth="6" strokeDasharray="15 15" />
-                </svg>
-              </div>
-              <div className="relative z-10 mb-2 mt-1 flex items-center gap-2">
-                <Server className="h-4 w-4 text-[#FF9900]" />
-                <h3 className="text-base font-semibold text-slate-200">AWS Deployment</h3>
-              </div>
-              <p className="relative z-10 mb-6 text-[13px] leading-relaxed text-[#a1a1aa]">Deploy live endpoints directly to Amazon Web Services infrastructure.</p>
+            <div className="app-paper flex flex-col p-6">
+              <p className="font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-neutral-500">Deployment</p>
+              <h3 className="mt-3 font-display text-lg font-semibold text-black">Cloud Deployment</h3>
+              <p className="mt-2 mb-5 text-[13px] leading-relaxed text-neutral-600">Ship live endpoints to AWS, Azure, GCP, and Heroku from one workspace.</p>
               <PixelNoiseButton
                 onClick={() => (firstRepository ? handleDeploy(firstRepository.id) : router.push('/dashboard/deploy'))}
-                theme="orange"
-                className="relative z-10 mt-auto w-full justify-center py-2.5 text-[13px]"
+                className="mt-auto w-full justify-center py-2.5 text-[13px]"
               >
-                <Play className="h-3.5 w-3.5 fill-current" /> Deploy to AWS
+                Deploy now
               </PixelNoiseButton>
-            </BorderGlow>
+            </div>
 
-            <BorderGlow backgroundColor="#000000" glowColor="220 40 50" glowIntensity={1} glowRadius={15} fillOpacity={0} borderRadius={16} className="group cursor-pointer p-1 shadow-lg">
-              <button onClick={handleUploadCardClick} disabled={uploadingLocalProject} className="flex h-full w-full flex-col items-center justify-center rounded-xl border border-dashed border-[#2A2A2A] p-5 text-center transition-colors group-hover:border-[#71717a] group-hover:bg-[#0A0A0A]/50 disabled:cursor-not-allowed disabled:opacity-70">
-                <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-md border border-[#2A2A2A] bg-[#141414] shadow-sm transition-transform group-hover:-translate-y-0.5">
-                  <Upload className="h-4 w-4 text-white" />
-                </div>
-                <h3 className="mb-2 text-[14px] font-semibold text-slate-200">{uploadingLocalProject ? 'Uploading...' : 'Upload Project'}</h3>
-                <p className="rounded border border-[#1A1A1A] bg-[#141414] px-2.5 py-1 text-[11px] font-medium text-[#a1a1aa]">.zip supported</p>
-              </button>
-            </BorderGlow>
+            <button type="button" onClick={handleUploadCardClick} disabled={uploadingLocalProject} className="app-paper group flex h-full w-full flex-col items-start justify-between p-6 text-left disabled:cursor-not-allowed disabled:opacity-70">
+              <p className="font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-neutral-500">Local</p>
+              <div>
+                <h3 className="font-display text-[15px] font-semibold text-black">{uploadingLocalProject ? 'Uploading…' : 'Upload Project'}</h3>
+                <p className="mt-2 text-[12px] text-neutral-500">ZIP archives supported</p>
+              </div>
+            </button>
 
             <input
               ref={uploadInputRef}
@@ -1448,23 +1151,22 @@ export default function DashboardHomeApp() {
           <div className="mt-8">
             <div className="mb-6 flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <h2 className="text-xl font-semibold text-white">Repositories</h2>
-                <span className="rounded border border-[#1A1A1A] bg-[#141414] px-2 py-0.5 text-[11px] font-medium text-[#a1a1aa]">{filteredRepositories.length}</span>
+                <h2 className="font-display text-xl font-semibold text-black">Repositories</h2>
+                <span className="border-2 border-black px-2 py-0.5 font-mono text-[11px] font-bold text-black">{filteredRepositories.length}</span>
               </div>
               <div className="flex items-center gap-3">
                 <div className="relative">
-                  <Search className="absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-[#a1a1aa]" />
                   <input
                     value={search}
                     onChange={(event) => setSearch(event.target.value)}
                     type="text"
-                    placeholder="Search repositories..."
-                    className="w-70 rounded-md border border-[#1A1A1A] bg-[#0A0A0A] py-1.5 pr-4 pl-9 text-[13px] text-slate-200 placeholder:text-[#71717a] focus:border-white/50 focus:outline-none"
+                    placeholder="Search repositories…"
+                    className="w-70 border-[3px] border-black bg-white py-2 pr-4 pl-3.5 text-[13px] text-black placeholder:text-neutral-400 focus:outline-none"
                   />
                 </div>
-                <div className="flex items-center rounded-md border border-[#1A1A1A] bg-[#0A0A0A] p-0.5">
-                  <button onClick={() => setViewMode('list')} className={`rounded p-1.5 transition-colors ${viewMode === 'list' ? 'bg-[#1A1A1A] text-white' : 'text-[#a1a1aa] hover:text-white'}`}><List className="h-4 w-4" /></button>
-                  <button onClick={() => setViewMode('grid')} className={`rounded p-1.5 transition-colors ${viewMode === 'grid' ? 'bg-[#1A1A1A] text-white' : 'text-[#a1a1aa] hover:text-white'}`}><Grid className="h-4 w-4" /></button>
+                <div className="flex items-center border-[3px] border-black p-0.5">
+                  <button onClick={() => setViewMode('list')} className={`px-2.5 py-1.5 text-[11px] font-bold ${viewMode === 'list' ? 'bg-black text-white' : 'text-neutral-500 hover:text-black'}`}>List</button>
+                  <button onClick={() => setViewMode('grid')} className={`px-2.5 py-1.5 text-[11px] font-bold ${viewMode === 'grid' ? 'bg-black text-white' : 'text-neutral-500 hover:text-black'}`}>Grid</button>
                 </div>
               </div>
             </div>
@@ -1472,20 +1174,18 @@ export default function DashboardHomeApp() {
             <div className={viewMode === 'list' ? 'space-y-3' : 'grid grid-cols-1 gap-4 lg:grid-cols-2'}>
               {filteredRepositories.map((repo, index) => (
                 <div key={repo.id} className="relative" style={{ zIndex: filteredRepositories.length - index }}>
-                  <BorderGlow backgroundColor="#000000" colors={['#ffffff', '#d4d4d8', '#a1a1aa']} glowColor="0 0 100" glowIntensity={0.8} glowRadius={12} fillOpacity={0} borderRadius={12} className="group border border-[#1A1A1A] shadow-sm transition-colors hover:border-transparent">
+                  <div className="app-paper group">
                     <div className={`flex h-full w-full p-4 ${viewMode === 'list' ? 'items-center gap-4' : 'flex-col items-start gap-4'}`}>
                       <div className={`flex w-full ${viewMode === 'list' ? 'flex-1 items-center gap-4' : 'items-start gap-3'}`}>
-                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#1A1A1A] bg-[#111111] shadow-sm transition-colors group-hover:border-[#2A2A2A]">
-                          <Github className="h-5 w-5 text-white" />
-                        </div>
+                        <ProjectSourceThumb type={repo.type} owner={repo.owner} />
                         <div className="flex min-w-0 flex-1 flex-col justify-center">
                           <div className="mb-1 flex items-center gap-3">
-                            <h4 className="truncate text-[15px] font-semibold text-slate-200">{repo.name}</h4>
-                            <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold tracking-wider ${repo.visibility === 'PUBLIC' ? 'border border-[#04D288]/20 bg-[#04D288]/10 text-[#04D288]' : 'border border-[#F59E0B]/20 bg-[#F59E0B]/10 text-[#F59E0B]'}`}>{repo.visibility}</span>
+                            <h4 className="truncate text-[15px] font-semibold text-black">{repo.name}</h4>
+                            <span className={`border-2 border-black px-1.5 py-0.5 font-mono text-[9px] font-bold tracking-wider ${repo.visibility === 'PUBLIC' ? 'bg-black text-white' : 'bg-white text-black'}`}>{repo.visibility}</span>
                           </div>
-                          <div className="flex flex-wrap items-center gap-2 text-[12px] text-[#a1a1aa]">
+                          <div className="flex flex-wrap items-center gap-2 text-[12px] text-neutral-600">
                             <span>{repo.source}</span>
-                            <span className="h-1 w-1 rounded-full bg-[#71717a]" />
+                            <span className="h-1 w-1 bg-black" />
                             <BranchDropdown
                               installationId={repo.installationId}
                               owner={repo.owner}
@@ -1496,34 +1196,34 @@ export default function DashboardHomeApp() {
                         </div>
                       </div>
 
-                      <div className={`flex shrink-0 items-center gap-2 ${viewMode === 'grid' ? 'w-full justify-between border-t border-[#1A1A1A] pt-2' : ''}`}>
+                      <div className={`flex shrink-0 items-center gap-2 ${viewMode === 'grid' ? 'w-full justify-between border-t-2 border-black pt-3' : ''}`}>
                         <div className="flex flex-wrap gap-2">
                           <PixelNoiseButton
                             onClick={() => void handleRunAll(repo)}
                             disabled={Boolean(runAllProjectId)}
-                            className="px-5 py-2 text-sm"
+                            className="px-4 py-2 text-sm"
                           >
-                            {runAllProjectId === repo.id ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5 fill-current" />} {runAllProjectId === repo.id ? 'Running All...' : 'Run All'}
+                            {runAllProjectId === repo.id ? 'Running…' : 'Run All'}
                           </PixelNoiseButton>
-                          <PixelNoiseButton onClick={() => handleDeploy(repo.id)} className="px-5 py-2 text-sm">
-                            <Rocket className="h-3.5 w-3.5" /> Deploy
+                          <PixelNoiseButton onClick={() => handleDeploy(repo.id)} className="px-4 py-2 text-sm">
+                            Deploy
                           </PixelNoiseButton>
-                          <PixelNoiseButton onClick={() => void handleRunScan(repo.id)} className="px-5 py-2 text-sm">
-                            <Zap className="h-3.5 w-3.5 fill-current" /> Run Scan
+                          <PixelNoiseButton onClick={() => void handleRunScan(repo.id)} className="px-4 py-2 text-sm">
+                            Scan
                           </PixelNoiseButton>
-                          <PixelNoiseButton onClick={() => handleOpenCustomization(repo)} className="px-5 py-2 text-sm">
-                            <Settings className="h-3.5 w-3.5" /> Customize UI
+                          <PixelNoiseButton onClick={() => handleOpenCustomization(repo)} className="px-4 py-2 text-sm">
+                            Customize
                           </PixelNoiseButton>
                         </div>
                         <div className="flex items-center gap-1">
-                          <div className={`mx-1 h-5 w-px bg-[#1A1A1A] ${viewMode === 'grid' ? 'hidden' : ''}`} />
-                          <button onClick={() => void handleDelete(repo.id)} className="ml-1 rounded-md p-1.5 text-[#a1a1aa] transition-colors hover:bg-[#F43F5E]/10 hover:text-[#F43F5E]" title="Delete">
-                            <Trash2 className="h-4 w-4" />
+                          <div className={`mx-1 h-5 w-px bg-black ${viewMode === 'grid' ? 'hidden' : ''}`} />
+                          <button onClick={() => void handleDelete(repo.id)} className="ml-1 px-2 py-1.5 text-[11px] font-bold text-neutral-500 hover:bg-black hover:text-white" title="Delete">
+                            Delete
                           </button>
                         </div>
                       </div>
                     </div>
-                  </BorderGlow>
+                  </div>
                 </div>
               ))}
             </div>
@@ -1533,10 +1233,6 @@ export default function DashboardHomeApp() {
       </main>
 
       <style dangerouslySetInnerHTML={{ __html: `
-        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background-color: #1A1A1A; border-radius: 10px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background-color: #2A2A2A; }
         @keyframes customBlink {
           0%, 100% { opacity: 1; }
           50% { opacity: 0; }

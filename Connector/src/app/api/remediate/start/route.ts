@@ -3,6 +3,20 @@ import { requireAuth } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { query } from '@/lib/db';
 import { githubService } from '@/lib/github';
+import { getBalance } from '@/lib/billing/credits';
+import { listCredentials } from '@/lib/ai-platform/credentials';
+import { canonicalizeProviderId } from '@/lib/ai-platform/providers/definitions';
+import {
+  assertPlatformModelAllowed,
+  defaultRemediationModel,
+  parseAccessMode,
+} from '@/lib/ai-platform/subscription-access';
+import {
+  findLatestSession,
+  isReusableSecuritySession,
+  resolveOrCreateSession,
+  tryAppendSessionLogs,
+} from '@/lib/sessions/store';
 
 interface ProjectRow {
   id: string;
@@ -57,15 +71,25 @@ export async function POST(request: NextRequest) {
     const { user, error } = await requireAuth();
     if (error) return error;
 
-    const { project_id, github_token, llm_provider, llm_api_key, llm_model, remediation_scope } = await request.json();
+    const {
+      project_id,
+      github_token,
+      llm_provider,
+      llm_api_key,
+      llm_model,
+      llm_access_mode,
+      remediation_scope,
+    } = await request.json();
     const runtimeGithubToken =
       typeof github_token === 'string' && github_token.trim().length > 0
         ? github_token.trim()
         : null;
-    const normalizedLlmProvider =
+    const canonicalProvider = canonicalizeProviderId(typeof llm_provider === 'string' ? llm_provider : '');
+    const normalizedLlmProvider = canonicalProvider || (
       typeof llm_provider === 'string' && llm_provider.trim().length > 0
         ? llm_provider.trim().toLowerCase()
-        : null;
+        : null
+    );
     const normalizedLlmApiKey =
       typeof llm_api_key === 'string' && llm_api_key.trim().length > 0
         ? llm_api_key.trim()
@@ -74,12 +98,39 @@ export async function POST(request: NextRequest) {
       typeof llm_model === 'string' && llm_model.trim().length > 0
         ? llm_model.trim()
         : null;
+    const accessMode = parseAccessMode(llm_access_mode) || 'auto';
     const scope = remediation_scope === 'major' ? 'major' : 'all';
     let usedInstallationToken = false;
 
     if (!project_id) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
     }
+
+    if (accessMode === 'platform') {
+      const balance = await getBalance(user.id).catch(() => null);
+      const model = normalizedLlmModel || defaultRemediationModel(balance?.planId);
+      const allowed = assertPlatformModelAllowed(balance?.planId, model);
+      if (!allowed.ok) {
+        return NextResponse.json({ error: allowed.message }, { status: 403 });
+      }
+    }
+    if (accessMode === 'byok' && !normalizedLlmApiKey) {
+      const creds = await listCredentials(user.id, canonicalProvider || undefined).catch(() => []);
+      const usable = creds.filter((item) => item.status === 'VALID' || item.status === 'PENDING');
+      if (!usable.length) {
+        return NextResponse.json(
+          { error: 'Add a BYOK key in AI Platform credentials before starting BYOK remediation.' },
+          { status: 400 },
+        );
+      }
+    }
+
+    const llmFields = {
+      llm_provider: normalizedLlmProvider,
+      llm_api_key: normalizedLlmApiKey,
+      llm_model: normalizedLlmModel,
+      llm_access_mode: accessMode,
+    };
 
     const projectRows = await query<ProjectRow[]>(
       `SELECT
@@ -123,9 +174,7 @@ export async function POST(request: NextRequest) {
           user_id: String(user.id),
           github_token: token,
           repository_url: `https://github.com/${owner}/${repo}`,
-          llm_provider: normalizedLlmProvider,
-          llm_api_key: normalizedLlmApiKey,
-          llm_model: normalizedLlmModel,
+          ...llmFields,
           remediation_scope: scope,
         };
       } else {
@@ -134,9 +183,7 @@ export async function POST(request: NextRequest) {
           project_name: project.name,
           project_type: 'local',
           user_id: String(user.id),
-          llm_provider: normalizedLlmProvider,
-          llm_api_key: normalizedLlmApiKey,
-          llm_model: normalizedLlmModel,
+          ...llmFields,
           remediation_scope: scope,
         };
       }
@@ -175,9 +222,7 @@ export async function POST(request: NextRequest) {
         user_id: String(user.id),
         github_token: token,
         repository_url: `https://github.com/${owner}/${repo}`,
-        llm_provider: normalizedLlmProvider,
-        llm_api_key: normalizedLlmApiKey,
-        llm_model: normalizedLlmModel,
+        ...llmFields,
         remediation_scope: scope,
       };
     }
@@ -195,9 +240,42 @@ export async function POST(request: NextRequest) {
     }
 
     const data = await response.json();
+    let workspaceSessionId: string | null = null;
+    try {
+      const repoLabel = String((backendPayload as { project_name?: string }).project_name || project_id);
+      const latest = await findLatestSession({
+        userId: user.id,
+        projectId: String(project_id),
+        service: 'security_agent',
+      });
+      const session = await resolveOrCreateSession(
+        latest && isReusableSecuritySession(latest) ? latest.id : null,
+        {
+          userId: user.id,
+          projectId: String(project_id),
+          service: 'security_agent',
+          title: latest?.title || `Security agent · ${repoLabel}`,
+          repo: repoLabel,
+          status: 'running',
+          currentStage: 'remediate_run',
+          triggeredBy: user.id,
+        },
+      );
+      if (session) {
+        await tryAppendSessionLogs(session.id, [{
+          level: 'info',
+          message: 'Remediation started.',
+          stage: 'remediate_run',
+        }]);
+        workspaceSessionId = session.id;
+      }
+    } catch (sessionError) {
+      console.error('[sessions] remediation start hook failed', sessionError);
+    }
     return NextResponse.json({
       ...data,
       auth_mode: usedInstallationToken ? 'installation_token' : 'user_token',
+      workspace_session_id: workspaceSessionId,
     });
   } catch (error: unknown) {
     console.error('Remediation start error:', error);

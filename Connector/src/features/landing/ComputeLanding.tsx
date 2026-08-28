@@ -15,7 +15,7 @@ import { FooterSection } from '@/components/landing/footer-section';
 /** The public entry point for the Compute the Platform experience. */
 export default function ComputeLanding() {
   return (
-    <main className="compute-landing relative min-h-screen overflow-x-hidden">
+    <main className="compute-landing noise-overlay relative min-h-screen overflow-x-hidden">
       <Navigation />
       <HeroSection />
       <FeaturesSection />

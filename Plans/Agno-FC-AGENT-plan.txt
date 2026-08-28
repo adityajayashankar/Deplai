@@ -1,0 +1,386 @@
+# Agno UI/UX Refactor Agent — Architecture Blueprint (v4: MongoDB-Backed, Local-First AgentOS)
+
+Scope: a multi-agent system, built on Agno and served by AgentOS, that upgrades the presentation layer of a frontend codebase — component by component, to an enterprise design bar — while being structurally incapable of touching business logic or backend code. This is the complete, self-contained plan: v1's pipeline design, v2's move onto AgentOS, v3's correction that AgentOS runs as a bare local process by default, and v4's swap of the persistence layer — every session, memory, trace, and HITL-approval record now lives in MongoDB (`agno.db.mongo.MongoDb` / `AsyncMongoDb`) instead of SQLite/Postgres, at every tier.
+
+> **Design note on this revision.** MongoDB is a documented, first-class Agno backend — `MongoDb` (sync, via `pymongo`) and `AsyncMongoDb` (async, via Motor or the newer PyMongo async driver) both implement the same `BaseDb` interface that SQLite and Postgres did, so nothing above the `db=` line changes. The one trade-off worth naming plainly: MongoDB has no embedded/file-only mode the way SQLite does. Even Tier 0 now runs a local `mongod` server process listening on a port, instead of a single `.db` file. It's still one extra command, still fully local, still nothing leaving localhost — but "zero infrastructure" meant *zero daemons* in v3, and that's no longer literally true. Addressed head-on in §2.4 rather than hidden.
+
+---
+
+## 0. Non-negotiables → engineering constraints
+
+| Your requirement | What it forces in the design |
+|---|---|
+| No business-logic/backend changes | Every edit is confined to a pre-computed "safe" AST region, enforced mechanically |
+| Enterprise-level, not AI slop | A written design-token rubric governs every component — no free-form styling |
+| Component-by-component targeting | Never load a full file into one agent's context; AST-chunk before anything else |
+| ~256K context ceiling, zero-trust | Two-tier memory: persistent index (AgentOS-backed session/db) + ephemeral per-component window |
+| Strict compliance to target files only | Allowlist enforced in the tool layer, not the system prompt |
+| No assumptions — must ask | A deterministic vagueness gate blocks generation until style/scope is explicit |
+| 100–3000 line files, no perf hit | Index once, cache by file hash, retrieve only what's touched |
+| Minimal token spend, max quality | Non-LLM preprocessing wherever possible, model tiering, patch diffs not full-file regen |
+| Runs on AgentOS | Runtime you host yourself — from a bare local process to a VPC-internal service; control plane is a pure client with no data path through Agno at any tier |
+
+---
+
+## 1. Tool Stack
+
+### 1.1 Agno-native primitives
+
+| Primitive | Role here |
+|---|---|
+| `agno.agent.Agent` | Per-role LLM executors (clarifier, design-system author, per-component refactorer) |
+| `agno.team.Team` | Fan-out across components. Modes: `coordinate`, `route`, `broadcast`, `tasks` |
+| `agno.workflow` (`Workflow`, `Step`, `Loop`, `Parallel`, `Condition`, `Router`) | Deterministic control of the whole pipeline; each `Step` wraps an Agent, a Team, or a plain function |
+| HITL: `@tool(requires_confirmation=True)`, `@tool(requires_user_input=True)`, `@approval(type="required")` | Native pause/resume — enforced and surfaced by the AgentOS runtime, not just the SDK |
+| `agno.guardrails` (`PromptInjectionGuardrail`, `PIIDetectionGuardrail`) | Input sanitization before untrusted repo content reaches a model |
+| Context Compression (`compress_tool_results=True` / `CompressionManager`) | Native summarization of large tool outputs past a token threshold |
+| `agno.memory` + `agno.db` | Design-token spec and component index, persisted as durable AgentOS-backed session state — same interface whether the backing store is `MongoDb` running against a local `mongod` or against a managed Atlas cluster |
+| `agno.knowledge` + vector DB (LanceDB/Qdrant/pgvector/MongoDB Atlas Vector Search) | Retrieval instead of context-stuffing |
+| **`agno.os.AgentOS`** | Wraps the Workflow in a FastAPI app you host: execution API, sessions, auth, tracing, scheduling |
+
+### 1.2 Deterministic code-analysis tools (zero LLM cost)
+
+tree-sitter (AST chunking), PostCSS/stylelint (CSS + Tailwind token extraction), a rule-based boundary classifier (presentation vs. logic AST nodes → diff mask), an import/dependency-graph check (confirms no backend/service paths are reachable), and `git` (worktree + patch-based diffs, never full-file overwrites).
+
+### 1.3 Validation / QA tools
+
+`tsc --noEmit`, ESLint + Prettier/Biome, `stylelint`, Playwright (headless render + screenshot diff at checkpoints), `axe-core` (WCAG).
+
+### 1.4 Runtime / ops tools
+
+| Tool | Role |
+|---|---|
+| `AgentOS(...).get_app()` served via `uvicorn` (or `agent_os.serve(...)`) | Turns the Workflow into a documented REST + SSE/websocket API with 50+ endpoints, no bespoke serving code |
+| `agno.db.mongo.MongoDb` / `agno.db.mongo.AsyncMongoDb` | Same interface at every tier — a local `mongod` process for solo dev, MongoDB Atlas (or a self-hosted replica set via Docker Compose) once you need parity, multi-user access, or non-blocking I/O under concurrent load |
+| AgentOS Control Plane (os.agno.com, or self-hosted for Enterprise) | Approval queue, session/run monitoring, live tool-call/reasoning timeline, RBAC management |
+| JWT-based RBAC | Separates "can trigger a run" from "can approve a merge" at the runtime layer, not in application code — native to AgentOS, not something you build |
+| Native tracing | Structured logs + execution traces per run, satisfying the audit-log requirement without custom logging |
+| Cron scheduler | Optional — periodic UI/UX audit runs across a repo without an external scheduler |
+| MCP server exposure | The same pipeline callable as an MCP tool from Claude Code, a Slack bot, or a CI system, in addition to REST |
+
+> **Sync vs. async driver.** `MongoDb` uses `pymongo` synchronously. `AsyncMongoDb` supports Motor (legacy) or the newer async PyMongo driver (recommended). This matters once you hit Phase 5 (§9): the Component Refactorer `Team` fans out concurrently in `tasks`/`broadcast` mode, and concurrent agents all writing through a synchronous driver will serialize on it. Start with `MongoDb` for simplicity in Phases 1–4; switch to `AsyncMongoDb` when you parallelize.
+
+### 1.5 Model tiering
+
+Cheap/fast model for indexing, boundary classification, validation retries, and the vagueness gate. Strongest coding/reasoning model reserved for the Design System Agent and the Component Refactor Agent — the only two roles requiring real creative/visual judgment. This mirrors the cost-tiered router pattern already used in DeplAI's remediation agent.
+
+---
+
+## 2. System Architecture
+
+### 2.1 Pipeline stages
+
+| # | Stage | Executor | LLM? |
+|---|---|---|---|
+| 1 | Repo/target scan → AST chunk → component index | Function (tree-sitter) | No |
+| 2 | Design-token extraction from existing code | Function | No |
+| 3 | Vagueness gate | Function | No |
+| 4 | Clarification (style, scope, constraints, references) | Agent, `requires_user_input=True` | Small |
+| 5 | Design-system spec authoring | Agent | Large |
+| 6 | Boundary classification → diff mask | Function, LLM fallback only on ambiguous nodes | Mostly no |
+| 7 | Per-component refactor (patch-only, within mask) | Team (`tasks`/`broadcast` mode) | Large |
+| 8 | Validation (tsc/eslint/stylelint/axe/screenshot) | Function | No |
+| 9 | Bounded retry loop on failure | `Loop` around 7–8 | Large |
+| 10 | Confirmation before write | `@tool(requires_confirmation=True)` | — |
+| 11 | Diff aggregation + PR description | Function + small Agent | Small |
+| 12 | Human approval to merge | `@approval(type="required")` | — |
+
+### 2.2 Agent / Team roster
+
+| Role | Type | Stage(s) | Tools | Model tier |
+|---|---|---|---|---|
+| Clarifier | Agent | 4 | `request_style_clarification` (`requires_user_input=True`) | Small |
+| Design System Author | Agent | 5 | — (reasons over extracted design tokens) | Large |
+| Component Refactorers | Team (`tasks`/`broadcast`) | 7 | `write_patch` (allowlist-enforced inside the tool) | Large |
+| Validator | Function | 8 | tsc, ESLint/Biome, stylelint, Playwright, axe-core | — |
+| Reporter | Small Agent + Function | 11 | diff aggregation, PR description | Small |
+
+Guardrails sit at the two roles that ever touch raw repo content: `PromptInjectionGuardrail` pre-hooks both the Clarifier and the Component Refactorers; `PIIDetectionGuardrail` additionally pre-hooks the Component Refactorers, since that's the only role that reads and writes actual source.
+
+### 2.3 Why Workflow, not just a Team
+
+Workflows give deterministic, auditable control flow — every stage transition, retry, and pause is inspectable and reproducible. Teams handle the agentic coordination inside a single stage (e.g., fanning the Component Refactorers across N components in `tasks` mode), where some model-driven flexibility is actually wanted. Mixing them gets you determinism at the pipeline level and intelligence at the task level, without trading one off against the other.
+
+### 2.4 Deployment — Two Tiers, Same Code
+
+The `db=` argument is the only thing that changes between tiers. Everything above it — the Workflow, the Team, the guardrails, the HITL gates — is identical in every environment. This is a property of `agno.db`'s interface, not something you have to engineer.
+
+#### Tier 0 — Local MongoDB process, no containers (default; use this first)
+
+No container required. One local daemon (`mongod`) alongside AgentOS itself — that's the only change from v3, where nothing besides AgentOS listened on a port at all.
+
+- **DB:** `agno.db.mongo.MongoDb`, pointed at a local `mongod` instance persisting to a data directory (`tmp/mongo-data/`), holding sessions, the component index, the design-token spec, and traces. Default database name is `agno`; override with `db_name` if you want something else.
+- **Run `mongod` directly, no Docker:** install via a package manager (`brew install mongodb-community` on macOS, or the official apt/yum repo on Linux), then:
+  ```bash
+  mongod --dbpath ./tmp/mongo-data --port 27017 --bind_ip 127.0.0.1
+  ```
+  Still "a plain local process" in spirit — just two processes (`mongod` + AgentOS) instead of v3's one.
+- **Vector store:** unchanged from v3 — LanceDB in embedded mode, file-based, no daemon. The retrieval tier doesn't touch Mongo at all unless you deliberately consolidate onto it later (see §10).
+- **Run it:** `python service/agent_os_app.py` inside a plain venv (`uv venv && uv pip install -U 'agno[os]' anthropic pymongo`). No Dockerfile needed to get a working instance.
+- **Connect the Control Plane:** unchanged — os.agno.com → "Add new OS" → "Local" → `http://localhost:7777`. The Control Plane never talks to Mongo directly, only to AgentOS's REST API, so nothing here changes.
+- **Close the telemetry gap:** `AGNO_TELEMETRY=false`, same as before.
+
+This tier still satisfies almost all of §4: no third-party data path, native tracing, JWT-based RBAC middleware, all present in AgentOS itself. What it doesn't give you: a service that survives your laptop sleeping, and — new in this version — durability against a single node failing, since one local `mongod` is a single point of failure for session/trace data the same way a single SQLite file was. That's what Tier 1 is for.
+
+#### Tier 1 — Docker Compose or MongoDB Atlas, for parity and shared use (opt into this when you need it)
+
+Reach for this when any of the following becomes true: you want a Mongo deployment that matches whatever the eventual VPC-internal/Atlas deployment will run, you want the eval fixtures (§8's `eval/`) reproducible across machines, you want to hand the agent to a CI runner or a teammate without "works on my machine," or you want replica-set durability and a vector store (pgvector, Qdrant, or MongoDB Atlas Vector Search) alongside the same box.
+
+Don't hand-roll a Dockerfile. Agno maintains a set of starter templates — `agentos-docker`, `agentos-railway`, `agentos-aws`, `agentos-gcp`, `agentos-azure`, `agentos-fly`, `agentos-render`, `agentos-modal`, `agentos-helm` — identical except for the deploy target. They ship with Postgres as the default `db=` wiring, so fork `agentos-docker-template` (or `agent-infra-docker`), strip the demo agents, drop in this pipeline's `Workflow`, and **swap the Postgres service block for Mongo** (below) rather than reproducing the Compose plumbing yourself.
+
+```yaml
+# docker-compose.yml — sketch; base structure comes from agentos-docker-template, db service swapped
+services:
+  agentos:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      - MONGO_DB_URL=mongodb://agno:agno@mongo:27017
+      - AGNO_TELEMETRY=false
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes: ["./:/app"]          # live-reload during dev
+    depends_on: [mongo]
+  mongo:
+    image: mongo:7
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=agno
+      - MONGO_INITDB_ROOT_PASSWORD=agno
+    volumes: ["mongodata:/data/db"]
+volumes:
+  mongodata:
+```
+
+```bash
+docker compose up -d --build
+# Confirm at http://localhost:8000/docs
+# Control Plane: os.agno.com → Add new OS → Local → http://localhost:8000
+docker compose down          # stop; add -v only if you want to wipe session/trace data
+```
+
+The Control Plane connection flow is the same "Local" path as Tier 0 — Docker changes where the process lives, not how the Control Plane reaches it. The same data-sovereignty guarantee applies.
+
+> **Operational caveat worth confirming before you lock this in:** a standalone `mongod` (which is what the Compose sketch above runs) does not support multi-document transactions — MongoDB requires the server running as a replica set, even a single-node one, for that. Check whether Agno's session/trace writes here ever need cross-collection transactional guarantees before deciding standalone is sufficient; if they do, initialize the container as a one-node replica set (`rs.initiate()`) rather than leaving it standalone.
+
+#### Tier 2 — Production placement
+
+VPC-internal service, self-hosted CI runner, or a specific cloud template (swap `agentos-docker` for `agentos-aws`/`gcp`/`azure`, etc. — same repo shape, different deploy script). For the managed route, MongoDB Atlas plays the role a managed Postgres service (RDS, Cloud SQL) would have played in v3 — same `db_url` swap, no Workflow/Team/guardrail code changes, IP allowlisting or VPC peering instead of a bare open port. The only thing genuinely gated behind an Enterprise plan is the *self-hosted Control Plane UI* itself, for environments that can't reach os.agno.com's static frontend at all. That's a narrow, specific need — it doesn't affect whether the API, RBAC, tracing, or the browser-to-your-instance connection work; those are already fully yours at every tier.
+
+**Multi-run isolation:** the runtime itself is stateless and horizontally scalable; per-session state (which repo, which components, current ledger) lives in the DB, not in process memory, so concurrent runs across different repos or teams don't bleed into each other and you can add replicas under load without redesigning anything.
+
+---
+
+## 3. Memory Management
+
+### 3.1 Two-tier model — AgentOS-backed
+
+**Persistent:** literally AgentOS session/db state, so it survives restarts, deploys, and replica changes — durable whether the backing store is Tier 0's local `mongod` or Tier 1/2's Atlas cluster / replica set, since both implement the same `agno.db` interface.
+- Design-token spec (~1–2K tokens)
+- Component index: `{name, file, line_range, prop_signature_hash, one_line_summary, mask_hash}`
+
+Because AgentOS sessions are durable and can persist for minutes, days, or weeks, a "refactor this whole app" job can span multiple days of human review cycles (approve component 3, come back tomorrow, approve component 4) without losing the index or re-scanning the repo.
+
+**Ephemeral** (per active component only): full masked source discarded the moment its patch validates, replaced by a one-line ledger entry.
+
+### 3.2 Compaction
+
+Lean on Agno's native `compress_tool_results`/`CompressionManager` rather than hand-rolled bookkeeping.
+
+### 3.3 Retrieval over recall
+
+Vector-store lookups, never a broadcast of the whole index.
+
+### 3.4 Rough 256K budget
+
+| Allocation | Tokens |
+|---|---|
+| System/role instructions + design-token spec | ~5–8K |
+| Component index (summaries only) | ~5–15K |
+| Active component's masked source + parent signature | ~2–10K |
+| Task ledger / conversation state | ~2–5K |
+| Headroom for reasoning + output diff | remainder |
+
+### 3.5 Cache invalidation
+
+Keyed by file hash/mtime, queryable from the same db AgentOS already uses for sessions — a local `mongod` locally, Atlas or a replica set once you're on Tier 1.
+
+---
+
+## 4. Zero-Trust Compliance Layer
+
+Sandboxed checkout, mechanical allowlist, guardrails as pre-hooks, least-privilege toolkits, and excluded-by-default secrets/backend paths hold regardless of tier. AgentOS adds an infrastructure-level layer on top of all of it:
+
+- **No third-party data path.** The Control Plane UI is a pure client — your browser talks directly to your AgentOS instance, whether that instance is a laptop process, a Docker container, or a VPC-internal service. Source code, diffs, and traces never transit Agno's servers.
+- **JWT-based RBAC at the runtime — native, not something you build.** Separate roles for "can trigger a refactor run" vs. "can approve a merge" vs. "can view traces," enforced by AgentOS itself via JWT middleware with per-endpoint and per-resource scopes, so a compromised or careless caller can't self-escalate.
+- **Native tracing = the audit log.** Every tool call, reasoning step, and handoff streams into AgentOS's trace store automatically — this satisfies the "audit every read/write" requirement without custom logging code.
+- **Network placement is the real allowlist boundary.** At Tier 0 there's very little to place — no vector-store daemon, and the one daemon that does run (`mongod`) is bound to `127.0.0.1` and never leaves the machine. Unlike v3's single-file SQLite store, this is a real local network surface now, just one that never crosses the loopback interface. At Tier 1/2, deploy inside the same perimeter as the repos it touches (VPC-internal, a self-hosted runner, or Atlas with IP allowlisting/VPC peering); the file-path allowlist tool remains the last line of defense, not the only one.
+- **Telemetry line-item.** `AGNO_TELEMETRY=false` closes the one outbound channel the SDK opens by default (an anonymous per-run ping naming the model provider, nothing about content or code). Set it in every tier.
+- **Managed vs. self-hosted control plane.** The hosted Control Plane at os.agno.com is the default — free for local/dev connections, with a paid Pro tier gating a persistent hosted connection to a *live production* instance. Enterprise adds a self-hosted control plane with custom SSO/RBAC, for environments that can't reach the public internet at all. Check current terms at agno.com/pricing — this determines pricing tier, not whether local or VPC-internal deployment works today.
+
+---
+
+## 5. Clarification-First Flow
+
+The deterministic vagueness gate runs before any agent is invoked, with a fixed question set: style direction, scope, constraints, references. The `requires_user_input` pause isn't something you build a form for — it appears as a pending requirement in the Control Plane, the reviewer answers it there (or via the REST API from your own front-end/Slack bot), and the run resumes automatically once resolved.
+
+---
+
+## 6. "Enterprise, not AI slop" Rubric
+
+Enforced mechanically at three points in the pipeline, not just asserted in an instruction string:
+
+- **Token traceability.** The Design System Agent's own instruction is explicit — every value must trace to a token; nothing shipped by the Component Refactorers should introduce a raw hex code, an arbitrary pixel value, or an ad hoc font size.
+- **Consistency of interactive states.** Hover/focus/active/disabled states follow the same token set as the resting state; no component ships a state that wasn't in the spec.
+- **Accessibility as a gate, not a suggestion.** `axe-core` runs at the validation stage (Stage 8); WCAG violations fail the loop the same way a TypeScript error does, and retry under the same bounded-retry policy (`max_iterations=2`).
+- **Visual regression as a gate.** Playwright screenshot diffs at checkpoints catch layout shifts a linter can't see — this is what keeps "enterprise-level" honest rather than just "passes the linter."
+- **Patch-only, never full-file regen.** As much a quality control as a safety control — it keeps every change reviewable as a diff against the existing (already-token-compliant) code, rather than an agent re-imagining a component from scratch.
+
+---
+
+## 7. Illustrative Skeleton
+
+```python
+import os
+from agno.workflow import Workflow, Step, Loop
+from agno.team import Team
+from agno.team.mode import TeamMode
+from agno.agent import Agent
+from agno.tools import tool
+from agno.guardrails import PromptInjectionGuardrail, PIIDetectionGuardrail
+from agno.os import AgentOS
+
+# --- Tier 0 (default): local MongoDB process, no containers ---
+from agno.db.mongo import MongoDb
+db = MongoDb(
+    db_url=os.environ.get("MONGO_DB_URL", "mongodb://localhost:27017"),
+    db_name="agno",
+)
+
+# --- Tier 1/2 (swap once you're on Docker Compose or Atlas): same interface, nothing else changes ---
+# from agno.db.mongo import AsyncMongoDb   # non-blocking — pairs well with Team fan-out in Phase 5
+# db = AsyncMongoDb(db_url=os.environ["MONGO_DB_URL"], db_name="agno")
+
+# --- deterministic, non-LLM steps ---
+def scan_and_index(step_input):
+    ...  # tree-sitter chunk -> component index, cached by file hash
+
+def classify_boundaries(step_input):
+    ...  # AST rule-matcher -> diff mask per component
+
+@tool(path_allowlist_required=True)
+def write_patch(component_id: str, diff: str) -> str:
+    ...  # hard allowlist check happens INSIDE this tool
+
+@tool(requires_confirmation=True)
+def apply_patch_to_worktree(component_id: str) -> str:
+    ...
+
+@tool(requires_user_input=True)
+def request_style_clarification() -> dict:
+    ...
+
+clarifier = Agent(
+    name="Clarifier",
+    tools=[request_style_clarification],
+    instructions="Never assume a style direction. If scope or style is missing, call the clarification tool.",
+    pre_hooks=[PromptInjectionGuardrail()],
+    db=db,
+)
+
+design_system_agent = Agent(name="DesignSystemAuthor", model=STRONG_MODEL, db=db,
+    instructions="Extend the existing token set. Every value must trace to a token.")
+
+component_refactor_team = Team(
+    name="ComponentRefactorers",
+    mode=TeamMode.tasks,
+    members=[Agent(model=STRONG_MODEL, tools=[write_patch]) for _ in range(BATCH_SIZE)],
+    pre_hooks=[PromptInjectionGuardrail(), PIIDetectionGuardrail()],
+    db=db,
+)
+
+def validate(step_input):
+    ...  # tsc, eslint, stylelint, axe, screenshot diff
+
+pipeline = Workflow(
+    name="UIUXRefactor",
+    db=db,
+    steps=[
+        scan_and_index,
+        Step(name="Clarify", agent=clarifier),
+        Step(name="DesignSpec", agent=design_system_agent),
+        classify_boundaries,
+        Loop(
+            steps=[Step(name="Refactor", team=component_refactor_team), validate],
+            end_condition=lambda outputs: all_passed(outputs),
+            max_iterations=2,
+        ),
+        Step(name="ApplyPatch", agent_or_fn=apply_patch_to_worktree),
+        # PR/@approval step omitted for brevity
+    ],
+)
+
+# --- serve it ---
+agent_os = AgentOS(id="uiux-refactor-agent", workflows=[pipeline], db=db, tracing=True)
+app = agent_os.get_app()
+
+if __name__ == "__main__":
+    agent_os.serve(app="service.agent_os_app:app", port=7777, reload=True)
+```
+
+Trigger a run and resolve a pause from the outside:
+
+```bash
+curl -X POST http://localhost:7777/workflows/uiux-refactor-agent/runs \
+  -F "message=Refactor the Settings module to the enterprise SaaS style" \
+  -F "user_id=aj" -F "session_id=settings-module-run-1"
+
+# -> response has status "paused" with the pending requirement (clarification, confirmation, or approval)
+# resolve it via the Control Plane UI, or:
+curl -X POST http://localhost:7777/workflows/uiux-refactor-agent/runs/{run_id}/continue \
+  -F "tool_call_id={id}" -F "confirmed=true"
+```
+
+The REST surface is identical whether you're on Tier 0 or Tier 1 — only the host/port and the `db=` wiring differ.
+
+---
+
+## 8. Suggested repo layout
+
+```
+uiux-agent/
+  tools/          # tree-sitter chunker, boundary classifier, allowlist wrapper, git patch tool
+  agents/         # clarifier, design_system_agent, component_refactor_agent, validator, reporter
+  workflows/      # the Workflow definition(s)
+  guardrails/     # custom pre/post hooks beyond the built-ins
+  schemas/        # component-capsule schema, token-spec schema
+  service/        # agent_os_app.py — AgentOS wiring, db config, serve entrypoint
+  eval/           # regression fixtures: repos + expected "unsafe" nodes the classifier must never touch
+  docker-compose.yml   # Tier 1 only — forked from agentos-docker-template with the db service swapped for Mongo
+  .env.example         # ANTHROPIC_API_KEY, MONGO_DB_URL (Tier 1+), AGNO_TELEMETRY=false
+```
+
+---
+
+## 9. Phased build order
+
+1. **Deterministic core** — tree-sitter chunker, boundary classifier, allowlist tool, dependency-graph check. Zero LLM; heaviest test coverage.
+2. **Stand up AgentOS on Tier 0 immediately** — a local `mongod` process + `MongoDb` + `agent_os.serve()`, no Docker, while the rest of the pipeline is still being built. Two local processes gets you durable sessions, tracing, and a Control Plane test surface on your own machine on day one.
+3. **Clarification + design-token spec** — Clarifier and Design System Agent, wired to `requires_user_input`; verify the pause/resume shows up correctly in the Control Plane.
+4. **Single-component refactor + validation loop** — prove mask → patch → validate end to end on one component, no parallelism yet.
+5. **Parallelize** — `Team` in `tasks`/`broadcast` mode plus `Loop`/`Parallel` for multi-component runs. Consider switching `MongoDb` → `AsyncMongoDb` here.
+6. **Harden zero-trust** — guardrails, all three HITL gates, RBAC roles in AgentOS (trigger vs. approve vs. view-only), `AGNO_TELEMETRY=false`, confirm tracing captures everything you need for audit.
+7. **Visual QA** — Playwright + axe-core at checkpoints.
+8. **Move to Tier 1 only when something outside solo-local needs it** — shared eval fixtures, Atlas/replica-set parity with the eventual production DB, or handing off to CI. Fork `agentos-docker-template` and swap in the Mongo service rather than authoring a Dockerfile from scratch.
+9. **Production placement** — network location (VPC-internal / self-hosted runner), cloud template choice, managed (Atlas) vs. self-hosted Mongo, managed vs. self-hosted Control Plane, and how external callers (CLI, GitHub Action, Slack) authenticate against the AgentOS REST API.
+
+---
+
+## 10. Open decisions (yours to make, not assumed here)
+
+- Sandbox mechanism: git worktree vs. full container isolation for untrusted third-party repos.
+- Vector DB: **resolved for Tier 0** — LanceDB (embedded, zero daemons). Revisit Qdrant/pgvector/MongoDB Atlas Vector Search only once Tier 1 is already running. Atlas Vector Search is worth a specific look at that point, since it would let session state and retrieval share one cluster instead of two separate systems — at the cost of coupling them operationally.
+- **Resolved:** delivery shape — CLI, GitHub App, and Slack bot are all thin callers of the same AgentOS REST/MCP surface, not separate orchestration implementations, at any tier.
+- **Resolved:** local vs. Docker was never actually an either/or. Tier 0 (a local `mongod` process, no containers) is fully sufficient to build and validate the whole pipeline, including satisfying the zero-trust and audit requirements in §4 — it now involves one local daemon rather than v3's single file, but that daemon never leaves localhost. Docker Compose is additive — for parity, sharing, or CI — not a gate you have to pass through to get AgentOS working.
+- **Resolved this version:** DB backend is `MongoDb`/`AsyncMongoDb` end to end, replacing v3's SQLite/Postgres split. Tier 0 runs a local `mongod`; Tier 1+ runs Atlas or a self-hosted replica set. **Still open:** whether it's shared across target repos or provisioned per-client if this becomes multi-tenant, and whether Tier 1's Mongo needs to run as a replica set (required for multi-document transactions — a standalone `mongod` doesn't support them) or whether this pipeline's write pattern never actually needs cross-collection transactional guarantees.
+- **New in this version:** Tier 0 no longer has a true zero-daemon option — `mongod` has to be running somewhere. Worth deciding whether that's installed as a system service (survives reboots, one less thing to remember to start) or launched manually per session (closer to v3's original zero-footprint spirit, at the cost of remembering to start it).
+- **Still open, lower stakes than it first appeared:** self-hosted Control Plane is an Enterprise/custom-priced feature and only matters if this ever needs to run somewhere with literally no path to os.agno.com's frontend. It doesn't block anything at Tier 0 or Tier 1 — the browser-to-your-instance connection and the "no data leaves your systems" guarantee hold at every tier already.
+- Whether target repos have Storybook — determines visual-regression cost.

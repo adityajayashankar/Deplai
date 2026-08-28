@@ -194,7 +194,7 @@ class RemediationTrackRunner(RunnerBase):
                         f"({snapshot.get('selected_findings', 0)} finding(s) across {snapshot.get('selected_groups', 0)} file group(s))."
                     ),
                 )
-            if snapshot.get("force_claude"):
+            if snapshot.get("force_claude") and str(getattr(self.context, "llm_access_mode", "auto") or "auto").lower() not in {"platform", "byok"}:
                 claude_model = (
                     self.context.llm_model
                     or os.getenv("REMEDIATION_CLAUDE_MODEL", "").strip()
@@ -220,7 +220,9 @@ class RemediationTrackRunner(RunnerBase):
                     llm_provider=self.context.llm_provider,
                     llm_api_key=self.context.llm_api_key,
                     llm_model=self.context.llm_model,
-                    force_claude=bool(snapshot.get("force_claude")),
+                    force_claude=bool(snapshot.get("force_claude")) and str(getattr(self.context, "llm_access_mode", "auto") or "auto").lower() not in {"platform", "byok"},
+                    user_id=getattr(self.context, "user_id", None),
+                    access_mode=getattr(self.context, "llm_access_mode", None),
                 )
             except Exception as exc:
                 return await self._terminate(f"Remediation pipeline execution failed: {type(exc).__name__}: {exc}")
@@ -317,7 +319,7 @@ class RemediationTrackRunner(RunnerBase):
         await self._send_status(StreamStatus.running)
         await self._send_message(
             "success",
-            "Final approval received. Persisting approved remediation changes and running verification.",
+            "Final approval received. Persisting approved remediation changes.",
         )
 
         candidate_fixes = [fix for fix in self._latest_fixes if fix.diff]
@@ -342,13 +344,21 @@ class RemediationTrackRunner(RunnerBase):
                 await self._send_message("success", "Remediation changes persisted locally.")
             except Exception as exc:
                 return await self._terminate(f"Failed to persist local remediation changes: {exc}")
-            return await self._run_verification_rescan()
+            await self._send_message(
+                "success",
+                "Remediation persisted. Verification scan is optional; rerun it from Security Agent after the PR is ready.",
+            )
+            return True
 
         github_token = (self.context.github_token or "").strip()
         repository_url = (self.context.repository_url or "").strip()
         if not github_token or not repository_url:
             await self._send_message("warning", "Missing GitHub token or repository URL. Skipping PR creation.")
-            return await self._run_verification_rescan()
+            await self._send_message(
+                "success",
+                "Remediation persisted. Verification scan is optional; rerun it from Security Agent after the PR is ready.",
+            )
+            return True
 
         try:
             pr = await self._run_step(
@@ -369,7 +379,11 @@ class RemediationTrackRunner(RunnerBase):
         except Exception as exc:
             await self._send_message("warning", f"PR creation failed: {exc}")
 
-        return await self._run_verification_rescan()
+        await self._send_message(
+            "success",
+            "Remediation persisted. Verification scan is optional; rerun it from Security Agent after the PR is ready.",
+        )
+        return True
 
     async def _wait_for_action(self) -> str:
         self._pending_action = None

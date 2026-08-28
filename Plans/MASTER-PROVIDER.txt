@@ -1,0 +1,3235 @@
+# Master Engineering Agent Prompt
+
+## Build a Production-Grade Multi-Provider AI Model Platform with Platform Provisioning + BYOK + Dynamic Model Catalog + Routing + UI/UX
+
+You are the principal engineer/architect responsible for implementing a production-ready **multi-provider AI platform layer** inside our existing application.
+
+Do not build this as seven/eight unrelated API integrations.
+
+Build a **provider-agnostic AI control plane** that supports:
+
+1. Platform-managed provider credentials
+2. Customer BYOK credentials
+3. Dynamic model discovery and lifecycle management
+4. Normalized model metadata
+5. Provider/model routing
+6. Automatic fallback
+7. Usage/cost accounting
+8. Organization-level controls
+9. Secrets management
+10. Provider health monitoring
+11. Model comparison
+12. Model playground
+13. AI provider management UI
+14. BYOK provisioning UI
+15. Routing-policy UI
+16. Audit/observability
+17. Extensible provider adapter architecture
+18. Optional future support for self-hosted/open-weight models
+
+The platform must initially support these providers:
+
+* OpenAI
+* Anthropic
+* MiniMax
+* xAI / Grok
+* Google Gemini
+* Kimi / Moonshot
+* GLM / Z.AI
+* Groq
+
+Do not assume that the list of models is static.
+
+The system must be able to discover, reconcile, activate, deprecate, and retire models from provider APIs/documentation/configuration sources.
+
+---
+
+# 1. PRIMARY PRODUCT OBJECTIVE
+
+Create a unified AI execution platform.
+
+The application must allow a tenant/user to make requests such as:
+
+```text
+model = "best_reasoning"
+```
+
+or:
+
+```text
+model = "best_coding"
+```
+
+or:
+
+```text
+model = "claude-opus-5"
+```
+
+or:
+
+```text
+model = "gpt-5.6-sol"
+```
+
+without exposing provider-specific implementation details to the rest of the application.
+
+The platform determines:
+
+```text
+provider
+model
+credential source
+routing policy
+fallback chain
+quota
+billing source
+regional policy
+security policy
+availability
+```
+
+and executes the request.
+
+---
+
+# 2. CORE ARCHITECTURE
+
+Create the following logical architecture:
+
+```text
+                         ┌───────────────────────────────┐
+                         │         Application UI         │
+                         │                               │
+                         │ Playground                    │
+                         │ Models                        │
+                         │ Providers                     │
+                         │ BYOK                          │
+                         │ Routing                       │
+                         │ Usage                         │
+                         │ Costs                         │
+                         │ Health                        │
+                         └───────────────┬───────────────┘
+                                         │
+                                         ▼
+                         ┌───────────────────────────────┐
+                         │         AI Gateway             │
+                         │                               │
+                         │ Authentication                │
+                         │ Authorization                 │
+                         │ Request normalization         │
+                         │ Policy evaluation             │
+                         │ Model routing                 │
+                         │ Credential resolution         │
+                         │ Rate limiting                 │
+                         │ Retry/fallback                │
+                         │ Usage metering                │
+                         │ Observability                 │
+                         └───────────────┬───────────────┘
+                                         │
+              ┌──────────────────────────┼──────────────────────────┐
+              │                          │                          │
+              ▼                          ▼                          ▼
+       Provider Adapters          Credential Resolver        Routing Engine
+              │                          │                          │
+              ▼                          ▼                          ▼
+       ┌────────────────┐       ┌──────────────────┐      ┌─────────────────┐
+       │ OpenAI         │       │ Platform Key     │      │ Capability      │
+       │ Anthropic      │       │ BYOK             │      │ Cost            │
+       │ MiniMax        │       │ Enterprise Key   │      │ Latency         │
+       │ Grok/xAI       │       │ Future Workload  │      │ Availability    │
+       │ Gemini         │       └──────────────────┘      │ Policy          │
+       │ Kimi           │                                 │ Preference      │
+       │ GLM            │                                 └─────────────────┘
+       │ Groq           │
+       └────────────────┘
+              │
+              ▼
+       Provider APIs / self-hosted endpoints
+```
+
+---
+
+# 3. NON-NEGOTIABLE DESIGN PRINCIPLES
+
+Implement these principles throughout the system.
+
+## 3.1 Provider abstraction
+
+The application must never contain provider-specific API logic scattered throughout business logic.
+
+Bad:
+
+```text
+if provider == "openai":
+    ...
+if provider == "anthropic":
+    ...
+```
+
+inside arbitrary application services.
+
+Good:
+
+```text
+AIProviderRegistry
+      ↓
+AIProviderAdapter
+      ↓
+provider implementation
+```
+
+---
+
+# 3.2 Model abstraction
+
+Never make provider model IDs the application's primary abstraction.
+
+Support:
+
+```text
+best
+best_reasoning
+best_coding
+best_fast
+best_cost
+best_agent
+best_long_context
+best_multimodal
+```
+
+as logical model aliases.
+
+Resolve aliases using routing policies.
+
+---
+
+# 3.3 Credentials are separate from models
+
+A model and credential are separate concepts.
+
+Example:
+
+```text
+model:
+    gpt-5.6-sol
+
+credential:
+    OpenAI platform credential
+
+OR
+
+credential:
+    OpenAI BYOK credential for tenant A
+```
+
+Do not couple these in the database.
+
+---
+
+# 3.4 Tenant isolation
+
+Every object related to customer configuration must be tenant/org scoped.
+
+Examples:
+
+```text
+organization_id
+workspace_id
+credential_id
+routing_policy_id
+usage_record_id
+model_access_policy_id
+```
+
+Never allow cross-tenant credential/model-policy leakage.
+
+---
+
+# 4. PROVIDER REGISTRY
+
+Create:
+
+```text
+ProviderRegistry
+```
+
+Initial provider definitions:
+
+```text
+openai
+anthropic
+minimax
+xai
+gemini
+kimi
+glm
+groq
+```
+
+Provider metadata:
+
+```text
+id
+name
+display_name
+status
+documentation_url
+api_base_url
+supports_platform_credentials
+supports_byok
+supports_model_discovery
+supports_streaming
+supports_tools
+supports_vision
+supports_audio
+supports_embeddings
+supports_batch
+supports_reasoning
+supports_structured_output
+supports_openai_compatibility
+authentication_type
+credential_schema
+```
+
+The registry must be extensible so adding a ninth provider does not require rewriting the gateway.
+
+---
+
+# 5. PROVIDER ADAPTER CONTRACT
+
+Create a common interface.
+
+Example conceptual interface:
+
+```text
+AIProviderAdapter
+
+validate_credentials()
+
+list_models()
+
+get_model()
+
+health_check()
+
+chat()
+
+stream()
+
+responses()
+
+embeddings()
+
+count_tokens()
+
+get_usage()
+
+get_rate_limits()
+
+normalize_error()
+
+normalize_response()
+
+normalize_stream()
+
+get_capabilities()
+```
+
+Do not force unsupported provider features into fake implementations.
+
+Return explicit capability errors.
+
+---
+
+# 6. PROVIDER ADAPTERS TO IMPLEMENT
+
+Create adapters for:
+
+```text
+OpenAIAdapter
+AnthropicAdapter
+MiniMaxAdapter
+XAIAdapter
+GeminiAdapter
+KimiAdapter
+GLMAdapter
+GroqAdapter
+```
+
+Also create:
+
+```text
+OpenAICompatibleAdapter
+```
+
+which can be reused for providers that expose compatible APIs.
+
+Groq should take advantage of its OpenAI-compatible API where possible, while still having a dedicated adapter for Groq-specific functionality and differences. Groq documents an OpenAI-compatible base URL and model listing endpoint.
+
+---
+
+# 7. DYNAMIC MODEL DISCOVERY
+
+Do not rely exclusively on a hardcoded model database.
+
+Build:
+
+```text
+ModelDiscoveryService
+```
+
+Responsibilities:
+
+```text
+discover(provider)
+
+validate(model)
+
+normalize(model)
+
+upsert(model)
+
+detect_changes()
+
+mark_deprecated()
+
+mark_retired()
+
+identify_replacement()
+
+refresh_pricing()
+
+refresh_capabilities()
+```
+
+Schedule background synchronization.
+
+Support:
+
+```text
+manual refresh
+scheduled refresh
+startup refresh
+credential-triggered refresh
+admin forced refresh
+```
+
+---
+
+# 8. MODEL NORMALIZATION
+
+Create canonical model schema:
+
+```text
+Model
+├── id
+├── provider_id
+├── provider_model_id
+├── display_name
+├── family
+├── version
+├── aliases
+├── status
+├── lifecycle
+├── release_date
+├── deprecation_date
+├── retirement_date
+├── replacement_model_id
+├── context_window
+├── max_output_tokens
+├── capabilities
+│   ├── reasoning
+│   ├── coding
+│   ├── agents
+│   ├── tools
+│   ├── vision
+│   ├── audio
+│   ├── embeddings
+│   ├── structured_output
+│   ├── streaming
+│   ├── batch
+│   └── multimodal
+├── latency_profile
+├── pricing
+├── region_support
+├── compliance_tags
+├── metadata
+├── discovered_at
+├── updated_at
+```
+
+---
+
+# 9. MODEL LIFECYCLE
+
+Every model must have lifecycle status.
+
+Support:
+
+```text
+DISCOVERED
+PREVIEW
+ACTIVE
+DEPRECATED
+SUNSET_PENDING
+RETIRED
+UNAVAILABLE
+```
+
+When a provider reports that a model is no longer available:
+
+Do not immediately delete it.
+
+Transition:
+
+```text
+ACTIVE
+   ↓
+DEPRECATED
+   ↓
+SUNSET_PENDING
+   ↓
+RETIRED
+```
+
+Support:
+
+```text
+replacement_model_id
+```
+
+so workflows can automatically migrate.
+
+This is especially important because provider model inventories can change rapidly.
+
+---
+
+# 10. INITIAL MODEL SEED DATA
+
+Seed the catalog using the current provider catalogs at implementation time.
+
+Do NOT consider this seed data authoritative forever.
+
+Use discovery/synchronization afterward.
+
+Current provider families to seed include:
+
+### OpenAI
+
+Prioritize current GPT-5.6 family and other currently active production models.
+
+OpenAI currently documents:
+
+```text
+GPT-5.6 Sol
+GPT-5.6 Terra
+GPT-5.6 Luna
+GPT-5.5
+GPT-5.4
+GPT-5.4 Mini
+GPT-5.4 nano
+GPT-5.3-Codex
+```
+
+and specialized model families including cybersecurity, realtime, audio, image and embeddings.
+
+Do not hardcode only those names; use the live model catalog.
+
+---
+
+### Anthropic
+
+Seed currently active Claude 5.x/4.x families discovered from official Anthropic model information.
+
+Support:
+
+```text
+Claude Opus
+Claude Sonnet
+Claude Haiku
+```
+
+as families/capability groups where appropriate.
+
+---
+
+### MiniMax
+
+Seed the latest active MiniMax models returned by the official API/catalog.
+
+Prioritize models appropriate for:
+
+```text
+reasoning
+coding
+agents
+long-context
+multimodal
+```
+
+---
+
+### xAI / Grok
+
+Seed currently active Grok models.
+
+Use live model discovery and lifecycle handling because xAI model availability changes.
+
+---
+
+### Gemini
+
+Seed active Gemini production models.
+
+Maintain capability classification for:
+
+```text
+reasoning
+coding
+agents
+multimodal
+long-context
+fast/high-volume
+```
+
+---
+
+### Kimi
+
+Seed currently active Kimi production models.
+
+Handle deprecated/sunset models independently.
+
+Never select retired Kimi models during routing.
+
+---
+
+### GLM / Z.AI
+
+Seed active GLM production models.
+
+Support:
+
+```text
+reasoning
+coding
+agentic
+long-context
+multimodal
+```
+
+---
+
+### Groq
+
+Treat Groq as both:
+
+```text
+provider
++
+inference platform
+```
+
+because Groq hosts multiple model families.
+
+Model discovery must call the appropriate Groq model catalog endpoint rather than assuming a fixed list.
+
+Groq provides:
+
+```text
+GET /openai/v1/models
+```
+
+for available models.
+
+Do not assume every model hosted by Groq is owned by Groq.
+
+The canonical record should separately track:
+
+```text
+provider = groq
+model_owner = meta / qwen / openai / other
+```
+
+where available.
+
+---
+
+# 11. MODEL CAPABILITY TAXONOMY
+
+Create a normalized capability system.
+
+Capabilities:
+
+```text
+reasoning
+coding
+agentic
+tool_calling
+structured_output
+vision
+audio_input
+audio_output
+image_generation
+long_context
+web_search
+computer_use
+batch
+streaming
+embeddings
+reranking
+function_calling
+```
+
+Capability confidence:
+
+```text
+provider_declared
+platform_verified
+benchmark_verified
+inferred
+unknown
+```
+
+Never silently infer important capabilities without labeling the source.
+
+---
+
+# 12. LOGICAL MODEL ALIASES
+
+Implement:
+
+```text
+best
+best_reasoning
+best_coding
+best_agent
+best_fast
+best_cost
+best_long_context
+best_multimodal
+best_vision
+best_structured_output
+```
+
+Aliases must resolve dynamically.
+
+Example:
+
+```text
+best_coding
+    ↓
+routing engine
+    ↓
+eligible models
+    ↓
+rank
+    ↓
+selected model
+```
+
+---
+
+# 13. CREDENTIAL SYSTEM
+
+Implement a first-class:
+
+```text
+CredentialService
+```
+
+Credential types:
+
+```text
+PLATFORM
+BYOK
+ENTERPRISE
+SELF_HOSTED
+```
+
+Credential states:
+
+```text
+PENDING
+VALID
+INVALID
+EXPIRED
+REVOKED
+RATE_LIMITED
+QUOTA_EXCEEDED
+ERROR
+```
+
+---
+
+# 14. PLATFORM-MANAGED CREDENTIALS
+
+Platform credentials are managed centrally.
+
+Architecture:
+
+```text
+Application
+    ↓
+Credential Resolver
+    ↓
+Secret Reference
+    ↓
+Vault / Secret Manager
+    ↓
+Provider API
+```
+
+Do not store raw platform provider API keys in normal application tables.
+
+---
+
+# 15. BYOK
+
+BYOK is a mandatory first-class capability.
+
+Provider support:
+
+```text
+OpenAI
+Anthropic
+MiniMax
+xAI
+Gemini
+Kimi
+GLM
+Groq
+```
+
+A tenant should be able to add multiple credentials per provider.
+
+Example:
+
+```text
+OpenAI
+
+Production Key
+Development Key
+Security Team Key
+```
+
+Support credential metadata:
+
+```text
+credential_id
+organization_id
+provider_id
+name
+secret_reference
+status
+created_by
+created_at
+last_validated_at
+last_used_at
+expires_at
+environment
+scope
+```
+
+---
+
+# 16. BYOK SECRET SECURITY
+
+Never return raw API keys to the frontend after save.
+
+Requirements:
+
+```text
+encryption at rest
+KMS-backed encryption
+secret vault
+RBAC
+tenant isolation
+audit logs
+secret redaction
+no secret logging
+credential rotation
+credential revoke
+credential validation
+```
+
+Frontend should only receive:
+
+```text
+********abcd
+```
+
+or equivalent masked representation.
+
+---
+
+# 17. CREDENTIAL VALIDATION
+
+When the user adds a key:
+
+```text
+POST /credentials
+       ↓
+validate
+       ↓
+provider health check
+       ↓
+discover models
+       ↓
+persist metadata
+```
+
+UI must show:
+
+```text
+✓ Credential valid
+✓ Provider reachable
+✓ Models discovered
+✓ N models available
+```
+
+On failure:
+
+```text
+✕ Authentication failed
+```
+
+or:
+
+```text
+✕ Provider unavailable
+```
+
+Never expose upstream secrets or raw error payloads.
+
+---
+
+# 18. ACCESS MODE
+
+Support request-level and organization-level access modes:
+
+```text
+PLATFORM
+BYOK
+AUTO
+```
+
+Behavior:
+
+### PLATFORM
+
+Use only platform-managed credentials.
+
+### BYOK
+
+Use only customer credentials.
+
+### AUTO
+
+Prefer BYOK when available, otherwise platform-managed credentials.
+
+Make this configurable.
+
+---
+
+# 19. ORGANIZATION POLICY
+
+Admins must be able to configure:
+
+```text
+Allowed providers
+Allowed models
+Allowed credential modes
+BYOK required
+Platform credentials allowed
+Fallback allowed
+Cross-provider fallback allowed
+Maximum token limits
+Maximum monthly spend
+Maximum request cost
+Allowed regions
+Compliance restrictions
+```
+
+Example:
+
+```text
+Security Team
+
+Allowed:
+OpenAI
+Anthropic
+Gemini
+GLM
+
+BYOK:
+Required
+
+Cross-provider fallback:
+Disabled
+```
+
+---
+
+# 20. ROUTING ENGINE
+
+Implement:
+
+```text
+AIRoutingEngine
+```
+
+Routing inputs:
+
+```text
+requested_model
+model_alias
+capabilities
+organization_policy
+credential availability
+provider health
+cost
+latency
+region
+quota
+rate limits
+user preference
+task type
+```
+
+Routing score:
+
+```text
+score =
+    capability_score
+  + reliability_score
+  + policy_score
+  + credential_score
+  + latency_score
+  + cost_score
+  + preference_score
+```
+
+Make weights configurable.
+
+---
+
+# 21. ROUTING EXAMPLE
+
+Input:
+
+```json
+{
+  "model": "best_coding",
+  "access_mode": "auto"
+}
+```
+
+Resolver:
+
+```text
+best_coding
+    ↓
+candidate model set
+    ↓
+policy filter
+    ↓
+credential filter
+    ↓
+availability filter
+    ↓
+health filter
+    ↓
+cost/latency ranking
+    ↓
+winner
+```
+
+---
+
+# 22. FALLBACK ENGINE
+
+Support:
+
+```text
+primary
+fallback_1
+fallback_2
+fallback_3
+```
+
+Fallback triggers:
+
+```text
+timeout
+429
+provider outage
+quota exceeded
+temporary provider failure
+model unavailable
+```
+
+Do not fallback on:
+
+```text
+invalid user input
+policy denial
+security rejection
+invalid credentials in BYOK-only mode
+```
+
+unless policy explicitly allows it.
+
+---
+
+# 23. BYOK FALLBACK RULES
+
+Support:
+
+```text
+BYOK ONLY
+PLATFORM ONLY
+BYOK → PLATFORM
+PLATFORM → BYOK
+NO CROSS-PROVIDER FALLBACK
+CROSS-PROVIDER FALLBACK
+```
+
+These must be explicit policies.
+
+Never silently use a different provider when the organization forbids it.
+
+---
+
+# 24. REQUEST NORMALIZATION
+
+Expose a platform-standard request contract.
+
+Example:
+
+```json
+{
+  "model": "best_reasoning",
+  "messages": [],
+  "access_mode": "auto",
+  "routing_policy": "default",
+  "stream": true,
+  "temperature": 0.2,
+  "tools": [],
+  "metadata": {}
+}
+```
+
+Convert this normalized contract into the provider-specific request.
+
+---
+
+# 25. RESPONSE NORMALIZATION
+
+Normalize:
+
+```text
+text
+tool calls
+reasoning metadata where permitted
+usage
+finish reason
+citations where available
+provider request ID
+model
+timings
+errors
+```
+
+Return provider-independent response metadata.
+
+Example:
+
+```json
+{
+  "model": "gpt-5.6-sol",
+  "provider": "openai",
+  "credential_source": "byok",
+  "output": "...",
+  "usage": {
+    "input_tokens": 100,
+    "output_tokens": 500,
+    "total_tokens": 600
+  },
+  "latency_ms": 1450
+}
+```
+
+---
+
+# 26. STREAMING
+
+Implement streaming across providers.
+
+Normalize events:
+
+```text
+stream.started
+output.delta
+tool_call.started
+tool_call.delta
+tool_call.completed
+stream.completed
+stream.error
+```
+
+Provider adapters translate provider-specific streams into the canonical event format.
+
+---
+
+# 27. OBSERVABILITY
+
+Every model request must produce a trace.
+
+Capture:
+
+```text
+request_id
+organization_id
+workspace_id
+user_id
+provider
+model
+credential_source
+routing_policy
+latency
+time_to_first_token
+input_tokens
+output_tokens
+cached_tokens
+reasoning_tokens where available
+estimated_cost
+actual_cost when available
+status
+error_code
+retry_count
+fallback_count
+```
+
+Do not capture raw secrets.
+
+Apply configurable prompt/output logging policies.
+
+---
+
+# 28. USAGE METERING
+
+Create:
+
+```text
+UsageMeteringService
+```
+
+Usage dimensions:
+
+```text
+requests
+input tokens
+output tokens
+cached tokens
+reasoning tokens
+tool calls
+audio duration
+image units
+batch units
+```
+
+Use provider-native usage where available.
+
+Mark estimated usage when provider data is unavailable.
+
+---
+
+# 29. BILLING
+
+Separate:
+
+```text
+provider_cost
+platform_cost
+customer_charge
+```
+
+and:
+
+```text
+billing_source:
+    platform
+    byok
+```
+
+For BYOK:
+
+```text
+provider_cost = customer provider account
+
+platform_cost = your platform fee
+```
+
+For platform-managed:
+
+```text
+provider_cost = your cost
+customer_charge = provider_cost + platform margin/plan logic
+```
+
+Never mix these accounting models.
+
+---
+
+# 30. COST ESTIMATION
+
+Before execution where practical:
+
+```text
+estimated_input_cost
+estimated_output_cost
+estimated_total_cost
+```
+
+After execution:
+
+```text
+actual_input_cost
+actual_output_cost
+actual_total_cost
+```
+
+Display:
+
+```text
+estimated
+actual
+```
+
+separately.
+
+---
+
+# 31. RATE LIMITING
+
+Implement layered rate limiting:
+
+```text
+platform
+organization
+workspace
+user
+provider
+credential
+model
+```
+
+Handle provider-specific:
+
+```text
+RPM
+TPM
+RPD
+concurrency
+quota
+```
+
+when exposed.
+
+---
+
+# 32. PROVIDER HEALTH MONITORING
+
+Implement:
+
+```text
+ProviderHealthService
+```
+
+Track:
+
+```text
+availability
+latency
+error_rate
+429_rate
+timeout_rate
+quota
+model availability
+```
+
+Expose:
+
+```text
+Healthy
+Degraded
+Unavailable
+Unknown
+```
+
+The routing engine must consume health data.
+
+---
+
+# 33. MODEL HEALTH
+
+A provider may be healthy while a specific model is unavailable.
+
+Support:
+
+```text
+provider health
+model health
+credential health
+```
+
+independently.
+
+Example:
+
+```text
+OpenAI
+  Provider: Healthy
+
+GPT-5.6 Sol:
+  Healthy
+
+GPT-X:
+  Unavailable
+```
+
+---
+
+# 34. MODEL COMPARISON ENGINE
+
+Implement a canonical model comparison structure.
+
+Compare:
+
+```text
+Capability
+Reasoning
+Coding
+Agentic performance
+Latency
+Cost
+Context window
+Output limit
+Tool support
+Vision
+Structured output
+Availability
+BYOK support
+Platform support
+```
+
+Do not manufacture benchmark numbers.
+
+Only display:
+
+```text
+provider reported
+platform measured
+benchmark measured
+unknown
+```
+
+---
+
+# 35. PLAYGROUND
+
+Create a provider-neutral playground.
+
+Features:
+
+```text
+model selector
+provider selector
+access mode
+BYOK/platform indicator
+system prompt
+user prompt
+temperature
+reasoning effort where supported
+tools
+structured output
+streaming
+token usage
+latency
+cost
+response comparison
+```
+
+Support side-by-side:
+
+```text
+Model A | Model B | Model C
+```
+
+Example:
+
+```text
+Claude
+GPT
+Grok
+```
+
+---
+
+# 36. UI/UX — INFORMATION ARCHITECTURE
+
+Add an **AI Platform** section.
+
+Navigation:
+
+```text
+AI Platform
+│
+├── Overview
+├── Playground
+├── Models
+│   ├── All Models
+│   ├── Recommended
+│   ├── Reasoning
+│   ├── Coding
+│   ├── Agents
+│   ├── Multimodal
+│   └── Fast / Cost Efficient
+│
+├── Providers
+│   ├── OpenAI
+│   ├── Anthropic
+│   ├── MiniMax
+│   ├── Grok
+│   ├── Gemini
+│   ├── Kimi
+│   ├── GLM
+│   └── Groq
+│
+├── Credentials
+│   ├── Platform
+│   └── BYOK
+│
+├── Routing
+├── Policies
+├── Usage
+├── Costs
+├── Health
+└── Audit
+```
+
+---
+
+# 37. UI/UX — PROVIDER CARD
+
+Each provider should have a card:
+
+```text
+┌──────────────────────────────────┐
+│ OpenAI                           │
+│ ● Healthy                        │
+│                                  │
+│ Platform Access      ✓          │
+│ BYOK                  ✓          │
+│                                  │
+│ Models              24           │
+│ Active               18           │
+│                                  │
+│ [Manage] [Add BYOK]              │
+└──────────────────────────────────┘
+```
+
+Do the same for all providers, including Groq.
+
+---
+
+# 38. UI/UX — MODEL CARD
+
+Example:
+
+```text
+┌────────────────────────────────────────┐
+│ GPT-5.6 Sol                            │
+│ OpenAI                                 │
+│                                        │
+│ Reasoning     ██████████               │
+│ Coding        ██████████               │
+│ Agents        ██████████               │
+│ Speed         ███████                  │
+│ Cost          $$$                      │
+│                                        │
+│ Context: 1.05M                         │
+│ Tools: ✓                               │
+│ Vision: ✓                              │
+│ Streaming: ✓                           │
+│                                        │
+│ Access: Platform ✓ | BYOK ✓           │
+│                                        │
+│ [Try] [Compare] [Configure Routing]   │
+└────────────────────────────────────────┘
+```
+
+Do not present generated/inferred performance scores as objective facts unless their source is explicitly shown.
+
+---
+
+# 39. UI/UX — ADD BYOK FLOW
+
+Create a guided wizard:
+
+```text
+Step 1
+Select provider
+
+Step 2
+Enter API key
+
+Step 3
+Validate
+
+Step 4
+Discover models
+
+Step 5
+Select allowed models
+
+Step 6
+Configure usage/policy
+
+Step 7
+Complete
+```
+
+Example:
+
+```text
+Connect Groq
+
+Provider
+Groq
+
+Authentication
+(•) Bring Your Own Key
+
+API Key
+[********************]
+
+[Validate]
+
+✓ Key valid
+
+Models discovered:
+12
+
+[Continue]
+```
+
+---
+
+# 40. UI/UX — CREDENTIAL DETAILS
+
+Never show raw secrets.
+
+Display:
+
+```text
+Groq Production Key
+
+Status:
+● Valid
+
+Created:
+26 Aug 2026
+
+Last validated:
+26 Aug 2026
+
+Last used:
+26 Aug 2026
+
+Allowed models:
+8
+
+Environment:
+Production
+```
+
+Actions:
+
+```text
+Validate
+Rename
+Restrict
+Rotate
+Revoke
+Delete
+```
+
+---
+
+# 41. UI/UX — ROUTING BUILDER
+
+Create a visual policy builder.
+
+Example:
+
+```text
+Routing Policy: Security Analysis
+
+Task Type:
+[Security]
+
+Primary:
+[Best Reasoning]
+
+Access:
+[BYOK preferred]
+
+Priority:
+[Capability ▼]
+
+Secondary:
+[Best Coding]
+
+Fallback:
+[GLM-5.3]
+
+Provider Restrictions:
+☑ OpenAI
+☑ Anthropic
+☑ Gemini
+☑ GLM
+☐ Groq
+```
+
+Support advanced mode:
+
+```text
+Capability 40%
+Reliability 25%
+Cost 15%
+Latency 10%
+Preference 10%
+```
+
+---
+
+# 42. UI/UX — HEALTH DASHBOARD
+
+Show:
+
+```text
+OpenAI       ● Healthy
+Anthropic    ● Healthy
+MiniMax      ● Healthy
+Grok         ● Healthy
+Gemini       ● Healthy
+Kimi         ● Healthy
+GLM          ● Healthy
+Groq         ● Healthy
+```
+
+Click provider:
+
+```text
+Latency
+Error Rate
+429 Rate
+Models
+Quota
+Recent Failures
+```
+
+---
+
+# 43. UI/UX — MODEL DISCOVERY
+
+Admin UI:
+
+```text
+Last sync:
+26 Aug 2026 20:10
+
+Providers:
+8
+
+Models discovered:
+N
+
+New models:
+4
+
+Deprecated:
+2
+
+Retired:
+1
+
+[Sync All]
+```
+
+Per provider:
+
+```text
+[Sync Models]
+```
+
+---
+
+# 44. UI/UX — MODEL LIFECYCLE
+
+For deprecated models:
+
+```text
+⚠ Deprecated
+
+This model will be retired on:
+DATE
+
+Recommended replacement:
+MODEL
+
+[Switch Workflows]
+[Ignore]
+```
+
+Do not delete historical usage records.
+
+---
+
+# 45. UI/UX — MODEL SELECTION
+
+Provide:
+
+```text
+Model
+[ Best Reasoning ▼ ]
+```
+
+Advanced selector:
+
+```text
+Provider
+[ Any Provider ▼ ]
+
+Access
+[ Auto ▼ ]
+
+Capability
+[ Reasoning ▼ ]
+
+Cost
+[$$]
+
+Context
+[1M+]
+
+Latency
+[Fast]
+```
+
+---
+
+# 46. API ENDPOINTS
+
+Implement provider-neutral APIs.
+
+Examples:
+
+```text
+GET    /api/v1/ai/providers
+GET    /api/v1/ai/models
+GET    /api/v1/ai/models/:id
+
+POST   /api/v1/ai/chat
+POST   /api/v1/ai/responses
+POST   /api/v1/ai/embeddings
+
+GET    /api/v1/ai/credentials
+POST   /api/v1/ai/credentials
+POST   /api/v1/ai/credentials/:id/validate
+DELETE /api/v1/ai/credentials/:id
+
+GET    /api/v1/ai/routing-policies
+POST   /api/v1/ai/routing-policies
+PUT    /api/v1/ai/routing-policies/:id
+
+GET    /api/v1/ai/usage
+GET    /api/v1/ai/costs
+GET    /api/v1/ai/health
+
+POST   /api/v1/ai/models/sync
+```
+
+Adapt naming to the existing application's API conventions instead of blindly introducing new conventions.
+
+---
+
+# 47. DATABASE DESIGN
+
+Create migrations for entities approximately equivalent to:
+
+```text
+ai_providers
+
+ai_provider_credentials
+
+ai_models
+
+ai_model_aliases
+
+ai_model_capabilities
+
+ai_model_prices
+
+ai_model_lifecycle
+
+ai_routing_policies
+
+ai_routing_rules
+
+ai_organization_policies
+
+ai_usage
+
+ai_costs
+
+ai_request_logs
+
+ai_provider_health
+
+ai_model_health
+
+ai_audit_events
+```
+
+Every tenant-scoped object must be tenant-safe.
+
+---
+
+# 48. AUDIT LOGGING
+
+Audit:
+
+```text
+credential_created
+credential_updated
+credential_validated
+credential_rotated
+credential_revoked
+credential_deleted
+
+routing_policy_created
+routing_policy_updated
+
+model_enabled
+model_disabled
+model_deprecated
+model_retired
+
+provider_enabled
+provider_disabled
+```
+
+Record:
+
+```text
+actor
+tenant
+timestamp
+resource
+action
+result
+metadata
+```
+
+Never log raw credentials.
+
+---
+
+# 49. SECURITY CONTROLS
+
+Apply:
+
+```text
+RBAC
+ABAC where appropriate
+tenant isolation
+secret vaulting
+KMS
+audit logging
+rate limiting
+provider allowlists
+model allowlists
+credential scopes
+network restrictions
+egress controls
+secret redaction
+request-size limits
+response-size limits
+cost limits
+```
+
+Build security policy enforcement before provider execution, not afterward.
+
+---
+
+# 50. FAILURE HANDLING
+
+Normalize provider errors.
+
+Canonical categories:
+
+```text
+AUTHENTICATION_ERROR
+AUTHORIZATION_ERROR
+RATE_LIMIT
+QUOTA_EXCEEDED
+MODEL_NOT_FOUND
+PROVIDER_UNAVAILABLE
+TIMEOUT
+INVALID_REQUEST
+CONTENT_POLICY
+CONTEXT_LIMIT
+TOKEN_LIMIT
+UNKNOWN_PROVIDER_ERROR
+```
+
+Map provider-specific errors into these categories.
+
+Keep original provider error metadata separately for debugging but sanitize sensitive information.
+
+---
+
+# 51. RETRY POLICY
+
+Implement exponential backoff with jitter for retry-safe failures.
+
+Retry only when appropriate.
+
+Default retryable:
+
+```text
+429
+5xx
+temporary network errors
+timeouts where safe
+```
+
+Do not automatically retry:
+
+```text
+400
+401
+403
+invalid model
+invalid request
+policy violation
+```
+
+Prevent duplicate billing/execution for non-idempotent operations.
+
+---
+
+# 52. REQUEST ID / TRACE ID
+
+Every request gets:
+
+```text
+request_id
+trace_id
+provider_request_id
+```
+
+Expose only safe identifiers to frontend/API consumers.
+
+This is mandatory for debugging provider routing/fallback behavior.
+
+---
+
+# 53. ROUTING EXPLANATION
+
+The platform should optionally explain why a model was selected.
+
+Example:
+
+```text
+Selected:
+Claude Opus 5
+
+Reason:
+
+✓ Matches reasoning requirement
+✓ BYOK credential available
+✓ Provider healthy
+✓ Within organization policy
+✓ Lowest expected latency among eligible frontier models
+```
+
+Do not expose internal secrets or proprietary scoring formulas beyond what is appropriate.
+
+---
+
+# 54. "WHY NOT THIS MODEL?" SUPPORT
+
+For debugging and admin interfaces:
+
+```text
+GPT model skipped because:
+✕ BYOK unavailable
+
+Grok skipped because:
+✕ Organization policy blocks provider
+
+Kimi skipped because:
+✕ Model retired
+```
+
+This will significantly improve operator usability.
+
+---
+
+# 55. BENCHMARKING
+
+Create an optional model evaluation subsystem.
+
+Test models against internal workloads:
+
+```text
+coding
+reasoning
+security analysis
+summarization
+structured extraction
+agent tool calling
+long context
+```
+
+Store:
+
+```text
+benchmark_id
+model
+provider
+prompt_version
+score
+latency
+cost
+timestamp
+```
+
+Never overwrite previous benchmark history.
+
+---
+
+# 56. INTEGRATION WITH OUR SECURITY PLATFORM
+
+The AI platform must be callable from the security pipeline.
+
+Wire the AI gateway into workflows such as:
+
+```text
+Repository
+   ↓
+Semgrep
+   ↓
+SAST findings
+   ↓
+Syft
+   ↓
+SBOM
+   ↓
+Grype
+   ↓
+Vulnerability findings
+   ↓
+AI Analysis
+   ↓
+Risk prioritization
+   ↓
+Remediation suggestions
+   ↓
+Developer-facing explanation
+```
+
+Do not allow security jobs to directly invoke provider SDKs.
+
+They must call:
+
+```text
+AI Gateway
+```
+
+Example:
+
+```text
+POST /api/v1/ai/chat
+
+model:
+best_reasoning
+
+task:
+security_analysis
+
+access_mode:
+organization-policy
+```
+
+---
+
+# 57. SECURITY-SPECIFIC ROUTING
+
+Create a routing profile:
+
+```text
+security_analysis
+```
+
+Potential characteristics:
+
+```text
+high reasoning
+high coding
+tool calling
+structured output
+large context
+low tolerance for hallucination
+strict output schema
+```
+
+Support models appropriate to this policy.
+
+Do not hardcode a permanent model.
+
+---
+
+# 58. SECURITY OUTPUT SCHEMAS
+
+For security workflows provide structured response modes.
+
+Example:
+
+```json
+{
+  "finding_id": "123",
+  "severity": "high",
+  "confidence": 0.91,
+  "root_cause": "...",
+  "exploitability": "...",
+  "impact": "...",
+  "recommended_fix": "...",
+  "patch": "...",
+  "references": []
+}
+```
+
+The AI response layer must validate against the schema.
+
+---
+
+# 59. SELF-HOSTED / OPEN-WEIGHT EXTENSION
+
+Design now for future:
+
+```text
+provider_type =
+    managed_api
+    byok
+    self_hosted
+```
+
+Potential architecture:
+
+```text
+SelfHostedProviderAdapter
+
+endpoint
+authentication
+model
+health
+capacity
+GPU resources
+```
+
+This will let the platform eventually use open-weight models through infrastructure such as:
+
+```text
+vLLM
+SGLang
+other compatible inference servers
+```
+
+without changing the application-level AI API.
+
+---
+
+# 60. PLUGIN/ADAPTER REGISTRATION
+
+Adding a new provider should require approximately:
+
+```text
+1. Provider adapter
+2. Provider metadata
+3. Credential schema
+4. Model discovery strategy
+5. Capability normalization
+6. Error normalization
+7. Provider tests
+```
+
+It must not require changes throughout the core AI gateway.
+
+---
+
+# 61. CONFIGURATION
+
+Support environment/configuration such as:
+
+```text
+AI_PLATFORM_ENABLED
+
+AI_PROVIDER_OPENAI_ENABLED
+AI_PROVIDER_ANTHROPIC_ENABLED
+AI_PROVIDER_MINIMAX_ENABLED
+AI_PROVIDER_XAI_ENABLED
+AI_PROVIDER_GEMINI_ENABLED
+AI_PROVIDER_KIMI_ENABLED
+AI_PROVIDER_GLM_ENABLED
+AI_PROVIDER_GROQ_ENABLED
+
+AI_MODEL_SYNC_ENABLED
+AI_MODEL_SYNC_INTERVAL
+AI_DEFAULT_ROUTING_POLICY
+AI_DEFAULT_ACCESS_MODE
+
+AI_MAX_REQUEST_COST
+AI_MAX_CONTEXT
+AI_ENABLE_CROSS_PROVIDER_FALLBACK
+```
+
+Use the application's existing configuration system.
+
+Do not create a second configuration framework.
+
+---
+
+# 62. FEATURE FLAGS
+
+Use feature flags for rollout:
+
+```text
+ai_platform
+ai_byok
+ai_dynamic_models
+ai_routing
+ai_fallback
+ai_playground
+ai_benchmarking
+ai_self_hosted
+```
+
+---
+
+# 63. ADMIN OVERRIDES
+
+Administrators must be able to:
+
+```text
+disable provider
+disable model
+disable BYOK
+force platform-only
+force BYOK-only
+set global provider priority
+set emergency fallback
+set spending limits
+```
+
+---
+
+# 64. TESTING STRATEGY
+
+Implement:
+
+## Unit tests
+
+Provider adapters:
+
+```text
+credential validation
+model discovery
+request conversion
+response conversion
+streaming conversion
+error normalization
+```
+
+## Integration tests
+
+Test actual provider integrations using test credentials.
+
+## Contract tests
+
+Ensure every adapter satisfies the canonical provider interface.
+
+## Routing tests
+
+Test:
+
+```text
+primary selection
+fallback
+BYOK selection
+policy filtering
+cost routing
+health filtering
+model lifecycle handling
+```
+
+## Security tests
+
+Verify:
+
+```text
+tenant isolation
+credential redaction
+RBAC
+unauthorized credential access
+audit events
+```
+
+## UI tests
+
+Test:
+
+```text
+provider setup
+BYOK wizard
+model selection
+routing builder
+playground
+credential management
+health dashboard
+```
+
+---
+
+# 65. OBSERVABILITY DASHBOARD
+
+Create metrics:
+
+```text
+ai_requests_total
+
+ai_request_failures_total
+
+ai_provider_requests_total
+
+ai_provider_errors_total
+
+ai_model_requests_total
+
+ai_fallback_total
+
+ai_retry_total
+
+ai_byoK_requests_total
+
+ai_platform_requests_total
+
+ai_tokens_input_total
+
+ai_tokens_output_total
+
+ai_cost_total
+
+ai_latency_ms
+
+ai_ttft_ms
+```
+
+Tag metrics carefully to prevent uncontrolled cardinality.
+
+---
+
+# 66. SECURITY AND PRIVACY
+
+Support configuration for:
+
+```text
+prompt logging
+response logging
+PII redaction
+sensitive data redaction
+retention
+data residency
+provider restrictions
+```
+
+Organization policy must be able to forbid routing specific data classes to selected providers.
+
+---
+
+# 67. DATA FLOW FOR PLATFORM MODE
+
+Implement:
+
+```text
+User
+ ↓
+Application
+ ↓
+AI Gateway
+ ↓
+Policy Engine
+ ↓
+Routing Engine
+ ↓
+Credential Resolver
+ ↓
+Platform Secret Vault
+ ↓
+Provider Adapter
+ ↓
+Provider API
+ ↓
+Normalized Response
+ ↓
+Usage Metering
+ ↓
+Audit/Observability
+ ↓
+Application
+```
+
+---
+
+# 68. DATA FLOW FOR BYOK
+
+Implement:
+
+```text
+User
+ ↓
+Application
+ ↓
+AI Gateway
+ ↓
+Policy Engine
+ ↓
+Routing Engine
+ ↓
+Credential Resolver
+ ↓
+Tenant BYOK Secret
+ ↓
+Provider Adapter
+ ↓
+Provider API
+ ↓
+Normalized Response
+ ↓
+Usage Metering
+ ↓
+Audit/Observability
+ ↓
+Application
+```
+
+The platform must know which credential source was used, without exposing the secret.
+
+---
+
+# 69. DATA FLOW FOR FALLBACK
+
+Example:
+
+```text
+Request
+ ↓
+Model Router
+ ↓
+Provider A
+ ↓
+429
+ ↓
+Fallback Engine
+ ↓
+Provider B
+ ↓
+Success
+ ↓
+Response
+```
+
+Persist:
+
+```text
+primary_provider
+primary_model
+fallback_provider
+fallback_model
+failure_reason
+retry_count
+```
+
+---
+
+# 70. MODEL CATALOG UX
+
+Create filters:
+
+```text
+Provider
+Capability
+Price
+Latency
+Context
+Availability
+Access mode
+Lifecycle
+Region
+```
+
+Search should support:
+
+```text
+"coding"
+"reasoning"
+"1m context"
+"cheap"
+"fast"
+"BYOK"
+```
+
+---
+
+# 71. SMART MODEL RECOMMENDER
+
+Implement optional:
+
+```text
+Recommend a Model
+```
+
+Inputs:
+
+```text
+task type
+budget
+latency target
+context size
+required tools
+required modalities
+BYOK preference
+compliance restrictions
+```
+
+Output:
+
+```text
+recommended model
+backup models
+reasoning
+estimated cost
+```
+
+---
+
+# 72. UI/UX QUALITY REQUIREMENTS
+
+Do not create generic admin screens.
+
+The AI Platform should feel like a first-class product surface.
+
+Requirements:
+
+```text
+clear visual hierarchy
+provider branding
+model family grouping
+capability badges
+health indicators
+cost indicators
+BYOK status
+platform access status
+lifecycle warnings
+responsive layout
+keyboard accessibility
+loading states
+error states
+empty states
+success states
+confirmation flows
+danger-state warnings
+```
+
+---
+
+# 73. DESIGN SYSTEM INTEGRATION
+
+Use the existing application's:
+
+```text
+tokens
+spacing
+typography
+components
+icons
+dark/light mode
+tables
+forms
+toast system
+modal system
+navigation
+```
+
+Do not create a second design system.
+
+Extend existing components where possible.
+
+---
+
+# 74. RESPONSIVE UI
+
+Support:
+
+```text
+desktop
+tablet
+mobile
+```
+
+Provider/model cards must gracefully collapse.
+
+Routing builder must remain usable on smaller screens.
+
+---
+
+# 75. UX STATES
+
+Every new screen must define:
+
+```text
+loading
+empty
+success
+error
+partial
+degraded
+disabled
+permission denied
+```
+
+For example:
+
+```text
+No BYOK credentials configured
+
+[Connect Provider]
+```
+
+instead of blank screens.
+
+---
+
+# 76. ACCESS CONTROL UI
+
+Users should see only allowed operations.
+
+Example:
+
+```text
+Viewer:
+Can view models/usage
+
+Developer:
+Can use playground
+
+Admin:
+Can configure providers/routing
+
+Security Admin:
+Can configure policies
+
+Billing Admin:
+Can view cost
+```
+
+Integrate with existing RBAC.
+
+---
+
+# 77. PERFORMANCE REQUIREMENTS
+
+Model execution should not block on unnecessary catalog refreshes.
+
+Use:
+
+```text
+cached model catalog
+cached provider health
+cached credential metadata
+async synchronization
+```
+
+Model discovery must run asynchronously.
+
+Routing should be low latency.
+
+---
+
+# 78. CONCURRENCY
+
+The AI Gateway must support parallel requests.
+
+Use asynchronous/non-blocking provider calls where the existing architecture supports them.
+
+Do not serialize independent requests.
+
+For agent workflows support concurrent model/tool execution subject to:
+
+```text
+provider limits
+organization concurrency
+credential limits
+application limits
+```
+
+---
+
+# 79. CACHING
+
+Cache safe/read-only metadata:
+
+```text
+provider metadata
+model catalog
+model capabilities
+pricing
+provider health
+```
+
+Do not cache secrets in general-purpose application caches.
+
+Define clear TTLs.
+
+---
+
+# 80. MIGRATION REQUIREMENTS
+
+Do not break existing application functionality.
+
+Before modifying architecture:
+
+```text
+inspect current repository
+inspect existing AI integrations
+inspect existing configuration
+inspect existing auth/RBAC
+inspect existing secret management
+inspect existing UI components
+inspect existing database conventions
+inspect deployment infrastructure
+```
+
+Reuse existing infrastructure whenever appropriate.
+
+Do not create duplicate services that already exist.
+
+---
+
+# 81. IMPLEMENTATION ORDER
+
+Implement in this order:
+
+## Phase 1
+
+```text
+Provider registry
+Model registry
+Canonical provider interface
+Canonical model schema
+Credential abstraction
+```
+
+## Phase 2
+
+```text
+OpenAI
+Anthropic
+Gemini
+```
+
+## Phase 3
+
+```text
+xAI/Grok
+MiniMax
+Kimi
+GLM
+Groq
+```
+
+## Phase 4
+
+```text
+Platform credential provisioning
+BYOK
+Secret vault integration
+```
+
+## Phase 5
+
+```text
+Model discovery
+Model lifecycle
+Pricing synchronization
+```
+
+## Phase 6
+
+```text
+Routing
+aliases
+fallback
+health
+```
+
+## Phase 7
+
+```text
+Usage
+cost
+billing
+audit
+```
+
+## Phase 8
+
+```text
+UI/UX
+Provider management
+BYOK
+Models
+Playground
+Routing
+Health
+```
+
+## Phase 9
+
+```text
+Security pipeline integration
+benchmarking
+advanced routing
+self-hosted adapter
+```
+
+---
+
+# 82. DEPLOYMENT
+
+Everything must run in the existing containerized platform.
+
+Do not introduce services that cannot be containerized.
+
+Support:
+
+```text
+Docker
+Docker Compose where applicable
+existing CI/CD
+existing secret injection
+existing observability stack
+```
+
+Document required environment variables and dependencies.
+
+---
+
+# 83. BACKGROUND JOBS
+
+Create background jobs for:
+
+```text
+model discovery
+provider health checks
+pricing refresh
+deprecated model detection
+credential health checks
+usage aggregation
+cost aggregation
+```
+
+Prevent duplicate scheduled execution in multi-instance deployments.
+
+Use the application's existing queue/scheduler infrastructure where available.
+
+---
+
+# 84. API SECURITY
+
+AI endpoints require:
+
+```text
+authentication
+authorization
+tenant context
+rate limiting
+request validation
+cost policy validation
+model allowlist validation
+credential policy validation
+```
+
+Never permit a user to bypass organization policy by directly specifying a provider model ID.
+
+---
+
+# 85. DIRECT PROVIDER BYPASS
+
+Avoid exposing raw provider endpoints to ordinary application consumers.
+
+Bad:
+
+```text
+POST /openai/chat
+POST /anthropic/chat
+```
+
+Preferred:
+
+```text
+POST /api/v1/ai/chat
+```
+
+The gateway handles provider resolution.
+
+---
+
+# 86. DEVELOPER EXPERIENCE
+
+Provide a simple SDK:
+
+```text
+ai.chat({
+    model: "best_reasoning",
+    messages,
+    accessMode: "auto"
+})
+```
+
+and:
+
+```text
+ai.stream(...)
+```
+
+Do not require product teams to import provider-specific SDKs.
+
+---
+
+# 87. EXAMPLES OF PRODUCT CALLS
+
+Security analysis:
+
+```text
+ai.chat({
+    model: "best_reasoning",
+    task: "security_analysis",
+    accessMode: "organization"
+})
+```
+
+Cheap classification:
+
+```text
+ai.chat({
+    model: "best_cost",
+    task: "classification"
+})
+```
+
+Fast UI generation:
+
+```text
+ai.chat({
+    model: "best_fast",
+    task: "ui_generation"
+})
+```
+
+Explicit BYOK:
+
+```text
+ai.chat({
+    model: "claude-opus-5",
+    accessMode: "byok"
+})
+```
+
+---
+
+# 88. ACCEPTANCE CRITERIA
+
+The implementation is complete only when:
+
+### Provider layer
+
+* All eight providers are registered.
+* Every provider has a working adapter.
+* Shared abstractions are used.
+* Provider-specific behavior remains isolated.
+
+### Model layer
+
+* Models can be discovered dynamically.
+* Models have normalized metadata.
+* Lifecycle states work.
+* Deprecated models are not selected.
+* Aliases resolve dynamically.
+
+### Credentials
+
+* Platform-managed credentials work.
+* BYOK works for all supported providers where the provider exposes an API-key credential mechanism.
+* Secrets are encrypted/vaulted.
+* Raw secrets never reach normal application logs.
+* Credential validation works.
+
+### Routing
+
+* Model aliases work.
+* Provider/model routing works.
+* Health-aware routing works.
+* Fallback works.
+* Organization policies work.
+* BYOK-only mode works.
+* Platform-only mode works.
+
+### Metering
+
+* Usage is captured.
+* Cost is estimated/calculated.
+* Platform vs BYOK is distinguished.
+* Historical data is retained.
+
+### UI/UX
+
+* Provider management UI works.
+* BYOK wizard works.
+* Model catalog works.
+* Model comparison works.
+* Playground works.
+* Routing UI works.
+* Health dashboard works.
+* Lifecycle warnings work.
+* Loading/error/empty states work.
+
+### Security
+
+* Tenant isolation is tested.
+* RBAC is enforced.
+* Audit logging works.
+* Credential access is restricted.
+* Provider/model allowlists work.
+
+### Deployment
+
+* Entire feature runs in Docker.
+* Database migrations are included.
+* Configuration is documented.
+* Background jobs are container-compatible.
+* Health checks are included.
+
+---
+
+# 89. DELIVERABLES
+
+Produce:
+
+```text
+1. Architecture changes
+2. Provider adapters
+3. AI gateway
+4. Credential service
+5. BYOK subsystem
+6. Model discovery subsystem
+7. Model registry
+8. Routing engine
+9. Fallback engine
+10. Health service
+11. Usage metering
+12. Cost engine
+13. Audit logging
+14. Database migrations
+15. API endpoints
+16. Frontend screens
+17. Frontend components
+18. Provider setup flows
+19. BYOK flows
+20. Routing UI
+21. Playground
+22. Tests
+23. Docker/deployment changes
+24. Documentation
+25. Seed/bootstrap configuration
+```
+
+---
+
+# 90. FINAL IMPLEMENTATION RULE
+
+Do not implement this as:
+
+```text
+OpenAI integration
++
+Anthropic integration
++
+Gemini integration
++
+etc.
+```
+
+Implement it as:
+
+```text
+              AI PLATFORM
+                   │
+          ┌────────┴─────────┐
+          │                  │
+      MODEL PLANE       CREDENTIAL PLANE
+          │                  │
+          ▼                  ▼
+  Model Registry        Platform/BYOK
+  Model Discovery       Secret Vault
+  Capabilities          Credential Policies
+  Lifecycle             Validation
+          │                  │
+          └────────┬─────────┘
+                   │
+                   ▼
+              ROUTING PLANE
+                   │
+        ┌──────────┼──────────┐
+        ▼          ▼          ▼
+     Policy      Health      Cost
+        │          │          │
+        └──────────┼──────────┘
+                   ▼
+             EXECUTION PLANE
+                   │
+       ┌───────────┼────────────┐
+       ▼           ▼            ▼
+   Providers      BYOK      Self-hosted
+```
+
+This platform must allow us to add future providers/models without redesigning the architecture.
+
+The final result should feel like an **internal AI infrastructure platform / model gateway / control plane**, not an API wrapper.
+
+It must be production-oriented, secure, observable, containerized, multi-tenant, extensible, and fully provisioned through the existing platform UI/UX.

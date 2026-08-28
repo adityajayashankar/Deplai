@@ -51,11 +51,36 @@ class LLMRouter:
         preferred_api_key: str | None = None,
         preferred_model: str | None = None,
         force_claude: bool = False,
+        user_id: str | None = None,
+        access_mode: str | None = None,
     ) -> tuple[str, str, int]:
         self._reset_if_needed()
 
+        mode = (access_mode or "auto").strip().lower() or "auto"
+        if user_id:
+            try:
+                from ai_gateway import remediate_text
+                ok, response = remediate_text(
+                    user_id=str(user_id),
+                    prompt=prompt,
+                    model=preferred_model,
+                    access_mode=mode,
+                    api_key=preferred_api_key,
+                    provider=preferred_provider,
+                )
+                if ok:
+                    tokens_used = max(estimated_tokens, len(response) // 4)
+                    return response, f"gateway:{mode}", tokens_used
+                if mode in {"platform", "byok"}:
+                    raise RuntimeError(f"AI platform {mode} remediation failed: {response}")
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                if mode in {"platform", "byok"}:
+                    raise RuntimeError(f"AI platform {mode} remediation failed: {exc}") from exc
+
         provider_name = str(preferred_provider or "").strip().lower()
-        if force_claude or provider_name == "claude":
+        if force_claude or provider_name in {"claude", "anthropic"}:
             ok, response = self._dispatch_claude_sdk(
                 prompt,
                 api_key=str(preferred_api_key or "").strip(),

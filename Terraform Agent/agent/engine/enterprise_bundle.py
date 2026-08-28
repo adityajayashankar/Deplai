@@ -5,7 +5,7 @@ import json
 import re
 from typing import Any
 
-from ..internal_registry import get_module, load_catalog, render_snippet
+from ..internal_registry import get_module, load_catalog, render_snippet, select_allowlisted_edits
 from .runtime import DEFAULT_PROVIDER_CONSTRAINT, slugify
 
 
@@ -148,6 +148,43 @@ def assert_endpoint_decision_renderable(payload: dict[str, Any]) -> None:
             )
 
 
+_CURRENT_POSTGRES_VERSION = "15.17"
+_POSTGRES_CURRENT_BY_MAJOR = {
+    "13": "13.18",
+    "14": "14.15",
+    "15": _CURRENT_POSTGRES_VERSION,
+    "16": "16.13",
+    "17": "17.4",
+}
+_POSTGRES_SENTINELS = {"", "latest", "lts", "stable", "current", "alpine"}
+_RETIRED_POSTGRES_VERSIONS = {
+    **{f"13.{patch}": "13.18" for patch in range(1, 18)},
+    **{f"14.{patch}": "14.15" for patch in range(1, 15)},
+    **{f"15.{patch}": _CURRENT_POSTGRES_VERSION for patch in range(1, 17)},
+    **{f"16.{patch}": "16.13" for patch in range(1, 13)},
+}
+
+
+def _supported_engine_version(engine: str, version: str) -> str:
+    """Map Docker tags and retired RDS minors onto a CreateDBInstance-valid version."""
+    engine_key = str(engine or "").strip().lower()
+    raw = str(version or "").strip()
+    token = raw.lower().split("-")[0].split("_")[0]
+    if engine_key in {"mysql", "mariadb"}:
+        if token in _POSTGRES_SENTINELS or not token or not token[0].isdigit():
+            return "8.0" if engine_key == "mysql" else "10.11"
+        return raw or ("8.0" if engine_key == "mysql" else "10.11")
+    if token in _POSTGRES_SENTINELS or not token or not token[0].isdigit():
+        return _CURRENT_POSTGRES_VERSION
+    if token in _POSTGRES_CURRENT_BY_MAJOR:
+        return _POSTGRES_CURRENT_BY_MAJOR[token]
+    mapped = _RETIRED_POSTGRES_VERSIONS.get(token) or _RETIRED_POSTGRES_VERSIONS.get(raw)
+    if mapped:
+        return mapped
+    major = token.split(".")[0]
+    return _POSTGRES_CURRENT_BY_MAJOR.get(major, _CURRENT_POSTGRES_VERSION)
+
+
 def build_enterprise_profile_bundle(
     *,
     payload: dict[str, Any],
@@ -157,6 +194,7 @@ def build_enterprise_profile_bundle(
     aws_region: str,
     context_summary: str,
     website_index_html: str,
+    app_bootstrap: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     assert_endpoint_decision_renderable(payload)
     project_name = str(payload.get("project_name") or "deplai-project").strip() or "deplai-project"
@@ -180,23 +218,48 @@ def build_enterprise_profile_bundle(
     ec2_module_source = str(ec2_module.get("source") or "terraform-aws-modules/ec2-instance/aws")
     ec2_module_version = str(ec2_module.get("version") or "5.8.0")
     app_service = next((item for item in compute.get("services") or [] if isinstance(item, dict) and str(item.get("process_type") or "") == "web"), {})
-    app_port = int(app_service.get("port") or 3000)
     secrets_prefix = str(runtime_config.get("secrets_manager_prefix") or f"/{project_slug}/{environment}").strip() or f"/{project_slug}/{environment}"
     required_secrets = [str(item).strip() for item in runtime_config.get("required_secrets") or [] if str(item).strip()]
     has_postgres = any(str(item.get("type") or "") == "postgresql" for item in data_layer)
     has_redis = any(str(item.get("type") or "") == "redis" for item in data_layer)
-    redis_item = next((item for item in data_layer if str(item.get("type") or "") == "redis"), {})
-    redis_node_type = str(redis_item.get("node_type") or "cache.t4g.micro").strip() or "cache.t4g.micro"
-    redis_engine_version = str(redis_item.get("engine_version") or "7.0").strip() or "7.0"
     postgres_item = next((item for item in data_layer if str(item.get("type") or "") == "postgresql"), {})
     postgres_engine = str(postgres_item.get("engine") or "postgres").strip().lower() or "postgres"
     if postgres_engine not in {"postgres", "mysql", "mariadb"}:
         postgres_engine = "postgres"
-    _default_db_version = {"postgres": "15.17", "mysql": "8.0", "mariadb": "10.11"}[postgres_engine]
-    postgres_engine_version = str(postgres_item.get("engine_version") or _default_db_version).strip() or _default_db_version
-    postgres_instance_class = str(postgres_item.get("instance_class") or "db.t4g.micro").strip() or "db.t4g.micro"
-    postgres_storage = _coerce_positive_int(postgres_item.get("storage_gb"), 20)
-    postgres_multi_az = bool(postgres_item.get("multi_az"))
+    bootstrap = app_bootstrap if isinstance(app_bootstrap, dict) else {}
+    repository_url = str(bootstrap.get("repository_url") or "").strip()
+    app_kind = str(bootstrap.get("app_kind") or "").strip().lower()
+    if not app_kind:
+        app_kind = "node" if repository_url else "static"
+    build_command = str(bootstrap.get("build_command") or "").strip()
+    start_command = str(bootstrap.get("start_command") or "").strip()
+    app_subdir = str(bootstrap.get("app_subdir") or ".").strip() or "."
+    agent_edits = select_allowlisted_edits(payload, app_bootstrap=bootstrap)
+    ec2_edits = agent_edits.get("ec2_instance") or {}
+    rds_edits = agent_edits.get("rds") or {}
+    cache_edits = agent_edits.get("elasticache") or {}
+    alb_edits = agent_edits.get("alb") or {}
+    instance_type = str(ec2_edits.get("instance_type") or "t3.micro").strip() or "t3.micro"
+    if instance_type not in {"t3.micro", "t3.small", "t3.medium"}:
+        instance_type = "t3.micro"
+    app_port = int(ec2_edits.get("app_port") or app_service.get("port") or 3000)
+    if app_port in {5432, 3306, 6379, 27017, 1433, 1521} or not (1 <= app_port <= 65535):
+        app_port = 3000
+    root_volume_size_gb = _coerce_positive_int(ec2_edits.get("root_volume_size_gb"), 8)
+    redis_node_type = str(cache_edits.get("node_type") or "cache.t4g.micro").strip() or "cache.t4g.micro"
+    redis_engine_version = str(cache_edits.get("engine_version") or "7.0").strip() or "7.0"
+    if rds_edits.get("engine"):
+        postgres_engine = str(rds_edits.get("engine")).strip().lower() or postgres_engine
+        if postgres_engine not in {"postgres", "mysql", "mariadb"}:
+            postgres_engine = "postgres"
+    _default_db_version = {"postgres": _CURRENT_POSTGRES_VERSION, "mysql": "8.0", "mariadb": "10.11"}[postgres_engine]
+    postgres_engine_version = _supported_engine_version(
+        postgres_engine,
+        str(rds_edits.get("engine_version") or _default_db_version).strip() or _default_db_version,
+    )
+    postgres_instance_class = str(rds_edits.get("instance_class") or "db.t4g.micro").strip() or "db.t4g.micro"
+    postgres_storage = _coerce_positive_int(rds_edits.get("allocated_storage"), 20)
+    postgres_multi_az = bool(rds_edits.get("multi_az"))
     postgres_backup = _coerce_positive_int(postgres_item.get("backup_retention_days"), 7, allow_zero=True)
     region = str(aws_region or "eu-north-1").strip() or "eu-north-1"
     provider_constraint = _provider_expr(provider_version)
@@ -206,7 +269,7 @@ def build_enterprise_profile_bundle(
     if cf_price_class not in {"PriceClass_100", "PriceClass_200", "PriceClass_All"}:
         cf_price_class = "PriceClass_100"
     spa_fallback = bool(static_site.get("spa_fallback"))
-    use_registry_slice = strategy == "ec2" and (enable_alb or enable_eip)
+    use_registry_slice = strategy == "ec2"
     terraform_required = str(
         (load_catalog().get("terraform") or {}).get("required_version") or ">= 1.6.0, < 1.12.0"
     ).strip() or ">= 1.6.0, < 1.12.0"
@@ -231,7 +294,7 @@ def build_enterprise_profile_bundle(
 """
 
     providers_tf = """provider "aws" {
-  region = var.region
+  region = var.aws_region
   default_tags { tags = local.common_tags }
 }
 """
@@ -262,7 +325,7 @@ def build_enterprise_profile_bundle(
     managed_by  = "terraform"
   }}
 
-  enable_compute     = var.compute_strategy == "ec2"
+  enable_compute     = startswith(var.compute_strategy, "ec2")
   enable_static_site = var.compute_strategy == "s3_cloudfront"
   enable_postgres    = var.enable_postgres
   enable_redis       = var.enable_redis
@@ -287,6 +350,11 @@ variable "environment" {{
     condition     = contains(["dev", "staging", "prod"], var.environment)
     error_message = "environment must be dev, staging, or prod."
   }}
+}}
+
+variable "aws_region" {{
+  type    = string
+  default = "{region}"
 }}
 
 variable "region" {{
@@ -344,7 +412,7 @@ variable "use_default_vpc" {{
 
 variable "instance_type" {{
   type    = string
-  default = "t3.micro"
+  default = "{instance_type}"
   validation {{
     condition     = contains(["t3.micro", "t3.small", "t3.medium"], var.instance_type)
     error_message = "instance_type must be one of the approved low-cost defaults."
@@ -359,6 +427,48 @@ variable "app_port" {{
 variable "existing_ec2_key_pair_name" {{
   type    = string
   default = ""
+}}
+
+variable "ec2_key_rotation" {{
+  type        = string
+  default     = "init"
+  description = "Unique suffix so each deploy mints a new EC2 key pair. AWS never stores the private half."
+}}
+
+variable "repository_url" {{
+  type    = string
+  default = {_json(repository_url)}
+}}
+
+variable "app_kind" {{
+  type    = string
+  default = {_json(app_kind)}
+}}
+
+variable "build_command" {{
+  type    = string
+  default = {_json(build_command)}
+}}
+
+variable "start_command" {{
+  type    = string
+  default = {_json(start_command)}
+}}
+
+variable "app_subdir" {{
+  type    = string
+  default = {_json(app_subdir)}
+}}
+
+variable "app_archive_base64" {{
+  type      = string
+  default   = ""
+  sensitive = true
+}}
+
+variable "deployment_package_id" {{
+  type    = string
+  default = {_json(str(bootstrap.get("package_id") or ""))}
 }}
 
 variable "bootstrap_index_html_base64" {{
@@ -461,16 +571,12 @@ data "aws_ami" "al2023" {
 """
 
     secrets_tf = """locals {
+  # App secrets are optional. Runtime fetch happens at boot when values exist.
+  # Do not look them up at plan/apply — missing keys must not fail Terraform.
   ssm_parameter_names = {
     for name in var.required_secret_names :
     name => "${var.secrets_manager_prefix}/${name}"
   }
-}
-
-data "aws_ssm_parameter" "managed" {
-  for_each        = local.ssm_parameter_names
-  name            = each.value
-  with_decryption = true
 }
 """
 
@@ -528,7 +634,7 @@ module "iam" {{
   source        = "./modules/iam"
   project_name  = var.project_name
   environment   = var.environment
-  region        = var.region
+  region        = var.aws_region
   secret_prefix = var.secrets_manager_prefix
   common_tags   = local.common_tags
 }}
@@ -566,8 +672,19 @@ module "compute" {{
   enable_eip                  = local.enable_eip
   bootstrap_index_html_base64 = var.bootstrap_index_html_base64
   instance_profile_name       = module.iam.instance_profile_name
-  existing_ec2_key_pair_name  = var.existing_ec2_key_pair_name
+  instance_role_name          = module.iam.instance_role_name
+  existing_ec2_key_pair_name  = ""
+  ec2_key_rotation            = var.ec2_key_rotation
+  repository_url              = var.repository_url
+  app_kind                    = var.app_kind
+  build_command               = var.build_command
+  start_command               = var.start_command
+  app_subdir                  = var.app_subdir
+  app_archive_base64          = var.app_archive_base64
+  database_secret_arn         = try(module.data.rds_secret_arn, "")
+  database_endpoint           = try(module.data.rds_endpoint, "")
   common_tags                 = local.common_tags
+  depends_on                  = [module.data]
 }}
 """
         alb_dns_output = (
@@ -599,6 +716,11 @@ output "app_url" {{
 
 output "rds_endpoint" {{
   value = module.data.rds_endpoint
+}}
+
+output "rds_secret_arn" {{
+  value     = module.data.rds_secret_arn
+  sensitive = true
 }}
 
 output "redis_endpoint" {{
@@ -675,13 +797,25 @@ output "generated_ec2_private_key_pem" {{
   state = "available"
 }}
 
+data "aws_vpcs" "default" {{
+  filter {{
+    name   = "isDefault"
+    values = ["true"]
+  }}
+}}
+
+locals {{
+  deplai_prefer_default_vpc = var.use_existing_vpc
+  has_default_vpc           = local.deplai_prefer_default_vpc && length(data.aws_vpcs.default.ids) > 0
+}}
+
 data "aws_vpc" "default" {{
-  count   = var.use_existing_vpc ? 1 : 0
-  default = true
+  count = local.has_default_vpc ? 1 : 0
+  id    = data.aws_vpcs.default.ids[0]
 }}
 
 data "aws_subnets" "default" {{
-  count = var.use_existing_vpc ? 1 : 0
+  count = local.has_default_vpc ? 1 : 0
   filter {{
     name   = "vpc-id"
     values = [data.aws_vpc.default[0].id]
@@ -689,7 +823,7 @@ data "aws_subnets" "default" {{
 }}
 
 module "vpc" {{
-  count   = var.use_existing_vpc || !var.use_registry_vpc ? 0 : 1
+  count   = local.has_default_vpc || !var.use_registry_vpc ? 0 : 1
   source  = "{vpc_module_source}"
   version = "{vpc_module_version}"
 
@@ -709,7 +843,7 @@ module "vpc" {{
 }}
 
 resource "aws_vpc" "main" {{
-  count                = var.use_existing_vpc || var.use_registry_vpc ? 0 : 1
+  count                = local.has_default_vpc || var.use_registry_vpc ? 0 : 1
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -717,13 +851,13 @@ resource "aws_vpc" "main" {{
 }}
 
 resource "aws_internet_gateway" "main" {{
-  count  = var.use_existing_vpc || var.use_registry_vpc ? 0 : 1
+  count  = local.has_default_vpc || var.use_registry_vpc ? 0 : 1
   vpc_id = aws_vpc.main[0].id
   tags   = merge(var.common_tags, {{ Name = "${{var.project_name}}-${{var.environment}}-igw" }})
 }}
 
 resource "aws_subnet" "public" {{
-  count                   = var.use_existing_vpc || var.use_registry_vpc ? 0 : 2
+  count                   = local.has_default_vpc || var.use_registry_vpc ? 0 : 2
   vpc_id                  = aws_vpc.main[0].id
   cidr_block              = var.public_subnet_cidrs[count.index]
   availability_zone       = data.aws_availability_zones.available.names[count.index]
@@ -732,7 +866,7 @@ resource "aws_subnet" "public" {{
 }}
 
 resource "aws_subnet" "private" {{
-  count             = var.use_existing_vpc || var.use_registry_vpc ? 0 : 2
+  count             = local.has_default_vpc || var.use_registry_vpc ? 0 : 2
   vpc_id            = aws_vpc.main[0].id
   cidr_block        = var.private_subnet_cidrs[count.index]
   availability_zone = data.aws_availability_zones.available.names[count.index]
@@ -740,37 +874,37 @@ resource "aws_subnet" "private" {{
 }}
 
 resource "aws_route_table" "public" {{
-  count  = var.use_existing_vpc || var.use_registry_vpc ? 0 : 1
+  count  = local.has_default_vpc || var.use_registry_vpc ? 0 : 1
   vpc_id = aws_vpc.main[0].id
   tags   = merge(var.common_tags, {{ Name = "${{var.project_name}}-${{var.environment}}-public-rt" }})
 }}
 
 resource "aws_route" "public_internet" {{
-  count                  = var.use_existing_vpc || var.use_registry_vpc ? 0 : 1
+  count                  = local.has_default_vpc || var.use_registry_vpc ? 0 : 1
   route_table_id         = aws_route_table.public[0].id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = aws_internet_gateway.main[0].id
 }}
 
 resource "aws_route_table_association" "public" {{
-  count          = var.use_existing_vpc || var.use_registry_vpc ? 0 : length(aws_subnet.public)
+  count          = local.has_default_vpc || var.use_registry_vpc ? 0 : length(aws_subnet.public)
   subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public[0].id
 }}
 
 locals {{
   vpc_id = (
-    var.use_existing_vpc ? data.aws_vpc.default[0].id :
+    local.has_default_vpc ? data.aws_vpc.default[0].id :
     var.use_registry_vpc ? module.vpc[0].vpc_id :
     aws_vpc.main[0].id
   )
   public_subnet_ids = (
-    var.use_existing_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(length(data.aws_subnets.default[0].ids), 2)) :
+    local.has_default_vpc ? slice(data.aws_subnets.default[0].ids, 0, min(length(data.aws_subnets.default[0].ids), 2)) :
     var.use_registry_vpc ? module.vpc[0].public_subnets :
     [for subnet in aws_subnet.public : subnet.id]
   )
   private_subnet_ids = (
-    var.use_existing_vpc ? local.public_subnet_ids :
+    local.has_default_vpc ? local.public_subnet_ids :
     var.use_registry_vpc ? module.vpc[0].private_subnets :
     [for subnet in aws_subnet.private : subnet.id]
   )
@@ -825,10 +959,20 @@ resource "aws_iam_role_policy" "app" {
     Version = "2012-10-17"
     Statement = [{
       Effect = "Allow"
-      Action = ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "secretsmanager:GetSecretValue", "kms:Decrypt"]
+      Action = [
+        "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath",
+        "secretsmanager:GetSecretValue", "kms:Decrypt",
+        "ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "ecr:DescribeImages"
+      ]
       Resource = "*"
     }]
   })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_iam_instance_profile" "ec2" {
@@ -845,10 +989,25 @@ variable "common_tags" { type = map(string) }
 """
 
     iam_outputs = """output "instance_profile_name" { value = aws_iam_instance_profile.ec2.name }
+output "instance_role_name" { value = aws_iam_role.ec2.name }
 """
 
     database_main = """locals {
   sql_port = contains(["mysql", "mariadb"], var.postgres_engine) ? 3306 : 5432
+  # Docker tags such as "latest" are not RDS engine versions. Coalesce here so a
+  # leftover tfvars/default cannot reach CreateDBInstance.
+  postgres_engine_sentinels = ["", "latest", "lts", "stable", "current", "alpine"]
+  postgres_engine_version = (
+    contains(local.postgres_engine_sentinels, lower(trimspace(var.postgres_engine_version)))
+    ? (contains(["mysql"], var.postgres_engine) ? "8.0" : contains(["mariadb"], var.postgres_engine) ? "10.11" : "15.17")
+    : var.postgres_engine_version
+  )
+  redis_engine_sentinels = ["", "latest", "lts", "stable", "current"]
+  redis_engine_version = (
+    contains(local.redis_engine_sentinels, lower(trimspace(var.redis_engine_version)))
+    ? "7.0"
+    : var.redis_engine_version
+  )
 }
 
 resource "aws_security_group" "database" {
@@ -890,7 +1049,7 @@ resource "aws_db_instance" "postgres" {
   count                       = var.enable_postgres ? 1 : 0
   identifier                  = "${var.postgres_engine}-${substr(md5(join(",", var.subnet_ids)), 0, 8)}"
   engine                      = var.postgres_engine
-  engine_version              = var.postgres_engine_version
+  engine_version              = local.postgres_engine_version
   instance_class              = var.postgres_instance_class
   allocated_storage           = var.postgres_allocated_storage
   multi_az                    = var.postgres_multi_az
@@ -904,6 +1063,12 @@ resource "aws_db_instance" "postgres" {
   username                    = "appadmin"
   db_name                     = "appdb"
   tags                        = var.common_tags
+
+  timeouts {
+    create = "45m"
+    update = "60m"
+    delete = "40m"
+  }
 }
 
 resource "aws_elasticache_subnet_group" "redis" {
@@ -917,7 +1082,7 @@ resource "aws_elasticache_cluster" "redis" {
   count                = var.enable_redis ? 1 : 0
   cluster_id           = "redis-${substr(md5(join(",", var.subnet_ids)), 0, 8)}"
   engine               = "redis"
-  engine_version       = var.redis_engine_version
+  engine_version       = local.redis_engine_version
   node_type            = var.redis_node_type
   num_cache_nodes      = 1
   port                 = 6379
@@ -943,7 +1108,7 @@ variable "postgres_engine" {
 }
 variable "postgres_engine_version" {
   type    = string
-  default = "15.5"
+  default = "15.17"
 }
 variable "postgres_instance_class" {
   type    = string
@@ -968,6 +1133,8 @@ variable "common_tags" { type = map(string) }
 """
 
     database_outputs = """output "rds_endpoint" { value = try(aws_db_instance.postgres[0].address, null) }
+output "rds_port" { value = try(aws_db_instance.postgres[0].port, null) }
+output "rds_secret_arn" { value = try(aws_db_instance.postgres[0].master_user_secret[0].secret_arn, null) }
 output "redis_endpoint" { value = try(aws_elasticache_cluster.redis[0].cache_nodes[0].address, null) }
 output "redis_port" { value = try(aws_elasticache_cluster.redis[0].cache_nodes[0].port, null) }
 """
@@ -1120,8 +1287,8 @@ output "website_bucket_name" {
   }"""
         )
         compute_main = f"""locals {{
-  use_existing_key = trimspace(var.existing_ec2_key_pair_name) != ""
-  ec2_key_name     = local.use_existing_key ? trimspace(var.existing_ec2_key_pair_name) : aws_key_pair.generated[0].key_name
+  use_existing_key = false
+  ec2_key_name     = try(aws_key_pair.generated[0].key_name, null)
   alb_dns          = var.enable_alb && length(module.alb) > 0 ? module.alb[0].dns_name : null
   eip_public_ip    = var.enable_eip && length(aws_eip.app) > 0 ? aws_eip.app[0].public_ip : null
   ec2_public_ip    = try(module.ec2[0].public_ip, null)
@@ -1175,23 +1342,85 @@ resource "aws_security_group" "app" {{
 }}
 
 resource "tls_private_key" "generated" {{
-  count     = var.enabled && !local.use_existing_key ? 1 : 0
+  count     = var.enabled ? 1 : 0
   algorithm = "RSA"
   rsa_bits  = 4096
 }}
 
 resource "aws_key_pair" "generated" {{
-  count      = var.enabled && !local.use_existing_key ? 1 : 0
-  key_name   = "${{var.project_name}}-${{var.environment}}-key"
+  count      = var.enabled ? 1 : 0
+  key_name   = "${{var.project_name}}-${{var.environment}}-${{var.ec2_key_rotation}}-key"
   public_key = tls_private_key.generated[0].public_key_openssh
+  tags = merge(var.common_tags, {{
+    Name             = "${{var.project_name}}-${{var.environment}}-${{var.ec2_key_rotation}}-key"
+    "deplai:managed" = "true"
+  }})
 }}
 """
-        # Compose EC2 / EIP / ALB from internal registry golden snippets (pinned contracts).
-        ec2_snippet = render_snippet("ec2_instance", {"root_volume_size_gb": 8})
+        artifacts_hcl = """
+resource "aws_s3_bucket" "artifacts" {
+  count         = var.enabled ? 1 : 0
+  bucket_prefix = substr(replace("${var.project_name}-${var.environment}-art-", "_", "-"), 0, 37)
+  force_destroy = true
+  tags          = merge(var.common_tags, { Name = "${var.project_name}-${var.environment}-artifacts" })
+}
+
+resource "aws_s3_bucket_public_access_block" "artifacts" {
+  count                   = var.enabled ? 1 : 0
+  bucket                  = aws_s3_bucket.artifacts[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
+  count  = var.enabled ? 1 : 0
+  bucket = aws_s3_bucket.artifacts[0].id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_object" "app" {
+  count  = var.enabled && fileexists("${path.root}/artifacts/app.tgz") ? 1 : 0
+  bucket = one(aws_s3_bucket.artifacts[*].id)
+  key    = "app.tgz"
+  source = "${path.root}/artifacts/app.tgz"
+  etag   = filemd5("${path.root}/artifacts/app.tgz")
+}
+
+resource "aws_iam_role_policy" "artifacts" {
+  count       = var.enabled && trimspace(var.instance_role_name) != "" ? 1 : 0
+  name_prefix = substr("${var.project_name}-${var.environment}-artifacts-", 0, 38)
+  role        = var.instance_role_name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.artifacts[*].arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = [for bucket in aws_s3_bucket.artifacts : "${bucket.arn}/*"]
+      }
+    ]
+  })
+}
+"""
+        # Compose EC2 / EIP / ALB from internal registry golden snippets.
+        # Catalog pins stay fixed; only allowlisted edits come from the agent selector.
+        ec2_snippet = render_snippet("ec2_instance", ec2_edits)
         eip_snippet = render_snippet("eip")
-        alb_snippet = render_snippet("alb", {"health_path": "/"})
+        alb_snippet = render_snippet("alb", alb_edits or {"health_path": "/"})
         compute_main = (
             compute_main
+            + artifacts_hcl
             + "\n"
             + ec2_snippet
             + "\n\n"
@@ -1222,8 +1451,8 @@ output "generated_ec2_private_key_pem" {
 """
     else:
         compute_main = """locals {
-  use_existing_key = trimspace(var.existing_ec2_key_pair_name) != ""
-  ec2_key_name     = local.use_existing_key ? trimspace(var.existing_ec2_key_pair_name) : aws_key_pair.generated[0].key_name
+  use_existing_key = false
+  ec2_key_name     = try(aws_key_pair.generated[0].key_name, null)
   alb_dns          = null
   eip_public_ip    = null
   ec2_public_ip    = try(aws_instance.app[0].public_ip, null)
@@ -1260,15 +1489,19 @@ resource "aws_security_group" "app" {
 }
 
 resource "tls_private_key" "generated" {
-  count     = var.enabled && !local.use_existing_key ? 1 : 0
+  count     = var.enabled ? 1 : 0
   algorithm = "RSA"
   rsa_bits  = 4096
 }
 
 resource "aws_key_pair" "generated" {
-  count      = var.enabled && !local.use_existing_key ? 1 : 0
-  key_name   = "${var.project_name}-${var.environment}-key"
+  count      = var.enabled ? 1 : 0
+  key_name   = "${var.project_name}-${var.environment}-${var.ec2_key_rotation}-key"
   public_key = tls_private_key.generated[0].public_key_openssh
+  tags = merge(var.common_tags, {
+    Name             = "${var.project_name}-${var.environment}-${var.ec2_key_rotation}-key"
+    "deplai:managed" = "true"
+  })
 }
 
 resource "aws_instance" "app" {
@@ -1280,6 +1513,7 @@ resource "aws_instance" "app" {
   iam_instance_profile        = var.instance_profile_name
   key_name                    = local.ec2_key_name
   associate_public_ip_address = true
+  user_data_replace_on_change = true
   tags                        = merge(var.common_tags, { Name = "${var.project_name}-${var.environment}-app" })
 
   metadata_options { http_tokens = "required" }
@@ -1287,13 +1521,16 @@ resource "aws_instance" "app" {
   root_block_device {
     encrypted   = true
     volume_type = "gp3"
-    volume_size = 8
+    volume_size = """ + str(root_volume_size_gb) + """
   }
 
   user_data = join("\\n", [
     "#!/bin/bash",
+    "# deplai_key_rotation=${var.ec2_key_rotation}",
     "set -euxo pipefail",
-    "dnf install -y nginx",
+    "dnf install -y nginx docker",
+    "systemctl enable --now docker || true",
+    "systemctl enable --now amazon-ssm-agent || true",
     "mkdir -p /usr/share/nginx/html",
     "cat <<'HTML' > /usr/share/nginx/html/index.html",
     "${base64decode(var.bootstrap_index_html_base64)}",
@@ -1349,7 +1586,48 @@ variable "bootstrap_index_html_base64" {
   sensitive = true
 }
 variable "instance_profile_name" { type = string }
-variable "existing_ec2_key_pair_name" { type = string }
+variable "instance_role_name" {
+  type    = string
+  default = ""
+}
+variable "existing_ec2_key_pair_name" {
+  type    = string
+  default = ""
+}
+variable "ec2_key_rotation" { type = string }
+variable "repository_url" {
+  type    = string
+  default = ""
+}
+variable "app_kind" {
+  type    = string
+  default = "static"
+}
+variable "build_command" {
+  type    = string
+  default = ""
+}
+variable "start_command" {
+  type    = string
+  default = ""
+}
+variable "app_subdir" {
+  type    = string
+  default = "."
+}
+variable "app_archive_base64" {
+  type      = string
+  default   = ""
+  sensitive = true
+}
+variable "database_secret_arn" {
+  type    = string
+  default = ""
+}
+variable "database_endpoint" {
+  type    = string
+  default = ""
+}
 variable "common_tags" { type = map(string) }
 """
 
@@ -1363,10 +1641,11 @@ variable "common_tags" { type = map(string) }
         "terraform/secrets.tf": secrets_tf,
         "terraform/main.tf": main_tf,
         "terraform/outputs.tf": outputs_tf,
-        "terraform/terraform.tfvars": f'project_name = "{project_slug}"\nenvironment = "{environment}"\nregion = "{region}"\ncompute_strategy = "{strategy}"\nteam = "platform-engineering"\ncost_center = "engineering"\nsecrets_manager_prefix = "{secrets_prefix}"\n',
-        "terraform/envs/dev/terraform.tfvars": f'project_name = "{project_slug}"\nenvironment = "dev"\nregion = "{region}"\ncompute_strategy = "{strategy}"\nteam = "platform-engineering"\ncost_center = "engineering"\nsecrets_manager_prefix = "/{project_slug}/dev"\n',
-        "terraform/envs/staging/terraform.tfvars": f'project_name = "{project_slug}"\nenvironment = "staging"\nregion = "{region}"\ncompute_strategy = "{strategy}"\nteam = "platform-engineering"\ncost_center = "engineering"\nsecrets_manager_prefix = "/{project_slug}/staging"\n',
-        "terraform/envs/prod/terraform.tfvars": f'project_name = "{project_slug}"\nenvironment = "prod"\nregion = "{region}"\ncompute_strategy = "{strategy}"\nteam = "platform-engineering"\ncost_center = "engineering"\nsecrets_manager_prefix = "/{project_slug}/prod"\n',
+        "terraform/terraform.tfvars": f'project_name = "{project_slug}"\nenvironment = "{environment}"\naws_region = "{region}"\nregion = "{region}"\ncompute_strategy = "{strategy}"\ninstance_type = {_json(instance_type)}\napp_port = {app_port}\nteam = "platform-engineering"\ncost_center = "engineering"\nsecrets_manager_prefix = "{secrets_prefix}"\nrepository_url = {_json(repository_url)}\napp_kind = {_json(app_kind)}\nbuild_command = {_json(build_command)}\nstart_command = {_json(start_command)}\napp_subdir = {_json(app_subdir)}\npostgres_engine_version = {_json(postgres_engine_version)}\nredis_engine_version = {_json(redis_engine_version)}\ndeployment_package_id = {_json(str(bootstrap.get("package_id") or ""))}\n',
+        "terraform/artifacts/.gitkeep": "",
+        "terraform/envs/dev/terraform.tfvars": f'project_name = "{project_slug}"\nenvironment = "dev"\naws_region = "{region}"\nregion = "{region}"\ncompute_strategy = "{strategy}"\nteam = "platform-engineering"\ncost_center = "engineering"\nsecrets_manager_prefix = "/{project_slug}/dev"\n',
+        "terraform/envs/staging/terraform.tfvars": f'project_name = "{project_slug}"\nenvironment = "staging"\naws_region = "{region}"\nregion = "{region}"\ncompute_strategy = "{strategy}"\nteam = "platform-engineering"\ncost_center = "engineering"\nsecrets_manager_prefix = "/{project_slug}/staging"\n',
+        "terraform/envs/prod/terraform.tfvars": f'project_name = "{project_slug}"\nenvironment = "prod"\naws_region = "{region}"\nregion = "{region}"\ncompute_strategy = "{strategy}"\nteam = "platform-engineering"\ncost_center = "engineering"\nsecrets_manager_prefix = "/{project_slug}/prod"\n',
         "terraform/backend-configs/dev.hcl": f'bucket = "{project_slug}-tfstate-dev"\nkey = "dev/terraform.tfstate"\nregion = "{region}"\ndynamodb_table = "{project_slug}-terraform-lock-dev"\nencrypt = true\n',
         "terraform/backend-configs/staging.hcl": f'bucket = "{project_slug}-tfstate-staging"\nkey = "staging/terraform.tfstate"\nregion = "{region}"\ndynamodb_table = "{project_slug}-terraform-lock-staging"\nencrypt = true\n',
         "terraform/backend-configs/prod.hcl": f'bucket = "{project_slug}-tfstate-prod"\nkey = "prod/terraform.tfstate"\nregion = "{region}"\ndynamodb_table = "{project_slug}-terraform-lock-prod"\nencrypt = true\n',
@@ -1434,5 +1713,9 @@ variable "common_tags" { type = map(string) }
         warnings.append(
             f"EC2+ALB/EIP vertical slice composes pinned registry modules "
             f"(vpc {vpc_module_version}, ec2-instance {ec2_module_version}, alb {alb_module_version})."
+        )
+        warnings.append(
+            "App delivery is S3 artifact pull plus a thin start script. Terraform does not git-clone "
+            "or compile the app on the instance; connect with SSM Session Manager, not SSH."
         )
     return files, warnings

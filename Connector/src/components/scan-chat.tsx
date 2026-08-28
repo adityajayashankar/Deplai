@@ -41,7 +41,7 @@ const SCAN_TYPE_OPTIONS = [
     id: 'sast' as ScanType,
     label: 'SAST',
     sublabel: 'Static Code Analysis',
-    desc: 'Scans source code for vulnerabilities and secrets using Bearer.',
+    desc: 'Scans source code for vulnerabilities and insecure patterns.',
     colorCls: 'bg-indigo-500/15 border-indigo-500/30 text-indigo-400',
     Icon: FiCode,
   },
@@ -49,15 +49,15 @@ const SCAN_TYPE_OPTIONS = [
     id: 'sca' as ScanType,
     label: 'SCA',
     sublabel: 'Dependency Audit',
-    desc: 'Checks open-source packages for known CVEs via Syft + Grype.',
+    desc: 'Checks open-source packages for known CVEs and builds an SBOM.',
     colorCls: 'bg-violet-500/15 border-violet-500/30 text-violet-400',
     Icon: FiPackage,
   },
   {
     id: 'all' as ScanType,
     label: 'Full Scan',
-    sublabel: 'SAST + SCA combined',
-    desc: 'Runs both analyzers in parallel for complete coverage.',
+    sublabel: 'Code, dependencies, secrets, and infrastructure',
+    desc: 'Runs static analysis, dependency scanning, and extra modules when matching files exist.',
     colorCls: 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400',
     Icon: FiShield,
     recommended: true,
@@ -104,6 +104,8 @@ export default function ScanChat({
   const [selectedProject, setSelectedProject] = useState<ScanChatProject | null>(initialProject ?? null);
   const [launchedProjectId, setLaunchedProjectId] = useState<string | null>(null);
   const [botTyping, setBotTyping] = useState(false);
+  const [dastAssetId, setDastAssetId] = useState('');
+  const [dastAssets, setDastAssets] = useState<Array<{ id: string; target_url: string; status: string }>>([]);
   const msgIdRef = useRef(0);
   const bottomRef = useRef<HTMLDivElement>(null);
   const initialized = useRef(false);
@@ -117,6 +119,18 @@ export default function ScanChat({
         resolve();
       }, delay);
     });
+
+  const loadDastAssets = async (projectId: string) => {
+    try {
+      const response = await fetch(`/api/dast/assets?project_id=${encodeURIComponent(projectId)}`, { cache: 'no-store' });
+      const body = await response.json().catch(() => ({})) as { assets?: Array<{ id: string; target_url: string; status: string }> };
+      const rows = Array.isArray(body.assets) ? body.assets.filter((item) => item.status === 'VERIFIED') : [];
+      setDastAssets(rows);
+      setDastAssetId(rows[0]?.id || '');
+    } catch {
+      setDastAssets([]);
+    }
+  };
 
   const addUserMessage = (content: string) => {
     setMessages(prev => [...prev, { id: ++msgIdRef.current, from: 'user', content }]);
@@ -133,6 +147,7 @@ export default function ScanChat({
         const pName = initialProject.name || initialProject.repo || 'your project';
         await addBotMessage(`What type of analysis should I run on **${pName}**?`, 300);
         setPhase('scan_type');
+        void loadDastAssets(initialProject.id);
         return;
       }
 
@@ -192,6 +207,7 @@ export default function ScanChat({
     setSelectedProject(project);
     await addBotMessage(`Got it! What type of scan should I run on **${pName}**?`, 400);
     setPhase('scan_type');
+    void loadDastAssets(project.id);
   };
 
   const handleTypeSelect = async (type: ScanType) => {
@@ -231,6 +247,57 @@ export default function ScanChat({
 
       await addBotMessage(
         `Scan launched! Monitor live output in the results view or stay here — I'll update when it completes.`,
+        500,
+      );
+      setPhase('done');
+    } catch (err: any) {
+      showPopup({ type: 'error', message: err?.message || 'Failed to start scan' });
+      setPhase('scan_type');
+    }
+  };
+
+  const handleDastLaunch = async () => {
+    const project = selectedProject ?? initialProject;
+    if (!project) return;
+    const selected = dastAssets.find((item) => item.id === dastAssetId);
+    if (!selected) {
+      showPopup({ type: 'error', message: 'Verify a project target in Dynamic Testing before running DAST.' });
+      return;
+    }
+
+    const pName = project.name || project.repo || 'project';
+    addUserMessage(`DAST — ${selected.target_url}`);
+    setPhase('launching');
+    await addBotMessage(`Kicking off dynamic testing on **${pName}**…`, 400);
+
+    try {
+      const response = await fetch('/api/scan/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          project_id: project.id,
+          project_name: pName,
+          project_type: project.type,
+          installation_id: project.installationId,
+          owner: project.owner,
+          repo: project.repo,
+          scan_type: 'all',
+          enabled_modules: ['dast'],
+          dast_asset_id: selected.id,
+          dast_target_url: selected.target_url,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => null);
+        throw new Error(errorData?.error || 'Backend request failed');
+      }
+
+      await response.json();
+      setLaunchedProjectId(project.id);
+      onStart(project.id, pName, 'all');
+      await addBotMessage(
+        `Dynamic testing launched! Monitor live output in the Security Pipeline.`,
         500,
       );
       setPhase('done');
@@ -356,20 +423,37 @@ export default function ScanChat({
             </button>
           ))}
 
-          {/* DAST placeholder */}
-          <div className="w-full flex items-start gap-3 px-4 py-3.5 rounded-xl border border-white/5 bg-white/2 opacity-50 cursor-not-allowed">
-            <div className="w-8 h-8 rounded-lg bg-zinc-900 border border-zinc-700/30 flex items-center justify-center shrink-0 text-zinc-600">
+          <div className="w-full flex items-start gap-3 px-4 py-3.5 rounded-xl border border-white/10 bg-white/3">
+            <div className="w-8 h-8 rounded-lg bg-zinc-900 border border-zinc-700/30 flex items-center justify-center shrink-0 text-zinc-300">
               <FiGlobe className="w-4 h-4" />
             </div>
-            <div>
+            <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-sm font-semibold text-zinc-500">DAST</span>
-                <span className="text-xs text-zinc-600">Dynamic Testing</span>
-                <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-500 border border-zinc-700">
-                  Coming Soon
-                </span>
+                <span className="text-sm font-semibold text-white">DAST</span>
+                <span className="text-xs text-zinc-500">Dynamic Testing</span>
               </div>
-              <p className="text-xs text-zinc-600 mt-0.5">Live traffic analysis against a running app.</p>
+              <p className="text-xs text-zinc-500 mt-0.5">Pick a verified project target. Unrelated public websites are blocked.</p>
+              {dastAssets.length ? (
+                <select
+                  value={dastAssetId}
+                  onChange={(event) => setDastAssetId(event.target.value)}
+                  className="mt-2 w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none"
+                >
+                  {dastAssets.map((asset) => (
+                    <option key={asset.id} value={asset.id}>{asset.target_url}</option>
+                  ))}
+                </select>
+              ) : (
+                <p className="mt-2 text-xs text-zinc-500">No verified targets. Open Dynamic Testing to prove ownership first.</p>
+              )}
+              <button
+                type="button"
+                onClick={() => void handleDastLaunch()}
+                disabled={!dastAssetId}
+                className="mt-2 rounded-lg border border-indigo-500/40 bg-indigo-500/20 px-3 py-1.5 text-xs font-semibold text-indigo-200 disabled:opacity-40"
+              >
+                Run DAST
+              </button>
             </div>
           </div>
         </div>

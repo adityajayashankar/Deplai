@@ -6,9 +6,9 @@ import re
 import anthropic
 
 if __package__:
-    from .template_registry import SUPPORTED_SERVICES, get_param_schema
+    from .template_registry import SUPPORTED_SERVICES, canonical_service_type, get_param_schema
 else:
-    from template_registry import SUPPORTED_SERVICES, get_param_schema
+    from template_registry import SUPPORTED_SERVICES, canonical_service_type, get_param_schema
 
 MODEL = os.getenv("IAC_PARAM_SELECTOR_MODEL", "claude-sonnet-4-5")
 _ANTHROPIC_API_KEY = (
@@ -307,6 +307,7 @@ async def select_params(
     Main entry point. Calls Claude to fill in terraform params for the given service.
     Returns a validated, default-filled params dict ready to write as terraform.tfvars.json.
     """
+    service_type = canonical_service_type(service_type)
     if service_type not in SUPPORTED_SERVICES:
         raise ValueError(f"Unknown service type: {service_type}")
 
@@ -320,7 +321,7 @@ async def select_params(
     enriched_customizations = {**user_customizations, **forced_values}
 
     # Append random suffix to bucket names to ensure global uniqueness
-    if service_type == "s3" and "bucket_name" not in enriched_customizations:
+    if service_type in {"s3", "s3_cloudfront"} and "bucket_name" not in enriched_customizations:
         suffix = secrets.token_hex(3)  # 6 hex chars
         base = repo_context.get("project_name", "deplai-bucket")
         enriched_customizations["bucket_name"] = f"{base}-{suffix}"
@@ -357,6 +358,7 @@ async def correct_params(
     Sends current params + exact error messages back to Claude for targeted correction.
     Returns corrected params dict.
     """
+    service_type = canonical_service_type(service_type)
     schema = get_param_schema(service_type)
     errors_text = "\n".join(validation_errors)
 

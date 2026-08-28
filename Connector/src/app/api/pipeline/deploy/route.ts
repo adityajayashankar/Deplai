@@ -7,6 +7,11 @@ import {
   SnapshotResolutionError,
   type CustomizationSnapshotSource,
 } from '@/lib/customization-snapshot';
+import {
+  resolveOrCreateSession,
+  tryAppendSessionLogs,
+} from '@/lib/sessions/store';
+import type { SessionStatus } from '@/lib/sessions/types';
 
 const AGENTIC_KEY = process.env.DEPLAI_SERVICE_KEY ?? '';
 
@@ -55,6 +60,7 @@ interface DeployBody {
   required_secret_keys?: string[];
   secrets_manager_prefix?: string;
   environment?: string;
+  workspace_session_id?: string;
 }
 
 function resolveAgenticOrigin(): string {
@@ -659,6 +665,7 @@ function normalizeDeploymentRuntime(payload: {
   outputs?: Record<string, unknown> | null;
   details?: Record<string, unknown> | null;
   runtimeDetails?: Record<string, unknown> | null;
+  oneTimeCredentials?: Record<string, unknown> | null;
 }): {
   keypair: Record<string, string | null>;
   ec2: Record<string, string | null>;
@@ -668,6 +675,7 @@ function normalizeDeploymentRuntime(payload: {
   const outputs = payload.outputs || {};
   const details = payload.details || {};
   const runtime = payload.runtimeDetails || {};
+  const oneTime = payload.oneTimeCredentials || {};
   const liveInstance = (runtime.instance && typeof runtime.instance === 'object')
     ? runtime.instance as Record<string, unknown>
     : null;
@@ -676,15 +684,17 @@ function normalizeDeploymentRuntime(payload: {
     {
       ...outputs,
       ...details,
+      ...oneTime,
     },
     ['ec2_key_name', 'generated_ec2_key_name', 'key_name'],
   );
   const privateKeyPem = extractStringFromRecord(
     {
+      ...oneTime,
       ...outputs,
       ...details,
     },
-    ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem'],
+    ['private_key_pem', 'generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem'],
   );
   const cloudfrontUrlRaw = normalizeScalar(payload.cloudfrontUrl)
     || extractOutputString(outputs, ['cloudfront_url'])
@@ -743,35 +753,41 @@ function normalizeDeploymentRuntime(payload: {
   };
 }
 
+function filesTextBySuffix(files: GeneratedFile[], suffix: string): string {
+  const needle = suffix.toLowerCase();
+  return files
+    .filter((file) => normalizePath(String(file.path || '')).toLowerCase().endsWith(needle))
+    .map((file) => String(file.content || ''))
+    .join('\n');
+}
+
 function containsAwsInstanceResource(files: GeneratedFile[]): boolean {
+  const tfvars = filesTextBySuffix(files, '.tfvars');
+  if (/^\s*compute_strategy\s*=\s*"(s3_cloudfront|cloudfront|s3cloudfront|static_site)"\s*$/im.test(tfvars)) {
+    return false;
+  }
+  const enableEc2False = /^\s*enable_ec2\s*=\s*false\s*$/im.test(tfvars);
+  const enableEc2True = /^\s*enable_ec2\s*=\s*true\s*$/im.test(tfvars);
+  if (enableEc2False && !enableEc2True) return false;
+
   return files.some((file) => {
     const path = normalizePath(String(file.path || '')).toLowerCase();
     if (!path.endsWith('.tf')) return false;
     const content = String(file.content || '');
-    return /resource\s+"aws_instance"\s+"[^"]+"/i.test(content);
+    return /resource\s+"aws_instance"\s+"[^"]+"/i.test(content)
+      || /terraform-aws-modules\/ec2-instance\/aws/i.test(content)
+      || /module\s+"(ec2|compute)"\s*\{/i.test(content);
   });
 }
 
-function containsRdsOrElasticacheResource(files: GeneratedFile[]): boolean {
-  return files.some((file) => {
-    const path = normalizePath(String(file.path || '')).toLowerCase();
-    if (!path.endsWith('.tf')) return false;
-    const content = String(file.content || '');
-    return /resource\s+"aws_db_instance"/i.test(content)
-      || /source\s*=\s*"terraform-aws-modules\/rds\//i.test(content)
-      || /resource\s+"aws_elasticache/i.test(content)
-      || /module\s+"db"\s*\{/i.test(content)
-      || /module\s+"rds"\s*\{/i.test(content);
-  });
+function liveDatabaseEndpoints(outputs: Record<string, unknown> | null | undefined): boolean {
+  return Boolean(
+    extractOutputString(outputs, ['rds_endpoint', 'rds_address', 'db_endpoint', 'postgres_endpoint'])
+    || extractOutputString(outputs, ['redis_endpoint', 'elasticache_endpoint', 'cache_endpoint']),
+  );
 }
 
 function detectStaleAwsTerraformBundle(files: GeneratedFile[]): string[] {
-  const normalizedPaths = new Set(files.map((file) => normalizePath(String(file.path || ''))));
-  const isCloudPosseAtmosBundle = normalizedPaths.has('atmos.yaml')
-    && normalizedPaths.has('vendor.yaml')
-    && normalizedPaths.has('.deplai/cloudposse-component-lock.json');
-  if (isCloudPosseAtmosBundle) return [];
-
   const tfFiles = files
     .filter((file) => normalizePath(String(file.path || '')).toLowerCase().endsWith('.tf'))
     .map((file) => String(file.content || ''));
@@ -799,12 +815,6 @@ function detectStaleAwsTerraformBundle(files: GeneratedFile[]): string[] {
   const hasLegacyOacName = /resource\s+"aws_cloudfront_origin_access_control"\s+"oac"\s*\{[\s\S]*?name\s*=\s*"\$\{var\.project_name\}-oac"/i.test(combined);
   if (hasLegacyOacName) {
     reasons.push('CloudFront OAC name is static and may collide on reruns.');
-  }
-
-  const hasExistingKeyPairVar = /variable\s+"existing_ec2_key_pair_name"\s*\{/i.test(combined);
-  const hasGeneratedKeyPair = /resource\s+"aws_key_pair"\s+"generated"\s*\{/i.test(combined);
-  if (hasGeneratedKeyPair && !hasExistingKeyPairVar) {
-    reasons.push('EC2 key pair reuse variable is missing; duplicate key-pair imports can fail.');
   }
 
   return reasons;
@@ -859,6 +869,39 @@ export async function POST(req: NextRequest) {
 
     const provider = clampProvider(body.provider);
     const projectName = String(owned.project?.name || owned.project?.full_name || projectId).split('/').pop() || projectId;
+    const incomingSessionId = String(body.workspace_session_id || '').trim();
+    const bindDeploySession = async (
+      payload: Record<string, unknown>,
+      status: SessionStatus,
+      stage: string,
+      message?: string,
+    ) => {
+      try {
+        const session = await resolveOrCreateSession(incomingSessionId, {
+          userId: user.id,
+          projectId,
+          service: 'deploy',
+          title: `Deploy · ${projectName}`,
+          repo: projectName,
+          status,
+          currentStage: stage,
+          triggeredBy: user.id,
+          externalId: typeof payload.run_id === 'string' ? payload.run_id : null,
+          metadata: { run_id: payload.run_id || null, mode: payload.mode || null },
+        });
+        if (session && message) {
+          await tryAppendSessionLogs(session.id, [{
+            level: status === 'failed' ? 'error' : 'info',
+            message,
+            stage,
+          }]);
+        }
+        return { ...payload, workspace_session_id: session?.id ?? (incomingSessionId || null) };
+      } catch (sessionError) {
+        console.error('[sessions] deploy hook failed', sessionError);
+        return { ...payload, workspace_session_id: incomingSessionId || null };
+      }
+    };
     const customizationSnapshotId = String(body.customization_snapshot_id || '').trim();
     const tenantId = String(body.tenant_id || '').trim();
     if (Boolean(customizationSnapshotId) !== Boolean(tenantId)) {
@@ -969,14 +1012,14 @@ export async function POST(req: NextRequest) {
       }
 
       const { run_id, status } = await agenticRes.json();
-      return NextResponse.json({
+      return NextResponse.json(await bindDeploySession({
         success: true,
         mode: 'iac_pipeline',
         provider: 'aws',
         run_id,
         service_type: normalizeServiceType(String(body.service_type || 'ec2')),
         status,
-      });
+      }, 'running', 'pipeline', 'IaC pipeline started.'));
     }
 
     const runId = String(body.run_id || '').trim();
@@ -1152,8 +1195,19 @@ export async function POST(req: NextRequest) {
       };
       const applyStatus = String(applyData.status || '').trim().toLowerCase();
       const runtimeOutputPayload = (applyData.outputs as Record<string, unknown> | null | undefined) ?? undefined;
+      const oneTimeCredentials = (
+        applyData.one_time_credentials
+        && typeof applyData.one_time_credentials === 'object'
+        && !Array.isArray(applyData.one_time_credentials)
+      ) ? applyData.one_time_credentials as Record<string, unknown> : null;
+      if (oneTimeCredentials && runtimeOutputPayload) {
+        const pem = String(oneTimeCredentials.private_key_pem || '').trim();
+        const keyName = String(oneTimeCredentials.key_name || '').trim();
+        if (pem) runtimeOutputPayload.generated_ec2_private_key_pem = pem;
+        if (keyName) runtimeOutputPayload.ec2_key_name = keyName;
+      }
       if (applyStatus === 'awaiting_plan_confirmation') {
-        return NextResponse.json({
+        return NextResponse.json(await bindDeploySession({
           success: true,
           provider,
           project_id: projectId,
@@ -1163,7 +1217,7 @@ export async function POST(req: NextRequest) {
           plan_summary: applyData.plan_summary || applyDetails.plan_summary || null,
           details: applyDetails,
           ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
-        });
+        }, 'needs_review', 'apply', 'Terraform plan is ready for confirmation.'));
       }
       if ((agenticRes && !agenticRes.ok) || applyData.success !== true) {
         const upstreamError = String(applyData.error || 'Runtime Terraform apply failed.');
@@ -1205,6 +1259,7 @@ export async function POST(req: NextRequest) {
               outputs: runtimeOutputPayload,
               details: mergedDetails,
               runtimeDetails: recoveredRuntimeDetails,
+              oneTimeCredentials,
             });
             const verification = await waitForRuntimeVerification({
               cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
@@ -1215,21 +1270,36 @@ export async function POST(req: NextRequest) {
               publicIp: normalizedRuntime.network.elastic_ip || normalizedRuntime.ec2.public_ip,
             });
             if (!verification.verified) {
-              return NextResponse.json(
-                {
-                  error: 'Deployment provisioned infrastructure but no live endpoint became reachable after apply.',
-                  details: {
-                    verification_checks: verification.checks,
-                    live_runtime_details: recoveredRuntimeDetails,
-                    apply_details: mergedDetails,
-                  },
-                  outputs: runtimeOutputPayload ?? {},
-                },
-                { status: 409 },
-              );
+              return NextResponse.json(await bindDeploySession({
+                success: true,
+                provider,
+                project_id: projectId,
+                mode: 'runtime_apply',
+                app_url: normalizedRuntime.cdn.app_url
+                  || (normalizedRuntime.ec2.public_ip ? `http://${normalizedRuntime.ec2.public_ip}` : null),
+                cloudfront_url: normalizedRuntime.cdn.cloudfront_url,
+                alb_url: normalizedRuntime.network.alb_url,
+                alb_dns_name: normalizedRuntime.network.alb_dns_name,
+                elastic_ip: normalizedRuntime.network.elastic_ip,
+                outputs: runtimeOutputPayload ?? {},
+                raw_outputs: runtimeOutputPayload ?? {},
+                details: mergedDetails,
+                customization_source: customizationSource,
+                ec2_key_name: normalizedRuntime.keypair.key_name,
+                generated_ec2_private_key_pem: normalizedRuntime.keypair.private_key_pem,
+                keypair: normalizedRuntime.keypair,
+                one_time_credentials: oneTimeCredentials,
+                ec2: normalizedRuntime.ec2,
+                network: normalizedRuntime.network,
+                cdn: normalizedRuntime.cdn,
+                status: 'needs_review',
+                deployment_verified: false,
+                partial_deployment: true,
+                verification_checks: verification.checks,
+              }, 'needs_review', 'apply', 'EC2 is up in AWS; the app endpoint is still booting.'));
             }
 
-            return NextResponse.json({
+            return NextResponse.json(await bindDeploySession({
               success: true,
               provider,
               project_id: projectId,
@@ -1248,6 +1318,7 @@ export async function POST(req: NextRequest) {
               ec2_key_name: normalizedRuntime.keypair.key_name,
               generated_ec2_private_key_pem: normalizedRuntime.keypair.private_key_pem,
               keypair: normalizedRuntime.keypair,
+              one_time_credentials: oneTimeCredentials,
               ec2: normalizedRuntime.ec2,
               network: normalizedRuntime.network,
               cdn: normalizedRuntime.cdn,
@@ -1260,7 +1331,7 @@ export async function POST(req: NextRequest) {
               verification_checks: verification.checks,
               recovered_from_apply_error: true,
               ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
-            });
+            }, 'completed', 'apply', 'Runtime apply recovered after a transport error.'));
           }
         }
         const staleError = staleBundleWarning
@@ -1284,7 +1355,7 @@ export async function POST(req: NextRequest) {
       }
 
       const expectedEc2 = containsAwsInstanceResource(baseFiles);
-      const hasDbResources = containsRdsOrElasticacheResource(baseFiles);
+      const hasDbResources = liveDatabaseEndpoints(runtimeOutputPayload);
       const ec2FallbackApplied = Boolean(applyDetails?.ec2_fallback_applied);
       const provisioningReport = applyData.provisioning_report || applyDetails?.provisioning_report;
       const runtimeDetails = awsAccessKeyId && awsSecretAccessKey
@@ -1300,12 +1371,12 @@ export async function POST(req: NextRequest) {
       const ec2InstanceId = extractInstanceIdFromRuntimeDetails(runtimeDetails)
         || extractOutputString(runtimeOutputPayload, ['ec2_instance_id', 'instance_id']);
 
-      if (expectedEc2 && (ec2FallbackApplied || !ec2InstanceId) && !hasDbResources) {
+      if (expectedEc2 && (ec2FallbackApplied || !ec2InstanceId)) {
         return NextResponse.json(
           {
             error: ec2FallbackApplied
               ? 'Deployment incomplete: EC2 provisioning was disabled by quota fallback, so required EC2 resources were not created.'
-              : 'Deployment incomplete: Terraform apply succeeded but no EC2 instance was provisioned.',
+              : 'Deployment incomplete: Terraform apply succeeded but no EC2 instance was provisioned in AWS.',
             details: {
               expected_ec2: true,
               ec2_fallback_applied: ec2FallbackApplied,
@@ -1329,6 +1400,8 @@ export async function POST(req: NextRequest) {
         outputs: runtimeOutputPayload,
         details: mergedDetails,
         runtimeDetails,
+        oneTimeCredentials,
+      });
       });
       const verification = await waitForRuntimeVerification({
         cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
@@ -1338,10 +1411,10 @@ export async function POST(req: NextRequest) {
         healthCheckUrl: extractOutputString(runtimeOutputPayload, ['health_check_url', 'health_url']),
         publicIp: normalizedRuntime.network.elastic_ip || normalizedRuntime.ec2.public_ip,
       });
-      if (!verification.verified && !hasDbResources) {
+      if (!verification.verified && expectedEc2 && !ec2InstanceId) {
         return NextResponse.json(
           {
-            error: 'Deployment provisioned infrastructure but no live endpoint became reachable after apply.',
+            error: 'Deployment incomplete: Terraform apply succeeded but no EC2 instance was provisioned in AWS.',
             details: {
               verification_checks: verification.checks,
               live_runtime_details: runtimeDetails,
@@ -1353,7 +1426,7 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      return NextResponse.json({
+      return NextResponse.json(await bindDeploySession({
         success: true,
         provider,
         project_id: projectId,
@@ -1373,21 +1446,23 @@ export async function POST(req: NextRequest) {
         ec2_key_name: normalizedRuntime.keypair.key_name,
         generated_ec2_private_key_pem: normalizedRuntime.keypair.private_key_pem,
         keypair: normalizedRuntime.keypair,
+        one_time_credentials: oneTimeCredentials,
         ec2: normalizedRuntime.ec2,
         network: normalizedRuntime.network,
         cdn: normalizedRuntime.cdn,
-        status: 'deployed',
-        provisioning_report: provisioningReport,
+        status: verification.verified ? 'deployed' : 'needs_review',
         has_database_resources: hasDbResources,
         deployment_summary: buildDeploymentSummary({
           outputs: runtimeOutputPayload ?? {},
           normalizedRuntime,
         }),
         deployment_verified: verification.verified,
-        partial_deployment: hasDbResources ? !verification.verified : false,
+        partial_deployment: Boolean(expectedEc2 && ec2InstanceId && !verification.verified),
         verification_checks: verification.checks,
         ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
-      });
+      }, verification.verified ? 'completed' : 'needs_review', 'apply', verification.verified
+        ? 'Runtime Terraform apply finished.'
+        : 'Infrastructure is in AWS; the app endpoint is still booting.'));
     }
 
     const githubPat = String(body.github_pat || '').trim();

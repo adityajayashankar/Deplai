@@ -12,11 +12,14 @@ import io
 import json
 import os
 import re
+import secrets
 import sys
 import tarfile
+import time
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import quote
 
 import boto3
 from botocore.config import Config
@@ -26,12 +29,14 @@ from docker.errors import ContainerError
 from utils import decode_output, ensure_docker_image, get_docker_client
 
 TERRAFORM_IMAGE = "hashicorp/terraform:1.9.0"
-DEFAULT_ATMOS_IMAGE = "ghcr.io/cloudposse/atmos:1.185.0"
+# Docker Desktop's embedded resolver (192.168.65.7) can fail mid-apply
+# ("no such host" for rds.<region>.amazonaws.com). Public resolvers keep
+# long RDS/ElastiCache waits from dying on a transient lookup.
+_TERRAFORM_DNS_SERVERS = ["8.8.8.8", "1.1.1.1"]
 _EC2_STANDARD_FAMILY_PREFIXES = {"a", "c", "d", "h", "i", "m", "r", "t", "z"}
 _EC2_STANDARD_ONDEMAND_VCPU_QUOTA_CODE = "L-1216C47A"
 _SAFE_EC2_INSTANCE_ORDER = ["t3.micro", "t2.micro", "t3a.micro", "t3.small", "t2.small"]
 _DEFAULT_FREE_TIER_INSTANCE_ORDER = ["t3.micro", "t2.micro"]
-_ATMOS_DEPLOY_ORDER = ["ec2-instance", "rds", "elasticache"]
 _REQUIRED_IAM_POLICY_HINTS = [
     "ec2:*",
     "vpc:*",
@@ -116,26 +121,6 @@ def _redact_sensitive_text(text: str, secrets: list[str]) -> str:
             continue
         redacted = redacted.replace(token, "***")
     return redacted
-
-
-def _atmos_sequence(sequence: list[str]) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in sequence:
-        component = str(item or "").strip()
-        if not component or component in seen:
-            continue
-        seen.add(component)
-        normalized.append(component)
-
-    ordered: list[str] = []
-    for required in _ATMOS_DEPLOY_ORDER:
-        if required in normalized:
-            ordered.append(required)
-    for item in normalized:
-        if item not in ordered:
-            ordered.append(item)
-    return ordered
 
 
 def _parse_plan_change_counts(plan_output: str) -> dict[str, int]:
@@ -259,14 +244,21 @@ def _write_files_to_volume(volume_name: str, files: list[dict[str, Any]]) -> Non
             pass
 
 
+def _terraform_run_kwargs(volume_name: str, env: dict[str, str]) -> dict[str, Any]:
+    return {
+        "environment": env,
+        "volumes": {volume_name: {"bind": "/workspace", "mode": "rw"}},
+        "dns": list(_TERRAFORM_DNS_SERVERS),
+    }
+
+
 def _run_terraform(volume_name: str, tf_root: str, args: list[str], env: dict[str, str]) -> str:
     ensure_docker_image(TERRAFORM_IMAGE)
     output = get_docker_client().containers.run(
         TERRAFORM_IMAGE,
         command=[f"-chdir={tf_root}", *args],
-        environment=env,
-        volumes={volume_name: {"bind": "/workspace", "mode": "rw"}},
         remove=True,
+        **_terraform_run_kwargs(volume_name, env),
     )
     return decode_output(output)
 
@@ -289,8 +281,7 @@ def _run_terraform_with_tracking(
     container = docker.containers.create(
         TERRAFORM_IMAGE,
         command=[f"-chdir={tf_root}", *args],
-        environment=env,
-        volumes={volume_name: {"bind": "/workspace", "mode": "rw"}},
+        **_terraform_run_kwargs(volume_name, env),
     )
     if apply_context is not None:
         apply_context["container_id"] = container.id
@@ -339,30 +330,6 @@ def _run_terraform_with_tracking(
             container.remove(force=True)
         except Exception:
             pass
-
-
-def _atmos_image() -> str:
-    return os.getenv("DEPLAI_ATMOS_IMAGE", DEFAULT_ATMOS_IMAGE).strip() or DEFAULT_ATMOS_IMAGE
-
-
-def _is_cloudposse_atmos_bundle(files: list[dict[str, Any]]) -> bool:
-    return False
-
-
-def _cloudposse_lock_payload(files: list[dict[str, Any]]) -> dict[str, Any]:
-    for item in files:
-        if _normalize_rel_path(str(item.get("path", ""))) == ".deplai/cloudposse-component-lock.json":
-            payload = json.loads(_extract_text_payload(item) or "{}")
-            if not isinstance(payload, dict):
-                raise ValueError("Cloud Posse component lock must be a JSON object.")
-            sequence = payload.get("deploy_sequence")
-            if not isinstance(sequence, list) or not all(str(component).strip() for component in sequence):
-                raise ValueError("Cloud Posse component lock is missing a valid deploy_sequence.")
-            stack = str(payload.get("stack") or "").strip()
-            if not stack:
-                raise ValueError("Cloud Posse component lock is missing stack.")
-            return payload
-    raise ValueError("Cloud Posse component lock file not found.")
 
 
 def _required_policy_hints(include_rds: bool = False) -> list[str]:
@@ -454,924 +421,6 @@ def _run_iam_permission_preflight(
     }
 
 
-def _state_backend_names(
-    *,
-    project_name: str,
-    account_id: str,
-    state_bucket_override: str,
-    lock_table_override: str,
-) -> tuple[str, str]:
-    slug = re.sub(r"[^a-z0-9-]+", "-", str(project_name or "").strip().lower())
-    slug = re.sub(r"-{2,}", "-", slug).strip("-")[:32] or "deplai-project"
-    bucket = str(state_bucket_override or "").strip() or f"{slug}-terraform-state-{account_id}"
-    table = str(lock_table_override or "").strip() or f"{slug}-terraform-locks"
-    return bucket, table
-
-
-def _inject_atmos_backend_vars(
-    files: list[dict[str, Any]],
-    *,
-    stack: str,
-    state_bucket: str,
-    lock_table: str,
-    aws_region: str,
-) -> list[dict[str, Any]]:
-    updated = [dict(item) for item in files]
-    stack_path = f"stacks/deploy/{stack}.yaml"
-
-    for idx, item in enumerate(updated):
-        rel = _normalize_rel_path(str(item.get("path", "")))
-        if rel != stack_path:
-            continue
-        raw_text = _extract_text_payload(item)
-
-        # Stack files are emitted as YAML. Rewriting YAML as JSON strips component
-        # definitions and causes Atmos to fail with "component not found" errors.
-        # Keep YAML stacks unchanged; backend config is already supplied via TF_CLI_ARGS_init.
-        stripped = str(raw_text or "").lstrip()
-        if not stripped.startswith("{"):
-            return updated
-
-        try:
-            payload = json.loads(raw_text or "{}")
-        except Exception:
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-        vars_payload = payload.get("vars") if isinstance(payload.get("vars"), dict) else {}
-        vars_payload["terraform_backend_type"] = "s3"
-        vars_payload["terraform_state_bucket"] = state_bucket
-        vars_payload["terraform_state_lock_table"] = lock_table
-        vars_payload["terraform_state_region"] = aws_region
-        vars_payload["terraform_state_key"] = f"{stack}/terraform.tfstate"
-        payload["vars"] = vars_payload
-        updated[idx] = _set_text_payload(updated[idx], json.dumps(payload, indent=2, sort_keys=False) + "\n")
-        break
-    return updated
-
-
-def _run_workspace_shell_with_tracking(
-    volume_name: str,
-    shell_command: str,
-    env: dict[str, str],
-    command_label: str | None = None,
-    apply_context: dict[str, Any] | None = None,
-) -> str:
-    if apply_context and apply_context.get("cancel_requested"):
-        raise RuntimeError("Atmos apply cancelled by user.")
-
-    label = str(command_label or "workspace patch command").strip() or "workspace patch command"
-    _emit_progress(apply_context, "info", f"Running {label}...")
-    docker = get_docker_client()
-    container = docker.containers.create(
-        _atmos_image(),
-        command=["sh", "-lc", f"cd /workspace && {shell_command}"],
-        environment=env,
-        volumes={volume_name: {"bind": "/workspace", "mode": "rw"}},
-    )
-    if apply_context is not None:
-        apply_context["container_id"] = container.id
-
-    secrets = [
-        env.get("AWS_ACCESS_KEY_ID", ""),
-        env.get("AWS_SECRET_ACCESS_KEY", ""),
-        env.get("AWS_SESSION_TOKEN", ""),
-    ]
-    logs: list[str] = []
-    try:
-        container.start()
-        for chunk in container.logs(stream=True, stdout=True, stderr=True, follow=True):
-            text = _redact_sensitive_text(decode_output(chunk), secrets)
-            if not text:
-                continue
-            logs.append(text)
-            for line in text.splitlines():
-                stripped = line.strip()
-                if stripped:
-                    _emit_progress(apply_context, "info", f"[workspace] {stripped}")
-            if apply_context and apply_context.get("cancel_requested"):
-                try:
-                    container.kill()
-                except Exception:
-                    pass
-                raise RuntimeError("Atmos apply cancelled by user.")
-
-        result = container.wait()
-        raw_status = result.get("StatusCode") if isinstance(result, dict) else result
-        try:
-            status = int(raw_status)
-        except Exception:
-            status = 1
-        if status != 0:
-            raise RuntimeError("".join(logs).strip() or f"workspace command failed (exit {status})")
-        return "".join(logs)
-    finally:
-        if apply_context is not None:
-            apply_context["container_id"] = None
-        try:
-            container.remove(force=True)
-        except Exception:
-            pass
-
-
-def _run_atmos_with_tracking(
-    volume_name: str,
-    args: list[str],
-    env: dict[str, str],
-    apply_context: dict[str, Any] | None = None,
-) -> str:
-    if apply_context and apply_context.get("cancel_requested"):
-        raise RuntimeError("Atmos apply cancelled by user.")
-
-    command_text = " ".join(args)
-    _emit_progress(apply_context, "info", f"Running atmos {command_text}...")
-
-    docker = get_docker_client()
-    container = docker.containers.create(
-        _atmos_image(),
-        command=["sh", "-lc", f"cd /workspace && atmos {command_text}"],
-        environment=env,
-        volumes={volume_name: {"bind": "/workspace", "mode": "rw"}},
-    )
-    if apply_context is not None:
-        apply_context["container_id"] = container.id
-    secrets = [
-        env.get("AWS_ACCESS_KEY_ID", ""),
-        env.get("AWS_SECRET_ACCESS_KEY", ""),
-        env.get("AWS_SESSION_TOKEN", ""),
-    ]
-    collected: list[str] = []
-    try:
-        container.start()
-        for chunk in container.logs(stream=True, stdout=True, stderr=True, follow=True):
-            text = _redact_sensitive_text(decode_output(chunk), secrets)
-            if not text:
-                continue
-            collected.append(text)
-            for line in text.splitlines():
-                stripped = line.strip()
-                if stripped:
-                    _emit_progress(apply_context, "info", f"[atmos] {stripped}")
-            if apply_context and apply_context.get("cancel_requested"):
-                try:
-                    container.kill()
-                except Exception:
-                    pass
-                raise RuntimeError("Atmos apply cancelled by user.")
-
-        result = container.wait()
-        raw_status = result.get("StatusCode") if isinstance(result, dict) else result
-        try:
-            status_code = int(raw_status)
-        except Exception:
-            status_code = 1
-        logs = "".join(collected)
-        if status_code != 0:
-            _emit_progress(apply_context, "error", f"atmos {command_text} failed.")
-            raise RuntimeError(logs or f"atmos command failed (exit {status_code})")
-        _emit_progress(apply_context, "success", f"atmos {command_text} completed.")
-        return logs
-    finally:
-        if apply_context is not None:
-            apply_context["container_id"] = None
-        try:
-            container.remove(force=True)
-        except Exception:
-            pass
-
-
-def _normalize_atmos_outputs(raw: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(raw or "{}")
-    except Exception:
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    outputs: dict[str, Any] = {}
-    for key, value in payload.items():
-        if isinstance(value, dict) and "value" in value:
-            outputs[key] = value.get("value")
-        else:
-            outputs[key] = value
-    return outputs
-
-
-def _apply_direct_provider_patch(
-    volume_name: str,
-    env: dict[str, str],
-    apply_context: dict[str, Any] | None,
-) -> str:
-    patch_script = """set -eu
-
-target_aws_version="5.100.0"
-compat_failures=""
-
-normalize_version() {
-    raw="$1"
-    cleaned=$(printf '%s' "$raw" | sed 's/^[^0-9]*//; s/[^0-9.].*$//')
-    major=$(printf '%s' "$cleaned" | cut -d. -f1)
-    minor=$(printf '%s' "$cleaned" | cut -d. -f2)
-    patch=$(printf '%s' "$cleaned" | cut -d. -f3)
-    major=${major:-0}
-    minor=${minor:-0}
-    patch=${patch:-0}
-    printf '%06d%06d%06d' "$major" "$minor" "$patch"
-}
-
-version_gt() {
-    left=$(normalize_version "$1")
-    right=$(normalize_version "$2")
-    [ "$left" \> "$right" ]
-}
-
-version_ge() {
-    left=$(normalize_version "$1")
-    right=$(normalize_version "$2")
-    [ "$left" = "$right" ] || [ "$left" \> "$right" ]
-}
-
-requires_above_target() {
-    constraint="$1"
-    old_ifs="$IFS"
-    IFS=','
-    for token in $constraint; do
-        trimmed=$(printf '%s' "$token" | tr -d '[:space:]')
-        [ -z "$trimmed" ] && continue
-
-        op=""
-        version=""
-        case "$trimmed" in
-            ">="*)
-                op="ge"
-                version=${trimmed#>=}
-                ;;
-            ">"*)
-                op="gt"
-                version=${trimmed#>}
-                ;;
-            "~>"*)
-                op="ge"
-                version=${trimmed#~>}
-                ;;
-            "="*)
-                op="eq"
-                version=${trimmed#=}
-                ;;
-            [0-9]*)
-                op="eq"
-                version="$trimmed"
-                ;;
-            *)
-                continue
-                ;;
-        esac
-
-        if [ "$op" = "gt" ]; then
-            if version_ge "$version" "$target_aws_version"; then
-                IFS="$old_ifs"
-                return 0
-            fi
-            continue
-        fi
-
-        if version_gt "$version" "$target_aws_version"; then
-            IFS="$old_ifs"
-            return 0
-        fi
-    done
-    IFS="$old_ifs"
-    return 1
-}
-
-for component in ec2-instance rds elasticache; do
-  target="components/terraform/$component/providers.tf"
-  if [ -f "$target" ]; then
-        cat > "$target" << 'TFEOF'
-provider "aws" {
-  region = var.region
-}
-TFEOF
-        echo "Patched providers.tf for $component"
-    fi
-done
-
-for component in ec2-instance rds elasticache; do
-    vtf="components/terraform/$component/versions.tf"
-    if [ -f "$vtf" ]; then
-        echo "[$component] versions.tf aws constraint:"
-        grep -A2 'hashicorp/aws' "$vtf" || true
-        constraint=$(awk -F'"' '
-            /required_providers/ { in_required=1 }
-            in_required && /aws[[:space:]]*=/ { in_aws=1 }
-            in_required && in_aws && /version[[:space:]]*=/ { print $2; exit }
-            in_required && in_aws && /^[[:space:]]*}/ { in_aws=0 }
-        ' "$vtf")
-        if [ -n "$constraint" ] && requires_above_target "$constraint"; then
-            echo "ERROR: [$component] versions.tf requires aws constraint '$constraint' which is incompatible with hashicorp/aws v$target_aws_version"
-            compat_failures="$compat_failures $component"
-        fi
-  fi
-done
-
-if [ -n "$compat_failures" ]; then
-    echo "ERROR: versions.tf compatibility check failed for:$compat_failures"
-    exit 1
-fi
-"""
-    return _run_workspace_shell_with_tracking(
-        volume_name,
-        patch_script,
-        env,
-        command_label="workspace provider patch",
-        apply_context=apply_context,
-    )
-
-
-def _apply_terraform_syntax_compat_patch(
-    volume_name: str,
-    env: dict[str, str],
-    apply_context: dict[str, Any] | None,
-) -> str:
-    patch_script = """set +e
-
-for tf_file in $(find components/terraform -name "*.tf" 2>/dev/null); do
-  if grep -q '[^a-z]map(' "$tf_file" 2>/dev/null; then
-    # Best-effort compatibility rewrite for legacy map(key, value) patterns.
-    perl -i -pe 's/\bmap\((.+),\s*"([^"]+)"\)/tomap({\1 = "\2"})/g' "$tf_file"
-    echo "Patched map() -> tomap() in $tf_file"
-  fi
-  
-  # Fix AWS Provider v6 compatibility: replace 'vpc = true' with 'domain = "vpc"' in aws_eip resources
-  if grep -q 'resource "aws_eip"' "$tf_file" 2>/dev/null; then
-    if grep -q 'vpc[[:space:]]*=[[:space:]]*true' "$tf_file" 2>/dev/null; then
-      # Try perl first (preferred for complex regex), fall back to sed
-      # Important: Always preserve at least one space around = for valid HCL syntax
-      if command -v perl >/dev/null 2>&1; then
-        perl -i -pe 's/vpc\s*=\s*true/domain = "vpc"/g' "$tf_file"
-      else
-        sed -i 's/vpc[[:space:]]*=[[:space:]]*true/domain = "vpc"/g' "$tf_file"
-      fi
-      echo "Patched EIP vpc=true -> domain=\"vpc\" in $tf_file (AWS Provider v6 compatibility)"
-    fi
-  fi
-done
-
-exit 0
-"""
-    return _run_workspace_shell_with_tracking(
-        volume_name,
-        patch_script,
-        env,
-        command_label="workspace syntax compatibility patch",
-        apply_context=apply_context,
-    )
-
-
-def _apply_required_var_defaults_patch(
-        volume_name: str,
-        env: dict[str, str],
-        apply_context: dict[str, Any] | None,
-        *,
-        stack: str,
-        deploy_sequence: list[str],
-) -> str:
-        components = " ".join(str(item).strip() for item in deploy_sequence if str(item).strip())
-        patch_script = f"""set +e
-
-stack_file="stacks/deploy/{stack}.yaml"
-[ -f "$stack_file" ] || exit 0
-
-component_has_var() {{
-    component="$1"
-    key="$2"
-    awk -v comp="$component" -v key="$key" '
-        $0 ~ "^    " comp ":" {{ in_comp=1; in_vars=0; next }}
-        in_comp && $0 ~ "^    [^ ]" {{ in_comp=0; in_vars=0 }}
-        in_comp && $0 ~ "^      vars:" {{ in_vars=1; next }}
-        in_comp && in_vars && $0 ~ "^      [^ ]" {{ in_vars=0 }}
-        in_comp && in_vars && $0 ~ ("^[[:space:]]*" key ":") {{ found=1 }}
-        END {{ exit(found ? 0 : 1) }}
-    ' "$stack_file"
-}}
-
-inject_var_default() {{
-    component="$1"
-    key="$2"
-    value="$3"
-
-    if component_has_var "$component" "$key"; then
-        return
-    fi
-
-    tmp_file="${{stack_file}}.tmp"
-    awk -v comp="$component" -v key="$key" -v value="$value" '
-        $0 ~ "^    " comp ":" {{ in_comp=1; in_vars=0 }}
-        in_comp && $0 ~ "^    [^ ]" && $0 !~ "^    " comp ":" {{ in_comp=0; in_vars=0 }}
-        if (in_comp && $0 ~ "^      vars:") {{
-            print $0
-            print "        " key ": " value
-            next
-        }}
-        print $0
-    ' "$stack_file" > "$tmp_file" && mv "$tmp_file" "$stack_file"
-    echo "Injected default ${{component}}.${{key}}=${{value}}"
-}}
-
-parse_required_vars() {{
-    vars_file="$1"
-    awk '
-        /^[[:space:]]*variable[[:space:]]+"[^"]+"[[:space:]]*{{/ {{
-            name=$0
-            sub(/^[[:space:]]*variable[[:space:]]+"/, "", name)
-            sub(/"[[:space:]]*\{{[[:space:]]*$/, "", name)
-            in_var=1
-            has_default=0
-            next
-        }}
-        in_var && /^[[:space:]]*default[[:space:]]*=/ {{ has_default=1 }}
-        in_var && /^[[:space:]]*\}}[[:space:]]*$/ {{
-            if (!has_default && name != "") print name
-            in_var=0
-            has_default=0
-            name=""
-        }}
-    ' "$vars_file"
-}}
-
-for component in {components}; do
-    vars_tf="components/terraform/${{component}}/variables.tf"
-    [ -f "$vars_tf" ] || continue
-
-    missing=""
-    for req in $(parse_required_vars "$vars_tf"); do
-        if ! component_has_var "$component" "$req"; then
-            missing="$missing $req"
-            case "$req" in
-                nat_instance_enabled)
-                    inject_var_default "$component" "$req" "false"
-                    ;;
-                nat_instance_type)
-                    inject_var_default "$component" "$req" '"t3.micro"'
-                    ;;
-                nat_instance_ami_id)
-                    inject_var_default "$component" "$req" '""'
-                    ;;
-                map_public_ip_on_launch)
-                    inject_var_default "$component" "$req" "true"
-                    ;;
-                deletion_protection)
-                    inject_var_default "$component" "$req" "false"
-                    ;;
-                multi_az)
-                    inject_var_default "$component" "$req" "false"
-                    ;;
-                publicly_accessible)
-                    inject_var_default "$component" "$req" "false"
-                    ;;
-                backup_retention_period)
-                    inject_var_default "$component" "$req" "7"
-                    ;;
-                vpc_id)
-                    inject_var_default "$component" "$req" '""'
-                    ;;
-                subnet)
-                    inject_var_default "$component" "$req" '""'
-                    ;;
-            esac
-        fi
-    done
-
-    if [ -n "$missing" ]; then
-        echo "[${{component}}] Missing required vars:$missing"
-    fi
-done
-
-exit 0
-"""
-        return _run_workspace_shell_with_tracking(
-                volume_name,
-                patch_script,
-                env,
-                command_label="workspace required-var defaults patch",
-                apply_context=apply_context,
-        )
-
-
-def _apply_cloudposse_atmos_bundle(
-    *,
-    volume_name: str,
-    files: list[dict[str, Any]],
-    project_name: str,
-    provider: str,
-    env: dict[str, str],
-    apply_context: dict[str, Any] | None,
-    confirm_apply: bool,
-) -> dict[str, Any]:
-    lock_payload = _cloudposse_lock_payload(files)
-    deploy_sequence = _atmos_sequence([str(item).strip() for item in lock_payload.get("deploy_sequence") or [] if str(item).strip()])
-    stack = str(lock_payload.get("stack") or "").strip()
-    outputs_to_capture = [str(item).strip() for item in lock_payload.get("outputs_to_capture") or [] if str(item).strip()]
-    vendor_log = ""
-    provider_patch_log = ""
-    syntax_patch_log = ""
-    required_var_defaults_log = ""
-    validate_log = ""
-    init_logs: dict[str, str] = {}
-    plan_logs: dict[str, str] = {}
-    plan_summary: dict[str, Any] = {
-        "total_resources": {"add": 0, "change": 0, "destroy": 0},
-        "per_component": {},
-        "estimated_monthly_cost_usd": None,
-    }
-    apply_logs: dict[str, str] = {}
-    successful_components: list[str] = []
-    outputs: dict[str, Any] = {}
-    component_outputs: dict[str, dict[str, Any]] = {}
-    try:
-        vendor_log = _run_atmos_with_tracking(volume_name, ["vendor", "pull"], env, apply_context=apply_context)
-        
-        # Discover actual variable names from vendored components
-        try:
-            vpc_vars_discovery = _run_workspace_shell_with_tracking(
-                volume_name,
-                """
-echo "=== VPC Component Variables (subnet-related) ==="
-grep -n "^variable" components/terraform/vpc/variables.tf 2>/dev/null | grep -i "subnet\\|public\\|private\\|count\\|per_az" | head -20 || echo "No vpc variables.tf found"
-echo ""
-echo "=== EC2 Component Variables (ami/user_data) ==="
-grep -n "^variable" components/terraform/ec2-instance/variables.tf 2>/dev/null | grep -i "ami\\|user_data" | head -10 || echo "No ec2-instance variables.tf found"
-""",
-                env,
-                command_label="discover component variables",
-                apply_context=apply_context,
-            )
-            _emit_progress(apply_context, "info", f"Component variable discovery:\n{vpc_vars_discovery}")
-        except Exception as exc:
-            _emit_progress(apply_context, "warning", f"Variable discovery skipped: {exc}")
-        
-        try:
-            provider_patch_log = _apply_direct_provider_patch(volume_name, env, apply_context)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Required patch failed: replace component providers with direct aws provider. Cannot continue. {exc}"
-            ) from exc
-
-        try:
-            syntax_patch_log = _apply_terraform_syntax_compat_patch(volume_name, env, apply_context)
-        except Exception as exc:
-            _emit_progress(
-                apply_context,
-                "warning",
-                f"Terraform syntax compatibility patch skipped: {exc}",
-            )
-
-        try:
-            required_var_defaults_log = _apply_required_var_defaults_patch(
-                volume_name,
-                env,
-                apply_context,
-                stack=stack,
-                deploy_sequence=deploy_sequence,
-            )
-        except Exception as exc:
-            _emit_progress(
-                apply_context,
-                "warning",
-                f"Required-var defaults patch skipped: {exc}",
-            )
-
-        validate_log = _run_atmos_with_tracking(volume_name, ["validate", "stacks"], env, apply_context=apply_context)
-
-        # Single sequential loop: init → plan → apply → output capture for each component
-        for component in deploy_sequence:
-            # Step 1: Initialize component
-            try:
-                init_logs[component] = _run_atmos_with_tracking(
-                    volume_name,
-                    ["terraform", "init", component, "-s", stack],
-                    env,
-                    apply_context=apply_context,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"atmos terraform init failed for component '{component}': {exc}"
-                ) from exc
-
-            # Step 2: Plan component with runtime variable injection for dependent components
-            try:
-                plan_args = ["terraform", "plan", component, "-s", stack, f"-out={component}.tfplan"]
-                
-                # EC2-specific: Look up default VPC and subnet, verify AMI exists before planning
-                if component == "ec2-instance":
-                    region = env.get("AWS_REGION", "us-east-1")
-                    
-                    # Look up default VPC
-                    try:
-                        vpc_lookup = _run_workspace_shell_with_tracking(
-                            volume_name,
-                            f'aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text --region {region}',
-                            env,
-                            command_label=f"lookup default VPC in {region}",
-                            apply_context=apply_context,
-                        )
-                        vpc_id = vpc_lookup.strip()
-                        if not vpc_id or vpc_id == "None" or "error" in vpc_id.lower():
-                            raise RuntimeError(
-                                f"No default VPC found in region {region}. "
-                                f"Create one with: aws ec2 create-default-vpc --region {region}"
-                            )
-                        _emit_progress(
-                            apply_context,
-                            "info",
-                            f"Found default VPC: {vpc_id}"
-                        )
-                    except Exception as exc:
-                        raise RuntimeError(
-                            f"Failed to lookup default VPC in {region}: {exc}"
-                        ) from exc
-                    
-                    # Look up first subnet in default VPC
-                    try:
-                        subnet_lookup = _run_workspace_shell_with_tracking(
-                            volume_name,
-                            f'aws ec2 describe-subnets --filters "Name=vpc-id,Values={vpc_id}" "Name=defaultForAz,Values=true" --query "Subnets[0].SubnetId" --output text --region {region}',
-                            env,
-                            command_label=f"lookup default subnet in {vpc_id}",
-                            apply_context=apply_context,
-                        )
-                        subnet_id = subnet_lookup.strip()
-                        if not subnet_id or subnet_id == "None" or "error" in subnet_id.lower():
-                            raise RuntimeError(
-                                f"No default subnet found in VPC {vpc_id}. "
-                                f"Check that default subnets exist in the VPC."
-                            )
-                        _emit_progress(
-                            apply_context,
-                            "info",
-                            f"Found default subnet: {subnet_id}"
-                        )
-                    except Exception as exc:
-                        raise RuntimeError(
-                            f"Failed to lookup default subnet in VPC {vpc_id}: {exc}"
-                        ) from exc
-                    
-                    # Dynamic AMI lookup for Amazon Linux 2023
-                    try:
-                        ami_lookup = _run_workspace_shell_with_tracking(
-                            volume_name,
-                            f'aws ec2 describe-images --owners amazon --filters "Name=name,Values=al2023-ami-2023*-x86_64" "Name=state,Values=available" "Name=architecture,Values=x86_64" --query "sort_by(Images, &CreationDate)[-1].ImageId" --output text --region {region}',
-                            env,
-                            command_label=f"lookup latest Amazon Linux 2023 AMI in {region}",
-                            apply_context=apply_context,
-                        )
-                        ami_id = ami_lookup.strip()
-                        if not ami_id or ami_id == "None" or "error" in ami_id.lower():
-                            raise RuntimeError(
-                                f"No Amazon Linux 2023 AMI found in region {region}. "
-                                f"Check AWS Marketplace or use a different region."
-                            )
-                        _emit_progress(
-                            apply_context,
-                            "info",
-                            f"Found Amazon Linux 2023 AMI: {ami_id}"
-                        )
-                    except Exception as exc:
-                        raise RuntimeError(
-                            f"Failed to lookup Amazon Linux 2023 AMI in {region}: {exc}"
-                        ) from exc
-                    
-                    # Inject as -var flags (these override any values in the stack YAML)
-                    plan_args.extend([
-                        f"-var=vpc_id={vpc_id}",
-                        f"-var=subnet={subnet_id}",
-                        f"-var=ami_id={ami_id}"
-                    ])
-                    _emit_progress(
-                        apply_context,
-                        "info",
-                        f"Injecting runtime vars: vpc_id={vpc_id}, subnet={subnet_id}, ami_id={ami_id}"
-                    )
-                
-                plan_logs[component] = _run_atmos_with_tracking(
-                    volume_name,
-                    plan_args,
-                    env,
-                    apply_context=apply_context,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"atmos terraform plan failed for component '{component}': {exc}"
-                ) from exc
-            
-            counts = _parse_plan_change_counts(plan_logs[component])
-            plan_summary["per_component"][component] = counts
-            plan_summary["total_resources"]["add"] += int(counts.get("add") or 0)
-            plan_summary["total_resources"]["change"] += int(counts.get("change") or 0)
-            plan_summary["total_resources"]["destroy"] += int(counts.get("destroy") or 0)
-
-            # For plan-only mode, skip apply and output capture
-            if not confirm_apply:
-                continue
-
-            # Step 3: Apply component (only if confirm_apply is True)
-            try:
-                apply_logs[component] = _run_atmos_with_tracking(
-                    volume_name,
-                    ["terraform", "apply", component, "-s", stack, "-auto-approve", "-input=false"],
-                    env,
-                    apply_context=apply_context,
-                )
-                successful_components.append(component)
-                
-                # Step 4: Capture outputs immediately after successful apply
-                raw_output = _run_atmos_with_tracking(
-                    volume_name,
-                    ["terraform", "output", component, "-s", stack, "-json"],
-                    env,
-                    apply_context=apply_context,
-                )
-                normalized = _normalize_atmos_outputs(raw_output)
-                component_outputs[component] = normalized
-                outputs.update(normalized)
-                
-            except Exception as apply_exc:
-                destroy_log = ""
-                destroy_error = ""
-                try:
-                    destroy_log = _run_atmos_with_tracking(
-                        volume_name,
-                        ["terraform", "destroy", component, "-s", stack, "-auto-approve", "-input=false"],
-                        env,
-                        apply_context=apply_context,
-                    )
-                except Exception as destroy_exc:
-                    destroy_error = str(destroy_exc)
-
-                return {
-                    "success": False,
-                    "error": f"Cloud Posse/Atmos apply failed at component '{component}': {apply_exc}",
-                    "details": {
-                        "execution_kind": "atmos",
-                        "renderer": "cloudposse_atmos",
-                        "atmos_image": _atmos_image(),
-                        "component_catalog_version": lock_payload.get("component_catalog_version"),
-                        "deploy_sequence": deploy_sequence,
-                        "successful_components": successful_components,
-                        "failed_component": component,
-                        "failed_reason": str(apply_exc),
-                        "destroy_attempted": True,
-                        "destroy_succeeded": not bool(destroy_error),
-                        "destroy_error": destroy_error or None,
-                        "destroy_log_tail": _tail(destroy_log),
-                        "stack": stack,
-                        "vendor_log_tail": _tail(vendor_log),
-                        "provider_patch_log_tail": _tail(provider_patch_log),
-                        "syntax_patch_log_tail": _tail(syntax_patch_log),
-                        "required_var_defaults_log_tail": _tail(required_var_defaults_log),
-                        "validate_log_tail": _tail(validate_log),
-                        "init_logs_tail": {key: _tail(value) for key, value in init_logs.items()},
-                        "plan_logs_tail": {key: _tail(value) for key, value in plan_logs.items()},
-                        "apply_logs_tail": {key: _tail(value) for key, value in apply_logs.items()},
-                        "component_outputs": component_outputs,
-                        "plan_summary": plan_summary,
-                    },
-                }
-
-        # Emit plan summary after all components processed
-        _emit_progress(
-            apply_context,
-            "info",
-            (
-                "Plan summary: "
-                f"add={plan_summary['total_resources']['add']}, "
-                f"change={plan_summary['total_resources']['change']}, "
-                f"destroy={plan_summary['total_resources']['destroy']}"
-            ),
-        )
-
-        # Return early if plan-only mode
-        if not confirm_apply:
-            return {
-                "success": True,
-                "status": "awaiting_plan_confirmation",
-                "provider": provider,
-                "project_name": project_name,
-                "outputs": {},
-                "cloudfront_url": None,
-                "plan_summary": plan_summary,
-                "details": {
-                    "execution_kind": "atmos",
-                    "renderer": "cloudposse_atmos",
-                    "atmos_image": _atmos_image(),
-                    "component_catalog_version": lock_payload.get("component_catalog_version"),
-                    "deploy_sequence": deploy_sequence,
-                    "stack": stack,
-                    "vendor_log_tail": _tail(vendor_log),
-                    "provider_patch_log_tail": _tail(provider_patch_log),
-                    "syntax_patch_log_tail": _tail(syntax_patch_log),
-                    "required_var_defaults_log_tail": _tail(required_var_defaults_log),
-                    "validate_log_tail": _tail(validate_log),
-                    "init_logs_tail": {key: _tail(value) for key, value in init_logs.items()},
-                    "plan_logs_tail": {key: _tail(value) for key, value in plan_logs.items()},
-                    "plan_summary": plan_summary,
-                    "requires_plan_confirmation": True,
-                },
-            }
-
-        # Final output aggregation and return (only reached if confirm_apply is True)
-
-        if outputs_to_capture:
-            outputs = {key: outputs.get(key) for key in outputs_to_capture}
-
-        cloudfront_url = None
-        if isinstance(outputs.get("cloudfront_url"), str):
-            cloudfront_url = outputs.get("cloudfront_url")
-        elif isinstance(outputs.get("cloudfront_domain"), str):
-            cloudfront_url = f"https://{outputs.get('cloudfront_domain')}"
-        elif isinstance(outputs.get("cloudfront_domain_name"), str):
-            cloudfront_url = f"https://{outputs.get('cloudfront_domain_name')}"
-        return {
-            "success": True,
-            "provider": provider,
-            "project_name": project_name,
-            "outputs": outputs,
-            "cloudfront_url": cloudfront_url,
-            "plan_summary": plan_summary,
-            "details": {
-                "execution_kind": "atmos",
-                "renderer": "cloudposse_atmos",
-                "atmos_image": _atmos_image(),
-                "component_catalog_version": lock_payload.get("component_catalog_version"),
-                "deploy_sequence": deploy_sequence,
-                "successful_components": successful_components,
-                "stack": stack,
-                "vendor_log_tail": _tail(vendor_log),
-                "provider_patch_log_tail": _tail(provider_patch_log),
-                "syntax_patch_log_tail": _tail(syntax_patch_log),
-                "required_var_defaults_log_tail": _tail(required_var_defaults_log),
-                "validate_log_tail": _tail(validate_log),
-                "init_logs_tail": {key: _tail(value) for key, value in init_logs.items()},
-                "plan_logs_tail": {key: _tail(value) for key, value in plan_logs.items()},
-                "apply_logs_tail": {key: _tail(value) for key, value in apply_logs.items()},
-                "component_outputs": component_outputs,
-                "outputs_to_capture": outputs_to_capture,
-                "plan_summary": plan_summary,
-            },
-        }
-    except Exception as exc:
-        error_text = str(exc)
-        remediation_hint = ""
-        if (
-            "module \"iam_roles\"" in error_text
-            or "team-assume-role-policy" in error_text
-            or "module \"gha_assume_role\"" in error_text
-        ):
-            remediation_hint = (
-                " The vendored component still references legacy iam_roles modules. "
-                "Retry deployment with the direct-provider post-vendor patch enabled so providers.tf is replaced "
-                "for vpc/ec2-instance/rds/elasticache before planning."
-            )
-        elif "subnet_type_tag_key" in error_text and "No value for required variable" in error_text:
-            remediation_hint = (
-                " Generated Cloud Posse VPC inputs are missing required subnet metadata. "
-                "Regenerate the Atmos bundle with the updated renderer so the vpc component receives "
-                "subnet_type_tag_key, nat_instance_enabled, and default availability zones."
-            )
-        elif (
-            "terraform_remote_state" in error_text
-            or "No stored state was found" in error_text
-            or "unsupported attribute" in error_text.lower()
-        ):
-            remediation_hint = (
-                " Plan stage failed while resolving remote-state outputs for dependent components. "
-                "In fresh accounts, ensure dependency components are initialized in order and that "
-                "the shared state backend is reachable before planning downstream components."
-            )
-        return {
-            "success": False,
-            "error": f"Cloud Posse/Atmos apply failed: {error_text}{remediation_hint}",
-            "details": {
-                "execution_kind": "atmos",
-                "renderer": "cloudposse_atmos",
-                "atmos_image": _atmos_image(),
-                "component_catalog_version": lock_payload.get("component_catalog_version"),
-                "deploy_sequence": deploy_sequence,
-                "successful_components": successful_components,
-                "stack": stack,
-                "vendor_log_tail": _tail(vendor_log),
-                "provider_patch_log_tail": _tail(provider_patch_log),
-                "syntax_patch_log_tail": _tail(syntax_patch_log),
-                "required_var_defaults_log_tail": _tail(required_var_defaults_log),
-                "validate_log_tail": _tail(validate_log),
-                "init_logs_tail": {key: _tail(value) for key, value in init_logs.items()},
-                "plan_logs_tail": {key: _tail(value) for key, value in plan_logs.items()},
-                "apply_logs_tail": {key: _tail(value) for key, value in apply_logs.items()},
-                "plan_summary": plan_summary,
-                "fallback_invoked": False,
-            },
-        }
-
-
 def _tail(text: str, limit: int = 3000) -> str:
     value = text or ""
     if len(value) <= limit:
@@ -1436,6 +485,52 @@ def _is_capacity_error(text: str) -> bool:
         "insufficientinstancecapacity" in value
         or "not supported in your requested availability zone" in value
         or ("insufficient capacity" in value and "availability zone" in value)
+    )
+
+
+def _is_transient_aws_api_error(text: str) -> bool:
+    """True when Terraform lost the AWS API (DNS/network), not a real AWS deny."""
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    if any(
+        marker in lowered
+        for marker in (
+            "unauthorizedoperation",
+            "accessdenied",
+            "invalidclienttokenid",
+            "expiredtoken",
+            "authfailure",
+            "vcpulimitexceeded",
+            "vpclimitexceeded",
+        )
+    ):
+        return False
+    needles = (
+        "no such host",
+        "temporary failure in name resolution",
+        "server misbehaving",
+        "i/o timeout",
+        "tls handshake timeout",
+        "connection reset by peer",
+        "network is unreachable",
+        "request send failed",
+        "dial tcp",
+        "wsarecv",
+    )
+    if any(needle in lowered for needle in needles):
+        return True
+    return "lookup " in lowered and ":53" in lowered
+
+
+def _transient_aws_api_error_message(text: str) -> str:
+    match = re.search(r"RDS DB Instance \(([^)]+)\)", text or "", flags=re.IGNORECASE)
+    rds_id = match.group(1).strip() if match else ""
+    resource = f"RDS instance {rds_id}" if rds_id else "a resource"
+    return (
+        f"Terraform lost connectivity to the AWS API while waiting for {resource} to finish "
+        "creating (Docker DNS lookup failed). Resources created before this failure remain in "
+        "remote state. Click Redeploy to resume apply — do not destroy."
     )
 
 
@@ -1512,8 +607,8 @@ def _orphan_collision_remediation(
                 "terraform plan  # review drift before apply",
             ],
             "note": (
-                "Prefer key reuse via existing_ec2_key_pair_name over importing a key pair "
-                "when DeplAI needs the private PEM (AWS does not return private keys)."
+                "Do not import or reuse an existing AWS key pair. AWS never stores the private "
+                "half, so DeplAI cannot give the user a PEM. Mint a new key with ec2_key_rotation."
             ),
         },
         "option_b_delete_orphans": {
@@ -1526,7 +621,7 @@ def _orphan_collision_remediation(
         "prevention": [
             "Keep S3 remote state + DynamoDB lock enabled (already used by enterprise bundles).",
             "ALB names are VPC-suffixed to avoid colliding with orphans from a prior VPC.",
-            "EC2 key pairs are reused when the project/env key already exists in-region.",
+            "Each deploy mints a new EC2 key pair named with a rotation suffix and tagged with the instance ID.",
         ],
     }
 
@@ -1699,6 +794,17 @@ def _legacy_runtime_bundle_needs_remediation(files: list[dict[str, Any]]) -> boo
             return True
         if conditional_depends_on.search(text):
             return True
+        if 'resource "aws_key_pair" "generated"' in text and (
+            "use_existing_key" in text
+            or (
+                re.search(
+                    r'key_name\s*=\s*"\$\{var\.project_name\}-\$\{var\.environment\}-key"',
+                    text,
+                )
+                and "ec2_key_rotation" not in text
+            )
+        ):
+            return True
         if 'module "ec2"' in text and (
             re.search(r"(?m)^\s*create_security_group\s*=", text.split('module "alb"')[0])
             or (
@@ -1751,6 +857,7 @@ def _remediate_legacy_runtime_bundle(
         "legacy_inline_blocks_rewritten": False,
         "legacy_key_pair_reuse_support_added": False,
         "legacy_ec2_count_ungated_from_key_reuse": False,
+        "unique_ec2_key_rotation_var_added": False,
         "legacy_iam_name_collision_rewritten": False,
         "legacy_versions_provider_deduped": False,
         "legacy_conditional_depends_on_rewritten": False,
@@ -1915,6 +1022,8 @@ def _remediate_legacy_runtime_bundle(
 
     def _rewrite_nginx_ingress_port(text: str) -> str:
         if "dnf install -y nginx" not in text:
+            return text
+        if re.search(r"\bfrom_port\s*=\s*80\b", text):
             return text
         rewritten = re.sub(
             r'(?ms)(resource\s+"aws_security_group"\s+"app"\s*\{[\s\S]*?ingress\s*\{[\s\S]*?from_port\s*=\s*)var\.app_port(\s*[\r\n]+\s*to_port\s*=\s*)var\.app_port',
@@ -2257,7 +1366,19 @@ output "redis_endpoint" {
                 + "}\n"
             )
             tf_texts[root_variables_idx] = root_variables_text
-            remediation["legacy_key_pair_reuse_support_added"] = True
+            changed = True
+        if 'variable "ec2_key_rotation"' not in root_variables_text:
+            root_variables_text = (
+                tf_texts[root_variables_idx].rstrip()
+                + "\n\n"
+                + "variable \"ec2_key_rotation\" {\n"
+                + "  type        = string\n"
+                + "  default     = \"init\"\n"
+                + "  description = \"Unique suffix so each deploy mints a new EC2 key pair.\"\n"
+                + "}\n"
+            )
+            tf_texts[root_variables_idx] = root_variables_text
+            remediation["unique_ec2_key_rotation_var_added"] = True
             changed = True
 
     root_main_idx = next(
@@ -2270,15 +1391,20 @@ output "redis_endpoint" {
 
         def _inject_compute_arg(match: re.Match[str]) -> str:
             body = str(match.group(2) or "")
-            if "existing_ec2_key_pair_name" in body:
+            extras = ""
+            if "existing_ec2_key_pair_name" not in body:
+                extras += "\n  existing_ec2_key_pair_name  = \"\"\n"
+            if "ec2_key_rotation" not in body:
+                extras += "\n  ec2_key_rotation            = var.ec2_key_rotation\n"
+            if not extras:
                 return match.group(0)
-            body = body.rstrip() + "\n  existing_ec2_key_pair_name  = var.existing_ec2_key_pair_name\n"
+            body = body.rstrip() + extras
             return f"{match.group(1)}{body}{match.group(3)}"
 
         updated_main = module_compute_pattern.sub(_inject_compute_arg, root_main_text, count=1)
         if updated_main != root_main_text:
             tf_texts[root_main_idx] = updated_main
-            remediation["legacy_key_pair_reuse_support_added"] = True
+            remediation["unique_ec2_key_rotation_var_added"] = True
             changed = True
 
     compute_variables_idx = next(
@@ -2287,14 +1413,14 @@ output "redis_endpoint" {
     )
     if compute_variables_idx is not None:
         compute_variables_text = tf_texts[compute_variables_idx]
+        extras = ""
         if 'variable "existing_ec2_key_pair_name"' not in compute_variables_text:
-            compute_variables_text = (
-                compute_variables_text.rstrip()
-                + "\n"
-                + "variable \"existing_ec2_key_pair_name\" { type = string }\n"
-            )
-            tf_texts[compute_variables_idx] = compute_variables_text
-            remediation["legacy_key_pair_reuse_support_added"] = True
+            extras += "variable \"existing_ec2_key_pair_name\" { type = string default = \"\" }\n"
+        if 'variable "ec2_key_rotation"' not in compute_variables_text:
+            extras += "variable \"ec2_key_rotation\" { type = string }\n"
+        if extras:
+            tf_texts[compute_variables_idx] = compute_variables_text.rstrip() + "\n" + extras
+            remediation["unique_ec2_key_rotation_var_added"] = True
             changed = True
 
     compute_main_idx = next(
@@ -2304,45 +1430,15 @@ output "redis_endpoint" {
     if compute_main_idx is not None:
         compute_main_text = tf_texts[compute_main_idx]
         if 'resource "aws_key_pair" "generated"' in compute_main_text:
-            if 'locals {' not in compute_main_text or 'use_existing_key' not in compute_main_text:
-                compute_main_text = (
-                    "locals {\n"
-                    "  use_existing_key = trimspace(var.existing_ec2_key_pair_name) != \"\"\n"
-                    "  ec2_key_name     = local.use_existing_key ? trimspace(var.existing_ec2_key_pair_name) : aws_key_pair.generated[0].key_name\n"
-                    "}\n\n"
-                    + compute_main_text
-                )
-
-            # Only rewrite count inside the key/tls resource bodies — never bleed into module "ec2".
-            def _rewrite_resource_count(text: str, resource_type: str, new_count: str) -> str:
-                pattern = re.compile(
-                    rf'(resource\s+"{re.escape(resource_type)}"\s+"generated"\s*\{{)([^}}]*?)(\n\}})',
-                    flags=re.IGNORECASE | re.DOTALL,
-                )
-
-                def _patch(match: re.Match[str]) -> str:
-                    header, body, closer = match.group(1), match.group(2), match.group(3)
-                    new_body, n = re.subn(
-                        r'(?m)^(\s*)count\s*=\s*var\.enabled\s*\?\s*1\s*:\s*0\s*$',
-                        rf'\1count = {new_count}',
-                        body,
-                        count=1,
-                    )
-                    if n == 0:
-                        return match.group(0)
-                    return f"{header}{new_body}{closer}"
-
-                return pattern.sub(_patch, text, count=1)
-
-            compute_main_text = _rewrite_resource_count(
+            compute_main_text = re.sub(
+                r'use_existing_key\s*=\s*trimspace\(var\.existing_ec2_key_pair_name\)\s*!=\s*""',
+                "use_existing_key = false",
                 compute_main_text,
-                "tls_private_key",
-                "var.enabled && !local.use_existing_key ? 1 : 0",
             )
-            compute_main_text = _rewrite_resource_count(
+            compute_main_text = re.sub(
+                r'ec2_key_name\s*=\s*local\.use_existing_key\s*\?\s*trimspace\(var\.existing_ec2_key_pair_name\)\s*:\s*aws_key_pair\.generated\[0\]\.key_name',
+                "ec2_key_name     = try(aws_key_pair.generated[0].key_name, null)",
                 compute_main_text,
-                "aws_key_pair",
-                "var.enabled && !local.use_existing_key ? 1 : 0",
             )
             # Repair prior bad remediations that accidentally gated module.ec2 on key reuse.
             repaired_ec2, ec2_n = re.subn(
@@ -2362,19 +1458,24 @@ output "redis_endpoint" {
 
             if compute_main_text != tf_texts[compute_main_idx]:
                 tf_texts[compute_main_idx] = compute_main_text
-                remediation["legacy_key_pair_reuse_support_added"] = True
                 changed = True
+
+    if changed:
+        for idx in tf_indexes:
+            patched_files[idx] = _set_text_payload(patched_files[idx], tf_texts[idx])
+
+    patched_files, key_fix = _ensure_unique_ec2_key_pair(patched_files)
+    if any(bool(value) for value in key_fix.values()):
+        remediation.update(key_fix)
+        changed = True
 
     if not changed:
         return files, {}
 
-    for idx in tf_indexes:
-        patched_files[idx] = _set_text_payload(patched_files[idx], tf_texts[idx])
-
     _emit_progress(
         apply_context,
         "info",
-        "Applied runtime compatibility fixes for legacy Terraform bundle (AMI, ALB subnet safety, user_data syntax, bootstrap interpolation quoting, EC2 key-pair reuse support, IAM name collision avoidance, duplicate provider cleanup, conditional depends_on rewrites, and variable block normalization).",
+        "Applied runtime compatibility fixes for the Terraform bundle (AMI, ALB, user_data, unique EC2 key rotation, IAM names, and variable normalization).",
     )
     return patched_files, remediation
 
@@ -2459,6 +1560,15 @@ def _normalize_rds_elasticache_provider_versions(
 # Map of retired/invalid RDS engine versions -> current valid replacement.
 # AWS periodically removes old minor versions from the CreateDBInstance API.
 # Keep this list updated when AWS retires more versions.
+_CURRENT_POSTGRES_VERSION = "15.17"
+_POSTGRES_CURRENT_BY_MAJOR = {
+    "13": "13.18",
+    "14": "14.15",
+    "15": _CURRENT_POSTGRES_VERSION,
+    "16": "16.13",
+    "17": "17.4",
+}
+_POSTGRES_SENTINELS = {"", "latest", "lts", "stable", "current", "alpine"}
 _RETIRED_POSTGRES_VERSIONS: dict[str, str] = {
     # PostgreSQL 15 — prefer a current available minor (15.10 is not offered in all regions).
     "15.1": "15.17",
@@ -2526,24 +1636,67 @@ _RETIRED_POSTGRES_VERSIONS: dict[str, str] = {
 }
 
 
+def _canonical_postgres_engine_version(version: str) -> str:
+    raw = str(version or "").strip()
+    token = raw.lower().split("-")[0].split("_")[0]
+    if token in _POSTGRES_SENTINELS or not token or not token[0].isdigit():
+        return _CURRENT_POSTGRES_VERSION
+    if token in _POSTGRES_CURRENT_BY_MAJOR:
+        return _POSTGRES_CURRENT_BY_MAJOR[token]
+    mapped = _RETIRED_POSTGRES_VERSIONS.get(token) or _RETIRED_POSTGRES_VERSIONS.get(raw)
+    if mapped:
+        return mapped
+    major = token.split(".")[0]
+    return _POSTGRES_CURRENT_BY_MAJOR.get(major, _CURRENT_POSTGRES_VERSION)
+
+
 def _normalize_rds_engine_versions(
     files: list[dict[str, Any]],
     apply_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Replace retired AWS RDS engine_version values in Terraform files.
+    """Replace invalid AWS RDS engine_version values in Terraform files.
 
-    AWS periodically removes old PostgreSQL minor versions from the
-    ``CreateDBInstance`` API, causing ``InvalidParameterCombination`` errors
-    like 'Cannot find version 15.3 for postgres'. This function rewrites any
-    known-retired engine_version string assignments to the nearest valid current
-    minor version so deploys don't fail due to stale LLM-generated versions.
+    AWS rejects Docker tags such as ``latest`` and retired minors such as
+    ``15.5`` with InvalidParameterCombination on CreateDBInstance.
     """
-    # Build a single regex that matches engine_version = "<retired_version>"
-    # in HCL. We match the value in both double-quoted string assignments and
-    # inside tfvars-style `key = "value"` lines.
-    version_pattern = re.compile(
+    version_key_pattern = re.compile(
+        r'((?:postgres_engine_version|db_engine_version|rds_engine_version|(?<![A-Za-z0-9_])engine_version)\s*=\s*)"([^"]+)"',
+        flags=re.IGNORECASE,
+    )
+    default_sentinel_pattern = re.compile(
+        r'(default\s*=\s*)"(latest|lts|stable|current|alpine|[\w.]+-alpine[^"]*)"',
+        flags=re.IGNORECASE,
+    )
+    retired_pattern = re.compile(
         r'((?:engine_version|default|value)\s*=\s*)"(' + "|".join(re.escape(v) for v in _RETIRED_POSTGRES_VERSIONS) + r')"',
         flags=re.IGNORECASE,
+    )
+    var_assign_pattern = re.compile(
+        r'^(\s*)engine_version\s*=\s*var\.(postgres_engine_version|db_engine_version|rds_engine_version)\s*$',
+        flags=re.MULTILINE,
+    )
+
+    def _replace_assigned(match: re.Match[str]) -> str:
+        prefix = match.group(1)
+        old_ver = match.group(2)
+        new_ver = _canonical_postgres_engine_version(old_ver)
+        if new_ver == old_ver:
+            return match.group(0)
+        return f'{prefix}"{new_ver}"'
+
+    def _replace_var_assign(match: re.Match[str]) -> str:
+        indent = match.group(1)
+        name = match.group(2)
+        pin = _CURRENT_POSTGRES_VERSION
+        return (
+            f'{indent}engine_version = contains(["", "latest", "lts", "stable", "current", "alpine"], '
+            f'lower(trimspace(var.{name}))) ? "{pin}" : var.{name}'
+        )
+
+    declares_postgres_version = any(
+        re.search(r'variable\s+"postgres_engine_version"', _extract_text_payload(item))
+        for item in files
+        if str(item.get("path", "")).replace("\\", "/").lower().endswith(".tf")
     )
 
     patched: list[dict[str, Any]] = []
@@ -2554,14 +1707,21 @@ def _normalize_rds_engine_versions(
             patched.append(item)
             continue
         text = _extract_text_payload(item)
-
-        def _replace_version(match: re.Match[str]) -> str:
-            prefix = match.group(1)
-            old_ver = match.group(2)
-            new_ver = _RETIRED_POSTGRES_VERSIONS.get(old_ver, old_ver)
-            return f'{prefix}"{new_ver}"'
-
-        rewritten = version_pattern.sub(_replace_version, text)
+        rewritten = version_key_pattern.sub(_replace_assigned, text)
+        rewritten = default_sentinel_pattern.sub(
+            lambda match: f'{match.group(1)}"{_canonical_postgres_engine_version(match.group(2))}"',
+            rewritten,
+        )
+        rewritten = retired_pattern.sub(_replace_assigned, rewritten)
+        rewritten = var_assign_pattern.sub(_replace_var_assign, rewritten)
+        if (
+            declares_postgres_version
+            and path.endswith("terraform.tfvars")
+            and "/envs/" not in path
+        ):
+            rewritten = _upsert_tfvars_assignment(
+                rewritten, "postgres_engine_version", _CURRENT_POSTGRES_VERSION
+            )
         if rewritten != text:
             item = _set_text_payload(dict(item), rewritten)
             changed = True
@@ -2570,9 +1730,161 @@ def _normalize_rds_engine_versions(
         _emit_progress(
             apply_context,
             "info",
-            "Patched retired RDS engine_version values to current AWS-supported versions (e.g. 15.5 -> 15.17).",
+            "Patched invalid RDS engine_version values to current AWS-supported versions (e.g. latest -> 15.17).",
         )
     return patched
+
+
+def _upsert_tfvars_assignment(text: str, key: str, value: str) -> str:
+    pattern = re.compile(rf'(?m)^{re.escape(key)}\s*=\s*".*?"\s*$')
+    line = f'{key} = "{value}"'
+    if pattern.search(text or ""):
+        return pattern.sub(line, text)
+    body = str(text or "")
+    if body and not body.endswith("\n"):
+        body += "\n"
+    return body + line + "\n"
+
+
+_SSM_CORE_ATTACHMENT = """
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+"""
+
+_ECR_PULL_POLICY = """
+resource "aws_iam_role_policy" "ecr_pull" {
+  name_prefix = substr("${var.project_name}-${var.environment}-ecr-", 0, 38)
+  role        = aws_iam_role.ec2.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ecr:GetAuthorizationToken"]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:DescribeImages"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+"""
+
+
+def _ensure_ssm_managed_instance_core(
+    files: list[dict[str, Any]],
+    apply_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Attach SSM Session Manager to the EC2 instance role when the bundle has one."""
+    patched: list[dict[str, Any]] = []
+    changed = False
+    for item in files:
+        path = str(item.get("path", "")).replace("\\", "/").lower()
+        if not path.endswith(".tf"):
+            patched.append(item)
+            continue
+        text = _extract_text_payload(item)
+        if "AmazonSSMManagedInstanceCore" in text or 'resource "aws_iam_role" "ec2"' not in text:
+            patched.append(item)
+            continue
+        item = _set_text_payload(dict(item), text.rstrip() + "\n" + _SSM_CORE_ATTACHMENT)
+        changed = True
+        patched.append(item)
+    if changed:
+        _emit_progress(
+            apply_context,
+            "info",
+            "Attached AmazonSSMManagedInstanceCore so the instance can be reached with Session Manager.",
+        )
+    return patched
+
+
+def _ensure_ecr_pull_policy(
+    files: list[dict[str, Any]],
+    apply_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Allow the instance role to authenticate to ECR and pull immutable images."""
+    patched: list[dict[str, Any]] = []
+    changed = False
+    for item in files:
+        path = str(item.get("path", "")).replace("\\", "/").lower()
+        if not path.endswith(".tf"):
+            patched.append(item)
+            continue
+        text = _extract_text_payload(item)
+        if "ecr:GetAuthorizationToken" in text or 'resource "aws_iam_role" "ec2"' not in text:
+            patched.append(item)
+            continue
+        item = _set_text_payload(dict(item), text.rstrip() + "\n" + _ECR_PULL_POLICY)
+        changed = True
+        patched.append(item)
+    if changed:
+        _emit_progress(
+            apply_context,
+            "info",
+            "Attached ECR pull permissions so the instance can fetch Docker images without long-lived keys.",
+        )
+    return patched
+
+
+def _inject_app_artifact_tarball(
+    files: list[dict[str, Any]],
+    apply_context: dict[str, Any] | None = None,
+    project_name: str = "",
+) -> list[dict[str, Any]]:
+    """Copy the packaged app tarball into the Terraform workspace for aws_s3_object.source."""
+    already = any(
+        str(item.get("path", "")).replace("\\", "/").rstrip("/").endswith("artifacts/app.tgz")
+        for item in files
+    )
+    if already:
+        return files
+    package_id = ""
+    for item in files:
+        path = str(item.get("path", "")).replace("\\", "/")
+        if not path.endswith("terraform.tfvars") or "/envs/" in path:
+            continue
+        match = re.search(
+            r'deployment_package_id\s*=\s*"([^"]*)"',
+            _extract_text_payload(item),
+        )
+        if match:
+            package_id = str(match.group(1) or "").strip()
+            break
+    try:
+        from deployment_packager import load_persisted_app_tarball
+    except Exception:
+        return files
+    loaded = load_persisted_app_tarball(package_id=package_id, project_slug=project_name)
+    if not loaded:
+        return files
+    loaded_id, payload = loaded
+    if not payload:
+        return files
+    updated = list(files)
+    updated.append(
+        {
+            "path": "terraform/artifacts/app.tgz",
+            "content": base64.b64encode(payload).decode("ascii"),
+            "encoding": "base64",
+        }
+    )
+    _emit_progress(
+        apply_context,
+        "info",
+        f"Attached deployment package {loaded_id} as terraform/artifacts/app.tgz for S3 app delivery.",
+    )
+    return updated
 
 
 def _collect_terraform_text(files: list[dict[str, Any]]) -> str:
@@ -2582,6 +1894,25 @@ def _collect_terraform_text(files: list[dict[str, Any]]) -> str:
         if not path.endswith(".tf"):
             continue
         chunks.append(_extract_text_payload(item))
+    return "\n".join(chunks)
+
+
+def _is_terraform_root_tf_path(path: str) -> bool:
+    try:
+        normalized = _normalize_rel_path(path)
+    except ValueError:
+        return False
+    if not normalized.endswith(".tf"):
+        return False
+    parts = [part for part in normalized.split("/") if part]
+    return len(parts) == 2 and parts[0] == "terraform"
+
+
+def _collect_root_terraform_text(files: list[dict[str, Any]]) -> str:
+    chunks: list[str] = []
+    for item in files:
+        if _is_terraform_root_tf_path(str(item.get("path", ""))):
+            chunks.append(_extract_text_payload(item))
     return "\n".join(chunks)
 
 
@@ -2599,6 +1930,499 @@ def _ec2_key_pair_exists(ec2_client: Any, key_name: str) -> bool:
         if "InvalidKeyPair.NotFound" in message or "not found" in message.lower():
             return False
         return False
+
+
+def _new_ec2_key_rotation() -> str:
+    return secrets.token_hex(4)
+
+
+def _scrub_workspace_private_keys(terraform_root: str | None) -> None:
+    root = Path(str(terraform_root or "").strip())
+    if not root.is_dir():
+        return
+    for pem_file in root.rglob("*.pem"):
+        try:
+            pem_file.unlink()
+        except OSError:
+            continue
+
+
+def _boto3_client(service: str, *, region: str, aws_access_key_id: str, aws_secret_access_key: str, aws_session_token: str | None) -> Any:
+    kwargs: dict[str, Any] = {"region_name": region}
+    if aws_access_key_id and aws_secret_access_key:
+        kwargs["aws_access_key_id"] = aws_access_key_id
+        kwargs["aws_secret_access_key"] = aws_secret_access_key
+        if aws_session_token:
+            kwargs["aws_session_token"] = aws_session_token
+    return boto3.client(service, **kwargs)
+
+
+def _tag_key_pair_with_instance(
+    *,
+    key_name: str,
+    instance_id: str,
+    project_name: str,
+    aws_region: str,
+    aws_access_key_id: str,
+    aws_secret_access_key: str,
+    aws_session_token: str | None,
+) -> dict[str, str]:
+    result = {"key_name": key_name, "instance_id": instance_id, "tagged": "false"}
+    if not key_name or not instance_id or not aws_access_key_id or not aws_secret_access_key:
+        return result
+    try:
+        ec2 = _boto3_client(
+            "ec2",
+            region=aws_region,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+        )
+        described = ec2.describe_key_pairs(KeyNames=[key_name])
+        pairs = described.get("KeyPairs") or []
+        key_pair_id = str((pairs[0] if pairs else {}).get("KeyPairId") or "").strip()
+        resource_id = key_pair_id or key_name
+        ec2.create_tags(
+            Resources=[resource_id],
+            Tags=[
+                {"Key": "Name", "Value": key_name},
+                {"Key": "deplai:instance-id", "Value": instance_id},
+                {"Key": "deplai:project", "Value": str(project_name or "")[:256]},
+                {"Key": "deplai:managed", "Value": "true"},
+            ],
+        )
+        result["tagged"] = "true"
+        result["key_pair_id"] = resource_id
+    except Exception as exc:
+        result["error"] = str(exc)[:240]
+    return result
+
+
+def _fetch_secret_string(
+    secret_arn: str,
+    *,
+    aws_region: str,
+    aws_access_key_id: str,
+    aws_secret_access_key: str,
+    aws_session_token: str | None,
+) -> dict[str, Any] | None:
+    arn = str(secret_arn or "").strip()
+    if not arn or arn.lower() in {"null", "none"}:
+        return None
+    try:
+        client = _boto3_client(
+            "secretsmanager",
+            region=aws_region,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+        )
+        payload = client.get_secret_value(SecretId=arn)
+        raw = str(payload.get("SecretString") or "").strip()
+        if not raw:
+            return None
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {"value": raw}
+    except Exception:
+        return None
+
+
+def _database_env_from_secret(secret: dict[str, Any] | None) -> str:
+    if not isinstance(secret, dict) or not secret:
+        return ""
+    user = str(secret.get("username") or secret.get("user") or "").strip()
+    password = str(secret.get("password") or "").strip()
+    host = str(secret.get("host") or secret.get("hostname") or "").strip()
+    port = str(secret.get("port") or "5432").strip() or "5432"
+    dbname = str(secret.get("dbname") or secret.get("database") or "appdb").strip() or "appdb"
+    lines = [
+        f"PGHOST={host}" if host else "",
+        f"PGPORT={port}",
+        f"PGUSER={user}" if user else "",
+        f"PGPASSWORD={password}" if password else "",
+        f"PGDATABASE={dbname}",
+    ]
+    if user and password and host:
+        engine = str(secret.get("engine") or "postgres").lower()
+        scheme = "mysql" if "mysql" in engine or "mariadb" in engine else "postgresql"
+        lines.append(
+            f"DATABASE_URL={scheme}://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{dbname}"
+        )
+    return "\n".join(item for item in lines if item) + ("\n" if any(lines) else "")
+
+
+def _collect_one_time_credentials(
+    outputs: dict[str, Any],
+    *,
+    project_name: str,
+    aws_region: str,
+    aws_access_key_id: str,
+    aws_secret_access_key: str,
+    aws_session_token: str | None,
+    terraform_root: str | None = None,
+) -> dict[str, Any]:
+    pem = str(
+        outputs.get("generated_ec2_private_key_pem")
+        or outputs.get("generated_private_key_pem")
+        or outputs.get("ec2_private_key_pem")
+        or ""
+    ).strip()
+    key_name = str(outputs.get("ec2_key_name") or outputs.get("generated_ec2_key_name") or "").strip()
+    instance_id = str(outputs.get("ec2_instance_id") or outputs.get("instance_id") or "").strip()
+    secret_arn = str(
+        outputs.get("rds_secret_arn")
+        or outputs.get("database_secret_arn")
+        or outputs.get("db_secret_arn")
+        or ""
+    ).strip()
+    database_env = ""
+    if secret_arn:
+        database_env = _database_env_from_secret(
+            _fetch_secret_string(
+                secret_arn,
+                aws_region=aws_region,
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                aws_session_token=aws_session_token,
+            )
+        )
+    tag_info = _tag_key_pair_with_instance(
+        key_name=key_name,
+        instance_id=instance_id,
+        project_name=project_name,
+        aws_region=aws_region,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        aws_session_token=aws_session_token,
+    ) if key_name and instance_id else {}
+    _scrub_workspace_private_keys(terraform_root)
+    file_stem = "-".join(part for part in (key_name or "deplai-ec2-key", instance_id) if part)
+    return {
+        "private_key_pem": pem or None,
+        "key_name": key_name or None,
+        "instance_id": instance_id or None,
+        "key_file_name": f"{file_stem}.pem" if pem else None,
+        "database_env": database_env or None,
+        "database_file_name": f"{file_stem}-database.env" if database_env else None,
+        "key_tags": tag_info,
+        "download_once": True,
+    }
+
+
+_EC2_KEY_ROTATION_ROOT_VAR = """
+variable "ec2_key_rotation" {
+  type        = string
+  default     = "init"
+  description = "Unique suffix so each deploy mints a new EC2 key pair. AWS never stores the private half."
+}
+""".strip()
+
+_EC2_KEY_ROTATION_MODULE_VAR = 'variable "ec2_key_rotation" { type = string }'
+
+
+def _ensure_unique_ec2_key_pair(
+    files: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Force a new TLS key on every apply. Never attach an AWS key whose PEM DeplAI does not have."""
+    details: dict[str, Any] = {
+        "unique_ec2_key_rotation_var_added": False,
+        "unique_ec2_key_name_rewritten": False,
+        "unique_ec2_key_always_generated": False,
+        "unique_ec2_key_reuse_disabled": False,
+    }
+    patched = [dict(item) for item in files]
+    combined = "\n".join(_extract_text_payload(item) for item in patched)
+    if 'resource "aws_key_pair"' not in combined and 'resource "tls_private_key"' not in combined:
+        return files, details
+
+    def _path_of(item: dict[str, Any]) -> str:
+        return _normalize_rel_path(str(item.get("path", "")))
+
+    for index, item in enumerate(patched):
+        path = _path_of(item).replace("\\", "/").lower()
+        if not path.endswith(".tf"):
+            continue
+        text = _extract_text_payload(item)
+        original = text
+
+        if path.endswith("variables.tf"):
+            if "modules/compute/" in path:
+                if 'variable "ec2_key_rotation"' not in text:
+                    text = text.rstrip() + "\n" + _EC2_KEY_ROTATION_MODULE_VAR + "\n"
+                    details["unique_ec2_key_rotation_var_added"] = True
+            elif 'variable "ec2_key_rotation"' not in text:
+                text = text.rstrip() + "\n\n" + _EC2_KEY_ROTATION_ROOT_VAR + "\n"
+                details["unique_ec2_key_rotation_var_added"] = True
+
+        if re.search(r'module\s+"compute"\s*\{', text, flags=re.IGNORECASE):
+            module_pattern = re.compile(
+                r'(module\s+"compute"\s*\{)([\s\S]*?)(\n\})',
+                flags=re.IGNORECASE,
+            )
+
+            def _inject_rotation(match: re.Match[str]) -> str:
+                body = str(match.group(2) or "")
+                extra = ""
+                if not re.search(r'(?m)^\s*ec2_key_rotation\s*=', body):
+                    extra += "\n  ec2_key_rotation            = var.ec2_key_rotation\n"
+                if re.search(r'(?m)^\s*existing_ec2_key_pair_name\s*=', body):
+                    body = re.sub(
+                        r'(?m)^(\s*)existing_ec2_key_pair_name\s*=\s*.+$',
+                        r'\1existing_ec2_key_pair_name  = ""',
+                        body,
+                    )
+                    details["unique_ec2_key_reuse_disabled"] = True
+                if extra:
+                    details["unique_ec2_key_rotation_var_added"] = True
+                    body = body.rstrip() + extra
+                return f"{match.group(1)}{body}{match.group(3)}"
+
+            text = module_pattern.sub(_inject_rotation, text, count=1)
+
+        text = re.sub(
+            r'use_existing_key\s*=\s*trimspace\(var\.existing_ec2_key_pair_name\)\s*!=\s*""',
+            "use_existing_key = false",
+            text,
+        )
+        text = re.sub(
+            r'ec2_key_name\s*=\s*local\.use_existing_key\s*\?\s*trimspace\(var\.existing_ec2_key_pair_name\)\s*:\s*aws_key_pair\.generated\[0\]\.key_name',
+            "ec2_key_name     = try(aws_key_pair.generated[0].key_name, null)",
+            text,
+        )
+        text = re.sub(
+            r'(selected_(?:ec2_)?key_name\s*=\s*)!var\.enable_ec2\s*\?\s*null\s*:\s*\(\s*'
+            r'trimspace\(var\.existing_ec2_key_pair_name\)\s*!=\s*""\s*'
+            r'\?\s*trimspace\(var\.existing_ec2_key_pair_name\)\s*'
+            r':\s*try\(aws_key_pair\.generated\[0\]\.key_name,\s*null\)\s*\)',
+            r"\1var.enable_ec2 ? try(aws_key_pair.generated[0].key_name, null) : null",
+            text,
+            flags=re.DOTALL,
+        )
+        if "use_existing_key = false" in text or "try(aws_key_pair.generated[0].key_name" in text:
+            if original != text:
+                details["unique_ec2_key_reuse_disabled"] = True
+
+        def _rewrite_generated_resource(src: str, resource_type: str) -> str:
+            header_match = re.search(
+                rf'resource\s+"{re.escape(resource_type)}"\s+"generated"\s*\{{',
+                src,
+                flags=re.IGNORECASE,
+            )
+            if not header_match:
+                return src
+            brace_at = header_match.end() - 1
+            depth = 0
+            end = None
+            for idx in range(brace_at, len(src)):
+                char = src[idx]
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = idx
+                        break
+            if end is None:
+                return src
+            body = src[brace_at + 1:end]
+            new_body = body
+            if re.search(r'!local\.use_existing_key|existing_ec2_key_pair_name', new_body):
+                new_body = re.sub(
+                    r'(?m)^(\s*)count\s*=\s*var\.enabled\s*&&\s*!local\.use_existing_key\s*\?\s*1\s*:\s*0\s*$',
+                    r'\1count      = var.enabled ? 1 : 0',
+                    new_body,
+                )
+                new_body = re.sub(
+                    r'(?m)^(\s*)count\s*=\s*var\.enable_ec2\s*&&\s*trimspace\(var\.existing_ec2_key_pair_name\)\s*==\s*""\s*\?\s*1\s*:\s*0\s*$',
+                    r'\1count      = var.enable_ec2 ? 1 : 0',
+                    new_body,
+                )
+                details["unique_ec2_key_always_generated"] = True
+            if resource_type == "aws_key_pair" and "var.ec2_key_rotation" not in new_body:
+                replaced, n = re.subn(
+                    r'(?m)^(\s*)key_name\s*=\s*.+$',
+                    r'\1key_name   = "${var.project_name}-${var.environment}-${var.ec2_key_rotation}-key"',
+                    new_body,
+                    count=1,
+                )
+                if n:
+                    new_body = replaced
+                    details["unique_ec2_key_name_rewritten"] = True
+            if new_body == body:
+                return src
+            return src[:brace_at + 1] + new_body + src[end:]
+
+        text = _rewrite_generated_resource(text, "tls_private_key")
+        text = _rewrite_generated_resource(text, "aws_key_pair")
+
+        if "deplai_key_rotation" not in text:
+            rotated = text.replace(
+                "#!/bin/bash\nset -euxo pipefail",
+                "#!/bin/bash\n# deplai_key_rotation=${var.ec2_key_rotation}\nset -euxo pipefail",
+                1,
+            )
+            if rotated == text:
+                rotated = text.replace(
+                    "#!/bin/bash\n              set -euo pipefail",
+                    "#!/bin/bash\n              # deplai_key_rotation=${var.ec2_key_rotation}\n              set -euo pipefail",
+                    1,
+                )
+            if rotated != text:
+                text = rotated
+                details["unique_ec2_key_name_rewritten"] = True
+
+        if re.search(r'resource\s+"random_id"\s+"key_suffix"', text) and "ec2_key_rotation" not in text.split('resource "random_id" "key_suffix"')[1][:400]:
+            text, n = re.subn(
+                r'(resource\s+"random_id"\s+"key_suffix"\s*\{[\s\S]*?keepers\s*=\s*\{)',
+                r'\1\n    ec2_key_rotation = var.ec2_key_rotation',
+                text,
+                count=1,
+            )
+            if n:
+                details["unique_ec2_key_always_generated"] = True
+
+        if text != original:
+            patched[index] = _set_text_payload(item, text)
+
+    return patched, details
+
+
+def _region_has_default_vpc(ec2_client: Any) -> bool | None:
+    """Return True/False when the region default VPC can be listed, else None."""
+    try:
+        resp = ec2_client.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
+        vpcs = resp.get("Vpcs") or []
+        return any(str(item.get("VpcId") or "").strip() for item in vpcs if isinstance(item, dict))
+    except Exception:
+        return None
+
+
+def _is_missing_default_vpc_error(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if "no matching ec2 vpc found" in lowered:
+        return True
+    if "data.aws_vpc.default" in lowered and ("no matching" in lowered or "not found" in lowered):
+        return True
+    if "default vpc not found" in lowered or "no default vpc" in lowered:
+        return True
+    return False
+
+
+_HARD_DEFAULT_VPC_LOOKUP = re.compile(
+    r'data\s+"aws_vpc"\s+"default"\s*\{[^{}]*\bdefault\s*=\s*true[^{}]*\}',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _terraform_module_dir(path: str) -> str:
+    parent = str(PurePosixPath(_normalize_rel_path(path)).parent)
+    return "" if parent == "." else parent
+
+
+def _soft_default_vpc_lookup_hcl(prefer_expr: str) -> str:
+    return f'''data "aws_vpcs" "default" {{
+  filter {{
+    name   = "isDefault"
+    values = ["true"]
+  }}
+}}
+
+locals {{
+  deplai_prefer_default_vpc = {prefer_expr}
+  has_default_vpc           = local.deplai_prefer_default_vpc && length(data.aws_vpcs.default.ids) > 0
+}}
+
+data "aws_vpc" "default" {{
+  count = local.has_default_vpc ? 1 : 0
+  id    = data.aws_vpcs.default.ids[0]
+}}'''
+
+
+def _detect_default_vpc_prefer_var(lookup_block: str, module_text: str) -> str | None:
+    count_match = re.search(
+        r"\bcount\s*=\s*var\.(use_default_vpc|use_existing_vpc)\b",
+        lookup_block or "",
+        flags=re.IGNORECASE,
+    )
+    if count_match:
+        return count_match.group(1)
+    if _terraform_has_variable(module_text, "use_default_vpc") or re.search(
+        r"\bvar\.use_default_vpc\b", module_text or ""
+    ):
+        return "use_default_vpc"
+    if _terraform_has_variable(module_text, "use_existing_vpc") or re.search(
+        r"\bvar\.use_existing_vpc\b", module_text or ""
+    ):
+        return "use_existing_vpc"
+    return None
+
+
+def _replace_prefer_var_with_has_default_vpc(text: str, prefer_var: str | None) -> str:
+    if not prefer_var:
+        return text
+    keep = f"deplai_prefer_default_vpc = var.{prefer_var}"
+    placeholder = f"deplai_prefer_default_vpc = DEPLAI_KEEP_VAR_{prefer_var}"
+    updated = text.replace(keep, placeholder)
+    updated = re.sub(rf"\bvar\.{re.escape(prefer_var)}\b", "local.has_default_vpc", updated)
+    return updated.replace(placeholder, keep)
+
+
+def _rewrite_hard_default_vpc_lookup(
+    files: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Replace failing default-VPC data lookups with a list filter plus create-VPC fallback.
+
+    `data.aws_vpc.default { default = true }` errors when the region has no default VPC.
+    Listing default VPCs returns empty instead, and `local.has_default_vpc` then creates
+    `aws_vpc.main` instead of planning against a missing data source.
+
+    Locals are module-scoped, so the prefer-var rewrite stays inside the Terraform module
+    that received the soft lookup. Root module references such as
+    `var.use_existing_vpc || var.use_default_vpc` must not become `local.has_default_vpc`.
+    """
+    remediation = {"default_vpc_lookup_softened": False}
+    patched = [dict(item) for item in files]
+    groups: dict[str, list[int]] = {}
+    for idx, item in enumerate(patched):
+        raw_path = str(item.get("path", ""))
+        try:
+            normalized = _normalize_rel_path(raw_path)
+        except ValueError:
+            continue
+        if not normalized.lower().endswith(".tf"):
+            continue
+        groups.setdefault(_terraform_module_dir(raw_path), []).append(idx)
+
+    for indices in groups.values():
+        module_text = "\n".join(_extract_text_payload(patched[idx]) for idx in indices)
+        if 'data "aws_vpcs" "default"' in module_text or "local.has_default_vpc" in module_text:
+            continue
+        lookup_block = ""
+        for idx in indices:
+            match = _HARD_DEFAULT_VPC_LOOKUP.search(_extract_text_payload(patched[idx]))
+            if match:
+                lookup_block = match.group(0)
+                break
+        if not lookup_block or not re.search(r"\bcount\s*=", lookup_block):
+            continue
+        prefer_var = _detect_default_vpc_prefer_var(lookup_block, module_text)
+        prefer_expr = f"var.{prefer_var}" if prefer_var else "true"
+        injected = False
+        for idx in indices:
+            text = _extract_text_payload(patched[idx])
+            updated = text
+            if not injected and _HARD_DEFAULT_VPC_LOOKUP.search(updated):
+                updated = _HARD_DEFAULT_VPC_LOOKUP.sub(
+                    _soft_default_vpc_lookup_hcl(prefer_expr),
+                    updated,
+                    count=1,
+                )
+                injected = True
+            updated = _replace_prefer_var_with_has_default_vpc(updated, prefer_var)
+            if updated != text:
+                patched[idx] = _set_text_payload(patched[idx], updated)
+                remediation["default_vpc_lookup_softened"] = True
+    return patched, remediation
 
 
 def _project_slug_for_key(project_name: str) -> str:
@@ -2780,12 +2604,76 @@ def _terraform_has_aws_instance(tf_text: str) -> bool:
     text = tf_text or ""
     if re.search(r'resource\s+"aws_instance"\s+"[^"]+"', text, flags=re.IGNORECASE):
         return True
-    # Enterprise vertical slice uses the registry EC2 module (no root aws_instance).
+    # Enterprise / runtime slice uses the registry EC2 module (no root aws_instance).
     if "terraform-aws-modules/ec2-instance/aws" in text:
         return True
     if re.search(r'resource\s+"aws_key_pair"\s+"[^"]+"', text, flags=re.IGNORECASE):
         return True
-    return bool(re.search(r'module\s+"ec2"\s*\{', text, flags=re.IGNORECASE))
+    return bool(re.search(r'module\s+"(ec2|compute)"\s*\{', text, flags=re.IGNORECASE))
+
+
+def _collect_tfvars_text(files: list[dict[str, Any]]) -> str:
+    chunks: list[str] = []
+    for item in files:
+        path = str(item.get("path", "")).replace("\\", "/").lower()
+        if path.endswith(".tfvars") or path.endswith(".auto.tfvars") or path.endswith(".tfvars.json"):
+            chunks.append(_extract_text_payload(item))
+    return "\n".join(chunks)
+
+
+def _bundle_requests_ec2(tf_text: str, tfvars_text: str) -> bool:
+    """True when this apply is expected to create a live EC2 instance.
+
+    Static-site stacks still embed a gated compute module. RDS/ElastiCache
+    templates always contain ``resource "aws_db_instance"`` with count=0.
+    Neither of those should count as a successful EC2 deploy.
+    """
+    vars_text = tfvars_text or ""
+    if re.search(
+        r'^\s*compute_strategy\s*=\s*"(s3_cloudfront|cloudfront|s3cloudfront|static_site)"\s*$',
+        vars_text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    ):
+        return False
+    enable_false = re.search(r'^\s*enable_ec2\s*=\s*false\s*$', vars_text, flags=re.IGNORECASE | re.MULTILINE)
+    enable_true = re.search(r'^\s*enable_ec2\s*=\s*true\s*$', vars_text, flags=re.IGNORECASE | re.MULTILINE)
+    if enable_false and not enable_true:
+        return False
+    return _terraform_has_aws_instance(tf_text)
+
+
+def _ec2_addresses_from_state_list(state_list_output: str) -> list[str]:
+    rows: list[str] = []
+    for line in (state_list_output or "").splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        if "aws_instance." in row:
+            rows.append(row)
+    return rows
+
+
+def _missing_required_ec2_error(
+    *,
+    requests_ec2: bool,
+    ec2_fallback_applied: bool,
+    ec2_state_resources: list[str],
+    ec2_output_evidence: dict[str, str],
+) -> str | None:
+    if not requests_ec2:
+        return None
+    if ec2_state_resources or ec2_output_evidence:
+        return None
+    if ec2_fallback_applied:
+        return (
+            "Deployment incomplete: EC2 was disabled by quota fallback, so no instance "
+            "was provisioned in AWS. Request a vCPU quota increase or free capacity, then retry."
+        )
+    return (
+        "Terraform apply finished but no EC2 instance was found in Terraform state, "
+        "outputs, or live AWS. Success requires terraform-aws-modules/ec2-instance "
+        "(or aws_instance) to actually create an instance."
+    )
 
 
 def _terraform_has_rds_or_elasticache(tf_text: str) -> bool:
@@ -2833,10 +2721,10 @@ def _build_provisioning_report(
     # ---- resource category definitions ----
     _CATEGORIES: list[tuple[str, str, list[str], list[str]]] = [
         # (display_name, key, state_prefixes, tf_resource_patterns)
-        ("VPC", "vpc", ["aws_vpc.", "aws_subnet.", "aws_internet_gateway.", "aws_route_table.", "aws_nat_gateway."],
-         [r'resource\s+"aws_vpc"', r'resource\s+"aws_subnet"']),
-        ("EC2 Instance", "ec2", ["aws_instance.", "aws_key_pair."],
-         [r'resource\s+"aws_instance"']),
+        ("VPC", "vpc", ["aws_vpc.", "aws_subnet.", "aws_internet_gateway.", "aws_route_table.", "aws_nat_gateway.", "module.vpc."],
+         [r'resource\s+"aws_vpc"', r'resource\s+"aws_subnet"', r'terraform-aws-modules/vpc/', r'module\s+"vpc"']),
+        ("EC2 Instance", "ec2", ["aws_instance.", "aws_key_pair.", "module.ec2."],
+         [r'resource\s+"aws_instance"', r'terraform-aws-modules/ec2-instance', r'module\s+"ec2"']),
         ("Security Group", "security_group", ["aws_security_group."],
          [r'resource\s+"aws_security_group"']),
         ("RDS Database", "rds", ["aws_db_instance.", "aws_db_subnet_group.", "module.db.", "module.rds."],
@@ -2851,8 +2739,8 @@ def _build_provisioning_report(
          [r'resource\s+"aws_cloudfront_distribution"']),
         ("IAM", "iam", ["aws_iam_role.", "aws_iam_policy.", "aws_iam_instance_profile.", "aws_iam_role_policy."],
          [r'resource\s+"aws_iam_role"', r'resource\s+"aws_iam_policy"']),
-        ("Load Balancer", "alb", ["aws_lb.", "aws_lb_listener.", "aws_lb_target_group.", "aws_alb."],
-         [r'resource\s+"aws_lb"', r'resource\s+"aws_alb"']),
+        ("Load Balancer", "alb", ["aws_lb.", "aws_lb_listener.", "aws_lb_target_group.", "aws_alb.", "module.alb."],
+         [r'resource\s+"aws_lb"', r'resource\s+"aws_alb"', r'terraform-aws-modules/alb/', r'module\s+"alb"']),
     ]
 
     resources: list[dict[str, Any]] = []
@@ -3438,6 +3326,26 @@ def apply_terraform_bundle(
             bundle_remediation = {**bundle_remediation, **legacy_remediation}
             normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
             _write_files_to_volume(volume_name, files)
+        files, vpc_lookup_remediation = _rewrite_hard_default_vpc_lookup(files)
+        if vpc_lookup_remediation.get("default_vpc_lookup_softened"):
+            bundle_remediation.update(vpc_lookup_remediation)
+            normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
+            _write_files_to_volume(volume_name, files)
+            _emit_progress(
+                apply_context,
+                "info",
+                "Rewrote hardcoded default-VPC lookups so regions without a default VPC can still apply.",
+            )
+        files, key_rotation_remediation = _ensure_unique_ec2_key_pair(files)
+        if any(bool(value) for value in key_rotation_remediation.values()):
+            bundle_remediation.update(key_rotation_remediation)
+            normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
+            _write_files_to_volume(volume_name, files)
+            _emit_progress(
+                apply_context,
+                "info",
+                "Each deploy mints a new EC2 SSH key tagged with the instance ID. Download the PEM and database password once — DeplAI does not keep them.",
+            )
         # Normalize AWS provider version constraints when bundle mixes EC2 and
         # RDS/ElastiCache templates (keep registry 5.x pin — never bump to 6.x here).
         tf_text_preflight = _collect_terraform_text(files)
@@ -3445,9 +3353,12 @@ def apply_terraform_bundle(
         bundle_has_registry_module = _terraform_has_registry_module(tf_text_preflight)
         if bundle_has_rds_or_elasticache:
             files = _normalize_rds_elasticache_provider_versions(files, apply_context)
-            files = _normalize_rds_engine_versions(files, apply_context)
-            normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
-            _write_files_to_volume(volume_name, files)
+        files = _normalize_rds_engine_versions(files, apply_context)
+        files = _ensure_ssm_managed_instance_core(files, apply_context)
+        files = _ensure_ecr_pull_policy(files, apply_context)
+        files = _inject_app_artifact_tarball(files, apply_context, project_name)
+        normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
+        _write_files_to_volume(volume_name, files)
         _emit_progress(apply_context, "info", "Terraform files staged into runtime workspace.")
 
         if not any(path.endswith(".tf") for path in normalized_paths):
@@ -3468,6 +3379,8 @@ def apply_terraform_bundle(
             "AWS_SECRET_ACCESS_KEY": aws_secret_access_key,
             "AWS_DEFAULT_REGION": aws_region,
             "TF_IN_AUTOMATION": "1",
+            "AWS_RETRY_MODE": "adaptive",
+            "AWS_MAX_ATTEMPTS": "10",
         }
         if aws_session_token:
             env["AWS_SESSION_TOKEN"] = aws_session_token
@@ -3542,6 +3455,29 @@ def apply_terraform_bundle(
             )
         except Exception as init_exc:
             init_error = str(init_exc)
+            lowered_init = init_error.lower()
+            if any(
+                marker in lowered_init
+                for marker in (
+                    "failed to download",
+                    "error downloading",
+                    "could not download",
+                    "unable to download",
+                    "failed to retrieve module",
+                )
+            ):
+                return {
+                    "success": False,
+                    "error": (
+                        "Terraform failed to download pinned AWS modules from the Terraform Registry. "
+                        "Apply cannot succeed without terraform-aws-modules/vpc, ec2-instance, and alb. "
+                        f"Init error: {_tail(init_error, 800)}"
+                    ),
+                    "details": {
+                        "terraform_root": tf_root,
+                        "init_log_tail": _tail(init_error),
+                    },
+                }
             actual_region_from_error = _extract_actual_bucket_region(init_error)
             needs_retry = _is_missing_remote_state_error(init_error) or _is_backend_region_mismatch_error(init_error)
             # Do not auto-retry with -upgrade: open module floors + upgrade grabs 6.x-requiring modules.
@@ -3606,17 +3542,45 @@ def apply_terraform_bundle(
             }
 
         tf_text = _collect_terraform_text(files)
+        tfvars_text = _collect_tfvars_text(files)
+        root_tf_text = _collect_root_terraform_text(files)
         has_ec2_resource = _terraform_has_aws_instance(tf_text)
+        requests_ec2 = _bundle_requests_ec2(tf_text, tfvars_text)
         has_rds_or_elasticache = _terraform_has_rds_or_elasticache(tf_text)
-        has_instance_type_var = _terraform_has_variable(tf_text, "instance_type")
-        has_enable_ec2_var = _terraform_has_variable(tf_text, "enable_ec2")
-        has_aws_region_var = _terraform_has_variable(tf_text, "aws_region")
-        has_preferred_azs_var = _terraform_has_variable(tf_text, "preferred_availability_zones")
-        has_existing_key_name_var = _terraform_has_variable(tf_text, "existing_ec2_key_pair_name")
-        has_use_default_vpc_var = _terraform_has_variable(tf_text, "use_default_vpc")
+        has_instance_type_var = _terraform_has_variable(root_tf_text, "instance_type")
+        has_enable_ec2_var = _terraform_has_variable(root_tf_text, "enable_ec2")
+        has_aws_region_var = _terraform_has_variable(root_tf_text, "aws_region")
+        has_preferred_azs_var = _terraform_has_variable(root_tf_text, "preferred_availability_zones")
+        has_existing_key_name_var = _terraform_has_variable(root_tf_text, "existing_ec2_key_pair_name")
+        has_ec2_key_rotation_var = _terraform_has_variable(root_tf_text, "ec2_key_rotation")
+        has_use_default_vpc_var = _terraform_has_variable(root_tf_text, "use_default_vpc")
         preferred_azs = _preferred_azs_for_region(aws_region)
         selected_az_order = [*preferred_azs]
         attempted_az_orders: list[list[str]] = [[*preferred_azs]] if preferred_azs else []
+        use_default_vpc_override: bool | None = None
+        if has_use_default_vpc_var:
+            try:
+                vpc_session = boto3.session.Session(
+                    aws_access_key_id=aws_access_key_id,
+                    aws_secret_access_key=aws_secret_access_key,
+                    aws_session_token=aws_session_token or None,
+                    region_name=aws_region,
+                )
+                vpc_ec2 = vpc_session.client("ec2", region_name=aws_region)
+                has_default_vpc = _region_has_default_vpc(vpc_ec2)
+                if has_default_vpc is False:
+                    use_default_vpc_override = False
+                    _emit_progress(
+                        apply_context,
+                        "info",
+                        f"No default VPC in {aws_region}. Terraform will create a dedicated VPC instead of failing lookup.",
+                    )
+            except Exception as vpc_exc:
+                _emit_progress(
+                    apply_context,
+                    "warning",
+                    f"Could not check for a default VPC in {aws_region}: {vpc_exc}",
+                )
         enforce_free_tier = bool(enforce_free_tier_ec2)
         allowed_instance_types = _FREE_TIER_EC2_INSTANCE_ORDER if enforce_free_tier else _SAFE_EC2_INSTANCE_ORDER
         allowed_instance_type_set = set(allowed_instance_types)
@@ -3631,7 +3595,7 @@ def apply_terraform_bundle(
         apply_args_base = ["apply", "-auto-approve", "-input=false", "-no-color", "-parallelism=20"]
         saved_plan_path = "deplai-runtime.tfplan"
         allow_disable_fallback = str(
-            os.getenv("DEPLAI_ALLOW_EC2_DISABLE_FALLBACK", "1")
+            os.getenv("DEPLAI_ALLOW_EC2_DISABLE_FALLBACK", "0")
         ).strip().lower() in {"1", "true", "yes"}
         requested_instance_type = (
             os.getenv("DEPLAI_EC2_INSTANCE_TYPE", "").strip().lower()
@@ -3639,6 +3603,7 @@ def apply_terraform_bundle(
             or "t3.micro"
         )
         existing_key_name_override: str | None = None
+        key_rotation = _new_ec2_key_rotation()
         instance_candidates = _ordered_instance_candidates(
             requested_instance_type,
             enforce_free_tier=enforce_free_tier,
@@ -3646,30 +3611,15 @@ def apply_terraform_bundle(
         if not (has_ec2_resource and has_instance_type_var):
             instance_candidates = []
 
-        # Reuse orphaned project key pairs even when EC2 is module-based (no root aws_instance).
+        # Always mint a new TLS key for this apply. Reusing an AWS key pair
+        # hides the private half (AWS never stores it) and leaves the user
+        # without a PEM. Collision retries use a fresh rotation suffix instead.
         if has_existing_key_name_var:
-            try:
-                key_session = boto3.session.Session(
-                    aws_access_key_id=aws_access_key_id,
-                    aws_secret_access_key=aws_secret_access_key,
-                    aws_session_token=aws_session_token or None,
-                    region_name=aws_region,
-                )
-                key_ec2 = key_session.client("ec2", region_name=aws_region)
-                key_candidate = _discover_existing_ec2_key_pair_name(files, project_name)
-                if key_candidate and _ec2_key_pair_exists(key_ec2, key_candidate):
-                    existing_key_name_override = key_candidate
-                    _emit_progress(
-                        apply_context,
-                        "info",
-                        f"Reusing existing EC2 key pair '{key_candidate}' to avoid InvalidKeyPair.Duplicate.",
-                    )
-            except Exception as key_exc:
-                _emit_progress(
-                    apply_context,
-                    "warning",
-                    f"EC2 key pair preflight skipped: {key_exc}",
-                )
+            _emit_progress(
+                apply_context,
+                "info",
+                f"Generating a new EC2 key pair for this deploy (rotation {key_rotation}); existing AWS keys will not be reused.",
+            )
 
         if has_ec2_resource and enforce_free_tier and not has_instance_type_var:
             literal_types = _terraform_literal_instance_types(tf_text)
@@ -3698,10 +3648,6 @@ def apply_terraform_bundle(
                 region_name=aws_region,
             )
             ec2 = session.client("ec2", region_name=aws_region)
-            if has_existing_key_name_var and not existing_key_name_override:
-                key_candidate = _discover_existing_ec2_key_pair_name(files, project_name)
-                if key_candidate and _ec2_key_pair_exists(ec2, key_candidate):
-                    existing_key_name_override = key_candidate
             quota_limit = _get_standard_vcpu_quota(session, aws_region)
             used_vcpus = _count_running_standard_vcpus(ec2)
             quota_info["requested_instance_type"] = requested_instance_type
@@ -3769,6 +3715,8 @@ def apply_terraform_bundle(
             preferred_azs_override: list[str] | None = None,
             existing_key_name: str | None = None,
             force_default_vpc: bool = False,
+            use_default_vpc_override_arg: bool | None = None,
+            key_rotation_override: str | None = None,
         ) -> list[str]:
             args = [*apply_args_base]
             if has_enable_ec2_var and has_ec2_resource:
@@ -3778,10 +3726,16 @@ def apply_terraform_bundle(
             az_order = preferred_azs_override if preferred_azs_override is not None else preferred_azs
             if has_preferred_azs_var and az_order:
                 args.append(f"-var=preferred_availability_zones={json.dumps(az_order)}")
-            if force_default_vpc and has_use_default_vpc_var:
-                args.append("-var=use_default_vpc=true")
-            if existing_key_name and has_existing_key_name_var:
-                args.append(f"-var=existing_ec2_key_pair_name={existing_key_name}")
+            vpc_override = True if force_default_vpc else use_default_vpc_override_arg
+            if vpc_override is None:
+                vpc_override = use_default_vpc_override
+            if vpc_override is not None and has_use_default_vpc_var:
+                args.append(f"-var=use_default_vpc={'true' if vpc_override else 'false'}")
+            if has_existing_key_name_var:
+                args.append('-var=existing_ec2_key_pair_name=')
+            rotation = key_rotation_override if key_rotation_override is not None else key_rotation
+            if has_ec2_key_rotation_var and rotation:
+                args.append(f"-var=ec2_key_rotation={rotation}")
             if instance_type_override:
                 args.append(f"-var=instance_type={instance_type_override}")
             return args
@@ -3793,6 +3747,8 @@ def apply_terraform_bundle(
             existing_key_name: str | None = None,
             force_default_vpc: bool = False,
             output_path: str | None = None,
+            use_default_vpc_override_arg: bool | None = None,
+            key_rotation_override: str | None = None,
         ) -> list[str]:
             args = [*plan_args_base]
             if has_enable_ec2_var and has_ec2_resource:
@@ -3802,10 +3758,16 @@ def apply_terraform_bundle(
             az_order = preferred_azs_override if preferred_azs_override is not None else preferred_azs
             if has_preferred_azs_var and az_order:
                 args.append(f"-var=preferred_availability_zones={json.dumps(az_order)}")
-            if force_default_vpc and has_use_default_vpc_var:
-                args.append("-var=use_default_vpc=true")
-            if existing_key_name and has_existing_key_name_var:
-                args.append(f"-var=existing_ec2_key_pair_name={existing_key_name}")
+            vpc_override = True if force_default_vpc else use_default_vpc_override_arg
+            if vpc_override is None:
+                vpc_override = use_default_vpc_override
+            if vpc_override is not None and has_use_default_vpc_var:
+                args.append(f"-var=use_default_vpc={'true' if vpc_override else 'false'}")
+            if has_existing_key_name_var:
+                args.append('-var=existing_ec2_key_pair_name=')
+            rotation = key_rotation_override if key_rotation_override is not None else key_rotation
+            if has_ec2_key_rotation_var and rotation:
+                args.append(f"-var=ec2_key_rotation={rotation}")
             if instance_type_override:
                 args.append(f"-var=instance_type={instance_type_override}")
             if output_path:
@@ -3870,8 +3832,9 @@ def apply_terraform_bundle(
                         "backend_bootstrap": backend_bootstrap,
                         "bundle_remediation": bundle_remediation,
                         "selected_instance_type": selected_instance_type,
-                        "existing_ec2_key_pair_name": existing_key_name_override,
-                        "key_pair_reused": bool(existing_key_name_override),
+                        "existing_ec2_key_pair_name": None,
+                        "key_pair_reused": False,
+                        "ec2_key_rotation": key_rotation,
                     },
                 }
             args = _build_apply_args(
@@ -3910,7 +3873,206 @@ def apply_terraform_bundle(
             stderr = combined
             stdout = ""
 
-            if "VpcLimitExceeded" in combined:
+            handled_missing_default_vpc = False
+            apply_recovered = False
+            if _is_transient_aws_api_error(combined):
+                transient_errors: list[str] = [_tail(combined, 1200)]
+                recovered = False
+                retry_log = ""
+                for attempt in range(1, 4):
+                    if apply_context and apply_context.get("cancel_requested"):
+                        _emit_progress(apply_context, "error", "Terraform apply cancelled during DNS/API retry.")
+                        return {
+                            "success": False,
+                            "error": "Deployment stopped by user.",
+                            "details": {
+                                "terraform_root": tf_root,
+                                "init_log_tail": _tail(init_log),
+                                "plan_log_tail": _tail(plan_log),
+                                "apply_log_tail": _tail(combined, 1800),
+                            },
+                        }
+                    wait_s = 5 * attempt
+                    _emit_progress(
+                        apply_context,
+                        "info",
+                        (
+                            "Lost connectivity to the AWS API (Docker DNS/network). "
+                            f"Retrying apply in {wait_s}s ({attempt}/3). "
+                            "Already-created resources stay in remote state."
+                        ),
+                    )
+                    time.sleep(wait_s)
+                    try:
+                        retry_log = _run_terraform_with_tracking(
+                            volume_name,
+                            tf_root,
+                            _build_apply_args(
+                                selected_instance_type,
+                                disable_ec2=precheck_disable_ec2,
+                                preferred_azs_override=selected_az_order,
+                                existing_key_name=existing_key_name_override,
+                                force_default_vpc=False,
+                            ),
+                            env,
+                            apply_context=apply_context,
+                        )
+                        apply_mode = "transient_aws_api_retry"
+                        apply_log = (
+                            f"{apply_log}\n[attempt-1] apply lost AWS API connectivity.\n"
+                            f"{_tail(combined, 900)}\n\n"
+                            f"[attempt-retry:{attempt}] apply retry log:\n{retry_log}"
+                        )
+                        recovered = True
+                        break
+                    except Exception as retry_exc:
+                        retry_combined = str(retry_exc).strip()
+                        transient_errors.append(_tail(retry_combined, 900))
+                        if apply_context and apply_context.get("cancel_requested"):
+                            _emit_progress(apply_context, "error", "Terraform apply cancelled during DNS/API retry.")
+                            return {
+                                "success": False,
+                                "error": "Deployment stopped by user.",
+                                "details": {
+                                    "terraform_root": tf_root,
+                                    "init_log_tail": _tail(init_log),
+                                    "apply_log_tail": _tail(retry_combined, 1800),
+                                },
+                            }
+                        if not _is_transient_aws_api_error(retry_combined):
+                            combined = retry_combined
+                            stderr = combined
+                            break
+                if recovered:
+                    apply_recovered = True
+                elif _is_transient_aws_api_error(combined):
+                    _emit_progress(apply_context, "error", _transient_aws_api_error_message(combined))
+                    return {
+                        "success": False,
+                        "error": _transient_aws_api_error_message(combined),
+                        "details": {
+                            "terraform_root": tf_root,
+                            "apply_mode": "transient_aws_api_retry_exhausted",
+                            "retry_errors": transient_errors[-4:],
+                            "init_log_tail": _tail(init_log),
+                            "plan_log_tail": _tail(plan_log),
+                            "apply_log_tail": _tail(combined, 1800),
+                        },
+                    }
+
+            if apply_recovered:
+                pass
+            elif _is_missing_default_vpc_error(combined) and has_use_default_vpc_var:
+                _emit_progress(
+                    apply_context,
+                    "info",
+                    f"Default VPC lookup failed in {aws_region}. Retrying Terraform with a dedicated VPC.",
+                )
+                use_default_vpc_override = False
+                try:
+                    plan_log = _run_terraform_with_tracking(
+                        volume_name,
+                        tf_root,
+                        _build_plan_args(
+                            selected_instance_type,
+                            disable_ec2=precheck_disable_ec2,
+                            preferred_azs_override=selected_az_order,
+                            existing_key_name=existing_key_name_override,
+                            use_default_vpc_override_arg=False,
+                            output_path=saved_plan_path,
+                        ),
+                        env,
+                        apply_context=apply_context,
+                    )
+                    try:
+                        plan_json_log = _run_terraform_with_tracking(
+                            volume_name,
+                            tf_root,
+                            ["show", "-json", saved_plan_path],
+                            env,
+                            apply_context=apply_context,
+                        )
+                        ec2_plan_changes = _summarize_ec2_plan_changes(json.loads(plan_json_log or "{}"))
+                    except Exception as plan_json_exc:
+                        plan_json_error = str(plan_json_exc)
+                        ec2_plan_changes = _summarize_ec2_plan_changes(None)
+                    plan_counts = _parse_plan_change_counts(plan_log)
+                    plan_summary = {
+                        "total_resources": plan_counts,
+                        "terraform_root": tf_root,
+                        "selected_instance_type": selected_instance_type,
+                        "ec2_disabled": precheck_disable_ec2,
+                        "ec2_plan_changes": ec2_plan_changes,
+                        "state_bucket": state_bucket_name or None,
+                        "lock_table": lock_table_name or None,
+                        "requires_confirmation": True,
+                        "created_dedicated_vpc": True,
+                    }
+                    if not confirm_apply:
+                        _emit_progress(
+                            apply_context,
+                            "info",
+                            "Terraform plan completed without a default VPC and is awaiting confirmation before apply.",
+                        )
+                        return {
+                            "success": True,
+                            "status": "awaiting_plan_confirmation",
+                            "outputs": {},
+                            "cloudfront_url": None,
+                            "plan_summary": plan_summary,
+                            "details": {
+                                "terraform_root": tf_root,
+                                "fmt_log_tail": _tail(fmt_log),
+                                "init_log_tail": _tail(init_log),
+                                "validate_log_tail": _tail(validate_log),
+                                "plan_log_tail": _tail(plan_log),
+                                "plan_json_error": plan_json_error,
+                                "backend_bootstrap": backend_bootstrap,
+                                "bundle_remediation": bundle_remediation,
+                                "selected_instance_type": selected_instance_type,
+                                "existing_ec2_key_pair_name": None,
+                                "key_pair_reused": False,
+                                "ec2_key_rotation": key_rotation,
+                                "use_default_vpc": False,
+                            },
+                        }
+                    apply_mode = "dedicated_vpc_fallback"
+                    apply_log = (
+                        f"[attempt-1] plan/apply failed: no default VPC in {aws_region}.\n"
+                        f"{_tail(combined, 900)}\n\n"
+                        "[attempt-retry:use_default_vpc=false] apply log:\n"
+                    )
+                    apply_log = (
+                        f"{apply_log}"
+                        f"{_run_terraform_with_tracking(volume_name, tf_root, ['apply', '-input=false', '-no-color', '-parallelism=20', saved_plan_path], env, apply_context=apply_context)}"
+                    )
+                    handled_missing_default_vpc = True
+                except Exception as retry_exc:
+                    retry_combined = str(retry_exc).strip()
+                    if "VpcLimitExceeded" in retry_combined:
+                        retry_error = (
+                            f"No default VPC exists in {aws_region}, and creating a dedicated VPC hit AWS VPC quota. "
+                            "Delete unused VPCs or request a quota increase, then retry."
+                        )
+                    else:
+                        retry_error = (
+                            f"No default VPC exists in {aws_region}, and creating a dedicated VPC also failed. "
+                            f"{retry_combined}"
+                        )
+                    return {
+                        "success": False,
+                        "error": retry_error,
+                        "details": {
+                            "terraform_root": tf_root,
+                            "init_log_tail": _tail(init_log),
+                            "plan_log_tail": _tail(plan_log),
+                            "apply_log_tail": _tail(retry_combined, 1800),
+                        },
+                    }
+
+            if apply_recovered or handled_missing_default_vpc:
+                pass
+            elif "VpcLimitExceeded" in combined:
                 return {
                     "success": False,
                     "error": (
@@ -3924,7 +4086,7 @@ def apply_terraform_bundle(
                     },
                 }
 
-            if "OriginAccessControlAlreadyExists" in combined:
+            elif "OriginAccessControlAlreadyExists" in combined:
                 return {
                     "success": False,
                     "error": (
@@ -3938,7 +4100,7 @@ def apply_terraform_bundle(
                     },
                 }
 
-            if "InvalidAMIID.NotFound" in combined:
+            elif "InvalidAMIID.NotFound" in combined:
                 return {
                     "success": False,
                     "error": (
@@ -3954,7 +4116,7 @@ def apply_terraform_bundle(
                     },
                 }
 
-            if "At least two subnets in two different Availability Zones must be specified" in combined:
+            elif "At least two subnets in two different Availability Zones must be specified" in combined:
                 return {
                     "success": False,
                     "error": (
@@ -3970,8 +4132,47 @@ def apply_terraform_bundle(
                     },
                 }
 
-            # Orphaned static names (key pair / ALB) from a prior partial apply.
-            if _is_orphan_key_pair_collision(combined) or _is_orphan_alb_collision(combined):
+            elif _is_orphan_key_pair_collision(combined) and not _is_orphan_alb_collision(combined) and has_ec2_key_rotation_var:
+                key_rotation = _new_ec2_key_rotation()
+                _emit_progress(
+                    apply_context,
+                    "info",
+                    f"EC2 key pair name already exists in AWS. Creating a new key ({key_rotation}) instead of reusing a key with no private PEM.",
+                )
+                try:
+                    retry_log = _run_terraform_with_tracking(
+                        volume_name,
+                        tf_root,
+                        _build_apply_args(
+                            selected_instance_type,
+                            preferred_azs_override=selected_az_order,
+                            existing_key_name=None,
+                            force_default_vpc=False,
+                            key_rotation_override=key_rotation,
+                        ),
+                        env,
+                        apply_context=apply_context,
+                    )
+                    apply_mode = "ec2_new_key_on_duplicate"
+                    apply_log = (
+                        f"{apply_log}\n\n[key-rotation-retry {key_rotation}]\n{retry_log}"
+                    )
+                except Exception as retry_exc:
+                    return {
+                        "success": False,
+                        "error": (
+                            "Terraform could not create a new EC2 key pair after a name collision. "
+                            "DeplAI will not reuse the existing AWS key because AWS never stores the private half."
+                        ),
+                        "details": {
+                            "terraform_root": tf_root,
+                            "ec2_key_rotation": key_rotation,
+                            "init_log_tail": _tail(init_log),
+                            "apply_log_tail": _tail(str(retry_exc), 1800),
+                        },
+                    }
+
+            elif _is_orphan_key_pair_collision(combined) or _is_orphan_alb_collision(combined):
                 duplicate_key = _extract_duplicate_key_pair_name(combined) or existing_key_name_override
                 if not duplicate_key and has_existing_key_name_var:
                     duplicate_key = _discover_existing_ec2_key_pair_name(files, project_name)
@@ -3991,9 +4192,7 @@ def apply_terraform_bundle(
                     "error": (
                         "Terraform tried to create static-named resources that already exist in AWS "
                         "but are missing from the current state (partial prior apply / lost state). "
-                        "See details.orphan_collision for Option A (adopt/import or key reuse) vs "
-                        "Option B (delete orphans). DeplAI now reuses existing project key pairs and "
-                        "VPC-suffixes ALB names on new generates to prevent recurrence."
+                        "See details.orphan_collision. DeplAI mints a new SSH key on each deploy and does not reuse AWS key pairs."
                     ),
                     "details": {
                         "terraform_root": tf_root,
@@ -4008,7 +4207,7 @@ def apply_terraform_bundle(
                     },
                 }
 
-            if _is_vcpu_quota_error(combined) and has_ec2_resource and has_instance_type_var:
+            elif _is_vcpu_quota_error(combined) and has_ec2_resource and has_instance_type_var:
                 retry_errors: list[str] = [_tail(combined, 1200)]
                 retry_log = ""
                 for candidate in instance_candidates:
@@ -4191,15 +4390,12 @@ def apply_terraform_bundle(
                 env,
                 apply_context=apply_context,
             )
-            for line in state_list_raw.splitlines():
-                row = line.strip()
-                if "aws_instance." in row:
-                    ec2_state_resources.append(row)
+            ec2_state_resources = _ec2_addresses_from_state_list(state_list_raw)
         except Exception as exc:
             ec2_state_list_error = str(exc)
             ec2_state_resources = []
 
-        if has_ec2_resource and not ec2_fallback_applied:
+        if requests_ec2:
             if not ec2_state_resources and not ec2_output_evidence:
                 live_ec2_reconciliation = _lookup_live_ec2_instance_for_project(
                     aws_access_key_id=aws_access_key_id,
@@ -4235,70 +4431,33 @@ def apply_terraform_bundle(
                         "info",
                         "Live AWS reconciliation confirmed EC2 provisioning despite incomplete Terraform state/output evidence.",
                     )
-            if not ec2_state_resources and not ec2_output_evidence:
-                # When the bundle mixes EC2 with RDS or ElastiCache, Terraform may
-                # apply the database/cache tier successfully while EC2 creation is
-                # deferred or managed by a conditional variable. Do not treat this
-                # as a hard failure — emit an informational message and continue so
-                # the caller can surface whichever outputs are available.
-                if has_rds_or_elasticache and not ec2_plan_changes.get("expects_ec2_create_or_replace"):
-                    _emit_progress(
-                        apply_context,
-                        "info",
-                        "Terraform apply finished. Bundle contains RDS/ElastiCache resources; EC2 was not created or replaced in this run (may be managed separately or disabled via variable).",
-                    )
-                    ec2_error = None
-                elif ec2_plan_changes.get("expects_ec2_create_or_replace"):
-                    if has_rds_or_elasticache:
-                        # RDS/ElastiCache apply may have partially succeeded; EC2
-                        # may have been created but state tracking failed due to
-                        # the registry module init delay. Warn but do not block.
-                        _emit_progress(
-                            apply_context,
-                            "info",
-                            "Terraform planned EC2 creation alongside RDS/ElastiCache but EC2 was not found in state after apply. "
-                            "The database/cache tier may have applied successfully. Check the AWS console for EC2 instance status.",
-                        )
-                        ec2_error = None
-                    else:
-                        ec2_error = (
-                            "Terraform planned EC2 creation or replacement, but no EC2 instance resource "
-                            "was found in state or outputs after apply."
-                        )
-                elif ec2_plan_changes.get("has_managed_ec2"):
-                    ec2_error = (
-                        "Terraform apply finished but the plan did not create or replace EC2, and no "
-                        "EC2 instance resource was found in state. The saved state/config may have "
-                        "EC2 disabled or removed."
-                    )
-                else:
-                    ec2_error = None
-                    _emit_progress(
-                        apply_context,
-                        "info",
-                        "Terraform apply finished. The codebase contains 'aws_instance' but the plan did not manage any EC2 instances."
-                    )
-
-                if ec2_error:
-                    return {
-                        "success": False,
-                        "error": ec2_error,
-                        "details": {
-                            "terraform_root": tf_root,
-                            "selected_instance_type": selected_instance_type,
-                            "attempted_instance_types": attempted_instance_types,
-                            "attempted_preferred_az_orders": attempted_az_orders,
-                            "quota_info": quota_info,
-                            "ec2_plan_changes": ec2_plan_changes,
-                            "ec2_output_evidence": ec2_output_evidence,
-                            "ec2_state_list_error": ec2_state_list_error,
-                            "output_read_error": output_read_error,
-                            "plan_json_error": plan_json_error,
-                            "live_ec2_reconciliation": live_ec2_reconciliation,
-                            "init_log_tail": _tail(init_log),
-                            "apply_log_tail": _tail(apply_log),
-                        },
-                    }
+            ec2_error = _missing_required_ec2_error(
+                requests_ec2=True,
+                ec2_fallback_applied=ec2_fallback_applied,
+                ec2_state_resources=ec2_state_resources,
+                ec2_output_evidence=ec2_output_evidence,
+            )
+            if ec2_error:
+                _emit_progress(apply_context, "error", ec2_error)
+                return {
+                    "success": False,
+                    "error": ec2_error,
+                    "details": {
+                        "terraform_root": tf_root,
+                        "selected_instance_type": selected_instance_type,
+                        "attempted_instance_types": attempted_instance_types,
+                        "attempted_preferred_az_orders": attempted_az_orders,
+                        "quota_info": quota_info,
+                        "ec2_plan_changes": ec2_plan_changes,
+                        "ec2_output_evidence": ec2_output_evidence,
+                        "ec2_state_list_error": ec2_state_list_error,
+                        "output_read_error": output_read_error,
+                        "plan_json_error": plan_json_error,
+                        "live_ec2_reconciliation": live_ec2_reconciliation,
+                        "init_log_tail": _tail(init_log),
+                        "apply_log_tail": _tail(apply_log),
+                    },
+                }
             if ec2_output_evidence and not ec2_state_resources:
                 _emit_progress(
                     apply_context,
@@ -4363,6 +4522,24 @@ def apply_terraform_bundle(
             has_rds_or_elasticache=has_rds_or_elasticache,
         )
 
+        one_time_credentials = _collect_one_time_credentials(
+            outputs,
+            project_name=project_name,
+            aws_region=aws_region,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            terraform_root=tf_root,
+        )
+        if one_time_credentials.get("private_key_pem"):
+            outputs["generated_ec2_private_key_pem"] = one_time_credentials["private_key_pem"]
+            outputs["ec2_key_name"] = one_time_credentials.get("key_name") or outputs.get("ec2_key_name")
+            _emit_progress(
+                apply_context,
+                "info",
+                "SSH key and database credentials are ready for a one-time download. They are deleted from DeplAI after you save them.",
+            )
+
         return {
             "success": True,
             "provider": provider,
@@ -4371,7 +4548,11 @@ def apply_terraform_bundle(
             "cloudfront_url": cloudfront_url,
             "plan_summary": plan_summary,
             "provisioning_report": provisioning_report,
-            "has_database_resources": has_rds_or_elasticache,
+            "one_time_credentials": one_time_credentials,
+            "has_database_resources": bool(
+                _nonempty_output_string(outputs, ["rds_endpoint", "rds_address", "db_endpoint", "postgres_endpoint"])
+                or _nonempty_output_string(outputs, ["redis_endpoint", "elasticache_endpoint", "cache_endpoint"])
+            ),
             "details": {
                 "apply_mode": apply_mode,
                 "ec2_fallback_applied": ec2_fallback_applied,
@@ -4397,8 +4578,10 @@ def apply_terraform_bundle(
                 "website_bucket_inspection": website_inspection,
                 "backend_bootstrap": backend_bootstrap,
                 "bundle_remediation": bundle_remediation,
-                "existing_ec2_key_pair_name": existing_key_name_override,
-                "key_pair_reused": bool(existing_key_name_override),
+                "existing_ec2_key_pair_name": None,
+                "key_pair_reused": False,
+                "ec2_key_rotation": key_rotation,
+                "key_file_name": one_time_credentials.get("key_file_name"),
             },
         }
 

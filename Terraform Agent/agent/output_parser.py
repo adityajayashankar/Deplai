@@ -4,9 +4,22 @@ from pathlib import Path
 
 # Maps service type -> the output keys we expect from terraform output -json
 # Must stay in sync with outputs.tf in each template directory
+_S3_CLOUDFRONT_OUTPUT_KEYS = [
+    "cloudfront_url",
+    "cloudfront_domain_name",
+    "website_bucket_name",
+    "distribution_id",
+    "region",
+]
+
 SERVICE_OUTPUT_KEYS: dict[str, list[str]] = {
-    "ec2": ["public_ip", "instance_id", "keypair_name", "availability_zone", "arn"],
+    "ec2": ["public_ip", "ec2_public_ip", "instance_id", "ec2_instance_id", "keypair_name", "availability_zone", "arn"],
     "s3": ["bucket_id", "bucket_arn", "bucket_domain_name", "region"],
+    "s3_cloudfront": list(_S3_CLOUDFRONT_OUTPUT_KEYS),
+    "cloudfront": list(_S3_CLOUDFRONT_OUTPUT_KEYS),
+    "cdn": list(_S3_CLOUDFRONT_OUTPUT_KEYS),
+    "static_site": list(_S3_CLOUDFRONT_OUTPUT_KEYS),
+    "s3cloudfront": list(_S3_CLOUDFRONT_OUTPUT_KEYS),
     "rds": ["endpoint", "port", "db_instance_id", "db_instance_arn"],
     "ecs": ["cluster_arn", "service_name", "task_definition_arn"],
     "lambda": ["lambda_function_arn", "lambda_function_name", "lambda_function_url"],
@@ -44,6 +57,10 @@ OUTPUT_LABELS: dict[str, str] = {
     "vpc_id": "VPC ID",
     "public_subnets": "Public Subnets",
     "private_subnets": "Private Subnets",
+    "cloudfront_url": "CloudFront URL",
+    "cloudfront_domain_name": "CloudFront Domain",
+    "website_bucket_name": "Origin Bucket",
+    "distribution_id": "Distribution ID",
 }
 
 

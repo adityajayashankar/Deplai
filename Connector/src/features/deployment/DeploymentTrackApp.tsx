@@ -2,24 +2,52 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { ArrowLeft, ArrowRight, CheckCircle2, ChevronRight, CircleDashed, Download, ExternalLink, RefreshCw, Rocket, Server, Terminal } from 'lucide-react';
-import { ResourceCard } from '@/components/pipeline/ResourceCard';
+import { ArrowLeft, ArrowRight, CheckCircle2, ChevronRight, CircleDashed, ExternalLink, RefreshCw, Rocket, Server, Terminal } from 'lucide-react';
 import { ApplyLogViewer } from '@/components/pipeline/ApplyLogViewer';
 import { AwsConsoleTerminal } from '@/components/pipeline/AwsConsoleTerminal';
 import { buildDeploymentWorkspace } from '@/lib/deployment-planning-contract';
+import { createWorkspaceSession, persistSessionProgress, finalizeWorkspaceSession } from '@/lib/sessions/client';
 import {
-  DEPLOYMENT_WORKSPACE_STYLE,
-  EndpointRow,
+  Callout,
+  Chip,
+  CodeSurface,
+  CountUp,
+  EmptyState,
+  KeyValueRow,
+  LogConsole,
   MetaChip,
+  Panel,
+  PanelHeader,
+  ProgressBar,
+  SectionLabel,
+  Skeleton,
   StageHeader,
-  Surface,
-  SurfaceLabel,
+  StageShell,
+  StatCard,
+  StatusPill,
+  StickyActionBar,
   accentButtonClass,
+  buttonClass,
+  fieldClass,
+  fieldLabelClass,
   formatCostComponentLabel,
+  paperInsetClass,
+  pipelinePrimaryButtonClass,
   primaryButtonClass,
   secondaryButtonClass,
-  shortenDecisionHash,
 } from '@/features/deployment/deployment-ui';
+import {
+  AnalysisStagePanel,
+  DeploymentCommandHeader,
+  DeploymentPipelineHeader,
+  DeploymentStageRail,
+  PlanningAgentPanel,
+  deriveAnalysisMetrics,
+  deriveDetectedServices,
+} from '@/features/deployment/DeploymentPipelineChrome';
+import { InfraOutputsStage } from '@/features/deployment/deployment-outputs';
+import { buildInfraAccessBriefing, firstProvisioned } from '@/features/deployment/infra-access-briefing';
+import { coerceHttpAppPort } from '@/features/deployment/http-ports';
 import {
   APPROVAL_PAYLOAD_KEY,
   ARCHITECTURE_VIEW_KEY,
@@ -47,9 +75,13 @@ import {
   extractDeploymentSummary,
   getDeployableIacFiles,
   hasTruncatedIacFiles,
+  isAwaitingPlanConfirmation,
+  isFailedDeployAttempt,
+  isLiveDeployAttempt,
   loadDeploySnapshot,
   loadDeployUiStage,
   persistDeploySnapshot,
+  clearDownloadedDeploySecrets,
   readSavedTerraformRuntimeConfig,
   readIacFilesFromSession,
   readSavedIacMeta,
@@ -85,6 +117,15 @@ import {
 } from './state';
 import { hashDecisionAsync } from '@/lib/decision-hash';
 import { AppSecretsPanel, type AppSecretMeta } from '@/features/deployment/AppSecretsPanel';
+import { AppDeployPanel } from '@/features/deployment/AppDeployPanel';
+import {
+  budgetCapFromAnswers,
+  buildScriptedHistory,
+  decisionFromDeploymentProfile,
+  isQuestionAnswered,
+  nextScriptedQuestionIndex,
+  resolveScriptedQuestionCursor,
+} from '@/features/deployment/decision-from-profile';
 
 type PipelineStageId = 'analysis' | 'qa' | 'architecture' | 'cost_estimation' | 'terraform' | 'aws_config' | 'app_secrets' | 'deploy' | 'outputs';
 
@@ -488,7 +529,7 @@ function normalizeEc2ResourceConfig(value: unknown): Ec2ResourceConfig {
       ? requestedInstanceType
       : DEFAULT_EC2_RESOURCE_CONFIG.instance_type,
     root_volume_size_gb: clampInteger(record.root_volume_size_gb, DEFAULT_EC2_RESOURCE_CONFIG.root_volume_size_gb, 20, 200),
-    app_port: clampInteger(record.app_port, DEFAULT_EC2_RESOURCE_CONFIG.app_port, 1, 65535),
+    app_port: coerceHttpAppPort(record.app_port, DEFAULT_EC2_RESOURCE_CONFIG.app_port),
     ssh_ingress_cidr_blocks: normalizeCidrList(record.ssh_ingress_cidr_blocks),
   };
 }
@@ -581,8 +622,8 @@ function deploymentPlanComponents(planId: DeploymentPlanId, services: Deployment
     : planId === 'ecs_fargate'
       ? ['vpc', 'alb', 'ecs']
       : ['vpc', 'ec2'];
-  if (services.rds) components.push('rds');
-  if (services.redis) components.push('elasticache');
+  if (planId !== 's3_cloudfront' && services.rds) components.push('rds');
+  if (planId !== 's3_cloudfront' && services.redis) components.push('elasticache');
 
   // Preserve consult intakes (ALB/EIP) across operator plan toggles for EC2-class apps.
   if (planId === 'ec2') {
@@ -660,7 +701,7 @@ function applyDeploymentSelectionToDecision(
       spa_fallback: configs.staticSite.spa_fallback,
     };
   }
-  if (services.rds) {
+  if (planId !== 's3_cloudfront' && services.rds) {
     stackConfig.rds = {
       ...toRecord(stackConfig.rds),
       engine: configs.rds.engine,
@@ -671,7 +712,7 @@ function applyDeploymentSelectionToDecision(
       backup_retention_period: configs.rds.backup_retention_period,
     };
   }
-  if (services.redis) {
+  if (planId !== 's3_cloudfront' && services.redis) {
     stackConfig.elasticache = {
       ...toRecord(stackConfig.elasticache),
       engine: 'redis',
@@ -709,7 +750,7 @@ const SIDEBAR_STAGES: Array<{ id: PipelineStageId; label: string; details: strin
   { id: 'cost_estimation', label: 'Cost Estimation', details: 'Stage 4' },
   { id: 'terraform', label: 'Infrastructure Generation', details: 'Generator' },
   { id: 'aws_config', label: 'AWS Config', details: 'Runtime Inputs' },
-  { id: 'app_secrets', label: 'App Secrets', details: 'Env & OAuth' },
+  { id: 'app_secrets', label: 'App Secrets', details: 'Optional' },
   { id: 'deploy', label: 'Deploy', details: 'Execution' },
   { id: 'outputs', label: 'Outputs', details: 'Credentials & URLs' },
 ];
@@ -732,6 +773,13 @@ function normalizeIacFiles(files: GeneratedIacFile[]): GeneratedIacFile[] {
     byPath.set(path, { path, content: String(file.content || '') });
   }
   return Array.from(byPath.values());
+}
+
+function splitIacFilePath(path: string): { dir: string; name: string } {
+  const normalized = String(path || '').replace(/\\/g, '/');
+  const slash = normalized.lastIndexOf('/');
+  if (slash < 0) return { dir: '', name: normalized };
+  return { dir: normalized.slice(0, slash), name: normalized.slice(slash + 1) };
 }
 
 function readCostEstimate() {
@@ -1012,21 +1060,25 @@ function emitActiveDeployment(projectId: string): void {
 
 function persistActiveDeploymentState(projectId: string, state: ActiveDeployState): void {
   if (typeof window === 'undefined') return;
-  persistDeploySnapshot(projectId, {
-    status: state.status,
-    progress: state.progress,
-    logs: state.logs,
-    deployResult: state.deployResult,
-    deploymentHistory: state.deploymentHistory,
-    updatedAt: new Date().toISOString(),
-  });
+  try {
+    persistDeploySnapshot(projectId, {
+      status: state.status,
+      progress: state.progress,
+      logs: state.logs,
+      deployResult: state.deployResult,
+      deploymentHistory: state.deploymentHistory,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch {
+    // Never block the live console on storage failures.
+  }
 }
 
 function setActiveDeploymentState(projectId: string, next: ActiveDeployState): void {
   const entry = getOrCreateActiveDeployment(projectId);
   entry.state = toDeployState(next);
-  persistActiveDeploymentState(projectId, entry.state);
   emitActiveDeployment(projectId);
+  persistActiveDeploymentState(projectId, entry.state);
 }
 
 function patchActiveDeploymentState(
@@ -1038,8 +1090,8 @@ function patchActiveDeploymentState(
     ? patch(entry.state)
     : { ...entry.state, ...patch };
   entry.state = toDeployState({ ...next, updatedAt: new Date().toISOString() });
-  persistActiveDeploymentState(projectId, entry.state);
   emitActiveDeployment(projectId);
+  persistActiveDeploymentState(projectId, entry.state);
   return entry.state;
 }
 
@@ -1790,15 +1842,19 @@ export default function DeploymentTrackApp() {
   const searchParams = useSearchParams();
   const customizationSnapshotId = (searchParams.get('customizationSnapshotId') || '').trim();
   const customizationTenantId = (searchParams.get('tenantId') || '').trim();
-  const logEndRef = useRef<HTMLDivElement>(null);
+  const logPanelRef = useRef<HTMLDivElement>(null);
+  const logStickToBottomRef = useRef(true);
   const pipelineSocketRef = useRef<WebSocket | null>(null);
   const pipelineSocketRetryRef = useRef<number | null>(null);
   const pipelineSocketAttemptRef = useRef(0);
+  const lastPrefillQuestionIdRef = useRef<string | null>(null);
   const socketNoticeKeysRef = useRef<Set<string>>(new Set());
   const deployRequestRef = useRef<string | null>(null);
   const idleRecoveryRef = useRef<string | null>(null);
   const analysisRequestRef = useRef<string | null>(null);
   const reviewRequestRef = useRef<string | null>(null);
+  const generatePlanInFlightRef = useRef(false);
+  const planAttemptedKeyRef = useRef<string | null>(null);
   const terraformAutostartRef = useRef<string | null>(null);
   const decisionCostRequestKeyRef = useRef<string | null>(null);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
@@ -1809,6 +1865,7 @@ export default function DeploymentTrackApp() {
   const [repoContextMd, setRepoContextMd] = useState<string>(() => readStoredJson<string>(REPO_CONTEXT_MD_KEY) || '');
   const [review, setReview] = useState<ArchitectureReviewPayload | null>(() => readStoredJson<ArchitectureReviewPayload>(REVIEW_PAYLOAD_KEY));
   const [answers, setAnswers] = useState<Record<string, string>>(() => readStoredJson<Record<string, string>>(REVIEW_ANSWERS_KEY) || {});
+  const [questionCursor, setQuestionCursor] = useState<number | null>(null);
   const [deploymentProfile, setDeploymentProfile] = useState<Record<string, unknown> | null>(() => readStoredJson<Record<string, unknown>>(DEPLOYMENT_PROFILE_KEY));
   const [architectureView, setArchitectureView] = useState<Record<string, unknown> | null>(() => readStoredJson<Record<string, unknown>>(ARCHITECTURE_VIEW_KEY));
   const [approvalPayload, setApprovalPayload] = useState<ApprovalPayload | null>(() => readStoredJson<ApprovalPayload>(APPROVAL_PAYLOAD_KEY));
@@ -1856,6 +1913,7 @@ export default function DeploymentTrackApp() {
   const [deployElapsedSec, setDeployElapsedSec] = useState(0);
   const deployStartedAtRef = useRef<number | null>(null);
   const deployHeartbeatRef = useRef<number | null>(null);
+  const workspaceSessionIdRef = useRef<string | null>(null);
   const [stopLoading, setStopLoading] = useState(false);
   const [destroyLoading, setDestroyLoading] = useState(false);
   const [verifyLoading, setVerifyLoading] = useState(false);
@@ -1960,38 +2018,6 @@ export default function DeploymentTrackApp() {
     [currentInfraConsultant?.decision, currentInfraConsultant?.summary, deploymentSelectionSummary],
   );
   const reviewQuestions = useMemo(() => review?.questions || [], [review]);
-  const requiredQuestions = useMemo(
-    () => reviewQuestions.filter((question) => question.required !== false),
-    [reviewQuestions],
-  );
-  const answeredRequiredCount = useMemo(
-    () => requiredQuestions.filter((question) => String(answers[question.id] || '').trim()).length,
-    [answers, requiredQuestions],
-  );
-  const answeredQuestionCount = useMemo(
-    () => reviewQuestions.filter((question) => String(answers[question.id] || '').trim()).length,
-    [answers, reviewQuestions],
-  );
-  const allQuestionsAnswered = Boolean(
-    review && requiredQuestions.every((question) => String(answers[question.id] || '').trim()),
-  );
-  const nextRequiredQuestion = useMemo(
-    () => requiredQuestions.find((question) => !String(answers[question.id] || '').trim()) || null,
-    [answers, requiredQuestions],
-  );
-  const optionalQuestionCount = Math.max(reviewQuestions.length - requiredQuestions.length, 0);
-  const groupedQuestions = useMemo(() => {
-    const groups = new Map<string, typeof reviewQuestions>();
-    reviewQuestions.forEach((question) => {
-      const key = formatQuestionCategory(question.category);
-      groups.set(key, [...(groups.get(key) || []), question]);
-    });
-    return Array.from(groups.entries());
-  }, [reviewQuestions]);
-  const reviewCompletionPercent = useMemo(() => {
-    if (requiredQuestions.length === 0) return 0;
-    return Math.round((answeredRequiredCount / requiredQuestions.length) * 100);
-  }, [answeredRequiredCount, requiredQuestions.length]);
   const needsSessionToken = aws.aws_access_key_id.trim().toUpperCase().startsWith('ASIA');
   const hasSessionTokenWhenRequired = !needsSessionToken || Boolean(aws.aws_session_token.trim());
   const hasAwsSecrets = Boolean(
@@ -2036,6 +2062,20 @@ export default function DeploymentTrackApp() {
     type: 'info' | 'success' | 'error' = 'info',
     meta?: Omit<DeployLogEntry, 'text' | 'ts' | 'type'>,
   ) => {
+    const entry: DeployLogEntry = { text, ts: timestampLabel(), type, ...meta };
+    setDeployLogs((prev) => {
+      const last = prev[prev.length - 1];
+      if (
+        last
+        && last.text === text
+        && last.type === type
+        && last.worker_id === meta?.worker_id
+        && last.worker_status === meta?.worker_status
+      ) {
+        return prev;
+      }
+      return [...prev, entry];
+    });
     patchState((prev) => {
       const last = prev.logs[prev.logs.length - 1];
       if (
@@ -2049,9 +2089,23 @@ export default function DeploymentTrackApp() {
       }
       return {
         ...prev,
-        logs: [...prev.logs, { text, ts: timestampLabel(), type, ...meta }],
+        logs: [...prev.logs, entry],
       };
     });
+    const sessionId = workspaceSessionIdRef.current;
+    if (sessionId) {
+      try {
+        persistSessionProgress(sessionId, {
+          line: {
+            level: type === 'error' ? 'error' : 'info',
+            message: text,
+            stage: meta?.stage || null,
+          },
+        });
+      } catch {
+        // Session log persistence is best-effort.
+      }
+    }
   }, [patchState]);
   const appendSocketNotice = useCallback((key: string, text: string, tone: 'info' | 'error' = 'info') => {
     if (!key || socketNoticeKeysRef.current.has(key)) return;
@@ -2118,15 +2172,12 @@ export default function DeploymentTrackApp() {
     };
   }, [deployResult?.ec2_key_name, deployResult?.keypair]);
   const keyPairDownloadMessage = useMemo(() => {
-    const details = deployResult?.details as Record<string, unknown> | null | undefined;
-    const reusedKey = Boolean(details?.key_pair_reused);
-    const existingKeyName = String(details?.existing_ec2_key_pair_name || deploySummary.keyName || '').trim();
-    if (deploySummary.generatedPem) return '';
-    if (reusedKey && existingKeyName) {
-      return `This deploy reused existing EC2 key pair '${existingKeyName}'. No new private PEM was generated, so there is nothing to download. Use the original private key for SSH access.`;
+    if (deploySummary.generatedPem || deploySummary.databaseEnv) return '';
+    if (deployResult?.one_time_credentials?.credentials_downloaded) {
+      return 'Credentials for this deploy were already downloaded and removed from DeplAI. Redeploy to mint a new SSH key tagged with the new instance.';
     }
-    return 'No generated private key is available in this deployment result.';
-  }, [deployResult?.details, deploySummary.generatedPem, deploySummary.keyName]);
+    return 'No generated private key is available in this deployment result. Each deploy mints a new key; AWS never stores the private half.';
+  }, [deployResult?.one_time_credentials?.credentials_downloaded, deploySummary.databaseEnv, deploySummary.generatedPem]);
   const terraformWorkerStates = useMemo(() => {
     const latest = new Map<string, DeployLogEntry>();
     deployLogs.forEach((log) => {
@@ -2183,64 +2234,64 @@ export default function DeploymentTrackApp() {
     if (deployStatus === 'running') {
       return {
         tone: 'warning',
-        label: 'Deployment Running',
-        title: 'Deployment In Progress',
-        description: 'The backend runtime is still applying infrastructure. Outputs will hydrate when the current repo reaches a terminal state.',
+        label: 'Applying',
+        title: 'Deployment in progress',
+        description: 'Terraform is still applying. Access URLs, SSH, and resource specs will appear when this run finishes.',
       };
     }
     if (deployStatus === 'error' || backendErrorMessage) {
       return {
         tone: 'error',
         label: 'Error',
-        title: 'Deployment Error',
+        title: 'Deployment did not finish',
         description: backendErrorMessage || 'The deployment did not complete successfully. Review the runtime error and verification details below.',
       };
     }
     if (!deployResult) {
       return {
         tone: 'warning',
-        label: 'No Deployment Data',
-        title: 'Infrastructure Outputs',
-        description: 'No deployment snapshot is bound to this repo yet. Run deploy or reconcile backend status to hydrate outputs.',
+        label: 'Not deployed',
+        title: 'No live infrastructure yet',
+        description: 'Run deploy to provision this stack. This page will then show how to open the app, SSH, and connect to data stores.',
       };
     }
     if (verificationFailed) {
       return {
         tone: 'error',
-        label: 'Verification Failed',
-        title: 'Infrastructure Outputs',
-        description: 'The backend returned outputs, but verification failed or the runtime data is incomplete for this repo.',
+        label: 'Unreachable',
+        title: 'Infrastructure is up, endpoints failed checks',
+        description: 'Outputs are available below, but live HTTP verification failed. Confirm security groups, health checks, and DNS.',
       };
     }
     if (!deployResult.success) {
       return {
         tone: 'warning',
-        label: 'Pending Runtime Confirmation',
-        title: 'Infrastructure Outputs',
-        description: 'The deploy track has a partial payload, but the backend has not confirmed a successful terminal runtime state yet.',
+        label: 'Pending',
+        title: 'Waiting for runtime confirmation',
+        description: 'A partial payload exists, but the backend has not confirmed a successful terminal state yet.',
       };
     }
     if (!hasLiveRuntimeDetails) {
       return {
         tone: 'warning',
-        label: 'Missing Runtime Data',
-        title: 'Infrastructure Outputs',
-        description: 'The deployment payload exists, but live runtime details are missing. Fetch runtime details before treating this deploy as healthy.',
+        label: 'Incomplete',
+        title: 'Runtime details are missing',
+        description: 'Fetch latest runtime details to hydrate the app URL, IPs, and instance specs.',
       };
     }
     if (verificationPassed) {
       return {
         tone: 'success',
         label: 'Live',
-        title: 'Infrastructure Outputs',
-        description: 'The backend confirmed a successful terminal state and the current repo has live runtime data.',
+        title: 'Your deployment is live',
+        description: 'Open the app URL, SSH with the key below, and use private RDS/Redis endpoints only from the VPC.',
       };
     }
     return {
       tone: 'warning',
-      label: 'Pending Verification',
-      title: 'Infrastructure Outputs',
-      description: 'The backend confirmed infrastructure, but live endpoint verification has not been recorded for this repo yet.',
+      label: 'Ready',
+      title: 'Infrastructure is provisioned',
+      description: 'Access details are below. Run Verify live endpoints to confirm HTTP from this workspace.',
     };
   }, [backendErrorMessage, deployResult, deployStatus, hasLiveRuntimeDetails, verificationFailed, verificationPassed]);
   const savedRun = readSavedIacRun();
@@ -2264,7 +2315,12 @@ export default function DeploymentTrackApp() {
   const deployStartBlockers = useMemo(() => {
     const blockers: string[] = [];
     const confirmingPlan = requiresPlanConfirmation || deployUiPhase === 'awaiting_plan';
-    if (deployStatus === 'running' && !confirmingPlan) {
+    const deployAlreadyFailed = isFailedDeployAttempt({
+      status: deployStatus,
+      uiPhase: deployUiPhase,
+      result: deployResult,
+    });
+    if (deployStatus === 'running' && !confirmingPlan && !deployAlreadyFailed) {
       blockers.push('Deployment is already running. Stop it or wait for completion.');
     }
     if (!selectedProject) {
@@ -2277,19 +2333,21 @@ export default function DeploymentTrackApp() {
           : 'Add AWS credentials in AWS Config (access key + secret key).',
       );
     }
-    // Plan already ran — keep snapshot soft for confirm, but still require a deployable bundle.
-    if (!confirmingPlan && !snapshotIacMatches) {
-      blockers.push('Regenerate infrastructure from the selected customization snapshot.');
-    }
-    if (deployableIacFiles.length === 0 && !shouldUseSavedRunForDeploy) {
-      blockers.push(
-        confirmingPlan
-          ? 'Plan is ready, but the Terraform bundle is no longer in this session. Regenerate infrastructure, then Start Deploy again.'
-          : 'Generate infrastructure after selecting a deployment target and managed services.',
-      );
-    }
-    if (effectiveCostTotal > effectiveBudgetCap && !budgetOverride) {
-      blockers.push('Estimated monthly cost exceeds the budget cap. Approve the budget override to deploy.');
+    // A failed apply should still be retryable even if session Terraform files were compacted.
+    if (!deployAlreadyFailed) {
+      if (!confirmingPlan && !snapshotIacMatches) {
+        blockers.push('Regenerate infrastructure from the selected customization snapshot.');
+      }
+      if (deployableIacFiles.length === 0 && !shouldUseSavedRunForDeploy) {
+        blockers.push(
+          confirmingPlan
+            ? 'Plan is ready, but the Terraform bundle is no longer in this session. Regenerate infrastructure, then Start Deploy again.'
+            : 'Generate infrastructure after selecting a deployment target and managed services.',
+        );
+      }
+      if (effectiveCostTotal > effectiveBudgetCap && !budgetOverride) {
+        blockers.push('Estimated monthly cost exceeds the budget cap. Approve the budget override to deploy.');
+      }
     }
     return blockers;
   }, [
@@ -2298,6 +2356,7 @@ export default function DeploymentTrackApp() {
     deployUiPhase,
     effectiveBudgetCap,
     effectiveCostTotal,
+    deployResult,
     deployStatus,
     deployableIacFiles.length,
     hasAwsSecrets,
@@ -2308,19 +2367,31 @@ export default function DeploymentTrackApp() {
     snapshotIacMatches,
   ]);
   const canStartDeploy = deployStartBlockers.length === 0;
-  const deployIsLive = deployStatus === 'running'
-    || deployUiPhase === 'starting'
-    || deployUiPhase === 'waiting_api'
-    || deployUiPhase === 'reconciling';
-  // Only keep Confirm enabled while idle awaiting plan — never during an in-flight apply.
-  const awaitingPlanIdle = (requiresPlanConfirmation || deployUiPhase === 'awaiting_plan') && !deployIsLive;
-  const deployButtonDisabled = !canStartDeploy || deployIsLive;
+  const deployFailed = isFailedDeployAttempt({
+    status: deployStatus,
+    uiPhase: deployUiPhase,
+    result: deployResult,
+  });
+  const awaitingPlanIdle = isAwaitingPlanConfirmation({
+    uiPhase: deployUiPhase,
+    requiresPlanConfirmation,
+    result: deployResult,
+  }) && !deployFailed;
+  const deployIsLive = isLiveDeployAttempt({
+    status: deployStatus,
+    uiPhase: deployUiPhase,
+    failed: deployFailed,
+    requiresPlanConfirmation,
+    result: deployResult,
+  });
+  const redeployDisabled = !selectedProject || !hasAwsSecrets || deployIsLive;
+  const deployButtonDisabled = deployFailed ? redeployDisabled : (!canStartDeploy || deployIsLive);
   const deployPhaseLabel = (() => {
+    if (deployFailed) return 'Deploy failed';
     if (deployUiPhase === 'starting') return 'Starting deploy…';
     if (deployUiPhase === 'waiting_api') return `Terraform apply in progress (${deployElapsedSec}s)`;
     if (deployUiPhase === 'reconciling') return `Reconciling backend status (${deployElapsedSec}s)`;
     if (deployUiPhase === 'awaiting_plan') return 'Plan ready — confirm to continue';
-    if (deployUiPhase === 'error' || deployStatus === 'error') return 'Deploy failed';
     if (deployUiPhase === 'done' || deployStatus === 'done') return 'Deploy finished';
     if (deployStatus === 'running') return `Deploy running (${deployElapsedSec}s)`;
     if (awaitingPlanIdle) return 'Plan ready — confirm to continue';
@@ -2337,6 +2408,7 @@ export default function DeploymentTrackApp() {
   );
   const canContinueToTerraform = Boolean(
     approvedConsultantDecision
+    || deploymentProfile
     || (currentInfraConsultant?.confirmed && currentInfraConsultant?.decision)
     || (decisionForVisualization && Number(decisionCostEstimate?.subtotal_monthly_usd || 0) > 0)
     || hasSuccessfulGeneration,
@@ -2392,6 +2464,10 @@ export default function DeploymentTrackApp() {
   const onIacPipelineError = useCallback((message: string) => {
     setError(message);
     appendLog(message, 'error', { stage: 'iac_pipeline' });
+    setDeployUiPhase('error');
+    if (selectedProject) {
+      getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
+    }
     patchState((prev) => ({
       ...prev,
       status: 'error',
@@ -2402,16 +2478,7 @@ export default function DeploymentTrackApp() {
         error: message,
       },
     }));
-  }, [appendLog, patchState]);
-  const handleIacDestroyed = useCallback(() => {
-    appendLog('IaC pipeline destroy requested.', 'info', { stage: 'iac_pipeline' });
-    patchState((prev) => ({
-      ...prev,
-      deployResult: prev.deployResult
-        ? { ...prev.deployResult, outputs: undefined, status: 'destroyed' }
-        : prev.deployResult,
-    }));
-  }, [appendLog, patchState]);
+  }, [appendLog, patchState, selectedProject]);
   const canVerifyLiveEndpoints = Boolean(
     selectedProject &&
     deployStatus !== 'running' &&
@@ -2434,6 +2501,11 @@ export default function DeploymentTrackApp() {
     return `/${slug}/${env}`;
   }, [deploymentProfile, selectedProject?.name]);
   const requiredAppSecretKeys = useMemo(() => {
+    // Detected keys are hints only — never a pipeline gate. Static / CloudFront
+    // deploys typically need none of these.
+    return [] as string[];
+  }, []);
+  const optionalAppSecretKeys = useMemo(() => {
     const keys = new Set<string>();
     const looksSensitive = (key: string) => {
       if (/^NEXT_PUBLIC_/i.test(key)) return false;
@@ -2447,7 +2519,6 @@ export default function DeploymentTrackApp() {
     if (Array.isArray(fromRepo)) {
       for (const item of fromRepo) {
         const key = String(item || '').trim();
-        // .env.example often lists every blank key as "required"; only gate true secrets.
         if (key && looksSensitive(key)) keys.add(key);
       }
     }
@@ -2459,16 +2530,18 @@ export default function DeploymentTrackApp() {
         if (key && looksSensitive(key)) keys.add(key);
       }
     }
-    const frameworks = Array.isArray(repoContext?.frameworks)
-      ? repoContext.frameworks.map((item) => String((item as { name?: string })?.name || item || '').toLowerCase()).join(' ')
-      : '';
-    if (/nextauth|auth\.js|passport|oauth|supabase/.test(frameworks) || /google|github|oauth|nextauth/i.test(JSON.stringify(repoContext?.environment_variables || {}))) {
-      for (const key of ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'NEXTAUTH_SECRET']) {
-        keys.add(key);
+    if (deploymentPlan !== 's3_cloudfront') {
+      const frameworks = Array.isArray(repoContext?.frameworks)
+        ? repoContext.frameworks.map((item) => String((item as { name?: string })?.name || item || '').toLowerCase()).join(' ')
+        : '';
+      if (/nextauth|auth\.js|passport|oauth|supabase/.test(frameworks) || /google|github|oauth|nextauth/i.test(JSON.stringify(repoContext?.environment_variables || {}))) {
+        for (const key of ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GITHUB_CLIENT_ID', 'GITHUB_CLIENT_SECRET', 'NEXTAUTH_SECRET']) {
+          keys.add(key);
+        }
       }
     }
     return Array.from(keys).filter((key) => !['JWT_SECRET', 'AUTH_SECRET'].includes(key));
-  }, [deploymentProfile, repoContext]);
+  }, [deploymentPlan, deploymentProfile, repoContext]);
   const oauthCallbackPaths = useMemo(() => {
     const paths = new Set<string>();
     const envKeys = JSON.stringify(repoContext?.environment_variables || {}).toLowerCase();
@@ -2486,6 +2559,80 @@ export default function DeploymentTrackApp() {
     if (deploySummary.publicIp && deploySummary.publicIp !== 'n/a') return `http://${deploySummary.publicIp}`;
     return null;
   }, [deploySummary.appUrl, deploySummary.elasticIp, deploySummary.publicIp]);
+  const infraAccessBriefing = useMemo(() => buildInfraAccessBriefing({
+    summary: deploySummary,
+    iacOutputs: iacResourceOutputs?.outputs || null,
+    decision: approvedConsultantDecision || currentInfraConsultant?.decision || null,
+    region: terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION,
+    planned: {
+      plan: deploymentPlan === 'ecs_fargate' ? 'ecs' : deploymentPlan === 's3_cloudfront' ? 'static' : 'ec2',
+      instanceType: ec2ResourceConfig.instance_type,
+      diskGb: ec2ResourceConfig.root_volume_size_gb,
+      appPort: ec2ResourceConfig.app_port,
+      needEip: Boolean(approvedConsultantDecision?.need_eip),
+      needAlb: Boolean(approvedConsultantDecision?.need_alb),
+      includeRds: Boolean(deploymentServices.rds),
+      includeRedis: Boolean(deploymentServices.redis),
+      rds: deploymentServices.rds ? rdsResourceConfig : null,
+      redis: deploymentServices.redis ? redisResourceConfig : null,
+      ecs: deploymentPlan === 'ecs_fargate' ? ecsResourceConfig : null,
+      components: selectedDeploymentComponents,
+    },
+  }), [
+    approvedConsultantDecision,
+    currentInfraConsultant?.decision,
+    deploySummary,
+    deploymentPlan,
+    deploymentServices.rds,
+    deploymentServices.redis,
+    ec2ResourceConfig.app_port,
+    ec2ResourceConfig.instance_type,
+    ec2ResourceConfig.root_volume_size_gb,
+    ecsResourceConfig,
+    iacResourceOutputs?.outputs,
+    rdsResourceConfig,
+    redisResourceConfig,
+    selectedDeploymentComponents,
+    terraformRuntimeConfig.aws_region,
+  ]);
+  const appDeployDefaults = useMemo(() => {
+    const ecrFromIac = (iacResourceOutputs?.outputs || []).find((entry) => ['ecr_repository_url', 'ecr_url'].includes(String(entry.key || '').toLowerCase()))?.value;
+    const account = firstProvisioned((liveRuntimeDetails as { account_id?: string } | null)?.account_id);
+    const slug = String(selectedProject?.name || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+    const regionName = terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION;
+    const inferred = account && slug ? `${account}.dkr.ecr.${regionName}.amazonaws.com/${slug}` : '';
+    const image = firstProvisioned(deploySummary.ecrRepositoryUrl, ecrFromIac, inferred) || '';
+    const healthUrl = firstProvisioned(deploySummary.healthCheckUrl, infraAccessBriefing.healthUrl);
+    let healthEndpoint = '/health';
+    if (healthUrl) {
+      try {
+        const parsed = new URL(healthUrl.includes('://') ? healthUrl : `http://placeholder.local${healthUrl.startsWith('/') ? healthUrl : `/${healthUrl}`}`);
+        healthEndpoint = parsed.pathname || '/health';
+      } catch {
+        if (healthUrl.startsWith('/')) healthEndpoint = healthUrl;
+      }
+    }
+    return {
+      image,
+      containerPort: String(coerceHttpAppPort(infraAccessBriefing.appPort || ec2ResourceConfig.app_port, 3000)),
+      hostPort: '80',
+      healthEndpoint,
+    };
+  }, [
+    deploySummary.ecrRepositoryUrl,
+    deploySummary.healthCheckUrl,
+    ec2ResourceConfig.app_port,
+    iacResourceOutputs?.outputs,
+    infraAccessBriefing.appPort,
+    infraAccessBriefing.healthUrl,
+    liveRuntimeDetails,
+    selectedProject?.name,
+    terraformRuntimeConfig.aws_region,
+  ]);
   const qaSummary = useMemo(() => buildQaSummary(review, answers, repoContext, repoContextMd), [answers, repoContext, repoContextMd, review]);
   const infraUserAnswers = useMemo(() => {
     return {
@@ -2595,12 +2742,20 @@ export default function DeploymentTrackApp() {
     }
     return items;
   }, [repoContext?.data_stores]);
+  const analysisMetrics = useMemo(() => deriveAnalysisMetrics(repoContext), [repoContext]);
+  const analysisDetectedServices = useMemo(() => deriveDetectedServices(repoContext), [repoContext]);
   useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [deployLogs]);
+    const node = logPanelRef.current;
+    if (!node || !logStickToBottomRef.current) return;
+    node.scrollTop = node.scrollHeight;
+  }, [deployLogs, socketNotices]);
 
   useEffect(() => {
-    writeSavedAws(aws);
+    try {
+      writeSavedAws(aws);
+    } catch {
+      // Credentials stay in React state if sessionStorage is full.
+    }
   }, [aws]);
 
   useEffect(() => {
@@ -2625,6 +2780,15 @@ export default function DeploymentTrackApp() {
         || aws.aws_session_token.trim(),
       );
       if (!hasCreds) return;
+      try {
+        const raw = sessionStorage.getItem('pipeline.aws');
+        if (!raw) {
+          writeSavedAws(aws);
+          return;
+        }
+      } catch {
+        return;
+      }
       if (awsOperatorCredRemainingMs(aws) > 0) return;
       clearSavedAws();
       setAws((prev) => ({
@@ -2656,16 +2820,27 @@ export default function DeploymentTrackApp() {
   }, [selectedProjectId]);
 
   useEffect(() => {
-    if (deployStatus === 'running' && (deployUiPhase === 'idle' || deployUiPhase === 'done' || deployUiPhase === 'error')) {
+    if (isFailedDeployAttempt({ status: deployStatus, uiPhase: deployUiPhase, result: deployResult })) {
+      if (deployUiPhase !== 'error') setDeployUiPhase('error');
+      return;
+    }
+    const applyInFlight = deployUiPhase === 'starting'
+      || deployUiPhase === 'waiting_api'
+      || deployUiPhase === 'reconciling';
+    if (!applyInFlight && isAwaitingPlanConfirmation({
+      uiPhase: deployUiPhase,
+      requiresPlanConfirmation,
+      result: deployResult,
+    })) {
+      if (deployUiPhase !== 'awaiting_plan') setDeployUiPhase('awaiting_plan');
+      return;
+    }
+    if (deployStatus === 'running' && (deployUiPhase === 'idle' || deployUiPhase === 'done')) {
       setDeployUiPhase('waiting_api');
     } else if (deployStatus === 'done') {
       setDeployUiPhase('done');
-    } else if (deployStatus === 'error') {
-      setDeployUiPhase('error');
-    } else if (deployStatus === 'idle' && requiresPlanConfirmation) {
-      setDeployUiPhase('awaiting_plan');
     }
-  }, [deployStatus, deployUiPhase, requiresPlanConfirmation]);
+  }, [deployResult, deployStatus, deployUiPhase, requiresPlanConfirmation]);
 
   // Restore plan log lines when UI resumes in awaiting_plan with an empty console.
   useEffect(() => {
@@ -2822,6 +2997,8 @@ export default function DeploymentTrackApp() {
       setRepoContextMd('');
       setReview(null);
       setAnswers({});
+      setQuestionCursor(null);
+      lastPrefillQuestionIdRef.current = null;
       setDeploymentProfile(null);
       setArchitectureView(null);
       setApprovalPayload(null);
@@ -2876,18 +3053,6 @@ export default function DeploymentTrackApp() {
     setIacFiles([]);
     setSelectedFile('');
   }, [hasCurrentIacMeta, iacFiles.length, selectedProjectId]);
-
-  useEffect(() => {
-    if (!selectedProjectId) return;
-    persistDeploySnapshot(selectedProjectId, {
-      status: deployStatus,
-      progress: deployProgress,
-      logs: deployLogs,
-      deployResult,
-      deploymentHistory,
-      updatedAt: new Date().toISOString(),
-    });
-  }, [deployLogs, deployProgress, deployResult, deployStatus, deploymentHistory, selectedProjectId]);
 
   useEffect(() => {
     if (!selectedProject || !hasAwsSecrets) return;
@@ -3086,6 +3251,9 @@ export default function DeploymentTrackApp() {
     if (nextStage === 'app_secrets' && (!hasAwsSecrets || !canContinueToAwsConfig) && !options?.force) {
       return;
     }
+    if (nextStage === 'deploy' && (!hasAwsSecrets || !canContinueToAwsConfig) && !options?.force) {
+      return;
+    }
     if (nextStage === 'terraform' && !canContinueToTerraform && !options?.force) {
       return;
     }
@@ -3095,6 +3263,49 @@ export default function DeploymentTrackApp() {
       localStorage.setItem(`${CURRENT_STAGE_STORAGE_PREFIX}${selectedProjectId}`, nextStage);
     }
   }, [canContinueToAwsConfig, canContinueToTerraform, hasAwsSecrets, selectedProjectId]);
+
+  const restartPipeline = useCallback(() => {
+    if (!selectedProjectId) return;
+    clearPlanningState();
+    idleRecoveryRef.current = null;
+    analysisRequestRef.current = null;
+    reviewRequestRef.current = null;
+    generatePlanInFlightRef.current = false;
+    planAttemptedKeyRef.current = null;
+    terraformAutostartRef.current = null;
+    decisionCostRequestKeyRef.current = null;
+    socketNoticeKeysRef.current.clear();
+    setAnalysisLoading(false);
+    setReviewLoading(false);
+    setRepoContext(null);
+    setRepoContextMd('');
+    setReview(null);
+    setAnswers({});
+    setQuestionCursor(null);
+    lastPrefillQuestionIdRef.current = null;
+    setDeploymentProfile(null);
+    setArchitectureView(null);
+    setApprovalPayload(null);
+    setIacFiles([]);
+    setSelectedFile('');
+    persistApprovedDecision(null);
+    persistInfraConsultant(null);
+    setDecisionCostEstimate(null);
+    setDecisionCostError(null);
+    setDeployStatus('idle');
+    setDeployProgress(0);
+    setDeployLogs([]);
+    setDeployResult(null);
+    setDeploymentHistory([]);
+    setEndpointChecks([]);
+    setSocketNotices([]);
+    setError(null);
+    setAndPersistStage('analysis');
+  }, [persistApprovedDecision, persistInfraConsultant, selectedProjectId, setAndPersistStage]);
+
+  const handleSelectDeploymentProject = useCallback((nextProjectId: string) => {
+    router.push(`/dashboard/deploy?projectId=${encodeURIComponent(nextProjectId)}&entry=selector`);
+  }, [router]);
 
   const runAnalysis = useCallback(async () => {
     if (!selectedProject) return;
@@ -3172,27 +3383,32 @@ export default function DeploymentTrackApp() {
 
   useEffect(() => {
     if (activeStage !== 'qa' || !selectedProject) return;
+    if (review && review.context_json.workspace === expectedWorkspace && review.questions.length > 0) return;
     if (!repoContext || repoContext.workspace !== expectedWorkspace) {
       setAndPersistStage('analysis');
       return;
     }
-    if (review && review.context_json.workspace === expectedWorkspace && review.questions.length > 0) return;
     void loadReview().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to start architecture review.'));
   }, [activeStage, expectedWorkspace, loadReview, repoContext, review, selectedProject, setAndPersistStage]);
 
-  const updateAnswer = useCallback((questionId: string, value: string) => {
-    setAnswers((prev) => ({ ...prev, [questionId]: value }));
-  }, []);
-
-  const generatePlan = useCallback(async () => {
+  const generatePlan = useCallback(async (overrideAnswers?: Record<string, string>) => {
     if (!selectedProject || !review) return;
+    if (generatePlanInFlightRef.current) return;
+    generatePlanInFlightRef.current = true;
     setError(null);
+    setInfraConsultantLoading(true);
+    const userAnswers = {
+      ...answers,
+      ...(overrideAnswers || {}),
+    };
+    setAnswers(userAnswers);
+    writeStoredJson(REVIEW_ANSWERS_KEY, userAnswers);
     const mergedAnswers = {
       ...(review.defaults || {}),
-      ...answers,
+      ...userAnswers,
     };
-    setAnswers(mergedAnswers);
-    writeStoredJson(REVIEW_ANSWERS_KEY, mergedAnswers);
+    planAttemptedKeyRef.current = JSON.stringify(userAnswers);
+    try {
     const response = await fetch('/api/architecture/review/complete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -3214,12 +3430,79 @@ export default function DeploymentTrackApp() {
     writeStoredJson(DEPLOYMENT_PROFILE_KEY, data.deployment_profile);
     writeStoredJson(ARCHITECTURE_VIEW_KEY, data.architecture_view);
     writeStoredJson(APPROVAL_PAYLOAD_KEY, data.approval_payload || {});
+      const budgetCap = budgetCapFromAnswers(mergedAnswers, Number((data.approval_payload?.budget_gate as { cap_usd?: number } | undefined)?.cap_usd || 100));
+      const costTotal = Number((data.approval_payload?.cost_estimate as { total_monthly_usd?: number } | undefined)?.total_monthly_usd || 0);
     writeStoredJson(COST_ESTIMATE_KEY, {
-      total_monthly_usd: Number((data.approval_payload?.cost_estimate as { total_monthly_usd?: number } | undefined)?.total_monthly_usd || 0),
-      budget_cap_usd: Number((data.approval_payload?.budget_gate as { cap_usd?: number } | undefined)?.cap_usd || 100),
-    });
-    setAndPersistStage('architecture');
-  }, [answers, review, selectedProject, setAndPersistStage]);
+        total_monthly_usd: costTotal,
+        budget_cap_usd: budgetCap,
+      });
+      const synthesized = decisionFromDeploymentProfile({
+        deploymentProfile: data.deployment_profile,
+        answers: mergedAnswers,
+        awsRegion: terraformRuntimeConfig.aws_region.trim() || DEFAULT_AWS_REGION,
+      });
+      const nextPlan = inferDeploymentPlanFromDecision(synthesized);
+      const nextServices = inferServicesFromDecision(synthesized);
+      setDeploymentPlan(nextPlan);
+      writeStoredJson(DEPLOYMENT_PLAN_KEY, nextPlan);
+      setDeploymentServices(nextServices);
+      writeStoredJson(DEPLOYMENT_SERVICES_KEY, nextServices);
+      const nextEc2 = ec2ResourceConfigFromDecision(synthesized);
+      setEc2ResourceConfig(nextEc2);
+      writeStoredJson(EC2_RESOURCE_CONFIG_KEY, nextEc2);
+      const nextRds = rdsResourceConfigFromDecision(synthesized);
+      if (nextRds) {
+        setRdsResourceConfig(nextRds);
+        writeStoredJson(RDS_RESOURCE_CONFIG_KEY, nextRds);
+      }
+      const nextRedis = redisResourceConfigFromDecision(synthesized);
+      if (nextRedis) {
+        setRedisResourceConfig(nextRedis);
+        writeStoredJson(REDIS_RESOURCE_CONFIG_KEY, nextRedis);
+      }
+      const nextEcs = ecsResourceConfigFromDecision(synthesized);
+      if (nextEcs) {
+        setEcsResourceConfig(nextEcs);
+        writeStoredJson(ECS_RESOURCE_CONFIG_KEY, nextEcs);
+      }
+      const nextStatic = staticSiteResourceConfigFromDecision(synthesized);
+      if (nextStatic) {
+        setStaticSiteResourceConfig(nextStatic);
+        writeStoredJson(STATIC_SITE_RESOURCE_CONFIG_KEY, nextStatic);
+      }
+      const history = buildScriptedHistory(review.questions || [], mergedAnswers, (review.questions || []).length);
+      const summary = summarizeInfraConsultantDecision(synthesized);
+      persistInfraConsultant({
+        workspace: expectedWorkspace,
+        history,
+        repo_detection_summary: String(review.context_json.summary || ''),
+        turn_count: history.filter((item) => item.role === 'user').length,
+        decision: synthesized,
+        summary,
+        confirmed: true,
+        ready: true,
+        budget_cap_usd: budgetCap,
+        selected_tier: 'recommended',
+        budget_gate: (data.approval_payload?.budget_gate as InfraConsultantState['budget_gate']) || {
+          cap_usd: budgetCap,
+          total_usd: costTotal,
+          status: costTotal > budgetCap ? 'FAIL' : 'PASS',
+        },
+        advisor_cost_estimate: {
+          subtotal_monthly_usd: costTotal,
+          currency: 'USD',
+        },
+      });
+      persistApprovedDecision({
+        workspace: expectedWorkspace,
+        decision: synthesized,
+        locked_at: new Date().toISOString(),
+      });
+    } finally {
+      generatePlanInFlightRef.current = false;
+      setInfraConsultantLoading(false);
+    }
+  }, [answers, expectedWorkspace, persistApprovedDecision, persistInfraConsultant, review, selectedProject, terraformRuntimeConfig.aws_region]);
 
   const resetCurrentIacSessionArtifacts = useCallback(() => {
     sessionStorage.removeItem(IAC_FILES_KEY);
@@ -3235,35 +3518,6 @@ export default function DeploymentTrackApp() {
       logs: prev.logs.filter((log) => log.stage !== 'terraform_generation'),
     }));
   }, [patchState]);
-
-  const handleDeploymentPlanChange = useCallback((planId: DeploymentPlanId) => {
-    if (deploymentPlan === planId) return;
-    resetCurrentIacSessionArtifacts();
-    persistApprovedDecision(null);
-    setDecisionCostEstimate(null);
-    if (typeof window !== 'undefined') {
-      sessionStorage.removeItem(DECISION_COST_ESTIMATE_KEY);
-    }
-    if (currentInfraConsultant?.confirmed) {
-      persistInfraConsultant({ ...currentInfraConsultant, confirmed: false });
-    }
-    appendLog(`Deployment target changed to ${DEPLOYMENT_PLAN_OPTIONS.find((option) => option.id === planId)?.label || planId}. Regenerate infrastructure before deploy.`, 'info', { stage: 'terraform_generation' });
-    setDeploymentPlan(planId);
-  }, [appendLog, currentInfraConsultant, deploymentPlan, persistApprovedDecision, persistInfraConsultant, resetCurrentIacSessionArtifacts]);
-
-  const handleDeploymentServiceToggle = useCallback((service: keyof DeploymentServiceSelection) => {
-    resetCurrentIacSessionArtifacts();
-    persistApprovedDecision(null);
-    setDecisionCostEstimate(null);
-    if (typeof window !== 'undefined') {
-      sessionStorage.removeItem(DECISION_COST_ESTIMATE_KEY);
-    }
-    if (currentInfraConsultant?.confirmed) {
-      persistInfraConsultant({ ...currentInfraConsultant, confirmed: false });
-    }
-    appendLog('Managed service selection changed. Regenerate infrastructure before deploy.', 'info', { stage: 'terraform_generation' });
-    setDeploymentServices((current) => ({ ...current, [service]: !current[service] }));
-  }, [appendLog, currentInfraConsultant, persistApprovedDecision, persistInfraConsultant, resetCurrentIacSessionArtifacts]);
 
   const handleEc2ResourceConfigChange = useCallback((patch: Partial<Ec2ResourceConfig>) => {
     const next = normalizeEc2ResourceConfig({ ...ec2ResourceConfig, ...patch });
@@ -3485,46 +3739,6 @@ export default function DeploymentTrackApp() {
     terraformRuntimeConfig.aws_region,
   ]);
 
-  useEffect(() => {
-    if (activeStage !== 'qa' || !selectedProject) return;
-    if (!repoContext || repoContext.workspace !== expectedWorkspace) return;
-    if (infraConsultantLoading) return;
-    const hasStartedConsultant = Boolean(
-      currentInfraConsultant
-      && (
-        (currentInfraConsultant.history?.length || 0) > 0
-        || (currentInfraConsultant.turn_count || 0) > 0
-        || currentInfraConsultant.decision
-      ),
-    );
-    if (hasStartedConsultant) return;
-
-    if (!currentInfraConsultant) {
-      persistInfraConsultant({
-        workspace: expectedWorkspace,
-        history: [],
-        repo_detection_summary: '',
-        turn_count: 0,
-        decision: null,
-        summary: '',
-        confirmed: false,
-        ready: false,
-      });
-    }
-    void runInfraConsultantTurn('start', []).catch((reason: unknown) => {
-      setError(reason instanceof Error ? reason.message : 'Failed to start infra consultant.');
-    });
-  }, [
-    activeStage,
-    currentInfraConsultant,
-    expectedWorkspace,
-    infraConsultantLoading,
-    persistInfraConsultant,
-    repoContext,
-    runInfraConsultantTurn,
-    selectedProject,
-  ]);
-
   const fetchDecisionCostEstimate = useCallback(async (decision: InfraConsultantDecision) => {
     if (!selectedProject) return;
     setDecisionCostLoading(true);
@@ -3609,8 +3823,17 @@ export default function DeploymentTrackApp() {
     setError(null);
     setIacPrUrl(null);
     setTerraformGenerating(true);
-    appendLog('Starting infrastructure generation from the confirmed deployment profile.', 'info', { stage: 'terraform_generation' });
     try {
+      const workspaceSessionId = await createWorkspaceSession({
+        service: 'deploy',
+        project_id: selectedProject.id,
+        title: `Generate infrastructure · ${selectedProject.name}`,
+        repo: selectedProject.name,
+        status: 'running',
+        current_stage: 'terraform_generation',
+      });
+      if (workspaceSessionId) workspaceSessionIdRef.current = workspaceSessionId;
+      appendLog('Starting infrastructure generation from the confirmed deployment profile.', 'info', { stage: 'terraform_generation' });
       // The dashboard may restore this stage immediately after a Connector
       // container restart.  Do not fire the one-shot generation request until
       // the same-origin API is ready; otherwise browsers surface only the
@@ -3624,8 +3847,8 @@ export default function DeploymentTrackApp() {
         body: JSON.stringify({
           project_id: selectedProject.id,
           provider: 'aws',
-          iac_mode: 'llm',
-          terraform_renderer: 'auto',
+          iac_mode: 'deterministic',
+          terraform_renderer: 'deplai_deterministic',
           qa_summary: qaSummary,
           architecture_context: String(repoContext?.summary || ''),
           repository_context: repoContext || undefined,
@@ -3637,6 +3860,7 @@ export default function DeploymentTrackApp() {
           aws_region: terraformRuntimeConfig.aws_region.trim() || DEFAULT_AWS_REGION,
           customization_snapshot_id: customizationSnapshotId || undefined,
           tenant_id: customizationTenantId || undefined,
+          workspace_session_id: workspaceSessionIdRef.current || undefined,
         }),
       });
       const data = await response.json().catch(() => ({})) as {
@@ -3667,7 +3891,11 @@ export default function DeploymentTrackApp() {
         requires_infra_consultation?: boolean;
         details?: unknown;
         error?: string;
+        workspace_session_id?: string;
       };
+      if (typeof data.workspace_session_id === 'string' && data.workspace_session_id) {
+        workspaceSessionIdRef.current = data.workspace_session_id;
+      }
       if (!response.ok || !data.success) {
         if (data.requires_infra_consultation) {
           appendLog('Infrastructure consultant decision is required before Terraform generation.', 'error', { stage: 'terraform_generation' });
@@ -3727,6 +3955,11 @@ export default function DeploymentTrackApp() {
       for (const warning of Array.isArray(data.warnings) ? data.warnings : []) {
         appendLog(String(warning), 'info', { stage: 'terraform_generation' });
       }
+      finalizeWorkspaceSession(workspaceSessionIdRef.current, {
+        status: 'completed',
+        current_stage: 'terraform_generation',
+        changed_files_count: files.length,
+      });
       return true;
     } catch (reason) {
       const rawMessage = reason instanceof Error ? reason.message : 'Infrastructure generation failed.';
@@ -3734,7 +3967,13 @@ export default function DeploymentTrackApp() {
         ? 'The connection to the DeplAI API was interrupted before Terraform generation returned a result. Select Regenerate Terraform to retry.'
         : rawMessage;
       appendLog(message, 'error', { stage: 'terraform_generation' });
-      throw new Error(message);
+      finalizeWorkspaceSession(workspaceSessionIdRef.current, {
+        status: 'failed',
+        current_stage: 'terraform_generation',
+        message,
+      });
+      setError(message);
+      return false;
     } finally {
       setTerraformGenerating(false);
     }
@@ -3773,13 +4012,13 @@ export default function DeploymentTrackApp() {
     if (terraformGenerating || infraConsultantLoading || hasSuccessfulGeneration) return;
     if (!repoContext || repoContext.workspace !== expectedWorkspace) return;
 
-    if (!approvedConsultantDecision) return;
+    if (!approvedConsultantDecision && !deploymentProfile) return;
     const autostartKey = `${selectedProject.id}:${expectedWorkspace}:${decisionSignature}:${Boolean(hasSuccessfulGeneration)}`;
     if (terraformAutostartRef.current === autostartKey) return;
     terraformAutostartRef.current = autostartKey;
 
     resetCurrentIacSessionArtifacts();
-    appendLog('Infra consultant decision approved. Starting repo-specific Terraform generation through the strategy router.', 'info', { stage: 'terraform_generation' });
+    appendLog('Planning answers locked. Starting deterministic Terraform generation.', 'info', { stage: 'terraform_generation' });
     void generateTerraform().catch((reason: unknown) => {
       setError(reason instanceof Error ? reason.message : 'Infrastructure generation failed.');
     });
@@ -3787,6 +4026,7 @@ export default function DeploymentTrackApp() {
     activeStage,
     appendLog,
     approvedConsultantDecision,
+    deploymentProfile,
     decisionSignature,
     expectedWorkspace,
     generateTerraform,
@@ -3954,14 +4194,46 @@ export default function DeploymentTrackApp() {
     const runtimeResult = data.result && typeof data.result === 'object'
       ? data.result as DeployApiResult
       : null;
+    const runtimeAwaitingPlan = isAwaitingPlanConfirmation({
+      result: runtimeResult,
+    }) || runtimeStatus === 'awaiting_plan_confirmation' || runtimeStatus === 'needs_review';
 
-    if (['pending', 'selecting_params', 'validating', 'planning', 'applying', 'running'].includes(runtimeStatus)) {
+    if (runtimeAwaitingPlan) {
+      const gatedResult: DeployApiResult = {
+        ...((runtimeResult || {}) as DeployApiResult),
+        success: true,
+        status: 'awaiting_plan_confirmation',
+        requires_plan_confirmation: true,
+      };
       patchState((prev) => ({
         ...prev,
-        status: 'running',
-        progress: Math.max(prev.progress, 55),
-        deployResult: runtimeResult || prev.deployResult,
+        status: 'idle',
+        progress: Math.max(prev.progress, 60),
+        deployResult: {
+          ...((prev.deployResult || {}) as DeployApiResult),
+          ...gatedResult,
+          plan_summary: gatedResult.plan_summary || prev.deployResult?.plan_summary || null,
+        },
       }));
+      getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
+      return;
+    }
+
+    if (['pending', 'selecting_params', 'validating', 'planning', 'applying', 'running'].includes(runtimeStatus)) {
+      patchState((prev) => {
+        if (isFailedDeployAttempt({ status: prev.status, result: prev.deployResult })) {
+          return prev;
+        }
+        if (isAwaitingPlanConfirmation({ result: prev.deployResult })) {
+          return prev;
+        }
+        return {
+          ...prev,
+          status: 'running' as const,
+          progress: Math.max(prev.progress, 55),
+          deployResult: runtimeResult || prev.deployResult,
+        };
+      });
       return;
     }
 
@@ -4015,12 +4287,21 @@ export default function DeploymentTrackApp() {
       return;
     }
 
-    patchState((prev) => ({
-      ...prev,
-      status: 'error',
-      progress: 100,
-      deployResult: prev.deployResult || { success: false, error: 'No active deployment process found.' },
-    }));
+    patchState((prev) => {
+      if (isAwaitingPlanConfirmation({ result: prev.deployResult })) {
+        return { ...prev, status: 'idle' };
+      }
+      return {
+        ...prev,
+        status: 'error',
+        progress: 100,
+        deployResult: prev.deployResult || { success: false, error: 'No active deployment process found.' },
+      };
+    });
+    if (isAwaitingPlanConfirmation({ result: getOrCreateActiveDeployment(selectedProject.id).state.deployResult })) {
+      getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
+      return;
+    }
     getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
     appendLog('No active deployment process found. Marking stale UI run as stopped.', 'error');
   }, [appendLog, deployResult?.run_id, hydrateTerminalDeployResult, patchState, pushDeploymentHistory, selectedProject]);
@@ -4035,8 +4316,21 @@ export default function DeploymentTrackApp() {
       || deployUiPhase === 'awaiting_plan'
       || Boolean(deployResult?.requires_plan_confirmation)
       || String(deployResult?.status || '').trim().toLowerCase() === 'awaiting_plan_confirmation';
+    const retryingFailedDeploy = isFailedDeployAttempt({
+      status: deployStatus,
+      uiPhase: deployUiPhase,
+      result: deployResult,
+    });
 
-    if (deployStartBlockers.length > 0) {
+    if (retryingFailedDeploy) {
+      const active = getOrCreateActiveDeployment(selectedProject.id);
+      active.inFlight = false;
+      if (deployRequestRef.current === selectedProject.id) {
+        deployRequestRef.current = null;
+      }
+    }
+
+    if (!retryingFailedDeploy && deployStartBlockers.length > 0) {
       const message = deployStartBlockers.join(' ');
       setError(message);
       appendLog(message, 'error');
@@ -4051,7 +4345,7 @@ export default function DeploymentTrackApp() {
       deploymentHistory,
     });
 
-    if (!confirmingPlan && (activeDeployment.inFlight || deployRequestRef.current === selectedProject.id)) {
+    if (!retryingFailedDeploy && !confirmingPlan && (activeDeployment.inFlight || deployRequestRef.current === selectedProject.id)) {
       setError('Deployment already running in background for this project.');
       appendLog('Deployment already running in background for this project.');
       return;
@@ -4086,6 +4380,15 @@ export default function DeploymentTrackApp() {
     }
     setDeployUiPhase('starting');
     setDeployElapsedSec(0);
+    const deploySessionId = await createWorkspaceSession({
+      service: 'deploy',
+      project_id: selectedProject.id,
+      title: `Deploy · ${selectedProject.name}`,
+      repo: selectedProject.name,
+      status: 'running',
+      current_stage: 'apply',
+    });
+    if (deploySessionId) workspaceSessionIdRef.current = deploySessionId;
     if (deployHeartbeatRef.current !== null) {
       window.clearInterval(deployHeartbeatRef.current);
       deployHeartbeatRef.current = null;
@@ -4101,16 +4404,21 @@ export default function DeploymentTrackApp() {
       }
     }, 1000);
 
+    const startedLog: DeployLogEntry = confirmingPlan
+      ? { text: 'Plan confirmed. Submitting Terraform apply…', ts: timestampLabel(), type: 'info' }
+      : { text: 'Deploy started. Running preflight checks…', ts: timestampLabel(), type: 'info' };
+    const nextProgress = confirmingPlan ? Math.max(deployProgress || 0, 65) : 5;
+    setDeployStatus('running');
+    setDeployProgress(nextProgress);
+    setDeployLogs(confirmingPlan ? [...deployLogs, startedLog] : [startedLog]);
+
     patchState((prev) => ({
       ...prev,
       status: 'running',
       progress: confirmingPlan ? Math.max(prev.progress || 0, 65) : 5,
       logs: confirmingPlan
-        ? [
-            ...prev.logs,
-            { text: 'Plan confirmed. Submitting Terraform apply…', ts: timestampLabel(), type: 'info' as const },
-          ]
-        : [{ text: 'Deploy started. Running preflight checks…', ts: timestampLabel(), type: 'info' as const }],
+        ? [...prev.logs, startedLog]
+        : [startedLog],
       // Keep prior result for continuity, but strip plan-gate flags so UI leaves confirm mode.
       deployResult: confirmingPlan
         ? {
@@ -4130,6 +4438,11 @@ export default function DeploymentTrackApp() {
         deployResult: { success: false, error: 'AWS credentials are required before deployment.' },
       });
       appendLog('AWS credentials are missing. Configure them first.', 'error');
+      finalizeWorkspaceSession(workspaceSessionIdRef.current, {
+        status: 'failed',
+        current_stage: 'apply',
+        message: 'AWS credentials are required before deployment.',
+      });
       activeDeployment.inFlight = false;
       deployRequestRef.current = null;
       return;
@@ -4144,8 +4457,12 @@ export default function DeploymentTrackApp() {
         setPendingPlanSummary(null);
       }
       appendLog('Calling /api/pipeline/deploy — Terraform apply can take 1–5 minutes…');
-      const canReuseSavedRun = shouldUseSavedRunForDeploy;
-      const runtimeDeployFiles = canReuseSavedRun ? [] : deployableIacFiles;
+      const retryRunId = String(deployResult?.run_id || activeSavedRun?.run_id || '').trim();
+      const retryWorkspace = String(deployResult?.workspace || activeSavedRun?.workspace || '').trim();
+      const canReuseSavedRun = shouldUseSavedRunForDeploy || Boolean(retryingFailedDeploy && retryRunId);
+      const runtimeDeployFiles = canReuseSavedRun
+        ? []
+        : (deployableIacFiles.length > 0 ? deployableIacFiles : (retryingFailedDeploy ? iacFiles : []));
       if (runtimeDeployFiles.length === 0 && !canReuseSavedRun) {
         throw new Error('No valid Terraform bundle is loaded in the current session. Regenerate infrastructure before deploy.');
       }
@@ -4170,8 +4487,8 @@ export default function DeploymentTrackApp() {
             db_username: rdsResourceConfig?.master_username,
             db_password: rdsResourceConfig?.master_password,
           },
-          run_id: canReuseSavedRun ? activeSavedRun?.run_id : undefined,
-          workspace: canReuseSavedRun ? activeSavedRun?.workspace : undefined,
+          run_id: canReuseSavedRun ? (retryRunId || activeSavedRun?.run_id) : undefined,
+          workspace: canReuseSavedRun ? (retryWorkspace || activeSavedRun?.workspace) : undefined,
           state_bucket: terraformRuntimeConfig.state_bucket.trim() || undefined,
           lock_table: terraformRuntimeConfig.lock_table.trim() || undefined,
           files: runtimeDeployFiles,
@@ -4189,9 +4506,13 @@ export default function DeploymentTrackApp() {
           iac_source: savedIacMeta?.source_metadata || undefined,
           secrets_manager_prefix: secretsManagerPrefix,
           environment: String((deploymentProfile as { environment?: string } | null)?.environment || 'prod'),
+          workspace_session_id: workspaceSessionIdRef.current || undefined,
         }),
       });
       const data = await response.json().catch(() => ({})) as DeployApiResult & { detail?: unknown };
+      if (typeof data.workspace_session_id === 'string' && data.workspace_session_id) {
+        workspaceSessionIdRef.current = data.workspace_session_id;
+      }
       if (!response.ok || !data.success) {
         const detail = typeof data.detail === 'string' ? data.detail.trim() : '';
         const message = [data.error || `Deployment failed (HTTP ${response.status}).`, detail].filter(Boolean).join(' ');
@@ -4205,6 +4526,11 @@ export default function DeploymentTrackApp() {
         }));
         pushDeploymentHistory(data || null, 'error');
         appendLog(message, 'error');
+        finalizeWorkspaceSession(workspaceSessionIdRef.current, {
+          status: 'failed',
+          current_stage: 'apply',
+          message,
+        });
         setError(message);
         return;
       }
@@ -4218,6 +4544,7 @@ export default function DeploymentTrackApp() {
         setRequiresPlanConfirmation(true);
         setPendingPlanSummary(summary);
         setDeployUiPhase('awaiting_plan');
+        setDeployStatus('idle');
         patchState((prev) => ({
           ...prev,
           status: 'idle',
@@ -4226,6 +4553,10 @@ export default function DeploymentTrackApp() {
         }));
         appendLog(summarizePlanResources(summary), 'info');
         appendLog('Terraform plan is ready. Click Confirm Plan & Deploy to continue apply.', 'info');
+        persistSessionProgress(workspaceSessionIdRef.current, {
+          status: 'needs_review',
+          current_stage: 'apply',
+        });
         return;
       }
 
@@ -4252,7 +4583,8 @@ export default function DeploymentTrackApp() {
             } catch {
               // transient error — keep polling
             }
-            if (!getOrCreateActiveDeployment(selectedProject.id).inFlight) break;
+            const latestRun = getOrCreateActiveDeployment(selectedProject.id);
+            if (!latestRun.inFlight || latestRun.state.status === 'error') break;
           }
         } else if (data.run_id) {
           await reconcileDeploymentStatus(data.run_id);
@@ -4270,7 +4602,18 @@ export default function DeploymentTrackApp() {
       }
       clearHeartbeat();
       const latest = getOrCreateActiveDeployment(selectedProject.id).state;
-      setDeployUiPhase(latest.status === 'error' ? 'error' : latest.status === 'done' ? 'done' : 'reconciling');
+      if (isFailedDeployAttempt({ status: latest.status, result: latest.deployResult })) {
+        setDeployUiPhase('error');
+      } else if (latest.status === 'done') {
+        setDeployUiPhase('done');
+      } else {
+        setDeployUiPhase('reconciling');
+      }
+      if (latest.status === 'error') {
+        finalizeWorkspaceSession(workspaceSessionIdRef.current, { status: 'failed', current_stage: 'apply' });
+      } else if (latest.status === 'done') {
+        finalizeWorkspaceSession(workspaceSessionIdRef.current, { status: 'completed', current_stage: 'apply' });
+      }
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : 'Deployment failed.';
       clearHeartbeat();
@@ -4282,6 +4625,11 @@ export default function DeploymentTrackApp() {
         deployResult: prev.deployResult || { success: false, error: message },
       }));
       appendLog(message, 'error');
+      finalizeWorkspaceSession(workspaceSessionIdRef.current, {
+        status: 'failed',
+        current_stage: 'apply',
+        message,
+      });
       setError(message);
     } finally {
       if (deployRequestRef.current === selectedProject.id) {
@@ -4293,7 +4641,7 @@ export default function DeploymentTrackApp() {
         deployHeartbeatRef.current = null;
       }
     }
-  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployLogs, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, hasAwsSecrets, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
+  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployLogs, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, hasAwsSecrets, iacFiles, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
 
   const stopDeployment = useCallback(async () => {
     if (!selectedProject || stopLoading || deployStatus !== 'running') return;
@@ -4398,12 +4746,25 @@ export default function DeploymentTrackApp() {
     }
   }, [deployStatus, deploySummary.albDns, deploySummary.appUrl, deploySummary.cloudfrontUrl, deploySummary.elasticIp, deploySummary.publicIp, patchState]);
 
+  const credentialFileStem = useMemo(() => {
+    if (deploySummary.keyFileName) return deploySummary.keyFileName.replace(/\.pem$/i, '');
+    const key = deploySummary.keyName || 'deplai-ec2-key';
+    const instanceId = deploySummary.instanceId && deploySummary.instanceId !== 'n/a' ? deploySummary.instanceId : '';
+    return [key, instanceId].filter(Boolean).join('-');
+  }, [deploySummary.instanceId, deploySummary.keyFileName, deploySummary.keyName]);
+
+  const wipeDownloadedCredentials = useCallback(() => {
+    if (!selectedProject?.id) return;
+    const cleared = clearDownloadedDeploySecrets(selectedProject.id, deployResult);
+    patchState((prev) => ({ ...prev, deployResult: cleared }));
+  }, [deployResult, patchState, selectedProject?.id]);
+
   const downloadPpk = useCallback(async () => {
     if (!deploySummary.generatedPem) return;
     const response = await fetch('/api/pipeline/keypair/ppk', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ private_key_pem: deploySummary.generatedPem, key_name: deploySummary.keyName, project_name: selectedProject?.name }),
+      body: JSON.stringify({ private_key_pem: deploySummary.generatedPem, key_name: credentialFileStem, project_name: selectedProject?.name }),
     });
     const data = await response.json().catch(() => ({})) as { success?: boolean; file_name?: string; content_base64?: string; error?: string; hint?: string };
     if (!response.ok || !data.success || !data.content_base64) {
@@ -4414,12 +4775,29 @@ export default function DeploymentTrackApp() {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = url;
-    anchor.download = data.file_name || `${deploySummary.keyName}.ppk`;
+    anchor.download = data.file_name || `${credentialFileStem}.ppk`;
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
     URL.revokeObjectURL(url);
-  }, [deploySummary.generatedPem, deploySummary.keyName, selectedProject?.name]);
+  }, [credentialFileStem, deploySummary.generatedPem, selectedProject?.name]);
+
+  const downloadOneTimeCredentials = useCallback(async (includePpk: boolean) => {
+    const pem = deploySummary.generatedPem || iacKeypair?.private_key_pem || '';
+    if (pem) {
+      downloadTextFile(`${credentialFileStem}.pem`, pem.endsWith('\n') ? pem : `${pem}\n`);
+    }
+    if (includePpk && pem) {
+      await downloadPpk();
+    }
+    if (deploySummary.databaseEnv) {
+      downloadTextFile(
+        deploySummary.databaseFileName || `${credentialFileStem}-database.env`,
+        deploySummary.databaseEnv.endsWith('\n') ? deploySummary.databaseEnv : `${deploySummary.databaseEnv}\n`,
+      );
+    }
+    wipeDownloadedCredentials();
+  }, [credentialFileStem, deploySummary.databaseEnv, deploySummary.databaseFileName, deploySummary.generatedPem, downloadPpk, iacKeypair?.private_key_pem, wipeDownloadedCredentials]);
 
   const destroyDeployment = useCallback(async () => {
     if (!selectedProject || destroyLoading) return;
@@ -4438,6 +4816,7 @@ export default function DeploymentTrackApp() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           project_id: selectedProject.id,
+          run_id: deployResult?.run_id || undefined,
           aws_access_key_id: aws.aws_access_key_id,
           aws_secret_access_key: aws.aws_secret_access_key,
           aws_session_token: aws.aws_session_token,
@@ -4486,10 +4865,15 @@ export default function DeploymentTrackApp() {
     } finally {
       setDestroyLoading(false);
     }
-  }, [appendLog, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, deployStatus, destroyLoading, hasAwsSecrets, patchState, selectedProject, terraformRuntimeConfig.aws_region]);
+  }, [appendLog, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, deployResult?.run_id, deployStatus, destroyLoading, hasAwsSecrets, patchState, selectedProject, terraformRuntimeConfig.aws_region]);
 
   useEffect(() => {
     if (!selectedProject || deployStatus !== 'running') return;
+    if (isAwaitingPlanConfirmation({
+      uiPhase: deployUiPhase,
+      requiresPlanConfirmation,
+      result: deployResult,
+    })) return;
     const activeDeployment = getOrCreateActiveDeployment(selectedProject.id);
     if (activeDeployment.inFlight) return;
     let cancelled = false;
@@ -4513,519 +4897,258 @@ export default function DeploymentTrackApp() {
       cancelled = true;
       window.clearInterval(timerId);
     };
-  }, [deployProgress, deployStatus, reconcileDeploymentStatus, selectedProject]);
+  }, [deployProgress, deployResult, deployStatus, deployUiPhase, reconcileDeploymentStatus, requiresPlanConfirmation, selectedProject]);
 
   const showRegenerateTerraformButton =
     Boolean(selectedProject) &&
-    /provided terraform bundle (is|appears) outdated|stale terraform bundle|default-vpc conditional mode|key pair reuse variable is missing/i.test(String(error || ''));
-  const useLiveConsultantQa = true;
-  const canContinueFromQa = Boolean(currentInfraConsultant?.decision && currentInfraConsultant?.confirmed);
+    /provided terraform bundle (is|appears) outdated|stale terraform bundle|default-vpc conditional mode/i.test(String(error || ''));
+  const unansweredQuestionIndex = useMemo(
+    () => nextScriptedQuestionIndex(reviewQuestions, answers),
+    [answers, reviewQuestions],
+  );
+  const viewingQuestionIndex = useMemo(
+    () => resolveScriptedQuestionCursor(reviewQuestions.length, unansweredQuestionIndex, questionCursor),
+    [questionCursor, reviewQuestions.length, unansweredQuestionIndex],
+  );
+  const currentScriptedQuestion = reviewQuestions[viewingQuestionIndex] || null;
+  const scriptedHistory = useMemo(
+    () => buildScriptedHistory(reviewQuestions, answers, Math.min(viewingQuestionIndex, Math.max(reviewQuestions.length - 1, 0))),
+    [answers, reviewQuestions, viewingQuestionIndex],
+  );
+  const planningLocked = Boolean(deploymentProfile && (approvedConsultantDecision || currentInfraConsultant?.ready));
+  const canContinueFromQa = Boolean(planningLocked && (approvedConsultantDecision || currentInfraConsultant?.decision));
+  const questionsComplete = reviewQuestions.length > 0 && unansweredQuestionIndex >= reviewQuestions.length;
+  const currentQuestionAnswered = Boolean(
+    currentScriptedQuestion && isQuestionAnswered(currentScriptedQuestion.id, answers),
+  );
+  const previousPlanningAnswers = useMemo(() => {
+    return reviewQuestions.flatMap((question, index) => {
+      if (!isQuestionAnswered(question.id, answers)) return [];
+      if (currentScriptedQuestion && index === viewingQuestionIndex) return [];
+      const raw = String(answers[question.id] || '');
+      return [{
+        index,
+        prompt: question.question,
+        answer: labelForAnswer(review, question.id, raw) || (raw.trim() ? raw : 'Skip'),
+      }];
+    });
+  }, [answers, currentScriptedQuestion, review, reviewQuestions, viewingQuestionIndex]);
+  const maybeGeneratePlan = useCallback((nextAnswers: Record<string, string>, nextCursor: number) => {
+    if (!review) return;
+    const allAnswered = nextScriptedQuestionIndex(review.questions || [], nextAnswers) >= (review.questions || []).length;
+    if (!allAnswered || nextCursor < (review.questions || []).length) return;
+    planAttemptedKeyRef.current = JSON.stringify(nextAnswers);
+    void generatePlan(nextAnswers).catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : 'Failed to generate deployment profile.');
+    });
+  }, [generatePlan, review]);
+  const answerScriptedQuestion = useCallback((questionId: string, value: string) => {
+    if (!review) return;
+    const nextAnswers = { ...answers, [questionId]: value };
+    const currentIdx = (review.questions || []).findIndex((question) => question.id === questionId);
+    const questionCount = (review.questions || []).length;
+    const unanswered = nextScriptedQuestionIndex(review.questions || [], nextAnswers);
+    const sequentialCursor = currentIdx >= 0 ? currentIdx + 1 : viewingQuestionIndex + 1;
+    const nextCursor = sequentialCursor >= questionCount && unanswered < questionCount
+      ? unanswered
+      : sequentialCursor;
+    setAnswers(nextAnswers);
+    writeStoredJson(REVIEW_ANSWERS_KEY, nextAnswers);
+    setQuestionCursor(nextCursor);
+    maybeGeneratePlan(nextAnswers, nextCursor);
+  }, [answers, maybeGeneratePlan, review, viewingQuestionIndex]);
+  const jumpToQuestion = useCallback((index: number) => {
+    if (reviewQuestions.length === 0) return;
+    setQuestionCursor(resolveScriptedQuestionCursor(reviewQuestions.length, unansweredQuestionIndex, index));
+  }, [reviewQuestions.length, unansweredQuestionIndex]);
+  const goToPreviousQuestion = useCallback(() => {
+    if (reviewQuestions.length === 0) return;
+    const from = viewingQuestionIndex >= reviewQuestions.length ? reviewQuestions.length : viewingQuestionIndex;
+    setQuestionCursor(Math.max(0, from - 1));
+  }, [reviewQuestions.length, viewingQuestionIndex]);
+  const goToNextQuestion = useCallback(() => {
+    if (!currentQuestionAnswered) return;
+    const allAnswered = unansweredQuestionIndex >= reviewQuestions.length;
+    if (viewingQuestionIndex + 1 >= reviewQuestions.length && !allAnswered) {
+      setQuestionCursor(unansweredQuestionIndex);
+      return;
+    }
+    const nextCursor = viewingQuestionIndex + 1;
+    setQuestionCursor(nextCursor);
+    maybeGeneratePlan(answers, nextCursor);
+  }, [answers, currentQuestionAnswered, maybeGeneratePlan, unansweredQuestionIndex, reviewQuestions.length, viewingQuestionIndex]);
+  useEffect(() => {
+    const questionId = currentScriptedQuestion?.id || null;
+    if (lastPrefillQuestionIdRef.current === questionId) return;
+    lastPrefillQuestionIdRef.current = questionId;
+    if (!questionId || (currentScriptedQuestion?.options || []).length > 0) return;
+    setInfraConsultantInput(String(answers[questionId] || ''));
+  }, [answers, currentScriptedQuestion]);
+  useEffect(() => {
+    if (activeStage !== 'qa' || planningLocked || infraConsultantLoading || reviewLoading) return;
+    if (!questionsComplete) return;
+    if (viewingQuestionIndex < reviewQuestions.length) return;
+    const key = JSON.stringify(answers);
+    if (planAttemptedKeyRef.current === key) return;
+    planAttemptedKeyRef.current = key;
+    void generatePlan(answers).catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : 'Failed to generate deployment profile.');
+    });
+  }, [activeStage, answers, generatePlan, infraConsultantLoading, planningLocked, questionsComplete, reviewLoading, reviewQuestions.length, viewingQuestionIndex]);
+  const retryGeneratePlan = useCallback(() => {
+    planAttemptedKeyRef.current = null;
+    setQuestionCursor(reviewQuestions.length);
+    void generatePlan(answers).catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : 'Failed to generate deployment profile.');
+    });
+  }, [answers, generatePlan, reviewQuestions.length]);
+  const unlockPlanningAnswers = useCallback(() => {
+    setDeploymentProfile(null);
+    setArchitectureView(null);
+    setApprovalPayload(null);
+    persistApprovedDecision(null);
+    persistInfraConsultant(null);
+    planAttemptedKeyRef.current = null;
+    generatePlanInFlightRef.current = false;
+    setQuestionCursor(0);
+    setAndPersistStage('qa');
+    if (typeof window !== 'undefined') {
+      sessionStorage.removeItem(DEPLOYMENT_PROFILE_KEY);
+      sessionStorage.removeItem(ARCHITECTURE_VIEW_KEY);
+      sessionStorage.removeItem(APPROVAL_PAYLOAD_KEY);
+    }
+  }, [persistApprovedDecision, persistInfraConsultant, setAndPersistStage]);
+  const advanceToArchitecture = useCallback(() => {
+    if (!currentInfraConsultant?.decision) return;
+    if (!currentInfraConsultant.confirmed) {
+      approveInfraConsultantDecision();
+    }
+    setAndPersistStage('architecture');
+  }, [approveInfraConsultantDecision, currentInfraConsultant, setAndPersistStage]);
   const advisorBudget = Number(currentInfraConsultant?.budget_cap_usd || costEstimate.cap || 0);
   const advisorEstimate = Number(currentInfraConsultant?.advisor_cost_estimate?.subtotal_monthly_usd || currentInfraConsultant?.budget_gate?.total_usd || 0);
   const advisorGateStatus = String(currentInfraConsultant?.budget_gate?.status || '').toUpperCase();
-  const applyBudgetCap = useCallback((cap: number) => {
-    const nextCap = Math.max(1, Number(cap) || 0);
-    persistInfraConsultant({
-      workspace: expectedWorkspace,
-      history: currentInfraConsultant?.history || [],
-      repo_detection_summary: currentInfraConsultant?.repo_detection_summary || '',
-      turn_count: currentInfraConsultant?.turn_count || 0,
-      decision: currentInfraConsultant?.decision || null,
-      summary: currentInfraConsultant?.summary || '',
-      confirmed: false,
-      ready: false,
-      budget_cap_usd: nextCap,
-      selected_tier: currentInfraConsultant?.selected_tier || 'recommended',
-      upgrade_suggestions: currentInfraConsultant?.upgrade_suggestions || [],
-      budget_gate: currentInfraConsultant?.budget_gate,
-      advisor_cost_estimate: currentInfraConsultant?.advisor_cost_estimate,
-      requirements: currentInfraConsultant?.requirements,
-    });
-    writeStoredJson(COST_ESTIMATE_KEY, { total_monthly_usd: costEstimate.total, budget_cap_usd: nextCap });
-    const message = `My monthly budget is $${nextCap}`;
-    const priorHistory = currentInfraConsultant?.history || [];
-    const nextHistory: InfraConsultantMessage[] = [...priorHistory, { role: 'user', content: message }];
-    void runInfraConsultantTurn('reply', nextHistory, currentInfraConsultant?.decision || null).catch((reason: unknown) => {
-      setError(reason instanceof Error ? reason.message : 'Failed to apply budget.');
-    });
-  }, [costEstimate.total, currentInfraConsultant, expectedWorkspace, persistInfraConsultant, runInfraConsultantTurn]);
-
-  const applySelectedTier = useCallback((tier: 'baseline' | 'recommended' | 'resilient') => {
-    persistInfraConsultant({
-      ...(currentInfraConsultant || {
-        workspace: expectedWorkspace,
-        history: [],
-        repo_detection_summary: '',
-        turn_count: 0,
-        decision: null,
-        summary: '',
-        confirmed: false,
-      }),
-      workspace: expectedWorkspace,
-      selected_tier: tier,
-      confirmed: false,
-      ready: false,
-    });
-    const label = tier === 'baseline' ? 'baseline' : tier === 'resilient' ? 'more resilient' : 'recommended';
-    const message = `Switch to the ${label} plan`;
-    const priorHistory = currentInfraConsultant?.history || [];
-    const nextHistory: InfraConsultantMessage[] = [...priorHistory, { role: 'user', content: message }];
-    void runInfraConsultantTurn('reply', nextHistory, currentInfraConsultant?.decision || null).catch((reason: unknown) => {
-      setError(reason instanceof Error ? reason.message : 'Failed to switch plan tier.');
-    });
-  }, [currentInfraConsultant, expectedWorkspace, persistInfraConsultant, runInfraConsultantTurn]);
-
-  const qaLiveConsultantView = (
-    <div className="mx-auto max-w-6xl space-y-6">
-      <StageHeader
-        title="Setup Advisor"
-        description="Tell us your budget and who will use the app. We'll design AWS for you in plain language."
-        actions={(
-          <>
-            <button
-              onClick={() => {
-                persistInfraConsultant({
-                  workspace: expectedWorkspace,
-                  history: [],
-                  repo_detection_summary: '',
-                  turn_count: 0,
-                  decision: null,
-                  summary: '',
-                  confirmed: false,
-                  ready: false,
-                  budget_cap_usd: currentInfraConsultant?.budget_cap_usd,
-                  selected_tier: 'recommended',
-                  upgrade_suggestions: [],
-                });
-                setInfraConsultantInput('');
-                void runInfraConsultantTurn('start', []).catch((reason: unknown) => {
-                  setError(reason instanceof Error ? reason.message : 'Failed to start infra consultant.');
-                });
-              }}
-              disabled={infraConsultantLoading || !selectedProject || !repoContext || repoContext.workspace !== expectedWorkspace}
-              className={secondaryButtonClass(infraConsultantLoading || !selectedProject || !repoContext || repoContext.workspace !== expectedWorkspace)}
-            >
-              {currentInfraConsultant?.history?.length ? 'Restart' : 'Start'}
-            </button>
-            <button
-              onClick={() => setAndPersistStage('architecture')}
-              disabled={!canContinueFromQa}
-              className={primaryButtonClass(!canContinueFromQa)}
-            >
-              Continue to Architecture
-              <ArrowRight className="h-4 w-4" />
-            </button>
-          </>
-        )}
-      />
-
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        <Surface>
-          <SurfaceLabel>Monthly estimate</SurfaceLabel>
-          <div className="text-lg font-semibold text-zinc-100">${advisorEstimate.toFixed(2)}</div>
-        </Surface>
-        <Surface>
-          <SurfaceLabel>Your budget</SurfaceLabel>
-          <div className="text-lg font-semibold text-zinc-100">${advisorBudget > 0 ? advisorBudget.toFixed(2) : '—'}</div>
-        </Surface>
-        <Surface>
-          <SurfaceLabel>Fit</SurfaceLabel>
-          <div className={`text-lg font-semibold ${
-            advisorGateStatus === 'PASS' ? 'text-emerald-300' : advisorGateStatus === 'WARN' ? 'text-amber-300' : advisorGateStatus === 'FAIL' ? 'text-rose-300' : 'text-zinc-400'
-          }`}
-          >
-            {advisorGateStatus === 'PASS' ? 'Fits' : advisorGateStatus === 'WARN' ? 'Tight' : advisorGateStatus === 'FAIL' ? 'Over budget' : 'Pending'}
-          </div>
-        </Surface>
-      </div>
-
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-        <Surface className="col-span-1 flex min-h-112 flex-col overflow-hidden xl:col-span-2" padded={false}>
-          <div className="border-b border-white/10 px-5 py-4">
-            <div className="text-sm font-semibold text-zinc-100">Conversation</div>
-            <div className="mt-1 text-xs text-zinc-500">No AWS jargon required — talk about budget, users, and how important uptime is.</div>
-            <div className="mt-3 flex flex-wrap gap-2">
-              {[25, 50, 100, 250].map((cap) => (
-                <button
-                  key={cap}
-                  type="button"
-                  onClick={() => applyBudgetCap(cap)}
-                  disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                  className={`rounded-md border px-3 py-1.5 text-xs transition-colors disabled:opacity-50 ${
-                    advisorBudget === cap
-                      ? 'border-zinc-300 bg-zinc-100 text-zinc-900'
-                      : 'border-white/10 bg-[#16161a] text-zinc-300 hover:border-white/25'
-                  }`}
-                >
-                  ${cap}/mo
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="custom-scrollbar deployment-scrollbar flex-1 space-y-4 overflow-y-auto p-5">
-            {currentInfraConsultant?.history?.length ? currentInfraConsultant.history.map((message, index) => (
-              <div
-                key={`${message.role}-${index}`}
-                className={`max-w-[88%] rounded-lg border px-4 py-3 text-sm leading-relaxed ${
-                  message.role === 'assistant'
-                    ? 'border-white/10 bg-[#16161a] text-zinc-200'
-                    : 'ml-auto border-white/10 bg-zinc-100 text-zinc-900'
-                }`}
-              >
-                <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-500">
-                  {message.role === 'assistant' ? 'Advisor' : 'You'}
-                </div>
-                <div className="whitespace-pre-wrap">{message.content}</div>
-              </div>
-            )) : (
-              <div className="text-sm text-zinc-500">
-                {infraConsultantLoading ? 'Reviewing your project...' : 'Chat starts automatically. Pick a budget chip to begin.'}
-              </div>
-            )}
-          </div>
-          <div className="border-t border-white/10 p-4 space-y-3">
-            {currentInfraConsultant?.decision && currentInfraConsultant.ready ? (
-              <div className="space-y-3">
-                <div className="rounded-lg border border-white/10 bg-black/30 p-3">
-                  <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-zinc-500">Proposed setup</div>
-                  <div className="mt-2 flex flex-wrap gap-1.5">
-                    {(currentInfraConsultant.decision.components || []).map((item, index) => (
-                      <span key={`proposed-${index}-${String(item)}`} className="rounded-md border border-white/10 bg-[#16161a] px-2 py-0.5 text-[11px] text-zinc-300">
-                        {formatComponentName(String(item))}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-                <div className="flex flex-wrap items-center gap-3">
-                  <button
-                    onClick={() => approveInfraConsultantDecision()}
-                    disabled={infraConsultantLoading || currentInfraConsultant.confirmed}
-                    className={primaryButtonClass(infraConsultantLoading || currentInfraConsultant.confirmed)}
-                  >
-                    {currentInfraConsultant.confirmed ? 'Approved' : 'Approve this setup'}
-                  </button>
-                  <button
-                    onClick={() => void rejectInfraConsultantDecision().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to continue the infra conversation.'))}
-                    disabled={infraConsultantLoading}
-                    className={secondaryButtonClass(infraConsultantLoading)}
-                  >
-                    Keep refining
-                  </button>
-                </div>
-              </div>
-            ) : null}
-            <div className="flex gap-3">
-              <textarea
-                value={infraConsultantInput}
-                onChange={(event) => setInfraConsultantInput(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' && !event.shiftKey) {
-                    event.preventDefault();
-                    void submitInfraConsultantMessage().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to continue the infra conversation.'));
-                  }
-                }}
-                placeholder="e.g. for customers, around 100 users, keep my data safe"
-                disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                className="min-h-18 flex-1 resize-none rounded-lg border border-white/10 bg-[#09090b] px-4 py-3 text-sm text-zinc-200 outline-none transition-colors placeholder:text-zinc-600 focus:border-white/25 disabled:opacity-50"
-              />
-              <button
-                onClick={() => void submitInfraConsultantMessage().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to continue the infra conversation.'))}
-                disabled={infraConsultantLoading || !infraConsultantInput.trim() || Boolean(currentInfraConsultant?.confirmed)}
-                className={`${primaryButtonClass(infraConsultantLoading || !infraConsultantInput.trim() || Boolean(currentInfraConsultant?.confirmed))} self-end`}
-              >
-                {infraConsultantLoading ? 'Thinking...' : 'Send'}
-              </button>
-            </div>
-          </div>
-        </Surface>
-        <div className="space-y-6">
-          <Surface>
-            <SurfaceLabel>Agent service decision</SurfaceLabel>
-            {currentInfraConsultant?.decision ? (
-              <div className="space-y-3">
-                <div className="rounded-md border border-white/10 bg-[#09090b] px-3 py-3">
-                  <div className="text-sm font-semibold text-zinc-100">
-                    {plainServiceDecisionLabel(inferDeploymentPlanFromDecision(currentInfraConsultant.decision)).label}
-                  </div>
-                  <div className="mt-1 text-xs leading-relaxed text-zinc-500">
-                    {plainServiceDecisionLabel(inferDeploymentPlanFromDecision(currentInfraConsultant.decision)).hint}
-                  </div>
-                  <div className="mt-3 flex flex-wrap gap-1.5">
-                    {normalizeDecisionComponents(currentInfraConsultant.decision).map((item, index) => (
-                      <span key={`decision-component-${index}-${item}`} className="rounded-md border border-white/10 bg-[#16161a] px-2 py-0.5 text-[11px] text-zinc-300">
-                        {formatComponentName(item)}
-                      </span>
-                    ))}
-                  </div>
-                  {(deploymentServices.rds || deploymentServices.redis) ? (
-                    <div className="mt-2 text-[11px] text-zinc-500">
-                      Add-ons: {[deploymentServices.rds ? 'managed database' : null, deploymentServices.redis ? 'managed cache' : null].filter(Boolean).join(' · ')}
-                    </div>
-                  ) : null}
-                </div>
-                <details className="rounded-md border border-white/10 bg-[#09090b] px-3 py-2">
-                  <summary className="cursor-pointer text-xs text-zinc-400">Override service type (optional)</summary>
-                  <div className="mt-3 space-y-2">
-                    {DEPLOYMENT_PLAN_OPTIONS.map((option) => {
-                      const selected = deploymentPlan === option.id;
-                      return (
-                        <button
-                          key={option.id}
-                          type="button"
-                          onClick={() => handleDeploymentPlanChange(option.id)}
-                          disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                          className={`w-full rounded-md border px-3 py-2 text-left text-xs transition-colors disabled:opacity-50 ${
-                            selected
-                              ? 'border-zinc-300 bg-zinc-100 text-zinc-900'
-                              : 'border-white/10 text-zinc-300 hover:border-white/25'
-                          }`}
-                        >
-                          <div className="font-medium">{plainServiceDecisionLabel(option.id).label}</div>
-                          <div className={selected ? 'text-zinc-600' : 'text-zinc-500'}>{plainServiceDecisionLabel(option.id).hint}</div>
-                        </button>
-                      );
-                    })}
-                    <div className="grid grid-cols-2 gap-2 pt-1">
-                      <button
-                        type="button"
-                        onClick={() => handleDeploymentServiceToggle('rds')}
-                        disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed) || deploymentPlan === 's3_cloudfront'}
-                        className={`rounded-md border px-2 py-2 text-left text-[11px] disabled:opacity-50 ${
-                          deploymentServices.rds ? 'border-zinc-300 bg-zinc-100 text-zinc-900' : 'border-white/10 text-zinc-400'
-                        }`}
-                      >
-                        Managed database
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleDeploymentServiceToggle('redis')}
-                        disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed) || deploymentPlan === 's3_cloudfront'}
-                        className={`rounded-md border px-2 py-2 text-left text-[11px] disabled:opacity-50 ${
-                          deploymentServices.redis ? 'border-zinc-300 bg-zinc-100 text-zinc-900' : 'border-white/10 text-zinc-400'
-                        }`}
-                      >
-                        Managed cache
-                      </button>
-                    </div>
-                  </div>
-                </details>
-              </div>
-            ) : (
-              <div className="text-sm text-zinc-500">The advisor will choose the service shape after budget and a few answers.</div>
-            )}
-          </Surface>
-
-          {deploymentPlan === 'ec2' ? (
-            <Surface>
-              <SurfaceLabel>Suggested settings</SurfaceLabel>
-              <div className="mb-3 text-xs text-zinc-500">Filled by the agent — change anything you want.</div>
-              <div className="space-y-3">
-                <label className="block text-xs text-zinc-400">
-                  Server size
-                  <select
-                    value={ec2ResourceConfig.instance_type}
-                    onChange={(event) => handleEc2ResourceConfigChange({ instance_type: event.target.value as Ec2ResourceConfig['instance_type'] })}
-                    disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                    className="mt-1 w-full rounded-md border border-white/10 bg-[#09090b] px-3 py-2 text-sm text-zinc-200 outline-none focus:border-white/25 disabled:opacity-50"
-                  >
-                    {EC2_INSTANCE_TYPES.map((item) => (
-                      <option key={item} value={item}>{item}</option>
-                    ))}
-                  </select>
-                </label>
-                <label className="block text-xs text-zinc-400">
-                  Disk (GB)
-                  <input
-                    type="number"
-                    min={20}
-                    max={200}
-                    value={ec2ResourceConfig.root_volume_size_gb}
-                    onChange={(event) => handleEc2ResourceConfigChange({ root_volume_size_gb: Number(event.target.value) })}
-                    disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                    className="mt-1 w-full rounded-md border border-white/10 bg-[#09090b] px-3 py-2 text-sm text-zinc-200 outline-none focus:border-white/25 disabled:opacity-50"
-                  />
-                </label>
-                <label className="block text-xs text-zinc-400">
-                  App port
-                  <input
-                    type="number"
-                    min={1}
-                    max={65535}
-                    value={ec2ResourceConfig.app_port}
-                    onChange={(event) => handleEc2ResourceConfigChange({ app_port: Number(event.target.value) })}
-                    disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                    className="mt-1 w-full rounded-md border border-white/10 bg-[#09090b] px-3 py-2 text-sm text-zinc-200 outline-none focus:border-white/25 disabled:opacity-50"
-                  />
-                </label>
-              </div>
-            </Surface>
-          ) : null}
-
-          {deploymentPlan === 'ecs_fargate' ? (
-            <Surface>
-              <SurfaceLabel>Suggested settings</SurfaceLabel>
-              <div className="mb-3 text-xs text-zinc-500">Filled by the agent — change anything you want.</div>
-              <div className="grid grid-cols-3 gap-2">
-                <label className="block text-xs text-zinc-400">
-                  CPU
-                  <input
-                    type="number"
-                    value={ecsResourceConfig.cpu}
-                    onChange={(event) => handleEcsResourceConfigChange({ cpu: Number(event.target.value) })}
-                    disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                    className="mt-1 w-full rounded-md border border-white/10 bg-[#09090b] px-2 py-2 text-sm text-zinc-200 outline-none disabled:opacity-50"
-                  />
-                </label>
-                <label className="block text-xs text-zinc-400">
-                  Memory
-                  <input
-                    type="number"
-                    value={ecsResourceConfig.memory}
-                    onChange={(event) => handleEcsResourceConfigChange({ memory: Number(event.target.value) })}
-                    disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                    className="mt-1 w-full rounded-md border border-white/10 bg-[#09090b] px-2 py-2 text-sm text-zinc-200 outline-none disabled:opacity-50"
-                  />
-                </label>
-                <label className="block text-xs text-zinc-400">
-                  Tasks
-                  <input
-                    type="number"
-                    value={ecsResourceConfig.desired_count}
-                    onChange={(event) => handleEcsResourceConfigChange({ desired_count: Number(event.target.value) })}
-                    disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                    className="mt-1 w-full rounded-md border border-white/10 bg-[#09090b] px-2 py-2 text-sm text-zinc-200 outline-none disabled:opacity-50"
-                  />
-                </label>
-              </div>
-            </Surface>
-          ) : null}
-
-          {deploymentServices.rds && deploymentPlan !== 's3_cloudfront' ? (
-            <Surface>
-              <SurfaceLabel>Suggested database</SurfaceLabel>
-              <div className="mb-3 text-xs text-zinc-500">Agent pick — editable.</div>
-              <div className="space-y-3">
-                <label className="block text-xs text-zinc-400">
-                  Engine
-                  <select
-                    value={rdsResourceConfig.engine}
-                    onChange={(event) => handleRdsResourceConfigChange({ engine: event.target.value as RdsResourceConfig['engine'] })}
-                    disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                    className="mt-1 w-full rounded-md border border-white/10 bg-[#09090b] px-3 py-2 text-sm text-zinc-200 outline-none focus:border-white/25 disabled:opacity-50"
-                  >
-                    {RDS_ENGINES.map((item) => (
-                      <option key={item} value={item}>{item}</option>
-                    ))}
-                  </select>
-                </label>
-                <label className="block text-xs text-zinc-400">
-                  Instance class
-                  <select
-                    value={rdsResourceConfig.instance_class}
-                    onChange={(event) => handleRdsResourceConfigChange({ instance_class: event.target.value })}
-                    disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                    className="mt-1 w-full rounded-md border border-white/10 bg-[#09090b] px-3 py-2 text-sm text-zinc-200 outline-none focus:border-white/25 disabled:opacity-50"
-                  >
-                    {(RDS_ENGINE_META[rdsResourceConfig.engine]?.instanceClasses || [rdsResourceConfig.instance_class]).map((item) => (
-                      <option key={item} value={item}>{item}</option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-            </Surface>
-          ) : null}
-
-          {deploymentServices.redis && deploymentPlan !== 's3_cloudfront' ? (
-            <Surface>
-              <SurfaceLabel>Suggested cache</SurfaceLabel>
-              <div className="mb-3 text-xs text-zinc-500">Agent pick — editable.</div>
-              <label className="block text-xs text-zinc-400">
-                Node type
-                <select
-                  value={redisResourceConfig.node_type}
-                  onChange={(event) => handleRedisResourceConfigChange({ node_type: event.target.value })}
-                  disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                  className="mt-1 w-full rounded-md border border-white/10 bg-[#09090b] px-3 py-2 text-sm text-zinc-200 outline-none focus:border-white/25 disabled:opacity-50"
-                >
-                  {REDIS_NODE_TYPES.map((item) => (
-                    <option key={item} value={item}>{item}</option>
-                  ))}
-                </select>
-              </label>
-            </Surface>
-          ) : null}
-
-          <Surface>
-            <SurfaceLabel>Plan level</SurfaceLabel>
-            <div className="space-y-2">
-              {([
-                { id: 'baseline' as const, label: 'Simple', hint: 'Lowest cost' },
-                { id: 'recommended' as const, label: 'Balanced', hint: 'Best default' },
-                { id: 'resilient' as const, label: 'Stay-online', hint: 'More protection' },
-              ]).map((tier) => {
-                const selected = (currentInfraConsultant?.selected_tier || 'recommended') === tier.id;
-                return (
-                  <button
-                    key={tier.id}
-                    type="button"
-                    onClick={() => applySelectedTier(tier.id)}
-                    disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                    className={`w-full rounded-md border px-3 py-2.5 text-left transition-colors disabled:opacity-50 ${
-                      selected
-                        ? 'border-zinc-300 bg-zinc-100 text-zinc-900'
-                        : 'border-white/10 bg-[#09090b] text-zinc-300 hover:border-white/25'
-                    }`}
-                  >
-                    <div className="text-sm font-medium">{tier.label}</div>
-                    <div className={`text-xs ${selected ? 'text-zinc-600' : 'text-zinc-500'}`}>{tier.hint}</div>
-                  </button>
-                );
-              })}
-            </div>
-          </Surface>
-          <Surface>
-            <SurfaceLabel>Upgrade ideas</SurfaceLabel>
-            {(currentInfraConsultant?.upgrade_suggestions || []).length > 0 ? (
-              <div className="space-y-2">
-                {(currentInfraConsultant?.upgrade_suggestions || []).map((item, index) => (
-                  <button
-                    key={`${item.tier || item.title}-${index}`}
-                    type="button"
-                    onClick={() => {
-                      const extra = Number(item.extra_monthly_usd || 0);
-                      if (extra > 0 && advisorBudget > 0) {
-                        applyBudgetCap(Math.ceil(advisorBudget + extra));
-                      } else if (item.tier === 'baseline' || item.tier === 'recommended' || item.tier === 'resilient') {
-                        applySelectedTier(item.tier);
-                      }
-                    }}
-                    disabled={infraConsultantLoading || Boolean(currentInfraConsultant?.confirmed)}
-                    className="w-full rounded-md border border-white/10 bg-[#09090b] px-3 py-3 text-left transition-colors hover:border-white/25 disabled:opacity-50"
-                  >
-                    <div className="text-sm font-medium text-zinc-100">
-                      +${Number(item.extra_monthly_usd || 0).toFixed(0)}/mo · {item.title || 'Upgrade'}
-                    </div>
-                    <div className="mt-1 text-xs leading-relaxed text-zinc-500">{item.plain_benefit || ''}</div>
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <div className="text-sm text-zinc-500">Upgrade suggestions appear once a budget and plan exist.</div>
-            )}
-          </Surface>
-          <Surface>
-            <SurfaceLabel>Status</SurfaceLabel>
-            <div className="text-sm text-zinc-200">
-              {currentInfraConsultant?.confirmed ? 'Approved' : currentInfraConsultant?.ready ? 'Ready to approve' : infraConsultantLoading ? 'Working' : 'In progress'}
-            </div>
-            <div className="mt-2 text-xs text-zinc-500">
-              Tier: <span className="text-zinc-300">{currentInfraConsultant?.selected_tier || 'recommended'}</span>
-            </div>
-          </Surface>
-        </div>
-      </div>
-    </div>
+  const planningComponentRows = useMemo(() => {
+    const decision = currentInfraConsultant?.decision;
+    if (!decision) return [];
+    const stack = toRecord(decision.stack_config);
+    return normalizeDecisionComponents(decision).map((id) => ({
+      name: formatComponentName(id),
+      details: componentDetails(id, stack).join(' · '),
+    }));
+  }, [currentInfraConsultant?.decision]);
+  const planningNotes = useMemo(
+    () => humanizeConsultantNotes(
+      Array.isArray(currentInfraConsultant?.decision?.consultant_notes)
+        ? currentInfraConsultant.decision.consultant_notes.map((item) => String(item || '').trim()).filter(Boolean)
+        : [],
+    ),
+    [currentInfraConsultant?.decision?.consultant_notes],
   );
+  const qaLiveConsultantView = (
+    <StageShell stageKey="planning" hasActionBar width="wide">
+      <StageHeader
+        eyebrow="Stage 02 · Planning"
+        title="Planning"
+        description={
+          reviewLoading
+            ? 'Preparing deployment questions from repository analysis.'
+            : planningLocked
+              ? 'Review the proposed AWS setup, then continue to architecture. Change answers anytime to edit the questionnaire.'
+              : 'Answer one question at a time. Use Back or Change to edit a previous response without starting over.'
+        }
+        meta={
+          <>
+            <MetaChip label="repo" value={selectedProject?.name || '—'} />
+            <MetaChip
+              label="question"
+              value={reviewQuestions.length ? `${Math.min(viewingQuestionIndex + 1, reviewQuestions.length)}/${reviewQuestions.length}` : '—'}
+            />
+            <MetaChip
+              label="budget"
+              value={advisorBudget > 0 ? `$${advisorBudget.toFixed(0)}/mo` : 'unset'}
+              tone={advisorBudget > 0 ? 'accent' : 'neutral'}
+            />
+            {advisorGateStatus ? (
+              <MetaChip
+                label="gate"
+                value={advisorGateStatus}
+                tone={advisorGateStatus === 'PASS' ? 'ok' : advisorGateStatus === 'FAIL' ? 'warn' : 'neutral'}
+              />
+            ) : null}
+          </>
+        }
+      />
+      {reviewLoading ? (
+        <div className="space-y-4">
+          {Array.from({ length: 3 }).map((_, index) => (
+            <Skeleton key={index} className="h-28 w-full" />
+          ))}
+        </div>
+      ) : review ? (
+      <PlanningAgentPanel
+        projectName={selectedProject?.name || 'project'}
+        loading={infraConsultantLoading}
+          messages={scriptedHistory.length > 0 ? scriptedHistory : [{ role: 'assistant', content: currentScriptedQuestion?.question || `I've analyzed \`${selectedProject?.name || 'your project'}\`. Let's lock the deployment plan with a few questions.` }]}
+        input={infraConsultantInput}
+        onInputChange={setInfraConsultantInput}
+        onSubmit={() => {
+            if (!currentScriptedQuestion) return;
+            answerScriptedQuestion(currentScriptedQuestion.id, infraConsultantInput.trim());
+            setInfraConsultantInput('');
+          }}
+          submitDisabled={infraConsultantLoading || planningLocked || (!infraConsultantInput.trim() && Boolean(currentScriptedQuestion && (currentScriptedQuestion.options || []).length === 0 && currentScriptedQuestion.required !== false))}
+        onContinue={advanceToArchitecture}
+        continueDisabled={!canContinueFromQa}
+          showDecision={planningLocked}
+          onRefine={unlockPlanningAnswers}
+        approved={Boolean(currentInfraConsultant?.confirmed)}
+        planSummary={consultantDecisionSummary}
+        planNotes={planningNotes}
+        region={String(currentInfraConsultant?.decision?.region || terraformRuntimeConfig.aws_region || '')}
+        estimateUsd={advisorEstimate}
+        budgetUsd={advisorBudget}
+        componentRows={planningComponentRows}
+        deploySequence={(currentInfraConsultant?.decision?.deploy_sequence || []).map((item) => formatComponentName(String(item)))}
+          currentQuestion={planningLocked ? null : currentScriptedQuestion}
+          questionIndex={viewingQuestionIndex}
+          questionTotal={reviewQuestions.length}
+          onSelectOption={(value) => {
+            if (!currentScriptedQuestion) return;
+            answerScriptedQuestion(currentScriptedQuestion.id, value);
+          }}
+          onSkip={() => {
+            if (!currentScriptedQuestion) return;
+            answerScriptedQuestion(currentScriptedQuestion.id, '');
+          }}
+          questionsComplete={questionsComplete}
+          onRetryGenerate={retryGeneratePlan}
+          selectedValue={currentScriptedQuestion ? String(answers[currentScriptedQuestion.id] || '') : ''}
+          currentAnswered={currentQuestionAnswered}
+          previousAnswers={planningLocked ? [] : previousPlanningAnswers}
+          onJumpToQuestion={jumpToQuestion}
+          onBack={goToPreviousQuestion}
+          onNext={goToNextQuestion}
+          backDisabled={viewingQuestionIndex <= 0 && Boolean(currentScriptedQuestion)}
+          nextDisabled={!currentQuestionAnswered}
+          nextLabel={
+            viewingQuestionIndex >= reviewQuestions.length - 1 && questionsComplete
+              ? 'Generate plan'
+              : 'Next question'
+          }
+        />
+      ) : (
+        <Panel padded={false}>
+          <EmptyState
+            icon={<CircleDashed className="h-5 w-5" />}
+            title="Questionnaire unavailable"
+            description="The deployment questionnaire could not be loaded. Return to repository analysis and retry."
+          />
+      </Panel>
+      )}
+    </StageShell>
+  );
+
   const decisionNodePositions = useMemo(() => {
     const map = new Map<string, { x: number; y: number; height: number }>();
     for (const node of decisionDiagram.nodes) {
@@ -5033,18 +5156,29 @@ export default function DeploymentTrackApp() {
     }
     return map;
   }, [decisionDiagram.nodes]);
+  const decisionCanvasHeight = decisionDiagram.hasPrivateTier ? 520 : 360;
   const decisionDiagramCanvas = (
-    <svg viewBox={`0 0 980 ${decisionDiagram.hasPrivateTier ? 520 : 360}`} className="w-full rounded-xl bg-[#0c0c0e]">
+    <svg
+      viewBox={`0 0 980 ${decisionCanvasHeight}`}
+      className="w-full rounded-xl"
+      style={{ background: 'radial-gradient(120% 90% at 50% 0%, #101015 0%, #07070a 60%)' }}
+    >
       <defs>
         <marker id="decision-flow-arrow" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
-          <polygon points="0 0, 7 2.5, 0 5" fill="#52525b" />
+          <polygon points="0 0, 7 2.5, 0 5" fill="rgba(163,230,53,0.65)" />
         </marker>
-        <linearGradient id="decision-canvas-fade" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#141417" />
-          <stop offset="100%" stopColor="#0c0c0e" />
+        <pattern id="decision-grid" width="28" height="28" patternUnits="userSpaceOnUse">
+          <path d="M 28 0 L 0 0 0 28" fill="none" stroke="rgba(255,255,255,0.035)" strokeWidth="1" />
+        </pattern>
+        <linearGradient id="decision-edge" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stopColor="rgba(163,230,53,0.12)" />
+          <stop offset="100%" stopColor="rgba(163,230,53,0.6)" />
         </linearGradient>
+        <filter id="decision-node-shadow" x="-40%" y="-40%" width="180%" height="180%">
+          <feDropShadow dx="0" dy="6" stdDeviation="8" floodColor="#000" floodOpacity="0.55" />
+        </filter>
       </defs>
-      <rect x="0" y="0" width="980" height={decisionDiagram.hasPrivateTier ? 520 : 360} fill="url(#decision-canvas-fade)" />
+      <rect x="0" y="0" width="980" height={decisionCanvasHeight} fill="url(#decision-grid)" />
       {decisionDiagram.hasVpcBoundary ? (
         <>
           <rect
@@ -5052,31 +5186,48 @@ export default function DeploymentTrackApp() {
             y="48"
             width="740"
             height={decisionDiagram.hasPrivateTier ? 420 : 260}
-            rx="18"
-            fill="rgba(255,255,255,0.015)"
-            stroke="rgba(255,255,255,0.1)"
+            rx="20"
+            fill="rgba(255,255,255,0.012)"
+            stroke="rgba(255,255,255,0.09)"
             strokeWidth="1"
           />
-          <text x="214" y="76" fill="#71717a" fontSize="11" style={{ fontFamily: 'var(--font-display, sans-serif)' }}>
-            VPC · {decisionDiagram.awsRegion}
+          <text
+            x="214"
+            y="76"
+            fill="#a3e635"
+            fontSize="10"
+            letterSpacing="0.18em"
+            style={{ fontFamily: 'var(--font-mono, monospace)' }}
+          >
+            VPC · {String(decisionDiagram.awsRegion).toUpperCase()}
           </text>
           <rect
             x="220"
             y="100"
             width="680"
             height={decisionDiagram.hasPrivateTier ? 170 : 180}
-            rx="14"
-            fill="rgba(255,255,255,0.02)"
-            stroke="rgba(255,255,255,0.08)"
+            rx="16"
+            fill="rgba(255,255,255,0.018)"
+            stroke="rgba(255,255,255,0.07)"
+            strokeDasharray="4 5"
           />
-          <text x="240" y="124" fill="#52525b" fontSize="10" letterSpacing="0.08em" style={{ fontFamily: 'var(--font-mono, monospace)' }}>
-            PUBLIC
+          <text x="240" y="124" fill="#6b6b75" fontSize="9.5" letterSpacing="0.2em" style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+            PUBLIC SUBNET
           </text>
           {decisionDiagram.hasPrivateTier ? (
             <>
-              <rect x="220" y="292" width="680" height="150" rx="14" fill="rgba(255,255,255,0.012)" stroke="rgba(255,255,255,0.06)" />
-              <text x="240" y="316" fill="#52525b" fontSize="10" letterSpacing="0.08em" style={{ fontFamily: 'var(--font-mono, monospace)' }}>
-                PRIVATE{decisionDiagram.hasMultiAz ? ' · MULTI-AZ' : ''}
+              <rect
+                x="220"
+                y="292"
+                width="680"
+                height="150"
+                rx="16"
+                fill="rgba(255,255,255,0.01)"
+                stroke="rgba(255,255,255,0.055)"
+                strokeDasharray="4 5"
+              />
+              <text x="240" y="316" fill="#6b6b75" fontSize="9.5" letterSpacing="0.2em" style={{ fontFamily: 'var(--font-mono, monospace)' }}>
+                PRIVATE SUBNET{decisionDiagram.hasMultiAz ? ' · MULTI-AZ' : ''}
               </text>
             </>
           ) : null}
@@ -5086,17 +5237,23 @@ export default function DeploymentTrackApp() {
         const from = decisionNodePositions.get(edge.from);
         const to = decisionNodePositions.get(edge.to);
         if (!from || !to) return null;
+        const x1 = from.x + 64;
+        const y1 = from.y + from.height / 2;
+        const x2 = to.x + 64;
+        const y2 = to.y + to.height / 2;
         return (
-          <line
-            key={`${edge.from}-${edge.to}-${index}`}
-            x1={from.x + 64}
-            y1={from.y + (from.height / 2)}
-            x2={to.x + 64}
-            y2={to.y + (to.height / 2)}
-            stroke="rgba(255,255,255,0.18)"
-            strokeWidth="1.25"
-            markerEnd="url(#decision-flow-arrow)"
-          />
+          <g key={`${edge.from}-${edge.to}-${index}`}>
+            <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="url(#decision-edge)" strokeWidth="1.5" markerEnd="url(#decision-flow-arrow)" />
+            {/* Packet dot travelling the edge conveys direction of traffic flow. */}
+            <circle className="dw-edge-packet" r="2.5" fill="#a3e635" opacity="0.85">
+              <animateMotion
+                dur="2.6s"
+                begin={`${index * 0.35}s`}
+                repeatCount="indefinite"
+                path={`M ${x1} ${y1} L ${x2} ${y2}`}
+              />
+            </circle>
+          </g>
         );
       })}
       {Array.from(new Map(decisionDiagram.nodes.map((node) => [node.id, node])).values()).map((node) => {
@@ -5104,21 +5261,23 @@ export default function DeploymentTrackApp() {
         const height = getDecisionNodeHeight(node);
         const isInternet = node.id === 'internet';
         return (
-          <g key={node.id} transform={`translate(${node.x},${node.y})`}>
+          <g key={node.id} transform={`translate(${node.x},${node.y})`} filter="url(#decision-node-shadow)">
             <rect
               width="128"
               height={height}
-              rx="12"
-              fill={isInternet ? '#16161a' : '#111113'}
-              stroke={isInternet ? 'rgba(255,255,255,0.16)' : `${node.color}55`}
+              rx="14"
+              fill={isInternet ? 'rgba(255,255,255,0.055)' : 'rgba(255,255,255,0.035)'}
+              stroke={isInternet ? 'rgba(255,255,255,0.18)' : `${node.color}66`}
               strokeWidth="1"
             />
-            <circle cx="18" cy="18" r="3.5" fill={node.color} opacity="0.9" />
+            <rect width="128" height="1" rx="0.5" fill="rgba(255,255,255,0.1)" />
+            <circle cx="18" cy="18" r="3.5" fill={node.color} />
+            <circle cx="18" cy="18" r="6.5" fill="none" stroke={node.color} strokeOpacity="0.3" strokeWidth="1" />
             <text
               x="64"
               y={details.length ? 22 : height / 2 + 4}
               textAnchor="middle"
-              fill="#f4f4f5"
+              fill="#ededf0"
               fontSize="12"
               fontWeight="600"
               style={{ fontFamily: 'var(--font-display, sans-serif)' }}
@@ -5131,8 +5290,8 @@ export default function DeploymentTrackApp() {
                 x="64"
                 y={40 + index * 14}
                 textAnchor="middle"
-                fill="#a1a1aa"
-                fontSize="10"
+                fill="#8b8b95"
+                fontSize="9.5"
                 style={{ fontFamily: 'var(--font-mono, monospace)' }}
               >
                 {line}
@@ -5148,984 +5307,653 @@ export default function DeploymentTrackApp() {
   const decisionCostVariance = String(decisionCostEstimate?.variance_note || 'Estimated monthly cost can vary by +/-20% depending on runtime usage.');
   const decisionCostBasedOnDecision = decisionCostEstimate?.based_on_decision !== false;
   return (
-    <div className="deployment-workspace flex h-screen overflow-hidden bg-[#09090b] font-sans text-zinc-300">
-      <style dangerouslySetInnerHTML={{ __html: DEPLOYMENT_WORKSPACE_STYLE }} />
-      <aside className="flex h-full w-64 shrink-0 flex-col border-r border-white/10 bg-[#09090b]">
-        <div className="flex h-14 items-center border-b border-white/10 px-5">
-          <div className="flex items-center gap-2.5">
-            <div className="flex h-7 w-7 items-center justify-center rounded-md border border-white/10 bg-[#16161a] text-[10px] font-bold tracking-[0.12em] text-zinc-100" style={{ fontFamily: 'var(--font-display)' }}>
-              DL
-            </div>
-            <div>
-              <div className="text-sm font-semibold tracking-[0.08em] text-zinc-50" style={{ fontFamily: 'var(--font-display)' }}>DeplAI</div>
-              <div className="text-[10px] uppercase tracking-[0.16em] text-zinc-600">Deployment</div>
-            </div>
-          </div>
-        </div>
-        <div className="deployment-scrollbar custom-scrollbar flex-1 space-y-0.5 overflow-y-auto px-2.5 py-4">
-          {(() => {
-            const activeIndex = SIDEBAR_STAGES.findIndex((s) => s.id === activeStage);
-            return SIDEBAR_STAGES.map((stage, idx) => {
-              const isActive = activeStage === stage.id;
-              const isDone = idx < activeIndex;
-              return (
-                <button
-                  key={stage.id}
-                  onClick={() => setAndPersistStage(stage.id)}
-                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors ${
-                    isActive
-                      ? 'bg-[#16161a] text-zinc-50 ring-1 ring-white/10'
-                      : isDone
-                        ? 'text-zinc-400 hover:bg-white/[0.03]'
-                        : 'text-zinc-600 hover:bg-white/[0.03]'
-                  }`}
-                >
-                  <div className="flex shrink-0 items-center justify-center">
-                    {isActive
-                      ? <CircleDashed className="h-4 w-4 animate-spin text-zinc-300" />
-                      : isDone
-                        ? <div className="flex h-4 w-4 items-center justify-center rounded-full bg-zinc-200"><svg width="8" height="8" viewBox="0 0 8 8" fill="none"><path d="M1.5 4l2 2 3-3" stroke="#09090b" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg></div>
-                        : <div className="h-4 w-4 rounded-full border border-zinc-700" />}
-                  </div>
-                  <div>
-                    <div className="text-[13px] font-medium">{stage.label}</div>
-                    <div className="text-[10px] uppercase tracking-[0.14em] text-zinc-600">{stage.details}</div>
-                  </div>
-                </button>
-              );
-            });
-          })()}
-        </div>
-      </aside>
-      <div className="flex h-full flex-1 flex-col overflow-hidden">
-        <header className="flex h-14 items-center justify-between border-b border-white/10 bg-[#09090b] px-6">
-          <div className="flex items-center gap-2 text-sm">
-            <button onClick={() => router.push('/dashboard')} className="font-medium text-zinc-500 hover:text-zinc-200">Dashboard</button>
-            <ChevronRight className="h-4 w-4 text-zinc-700" />
-            <span className="font-medium text-zinc-100">{SIDEBAR_STAGES.find((stage) => stage.id === activeStage)?.label}</span>
-          </div>
-          {selectedProject && (
-            <div className="flex items-center gap-3">
-              <span className="rounded-md border border-white/10 bg-[#111113] px-3 py-1.5 font-mono text-xs text-zinc-400">{selectedProject.name}</span>
-              <button onClick={() => router.push('/dashboard')} className="text-xs font-semibold text-zinc-500 hover:text-zinc-200">Exit</button>
-            </div>
-          )}
-        </header>
-        <div className="deployment-scrollbar custom-scrollbar flex-1 overflow-y-auto p-6 lg:p-8">
+    <div className="deployment-workspace flex h-full overflow-hidden bg-[var(--dw-canvas)] font-sans text-[var(--dw-fg-soft)]">
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <DeploymentCommandHeader onExit={() => router.push('/dashboard')} />
+        <DeploymentPipelineHeader
+          projects={projects}
+          selectedProjectId={selectedProjectId}
+          onSelectProject={handleSelectDeploymentProject}
+          onRestart={restartPipeline}
+          restartDisabled={!selectedProjectId || analysisLoading}
+        />
+        <DeploymentStageRail activeStage={activeStage} onSelectStage={setAndPersistStage} />
+        <div className="dw-scrollbar relative flex-1 overflow-y-auto p-6 lg:p-8">
           {error && (
-            <div className="mx-auto mb-6 flex max-w-5xl items-center justify-between gap-4 rounded-xl border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">
-              <div>{error}</div>
-              {showRegenerateTerraformButton ? (
-                <button
-                  onClick={() => {
-                    setAndPersistStage('terraform');
-                    resetCurrentIacSessionArtifacts();
-                    void generateTerraform().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Infrastructure generation failed.'));
-                  }}
-                  className="shrink-0 rounded-md border border-red-400/30 bg-red-500/20 px-4 py-2 text-xs font-semibold text-red-100 hover:bg-red-500/30"
-                >
-                  Regenerate Terraform
-                </button>
-              ) : null}
+            <div className="mx-auto mb-6 max-w-5xl">
+              <Callout
+                tone="danger"
+                title="Pipeline error"
+                actions={
+                  showRegenerateTerraformButton ? (
+                    <button
+                      onClick={() => {
+                        setAndPersistStage('terraform');
+                        resetCurrentIacSessionArtifacts();
+                        void generateTerraform().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Infrastructure generation failed.'));
+                      }}
+                      className={buttonClass('danger', { size: 'sm' })}
+                    >
+                      Regenerate Terraform
+                    </button>
+                  ) : null
+                }
+              >
+                {error}
+              </Callout>
             </div>
           )}
           {activeStage === 'analysis' && (
-            <div className="mx-auto max-w-5xl space-y-6">
-              {!projectsLoaded ? (
-                <div className="flex min-h-[400px] items-center justify-center">
-                  <div className="animate-pulse text-sm font-medium text-zinc-400">Loading workspace data...</div>
+            !projectsLoaded ? (
+              <StageShell stageKey="analysis-loading" className="flex flex-col gap-5">
+                <div className="grid grid-cols-2 gap-3.5 lg:grid-cols-4">
+                  {[0, 1, 2, 3].map((index) => (
+                    <Skeleton key={index} className="h-[86px] w-full" />
+                  ))}
                 </div>
-              ) : selectedProject ? (
-                <>
-                  <StageHeader
-                    title="Repository Analysis"
-                    description={
-                      analysisLoading
-                        ? 'Scanning the repository for frameworks, data stores, and container/orchestration signals.'
-                        : 'Inventory of what this project already uses — frameworks, databases, containers, and cluster config.'
+                <Skeleton className="h-64 w-full" />
+              </StageShell>
+            ) : selectedProject ? (
+              <StageShell stageKey="analysis" hasActionBar>
+                <StageHeader
+                  eyebrow="Stage 01 · Analysis"
+                  title="Repository analysis"
+                  description="DeplAI reads the codebase to infer runtime, framework, exposed ports, and the external services your app depends on."
+                  meta={
+                    <>
+                      <MetaChip label="repo" value={selectedProject.name} />
+                      <MetaChip
+                        label="status"
+                        value={analysisLoading ? 'scanning' : 'complete'}
+                        tone={analysisLoading ? 'info' : 'ok'}
+                      />
+                    </>
+                  }
+                />
+                <AnalysisStagePanel
+                  loading={analysisLoading}
+                  metrics={analysisMetrics}
+                  services={analysisDetectedServices}
+                  continueDisabled={analysisLoading || !repoContext || repoContext.workspace !== expectedWorkspace}
+                  onContinue={() => setAndPersistStage('qa')}
+                />
+              </StageShell>
+            ) : (
+              <StageShell stageKey="analysis-empty">
+                <Panel padded={false}>
+                  <EmptyState
+                    icon={<Server className="h-5 w-5" />}
+                    title="Choose a repository from the dashboard"
+                    description="The deployment pipeline runs against one repository at a time. Start from a repo card on the dashboard so the flow binds to the right project."
+                    actions={
+                      <button onClick={() => router.push('/dashboard')} className={pipelinePrimaryButtonClass(false)}>
+                        Back to dashboard
+                      </button>
                     }
-                    actions={(
-                      <button
-                        onClick={() => setAndPersistStage('qa')}
-                        disabled={analysisLoading || !repoContext || repoContext.workspace !== expectedWorkspace}
-                        className={primaryButtonClass(analysisLoading || !repoContext || repoContext.workspace !== expectedWorkspace)}
-                      >
-                        {analysisLoading ? 'Scanning Repository...' : 'Continue to Questions'}
-                        <ArrowRight className="h-4 w-4" />
-                      </button>
-                    )}
                   />
-
-                  {analysisLoading ? (
-                    <Surface>
-                      <div className="text-sm text-zinc-400">Scanning codebase and waiting for Agentic Layer...</div>
-                    </Surface>
-                  ) : repoContext ? (
-                    <div className="space-y-4">
-                      <Surface>
-                        <SurfaceLabel>Runtime</SurfaceLabel>
-                        <div className="text-base text-zinc-100">{String(repoContext.language?.runtime || 'Unknown')}</div>
-                        <div className="mt-2 space-y-1 text-sm text-zinc-500">
-                          <div>Workspace: <span className="font-mono text-zinc-300">{repoContext.workspace}</span></div>
-                          {String(repoContext.build?.build_command || '').trim() ? (
-                            <div>Build: <span className="font-mono text-zinc-300">{String(repoContext.build?.build_command)}</span></div>
-                          ) : null}
-                          {String(repoContext.build?.start_command || '').trim() ? (
-                            <div>Start: <span className="font-mono text-zinc-300">{String(repoContext.build?.start_command)}</span></div>
-                          ) : null}
-                          {String(repoContext.health?.endpoint || '').trim() ? (
-                            <div>Health: <span className="font-mono text-zinc-300">{String(repoContext.health?.endpoint)}</span></div>
-                          ) : null}
-                        </div>
-                      </Surface>
-
-                      <Surface>
-                        <SurfaceLabel>Frameworks & dependencies</SurfaceLabel>
-                        {analysisFrameworkDetails.length > 0 ? (
-                          <ul className="space-y-2 text-sm text-zinc-300">
-                            {analysisFrameworkDetails.map((item, index) => (
-                              <li key={`${item.name}-${item.role || 'unknown'}-${index}`} className="flex flex-wrap gap-x-3 gap-y-1">
-                                <span className="font-medium text-zinc-100">{item.name}</span>
-                                {item.role ? <span className="text-zinc-500">{item.role}</span> : null}
-                              </li>
-                            ))}
-                          </ul>
-                        ) : (
-                          <div className="text-sm text-zinc-500">None detected</div>
-                        )}
-                      </Surface>
-
-                      <Surface>
-                        <SurfaceLabel>Data stores</SurfaceLabel>
-                        {analysisDataStoreDetails.length > 0 ? (
-                          <ul className="space-y-2 text-sm text-zinc-300">
-                            {analysisDataStoreDetails.map((item, index) => (
-                              <li key={`${item.type}-${item.version || 'unknown'}-${index}`} className="flex flex-wrap gap-x-3 gap-y-1">
-                                <span className="font-medium text-zinc-100">{item.type}</span>
-                                {item.version ? <span className="font-mono text-zinc-500">{item.version}</span> : null}
-                              </li>
-                            ))}
-                          </ul>
-                        ) : (
-                          <div className="text-sm text-zinc-500">None detected</div>
-                        )}
-                      </Surface>
-
-                      <Surface>
-                        <SurfaceLabel>Containers & orchestration</SurfaceLabel>
-                        <ul className="space-y-2 text-sm text-zinc-300">
-                          <li>Dockerfile: {analysisInfraHints.hasDockerfile ? 'yes' : 'no'}</li>
-                          <li>Docker Compose: {analysisInfraHints.hasCompose ? 'yes' : 'no'}</li>
-                          <li>Kubernetes manifests: {analysisInfraHints.hasKubernetes ? 'yes' : 'no'}</li>
-                          <li>Helm charts: {analysisInfraHints.hasHelm ? 'yes' : 'no'}</li>
-                          {analysisInfraHints.isMonorepo ? <li>Monorepo layout detected</li> : null}
-                          {analysisInfraHints.isServerless ? <li>Serverless config detected</li> : null}
-                        </ul>
-                        {analysisInfraHints.composeImages.length > 0 ? (
-                          <div className="mt-4">
-                            <div className="mb-2 text-xs text-zinc-500">Compose / referenced images</div>
-                            <ul className="space-y-1 font-mono text-xs text-zinc-400">
-                              {analysisInfraHints.composeImages.map((image, index) => (
-                                <li key={`compose-image-${index}-${image}`}>{image}</li>
-                              ))}
-                            </ul>
-                          </div>
-                        ) : null}
-                      </Surface>
-
-                      {analysisProcessLines.length > 0 ? (
-                        <Surface>
-                          <SurfaceLabel>Processes</SurfaceLabel>
-                          <ul className="space-y-2 font-mono text-xs text-zinc-400">
-                            {analysisProcessLines.map((line, index) => (
-                              <li key={`process-${index}-${line}`}>{line}</li>
-                            ))}
-                          </ul>
-                        </Surface>
-                      ) : null}
-
-                      {(analysisSecretNames.length > 0 || analysisConfigNames.length > 0 || analysisFlagLines.length > 0) ? (
-                        <Surface>
-                          <SurfaceLabel>Secrets, config & flags</SurfaceLabel>
-                          <div className="space-y-2 text-sm text-zinc-300">
-                            {analysisSecretNames.length > 0 ? (
-                              <div>Required secrets: <span className="font-mono text-xs text-zinc-400">{analysisSecretNames.join(', ')}</span></div>
-                            ) : null}
-                            {analysisConfigNames.length > 0 ? (
-                              <div>Config values: <span className="font-mono text-xs text-zinc-400">{analysisConfigNames.join(', ')}</span></div>
-                            ) : null}
-                            {analysisFlagLines.map((line, index) => (
-                              <div key={`flag-${index}-${line}`} className="text-amber-300/90">{line}</div>
-                            ))}
-                          </div>
-                        </Surface>
-                      ) : null}
-
-                      {String(repoContext.summary || '').trim() ? (
-                        <Surface>
-                          <SurfaceLabel>Summary</SurfaceLabel>
-                          <p className="text-sm leading-relaxed text-zinc-400">{String(repoContext.summary)}</p>
-                        </Surface>
-                      ) : null}
-                    </div>
-                  ) : (
-                    <Surface>
-                      <div className="text-sm text-zinc-500">No analysis yet. Re-open this stage after selecting a repository.</div>
-                    </Surface>
-                  )}
-                </>
-              ) : (
-                <Surface>
-                  <h1 className="mb-2 text-2xl font-semibold text-zinc-100">Choose a Repository from the Dashboard</h1>
-                  <p className="max-w-2xl text-sm leading-relaxed text-zinc-400">
-                    Deployment Track only runs against a specific repository. Start from a repo card on the dashboard so the AWS deployment flow is bound to the correct project.
-                  </p>
-                  <div className="mt-6">
-                    <button onClick={() => router.push('/dashboard')} className={primaryButtonClass(false)}>
-                      Back to Dashboard
-                    </button>
-                  </div>
-                </Surface>
-              )}
-            </div>
-          )}
-
-          {activeStage === 'qa' && (
-            useLiveConsultantQa ? qaLiveConsultantView : (
-            <div className="mx-auto max-w-6xl space-y-6">
-              <div className="border-b border-[#1A1A1A] py-6">
-                <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-                  <div>
-                    <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Deployment Questions</h1>
-                    <p className="text-sm text-zinc-400">
-                      {reviewLoading
-                        ? 'Preparing deployment questions from repository analysis.'
-                        : 'Answer the required deployment questions so DeplAI can generate an AWS architecture and Terraform plan.'}
-                    </p>
-                  </div>
-                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-                    <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] px-4 py-3">
-                      <div className="text-xs font-semibold tracking-wide text-zinc-500">Required</div>
-                      <div className="mt-1 text-xl font-semibold text-zinc-100">{answeredRequiredCount}/{requiredQuestions.length || 0}</div>
-                    </div>
-                    <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] px-4 py-3">
-                    </div>
-                  </div>
-                </div>
-              </div>
-              {reviewLoading ? (
-                <>
-                  <div className="space-y-4">
-                    {Array.from({ length: 4 }).map((_, index) => (
-                      <div key={index} className="animate-pulse rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
-                        <div className="mb-4 h-3 w-24 rounded bg-[#111111]" />
-                        <div className="mb-3 h-6 w-3/4 rounded bg-[#111111]" />
-                        <div className="h-10 w-full rounded bg-[#111111]" />
-                      </div>
-                    ))}
-                  </div>
-                  <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6 text-sm text-zinc-400">
-                    Building the deployment questionnaire from repository analysis...
-                  </div>
-                </>
-              ) : review ? (
-                <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
-                  <div className="space-y-6">
-                    <div className="grid gap-4 md:grid-cols-3">
-                      <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-5">
-                        <div className="text-xs font-semibold tracking-wide text-zinc-500">Repository</div>
-                        <div className="mt-2 text-sm font-medium text-zinc-100">{selectedProject?.name || 'Unknown project'}</div>
-                        <div className="mt-2 text-xs text-zinc-500">{String(repoContext?.language?.runtime || 'Unknown runtime')}</div>
-                      </div>
-                      <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-5">
-                        <div className="text-xs font-semibold tracking-wide text-zinc-500">Detected Stack</div>
-                        <div className="mt-2 text-sm text-zinc-200">
-                          {analysisFrameworkNames.length > 0 ? analysisFrameworkNames.join(' / ') : 'Frameworks not detected'}
-                        </div>
-                        <div className="mt-2 text-xs text-zinc-500">
-                          {analysisDataStoreNames.length > 0 ? `Data: ${analysisDataStoreNames.join(', ')}` : 'No managed datastore detected'}
-                        </div>
-                      </div>
-                      <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-5">
-                        <div className="text-xs font-semibold tracking-wide text-zinc-500">Question Scope</div>
-                        <div className="mt-2 text-sm text-zinc-200">{reviewQuestions.length} total questions</div>
-                        <div className="mt-2 text-xs text-zinc-500">{optionalQuestionCount} optional</div>
-                      </div>
-                    </div>
-
-                    {groupedQuestions.map(([category, questions]) => (
-                      <section key={category} className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
-                        <div className="mb-5 flex items-center justify-between gap-4">
-                          <div>
-                            <div className="text-xs font-semibold tracking-wide text-zinc-500">{category}</div>
-                            <div className="mt-1 text-sm text-zinc-400">
-                              {questions.filter((question) => String(answers[question.id] || '').trim()).length}/{questions.length} answered
-                            </div>
-                          </div>
-                          <div className="h-2 w-28 overflow-hidden rounded-full bg-[#111111]">
-                            <div
-                              className="h-full rounded-full bg-indigo-500"
-                              style={{
-                                width: `${Math.round((questions.filter((question) => String(answers[question.id] || '').trim()).length / Math.max(questions.length, 1)) * 100)}%`,
-                              }}
-                            />
-                          </div>
-                        </div>
-
-                        <div className="space-y-4">
-                          {questions.map((question, index) => {
-                            const answer = String(answers[question.id] || '').trim();
-                            const suggested = String(question.default || '').trim();
-                            const isRequired = question.required !== false;
-                            const isNext = nextRequiredQuestion?.id === question.id;
-                            return (
-                              <div
-                                key={question.id}
-                                className={`rounded-2xl border p-5 transition-colors ${
-                                  isNext
-                                    ? 'border-indigo-500/40 bg-indigo-500/5'
-                                    : answer
-                                      ? 'border-zinc-700 bg-zinc-800/50'
-                                      : 'border-[#1A1A1A] bg-black/40'
-                                }`}
-                              >
-                                <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
-                                  <div>
-                                    <div className="mb-2 flex flex-wrap items-center gap-2">
-                                      <span className="rounded-full border border-[#262626] bg-[#111111] px-2.5 py-1 text-xs font-semibold tracking-wide text-zinc-500">
-                                        Question {index + 1}
-                                      </span>
-                                      <span
-                                        className={`rounded-full border px-2.5 py-1 text-xs font-semibold tracking-wide ${
-                                          isRequired
-                                            ? 'border-amber-500/20 bg-amber-500/10 text-amber-300'
-                                            : 'border-zinc-700 bg-[#111111] text-zinc-500'
-                                        }`}
-                                      >
-                                        {isRequired ? 'Required' : 'Optional'}
-                                      </span>
-                                      {isNext ? (
-                                        <span className="rounded-full border border-indigo-500/20 bg-indigo-500/10 px-2.5 py-1 text-xs font-semibold tracking-wide text-indigo-300">
-                                          Next
-                                        </span>
-                                      ) : null}
-                                    </div>
-                                    <h2 className="text-base font-medium leading-relaxed text-zinc-100">{question.question}</h2>
-                                  </div>
-                                  {answer ? (
-                                    <div className="inline-flex items-center gap-2 rounded-full border border-zinc-700 bg-zinc-800/50 px-3 py-1 text-xs font-medium text-zinc-200">
-                                      <CheckCircle2 className="h-3.5 w-3.5" />
-                                      Answered
-                                    </div>
-                                  ) : null}
-                                </div>
-
-                                {Array.isArray(question.options) && question.options.length > 0 ? (
-                                  <div className="grid gap-3 md:grid-cols-2">
-                                    {question.options.map((option) => {
-                                      const selected = answer === option.value;
-                                      const suggestedOption = !answer && suggested === option.value;
-                                      return (
-                                        <button
-                                          key={option.value}
-                                          type="button"
-                                          onClick={() => updateAnswer(question.id, option.value)}
-                                          className={`rounded-xl border px-4 py-3 text-left transition-colors ${
-                                            selected
-                                              ? 'border-indigo-500 bg-indigo-500/10 text-white'
-                                              : 'border-[#262626] bg-[#050505] text-zinc-300 hover:border-[#3f3f46] hover:bg-[#0A0A0A]'
-                                          }`}
-                                        >
-                                          <div className="flex items-start justify-between gap-3">
-                                            <div>
-                                              <div className="text-sm font-medium">{option.label}</div>
-                                              {option.description ? (
-                                                <div className="mt-1 text-xs leading-relaxed text-zinc-500">{option.description}</div>
-                                              ) : null}
-                                            </div>
-                                            {selected ? (
-                                              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-indigo-300" />
-                                            ) : suggestedOption ? (
-                                              <span className="rounded-full border border-zinc-700 px-2 py-0.5 text-xs uppercase tracking-widest text-zinc-500">
-                                                Suggested
-                                              </span>
-                                            ) : null}
-                                          </div>
-                                        </button>
-                                      );
-                                    })}
-                                  </div>
-                                ) : (
-                                  <div className="space-y-3">
-                                    <input
-                                      value={answer}
-                                      onChange={(event) => updateAnswer(question.id, event.target.value)}
-                                      placeholder={questionInputPlaceholder(question.id, question.default)}
-                                      className="w-full rounded-xl border border-[#262626] bg-[#050505] px-4 py-3 text-sm text-zinc-200 outline-none transition-colors placeholder:text-zinc-600 focus:border-indigo-500/50"
-                                    />
-                                    {suggested ? (
-                                      <div className="text-xs text-zinc-500">
-                                        Suggested default: <span className="font-mono text-zinc-300">{suggested}</span>
-                                      </div>
-                                    ) : null}
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </section>
-                    ))}
-                  </div>
-
-                  <div className="space-y-4 lg:sticky lg:top-8 lg:self-start">
-                    <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
-                      <div className="mb-4 text-xs font-semibold tracking-wide text-zinc-500">Readiness</div>
-                      <div className="mb-3 text-3xl font-semibold text-zinc-100">{reviewCompletionPercent}%</div>
-                      <div className="h-2 overflow-hidden rounded-full bg-[#111111]">
-                        <div className="h-full rounded-full bg-indigo-500" style={{ width: `${reviewCompletionPercent}%` }} />
-                      </div>
-                      <div className="mt-4 space-y-2 text-xs text-zinc-400">
-                        <div>Required answered: <span className="font-mono text-zinc-200">{answeredRequiredCount}/{requiredQuestions.length || 0}</span></div>
-                        <div>Total answered: <span className="font-mono text-zinc-200">{answeredQuestionCount}/{reviewQuestions.length || 0}</span></div>
-                        {nextRequiredQuestion ? (
-                          <div>Next question: <span className="text-zinc-200">{nextRequiredQuestion.question}</span></div>
-                        ) : (
-                          <div className="text-zinc-200">All required deployment questions are complete.</div>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
-                      <div className="mb-4 text-xs font-semibold tracking-wide text-zinc-500">Repository Signal</div>
-                      <div className="space-y-3 text-sm text-zinc-300">
-                        <div>
-                          <div className="text-zinc-500">Workspace</div>
-                          <div className="mt-1 font-mono text-xs text-zinc-200">{review.context_json.workspace}</div>
-                        </div>
-                        <div>
-                          <div className="text-zinc-500">Runtime</div>
-                          <div className="mt-1 text-zinc-200">{String(repoContext?.language?.runtime || 'Unknown')}</div>
-                        </div>
-                        <div>
-                          <div className="text-zinc-500">Build Command</div>
-                          <div className="mt-1 font-mono text-xs text-zinc-200">{String(repoContext?.build?.build_command || 'not detected')}</div>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-6">
-                      <div className="mb-4 text-xs font-semibold tracking-wide text-zinc-500">What Happens Next</div>
-                      <div className="space-y-2 text-sm text-zinc-400">
-                        <div>1. Generate AWS architecture and cost estimate.</div>
-                        <div>2. Review architecture and cost.</div>
-                        <div>3. Generate Terraform and continue to deployment.</div>
-                      </div>
-                      <button
-                        onClick={() => void generatePlan().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to generate deployment profile.'))}
-                        disabled={!allQuestionsAnswered}
-                        className="mt-6 flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-[#111111] disabled:text-zinc-500"
-                      >
-                        Generate Architecture & Cost
-                        <ArrowRight className="h-4 w-4" />
-                      </button>
-                      {!allQuestionsAnswered ? (
-                        <div className="mt-3 text-xs text-zinc-500">
-                          Finish the required questions to unlock the plan.
-                        </div>
-                      ) : null}
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="rounded-2xl border border-[#1A1A1A] bg-[#050505] p-8 text-sm text-zinc-400">
-                  The deployment questionnaire could not be loaded. Return to repository analysis and retry.
-                </div>
-              )}
-            </div>
+                </Panel>
+              </StageShell>
             )
           )}
+
+          {activeStage === 'qa' && qaLiveConsultantView}
           {activeStage === 'architecture' && (
-            <div className="mx-auto max-w-6xl space-y-6">
+            <StageShell stageKey="architecture" hasActionBar width="wide">
               <StageHeader
-                title="Architecture"
-                description={`Approved ${currentInfraConsultant?.selected_tier || 'recommended'} setup for ${decisionDiagram.awsRegion}.`}
-                actions={(
-                  <button
-                    onClick={() => setAndPersistStage('cost_estimation')}
-                    disabled={!decisionForVisualization}
-                    className={primaryButtonClass(!decisionForVisualization)}
-                  >
-                    Continue to Cost
-                    <ArrowRight className="h-4 w-4" />
-                  </button>
-                )}
+                eyebrow="Stage 03 · Architecture"
+                title="Proposed topology"
+                description="Visualized from the approved planning decision. Nodes and edges reflect the stack that will be priced and generated next."
+                meta={
+                  <>
+                    <MetaChip
+                      label="region"
+                      value={String(decisionDiagram.awsRegion || 'pending')}
+                      tone={decisionDiagram.awsRegion ? 'accent' : 'neutral'}
+                    />
+                    <MetaChip
+                      label="nodes"
+                      value={String(decisionDiagram.nodes.length)}
+                    />
+                  </>
+                }
               />
-              <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-                <Surface className="xl:col-span-2" padded={false}>
-                  <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
-                    <div>
-                      <div className="text-sm font-semibold text-zinc-100">Topology</div>
-                      <div className="mt-1 text-xs text-zinc-500">
-                        {decisionDiagram.components.length > 0
-                          ? decisionDiagram.components.map((item) => formatComponentName(item)).join(' · ')
-                          : 'Waiting for an approved decision'}
-                      </div>
-                    </div>
-                  </div>
+              <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+                <Panel className="xl:col-span-2" padded={false} elevation="base" glow={decisionDiagram.nodes.length > 0}>
+                  <PanelHeader
+                    title="Topology"
+                    subtitle={
+                      decisionDiagram.components.length > 0
+                        ? decisionDiagram.components.map((item) => formatComponentName(item)).join(' · ')
+                        : 'Waiting for a planning decision'
+                    }
+                    tone="accent"
+                  />
                   <div className="p-4">
-                    {decisionDiagram.nodes.length > 0 ? decisionDiagramCanvas : (
-                      <div className="rounded-xl border border-dashed border-white/10 bg-[#0c0c0e] px-6 py-16 text-center text-sm text-zinc-500">
-                        Approve a consultant decision to see the topology.
-                      </div>
+                    {decisionDiagram.nodes.length > 0 ? (
+                      <div className="overflow-hidden rounded-xl dw-panel-recessed">{decisionDiagramCanvas}</div>
+                    ) : (
+                      <EmptyState
+                        icon={<Server className="h-5 w-5" />}
+                        title="Continue from Planning to see topology"
+                        description="The architecture diagram appears after you continue from the proposed plan."
+                      />
                     )}
                   </div>
-                </Surface>
-                <div className="space-y-6">
-                  <Surface>
-                    <SurfaceLabel>Stack</SurfaceLabel>
+                </Panel>
+                <div className="space-y-5">
+                  <Panel>
+                    <SectionLabel>Stack</SectionLabel>
                     {decisionDiagram.components.length > 0 ? (
                       <div className="flex flex-wrap gap-2">
                         {decisionDiagram.components.map((item, index) => (
-                          <span
-                            key={`stack-${index}-${item}`}
-                            className="rounded-md border border-white/10 bg-[#16161a] px-2.5 py-1 text-xs text-zinc-200"
-                          >
+                          <Chip key={`stack-${index}-${item}`} mono>
                             {formatComponentName(item)}
-                          </span>
+                          </Chip>
                         ))}
                       </div>
                     ) : (
-                      <div className="text-sm text-zinc-500">No components yet.</div>
+                      <p className="text-[13px] text-[var(--dw-muted)]">No components yet.</p>
                     )}
-                  </Surface>
-                  <Surface>
-                    <SurfaceLabel>Why this shape</SurfaceLabel>
+                  </Panel>
+                  <Panel>
+                    <SectionLabel>Why this shape</SectionLabel>
                     {consultantNotesList.length > 0 ? (
-                      <ul className="space-y-3 text-sm leading-relaxed text-zinc-400">
+                      <ul className="space-y-3 text-[13px] leading-relaxed text-[var(--dw-fg-soft)]">
                         {consultantNotesList.map((note, index) => (
-                          <li key={`note-${index}-${note}`} className="border-l border-white/15 pl-3">{note}</li>
+                          <li key={`note-${index}-${note}`} className="border-l border-[var(--dw-accent-line)] pl-3">
+                            {note}
+                          </li>
                         ))}
                       </ul>
                     ) : (
-                      <div className="text-sm text-zinc-500">
-                        Built from the approved chat decision for this repository.
-                      </div>
+                      <p className="text-[13px] text-[var(--dw-muted)]">
+                        Built from your planning answers for this repository.
+                      </p>
                     )}
-                  </Surface>
+                  </Panel>
                 </div>
               </div>
-            </div>
+              <StickyActionBar hint={decisionForVisualization ? 'Topology locked. Next: price the stack against your budget.' : 'Continue from Planning to lock a setup first.'}>
+                <button
+                  type="button"
+                  onClick={unlockPlanningAnswers}
+                  className={`${secondaryButtonClass(false)} gap-2`}
+                >
+                  <ArrowLeft className="h-4 w-4" />
+                  Change answers
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAndPersistStage('cost_estimation')}
+                  disabled={!decisionForVisualization}
+                  className={primaryButtonClass(!decisionForVisualization)}
+                >
+                  Continue to cost →
+                </button>
+              </StickyActionBar>
+            </StageShell>
           )}
           {activeStage === 'cost_estimation' && (
-            <div className="mx-auto max-w-6xl space-y-6">
+            <StageShell stageKey="cost" hasActionBar width="wide">
               <StageHeader
-                title="Cost Estimation"
+                eyebrow="Stage 04 · Approval"
+                title="Cost estimation"
                 description="Priced from your approved setup. Check the monthly total against your budget before generating infrastructure."
-                actions={(
-                  <div className="flex flex-wrap items-center gap-3">
-                    <button
-                      type="button"
-                      onClick={() => setAndPersistStage('qa')}
-                      className={secondaryButtonClass(false)}
-                    >
-                      <ArrowLeft className="h-4 w-4" />
-                      Go back and make changes
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (!lockDecisionForTerraform()) {
-                          setError('Approve a setup in Questions before generating infrastructure.');
-                          return;
-                        }
-                        setAndPersistStage('terraform');
-                      }}
-                      disabled={!canContinueToTerraform}
-                      className={primaryButtonClass(!canContinueToTerraform)}
-                    >
-                      Continue to Infrastructure
-                      <ArrowRight className="h-4 w-4" />
-                    </button>
-                  </div>
-                )}
               />
               {!decisionCostBasedOnDecision ? (
-                <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
-                  Estimate used safe defaults because decision stack_config was incomplete.
-                </div>
+                <Callout tone="warn" title="Estimate used safe defaults">
+                  Decision stack_config was incomplete, so this price is a conservative fallback.
+                </Callout>
               ) : null}
-              <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-                <Surface className="xl:col-span-2" padded={false}>
-                  <div className="flex items-end justify-between border-b border-white/10 px-5 py-4">
+              <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+                <Panel className="xl:col-span-2" padded={false}>
+                  <div className="flex items-end justify-between border-b border-[var(--dw-border)] px-5 py-4">
                     <div>
-                      <div className="text-sm font-semibold text-zinc-100">Monthly breakdown</div>
-                      <div className="mt-1 text-xs text-zinc-500">{decisionCostVariance}</div>
+                      <div className="text-[13px] font-semibold text-[var(--dw-fg)]">Monthly breakdown</div>
+                      <div className="mt-1 text-[12px] text-[var(--dw-muted)]">{decisionCostVariance}</div>
                     </div>
                     <div className="text-right">
-                      <div className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">Subtotal</div>
-                      <div className="font-mono text-2xl font-semibold text-zinc-50">${decisionCostSubtotal.toFixed(2)}</div>
+                      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--dw-faint)]">Subtotal</div>
+                      <div className="mt-1 font-mono text-[26px] font-semibold tracking-tight text-[var(--dw-fg)]">
+                        {decisionCostLoading ? (
+                          <Skeleton className="ml-auto h-7 w-24" />
+                        ) : (
+                          <CountUp value={decisionCostSubtotal} prefix="$" />
+                        )}
+                      </div>
                     </div>
                   </div>
                   <div className="p-5">
                     {decisionCostLoading ? (
-                      <div className="text-sm text-zinc-500">Fetching AWS public pricing data...</div>
+                      <div className="space-y-2.5">
+                        <Skeleton className="h-8 w-full" />
+                        <Skeleton className="h-8 w-full" />
+                        <Skeleton className="h-8 w-5/6" />
+                      </div>
                     ) : decisionCostRows.length > 0 ? (
-                      <table className="w-full text-sm">
+                      <table className="w-full text-[13px]">
                         <thead>
-                          <tr className="border-b border-white/10 text-left text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">
-                            <th className="px-2 py-3">Component</th>
-                            <th className="px-2 py-3">Hourly</th>
-                            <th className="px-2 py-3">Monthly</th>
+                          <tr className="border-b border-[var(--dw-border)] text-left font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--dw-faint)]">
+                            <th className="px-2 py-3 font-medium">Component</th>
+                            <th className="px-2 py-3 font-medium">Hourly</th>
+                            <th className="px-2 py-3 font-medium">Monthly</th>
                           </tr>
                         </thead>
                         <tbody>
                           {decisionCostRows.map((row) => (
-                            <tr key={`${row.component}-${row.label}`} className="border-b border-white/5">
-                              <td className="px-2 py-3 text-zinc-200">{formatCostComponentLabel(row.component, row.label)}</td>
-                              <td className="px-2 py-3 font-mono text-zinc-400">${Number(row.hourly_usd || 0).toFixed(4)}</td>
-                              <td className="px-2 py-3 font-mono text-zinc-100">${Number(row.monthly_usd || 0).toFixed(2)}</td>
+                            <tr key={`${row.component}-${row.label}`} className="border-b border-[var(--dw-border)] last:border-0">
+                              <td className="px-2 py-3 text-[var(--dw-fg-soft)]">{formatCostComponentLabel(row.component, row.label)}</td>
+                              <td className="px-2 py-3 font-mono text-[var(--dw-muted)]">${Number(row.hourly_usd || 0).toFixed(4)}</td>
+                              <td className="px-2 py-3 font-mono text-[var(--dw-fg)]">${Number(row.monthly_usd || 0).toFixed(2)}</td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
                     ) : (
-                      <div className="text-sm text-zinc-500">{decisionCostError || 'Cost estimation is not available yet.'}</div>
+                      <EmptyState
+                        title="No estimate yet"
+                        description={decisionCostError || 'Cost estimation is not available yet.'}
+                      />
                     )}
                   </div>
-                </Surface>
-                <div className="space-y-6">
-                  <Surface>
-                    <SurfaceLabel>Budget fit</SurfaceLabel>
-                    <div className="space-y-2 text-sm text-zinc-300">
-                      <div>Cap: <span className="font-mono text-zinc-100">${Number(currentInfraConsultant?.budget_cap_usd || costEstimate.cap).toFixed(2)}</span></div>
-                      <div>Estimate: <span className="font-mono text-zinc-100">${Number(decisionCostEstimate?.subtotal_monthly_usd || costEstimate.total).toFixed(2)}</span></div>
-                      <div className="text-xs text-zinc-500">
-                        {Number(decisionCostEstimate?.subtotal_monthly_usd || costEstimate.total) <= Number(currentInfraConsultant?.budget_cap_usd || costEstimate.cap)
-                          ? 'This setup fits the approved budget.'
-                          : `Over budget by $${Math.max(0, Number(decisionCostEstimate?.subtotal_monthly_usd || costEstimate.total) - Number(currentInfraConsultant?.budget_cap_usd || costEstimate.cap)).toFixed(2)}/mo.`}
-                      </div>
-                    </div>
-                  </Surface>
-                  <Surface>
-                    <SurfaceLabel>Need a different setup?</SurfaceLabel>
-                    <p className="mb-3 text-xs leading-relaxed text-zinc-500">
+                </Panel>
+                <div className="space-y-5">
+                  <Panel
+                    glow={Number(decisionCostEstimate?.subtotal_monthly_usd || costEstimate.total) > Number(currentInfraConsultant?.budget_cap_usd || costEstimate.cap)}
+                  >
+                    <SectionLabel>Budget fit</SectionLabel>
+                    <KeyValueRow
+                      label="Cap"
+                      value={`$${Number(currentInfraConsultant?.budget_cap_usd || costEstimate.cap).toFixed(2)}`}
+                    />
+                    <KeyValueRow
+                      label="Estimate"
+                      value={<CountUp value={Number(decisionCostEstimate?.subtotal_monthly_usd || costEstimate.total)} prefix="$" />}
+                    />
+                    <p className="mt-3 text-[12px] leading-relaxed text-[var(--dw-muted)]">
+                      {Number(decisionCostEstimate?.subtotal_monthly_usd || costEstimate.total) <= Number(currentInfraConsultant?.budget_cap_usd || costEstimate.cap)
+                        ? 'This setup fits the approved budget.'
+                        : `Over budget by $${Math.max(0, Number(decisionCostEstimate?.subtotal_monthly_usd || costEstimate.total) - Number(currentInfraConsultant?.budget_cap_usd || costEstimate.cap)).toFixed(2)}/mo.`}
+                    </p>
+                  </Panel>
+                  <Panel>
+                    <SectionLabel>Need a different setup?</SectionLabel>
+                    <p className="mb-3 text-[12px] leading-relaxed text-[var(--dw-muted)]">
                       Go back to the advisor to change services, sizes, or budget, then re-approve before continuing.
                     </p>
                     <button
                       type="button"
-                      onClick={() => setAndPersistStage('qa')}
-                      className={`${secondaryButtonClass(false)} w-full`}
+                      onClick={unlockPlanningAnswers}
+                      className={`${secondaryButtonClass(false)} w-full gap-2`}
                     >
                       <ArrowLeft className="h-4 w-4" />
                       Go back and make changes
                     </button>
-                  </Surface>
-                  <Surface>
-                    <SurfaceLabel>Ready for infrastructure</SurfaceLabel>
-                    <div className="space-y-2 text-xs text-zinc-400">
-                      <div>Budget cap: <span className="font-mono text-zinc-200">${effectiveBudgetCap.toFixed(2)}</span></div>
-                      <div>Estimate total: <span className="font-mono text-zinc-200">${effectiveCostTotal.toFixed(2)}</span></div>
-                      <div className="text-zinc-300">
-                        {canContinueToTerraform
-                          ? 'You can continue to generate Terraform from this estimate.'
-                          : 'Approve a setup in Questions first, then return here.'}
-                      </div>
-                    </div>
-                  </Surface>
+                  </Panel>
+                  <Panel>
+                    <SectionLabel>Ready for infrastructure</SectionLabel>
+                    <KeyValueRow label="Budget cap" value={`$${effectiveBudgetCap.toFixed(2)}`} />
+                    <KeyValueRow label="Estimate total" value={`$${effectiveCostTotal.toFixed(2)}`} />
+                    <p className="mt-3 text-[12px] text-[var(--dw-fg-soft)]">
+                      {canContinueToTerraform
+                        ? 'You can continue to generate Terraform from this estimate.'
+                        : 'Continue from Planning first, then return here.'}
+                    </p>
+                  </Panel>
                 </div>
               </div>
-            </div>
+              <StickyActionBar hint={canContinueToTerraform ? 'Estimate accepted. Next: generate Terraform from this decision.' : 'Continue from Planning before generating infrastructure.'}>
+                <button
+                  type="button"
+                  onClick={unlockPlanningAnswers}
+                  className={`${secondaryButtonClass(false)} gap-2`}
+                >
+                  <ArrowLeft className="h-4 w-4" />
+                  Make changes
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!lockDecisionForTerraform()) {
+                      setError('Continue from Planning before generating infrastructure.');
+                      return;
+                    }
+                    setAndPersistStage('terraform');
+                  }}
+                  disabled={!canContinueToTerraform}
+                  className={primaryButtonClass(!canContinueToTerraform)}
+                >
+                  Continue to infrastructure
+                  <ArrowRight className="h-4 w-4" />
+                </button>
+              </StickyActionBar>
+            </StageShell>
           )}
           {activeStage === 'terraform' && (
-            <div className="mx-auto flex max-w-6xl flex-col gap-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h1 className="mb-1 text-2xl font-semibold text-zinc-100">Infrastructure Generation</h1>
-                  <p className="text-sm text-zinc-400">Repo-specific Terraform generation runs here from the confirmed consultant decision.</p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={() => {
-                      resetCurrentIacSessionArtifacts();
-                      void generateTerraform().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Infrastructure generation failed.'));
-                    }}
-                    disabled={terraformGenerating || !approvedConsultantDecision}
-                    className="rounded-md border border-[#262626] bg-[#111111] px-5 py-2 text-sm font-semibold text-zinc-200 hover:bg-[#181818] disabled:bg-[#111111] disabled:text-zinc-500"
-                  >
-                    {terraformGenerating ? 'Generating...' : 'Regenerate'}
-                  </button>
-                  <button
-                    onClick={() => void createIacPr()}
-                    disabled={terraformGenerating || iacPrCreating || deployableIacFiles.length === 0 || Boolean(iacPrUrl)}
-                    className="rounded-md border border-zinc-700 bg-zinc-800/50 px-5 py-2 text-sm font-semibold text-zinc-200 hover:bg-zinc-800/50 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500"
-                  >
-                    {iacPrUrl ? 'PR ready' : iacPrCreating ? 'Creating PR...' : 'Create PR'}
-                  </button>
-                  {iacPrUrl ? (
+            <StageShell stageKey="terraform" hasActionBar width="wide">
+              <StageHeader
+                eyebrow="Stage 05 · Terraform"
+                title="Infrastructure generation"
+                description="Deterministic Terraform generation from the locked planning profile."
+                meta={
+                  <>
+                    <MetaChip label="files" value={String(iacFiles.length)} />
+                    <MetaChip
+                      label="ws"
+                      value={deploySocketState}
+                      tone={deploySocketState === 'connected' ? 'ok' : deploySocketState === 'error' ? 'warn' : 'neutral'}
+                    />
+                    <StatusPill tone={terraformGenerating ? 'info' : hasSuccessfulGeneration ? 'ok' : 'neutral'} live={terraformGenerating}>
+                      {terraformGenerating ? 'Generating' : terraformRunLabel}
+                    </StatusPill>
+                  </>
+                }
+                actions={
+                  <div className="flex flex-wrap items-center gap-2">
                     <button
-                      onClick={() => window.open(iacPrUrl, '_blank', 'noopener,noreferrer')}
-                      className="flex items-center gap-2 rounded-md border border-[#262626] bg-[#111111] px-5 py-2 text-sm font-semibold text-zinc-200 hover:bg-[#181818]"
+                      onClick={() => {
+                        resetCurrentIacSessionArtifacts();
+                        void generateTerraform().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Infrastructure generation failed.'));
+                      }}
+                      disabled={terraformGenerating || !(approvedConsultantDecision || deploymentProfile)}
+                      className={buttonClass('secondary', { disabled: terraformGenerating || !approvedConsultantDecision })}
                     >
-                      <ExternalLink className="h-4 w-4" />
-                      Open PR
+                      {terraformGenerating ? 'Generating…' : 'Regenerate'}
                     </button>
-                  ) : null}
-                  <button
-                    onClick={async () => {
-                      if (!approvedConsultantDecision) return;
-                      if (!hasSuccessfulGeneration) {
-                        await generateTerraform();
-                      }
-                      setAndPersistStage('aws_config', { force: true });
-                    }}
-                    disabled={terraformGenerating || !approvedConsultantDecision}
-                    className="rounded-md bg-zinc-100 px-5 py-2 text-sm font-semibold text-black hover:bg-white disabled:bg-[#111111] disabled:text-zinc-500"
-                  >
-                    {terraformGenerating ? 'Generating...' : hasSuccessfulGeneration ? 'Continue' : 'Generate & Continue'}
-                  </button>
-                </div>
-              </div>
+                    <button
+                      onClick={() => void createIacPr()}
+                      disabled={terraformGenerating || iacPrCreating || deployableIacFiles.length === 0 || Boolean(iacPrUrl)}
+                      className={buttonClass('secondary', { disabled: terraformGenerating || iacPrCreating || deployableIacFiles.length === 0 || Boolean(iacPrUrl) })}
+                    >
+                      {iacPrUrl ? 'PR ready' : iacPrCreating ? 'Creating PR…' : 'Create PR'}
+                    </button>
+                    {iacPrUrl ? (
+                      <button
+                        onClick={() => window.open(iacPrUrl, '_blank', 'noopener,noreferrer')}
+                        className={buttonClass('ghost')}
+                      >
+                        <ExternalLink className="h-4 w-4" />
+                        Open PR
+                      </button>
+                    ) : null}
+                  </div>
+                }
+              />
               {!hasSuccessfulGeneration ? (
-                <div className="rounded-lg border border-zinc-700 bg-zinc-800/50 px-4 py-3 text-xs text-zinc-200">
-                  Terraform stage only shows generation status and artifacts. Use Questions to refine consultant decisions.
-                </div>
+                <Callout tone="info">
+                  This stage shows generation status and artifacts. Use Planning to refine the consultant decision.
+                </Callout>
               ) : null}
-              <div className="grid grid-cols-3 gap-6">
-                <div className="space-y-6">
-                  <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
-                    <div className="mb-2 text-xs font-semibold tracking-wide text-zinc-500">Generator</div>
-                    <div className="text-lg font-semibold text-zinc-100">{terraformRendererSummary.primary}</div>
-                    <div className="mt-1 text-sm text-zinc-400">{terraformRendererSummary.secondary}</div>
-                    <div className="mt-3 space-y-2 text-xs text-zinc-500">
-                      <div>Runtime: <span className="font-mono text-zinc-300">{terraformRendererSummary.runtime}</span></div>
-                      <div>Status: <span className="font-mono text-zinc-300">{terraformRunLabel}</span></div>
-                      <div>Run ID: <span className="font-mono text-zinc-300">{shouldUseSavedRunForDeploy ? activeSavedRun?.run_id : (hasCurrentIacMeta ? 'bundle-only' : 'pending')}</span></div>
-                      <div>Workspace: <span className="font-mono text-zinc-300">{(shouldUseSavedRunForDeploy ? activeSavedRun?.workspace : savedIacMeta?.workspace) || expectedWorkspace || 'pending'}</span></div>
-                      <div>Files: <span className="font-mono text-zinc-300">{iacFiles.length}</span></div>
-                      <div>Socket: <span className={`font-mono ${deploySocketState === 'connected' ? 'text-zinc-200' : deploySocketState === 'connecting' ? 'text-zinc-200' : deploySocketState === 'error' ? 'text-amber-400' : 'text-zinc-300'}`}>{deploySocketState}</span></div>
+              <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+                <div className="space-y-5">
+                  <Panel glow={terraformGenerating}>
+                    <SectionLabel>Generator</SectionLabel>
+                    <div className="text-[16px] font-semibold text-[var(--dw-fg)]">{terraformRendererSummary.primary}</div>
+                    <div className="mt-1 text-[13px] text-[var(--dw-muted)]">{terraformRendererSummary.secondary}</div>
+                    <div className="mt-3">
+                      <KeyValueRow label="Runtime" value={terraformRendererSummary.runtime} />
+                      <KeyValueRow label="Status" value={terraformRunLabel} />
+                      <KeyValueRow label="Run ID" value={shouldUseSavedRunForDeploy ? activeSavedRun?.run_id : (hasCurrentIacMeta ? 'bundle-only' : 'pending')} />
+                      <KeyValueRow label="Workspace" value={(shouldUseSavedRunForDeploy ? activeSavedRun?.workspace : savedIacMeta?.workspace) || expectedWorkspace || 'pending'} />
+                      <KeyValueRow label="Files" value={String(iacFiles.length)} />
                     </div>
                     {socketNotices.length > 0 ? (
                       <div className="mt-4 space-y-2">
-                        <div className="text-xs font-semibold tracking-wide text-zinc-500">Connection Notices</div>
+                        <SectionLabel>Connection notices</SectionLabel>
                         {socketNotices.map((notice) => (
-                          <div key={notice.key} className={`rounded-md border px-3 py-2 text-xs ${notice.tone === 'error' ? 'border-amber-500/20 bg-amber-500/10 text-amber-200' : 'border-zinc-700 bg-zinc-800/50 text-zinc-200'}`}>
-                            <div>{notice.text}</div>
-                            <div className="mt-1 font-mono text-xs opacity-70">{notice.ts}</div>
-                          </div>
+                          <Callout key={notice.key} tone={notice.tone === 'error' ? 'warn' : 'info'} title={notice.text}>
+                            <span className="font-mono text-[11px]">{notice.ts}</span>
+                          </Callout>
                         ))}
                       </div>
                     ) : null}
                     {sessionIacTruncated ? (
-                      <div className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
-                        This cached generation preview is truncated. Regenerate before creating a PR or deploying from session files.
-                      </div>
+                      <Callout tone="warn" className="mt-4" title="Truncated preview">
+                        Regenerate before creating a PR or deploying from session files.
+                      </Callout>
                     ) : null}
                     {iacPrUrl ? (
-                      <div className="mt-4 rounded-md border border-zinc-700 bg-zinc-800/50 p-3 text-xs text-zinc-200">
+                      <Callout tone="ok" className="mt-4">
                         Pull request creation is available and does not block AWS Config or deploy readiness.
-                      </div>
+                      </Callout>
                     ) : null}
-                  </div>
-                  <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-5">
-                    <div className="mb-3 text-xs font-semibold tracking-wide text-zinc-500">Workers</div>
-                    <div className="space-y-2 text-xs">
+                  </Panel>
+                  <Panel>
+                    <SectionLabel>Workers</SectionLabel>
+                    <div className="space-y-2">
                       {terraformWorkerStates.length > 0 ? terraformWorkerStates.map((worker) => (
-                        <div key={worker.worker_id} className="rounded-md border border-[#1A1A1A] bg-black px-3 py-2">
-                          <div className="flex items-center justify-between gap-3">
-                            <div>
-                              <div className="font-medium text-zinc-200">{worker.worker_role || worker.worker_id}</div>
-                              <div className="font-mono text-sm text-zinc-500">{worker.worker_id}</div>
-                            </div>
-                            <span className={`rounded border px-2 py-0.5 text-xs font-semibold uppercase tracking-widest ${
-                              worker.worker_status === 'completed'
-                                ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200'
-                                : worker.worker_status === 'failed'
-                                  ? 'border-red-500/20 bg-red-500/10 text-red-300'
-                                  : 'border-zinc-700 bg-zinc-800/50 text-zinc-200'
-                            }`}>
-                              {worker.worker_status || 'running'}
-                            </span>
-                          </div>
-                        </div>
-                      )) : (
-                        <div className="text-zinc-500">Only workers whose latest activity is still in terraform generation appear here.</div>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex h-80 flex-col overflow-hidden rounded-lg border border-[#1A1A1A] bg-[#050505]">
-                    <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-black px-4 py-2.5 font-mono text-xs text-zinc-500">
-                      <div className="flex items-center gap-2">
-                        <Terminal className="h-4 w-4 text-zinc-400" />
-                        Generation feed
-                      </div>
-                      <div>{terraformGenerationLogs.length} events</div>
-                    </div>
-                    <div className="custom-scrollbar flex-1 overflow-y-auto bg-black p-4 font-mono text-[12px]">
-                      {terraformGenerationLogs.length > 0 ? terraformGenerationLogs.slice(-40).map((log, index) => (
-                        <div key={`${log.ts}-${index}`} className="mb-2 flex gap-3">
-                          <span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span>
+                        <div key={worker.worker_id} className={`flex items-center justify-between gap-3 ${paperInsetClass} px-3 py-2.5`}>
                           <div className="min-w-0">
-                            <div className="mb-1 flex flex-wrap items-center gap-2">
-                              {log.worker_id && <span className="rounded border border-[#262626] bg-[#111111] px-2 py-0.5 text-xs uppercase tracking-widest text-zinc-400">{log.worker_id}</span>}
-                              {log.worker_status && <span className={`rounded border px-2 py-0.5 text-xs uppercase tracking-widest ${
-                                log.worker_status === 'completed'
-                                  ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200'
-                                  : log.worker_status === 'failed'
-                                    ? 'border-red-500/20 bg-red-500/10 text-red-300'
-                                    : 'border-zinc-700 bg-zinc-800/50 text-zinc-200'
-                              }`}>{log.worker_status}</span>}
-                              {log.model && <span className="font-mono text-xs text-zinc-600">{log.model}</span>}
-                            </div>
-                            <div className={log.type === 'success' ? 'font-medium text-zinc-200' : log.type === 'error' ? 'text-red-400' : 'text-zinc-300'}>{log.text}</div>
+                            <div className="truncate text-[13px] font-medium text-[var(--dw-fg)]">{worker.worker_role || worker.worker_id}</div>
+                            <div className="font-mono text-[11px] text-[var(--dw-muted)]">{worker.worker_id}</div>
                           </div>
+                          <StatusPill
+                            tone={worker.worker_status === 'completed' ? 'ok' : worker.worker_status === 'failed' ? 'danger' : 'info'}
+                            live={worker.worker_status !== 'completed' && worker.worker_status !== 'failed'}
+                          >
+                            {worker.worker_status || 'running'}
+                          </StatusPill>
                         </div>
                       )) : (
-                        <div className="text-zinc-500">{hasSuccessfulGeneration ? 'Generation already succeeded for this workspace. Regenerate to start a new attempt.' : 'The generation feed will populate as soon as live terraform-generation events arrive.'}</div>
+                        <p className="text-[12.5px] text-[var(--dw-muted)]">Only workers whose latest activity is still in terraform generation appear here.</p>
                       )}
                     </div>
-                  </div>
-                </div>
-                <div className="col-span-2 flex gap-6">
-                  <div className="custom-scrollbar h-130 w-64 shrink-0 overflow-y-auto rounded-lg border border-[#1A1A1A] bg-[#050505] p-3 text-sm">
-                    {iacFiles.map((file) => (
-                      <button
-                        key={file.path}
-                        onClick={() => setSelectedFile(file.path)}
-                        className={`mb-2 block w-full rounded px-2 py-1 text-left ${activeIacFilePath === file.path ? 'bg-[#111111] text-zinc-200' : 'text-zinc-300 hover:bg-[#111111]'}`}
-                      >
-                        {file.path}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="flex h-130 flex-1 flex-col rounded-lg border border-[#1A1A1A] bg-[#050505]">
-                    <div className="flex items-center justify-between border-b border-[#1A1A1A] bg-black px-4 py-2.5">
-                      <div className="font-mono text-sm text-zinc-400">{activeIacFilePath || 'Generated files'}</div>
-                      <div className="text-xs font-semibold tracking-wide text-zinc-500">Editable</div>
+                  </Panel>
+                  <Panel padded={false}>
+                    <PanelHeader
+                      title="Generation feed"
+                      icon={<Terminal className="h-3.5 w-3.5" />}
+                      tone="info"
+                      actions={<span className="font-mono text-[10px] text-[var(--dw-faint)]">{terraformGenerationLogs.length} events</span>}
+                    />
+                    <div className="p-3">
+                      <LogConsole
+                        lines={terraformGenerationLogs.slice(-40).map((log) => ({
+                          text: [log.worker_id, log.worker_status, log.text].filter(Boolean).join(' · '),
+                          tone: log.type === 'error' ? 'danger' : log.type === 'success' ? 'ok' : 'neutral',
+                        }))}
+                        streaming={terraformGenerating}
+                        emptyLabel={hasSuccessfulGeneration ? 'Generation already succeeded for this workspace. Regenerate to start a new attempt.' : 'The generation feed will populate as soon as live terraform-generation events arrive.'}
+                        maxHeight="20rem"
+                      />
                     </div>
-                    <textarea
-                      value={(iacFiles.find((file) => file.path === activeIacFilePath) || iacFiles[0])?.content || ''}
-                      onChange={(event) => {
+                  </Panel>
+                </div>
+                <div className="flex min-w-0 gap-4 xl:col-span-2">
+                  <Panel padded="sm" className="dw-scrollbar h-[32.5rem] w-72 min-w-0 shrink-0 overflow-y-auto overflow-x-hidden">
+                    <SectionLabel>Files</SectionLabel>
+                    {iacFiles.length === 0 ? (
+                      <p className="px-1 text-[12px] text-[var(--dw-muted)]">Waiting for generated files…</p>
+                    ) : (
+                      iacFiles.map((file) => {
+                        const { dir, name } = splitIacFilePath(file.path);
+                        const selected = activeIacFilePath === file.path;
+                        return (
+                        <button
+                          key={file.path}
+                            type="button"
+                            title={file.path}
+                          onClick={() => setSelectedFile(file.path)}
+                            className={`mb-1 block w-full min-w-0 rounded-none border-[3px] px-2.5 py-1.5 text-left font-mono text-[11.5px] leading-snug transition-colors ${
+                              selected
+                              ? 'border-black bg-black text-white'
+                              : 'border-black bg-white text-black hover:bg-neutral-100'
+                          }`}
+                        >
+                            <span className="block break-all font-medium">{name}</span>
+                            {dir ? (
+                              <span className={`mt-0.5 block break-all text-[10px] ${selected ? 'text-white/70' : 'text-neutral-500'}`}>
+                                {dir}
+                              </span>
+                            ) : null}
+                        </button>
+                        );
+                      })
+                    )}
+                  </Panel>
+                  <div className="min-w-0 flex-1">
+                    <CodeSurface
+                      filename={activeIacFilePath || 'Generated files'}
+                      language="hcl"
+                      code={(iacFiles.find((file) => file.path === activeIacFilePath) || iacFiles[0])?.content || ''}
+                      editable={Boolean(activeIacFilePath)}
+                      onChange={(value) => {
                         if (!activeIacFilePath) return;
-                        updateIacFileContent(activeIacFilePath, event.target.value);
+                        updateIacFileContent(activeIacFilePath, value);
                       }}
-                      disabled={!activeIacFilePath}
-                      placeholder="Generate infrastructure to view and edit files."
-                      spellCheck={false}
-                      className="custom-scrollbar flex-1 resize-none bg-[#050505] p-5 font-mono text-[13px] leading-relaxed text-zinc-300 outline-none"
+                      maxHeight="32.5rem"
                     />
                   </div>
                 </div>
               </div>
-            </div>
+              <StickyActionBar hint={hasSuccessfulGeneration ? 'Bundle ready. Continue to AWS credentials.' : 'Generate Terraform from the approved decision to continue.'}>
+                <button
+                  onClick={async () => {
+                    if (!approvedConsultantDecision && !deploymentProfile) return;
+                    if (!hasSuccessfulGeneration) {
+                      const generated = await generateTerraform();
+                      if (!generated) return;
+                    }
+                    setAndPersistStage('aws_config', { force: true });
+                  }}
+                  disabled={terraformGenerating || !(approvedConsultantDecision || deploymentProfile)}
+                  className={primaryButtonClass(terraformGenerating || !(approvedConsultantDecision || deploymentProfile))}
+                >
+                  {terraformGenerating ? 'Generating…' : hasSuccessfulGeneration ? 'Continue to AWS config' : 'Generate & continue'}
+                </button>
+              </StickyActionBar>
+            </StageShell>
           )}
           {activeStage === 'aws_config' && (
-            <div className="mx-auto max-w-5xl space-y-6">
+            <StageShell stageKey="aws_config" hasActionBar>
               <StageHeader
-                title="AWS Config"
+                eyebrow="Stage 05 · Credentials"
+                title="AWS config"
                 description="Credentials and Terraform runtime for deploy handoff. Temporary ASIA keys require a session token."
               />
-              <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-                <Surface className="space-y-5 xl:col-span-2">
+              <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+                <Panel className="space-y-5 xl:col-span-2" elevation="raised">
                   <div className="space-y-3">
                     <label className="block">
-                      <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">Access key</span>
-                      <input value={aws.aws_access_key_id} onChange={(event) => setAws((prev) => ({ ...prev, aws_access_key_id: event.target.value }))} placeholder="AKIA… or ASIA…" className="w-full rounded-md border border-white/10 bg-[#09090b] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none focus:border-white/25" />
+                      <span className={fieldLabelClass()}>Access key</span>
+                      <input name="aws_access_key_id" value={aws.aws_access_key_id} onChange={(event) => setAws((prev) => ({ ...prev, aws_access_key_id: event.target.value }))} placeholder="AKIA… or ASIA…" className={fieldClass()} autoComplete="off" />
                     </label>
                     <label className="block">
-                      <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">Secret key</span>
-                      <input type="password" value={aws.aws_secret_access_key} onChange={(event) => setAws((prev) => ({ ...prev, aws_secret_access_key: event.target.value }))} placeholder="AWS_SECRET_ACCESS_KEY" className="w-full rounded-md border border-white/10 bg-[#09090b] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none focus:border-white/25" />
+                      <span className={fieldLabelClass()}>Secret key</span>
+                      <input name="aws_secret_access_key" type="password" value={aws.aws_secret_access_key} onChange={(event) => setAws((prev) => ({ ...prev, aws_secret_access_key: event.target.value }))} placeholder="AWS_SECRET_ACCESS_KEY" className={fieldClass()} autoComplete="off" />
                     </label>
                     <label className="block">
-                      <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">
+                      <span className={fieldLabelClass()}>
                         Session token {needsSessionToken ? '(required for ASIA)' : '(optional)'}
                       </span>
-                      <input type="password" value={aws.aws_session_token} onChange={(event) => setAws((prev) => ({ ...prev, aws_session_token: event.target.value }))} placeholder={needsSessionToken ? 'Required for temporary STS credentials' : 'Optional for long-lived AKIA credentials'} className="w-full rounded-md border border-white/10 bg-[#09090b] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none focus:border-white/25" />
+                      <input name="aws_session_token" type="password" value={aws.aws_session_token} onChange={(event) => setAws((prev) => ({ ...prev, aws_session_token: event.target.value }))} placeholder={needsSessionToken ? 'Required for temporary STS credentials' : 'Optional for long-lived AKIA credentials'} className={fieldClass()} autoComplete="off" />
                     </label>
                     <label className="block">
-                      <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">Region</span>
-                      <input value={terraformRuntimeConfig.aws_region} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, aws_region: event.target.value }))} placeholder="eu-north-1" className="w-full rounded-md border border-white/10 bg-[#09090b] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none focus:border-white/25" />
+                      <span className={fieldLabelClass()}>Region</span>
+                      <input name="aws_region" value={terraformRuntimeConfig.aws_region} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, aws_region: event.target.value }))} placeholder="eu-north-1" className={fieldClass()} />
                     </label>
                     <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                       <label className="block">
-                        <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">State bucket</span>
-                        <input value={terraformRuntimeConfig.state_bucket} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, state_bucket: event.target.value }))} placeholder="optional" className="w-full rounded-md border border-white/10 bg-[#09090b] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none focus:border-white/25" />
+                        <span className={fieldLabelClass()}>State bucket</span>
+                        <input name="state_bucket" value={terraformRuntimeConfig.state_bucket} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, state_bucket: event.target.value }))} placeholder="optional" className={fieldClass()} />
                       </label>
                       <label className="block">
-                        <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">Lock table</span>
-                        <input value={terraformRuntimeConfig.lock_table} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, lock_table: event.target.value }))} placeholder="optional" className="w-full rounded-md border border-white/10 bg-[#09090b] px-4 py-2.5 font-mono text-sm text-zinc-200 outline-none focus:border-white/25" />
+                        <span className={fieldLabelClass()}>Lock table</span>
+                        <input name="lock_table" value={terraformRuntimeConfig.lock_table} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, lock_table: event.target.value }))} placeholder="optional" className={fieldClass()} />
                       </label>
                     </div>
                   </div>
                   {hasAwsSecrets && !canContinueToAwsConfig && (
-                    <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-                      Infrastructure generation is required before deploying. Complete the Infrastructure Generation step first.
-                    </div>
+                    <Callout tone="warn">
+                      Infrastructure generation is required before deploying. Complete the Terraform step first.
+                    </Callout>
                   )}
                   {needsSessionToken && !aws.aws_session_token.trim() && (
-                    <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                    <Callout tone="warn">
                       This access key starts with ASIA. Provide AWS_SESSION_TOKEN or STS GetCallerIdentity will fail.
-                    </div>
+                    </Callout>
                   )}
-                  <div className="rounded-md border border-white/10 bg-[#111113] px-3 py-2 text-[11px] leading-relaxed text-zinc-400">
-                    Operator AWS keys are kept in <span className="font-mono text-zinc-300">sessionStorage</span> only
+                  <Callout tone="info">
+                    Operator AWS keys are kept in <span className="font-mono">sessionStorage</span> only
                     (never localStorage), expire after {needsSessionToken ? '1 hour' : '2 hours'}, and are wiped from this browser when the tab closes.
-                  </div>
-                  <div className="flex flex-col gap-3 sm:flex-row">
-                    <button onClick={() => setAndPersistStage('app_secrets')} disabled={!hasAwsSecrets || !canContinueToAwsConfig} className={`${accentButtonClass(!hasAwsSecrets || !canContinueToAwsConfig)} w-full`}>
-                      <Rocket className="h-4 w-4" /> Continue to App Secrets
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        clearSavedAws();
-                        setAws({
-                          aws_access_key_id: '',
-                          aws_secret_access_key: '',
-                          aws_session_token: '',
-                          aws_region: terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION,
-                        });
-                      }}
-                      disabled={!hasAwsSecrets}
-                      className={`${secondaryButtonClass(!hasAwsSecrets)} w-full sm:w-auto whitespace-nowrap`}
-                    >
-                      Clear credentials
-                    </button>
-                  </div>
-                </Surface>
+                  </Callout>
+                </Panel>
                 <div className="space-y-4">
-                  <Surface>
-                    <SurfaceLabel>Runtime Inputs</SurfaceLabel>
-                    <div className="mt-1 space-y-2 text-xs text-zinc-400">
-                      <div>Deploy source: <span className="font-mono text-zinc-200">{shouldUseSavedRunForDeploy ? 'saved run' : 'session files'}</span></div>
-                      <div>Workspace: <span className="font-mono text-zinc-200">{shouldUseSavedRunForDeploy ? (activeSavedRun?.workspace || expectedWorkspace || 'pending') : (expectedWorkspace || 'local session')}</span></div>
-                      {customizationSnapshotId ? (
-                        <div>Customization snapshot: <span className="font-mono text-zinc-200">{customizationSnapshotId}</span></div>
-                      ) : null}
-                      <div>AWS region: <span className="font-mono text-zinc-200">{terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION}</span></div>
-                      <div>Estimated monthly: <span className="font-mono text-zinc-200">${effectiveCostTotal.toFixed(2)}</span></div>
-                      <div>Budget cap: <span className="font-mono text-zinc-200">${effectiveBudgetCap.toFixed(2)}</span></div>
-                    </div>
-                  </Surface>
-                  <div className={`rounded-xl border px-3 py-2 text-xs ${hasAwsSecrets && canContinueToAwsConfig ? 'border-white/10 bg-[#16161a] text-zinc-200' : hasAwsSecrets ? 'border-white/10 bg-[#111113] text-zinc-400' : 'border-amber-500/20 bg-amber-500/10 text-amber-300'}`}>
+                  <Panel>
+                    <SectionLabel>Runtime inputs</SectionLabel>
+                    <KeyValueRow label="Deploy source" value={shouldUseSavedRunForDeploy ? 'saved run' : 'session files'} />
+                    <KeyValueRow label="Workspace" value={shouldUseSavedRunForDeploy ? (activeSavedRun?.workspace || expectedWorkspace || 'pending') : (expectedWorkspace || 'local session')} />
+                    {customizationSnapshotId ? (
+                      <KeyValueRow label="Customization snapshot" value={customizationSnapshotId} />
+                    ) : null}
+                    <KeyValueRow label="AWS region" value={terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION} />
+                    <KeyValueRow label="Estimated monthly" value={`$${effectiveCostTotal.toFixed(2)}`} />
+                    <KeyValueRow label="Budget cap" value={`$${effectiveBudgetCap.toFixed(2)}`} />
+                  </Panel>
+                  <Callout
+                    tone={hasAwsSecrets && canContinueToAwsConfig ? 'ok' : hasAwsSecrets ? 'info' : 'warn'}
+                    title={hasAwsSecrets && canContinueToAwsConfig ? 'Ready' : hasAwsSecrets ? 'Credentials saved' : 'Credentials required'}
+                  >
                     {hasAwsSecrets && canContinueToAwsConfig
                       ? needsSessionToken
                         ? 'Temporary credentials ready with session token.'
                         : 'Long-lived credentials ready. Session token not required.'
                       : hasAwsSecrets
-                        ? 'Credentials saved. Complete infrastructure generation to unlock deploy.'
+                        ? 'Complete infrastructure generation to unlock deploy.'
                         : 'Enter AWS access key and secret key to unlock deployment.'}
-                  </div>
+                  </Callout>
                   {sessionIacTruncated && !activeSavedRun && (
-                    <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                    <Callout tone="warn">
                       Session-cached generation files are truncated preview data and cannot be deployed. Regenerate infrastructure to produce a fresh bundle.
-                    </div>
+                    </Callout>
                   )}
                 </div>
               </div>
-            </div>
+              <StickyActionBar hint={
+                hasAwsSecrets && canContinueToAwsConfig
+                  ? (deploymentPlan === 's3_cloudfront'
+                    ? 'Credentials ready. Secrets are optional — continue to deploy, or add app secrets first.'
+                    : 'Credentials ready. Add app secrets if the app needs them, or skip straight to deploy.')
+                  : 'Enter valid AWS credentials and finish Terraform generation to continue.'
+              }>
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearSavedAws();
+                    setAws({
+                      aws_access_key_id: '',
+                      aws_secret_access_key: '',
+                      aws_session_token: '',
+                      aws_region: terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION,
+                    });
+                  }}
+                  disabled={!hasAwsSecrets}
+                  className={secondaryButtonClass(!hasAwsSecrets)}
+                >
+                  Clear credentials
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAndPersistStage('app_secrets')}
+                  disabled={!hasAwsSecrets || !canContinueToAwsConfig}
+                  className={secondaryButtonClass(!hasAwsSecrets || !canContinueToAwsConfig)}
+                >
+                  Add app secrets
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAndPersistStage('deploy')}
+                  disabled={!hasAwsSecrets || !canContinueToAwsConfig}
+                  className={accentButtonClass(!hasAwsSecrets || !canContinueToAwsConfig)}
+                >
+                  <Rocket className="h-4 w-4" />
+                  Skip secrets · continue to deploy
+                </button>
+              </StickyActionBar>
+            </StageShell>
           )}
           {activeStage === 'app_secrets' && selectedProject && (
+            <StageShell stageKey="app_secrets" hasActionBar>
             <AppSecretsPanel
               projectId={selectedProject.id}
               projectName={selectedProject.name}
@@ -6134,34 +5962,41 @@ export default function DeploymentTrackApp() {
               secretsPrefix={secretsManagerPrefix}
               environment={String((deploymentProfile as { environment?: string } | null)?.environment || 'prod')}
               requiredKeys={requiredAppSecretKeys}
+              optionalHintKeys={optionalAppSecretKeys}
               publicAppUrl={publicAppUrlForSecrets}
               oauthCallbackPaths={oauthCallbackPaths}
               hasAwsCredentials={hasAwsSecrets}
               initialMeta={appSecretsMeta}
               onMetaChange={setAppSecretsMeta}
-              onContinueToDeploy={() => setAndPersistStage('deploy', { force: true })}
+              onContinueToDeploy={() => setAndPersistStage('deploy')}
               onBackToAwsConfig={() => setAndPersistStage('aws_config', { force: true })}
               canContinueToDeploy={canContinueToAwsConfig}
             />
+            </StageShell>
           )}
           {activeStage === 'deploy' && (
-            <div className="mx-auto max-w-5xl space-y-6">
+            <StageShell stageKey="deploy">
               <StageHeader
+                eyebrow="Stage 07 · Deploy"
                 title={
                   deployIsLive
-                    ? 'Deployment In Progress'
+                    ? 'Deployment in progress'
                     : deployStatus === 'done'
-                      ? 'Deployment Complete'
-                      : deployStatus === 'error' || deployUiPhase === 'error'
-                        ? 'Deployment Failed'
+                      ? 'Deployment complete'
+                      : deployFailed
+                        ? 'Deployment failed'
                         : deployUiPhase === 'awaiting_plan' || requiresPlanConfirmation
-                          ? 'Confirm Terraform Plan'
-                          : 'Ready to Deploy'
+                          ? 'Confirm Terraform plan'
+                          : 'Ready to deploy'
                 }
                 description={
                   deployIsLive
                     ? 'Backend is applying Terraform now. Live lines appear below even if WebSocket is still connecting.'
-                    : 'Live console from pipeline WebSocket events and backend status reconciliation.'
+                    : awaitingPlanIdle
+                      ? 'Terraform plan finished. Confirm to apply these changes in AWS.'
+                      : deployFailed
+                        ? 'Terraform apply stopped with an error. Redeploy retries against the existing state so already-created resources are reused.'
+                        : 'Live console from pipeline WebSocket events.'
                 }
                 meta={(
                   <div className="flex items-center gap-2">
@@ -6173,184 +6008,203 @@ export default function DeploymentTrackApp() {
                     <MetaChip
                       label="Phase"
                       value={deployPhaseLabel}
-                      tone={deployIsLive ? 'warn' : deployStatus === 'error' || deployUiPhase === 'error' ? 'danger' : deployStatus === 'done' ? 'ok' : 'neutral'}
+                      tone={deployIsLive ? 'warn' : deployFailed ? 'danger' : deployStatus === 'done' ? 'ok' : 'neutral'}
                     />
                   </div>
                 )}
               />
-              {(deployIsLive || deployUiPhase === 'awaiting_plan' || error || backendErrorMessage) && (
-                <div
-                  className={`mb-6 rounded-xl border px-4 py-3 text-sm ${
-                    deployStatus === 'error' || deployUiPhase === 'error' || error
-                      ? 'border-red-500/20 bg-red-500/10 text-red-200'
-                      : deployUiPhase === 'awaiting_plan' || requiresPlanConfirmation
-                        ? 'border-amber-500/20 bg-amber-500/10 text-amber-100'
-                        : 'border-white/10 bg-[#16161a] text-zinc-200'
-                  }`}
-                >
-                  <div className="flex items-center gap-2 font-semibold">
-                    {deployIsLive ? <CircleDashed className="h-4 w-4 animate-spin" /> : null}
-                    <span>{deployPhaseLabel}</span>
-                  </div>
-                  {(error || backendErrorMessage) ? (
-                    <div className="mt-2 text-sm leading-relaxed opacity-90">{error || backendErrorMessage}</div>
-                  ) : deployIsLive ? (
-                    <div className="mt-2 text-sm text-zinc-400">
-                      Request accepted. Waiting on `/api/pipeline/deploy` — this commonly takes 1–5 minutes. Watch `deployment.log` for heartbeat lines every 5s.
-                    </div>
-                  ) : (
-                    <div className="mt-2 text-sm text-amber-200/80">
-                      Review the plan summary in the log, then click Confirm Plan & Deploy.
-                    </div>
-                  )}
-                </div>
+              {!hasAwsSecrets && (
+                <Callout tone="warn" title="AWS credentials missing">
+                  Access key and secret were not saved for this session (they expire after 1–2 hours, and a full session cache can drop them). Go back to Stage 05 AWS config, paste the keys again, then start deploy.
+                </Callout>
               )}
-              <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-                <Surface className="flex h-125 flex-col overflow-hidden xl:col-span-2" padded={false}>
-                  <div className="flex items-center justify-between border-b border-white/10 bg-[#0c0c0e] px-4 py-2.5 font-mono text-xs">
-                    <div className="flex items-center gap-2.5">
-                      <Terminal className="h-3.5 w-3.5 text-zinc-500" />
-                      <span className="font-semibold tracking-wider text-zinc-400">deployment.log</span>
-                    </div>
-                    <span className="rounded bg-[#16161a] px-2 py-0.5 text-xs font-mono text-zinc-500">{deployLogs.length} events</span>
-                  </div>
-                  <div className="custom-scrollbar deployment-scrollbar flex-1 overflow-y-auto bg-[#09090b] p-4 font-mono text-[12px]">
+              {(deployIsLive || deployUiPhase === 'awaiting_plan' || error || backendErrorMessage) && (
+                <Callout
+                  tone={
+                    deployFailed || error
+                      ? 'danger'
+                      : deployUiPhase === 'awaiting_plan' || requiresPlanConfirmation
+                        ? 'warn'
+                        : 'info'
+                  }
+                  title={deployPhaseLabel}
+                  icon={deployIsLive ? <CircleDashed className="h-4 w-4 animate-spin" /> : undefined}
+                  actions={
+                    deployFailed ? (
+                      <button
+                        type="button"
+                        onClick={() => void startDeploy()}
+                        disabled={redeployDisabled}
+                        className={`${buttonClass('primary', { size: 'sm', disabled: redeployDisabled })} gap-2`}
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" />
+                        Redeploy
+                      </button>
+                    ) : null
+                  }
+                >
+                  {(error || backendErrorMessage)
+                    ? (error || backendErrorMessage)
+                    : deployIsLive
+                      ? 'Request accepted. Waiting on `/api/pipeline/deploy` — this commonly takes 1–5 minutes. Watch deployment.log for heartbeat lines every 5s.'
+                      : 'Review the plan summary in the log, then click Confirm Plan & Deploy.'}
+                </Callout>
+              )}
+              <div className="mt-6 grid grid-cols-1 gap-5 xl:grid-cols-3">
+                <Panel className="flex h-125 flex-col overflow-hidden xl:col-span-2" padded={false} elevation="recessed" glow={deployIsLive}>
+                  <PanelHeader
+                    title="deployment.log"
+                    icon={<Terminal className="h-3.5 w-3.5" />}
+                    tone="info"
+                    actions={<span className="font-mono text-[10px] text-[var(--dw-faint)]">{deployLogs.length} events</span>}
+                  />
+                  <div
+                    ref={logPanelRef}
+                    onScroll={() => {
+                      const node = logPanelRef.current;
+                      if (!node) return;
+                      logStickToBottomRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 32;
+                    }}
+                    className="dw-scrollbar dw-no-scroll-anchor flex-1 overflow-y-auto p-4 font-mono text-[12px] leading-[1.7] [overflow-anchor:none]"
+                  >
                     {deployLogs.length === 0 && (
-                      <div className="flex h-full flex-col items-center justify-center gap-2 text-xs text-zinc-600">
-                        <span>Waiting for deployment events...</span>
-                        <span className="text-zinc-700">Click Start Deploy — the first log line should appear immediately.</span>
+                      <div className="flex h-full flex-col items-center justify-center gap-2 text-[12px] text-[var(--dw-faint)]">
+                        <span>Waiting for deployment events…</span>
+                        <span>Click Start Deploy — the first log line should appear immediately.</span>
                       </div>
                     )}
                     {socketNotices.map((notice) => (
-                      <div key={notice.key} className={`mb-1 px-2 py-0.5 ${notice.tone === 'error' ? 'text-red-400' : 'text-amber-300/80'}`}>
+                      <div key={notice.key} className={`mb-1 px-2 py-0.5 ${notice.tone === 'error' ? 'text-[var(--dw-danger)]' : 'text-[var(--dw-warn)]'}`}>
                         [ws] {notice.text}
                       </div>
                     ))}
                     {deployLogs.map((log, index) => (
                       <div key={`${log.ts}-${index}`} className={`mb-0.5 flex gap-3 rounded px-2 py-0.5 ${index % 2 === 0 ? 'bg-transparent' : 'bg-white/[0.02]'}`}>
-                        <span className="mt-0.5 shrink-0 select-none text-xs text-zinc-700">{String(index + 1).padStart(2, '0')}</span>
-                        <span className={`flex-1 leading-relaxed ${
-                          log.type === 'success' ? 'text-zinc-200'
-                          : log.type === 'error' ? 'text-red-400'
-                          : log.text.startsWith('✓') || log.text.includes('created') ? 'text-zinc-200'
-                          : log.text.startsWith('+') || log.text.includes('Creating') ? 'text-zinc-300'
-                          : log.text.includes('Error') || log.text.includes('failed') ? 'text-red-400'
-                          : log.text.startsWith('[') ? 'text-amber-300/80'
-                          : 'text-zinc-500'
+                        <span className="mt-0.5 shrink-0 select-none text-[11px] text-[var(--dw-faint)]">{String(index + 1).padStart(2, '0')}</span>
+                        <span className={`flex-1 ${
+                          log.type === 'success' ? 'text-[var(--dw-ok)]'
+                          : log.type === 'error' ? 'text-[var(--dw-danger)]'
+                          : log.text.startsWith('✓') || log.text.includes('created') ? 'text-[var(--dw-ok)]'
+                          : log.text.startsWith('+') || log.text.includes('Creating') ? 'text-[var(--dw-info)]'
+                          : log.text.includes('Error') || log.text.includes('failed') ? 'text-[var(--dw-danger)]'
+                          : log.text.startsWith('[') ? 'text-[var(--dw-warn)]'
+                          : 'text-[var(--dw-fg-soft)]'
                         }`}>
                           {log.text}
                         </span>
                       </div>
                     ))}
-                    <div ref={logEndRef} />
+                    {deployIsLive ? <span className="dw-caret ml-2 inline-block h-3.5 w-[7px] bg-[var(--dw-accent)]" /> : null}
                   </div>
-                </Surface>
-                <Surface className="space-y-4">
+                </Panel>
+                <Panel className="space-y-4" elevation="raised" glow={deployIsLive}>
                   <div>
-                    <SurfaceLabel>Execution</SurfaceLabel>
-                    <div className="mt-1 text-3xl font-semibold text-zinc-100">{deployProgress}%</div>
-                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/5">
-                      <div
-                        className={`h-full rounded-full ${deployStatus === 'done'
-                          ? 'bg-zinc-300'
-                          : deployStatus === 'error' || deployUiPhase === 'error'
-                            ? 'bg-red-500'
-                            : deployIsLive
-                              ? 'animate-pulse bg-zinc-100'
-                              : 'bg-zinc-100'
-                        }`}
-                        style={{ width: `${Math.max(deployProgress, deployIsLive ? 5 : 0)}%` }}
-                      />
-                    </div>
-                    <div className="mt-3 flex items-center gap-2 text-xs text-zinc-500">
+                    <SectionLabel>Execution</SectionLabel>
+                    <div className="mt-1 font-mono text-[28px] font-semibold tracking-tight text-[var(--dw-fg)]">{deployProgress}%</div>
+                    <ProgressBar
+                      className="mt-2"
+                      value={Math.max(deployProgress, deployIsLive ? 5 : 0)}
+                      tone={deployStatus === 'done' ? 'ok' : deployFailed ? 'danger' : deployIsLive ? 'accent' : 'neutral'}
+                      indeterminate={deployIsLive && deployProgress < 5}
+                    />
+                    <div className="mt-3 flex items-center gap-2 text-[12px] text-[var(--dw-muted)]">
                       <span>Status:</span>
-                      <span className={`rounded-full px-2 py-0.5 font-mono text-xs font-semibold ${
-                        deployStatus === 'done' ? 'border border-white/10 bg-[#16161a] text-zinc-200'
-                        : deployStatus === 'error' || deployUiPhase === 'error' ? 'border border-red-500/20 bg-red-500/10 text-red-400'
-                        : deployIsLive ? 'animate-pulse border border-amber-500/20 bg-amber-500/10 text-amber-200'
-                        : 'border border-white/10 bg-[#16161a] text-zinc-300'
-                      }`}>{deployIsLive ? 'running' : deployStatus}</span>
+                      <StatusPill
+                        tone={deployStatus === 'done' ? 'ok' : deployFailed ? 'danger' : deployIsLive ? 'warn' : awaitingPlanIdle ? 'warn' : 'neutral'}
+                        live={deployIsLive}
+                      >
+                        {deployIsLive ? 'running' : awaitingPlanIdle ? 'awaiting confirmation' : deployStatus}
+                      </StatusPill>
                     </div>
-                    <div className="mt-2 text-xs text-zinc-500">{deployPhaseLabel}</div>
+                    <div className="mt-2 text-[12px] text-[var(--dw-muted)]">{deployPhaseLabel}</div>
                     {deployProgress >= 100 && deployStatus === 'running' && (
-                      <div className="mt-3 rounded-md border border-white/10 bg-[#16161a] px-3 py-2 text-sm text-zinc-300">
-                        Build script running on EC2. This can take 30–60 min. Watch the terminal.
-                      </div>
+                      <Callout tone="info" className="mt-3">
+                        The deterministic executor is building and verifying the release on EC2. Status updates appear here automatically.
+                      </Callout>
                     )}
                   </div>
                   {!costEstimateIsFresh && hasApprovedDecisionForCost ? (
-                    <div className="rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
-                      <div>Refreshing cost estimate for the current setup…</div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (!decisionForVisualization) return;
-                          decisionCostRequestKeyRef.current = null;
-                          void fetchDecisionCostEstimate(decisionForVisualization).catch((reason: unknown) => {
-                            setDecisionCostError(reason instanceof Error ? reason.message : 'Failed to refresh cost estimate.');
-                          });
-                        }}
-                        disabled={decisionCostLoading || !decisionForVisualization}
-                        className="mt-2 text-amber-100 underline disabled:opacity-50"
-                      >
-                        {decisionCostLoading ? 'Refreshing…' : 'Refresh now'}
-                      </button>
-                    </div>
+                    <Callout
+                      tone="warn"
+                      title="Refreshing cost estimate for the current setup…"
+                      actions={
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!decisionForVisualization) return;
+                            decisionCostRequestKeyRef.current = null;
+                            void fetchDecisionCostEstimate(decisionForVisualization).catch((reason: unknown) => {
+                              setDecisionCostError(reason instanceof Error ? reason.message : 'Failed to refresh cost estimate.');
+                            });
+                          }}
+                          disabled={decisionCostLoading || !decisionForVisualization}
+                          className={buttonClass('ghost', { size: 'sm', disabled: decisionCostLoading || !decisionForVisualization })}
+                        >
+                          {decisionCostLoading ? 'Refreshing…' : 'Refresh now'}
+                        </button>
+                      }
+                    />
                   ) : null}
                   {effectiveCostTotal > effectiveBudgetCap && (
-                    <div className="rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
-                      <div className="font-semibold text-amber-300">Budget guardrail</div>
-                      <div className="mt-1">Estimated monthly cost ${effectiveCostTotal.toFixed(2)} exceeds cap ${effectiveBudgetCap.toFixed(2)}.</div>
+                    <Callout tone="warn" title="Budget guardrail">
+                      <div>Estimated monthly cost ${effectiveCostTotal.toFixed(2)} exceeds cap ${effectiveBudgetCap.toFixed(2)}.</div>
                       <label className="mt-3 flex items-start gap-3 text-left">
                         <input
                           type="checkbox"
                           checked={budgetOverride}
                           onChange={(event) => setBudgetOverride(event.target.checked)}
                           disabled={deployStatus === 'running'}
-                          className="mt-0.5 h-4 w-4 rounded border-[#3f3f46] bg-black text-zinc-200 focus:ring-zinc-400/40"
+                          className="mt-0.5 h-4 w-4 rounded border-[var(--dw-border)] bg-black accent-[var(--dw-accent)]"
                         />
                         <span>
-                          <span className="block font-medium text-amber-100">Override budget guardrail for this deploy</span>
-                          <span className="mt-1 block text-sm text-amber-200/80">Use only when you intentionally approve costs above the configured cap.</span>
+                          <span className="block font-medium text-[var(--dw-warn)]">Override budget guardrail for this deploy</span>
+                          <span className="mt-1 block text-[12px] text-[var(--dw-muted)]">Use only when you intentionally approve costs above the configured cap.</span>
                         </span>
                       </label>
-                    </div>
+                    </Callout>
                   )}
                   <div className="space-y-3">
                     <button
                       onClick={() => void startDeploy()}
                       disabled={deployButtonDisabled}
-                      className={`${accentButtonClass(deployButtonDisabled)} w-full`}
+                      className={`${accentButtonClass(deployButtonDisabled)} w-full gap-2`}
                     >
-                      {deployIsLive ? <CircleDashed className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
+                      {deployIsLive ? (
+                        <CircleDashed className="h-4 w-4 animate-spin" />
+                      ) : deployFailed ? (
+                        <RefreshCw className="h-4 w-4" />
+                      ) : (
+                        <Rocket className="h-4 w-4" />
+                      )}
                       {deployIsLive
                         ? `Deploying… ${deployElapsedSec}s`
                         : awaitingPlanIdle
-                          ? 'Confirm Plan & Deploy'
-                          : deployStatus === 'done'
-                            ? 'Re-run Deploy'
-                            : 'Start Deploy'}
+                          ? 'Confirm plan & deploy'
+                          : deployFailed
+                            ? 'Redeploy'
+                            : deployStatus === 'done'
+                              ? 'Re-run deploy'
+                              : 'Start deploy'}
                     </button>
-                    {deployStartBlockers.length > 0 && (
-                      <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200 space-y-1">
-                        {deployStartBlockers.map((blocker) => (
-                          <div key={blocker}>{blocker}</div>
-                        ))}
-                      </div>
+                    {deployStartBlockers.length > 0 && !deployFailed && (
+                      <Callout tone="warn">
+                        <div className="space-y-1">
+                          {deployStartBlockers.map((blocker) => (
+                            <div key={blocker}>{blocker}</div>
+                          ))}
+                        </div>
+                      </Callout>
                     )}
-                    <button onClick={() => void stopDeployment()} disabled={!deployIsLive || stopLoading} className="w-full rounded-md border border-red-500/20 bg-red-500/10 px-6 py-2.5 font-semibold text-red-300 hover:bg-red-500/20 disabled:border-white/5 disabled:bg-transparent disabled:text-zinc-600">
-                      {stopLoading ? 'Stopping...' : 'Stop Deployment'}
+                    <button onClick={() => void stopDeployment()} disabled={!deployIsLive || stopLoading} className={`${buttonClass('danger', { disabled: !deployIsLive || stopLoading, block: true })}`}>
+                      {stopLoading ? 'Stopping…' : 'Stop deployment'}
                     </button>
-                    <button onClick={() => void reconcileDeploymentStatus().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to reconcile deployment status.'))} className={`${secondaryButtonClass(false)} w-full`}>
-                      Reconcile Backend Status
-                    </button>
-                    {deployStatus !== 'running' && deployResult && (
+                    {!deployIsLive && deployResult && (
                       <button onClick={() => setAndPersistStage('outputs')} className={`${primaryButtonClass(false)} w-full`}>
-                        {deployStatus === 'error' ? 'View Results' : 'View Outputs'} <ArrowRight className="h-4 w-4" />
+                        {deployFailed ? 'View results' : 'View outputs'} <ArrowRight className="h-4 w-4" />
                       </button>
                     )}
                   </div>
-                </Surface>
+                </Panel>
               </div>
               {deployResult?.mode === 'iac_pipeline' && deployResult?.run_id ? (
                 <ApplyLogViewer runId={deployResult.run_id} onComplete={onIacPipelineComplete} onError={onIacPipelineError} />
@@ -6367,22 +6221,44 @@ export default function DeploymentTrackApp() {
                 const termPrivateKey = sanitize(rawPrivateKey);
                 
                 return deployResult?.success && termInstanceId !== 'n/a' ? (
-                  <div className="mt-6">
+                  <div className="dw-no-scroll-anchor mt-6" style={{ overflowAnchor: 'none' }}>
                     <AwsConsoleTerminal 
                       instanceId={termInstanceId} 
                       publicIp={termPublicIp}
                       privateKey={termPrivateKey}
                       region={terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION} 
+                      projectId={selectedProject?.id}
                       projectName={selectedProject?.name}
+                      awsAccessKeyId={aws.aws_access_key_id}
+                      awsSecretAccessKey={aws.aws_secret_access_key}
+                      awsSessionToken={aws.aws_session_token}
                     />
                   </div>
                 ) : null;
               })()}
-            </div>
+              {selectedProject && deploySummary.instanceId && deploySummary.instanceId !== 'n/a' && (deployResult?.success || hasLiveRuntimeDetails) ? (
+                <AppDeployPanel
+                  projectId={selectedProject.id}
+                  environmentId={String((deploymentProfile as { environment?: string } | null)?.environment || 'production')}
+                  instanceId={deploySummary.instanceId}
+                  region={terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION}
+                  accountId={String((liveRuntimeDetails as { account_id?: string } | null)?.account_id || '')}
+                  publicEndpoint={deploySummary.appUrl && deploySummary.appUrl !== 'n/a' ? deploySummary.appUrl : undefined}
+                  defaultImage={appDeployDefaults.image}
+                  defaultContainerPort={appDeployDefaults.containerPort}
+                  defaultHostPort={appDeployDefaults.hostPort}
+                  defaultHealthEndpoint={appDeployDefaults.healthEndpoint}
+                  awsAccessKeyId={aws.aws_access_key_id}
+                  awsSecretAccessKey={aws.aws_secret_access_key}
+                  awsSessionToken={aws.aws_session_token}
+                />
+              ) : null}
+            </StageShell>
           )}
           {activeStage === 'outputs' && (
-            <div className="mx-auto max-w-5xl space-y-6">
+            <StageShell stageKey="outputs">
               <StageHeader
+                eyebrow="Stage 08 · Outputs"
                 title={outputBanner.title}
                 description={outputBanner.description}
                 meta={(
@@ -6394,197 +6270,131 @@ export default function DeploymentTrackApp() {
                 )}
               />
               {backendErrorMessage && (
-                <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-300">
+                <Callout
+                  tone="danger"
+                  title="Deployment failed"
+                  actions={
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAndPersistStage('deploy');
+                        void startDeploy();
+                      }}
+                      disabled={redeployDisabled}
+                      className={`${buttonClass('primary', { size: 'sm', disabled: redeployDisabled })} gap-2`}
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      Redeploy
+                    </button>
+                  }
+                >
                   {backendErrorMessage}
-                </div>
+                </Callout>
               )}
               {!backendErrorMessage && !hasLiveRuntimeDetails && deployResult?.success && deployResult.mode !== 'iac_pipeline' && (
-                <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-200">
+                <Callout tone="warn">
                   Live runtime details are missing for this repo. Fetch the latest runtime details to hydrate outputs before treating this deploy as successful.
-                </div>
+                </Callout>
               )}
-              {deployResult?.mode === 'iac_pipeline' && deployResult.run_id && iacResourceOutputs ? (
-                <ResourceCard
-                  runId={deployResult.run_id}
-                  serviceType={deployResult.service_type || 'aws'}
-                  outputs={iacResourceOutputs}
-                  keypair={iacKeypair}
-                  awsCredentials={{
-                    access_key_id: aws.aws_access_key_id,
-                    secret_access_key: aws.aws_secret_access_key,
-                    region: terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION,
-                  }}
-                  onDestroyed={handleIacDestroyed}
-                />
-              ) : null}
-              {(() => {
-                const termInstanceId = deploySummary.instanceId && deploySummary.instanceId !== 'n/a' 
-                  ? deploySummary.instanceId 
-                  : String(iacResourceOutputs?.outputs?.find(o => o.key === 'instance_id' || o.key === 'ec2_instance_id')?.value || 'n/a');
-                const rawPublicIp = (deploySummary.publicIp && deploySummary.publicIp !== 'n/a') ? deploySummary.publicIp : String(iacResourceOutputs?.outputs?.find(o => o.key === 'public_ip')?.value || '');
-                const rawPrivateKey = (deploySummary.generatedPem && deploySummary.generatedPem !== 'n/a') ? deploySummary.generatedPem : String(iacResourceOutputs?.outputs?.find(o => o.key === 'private_key_pem')?.value || '');
-                // Sanitize: only pass real values, not placeholder strings
-                const sanitize = (v: string) => (!v || v === 'n/a' || v === 'N/A' || v === 'null' || v === 'undefined' ? undefined : v);
-                const termPublicIp = sanitize(rawPublicIp);
-                const termPrivateKey = sanitize(rawPrivateKey);
-                
-                return termInstanceId !== 'n/a' ? (
+              <InfraOutputsStage
+                briefing={infraAccessBriefing}
+                generatedPem={deploySummary.generatedPem || iacKeypair?.private_key_pem || null}
+                databaseEnv={deploySummary.databaseEnv || null}
+                keyPairMessage={keyPairDownloadMessage}
+                oauthAppUrl={publicAppUrlForSecrets || infraAccessBriefing.appUrl}
+                oauthCallbackPaths={oauthCallbackPaths}
+                missingOauthSecrets={appSecretsMeta.some((row) => row.required && !row.is_set)}
+                showOauthPanel={Boolean(
+                  publicAppUrlForSecrets
+                  || oauthCallbackPaths.length > 0
+                  || optionalAppSecretKeys.some((key) => /GOOGLE|GITHUB|OAUTH|NEXTAUTH/i.test(key)),
+                )}
+                endpointChecks={effectiveEndpointChecks}
+                canVerify={canVerifyLiveEndpoints}
+                history={deploymentHistory}
+                onDownloadPem={() => {
+                  void downloadOneTimeCredentials(false).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Credential download failed.'));
+                }}
+                onDownloadPpk={() => {
+                  void downloadOneTimeCredentials(true).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'PPK conversion failed.'));
+                }}
+                onDownloadDatabase={() => {
+                  void downloadOneTimeCredentials(false).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Credential download failed.'));
+                }}
+                rawOutputs={iacResourceOutputs?.outputs || null}
+                consoleSlot={(() => {
+                  const termInstanceId = firstProvisioned(
+                    deploySummary.instanceId,
+                    iacResourceOutputs?.outputs?.find((entry) => entry.key === 'instance_id' || entry.key === 'ec2_instance_id')?.value,
+                  );
+                  const termPublicIp = firstProvisioned(
+                    deploySummary.publicIp,
+                    deploySummary.elasticIp,
+                    iacResourceOutputs?.outputs?.find((entry) => entry.key === 'public_ip' || entry.key === 'elastic_ip')?.value,
+                  ) || undefined;
+                  const termPrivateKey = firstProvisioned(
+                    deploySummary.generatedPem,
+                    iacKeypair?.private_key_pem,
+                    iacResourceOutputs?.outputs?.find((entry) => entry.key === 'private_key_pem')?.value,
+                  ) || undefined;
+                  return termInstanceId ? (
                   <AwsConsoleTerminal 
                     instanceId={termInstanceId} 
                     publicIp={termPublicIp}
                     privateKey={termPrivateKey}
                     region={terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION} 
+                    projectId={selectedProject?.id}
                     projectName={selectedProject?.name}
+                    awsAccessKeyId={aws.aws_access_key_id}
+                    awsSecretAccessKey={aws.aws_secret_access_key}
+                    awsSessionToken={aws.aws_session_token}
                   />
                 ) : null;
               })()}
-              <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-                <Surface>
-                  <SurfaceLabel>Security</SurfaceLabel>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => deploySummary.generatedPem && downloadTextFile(`${deploySummary.keyName}.pem`, deploySummary.generatedPem.endsWith('\n') ? deploySummary.generatedPem : `${deploySummary.generatedPem}\n`)}
-                      disabled={!deploySummary.generatedPem}
-                      className={`${secondaryButtonClass(!deploySummary.generatedPem)} flex-1 text-[12px]`}
-                    >
-                      <Download className="h-4 w-4" /> Download .PEM
-                    </button>
-                    <button
-                      onClick={() => void downloadPpk().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'PPK conversion failed.'))}
-                      disabled={!deploySummary.generatedPem}
-                      className={`${secondaryButtonClass(!deploySummary.generatedPem)} flex-1 text-[12px]`}
-                    >
-                      <Download className="h-4 w-4" /> Download .PPK
-                    </button>
-                  </div>
-                  {!deploySummary.generatedPem && (
-                    <div className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200">
-                      {keyPairDownloadMessage}
-                    </div>
-                  )}
-                </Surface>
-                <Surface>
-                  <SurfaceLabel>Front-door endpoints</SurfaceLabel>
-                  <div className="space-y-0">
-                    {(() => {
-                      const termInstanceId = deploySummary.instanceId && deploySummary.instanceId !== 'n/a' ? deploySummary.instanceId : String(iacResourceOutputs?.outputs?.find(o => o.key === 'instance_id' || o.key === 'ec2_instance_id')?.value || 'n/a');
-                      const termPublicIp = (deploySummary.publicIp && deploySummary.publicIp !== 'n/a') ? deploySummary.publicIp : String(iacResourceOutputs?.outputs?.find(o => o.key === 'public_ip')?.value || 'n/a');
-                      const termAlbDns = (deploySummary.albDns && deploySummary.albDns !== 'n/a') ? deploySummary.albDns : String(iacResourceOutputs?.outputs?.find(o => o.key === 'alb_dns_name' || o.key === 'load_balancer_dns_name')?.value || 'n/a');
-                      const termElasticIp = (deploySummary.elasticIp && deploySummary.elasticIp !== 'n/a') ? deploySummary.elasticIp : String(iacResourceOutputs?.outputs?.find(o => o.key === 'elastic_ip' || o.key === 'eip_public_ip')?.value || 'n/a');
-                      const termAppUrl = (deploySummary.appUrl && deploySummary.appUrl !== 'n/a')
-                        ? deploySummary.appUrl
-                        : (termAlbDns !== 'n/a'
-                          ? `http://${termAlbDns}`
-                          : termElasticIp !== 'n/a'
-                            ? `http://${termElasticIp}`
-                            : termPublicIp !== 'n/a'
-                              ? `http://${termPublicIp}`
-                              : 'n/a');
-                      return (
-                        <>
-                          <EndpointRow label="App URL" value={termAppUrl} primary />
-                          <EndpointRow label="ALB DNS" value={termAlbDns} />
-                          <EndpointRow label="Elastic IP" value={termElasticIp} />
-                          <EndpointRow label="Public IP" value={termPublicIp} />
-                          <EndpointRow label="CloudFront" value={deploySummary.cloudfrontUrl} />
-                          <EndpointRow label="RDS endpoint" value={deploySummary.rdsEndpoint} />
-                          <EndpointRow label="Instance" value={termInstanceId} />
-                          <div className="flex items-center justify-between border-t border-white/5 pt-3 text-sm">
-                            <span className="text-zinc-500">Verification</span>
-                            <span className={`font-medium ${outputBanner.tone === 'success' ? 'text-zinc-200' : outputBanner.tone === 'error' ? 'text-red-300' : 'text-amber-300'}`}>{outputBanner.label}</span>
-                          </div>
-                        </>
-                      );
-                    })()}
-                  </div>
-                </Surface>
-              </div>
-              {(publicAppUrlForSecrets || oauthCallbackPaths.length > 0 || requiredAppSecretKeys.some((key) => /GOOGLE|GITHUB|OAUTH|NEXTAUTH/i.test(key))) && (
-                <Surface>
-                  <SurfaceLabel>OAuth callback URLs to register</SurfaceLabel>
-                  <p className="mt-2 text-xs text-zinc-400">
-                    After the app is reachable, register these redirect URLs in Google / GitHub (or other) OAuth consoles. Update client secrets in App Secrets if needed, then reboot the instance so EC2 reloads Secrets Manager values.
-                  </p>
-                  {publicAppUrlForSecrets ? (
-                    <p className="mt-3 break-all font-mono text-sm text-zinc-200">{publicAppUrlForSecrets}</p>
-                  ) : (
-                    <p className="mt-3 text-xs text-amber-200">App URL not available yet — deploy first, then register callbacks.</p>
-                  )}
-                  {oauthCallbackPaths.length > 0 && (
-                    <ul className="mt-3 space-y-1 font-mono text-xs text-zinc-400">
-                      {oauthCallbackPaths.map((path) => (
-                        <li key={path}>
-                          {publicAppUrlForSecrets ? `${publicAppUrlForSecrets.replace(/\/$/, '')}${path}` : path}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                  {appSecretsMeta.some((row) => row.required && !row.is_set) && (
-                    <div className="mt-3 rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-                      Missing Google/GitHub (or other) keys in App Secrets — login providers will fail until those values are saved.
-                    </div>
-                  )}
-                </Surface>
-              )}
-              <div className="flex gap-3">
-                <button onClick={() => void fetchRuntimeDetails().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to fetch runtime details.'))} disabled={!canFetchRuntimeDetails} className="flex items-center gap-2 rounded-md border border-[#262626] bg-[#111111] px-4 py-2 text-sm font-semibold text-zinc-300 hover:bg-[#181818] disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">
-                  <RefreshCw className="h-4 w-4" /> Fetch Latest Runtime Details
+                actions={(
+                  <>
+                <button onClick={() => void fetchRuntimeDetails().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Failed to fetch runtime details.'))} disabled={!canFetchRuntimeDetails} className={buttonClass('secondary', { disabled: !canFetchRuntimeDetails })}>
+                  <RefreshCw className="h-4 w-4" /> Fetch latest runtime details
                 </button>
-                <button onClick={() => void verifyLiveEndpoints()} disabled={verifyLoading || !canVerifyLiveEndpoints} className="flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-800/50 px-4 py-2 text-sm font-semibold text-zinc-200 hover:bg-zinc-800/50 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">
-                  <ExternalLink className="h-4 w-4" /> {verifyLoading ? 'Verifying...' : 'Verify Live Endpoints'}
+                <button onClick={() => void verifyLiveEndpoints()} disabled={verifyLoading || !canVerifyLiveEndpoints} className={buttonClass('secondary', { disabled: verifyLoading || !canVerifyLiveEndpoints })}>
+                  <ExternalLink className="h-4 w-4" /> {verifyLoading ? 'Verifying…' : 'Verify live endpoints'}
                 </button>
-                <button onClick={() => void destroyDeployment().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Destroy failed.'))} disabled={destroyLoading || !hasAwsSecrets} className="flex items-center gap-2 rounded-md border border-red-500/20 bg-red-500/10 px-4 py-2 text-sm font-semibold text-red-300 hover:bg-red-500/20 disabled:border-[#262626] disabled:bg-[#111111] disabled:text-zinc-500">
-                  <Server className="h-4 w-4" /> {destroyLoading ? 'Destroying...' : 'Destroy Infrastructure'}
+                {selectedProject && deployResult?.success ? (
+                  <button
+                    type="button"
+                    onClick={() => router.push(`/dashboard/instances?projectId=${encodeURIComponent(selectedProject.id)}`)}
+                    className={buttonClass('secondary')}
+                  >
+                    <Server className="h-4 w-4" /> Manage instance & IaC
+                  </button>
+                ) : null}
+                <button onClick={() => void destroyDeployment().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Destroy failed.'))} disabled={destroyLoading || !hasAwsSecrets} className={buttonClass('danger', { disabled: destroyLoading || !hasAwsSecrets })}>
+                  <Server className="h-4 w-4" /> {destroyLoading ? 'Destroying…' : 'Destroy infrastructure'}
                 </button>
-              </div>
-              <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
-                <h3 className="mb-4 text-sm font-semibold text-zinc-200">Endpoint Verification</h3>
-                {effectiveEndpointChecks.length > 0 ? (
-                  <div className="space-y-3">
-                    {effectiveEndpointChecks.map((check) => (
-                      <div key={`${check.label}-${check.url || 'empty'}`} className="rounded-md border border-[#1A1A1A] bg-black p-4">
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <div className="text-sm font-medium text-zinc-200">{check.label}</div>
-                            <div className="mt-1 font-mono text-sm text-zinc-500">{check.url || 'n/a'}</div>
-                          </div>
-                          <span className={`rounded border px-2.5 py-1 text-sm font-medium ${check.ok ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200' : 'border-red-500/20 bg-red-500/10 text-red-300'}`}>
-                            {check.ok ? `HTTP ${check.status ?? 200}` : (check.status ? `HTTP ${check.status}` : 'Unreachable')}
-                          </span>
-                        </div>
-                        <div className="mt-3 text-xs leading-relaxed text-zinc-400">{check.detail}</div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="rounded-md border border-dashed border-[#262626] bg-black px-4 py-6 text-sm text-zinc-500">
-                    {canVerifyLiveEndpoints ? 'No live verification has been recorded yet. Run `Verify Live Endpoints` to test the deployed URLs.' : 'Verification is unavailable until the current repo has a successful deploy payload and live runtime details.'}
-                  </div>
+                  </>
                 )}
-              </div>
-              <div className="rounded-lg border border-[#1A1A1A] bg-[#050505] p-6">
-                <h3 className="mb-4 text-sm font-semibold text-zinc-200">Deployment History</h3>
-                <div className="space-y-3">
-                  {deploymentHistory.map((entry) => (
-                    <div key={entry.id} className="rounded-md border border-[#1A1A1A] bg-black p-4">
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <p className="text-sm font-medium text-zinc-200">{new Date(entry.createdAt).toLocaleString()}</p>
-                          <p className="mt-1 font-mono text-sm text-zinc-400">EC2: {entry.instanceId}</p>
-                        </div>
-                        <span className={`rounded border px-2.5 py-1 text-sm font-medium ${entry.status === 'done' ? 'border-zinc-700 bg-zinc-800/50 text-zinc-200' : 'border-red-500/20 bg-red-500/10 text-red-400'}`}>
-                          {entry.status === 'done' ? 'Success' : 'Error'}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
+              />
+              {selectedProject && deploySummary.instanceId && deploySummary.instanceId !== 'n/a' && (deployResult?.success || hasLiveRuntimeDetails) ? (
+                <AppDeployPanel
+                  projectId={selectedProject.id}
+                  environmentId={String((deploymentProfile as { environment?: string } | null)?.environment || 'production')}
+                  instanceId={deploySummary.instanceId}
+                  region={terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION}
+                  accountId={String((liveRuntimeDetails as { account_id?: string } | null)?.account_id || '')}
+                  publicEndpoint={deploySummary.appUrl && deploySummary.appUrl !== 'n/a' ? deploySummary.appUrl : undefined}
+                  defaultImage={appDeployDefaults.image}
+                  defaultContainerPort={appDeployDefaults.containerPort}
+                  defaultHostPort={appDeployDefaults.hostPort}
+                  defaultHealthEndpoint={appDeployDefaults.healthEndpoint}
+                  awsAccessKeyId={aws.aws_access_key_id}
+                  awsSecretAccessKey={aws.aws_secret_access_key}
+                  awsSessionToken={aws.aws_session_token}
+                />
+              ) : null}
+            </StageShell>
           )}
         </div>
       </div>
-      <style dangerouslySetInnerHTML={{ __html: `.custom-scrollbar::-webkit-scrollbar{width:6px}.custom-scrollbar::-webkit-scrollbar-track{background:transparent}.custom-scrollbar::-webkit-scrollbar-thumb{background-color:#262626;border-radius:10px}.custom-scrollbar::-webkit-scrollbar-thumb:hover{background-color:#3f3f46}` }} />
     </div>
   );
 }

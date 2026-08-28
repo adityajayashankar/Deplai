@@ -2,9 +2,12 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO = ROOT.parent
+for candidate in (ROOT, REPO):
+    if str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
 
+from deployment_manifest import ManifestResolutionError
 from deployment_packager import DeploymentPackage, _source_root_candidates, build_deployment_package
 from ec2_app_renderer import render_ec2_app_bundle
 
@@ -74,6 +77,25 @@ def test_ec2_renderer_materializes_requested_data_services() -> None:
     assert "enable_elasticache = true" in by_path["terraform/terraform.tfvars"]
 
 
+def test_ec2_renderer_looks_up_default_vpc_without_hard_fail() -> None:
+    rendered = render_ec2_app_bundle(
+        project_name="demo-app",
+        aws_region="eu-north-1",
+        deployment_package=_package(),
+    )
+    by_path = {item["path"]: item["content"] for item in rendered["files"]}
+    main_tf = by_path["terraform/main.tf"]
+    variables_tf = by_path["terraform/variables.tf"]
+    vpc_lookup = main_tf.split('data "aws_vpc" "default"')[1].split('data "aws_subnets" "default"')[0]
+
+    assert 'data "aws_vpcs" "default"' in main_tf
+    assert "has_default_vpc    = local.prefer_default_vpc && length(data.aws_vpcs.default.ids) > 0" in main_tf
+    assert "default = true" not in vpc_lookup
+    assert "data.aws_vpcs.default.ids[0]" in vpc_lookup
+    assert "count                = local.has_default_vpc ? 0 : 1" in main_tf
+    assert "a dedicated VPC is created automatically" in variables_tf
+
+
 def test_ec2_renderer_bootstraps_node_app_without_manual_ssh_build() -> None:
     rendered = render_ec2_app_bundle(
         project_name="demo-app",
@@ -92,18 +114,25 @@ def test_ec2_renderer_bootstraps_node_app_without_manual_ssh_build() -> None:
     assert 'pm2 start node_modules/next/dist/bin/next --name "$APP_NAME" -- start -p "$APP_PORT"' in main_tf
     assert 'write_status "application_service_started"' in main_tf
     assert 'write_status "ready"' in main_tf
-    assert "volume_size           = var.root_volume_size_gb" in main_tf
+    assert "var.root_volume_size_gb" in main_tf
+    assert 'source  = "terraform-aws-modules/ec2-instance/aws"' in main_tf
+    assert 'version = "5.8.0"' in main_tf
+    assert 'module "ec2"' in main_tf
+    assert 'resource "aws_instance"' not in main_tf
+    assert "dnf update -y" not in main_tf
+    assert "SKIP_NODE_BUILD" in main_tf
     assert 'output "app_url"' in by_path["terraform/outputs.tf"]
     assert 'variable "root_volume_size_gb"' in variables_tf
     assert "root_volume_size_gb = 35" in tfvars
 
 
-def test_ec2_renderer_uses_approved_ec2_resource_config() -> None:
+def test_ec2_renderer_ignores_operator_instance_sizing() -> None:
     rendered = render_ec2_app_bundle(
         project_name="demo-app",
         aws_region="us-east-1",
         deployment_package=_package(),
         deployment_profile={
+            "environment": "dev",
             "consultant_decision": {
                 "stack_config": {
                     "ec2": {
@@ -119,10 +148,12 @@ def test_ec2_renderer_uses_approved_ec2_resource_config() -> None:
     by_path = {item["path"]: item["content"] for item in rendered["files"]}
     tfvars = by_path["terraform/terraform.tfvars"]
 
-    assert 'instance_type = "t3.medium"' in tfvars
-    assert "root_volume_size_gb = 50" in tfvars
+    assert 'instance_type = "t3.small"' in tfvars
+    assert "root_volume_size_gb = 35" in tfvars
     assert "app_port = 3000" in tfvars
     assert 'ssh_ingress_cidr_blocks = ["203.0.113.10/32"]' in tfvars
+    assert "t3.medium" not in tfvars
+    assert "root_volume_size_gb = 50" not in tfvars
 
 
 def test_ec2_renderer_normalizes_legacy_ec2_instance_config() -> None:
@@ -131,6 +162,7 @@ def test_ec2_renderer_normalizes_legacy_ec2_instance_config() -> None:
         aws_region="us-east-1",
         deployment_package=_package(),
         deployment_profile={
+            "environment": "dev",
             "consultant_decision": {
                 "stack_config": {
                     "ec2-instance": {
@@ -142,7 +174,8 @@ def test_ec2_renderer_normalizes_legacy_ec2_instance_config() -> None:
     )
     by_path = {item["path"]: item["content"] for item in rendered["files"]}
 
-    assert 'instance_type = "t3.medium"' in by_path["terraform/terraform.tfvars"]
+    assert 'instance_type = "t3.small"' in by_path["terraform/terraform.tfvars"]
+    assert "t3.medium" not in by_path["terraform/terraform.tfvars"]
 
 
 def test_ec2_renderer_invalid_instance_type_falls_back_to_micro() -> None:
@@ -162,7 +195,8 @@ def test_ec2_renderer_invalid_instance_type_falls_back_to_micro() -> None:
     )
     by_path = {item["path"]: item["content"] for item in rendered["files"]}
 
-    assert 'instance_type = "t3.micro"' in by_path["terraform/terraform.tfvars"]
+    assert 'instance_type = "t3.small"' in by_path["terraform/terraform.tfvars"]
+    assert "m7g.16xlarge" not in by_path["terraform/terraform.tfvars"]
 
 
 def test_ec2_renderer_clones_github_repo_and_uses_detected_frontend_subdir() -> None:
@@ -184,6 +218,22 @@ def test_ec2_renderer_clones_github_repo_and_uses_detected_frontend_subdir() -> 
     assert 'app_subdir = "frontend"' in tfvars
 
 
+def test_ec2_renderer_workspace_user_data_proxies_api_and_web() -> None:
+    package = _package()
+    package.start_command = "deplai-node-workspace"
+    package.build_command = "deplai-node-workspace"
+    rendered = render_ec2_app_bundle(
+        project_name="ifca",
+        aws_region="eu-north-1",
+        deployment_package=package,
+        repository_url="https://github.com/acme/ifca.git",
+    )
+    main_tf = {item["path"]: item["content"] for item in rendered["files"]}["terraform/main.tf"]
+    assert "node_workspace_detected" in main_tf
+    assert "location /api/" in main_tf
+    assert "APP_ROOT/$rel/package.json" in main_tf or "frontend/package.json" in main_tf
+
+
 def test_packager_detects_nested_frontend_node_app(tmp_path: Path) -> None:
     frontend = tmp_path / "frontend"
     frontend.mkdir()
@@ -203,6 +253,42 @@ def test_packager_detects_nested_frontend_node_app(tmp_path: Path) -> None:
     assert package.selected_root == "frontend"
     assert package.build_command == "npm run build"
     assert package.start_command == "npm run start"
+
+
+def test_packager_detects_frontend_backend_workspace_not_static(tmp_path: Path) -> None:
+    frontend = tmp_path / "frontend"
+    backend = tmp_path / "backend"
+    frontend.mkdir()
+    backend.mkdir()
+    (frontend / "package.json").write_text(
+        '{"scripts":{"dev":"next dev -p 3001","build":"next build","start":"next start"}}',
+        encoding="utf-8",
+    )
+    (backend / "package.json").write_text(
+        '{"scripts":{"start":"node server.js"}}',
+        encoding="utf-8",
+    )
+
+    package = build_deployment_package(
+        source_root=str(tmp_path),
+        project_name="ifca",
+        repository_context={},
+        user_answers={"rds_port": 5432, "postgres_port": 5432},
+    )
+
+    assert package.app_kind == "node"
+    assert package.selected_root == "."
+    assert package.start_command == "deplai-node-workspace"
+    assert package.build_command == "deplai-node-workspace"
+    assert package.app_port == 3001
+
+
+def test_infer_port_ignores_datastore_ports(tmp_path: Path) -> None:
+    from deployment_packager import _infer_port
+
+    assert _infer_port({}, {}, {"rds_port": 5432, "app_port": 3001}) == 3001
+    assert _infer_port({}, {"compute": {"services": [{"process_type": "web", "port": 5432}]}}, {}) == 3000
+    assert _infer_port({}, {"compute": {"services": [{"process_type": "web", "port": 8080}]}}, {"db_port": 3306}) == 8080
 
 
 def test_packager_does_not_treat_cra_public_as_finished_static_site(tmp_path: Path) -> None:
@@ -300,6 +386,7 @@ def test_ec2_renderer_bootstraps_docker_engine(tmp_path: Path) -> None:
     assert 'APP_KIND="${var.app_kind}"' in main_tf
     assert "dnf install -y docker" in main_tf
     assert "docker compose" in main_tf
+    assert "up -d --no-build" in main_tf
     assert "docker build -t" in main_tf
     assert "docker run -d --name" in main_tf
     assert "root_volume_size_gb = 40" in next(
@@ -307,19 +394,19 @@ def test_ec2_renderer_bootstraps_docker_engine(tmp_path: Path) -> None:
     )
 
 
-def test_packager_falls_back_to_generated_static_package_for_unknown_app_shape(tmp_path: Path) -> None:
+def test_packager_requires_manifest_for_unknown_app_shape(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("No deployable entrypoint yet.", encoding="utf-8")
 
-    package = build_deployment_package(
-        source_root=str(tmp_path),
-        project_name="demo-app",
-        repository_context={"summary": "unknown app"},
-    )
-
-    assert package.app_kind == "static"
-    assert package.selected_root == "generated-placeholder"
-    assert package.package_file_count == 1
-    assert any("generated a static placeholder" in warning for warning in package.warnings)
+    try:
+        build_deployment_package(
+            source_root=str(tmp_path),
+            project_name="demo-app",
+            repository_context={"summary": "unknown app"},
+        )
+    except ManifestResolutionError as exc:
+        assert "deterministic_manifest_required" in str(exc)
+    else:
+        raise AssertionError("unknown repositories must request an explicit deplai.yaml")
 
 def test_ec2_renderer_fetches_secrets_manager_and_omits_oauth_plaintext(tmp_path: Path) -> None:
     (tmp_path / "package.json").write_text(

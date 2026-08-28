@@ -1,29 +1,100 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import { Copy, Check } from "lucide-react";
 
-const features = [
-  { 
-    title: "Repository-aware", 
-    description: "Start security and deployment work from the actual project context."
+const documentationHref = "/dashboard/documentation";
+
+const codeExamples = [
+  {
+    label: "Install",
+    code: `npm install @deplai/sdk
+
+# or
+yarn add @deplai/sdk
+pnpm add @deplai/sdk`,
   },
-  { 
-    title: "Guided planning", 
-    description: "Answer architecture questions and build a structured deployment profile."
+  {
+    label: "Initialize",
+    code: `import { DeplAI } from '@deplai/sdk'
+
+const deplai = new DeplAI({
+  apiKey: process.env.OPTIMUS_KEY
+})`,
   },
-  { 
-    title: "Reviewable outputs", 
-    description: "Inspect remediation changes and generated Terraform before execution."
-  },
-  { 
-    title: "Runtime visibility", 
-    description: "Verify, inspect, stop, and manage DeplAI-tagged AWS runtime resources."
+  {
+    label: "Deploy",
+    code: `const app = await deplai.deploy({
+  name: 'my-app',
+  region: 'auto',
+  scaling: {
+    min: 1,
+    max: 100
+  }
+})
+
+console.log('Live at:', app.url)`,
   },
 ];
 
+const features = [
+  { 
+    title: "TypeScript native", 
+    description: "Full type safety with auto-generated types."
+  },
+  { 
+    title: "Zero config", 
+    description: "Sensible defaults that just work."
+  },
+  { 
+    title: "Edge-ready", 
+    description: "Runs anywhere: Node, Deno, Bun, browsers."
+  },
+  { 
+    title: "12KB gzipped", 
+    description: "Lightweight with zero dependencies."
+  },
+];
+
+const codeAnimationStyles = `
+  .dev-code-line {
+    opacity: 0;
+    transform: translateX(-8px);
+    animation: devLineReveal 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  }
+  
+  @keyframes devLineReveal {
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+  
+  .dev-code-char {
+    opacity: 0;
+    filter: blur(8px);
+    animation: devCharReveal 0.3s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  }
+  
+  @keyframes devCharReveal {
+    to {
+      opacity: 1;
+      filter: blur(0);
+    }
+  }
+`;
+
 export function DevelopersSection() {
+  const [activeTab, setActiveTab] = useState(0);
+  const [copied, setCopied] = useState(false);
   const [isVisible, setIsVisible] = useState(false);
   const sectionRef = useRef<HTMLElement>(null);
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(codeExamples[activeTab].code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
 
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -39,66 +110,124 @@ export function DevelopersSection() {
 
   return (
     <section id="developers" ref={sectionRef} className="relative py-24 lg:py-32 overflow-hidden">
-
-      {/* Image â€” absolute, bottom-right, behind all content */}
-      <div
-        className={`absolute bottom-0 right-0 w-[55%] h-[85%] pointer-events-none transition-all duration-1000 delay-300 ${
-          isVisible ? "opacity-100" : "opacity-0"
-        }`}
-      >
-        <img
-          src="https://hebbkx1anhila5yf.public.blob.vercel-storage.com/Upscaled%20Image%20%2813%29-OQ2DiR3ElVsUg8kTvTL1kC5A3Q6maM.png"
-          alt=""
-          aria-hidden="true"
-          className="w-full h-full object-cover object-left-top"
-        />
-        {/* Fade left edge */}
-        <div className="absolute inset-0 bg-gradient-to-r from-background via-background/60 to-transparent" />
-        {/* Fade top edge */}
-        <div className="absolute inset-0 bg-gradient-to-b from-background via-transparent to-transparent" />
-      </div>
-
-      {/* All text content sits on top */}
-      <div className="relative z-10 max-w-[1400px] mx-auto px-6 lg:px-12">
-        {/* Header â€” Full width */}
-        <div
-          className={`mb-16 transition-all duration-700 ${
-            isVisible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-8"
-          }`}
-        >
-          <span className="inline-flex items-center gap-3 text-sm font-mono text-muted-foreground mb-6">
-            <span className="w-8 h-px bg-foreground/30" />
-            Engineering workspace
-          </span>
-          <h2 className="text-6xl md:text-7xl lg:text-[128px] font-display tracking-tight leading-[0.9]">
-            Guide your delivery.
-            <br />
-            <span className="text-muted-foreground">Keep control.</span>
-          </h2>
-        </div>
-
-        {/* Description + Features â€” left half only */}
-        <div
-          className={`max-w-[50%] transition-all duration-700 delay-100 ${
-            isVisible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-8"
-          }`}
-        >
-          <p className="text-xl text-muted-foreground mb-12 leading-relaxed max-w-md">
-            One workspace for security analysis, remediation, deployment planning, infrastructure generation, and runtime operations.
-          </p>
-          <div className="grid grid-cols-2 gap-6">
-            {features.map((feature, index) => (
-              <div
-                key={feature.title}
-                className={`transition-all duration-500 ${
-                  isVisible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"
-                }`}
-                style={{ transitionDelay: `${index * 50 + 200}ms` }}
-              >
-                <h3 className="font-medium mb-1">{feature.title}</h3>
-                <p className="text-sm text-muted-foreground">{feature.description}</p>
+      <style dangerouslySetInnerHTML={{ __html: codeAnimationStyles }} />
+      <div className="max-w-[1400px] mx-auto px-6 lg:px-12">
+        <div className="grid lg:grid-cols-2 gap-16 lg:gap-24 items-start">
+          {/* Left: Content */}
+          <div
+            className={`transition-all duration-700 ${
+              isVisible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-8"
+            }`}
+          >
+            <span className="inline-flex items-center gap-3 text-sm font-mono text-muted-foreground mb-6">
+              <span className="w-8 h-px bg-foreground/30" />
+              For builders
+            </span>
+            <h2 className="text-4xl lg:text-6xl font-display tracking-tight mb-8">
+              Built for agents.
+              <br />
+              <span className="text-muted-foreground">Owned by you.</span>
+            </h2>
+            <p className="text-xl text-muted-foreground mb-12 leading-relaxed">
+              DeplAI gives agents the context and interfaces they need to automate frontend changes, security fixes, infrastructure planning, and deployment without taking ownership away from your team.
+            </p>
+            
+            {/* Features */}
+            <div className="grid grid-cols-2 gap-6">
+              {features.map((feature, index) => (
+                <div
+                  key={feature.title}
+                  className={`transition-all duration-500 ${
+                    isVisible ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"
+                  }`}
+                  style={{ transitionDelay: `${index * 50 + 200}ms` }}
+                >
+                  <h3 className="font-medium mb-1">{feature.title}</h3>
+                  <p className="text-sm text-muted-foreground">{feature.description}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+          
+          {/* Right: Code block */}
+          <div
+            className={`lg:sticky lg:top-32 transition-all duration-700 delay-200 ${
+              isVisible ? "opacity-100 translate-x-0" : "opacity-0 translate-x-8"
+            }`}
+          >
+            <div className="border border-foreground/10">
+              {/* Tabs */}
+              <div className="flex items-center border-b border-foreground/10">
+                {codeExamples.map((example, idx) => (
+                  <button
+                    key={example.label}
+                    type="button"
+                    onClick={() => setActiveTab(idx)}
+                    className={`px-6 py-4 text-sm font-mono transition-colors relative ${
+                      activeTab === idx
+                        ? "text-foreground"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {example.label}
+                    {activeTab === idx && (
+                      <span className="absolute bottom-0 left-0 right-0 h-px bg-foreground" />
+                    )}
+                  </button>
+                ))}
+                <div className="flex-1" />
+                <button
+                  type="button"
+                  onClick={handleCopy}
+                  className="px-4 py-4 text-muted-foreground hover:text-foreground transition-colors"
+                  aria-label="Copy code"
+                >
+                  {copied ? (
+                    <Check className="w-4 h-4 text-green-600" />
+                  ) : (
+                    <Copy className="w-4 h-4" />
+                  )}
+                </button>
               </div>
-            ))}
+              
+              {/* Code content */}
+              <div className="p-8 font-mono text-sm bg-foreground/[0.01] min-h-[220px]">
+                <pre className="text-foreground/80">
+                  {codeExamples[activeTab].code.split('\n').map((line, lineIndex) => (
+                    <div 
+                      key={`${activeTab}-${lineIndex}`} 
+                      className="leading-loose dev-code-line"
+                      style={{ animationDelay: `${lineIndex * 80}ms` }}
+                    >
+                      <span className="inline-flex">
+                        {line.split('').map((char, charIndex) => (
+                          <span
+                            key={`${activeTab}-${lineIndex}-${charIndex}`}
+                            className="dev-code-char"
+                            style={{
+                              animationDelay: `${lineIndex * 80 + charIndex * 15}ms`,
+                            }}
+                          >
+                            {char === ' ' ? '\u00A0' : char}
+                          </span>
+                        ))}
+                      </span>
+                    </div>
+                  ))}
+                </pre>
+              </div>
+            </div>
+            
+            {/* Links */}
+            <div className="mt-6 flex items-center gap-6 text-sm">
+              <a href={documentationHref} className="text-foreground hover:underline underline-offset-4">
+                Read the docs
+              </a>
+              <span className="text-foreground/20">|</span>
+              <a href="#" className="text-muted-foreground hover:text-foreground">
+                View on GitHub
+              </a>
+            </div>
           </div>
         </div>
       </div>

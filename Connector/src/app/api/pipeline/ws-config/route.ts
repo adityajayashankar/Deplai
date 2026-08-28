@@ -20,12 +20,13 @@ export async function GET(request: NextRequest) {
   const { error } = await requireAuth();
   if (error) return error;
 
-  // AGENTIC_LAYER_URL is intentionally a Docker-internal service name. Never
-  // send it to a browser: use the explicitly configured public endpoint or
-  // the same-origin Caddy /agentic proxy instead.
-  const publicWsUrl = String(process.env.NEXT_PUBLIC_AGENTIC_WS_URL || '').trim();
-  const sameOriginWsBase = toWsBase(request.nextUrl.origin);
-  const wsBase = toWsBase(publicWsUrl) || (sameOriginWsBase ? `${sameOriginWsBase}/agentic` : null);
+  // AGENTIC_LAYER_URL is a Docker-internal hostname in production. Never send
+  // it to the browser. The browser always connects same-origin at /agentic,
+  // which Caddy (prod) or the Next.js upgrade proxy (dev) forwards only for
+  // /agentic/ws/*. HTTP Agentic APIs are not publicly rewritten.
+  const requestOrigin = request.nextUrl.origin;
+  const sameOriginWsBase = toWsBase(requestOrigin);
+  const wsBase = sameOriginWsBase ? `${sameOriginWsBase}/agentic` : null;
   if (!wsBase) {
     return NextResponse.json(
       { success: false, error: 'Unable to resolve the public WebSocket base URL.' },

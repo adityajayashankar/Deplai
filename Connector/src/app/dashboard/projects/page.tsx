@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { LOGIN_HREF } from '@/lib/auth-providers';
 
 const GITHUB_APP_INSTALL_URL =
   process.env.NEXT_PUBLIC_GITHUB_APP_INSTALL_URL
@@ -24,7 +25,7 @@ export default function DashboardProjectsRedirectPage() {
       if (cancelled) return;
 
       if (!session?.isLoggedIn || !session.user) {
-        window.location.assign('/api/auth/login?force=1');
+        window.location.assign(LOGIN_HREF);
         return;
       }
 

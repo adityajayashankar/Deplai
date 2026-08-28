@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
@@ -9,6 +11,17 @@ from openai import OpenAI
 # Default model and provider can be modified based on available APIs
 DEFAULT_MODEL = "llama-3.1-8b-instant"
 DEFAULT_PROVIDER = "groq"  # Can be one of: openai, groq, anthropic, openrouter
+
+
+def _ensure_gateway_import() -> None:
+    try:
+        import ai_gateway  # noqa: F401
+        return
+    except ImportError:
+        pass
+    agentic = Path(__file__).resolve().parents[3] / "Agentic Layer"
+    if agentic.exists() and str(agentic) not in sys.path:
+        sys.path.insert(0, str(agentic))
 
 
 def get_llm_client() -> OpenAI:
@@ -62,8 +75,6 @@ def chat_text(
     user_prompt: str | None = None,
     temperature: float = 0.2,
 ) -> str:
-    client = get_llm_client()
-    model = get_model()
     request_messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
     if messages:
         for message in messages:
@@ -74,6 +85,24 @@ def chat_text(
             request_messages.append({"role": role, "content": content})
     elif user_prompt is not None:
         request_messages.append({"role": "user", "content": user_prompt})
+
+    try:
+        _ensure_gateway_import()
+        from ai_gateway import chat_text as gateway_chat_text, gateway_ready
+        if gateway_ready():
+            ok, text = gateway_chat_text(
+                model=os.environ.get("GROQ_MODEL") or "best_coding",
+                messages=request_messages,
+                task="coding",
+                temperature=temperature,
+            )
+            if ok:
+                return text
+    except Exception:
+        pass
+
+    client = get_llm_client()
+    model = get_model()
 
     try:
         response = client.chat.completions.create(
@@ -88,6 +117,21 @@ def chat_text(
 
 
 def chat_json(system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    try:
+        _ensure_gateway_import()
+        from ai_gateway import chat_json as gateway_chat_json, gateway_ready
+        if gateway_ready():
+            return gateway_chat_json(
+                model=os.environ.get("GROQ_MODEL") or "best_coding",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                task="coding",
+            )
+    except Exception:
+        pass
+
     client = get_llm_client()
     model = get_model()
 

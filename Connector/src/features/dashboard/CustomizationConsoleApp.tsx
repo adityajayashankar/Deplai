@@ -2,17 +2,29 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Lock, PanelLeftOpen } from 'lucide-react';
+import { KeyRound, Sparkles } from 'lucide-react';
 import { AgentPanel } from '@/features/customization/AgentPanel';
-import { ByokDialog } from '@/features/customization/ByokDialog';
+import { ModelSourceDialog } from '@/features/customization/ModelSourceDialog';
 import {
   AUTO_APPLY_STORAGE_KEY,
+  CUSTOMIZATION_MODES,
   DEFAULT_APP_TARGETS,
   INITIAL_CHAT_TIMESTAMP,
-  PROVIDER_TO_BACKEND_ID,
   REVERT_TO_BASE_CHAT_PATTERN,
   TENANT_STORAGE_KEY,
 } from '@/features/customization/config';
+import {
+  continueFrontendRun,
+  frontendZipUrl,
+  isEngineBusy,
+  listFrontendDiffs,
+  listFrontendFiles,
+  readFrontendRun,
+  restoreFrontendCheckpoint,
+  startFrontendRun,
+  finalizeFrontendRun,
+} from '@/features/customization/engine';
+import { StudioHome, StudioWorkspace } from '@/features/customization/StudioLayout';
 import { PreviewPanel } from '@/features/customization/PreviewPanel';
 import {
   AssetsPanel,
@@ -32,14 +44,15 @@ import type {
   AssetPreview,
   AssetsListResponse,
   AssetType,
-  ByokConfig,
-  ByokProvider,
   ChatMessage,
   ChatResponse,
   ConfirmationState,
   ConfirmResponse,
   CustomizationHandoffRecord,
+  CustomizationMode,
   DiffEntry,
+  FrontendFileListing,
+  FrontendRunView,
   ImplementResponse,
   ImplementRunState,
   LoadingState,
@@ -52,6 +65,7 @@ import type {
   SnapshotMetadata,
   CustomizationPrResult,
   StatusState,
+  StudioBottomTab,
   UploadAssetResponse,
   WorkflowStage,
   WorkspaceTab,
@@ -70,6 +84,12 @@ import {
   sanitizeManifestForDisplay,
   sanitizeTenantId,
 } from '@/features/customization/utils';
+import {
+  DEFAULT_PLATFORM_MODEL_VALUE,
+  type PlatformModelValue,
+} from '@/features/ai-platform/PlatformModelPicker';
+import { persistSessionProgress } from '@/lib/sessions/client';
+import type { SessionStatus } from '@/lib/sessions/types';
 
 const initialLoading: LoadingState = {
   chat: false,
@@ -128,13 +148,10 @@ export default function CustomizationConsoleApp() {
   const [previewNonce, setPreviewNonce] = useState(0);
   const [previewMeta, setPreviewMeta] = useState<PreviewMetaResponse | null>(null);
   const [previewMetaLoading, setPreviewMetaLoading] = useState(false);
-  const [previewDevice, setPreviewDevice] = useState<PreviewDevice>('desktop');
   const [railCollapsed, setRailCollapsed] = useState(false);
-  const [agentOpen, setAgentOpen] = useState(true);
-  const [agentWidth, setAgentWidth] = useState(330);
-  const [resizingAgent, setResizingAgent] = useState(false);
-  const [showByok, setShowByok] = useState(false);
+  const [showModelSource, setShowModelSource] = useState(false);
   const [showHandoff, setShowHandoff] = useState(false);
+  const [showWorkspaceTools, setShowWorkspaceTools] = useState(false);
   const [autoApply, setAutoApply] = useState(false);
   const [loading, setLoading] = useState<LoadingState>(initialLoading);
   const [finalizing, setFinalizing] = useState(false);
@@ -142,18 +159,74 @@ export default function CustomizationConsoleApp() {
   const [deployedUrl, setDeployedUrl] = useState('');
   const [creatingGitPr, setCreatingGitPr] = useState(false);
   const [gitPrResult, setGitPrResult] = useState<CustomizationPrResult | null>(null);
+  const [customizationMode, setCustomizationMode] = useState<CustomizationMode>('full_transformation');
+  const [customizationGoal, setCustomizationGoal] = useState('Improve overall UI/UX');
+  const [selectedScreens, setSelectedScreens] = useState<string[]>([]);
+  const [engineRun, setEngineRun] = useState<FrontendRunView | null>(null);
+  const [engineFiles, setEngineFiles] = useState<FrontendFileListing | null>(null);
+  const [engineDiffs, setEngineDiffs] = useState<DiffEntry[]>([]);
+  const [engineFile, setEngineFile] = useState('');
+  const [engineTab, setEngineTab] = useState<StudioBottomTab | null>(null);
+  const [previewDevice, setPreviewDevice] = useState<PreviewDevice>('desktop');
+  const [compareOriginal, setCompareOriginal] = useState(false);
+  const [engineStarting, setEngineStarting] = useState(false);
+  const [engineContinuing, setEngineContinuing] = useState(false);
+  const [engineRestoring, setEngineRestoring] = useState(false);
+  const uiuxLogCursorRef = useRef(0);
+  const uiuxRunIdRef = useRef<string | null>(null);
 
-  const [byokDraft, setByokDraft] = useState<{ provider: ByokProvider | ''; modelId: string; apiKey: string }>({
-    provider: '',
-    modelId: '',
-    apiKey: '',
-  });
-  const [byokConfig, setByokConfig] = useState<ByokConfig | null>(null);
+  const [agentModel, setAgentModel] = useState<PlatformModelValue>(DEFAULT_PLATFORM_MODEL_VALUE);
+
+  const llmConfig = useMemo(
+    () => ({
+      access_mode: agentModel.accessMode,
+      model: agentModel.model,
+      provider: agentModel.provider || '',
+    }),
+    [agentModel.accessMode, agentModel.model, agentModel.provider],
+  );
 
   const effectiveTenantId = useMemo(
     () => sanitizeTenantId(tenantId || tenantFromQuery || projectName || ''),
     [projectName, tenantFromQuery, tenantId],
   );
+
+  useEffect(() => {
+    const runId = engineRun?.run_id || null;
+    if (runId !== uiuxRunIdRef.current) {
+      uiuxRunIdRef.current = runId;
+      uiuxLogCursorRef.current = 0;
+    }
+    const sessionId = engineRun?.workspace_session_id;
+    if (!sessionId) return;
+    const events = Array.isArray(engineRun.events) ? engineRun.events : [];
+    const fresh = events.slice(uiuxLogCursorRef.current);
+    uiuxLogCursorRef.current = events.length;
+    const statusRaw = String(engineRun.status || '');
+    const status: SessionStatus = statusRaw === 'awaiting_review'
+      ? 'needs_review'
+      : statusRaw === 'failed' || statusRaw === 'blocked'
+        ? 'failed'
+        : statusRaw === 'completed'
+          ? 'completed'
+          : statusRaw === 'queued'
+            ? 'queued'
+            : 'running';
+    persistSessionProgress(sessionId, {
+      status,
+      current_stage: engineRun.current_stage || status,
+      lines: fresh
+        .map((event) => ({
+          level: 'info' as const,
+          message: String(event.summary || event.stage || '').trim(),
+          ts: event.at,
+          stage: event.stage || null,
+        }))
+        .filter((line) => line.message.length > 0),
+      completed: status === 'completed' || status === 'failed',
+    });
+  }, [engineRun]);
+
   const previewUrl = useMemo(() => {
     if (!projectId) return '';
     const tenantSegment = effectiveTenantId ? `_tenant/${encodeURIComponent(effectiveTenantId)}/` : '';
@@ -165,17 +238,24 @@ export default function CustomizationConsoleApp() {
     return `/api/customization/preview/${encodeURIComponent(projectId)}/${tenantSegment}?meta=1&v=${previewNonce}`;
   }, [effectiveTenantId, previewNonce, projectId]);
 
-  const previewStarting = previewMeta?.preview_kind === 'live_server' && previewMeta.preview_status === 'starting';
+  const previewStarting = previewMeta?.preview_kind === 'live_server'
+    && (previewMeta.preview_status === 'starting' || previewMeta.preview_status === 'stopped');
   const previewFailed = previewMeta?.preview_kind === 'live_server' && previewMeta.preview_status === 'failed';
   const previewHeld = previewStarting || previewFailed || (previewMetaLoading && !previewMeta);
-  const previewFrameSrc = previewHeld ? '' : previewUrl;
   const previewReady =
     (previewMeta?.preview_kind === 'live_server' && previewMeta.preview_status === 'ready') ||
     (previewMeta?.preview_kind === 'static_file' && Boolean(previewMeta.preview_entry)) ||
     lastPreviewPayload?.status === 'ready';
+  // Do not mount the preview iframe until its status endpoint has confirmed it.
+  // Otherwise an unavailable backend renders a raw JSON error in the design surface.
+  const previewFrameSrc = !previewHeld && previewReady ? previewUrl : '';
   const qualityAcceptable = qualityReport?.status === 'passed' || qualityReport?.status === 'warning';
-  const isBusy = Object.values(loading).some(Boolean) || previewMetaLoading || finalizing;
+  const isBusy = Object.values(loading).some(Boolean) || previewMetaLoading || finalizing || engineStarting || engineContinuing || engineRestoring;
   const displayManifest = useMemo(() => (manifest ? sanitizeManifestForDisplay(manifest) : null), [manifest]);
+  const modelButtonLabel = useMemo(() => {
+    const model = agentModel.model || 'best';
+    return `${agentModel.sourceLabel} · ${model}`;
+  }, [agentModel.model, agentModel.sourceLabel]);
 
   const workflowStage = useMemo<WorkflowStage>(() => {
     if (!effectiveTenantId || !manifest) return 'draft';
@@ -261,18 +341,6 @@ export default function CustomizationConsoleApp() {
   }, [messages, loading.chat]);
 
   useEffect(() => {
-    if (!resizingAgent) return;
-    const handleMove = (event: MouseEvent) => setAgentWidth(Math.min(480, Math.max(280, event.clientX)));
-    const handleUp = () => setResizingAgent(false);
-    window.addEventListener('mousemove', handleMove);
-    window.addEventListener('mouseup', handleUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMove);
-      window.removeEventListener('mouseup', handleUp);
-    };
-  }, [resizingAgent]);
-
-  useEffect(() => {
     if (!previewMetaUrl) {
       setPreviewMeta(null);
       setPreviewMetaLoading(false);
@@ -296,6 +364,48 @@ export default function CustomizationConsoleApp() {
       cancelled = true;
     };
   }, [previewMetaUrl]);
+
+  useEffect(() => {
+    if (!projectId || !effectiveTenantId || !resolvedRepoPath || previewMetaLoading) return;
+
+    const liveActive =
+      previewMeta?.preview_kind === 'live_server'
+      && (previewMeta.preview_status === 'ready' || previewMeta.preview_status === 'starting');
+    const staticActive =
+      previewMeta?.preview_kind === 'static_file'
+      && previewMeta.preview_status === 'ready';
+    if (liveActive || staticActive) return;
+
+    let cancelled = false;
+    const bootPreview = async () => {
+      try {
+        const response = await fetch('/api/customization/preview/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: projectId,
+            tenant_id: effectiveTenantId,
+            base_repo_path: resolvedRepoPath,
+          }),
+        });
+        if (!cancelled && response.ok) refreshPreview();
+      } catch {
+        // Static sandbox preview remains available when live boot fails.
+      }
+    };
+    void bootPreview();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    effectiveTenantId,
+    previewMeta?.preview_kind,
+    previewMeta?.preview_status,
+    previewMetaLoading,
+    projectId,
+    refreshPreview,
+    resolvedRepoPath,
+  ]);
 
   useEffect(() => {
     if (!previewStarting) return;
@@ -491,15 +601,7 @@ export default function CustomizationConsoleApp() {
             pipeline_mode: implementRun.pipelineMode,
             run_quality_gates: true,
             start_preview: true,
-            ...(byokConfig
-              ? {
-                  llm_config: {
-                    provider: PROVIDER_TO_BACKEND_ID[byokConfig.provider],
-                    model: byokConfig.modelId,
-                    api_key: byokConfig.apiKey,
-                  },
-                }
-              : {}),
+            llm_config: llmConfig,
           }),
         });
         const payload = await parseJsonSafe<ImplementResponse>(response);
@@ -579,12 +681,12 @@ export default function CustomizationConsoleApp() {
       }
     },
     [
-      byokConfig,
       confirmedTenantId,
       fetchManifest,
       implementRun.appTargets,
       implementRun.pipelineMode,
       isConfirmed,
+      llmConfig,
       projectId,
       refreshPreview,
       tenantId,
@@ -681,11 +783,10 @@ export default function CustomizationConsoleApp() {
     [clearRunResults, loadAssets, projectId, refreshPreview, syncConfirmation, tenantId],
   );
 
-  const handleChatSubmit = useCallback(
-    async (event: React.FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
+  const submitCustomization = useCallback(
+    async (rawMessage: string) => {
       const activeTenantId = sanitizeTenantId(tenantId);
-      const message = chatInput.trim();
+      const message = rawMessage.trim();
       if (!activeTenantId || !message) return;
       setMessages((previous) => [...previous, { role: 'user', content: message, timestamp: nowStamp() }]);
       setChatInput('');
@@ -702,15 +803,7 @@ export default function CustomizationConsoleApp() {
           body: JSON.stringify({
             tenant_id: activeTenantId,
             message,
-            ...(byokConfig
-              ? {
-                  llm_config: {
-                    provider: PROVIDER_TO_BACKEND_ID[byokConfig.provider],
-                    model: byokConfig.modelId,
-                    api_key: byokConfig.apiKey,
-                  },
-                }
-              : {}),
+            llm_config: llmConfig,
           }),
         });
         const payload = await parseJsonSafe<ChatResponse>(response);
@@ -727,7 +820,6 @@ export default function CustomizationConsoleApp() {
         syncConfirmation(payload?.confirmation);
         setImplementStatus('idle');
         await loadAssets(activeTenantId);
-        setActiveTab('manifest');
         setStatus({ level: 'success', text: 'Draft updated. Review and confirm before applying.' });
       } catch (error) {
         const messageText = error instanceof Error ? error.message : 'Failed to send instruction.';
@@ -740,7 +832,15 @@ export default function CustomizationConsoleApp() {
         setLoading((previous) => ({ ...previous, chat: false }));
       }
     },
-    [byokConfig, chatInput, loadAssets, resetRepository, syncConfirmation, tenantId],
+    [llmConfig, loadAssets, resetRepository, syncConfirmation, tenantId],
+  );
+
+  const handleChatSubmit = useCallback(
+    (event: React.FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      void submitCustomization(chatInput);
+    },
+    [chatInput, submitCustomization],
   );
 
   const handleAssetUpload = useCallback(
@@ -941,6 +1041,163 @@ export default function CustomizationConsoleApp() {
     }
   }, [creatingGitPr, effectiveTenantId, projectId, snapshot?.snapshot_id]);
 
+  const refreshEngineArtifacts = useCallback(async (runId: string, file?: string) => {
+    try {
+      const [listing, entries] = await Promise.all([
+        listFrontendFiles(runId),
+        listFrontendDiffs(runId, file),
+      ]);
+      setEngineFiles(listing);
+      setEngineDiffs(entries);
+      if (!file) {
+        const first = listing.files_changed?.[0]?.file || listing.files_added?.[0]?.file || '';
+        if (first) setEngineFile(first);
+      }
+    } catch {
+      // Artifacts populate as the graph writes checkpoints.
+    }
+  }, []);
+
+  useEffect(() => {
+    const runId = engineRun?.run_id;
+    if (!runId) return;
+    const busy = isEngineBusy(engineRun.status);
+    if (!busy) {
+      void refreshEngineArtifacts(runId, engineFile || undefined);
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const next = await readFrontendRun(runId);
+        if (cancelled) return;
+        setEngineRun(next);
+        await refreshEngineArtifacts(runId, engineFile || undefined);
+        refreshPreview();
+      } catch (error) {
+        if (!cancelled) {
+          setStatus({
+            level: 'error',
+            text: error instanceof Error ? error.message : 'Failed to poll the customization run.',
+          });
+        }
+      }
+    };
+    const timer = window.setInterval(() => void tick(), 1800);
+    void tick();
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [engineFile, engineRun?.run_id, engineRun?.status, refreshEngineArtifacts, refreshPreview]);
+
+  const startEngine = useCallback(async () => {
+    if (!projectId) {
+      setStatus({ level: 'warning', text: 'Open this page from a project so the repository can be resolved.' });
+      return;
+    }
+    if (!agentModel.ready) {
+      setShowModelSource(true);
+      setStatus({
+        level: 'warning',
+        text: agentModel.blockedReason || 'Choose a platform model or a saved BYOK credential first.',
+      });
+      return;
+    }
+    setEngineStarting(true);
+    setStatus({ level: 'info', text: 'Starting repository analysis…' });
+    try {
+      const next = await startFrontendRun({
+        projectId,
+        tenantId: effectiveTenantId,
+        goal: customizationGoal,
+        mode: customizationMode,
+        selectedScreens,
+        llm: {
+          accessMode: agentModel.accessMode,
+          model: agentModel.model,
+          provider: agentModel.provider,
+        },
+      });
+      setEngineRun(next);
+      setEngineTab(null);
+      setStatus({ level: 'success', text: 'Customization run started. Watching multi-agent progress.' });
+    } catch (error) {
+      setStatus({
+        level: 'error',
+        text: error instanceof Error ? error.message : 'Failed to start frontend customization.',
+      });
+    } finally {
+      setEngineStarting(false);
+    }
+  }, [agentModel, customizationGoal, customizationMode, effectiveTenantId, projectId, selectedScreens]);
+
+  const continueEngine = useCallback(async () => {
+    if (!engineRun?.run_id) return;
+    setEngineContinuing(true);
+    try {
+      const next = await continueFrontendRun(engineRun.run_id, {
+        userInput: { mode: customizationMode },
+        confirmed: true,
+      });
+      setEngineRun(next);
+      setStatus({ level: 'info', text: 'Continuing the customization graph…' });
+    } catch (error) {
+      setStatus({
+        level: 'error',
+        text: error instanceof Error ? error.message : 'Failed to continue the run.',
+      });
+    } finally {
+      setEngineContinuing(false);
+    }
+  }, [customizationMode, engineRun?.run_id]);
+
+  const restoreEngineCheckpoint = useCallback(async (checkpointId: string) => {
+    if (!engineRun?.run_id) return;
+    setEngineRestoring(true);
+    try {
+      const next = await restoreFrontendCheckpoint(engineRun.run_id, checkpointId);
+      setEngineRun(next);
+      setStatus({ level: 'success', text: 'Checkpoint restored. You can continue from that stage.' });
+    } catch (error) {
+      setStatus({
+        level: 'error',
+        text: error instanceof Error ? error.message : 'Failed to restore the checkpoint.',
+      });
+    } finally {
+      setEngineRestoring(false);
+    }
+  }, [engineRun?.run_id]);
+
+  const downloadEngineZip = useCallback(() => {
+    if (!engineRun?.run_id || !engineRun.gate_passed) return;
+    window.location.assign(frontendZipUrl(engineRun.run_id));
+  }, [engineRun?.gate_passed, engineRun?.run_id]);
+
+  const finalizeEngine = useCallback(async () => {
+    if (!engineRun?.run_id || !projectId || !effectiveTenantId) return;
+    setFinalizing(true);
+    try {
+      const payload = await finalizeFrontendRun(engineRun.run_id, {
+        projectId,
+        tenantId: effectiveTenantId,
+      });
+      const snapshotPayload = payload.snapshot && typeof payload.snapshot === 'object'
+        ? payload.snapshot as SnapshotMetadata
+        : null;
+      if (snapshotPayload?.snapshot_id) setSnapshot(snapshotPayload);
+      setShowHandoff(true);
+      setStatus({ level: 'success', text: 'Snapshot ready. Create a GitHub PR or continue to security.' });
+    } catch (error) {
+      setStatus({
+        level: 'error',
+        text: error instanceof Error ? error.message : 'Failed to finalize the customized repository.',
+      });
+    } finally {
+      setFinalizing(false);
+    }
+  }, [effectiveTenantId, engineRun?.run_id, projectId]);
+
   const canFinalize = Boolean(
     projectId &&
       effectiveTenantId &&
@@ -949,167 +1206,275 @@ export default function CustomizationConsoleApp() {
   );
 
   return (
-    <div className="customization-workspace flex h-screen min-h-[560px] flex-col overflow-hidden bg-[#09090b] font-sans text-zinc-300">
+    <div className="customization-workspace flex h-full min-h-[560px] overflow-hidden bg-white font-sans text-black">
       <style>{`
-        .customization-workspace { --font-sans: 'Noto Sans', sans-serif; --font-display: 'Space Grotesk', sans-serif; --font-mono: 'JetBrains Mono', monospace; }
+        .customization-workspace { --font-sans: 'Instrument Sans', 'Noto Sans', sans-serif; --font-display: 'Space Grotesk', sans-serif; --font-mono: 'JetBrains Mono', monospace; }
         .customization-workspace h1, .customization-workspace h2 { font-family: var(--font-display); }
-        .customization-scrollbar { scrollbar-width: thin; scrollbar-color: #27272a transparent; }
-        .customization-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
-        .customization-scrollbar::-webkit-scrollbar-thumb { background: #27272a; border-radius: 999px; }
+        .customization-workspace .grid-bg-fine { background-image: linear-gradient(rgba(0,0,0,.06) 1px, transparent 1px), linear-gradient(90deg, rgba(0,0,0,.06) 1px, transparent 1px); background-size: 26px 26px; }
         @media (prefers-reduced-motion: reduce) {
           .customization-workspace *, .customization-workspace *::before, .customization-workspace *::after {
             scroll-behavior: auto !important; animation-duration: 0.01ms !important; transition-duration: 0.01ms !important;
           }
         }
       `}</style>
-      <CommandHeader
-        projectLabel={projectName || projectId}
-        tenantId={tenantId}
-        onTenantChange={handleTenantChange}
-        onBack={() => router.push('/dashboard')}
-        onConfirm={() => void handleExplicitConfirm()}
-        onApply={() => void applyChanges()}
-        onOpenHandoff={() => setShowHandoff(true)}
-        isConfirmed={isConfirmed}
-        hasManifest={Boolean(manifest)}
-        isBusy={isBusy}
-      />
-      <div className="relative flex min-h-0 flex-1 overflow-hidden">
-        <WorkflowRail
-          currentStage={workflowStage}
-          collapsed={railCollapsed}
-          onToggle={() => setRailCollapsed((previous) => !previous)}
-          onSelectStage={selectWorkflowStage}
-        />
-        <AgentPanel
-          open={agentOpen}
-          width={agentWidth}
-          messages={messages}
-          input={chatInput}
-          loading={loading.chat}
-          disabled={!tenantId.trim()}
-          byokLabel={byokConfig ? byokConfig.provider : 'BYOK'}
-          chatEndRef={chatEndRef}
-          onInputChange={setChatInput}
-          onSubmit={handleChatSubmit}
-          onClose={() => setAgentOpen(false)}
-          onOpenByok={() => setShowByok(true)}
-          onResetSession={() => void resetSession()}
-          onResizeStart={() => setResizingAgent(true)}
-        />
-        <main className="relative flex min-w-0 flex-1 flex-col">
-          {!agentOpen && (
+      <div className="flex min-w-0 flex-1 flex-col">
+      <CommandHeader onBack={() => router.push('/dashboard')} />
+      <main className="flex min-h-0 flex-1 flex-col overflow-auto px-5 py-8 sm:px-9 sm:py-9 xl:px-10">
+        <section className="mb-10 flex flex-col justify-between gap-5 xl:flex-row xl:items-start">
+          <div>
+            <h1 className="text-3xl font-semibold tracking-tight text-black sm:text-[36px]">Frontend Customization</h1>
+            <p className="mt-3 max-w-2xl text-[15px] leading-6 text-neutral-600">
+              Ask for last-minute UI changes in plain English, or run a full multi-agent UI/UX transformation. Agents edit presentational code only — never your business logic.
+            </p>
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center gap-3">
+            <label className="sr-only" htmlFor="customization-mode">Customization mode</label>
+            <select
+              id="customization-mode"
+              value={customizationMode}
+              onChange={(event) => setCustomizationMode(event.target.value as CustomizationMode)}
+              className="h-12 min-w-56 border-[3px] border-black bg-white px-3 text-[13px] font-bold text-black shadow-[4px_4px_0_0_#000]"
+            >
+              {CUSTOMIZATION_MODES.map((item) => (
+                <option key={item.value} value={item.value}>{item.label}</option>
+              ))}
+            </select>
             <button
               type="button"
-              onClick={() => setAgentOpen(true)}
-              aria-label="Open agent panel"
-              className="absolute left-2 top-1.5 z-20 rounded-md border border-white/10 bg-[#111113] p-2 text-zinc-500 shadow-lg hover:text-zinc-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-300"
+              onClick={() => setShowModelSource(true)}
+              className="inline-flex h-12 min-w-0 max-w-[16rem] items-center gap-2 border-[3px] border-black bg-white px-4 text-[13px] font-bold text-black shadow-[4px_4px_0_0_#000] transition-transform hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none"
+              title={agentModel.blockedReason || `${agentModel.sourceLabel} model from AI Platform`}
             >
-              <PanelLeftOpen className="h-3.5 w-3.5" />
+              {agentModel.accessMode === 'byok' ? <KeyRound className="h-4 w-4 shrink-0" /> : <Sparkles className="h-4 w-4 shrink-0" />}
+              <span className="truncate">{modelButtonLabel}</span>
             </button>
-          )}
-          <WorkspaceTabs
-            active={activeTab}
-            onChange={setActiveTab}
-            errorCount={errors.length}
-            pendingAssetCount={pendingAssetTypes.length}
+            <button
+              type="button"
+              onClick={() => setShowWorkspaceTools(true)}
+              className="inline-flex h-12 items-center gap-2 border-[3px] border-black bg-white px-3 text-[11px] font-bold text-black shadow-[4px_4px_0_0_#000] transition-transform hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none"
+              title="Open review and workspace controls"
+            >
+              Review
+            </button>
+            {engineRun?.run_id ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setEngineRun(null);
+                  setEngineFiles(null);
+                  setEngineDiffs([]);
+                  setEngineFile('');
+                  setStatus({ level: 'info', text: 'Ready to start a new customization run.' });
+                }}
+                className="inline-flex h-12 items-center border-[3px] border-black bg-white px-3 text-[11px] font-bold text-black shadow-[4px_4px_0_0_#000]"
+              >
+                New run
+              </button>
+            ) : null}
+          </div>
+        </section>
+
+        {engineRun?.run_id ? (
+          <StudioWorkspace
+            run={engineRun}
+            files={engineFiles}
+            diffs={engineDiffs.length ? engineDiffs : diffs}
+            selectedFile={engineFile}
+            inspectorTab={engineTab}
+            previewDevice={previewDevice}
+            compareOriginal={compareOriginal}
+            previewMeta={previewMeta}
+            previewMetaLoading={previewMetaLoading}
+            previewFrameSrc={previewFrameSrc}
+            mode={customizationMode}
+            continuing={engineContinuing}
+            restoring={engineRestoring}
+            finalizing={finalizing}
+            onInspectorTab={setEngineTab}
+            onSelectFile={(file) => {
+              setEngineFile(file);
+              if (engineRun.run_id) void refreshEngineArtifacts(engineRun.run_id, file);
+            }}
+            onPreviewDevice={setPreviewDevice}
+            onToggleCompare={() => setCompareOriginal((previous) => !previous)}
+            onRefreshPreview={refreshPreview}
+            onModeChange={setCustomizationMode}
+            onContinue={() => void continueEngine()}
+            onRestore={(checkpointId) => void restoreEngineCheckpoint(checkpointId)}
+            onDownloadZip={downloadEngineZip}
+            onFinalize={() => void finalizeEngine()}
+            onCreatePr={() => void createGitPr()}
+            creatingGitPr={creatingGitPr}
           />
-          <div className="relative min-h-0 flex-1">
-            {!tenantId.trim() && (
-              <div className="absolute inset-0 z-20 flex items-center justify-center bg-[#09090b]/90 p-6 backdrop-blur-sm">
-                <div className="max-w-sm rounded-xl border border-white/10 bg-[#111113] p-6 text-center shadow-2xl">
-                  <Lock className="mx-auto h-6 w-6 text-zinc-600" />
-                  <h1 className="mt-3 text-base font-semibold text-zinc-100">Workspace ID required</h1>
-                  <p className="mt-1 text-xs leading-5 text-zinc-500">Enter a workspace ID in the command header to unlock customization controls.</p>
+        ) : (
+          <StudioHome
+            projectName={projectName || 'Connected repository'}
+            stackSummary=""
+            goal={customizationGoal}
+            mode={customizationMode}
+            selectedScreens={selectedScreens}
+            availableScreens={[]}
+            starting={engineStarting}
+            canStart={Boolean(projectId) && agentModel.ready}
+            modelHint={!agentModel.ready ? (agentModel.blockedReason || 'Choose a platform or BYOK model first.') : undefined}
+            onGoalChange={setCustomizationGoal}
+            onModeChange={setCustomizationMode}
+            onToggleScreen={(screen) => {
+              setSelectedScreens((previous) => (
+                previous.includes(screen) ? previous.filter((item) => item !== screen) : [...previous, screen]
+              ));
+            }}
+            onStart={() => void startEngine()}
+          />
+        )}
+      </main>
+
+      {showWorkspaceTools && (
+        <div
+          className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+          role="presentation"
+          onMouseDown={() => setShowWorkspaceTools(false)}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-label="Customization review controls"
+            onMouseDown={(event) => event.stopPropagation()}
+            className="app-paper flex h-[min(760px,calc(100vh-2rem))] w-full max-w-6xl flex-col overflow-hidden"
+          >
+            <div className="flex shrink-0 items-center justify-between gap-3 border-b-[3px] border-black px-5 py-4">
+              <div>
+                <p className="text-sm font-semibold text-black">Review & workspace controls</p>
+                <p className="mt-0.5 text-[11px] text-neutral-500">Manifest, changes, quality checks, assets, and implementation settings.</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleExplicitConfirm()}
+                  disabled={!manifest || isBusy}
+                  className="rounded-none border-[3px] border-black bg-white px-3 py-2 text-xs font-bold text-black shadow-[4px_4px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Confirm manifest
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void applyChanges()}
+                  disabled={!manifest || isBusy}
+                  className="rounded-none border-[3px] border-black bg-black px-3 py-2 text-xs font-bold text-white shadow-[4px_4px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Apply changes
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowHandoff(true)}
+                  className="rounded-none border-[3px] border-black bg-white px-3 py-2 text-xs font-bold text-black shadow-[4px_4px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none"
+                >
+                  Handoff
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowWorkspaceTools(false)}
+                  className="rounded-none border-[3px] border-black bg-white px-2 py-2 text-xs font-bold text-black shadow-[4px_4px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="flex min-h-0 flex-1">
+              <WorkflowRail
+                currentStage={workflowStage}
+                collapsed={railCollapsed}
+                onToggle={() => setRailCollapsed((previous) => !previous)}
+                onSelectStage={selectWorkflowStage}
+              />
+              <div className="flex min-w-0 flex-1 flex-col">
+                <WorkspaceTabs
+                  active={activeTab}
+                  onChange={setActiveTab}
+                  errorCount={errors.length}
+                  pendingAssetCount={pendingAssetTypes.length}
+                />
+                <div className="relative min-h-0 flex-1">
+                  {activeTab === 'changes' && <ChangesPanel entries={diffs} />}
+                  {activeTab === 'quality' && (
+                    <QualityPanel
+                      errors={errors}
+                      warnings={warnings}
+                      report={qualityReport}
+                      validatorIssues={implementRun.validatorIssues}
+                      repairing={loading.repair}
+                      onRepair={() =>
+                        void runImplementation({
+                          isRepairPass: true,
+                          validatorIssues: implementRun.validatorIssues,
+                          skipConfirmCheck: true,
+                        })
+                      }
+                    />
+                  )}
+                  {activeTab === 'manifest' && (
+                    <ManifestPanel
+                      manifest={displayManifest}
+                      confirmed={isConfirmed}
+                      loading={loading.manifest || loading.confirm}
+                      onReload={() => void fetchManifest()}
+                      onConfirm={() => void handleExplicitConfirm()}
+                    />
+                  )}
+                  {activeTab === 'assets' && (
+                    <AssetsPanel
+                      assetType={assetType}
+                      assets={assets}
+                      loading={loading}
+                      fileInputRef={fileInputRef}
+                      onAssetTypeChange={setAssetType}
+                      onUpload={handleAssetUpload}
+                      onChooseFile={() => fileInputRef.current?.click()}
+                      onApplyNow={() => void applyChanges()}
+                    />
+                  )}
+                  {activeTab === 'settings' && (
+                    <SettingsPanel
+                      run={implementRun}
+                      autoApply={autoApply}
+                      resolvedRepoPath={resolvedRepoPath}
+                      onRunChange={setImplementRun}
+                      onAutoApplyChange={updateAutoApply}
+                    />
+                  )}
+                  {activeTab === 'preview' && (
+                    <div className="grid h-full min-h-0 lg:grid-cols-2">
+                      <PreviewPanel meta={previewMeta} metaLoading={previewMetaLoading} frameSrc={previewFrameSrc} compact />
+                      <AgentPanel
+                        messages={messages}
+                        input={chatInput}
+                        loading={loading.chat}
+                        disabled={!tenantId.trim()}
+                        chatEndRef={chatEndRef}
+                        onInputChange={setChatInput}
+                        onSubmit={handleChatSubmit}
+                        onSuggestionSubmit={(suggestion) => void submitCustomization(suggestion)}
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
-            )}
-            {activeTab === 'preview' && (
-              <PreviewPanel
-                device={previewDevice}
-                meta={previewMeta}
-                metaLoading={previewMetaLoading}
-                frameSrc={previewFrameSrc}
-                previewUrl={previewUrl}
-                onDeviceChange={setPreviewDevice}
-                onRefresh={refreshPreview}
-              />
-            )}
-            {activeTab === 'changes' && <ChangesPanel entries={diffs} />}
-            {activeTab === 'quality' && (
-              <QualityPanel
-                errors={errors}
-                warnings={warnings}
-                report={qualityReport}
-                validatorIssues={implementRun.validatorIssues}
-                repairing={loading.repair}
-                onRepair={() =>
-                  void runImplementation({
-                    isRepairPass: true,
-                    validatorIssues: implementRun.validatorIssues,
-                    skipConfirmCheck: true,
-                  })
-                }
-              />
-            )}
-            {activeTab === 'manifest' && (
-              <ManifestPanel
-                manifest={displayManifest}
-                confirmed={isConfirmed}
-                loading={loading.manifest || loading.confirm}
-                onReload={() => void fetchManifest()}
-                onConfirm={() => void handleExplicitConfirm()}
-              />
-            )}
-            {activeTab === 'assets' && (
-              <AssetsPanel
-                assetType={assetType}
-                assets={assets}
-                loading={loading}
-                fileInputRef={fileInputRef}
-                onAssetTypeChange={setAssetType}
-                onUpload={handleAssetUpload}
-                onChooseFile={() => fileInputRef.current?.click()}
-                onApplyNow={() => void applyChanges()}
-              />
-            )}
-            {activeTab === 'settings' && (
-              <SettingsPanel
-                run={implementRun}
-                autoApply={autoApply}
-                resolvedRepoPath={resolvedRepoPath}
-                onRunChange={setImplementRun}
-                onAutoApplyChange={updateAutoApply}
-              />
-            )}
-          </div>
-        </main>
-      </div>
-      <StatusBar
-        status={status}
-        busy={isBusy}
-        onToggleAgent={() => setAgentOpen((previous) => !previous)}
-        onResetSession={() => void resetSession()}
-        onResetRepo={() => void resetRepository()}
-      />
-      <ByokDialog
-        open={showByok}
-        config={byokConfig}
-        draft={byokDraft}
-        onDraftChange={setByokDraft}
-        onSave={() => {
-          if (!byokDraft.provider || !byokDraft.modelId || !byokDraft.apiKey.trim()) return;
-          setByokConfig({
-            provider: byokDraft.provider,
-            modelId: byokDraft.modelId,
-            apiKey: byokDraft.apiKey.trim(),
-          });
-        }}
-        onClear={() => {
-          setByokConfig(null);
-          setByokDraft({ provider: '', modelId: '', apiKey: '' });
-        }}
-        onClose={() => setShowByok(false)}
+            </div>
+            <StatusBar
+              status={status}
+              busy={isBusy}
+              onToggleAgent={() => setShowWorkspaceTools(false)}
+              onResetSession={() => void resetSession()}
+              onResetRepo={() => void resetRepository()}
+            />
+          </section>
+        </div>
+      )}
+      <ModelSourceDialog
+        open={showModelSource}
+        value={agentModel}
+        onChange={setAgentModel}
+        onClose={() => setShowModelSource(false)}
       />
       <HandoffDialog
         open={showHandoff}
@@ -1128,6 +1493,7 @@ export default function CustomizationConsoleApp() {
         gitPrResult={gitPrResult}
         deployedUrl={deployedUrl}
       />
+      </div>
     </div>
   );
 }

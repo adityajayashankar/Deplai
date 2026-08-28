@@ -184,8 +184,10 @@ export interface DeployApiResult {
   success?: boolean;
   mode?: string;
   run_id?: string;
+  workspace?: string;
   service_type?: string;
   status?: string;
+  workspace_session_id?: string;
   requires_plan_confirmation?: boolean;
   plan_summary?: Record<string, unknown> | null;
   deployment_summary?: Record<string, unknown> | null;
@@ -207,6 +209,16 @@ export interface DeployApiResult {
   keypair?: {
     key_name?: string | null;
     private_key_pem?: string | null;
+  } | null;
+  one_time_credentials?: {
+    private_key_pem?: string | null;
+    key_name?: string | null;
+    instance_id?: string | null;
+    key_file_name?: string | null;
+    database_env?: string | null;
+    database_file_name?: string | null;
+    download_once?: boolean;
+    credentials_downloaded?: boolean;
   } | null;
   ec2?: {
     instance_id?: string | null;
@@ -435,7 +447,21 @@ export function writeSavedAws(config: AwsSessionConfig): void {
     aws_secret_access_key: secret,
     aws_session_token: token,
   };
-  sessionStorage.setItem(AWS_OPERATOR_STORAGE_KEY, JSON.stringify(payload));
+  const serialized = JSON.stringify(payload);
+  try {
+    sessionStorage.setItem(AWS_OPERATOR_STORAGE_KEY, serialized);
+  } catch (err) {
+    const quota = err instanceof DOMException
+      && (err.name === 'QuotaExceededError' || err.name === 'NS_ERROR_DOM_QUOTA_REACHED');
+    if (!quota) return;
+    try {
+      const compact = compactIacFilesForSession(readIacFilesFromSession());
+      sessionStorage.setItem(IAC_FILES_KEY, JSON.stringify(compact));
+      sessionStorage.setItem(AWS_OPERATOR_STORAGE_KEY, serialized);
+    } catch {
+      // Keep credentials in React state even if sessionStorage is full.
+    }
+  }
 }
 
 /** Milliseconds until stored operator credentials expire; 0 if missing/expired. */
@@ -516,8 +542,19 @@ export interface DeploymentInstanceSummary {
   albDns: string;
   elasticIp: string;
   rdsEndpoint: string;
+  rdsPort: string;
+  rdsDatabaseName: string;
+  redisEndpoint: string;
+  redisPort: string;
+  ecsCluster: string;
+  ecrRepositoryUrl: string;
+  logGroup: string;
+  healthCheckUrl: string;
   keyName: string;
+  keyFileName: string;
   generatedPem: string | null;
+  databaseEnv: string | null;
+  databaseFileName: string;
   instanceId: string;
   instanceArn: string;
   instanceState: string;
@@ -846,14 +883,310 @@ export function readIacFilesFromSession(): GeneratedIacFile[] {
   }
 }
 
+const DEPLOY_LOG_MAX = 80;
+const DEPLOY_LOG_TEXT_MAX = 2000;
+const DEPLOY_SNAPSHOT_MAX_CHARS = 400000;
+const EC2_PEM_SESSION_PREFIX = 'deplai.pipeline.ec2Pem.';
+const DEPLOY_DB_ENV_SESSION_PREFIX = 'deplai.pipeline.dbEnv.';
+const DEPLOY_SECRETS_DOWNLOADED_PREFIX = 'deplai.pipeline.secretsDownloaded.';
+
+function isQuotaExceededError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const name = String((err as { name?: string }).name || '');
+  const message = String((err as { message?: string }).message || '');
+  return name === 'QuotaExceededError'
+    || name === 'NS_ERROR_DOM_QUOTA_REACHED'
+    || /exceeded the quota/i.test(message)
+    || /quota/i.test(message);
+}
+
+function capDeployLogs(logs: DeployLogEntry[], maxEntries: number): DeployLogEntry[] {
+  return logs.slice(-Math.max(1, maxEntries)).map((row) => {
+    const text = String(row?.text || '');
+    return {
+      ...row,
+      text: text.length > DEPLOY_LOG_TEXT_MAX
+        ? `${text.slice(0, DEPLOY_LOG_TEXT_MAX)}\n…[truncated]`
+        : text,
+    };
+  });
+}
+
+function omitHeavyDeployDetails(details: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+  if (!details || typeof details !== 'object') return details ?? null;
+  const slim: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(details)) {
+    const lowered = key.toLowerCase();
+    if (
+      lowered.endsWith('_log_tail')
+      || lowered.endsWith('_log')
+      || lowered.includes('private_key')
+      || lowered.includes('_pem')
+      || lowered === 'files'
+      || lowered === 'generated_files'
+      || lowered === 'stdout_tail'
+      || lowered === 'stderr_tail'
+      || lowered === 'retry_errors'
+    ) {
+      continue;
+    }
+    slim[key] = value;
+  }
+  return slim;
+}
+
+function omitSensitiveOutputBag(outputs: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!outputs || typeof outputs !== 'object') return outputs;
+  const next: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(outputs)) {
+    if (/private_key|pem|password|secret/i.test(key)) continue;
+    next[key] = value;
+  }
+  return next;
+}
+
+function slimDeployResultForStorage(
+  result: DeployApiResult | null,
+  options: { keepDetails: boolean },
+): DeployApiResult | null {
+  if (!result) return null;
+  const next: DeployApiResult = { ...result };
+  next.generated_ec2_private_key_pem = null;
+  if (next.keypair) {
+    next.keypair = {
+      key_name: next.keypair.key_name ?? null,
+      private_key_pem: null,
+    };
+  }
+  if (next.one_time_credentials) {
+    next.one_time_credentials = {
+      ...next.one_time_credentials,
+      private_key_pem: null,
+      database_env: null,
+    };
+  }
+  next.outputs = omitSensitiveOutputBag(next.outputs);
+  next.raw_outputs = undefined;
+  if (!options.keepDetails) {
+    next.details = null;
+    next.plan_summary = null;
+  } else if (next.details && typeof next.details === 'object') {
+    next.details = omitHeavyDeployDetails(next.details);
+  }
+  return next;
+}
+
+export function buildPersistableDeploySnapshot(
+  snapshot: DeployStateSnapshot,
+  level: 0 | 1 | 2 = 0,
+): DeployStateSnapshot {
+  const logMax = level === 0 ? DEPLOY_LOG_MAX : level === 1 ? 30 : 8;
+  const historyMax = level === 0 ? 8 : level === 1 ? 3 : 1;
+  const keepDetails = level === 0;
+  const keepHistoryResults = level < 2;
+  return {
+    status: snapshot.status,
+    progress: snapshot.progress,
+    logs: capDeployLogs(Array.isArray(snapshot.logs) ? snapshot.logs : [], logMax),
+    deployResult: slimDeployResultForStorage(snapshot.deployResult, { keepDetails }),
+    deploymentHistory: (Array.isArray(snapshot.deploymentHistory) ? snapshot.deploymentHistory : [])
+      .slice(0, historyMax)
+      .map((entry) => ({
+        ...entry,
+        deployResult: keepHistoryResults
+          ? slimDeployResultForStorage(entry.deployResult, { keepDetails: false })
+          : null,
+      })),
+    updatedAt: snapshot.updatedAt,
+  };
+}
+
+function stashDeployPem(projectId: string, snapshot: DeployStateSnapshot): void {
+  if (wereDeploySecretsDownloaded(projectId)) return;
+  const pem = String(
+    snapshot.deployResult?.one_time_credentials?.private_key_pem
+    || snapshot.deployResult?.generated_ec2_private_key_pem
+    || snapshot.deployResult?.keypair?.private_key_pem
+    || '',
+  ).trim();
+  const databaseEnv = String(snapshot.deployResult?.one_time_credentials?.database_env || '').trim();
+  try {
+    if (pem && pem.includes('BEGIN')) {
+      sessionStorage.setItem(`${EC2_PEM_SESSION_PREFIX}${projectId}`, pem);
+    }
+    if (databaseEnv) {
+      sessionStorage.setItem(`${DEPLOY_DB_ENV_SESSION_PREFIX}${projectId}`, databaseEnv);
+    }
+  } catch {
+    // Session quota is separate; in-memory UI still has the key.
+  }
+}
+
+function readStashedDeployPem(projectId: string): string | null {
+  if (wereDeploySecretsDownloaded(projectId)) return null;
+  try {
+    const pem = sessionStorage.getItem(`${EC2_PEM_SESSION_PREFIX}${projectId}`);
+    return pem && pem.includes('BEGIN') ? pem : null;
+  } catch {
+    return null;
+  }
+}
+
+function readStashedDatabaseEnv(projectId: string): string | null {
+  if (wereDeploySecretsDownloaded(projectId)) return null;
+  try {
+    const value = sessionStorage.getItem(`${DEPLOY_DB_ENV_SESSION_PREFIX}${projectId}`);
+    return value && value.trim() ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function wereDeploySecretsDownloaded(projectId: string): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return sessionStorage.getItem(`${DEPLOY_SECRETS_DOWNLOADED_PREFIX}${projectId}`) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function rehydrateDeployResultPem(projectId: string, result: DeployApiResult | null): DeployApiResult | null {
+  if (!result) return null;
+  if (wereDeploySecretsDownloaded(projectId)) {
+    return {
+      ...result,
+      generated_ec2_private_key_pem: null,
+      keypair: result.keypair ? { ...result.keypair, private_key_pem: null } : result.keypair,
+      one_time_credentials: result.one_time_credentials
+        ? { ...result.one_time_credentials, private_key_pem: null, database_env: null, credentials_downloaded: true }
+        : result.one_time_credentials,
+    };
+  }
+  const pem = result.generated_ec2_private_key_pem
+    || result.keypair?.private_key_pem
+    || result.one_time_credentials?.private_key_pem
+    || readStashedDeployPem(projectId);
+  const databaseEnv = result.one_time_credentials?.database_env || readStashedDatabaseEnv(projectId);
+  if (!pem && !databaseEnv) return result;
+  return {
+    ...result,
+    generated_ec2_private_key_pem: pem || null,
+    keypair: {
+      key_name: result.keypair?.key_name ?? result.ec2_key_name ?? result.one_time_credentials?.key_name ?? null,
+      private_key_pem: pem || null,
+    },
+    one_time_credentials: {
+      ...(result.one_time_credentials || {}),
+      private_key_pem: pem || result.one_time_credentials?.private_key_pem || null,
+      database_env: databaseEnv || null,
+      download_once: true,
+    },
+  };
+}
+
+export function clearDownloadedDeploySecrets(projectId: string, result: DeployApiResult | null): DeployApiResult | null {
+  try {
+    sessionStorage.setItem(`${DEPLOY_SECRETS_DOWNLOADED_PREFIX}${projectId}`, '1');
+    sessionStorage.removeItem(`${EC2_PEM_SESSION_PREFIX}${projectId}`);
+    sessionStorage.removeItem(`${DEPLOY_DB_ENV_SESSION_PREFIX}${projectId}`);
+  } catch {
+    // ignore
+  }
+  if (!result) return null;
+  return {
+    ...result,
+    generated_ec2_private_key_pem: null,
+    keypair: result.keypair ? { ...result.keypair, private_key_pem: null } : null,
+    one_time_credentials: result.one_time_credentials
+      ? {
+        ...result.one_time_credentials,
+        private_key_pem: null,
+        database_env: null,
+        credentials_downloaded: true,
+      }
+      : { download_once: true, credentials_downloaded: true },
+  };
+}
+
+function evictOtherDeploySnapshots(keepProjectId: string): void {
+  const keepKey = `${DEPLOY_STATE_STORAGE_PREFIX}${keepProjectId}`;
+  const remove: string[] = [];
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index);
+    if (key && key.startsWith(DEPLOY_STATE_STORAGE_PREFIX) && key !== keepKey) {
+      remove.push(key);
+    }
+  }
+  for (const key of remove) {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 export function persistDeploySnapshot(projectId: string, snapshot: DeployStateSnapshot): void {
   if (typeof window === 'undefined') return;
-  localStorage.setItem(`${DEPLOY_STATE_STORAGE_PREFIX}${projectId}`, JSON.stringify(snapshot));
+  try {
+    const storageKey = `${DEPLOY_STATE_STORAGE_PREFIX}${projectId}`;
+    stashDeployPem(projectId, snapshot);
+
+    const candidates: DeployStateSnapshot[] = [
+      buildPersistableDeploySnapshot(snapshot, 0),
+      buildPersistableDeploySnapshot(snapshot, 1),
+      buildPersistableDeploySnapshot(snapshot, 2),
+    ];
+
+    const write = (payload: DeployStateSnapshot): boolean => {
+      let serialized = '';
+      try {
+        serialized = JSON.stringify(payload);
+      } catch {
+        return false;
+      }
+      if (serialized.length > DEPLOY_SNAPSHOT_MAX_CHARS && payload !== candidates[candidates.length - 1]) {
+        return false;
+      }
+      try {
+        localStorage.setItem(storageKey, serialized);
+        return true;
+      } catch (err) {
+        if (!isQuotaExceededError(err)) return true;
+        return false;
+      }
+    };
+
+    for (const candidate of candidates) {
+      if (write(candidate)) return;
+    }
+
+    evictOtherDeploySnapshots(projectId);
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(candidates[candidates.length - 1]));
+    } catch {
+      try {
+        localStorage.removeItem(storageKey);
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // Persistence must never take down the deploy console.
+  }
 }
 
 export function removeDeploySnapshot(projectId: string): void {
   if (typeof window === 'undefined') return;
   localStorage.removeItem(`${DEPLOY_STATE_STORAGE_PREFIX}${projectId}`);
+  try {
+    sessionStorage.removeItem(`${EC2_PEM_SESSION_PREFIX}${projectId}`);
+    sessionStorage.removeItem(`${DEPLOY_DB_ENV_SESSION_PREFIX}${projectId}`);
+    sessionStorage.removeItem(`${DEPLOY_SECRETS_DOWNLOADED_PREFIX}${projectId}`);
+  } catch {
+    // ignore
+  }
 }
 
 export function loadDeploySnapshot(projectId: string): DeployStateSnapshot | null {
@@ -880,7 +1213,10 @@ export function loadDeploySnapshot(projectId: string): DeployStateSnapshot | nul
             model: typeof row.model === 'string' ? row.model : undefined,
           }))
         : [],
-      deployResult: parsed.deployResult && typeof parsed.deployResult === 'object' ? parsed.deployResult as DeployApiResult : null,
+      deployResult: rehydrateDeployResultPem(
+        projectId,
+        parsed.deployResult && typeof parsed.deployResult === 'object' ? parsed.deployResult as DeployApiResult : null,
+      ),
       deploymentHistory: Array.isArray(parsed.deploymentHistory)
         ? parsed.deploymentHistory
           .filter((row) => row && typeof row.id === 'string' && typeof row.createdAt === 'string')
@@ -902,6 +1238,95 @@ export function loadDeploySnapshot(projectId: string): DeployStateSnapshot | nul
   }
 }
 
+export function projectHasSuccessfulDeploy(projectId: string): boolean {
+  const snapshot = loadDeploySnapshot(projectId);
+  if (!snapshot) return false;
+  if (isLiveManagedDeployment(snapshot)) return true;
+  return snapshot.deploymentHistory.some((entry) => entry.status === 'done' && entry.deployResult?.success !== false);
+}
+
+/** True when Terraform plan finished and the UI must wait for Confirm plan & deploy. */
+export function isAwaitingPlanConfirmation(args: {
+  uiPhase?: string | null;
+  requiresPlanConfirmation?: boolean;
+  result?: Pick<DeployApiResult, 'requires_plan_confirmation' | 'status'> | null;
+}): boolean {
+  if (args.requiresPlanConfirmation) return true;
+  if (String(args.uiPhase || '').trim().toLowerCase() === 'awaiting_plan') return true;
+  if (args.result?.requires_plan_confirmation) return true;
+  return String(args.result?.status || '').trim().toLowerCase() === 'awaiting_plan_confirmation';
+}
+
+/** True when an apply has already failed and Redeploy should be available. */
+export function isFailedDeployAttempt(args: {
+  status?: string | null;
+  uiPhase?: string | null;
+  result?: Pick<DeployApiResult, 'success' | 'error'> | null;
+}): boolean {
+  if (args.status === 'error' || args.uiPhase === 'error') return true;
+  if (args.result?.success === false) return true;
+  if (args.result?.success === true) return false;
+  return Boolean(String(args.result?.error || '').trim());
+}
+
+/** True while Terraform apply is actually in flight — not while waiting for plan confirmation. */
+export function isLiveDeployAttempt(args: {
+  status?: string | null;
+  uiPhase?: string | null;
+  failed?: boolean;
+  requiresPlanConfirmation?: boolean;
+  result?: Pick<DeployApiResult, 'requires_plan_confirmation' | 'status'> | null;
+}): boolean {
+  if (args.failed) return false;
+  const phase = String(args.uiPhase || '').trim().toLowerCase();
+  // Confirm click leaves awaiting_plan immediately; keep the button in the live
+  // state even if the previous result still carries plan-gate flags.
+  if (phase === 'starting' || phase === 'waiting_api' || phase === 'reconciling') return true;
+  if (isAwaitingPlanConfirmation(args)) return false;
+  return args.status === 'running';
+}
+
+/** True after a successful apply that has not been destroyed (status reset to idle). */
+export function isLiveManagedDeployment(snapshot: DeployStateSnapshot | null | undefined): boolean {
+  if (!snapshot || snapshot.status !== 'done') return false;
+  const result = snapshot.deployResult;
+  if (!result || typeof result !== 'object') return false;
+  if (result.success === false) return false;
+  return true;
+}
+
+export function isApplyingDeployment(snapshot: DeployStateSnapshot | null | undefined): boolean {
+  if (snapshot?.status !== 'running') return false;
+  if (isAwaitingPlanConfirmation({ result: snapshot.deployResult })) return false;
+  return true;
+}
+
+export function isRealAwsInstanceId(value: string | null | undefined): boolean {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  if (['n/a', 'na', 'null', 'undefined', 'none', '-', '—'].includes(lower)) return false;
+  if (text.startsWith('project-')) return false;
+  return /^i-[a-z0-9]+$/i.test(text);
+}
+
+export function listManagedDeploymentRecords(projects: ProjectRecord[]): ProjectDeploymentRecord[] {
+  return listProjectDeploymentRecords(projects).filter((record) => isLiveManagedDeployment(record.snapshot));
+}
+
+export function listApplyingDeploymentRecords(projects: ProjectRecord[]): ProjectDeploymentRecord[] {
+  return listProjectDeploymentRecords(projects).filter((record) => isApplyingDeployment(record.snapshot));
+}
+
+export function iacRunIdFromResult(result: DeployApiResult | null | undefined): string | null {
+  const runId = String(result?.run_id || '').trim();
+  return runId || null;
+}
+
+export function isIacPipelineResult(result: DeployApiResult | null | undefined): boolean {
+  return String(result?.mode || '').trim() === 'iac_pipeline';
+}
+
 export function saveDeployUiStage(projectId: string, stage: string): void {
   if (typeof window === 'undefined') return;
   localStorage.setItem(`${DEPLOY_UI_STAGE_STORAGE_PREFIX}${projectId}`, stage);
@@ -912,15 +1337,49 @@ export function loadDeployUiStage(projectId: string): string | null {
   return localStorage.getItem(`${DEPLOY_UI_STAGE_STORAGE_PREFIX}${projectId}`);
 }
 
+function scalarOutputValue(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    const joined = value
+      .map((item) => scalarOutputValue(item))
+      .filter((item): item is string => Boolean(item))
+      .join(', ');
+    return joined || null;
+  }
+  return null;
+}
+
+/** Flatten IaC pipeline `{ outputs: [{ key, value }] }` bags into a lookup map. */
+export function flattenDeployOutputs(outputs: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!outputs) return undefined;
+  const nested = outputs.outputs;
+  if (!Array.isArray(nested)) return outputs;
+  const flat: Record<string, unknown> = { ...outputs };
+  for (const entry of nested) {
+    if (!entry || typeof entry !== 'object') continue;
+    const record = entry as Record<string, unknown>;
+    const key = String(record.key || '').trim();
+    if (!key) continue;
+    flat[key] = record.value;
+  }
+  return flat;
+}
+
 export function pickOutput(outputs: Record<string, unknown> | undefined, candidates: string[]): string {
   if (!outputs) return 'n/a';
 
   for (const key of candidates) {
     const direct = outputs[key];
-    if (typeof direct === 'string' && direct.trim()) return direct;
+    const scalar = scalarOutputValue(direct);
+    if (scalar) return scalar;
     if (direct && typeof direct === 'object' && 'value' in (direct as Record<string, unknown>)) {
-      const value = (direct as Record<string, unknown>).value;
-      if (typeof value === 'string' && value.trim()) return value;
+      const value = scalarOutputValue((direct as Record<string, unknown>).value);
+      if (value) return value;
     }
   }
 
@@ -931,20 +1390,22 @@ export function pickOutput(outputs: Record<string, unknown> | undefined, candida
 
   for (const key of candidates.map((candidate) => candidate.toLowerCase())) {
     const match = lowered[key];
-    if (typeof match === 'string' && match.trim()) return match;
+    const scalar = scalarOutputValue(match);
+    if (scalar) return scalar;
     if (match && typeof match === 'object' && 'value' in (match as Record<string, unknown>)) {
-      const value = (match as Record<string, unknown>).value;
-      if (typeof value === 'string' && value.trim()) return value;
+      const value = scalarOutputValue((match as Record<string, unknown>).value);
+      if (value) return value;
     }
   }
 
   const fuzzyKey = Object.keys(outputs).find((key) => candidates.some((candidate) => key.toLowerCase().includes(candidate.toLowerCase())));
   if (fuzzyKey) {
     const match = outputs[fuzzyKey];
-    if (typeof match === 'string' && match.trim()) return match;
+    const scalar = scalarOutputValue(match);
+    if (scalar) return scalar;
     if (match && typeof match === 'object' && 'value' in (match as Record<string, unknown>)) {
-      const value = (match as Record<string, unknown>).value;
-      if (typeof value === 'string' && value.trim()) return value;
+      const value = scalarOutputValue((match as Record<string, unknown>).value);
+      if (value) return value;
     }
   }
 
@@ -955,19 +1416,20 @@ export function pickOutputRaw(outputs: Record<string, unknown> | undefined, cand
   if (!outputs) return null;
   for (const key of candidates) {
     const direct = outputs[key];
-    if (typeof direct === 'string' && direct.trim()) return direct;
+    const scalar = scalarOutputValue(direct);
+    if (scalar) return scalar;
     if (direct && typeof direct === 'object' && 'value' in (direct as Record<string, unknown>)) {
-      const value = (direct as Record<string, unknown>).value;
-      if (typeof value === 'string' && value.trim()) return value;
+      const value = scalarOutputValue((direct as Record<string, unknown>).value);
+      if (value) return value;
     }
   }
   const fuzzyKey = Object.keys(outputs).find((key) => candidates.some((candidate) => key.toLowerCase().includes(candidate.toLowerCase())));
   if (!fuzzyKey) return null;
   const match = outputs[fuzzyKey];
-  if (typeof match === 'string' && match.trim()) return match;
+  const scalar = scalarOutputValue(match);
+  if (scalar) return scalar;
   if (match && typeof match === 'object' && 'value' in (match as Record<string, unknown>)) {
-    const value = (match as Record<string, unknown>).value;
-    if (typeof value === 'string' && value.trim()) return value;
+    return scalarOutputValue((match as Record<string, unknown>).value);
   }
   return null;
 }
@@ -1013,7 +1475,7 @@ export function toHistoryEntry(
 }
 
 export function extractDeploymentSummary(result: DeployApiResult | null): DeploymentInstanceSummary {
-  const runtimeOutputs = result?.raw_outputs || result?.outputs;
+  const runtimeOutputs = flattenDeployOutputs(result?.raw_outputs || result?.outputs);
   const details = result?.details as Record<string, unknown> | null | undefined;
   const liveRuntimeDetails = details?.live_runtime_details as { instance?: Record<string, unknown> } | undefined;
   const instance = liveRuntimeDetails?.instance as Record<string, unknown> | undefined;
@@ -1058,21 +1520,53 @@ export function extractDeploymentSummary(result: DeployApiResult | null): Deploy
     albDns,
     elasticIp,
     rdsEndpoint: String(
-      pickOutputRaw(runtimeOutputs, ['rds_endpoint', 'database_endpoint', 'db_endpoint'])
+      pickOutputRaw(runtimeOutputs, ['rds_endpoint', 'database_endpoint', 'db_endpoint', 'rds_address'])
+      || 'n/a',
+    ),
+    rdsPort: String(pickOutputRaw(runtimeOutputs, ['rds_port', 'database_port', 'db_port']) || 'n/a'),
+    rdsDatabaseName: String(pickOutputRaw(runtimeOutputs, ['rds_database_name', 'db_name', 'database_name']) || 'n/a'),
+    redisEndpoint: String(
+      pickOutputRaw(runtimeOutputs, ['redis_endpoint', 'elasticache_endpoint', 'cache_endpoint'])
+      || 'n/a',
+    ),
+    redisPort: String(pickOutputRaw(runtimeOutputs, ['redis_port', 'cache_port', 'elasticache_port']) || 'n/a'),
+    ecsCluster: String(
+      pickOutputRaw(runtimeOutputs, ['ecs_cluster_name', 'ecs_cluster'])
+      || 'n/a',
+    ),
+    ecrRepositoryUrl: String(
+      pickOutputRaw(runtimeOutputs, ['ecr_repository_url', 'ecr_url'])
+      || 'n/a',
+    ),
+    logGroup: String(
+      pickOutputRaw(runtimeOutputs, ['log_group_name', 'cloudwatch_log_group', 'ecs_log_group'])
+      || 'n/a',
+    ),
+    healthCheckUrl: String(
+      pickOutputRaw(runtimeOutputs, ['health_check_url', 'health_url'])
       || 'n/a',
     ),
     keyName: String(
-      result?.keypair?.key_name
+      result?.one_time_credentials?.key_name
+      || result?.keypair?.key_name
       || result?.ec2_key_name
       || pickOutputRaw(runtimeOutputs, ['ec2_key_name', 'generated_ec2_key_name', 'key_name'])
       || pickNestedOutputRaw(details || undefined, ['ec2_key_name', 'generated_ec2_key_name', 'key_name'])
       || 'deplai-ec2-key',
     ),
-    generatedPem: result?.keypair?.private_key_pem
+    keyFileName: String(
+      result?.one_time_credentials?.key_file_name
+      || '',
+    ),
+    generatedPem: result?.one_time_credentials?.private_key_pem
+      || result?.keypair?.private_key_pem
       || result?.generated_ec2_private_key_pem
       || pickOutputRaw(runtimeOutputs, ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem'])
-      || pickNestedOutputRaw(details || undefined, ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem']),
-    instanceId: String(instance?.instance_id || result?.ec2?.instance_id || pickOutput(runtimeOutputs, ['ec2_instance_id', 'instance_id'])),
+      || pickNestedOutputRaw(details || undefined, ['generated_ec2_private_key_pem', 'generated_private_key_pem', 'ec2_private_key_pem', 'private_key_pem'])
+      || null,
+    databaseEnv: result?.one_time_credentials?.database_env || null,
+    databaseFileName: String(result?.one_time_credentials?.database_file_name || ''),
+    instanceId: String(instance?.instance_id || result?.ec2?.instance_id || result?.one_time_credentials?.instance_id || pickOutput(runtimeOutputs, ['ec2_instance_id', 'instance_id'])),
     instanceArn: String(instance?.instance_arn || result?.ec2?.instance_arn || pickOutput(runtimeOutputs, ['ec2_instance_arn', 'instance_arn'])),
     instanceState: String(instance?.instance_state || result?.ec2?.state || pickOutput(runtimeOutputs, ['ec2_instance_state', 'instance_state'])),
     instanceType: String(instance?.instance_type || result?.ec2?.type || pickOutput(runtimeOutputs, ['ec2_instance_type', 'instance_type'])),
