@@ -39,8 +39,14 @@ PDF export: `GET /api/scan/results/pdf`.
 
 1. Connector `POST` scan start (ownership + clone/ZIP).
 2. `GET /api/scan/ws-token` — HMAC bound to user + project (`WS_TOKEN_SECRET`).
-3. Browser `WS` → `NEXT_PUBLIC_AGENTIC_WS_URL` `/ws/scan/{project_id}`.
-4. Agentic ingest into volume `codebase_deplai`, run Docker scanners, write `security_reports`.
+3. Browser resolves WebSocket base (`src/lib/agentic-websocket.ts`):
+   - **Production** (public hostname): same-origin `wss://<APP_DOMAIN>/agentic`
+   - **Local** (no Caddy): direct Agentic, e.g. `ws://localhost:8000`
+   - Connects to `{ws_base}/ws/scan/{project_id}?token=…` (remediate uses `/ws/remediate/…`)
+4. **Caddy** (production only): browser hits `/agentic/ws/…`; `uri strip_prefix /agentic` forwards `/ws/…` to Agentic. Do **not** use `handle_path /agentic/ws/*` — that strips too much and breaks FastAPI routing.
+5. Agentic ingest into volume `codebase_deplai`, run Docker scanners, write `security_reports`.
+
+Remediation reuses the same base resolution and token mint; `ScanProvider` (`scan-context.tsx`) owns both scan and remediate sockets.
 
 `project_id` allowlist: `^[a-zA-Z0-9_-]{1,80}$` so it cannot reach Docker exec as a shell metacharacter.
 

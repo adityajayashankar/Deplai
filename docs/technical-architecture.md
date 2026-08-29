@@ -124,7 +124,9 @@ agent transitions are documented in [agent architecture](agent-architecture.md).
 - Connector-to-Agentic HTTP calls use `X-API-Key` with
   `DEPLAI_SERVICE_KEY`; the key must never be exposed to the browser.
 - Scan/remediation/pipeline WebSockets use a short-lived HMAC token bound to a
-  user and project ID.
+  user and project ID. Production browsers reach Agentic through Caddy at
+  `/agentic/ws/*`; Caddy strips `/agentic` before proxying to FastAPI `/ws/*`.
+  URL resolution lives in `Connector/src/lib/agentic-websocket.ts`.
 - The Connector proxies customization traffic only after resolving a
   user-owned project and source location.
 

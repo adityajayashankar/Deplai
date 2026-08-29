@@ -4,7 +4,7 @@ Team-only. Overlaps `docs/guide/_internal-review.md`. Do not publish.
 
 ## Product placeholders
 
-- **Code Reviewer**: `WorkspaceNav` `placeholder: true`. No `/dashboard/code-reviewer` page. `workspace_sessions.service` still allows `code_reviewer`.
+- **Code Reviewer**: `/dashboard/code-reviewer` is a coming-soon shell (nav tag **Soon**). No agent yet. `workspace_sessions.service` still allows `code_reviewer`.
 - **Organizations**: same, `/dashboard/organization`.
 - **DAST**: available from Security Agent pipeline config and `/dashboard/dast`. Requires an authorized public URL (`dast_target_url`). Internal addresses are rejected.
 - Full Scan **UI** still starts as SAST + SCA + Full Scan in the home scan dialog. Security Agent pipeline config can select extra modules and an optional DAST URL. `scan_type=all` runs those extra modules when files (or a DAST URL) exist.
@@ -34,7 +34,7 @@ Agentic mounts **`/var/run/docker.sock`**. Treat the host as a trusted execution
 
 ## Local ports
 
-`.env.template` HTTP 8001 vs WS 8000 vs `compose.yaml` publishing 8000. See [Local development](local-development.md).
+`.env.template` HTTP 8001 vs WS 8000 vs `compose.yaml` publishing 8000. Production WS must include the `/agentic` prefix (`wss://<APP_DOMAIN>/agentic`). See [Local development](local-development.md).
 
 ## Unused / stale
 

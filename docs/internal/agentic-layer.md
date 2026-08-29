@@ -37,6 +37,8 @@ All of these except `/health` and `/ready` need the service key.
 
 WebSockets: `/ws/scan/{project_id}`, `/ws/remediate/{project_id}`, `/ws/pipeline/{project_id}`.
 
+In production, browsers reach these through Caddy at `/agentic/ws/{endpoint}/{project_id}`; Caddy strips `/agentic` before proxying. Connector builds the public URL in `Connector/src/lib/agentic-websocket.ts`.
+
 ## Source ingest
 
 `environment.py` copies GitHub or local trees into Docker volume `codebase_deplai` under `{project_id}/`. GitHub clones on Connector are mounted read-only at `/repos`. ZIP trees at `/local-projects`.

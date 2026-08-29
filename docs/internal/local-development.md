@@ -34,6 +34,17 @@ Publishes Agentic at **localhost:8001**. Mounts `./Connector/tmp/repos` and `./C
 
 Align HTTP and WS with whichever Compose file you actually started, or scans will “start” in Connector and never stream.
 
+## WebSocket URL shapes
+
+| Environment | Browser connects to | Agentic receives |
+| --- | --- | --- |
+| Local `compose.yaml` (no Caddy) | `ws://localhost:8000/ws/scan/{project_id}?token=…` | `/ws/scan/{project_id}` |
+| Production (`deploy/Caddyfile`) | `wss://<APP_DOMAIN>/agentic/ws/scan/{project_id}?token=…` | `/ws/scan/{project_id}` (after Caddy strips `/agentic`) |
+
+Resolution lives in `Connector/src/lib/agentic-websocket.ts`. On a **public** hostname the browser always uses same-origin `/agentic` and does not trust a stale `ws-config` pointing at `localhost`. Local dev does not use the `/agentic` prefix unless you run the production-shaped Caddy stack.
+
+Diagnostic: sign in and `GET /api/scan/ws-health` — probes the Docker-network upgrade and prints `public_ws_base` / hints.
+
 ## Connector on the host (without Compose UI)
 
 `cd Connector && npm install && npm run dev` — needs MySQL (`DB_*`), `.env` at repo root or Connector env, and a reachable Agentic.

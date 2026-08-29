@@ -52,7 +52,7 @@ Production (`docker-compose.production.yml`): only **Caddy** publishes 80/443. C
 | --- | --- |
 | Browser → Connector | Encrypted `deplai_session` (iron-session). Protected routes `requireAuth`. Project/repo/installation ownership checks. |
 | Connector → Agentic | `X-API-Key: DEPLAI_SERVICE_KEY`. Browser must never see this key. |
-| Live scan/remediation/pipeline sockets | Short-lived HMAC token minted by Connector, bound to user + project. Agentic rejects mismatch/expiry. |
+| Live scan/remediation/pipeline sockets | Short-lived HMAC token minted by Connector, bound to user + project. Agentic rejects mismatch/expiry. Production browsers use same-origin `wss://<APP_DOMAIN>/agentic/ws/…`; Caddy strips `/agentic` before proxying to FastAPI `/ws/…`. |
 | Connector → AI gateway (from Agentic/customization) | Same service key plus `x-deplai-user-id` so BYOK/platform resolution is per user. |
 | Connector → Customization | Authenticated proxy; source path resolved from ownership-checked DB rows, not client-supplied paths. |
 | Agentic → Docker | Host `/var/run/docker.sock`. Treat the Agentic host as a **trusted execution environment**. Do not expose Agentic publicly without Caddy/network lock-down. |
@@ -76,7 +76,7 @@ Scan/remediation/pipeline **run context** lives in Agentic process memory. A res
 | Security Agent | Connector `/dashboard/security-analysis/[projectId]` + Agentic `/api/scan/*`, `/ws/scan`, `/ws/remediate` |
 | Deploy | `/dashboard/deploy` + Agentic terraform/AWS routes |
 | UI/UX customizer | `/dashboard/customization` + customization backend |
-| Code Reviewer | Nav `placeholder: true`. No page. Session service `code_reviewer` reserved |
+| Code Reviewer | `/dashboard/code-reviewer` coming-soon shell (nav tag **Soon**). Session service `code_reviewer` reserved |
 | Sessions | `workspace_sessions` |
 | BYOK | `/dashboard/ai/*` — AI platform control plane |
 | Organizations | Nav placeholder |

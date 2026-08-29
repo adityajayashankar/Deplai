@@ -52,18 +52,25 @@ Read the documentation in this order:
 3. [Agent architecture](docs/agent-architecture.md) — the detailed workflow, orchestration, validation, and fallback design.
 4. [Architecture and execution flows](docs/architecture.md) and the [API reference](docs/api-reference.md) — implementation-facing details.
 
+**Engineering handbook:** [docs/internal/](docs/internal/README.md) — services, pipelines, Compose/Caddy, env vars, and known gaps. Prefer this over older narratives when they disagree.
+
+**Client guide:** [docs/guide/](docs/guide/README.md) — dashboard Documentation (`/dashboard/documentation`). After editing, run `cd Connector && npm run docs:embed`.
+
+**Production deploy:** [deploy/README.md](deploy/README.md) — Caddy TLS, `docker-compose.production.yml`, and production env.
+
 ## What the product supports today
 
 - GitHub OAuth login with an explicit GitHub account chooser; users can select a different GitHub account after signing out of DeplAI.
 - GitHub App installation discovery, repository synchronization, cloning, branch access, webhook processing, and installation-token access.
 - Local ZIP project upload, extraction, browsing, and deletion.
-- SAST and software-composition analysis (SCA) workflows with status/result APIs and authenticated WebSocket progress streams.
+- SAST, SCA, and Full Scan workflows (secrets, IaC, containers, Kubernetes, CI/CD, API spec checks; optional DAST with an authorized public URL) with status/result APIs and authenticated WebSocket progress streams.
 - Guided remediation, optional user-supplied LLM credentials, repository changes, and pull-request handoff for GitHub projects.
 - Repository analysis, architecture review, deterministic or LLM-assisted architecture generation, cost estimation, and approval payload generation.
 - Terraform generation through the deterministic deployment-profile renderer, the EC2 application renderer, and the Terraform Agent pipeline.
 - Runtime deployment controls, plan confirmation, live AWS details, EC2 start/stop/reboot, endpoint verification, generated SSH-key conversion, and destruction of DeplAI-managed resources.
 - Repository-aware database provisioning: Prisma, Docker Compose, package dependencies, and `DATABASE_URL` signals can trigger RDS provisioning and application environment injection.
 - Tenant customization through a Connector-authenticated proxy to the customization backend, including chat, manifest confirmation, implementation, preview, uploaded assets, and repository reset.
+- BYOK AI platform (credentials vault, catalog, routing, usage/costs), workspace sessions, and Razorpay billing (credits, subscription, GST invoices).
 
 ## Runtime topology
 
@@ -73,12 +80,14 @@ Browser
   ▼
 Connector (Next.js, port 3000)
   ├── iron-session cookie authentication
-  ├── MySQL project, GitHub, chat, and settings records
+  ├── MySQL (users, GitHub, billing, AI vault, workspace sessions)
   ├── GitHub OAuth and GitHub App API access
   └── authenticated service calls (X-API-Key)
           │
           ▼
-Agentic Layer (FastAPI, host port 8001 / container port 8000)
+Agentic Layer (FastAPI)
+  ├── local full stack (`compose.yaml`): host port 8000
+  ├── hot-reload dev (`docker-compose.dev.yml`): host port 8001 → container 8000
   ├── scan and remediation runners
   ├── repository analysis and architecture review
   ├── cost, approval, Terraform, and AWS runtime APIs
@@ -87,9 +96,13 @@ Agentic Layer (FastAPI, host port 8001 / container port 8000)
           ├── Docker Engine: scanners, workspaces, and runtime execution
           └── AWS: Terraform-managed infrastructure and runtime inspection
 
-Optional: Customization backend (FastAPI, port 8010)
+Customization backend (FastAPI, port 8010)
   ▲
   └── Connector `/api/customization/*` proxy
+
+Production: Caddy publishes 80/443 only. Browser WebSockets use
+`wss://<APP_DOMAIN>/agentic/ws/*`; Caddy strips `/agentic` before proxying to
+Agentic `/ws/*`. Connector reaches Agentic HTTP on the Docker network.
 ```
 
 ## Repository layout
@@ -101,16 +114,19 @@ Optional: Customization backend (FastAPI, port 8010)
 | `Terraform Agent/agent/` | Terraform run engine, renderers, validation/refinement loop, state storage, lock handling, deployment profiles, templates, and execution helpers. |
 | `Customization Agent/tenant_builder_app/backend/` | Tenant manifest chat, planning, repository edits, asset storage, preview orchestration, and customization quality gates. |
 | `remediation_pipeline/` | Remediation extraction, grouping, generation, validation, and track orchestration used by the Agentic Layer. |
-| `Connector/database.sql` | Baseline MySQL schema for users, GitHub installations/repositories, projects, and chat sessions/messages. |
-| `docker-compose.yml` | Agentic Layer development container, source mounts, Docker socket access, and service network. |
+| `Connector/database.sql` | Baseline MySQL schema (users, GitHub, projects, billing, AI platform, workspace sessions). |
+| `compose.yaml` | Default local full stack (`docker compose up --build`): Connector, Agentic, customization, MySQL. |
+| `docker-compose.dev.yml` | Agentic hot-reload only (host port 8001) against a host-run Connector. |
+| `docker-compose.production.yml` | Production stack with Caddy TLS (`deploy/.env`). |
+| `deploy/` | Production Caddyfile, env template, and deployment runbook. |
 | `.env.template` | Shared environment-variable template. Never commit the populated `.env` file. |
-| `docs/` | Source-derived architecture, API, and operating documentation. |
+| `docs/` | Product, API, engineering handbook (`docs/internal/`), and client guide (`docs/guide/`). |
 
 ## Main user journey
 
 1. Sign in through GitHub and choose the desired GitHub account.
 2. Add a GitHub repository through the GitHub App, or upload a local ZIP project.
-3. Start a security scan. The Connector validates ownership, then the Agentic Layer streams scan progress over a project-bound WebSocket.
+3. Start a security scan. The Connector validates ownership, mints a short-lived WebSocket token, then the Agentic Layer streams scan progress over a project-bound WebSocket.
 4. Review findings and start remediation when appropriate. GitHub remediation can use a scoped installation token or a supplied personal token.
 5. Run repository analysis and complete the architecture review questions.
 6. Generate an architecture, estimate cost, review the approval payload, and choose a Terraform renderer.
@@ -138,14 +154,26 @@ docker compose up --build
 ```
 
 Open `http://localhost:3000`. This starts the Connector, Agentic Layer,
-customization backend and MySQL. GitHub sign-in, repository
-access, PR creation, cloud deployment, and LLM-backed features require their
-respective credentials; see the full setup below. Stop the stack with
-`docker compose down` (do not add `-v` unless you intend to erase local data).
+customization backend, and MySQL on ports **3000**, **8000**, and **8010**.
+GitHub sign-in, repository access, PR creation, cloud deployment, and
+LLM-backed features require their respective credentials; see the full setup
+below. Stop the stack with `docker compose down` (do not add `-v` unless you
+intend to erase local data).
+
+For this stack, browser WebSockets connect directly to Agentic at
+`ws://localhost:8000/ws/scan/{project_id}?token=…` (no `/agentic` prefix).
 
 ### 1. Create the shared environment file
 
-Copy `.env.template` to `.env` and set non-placeholder secrets. At minimum, configure:
+Copy `.env.template` to `.env` and set non-placeholder secrets. Values depend on how you run the stack:
+
+| Mode | `AGENTIC_LAYER_URL` | `NEXT_PUBLIC_AGENTIC_WS_URL` |
+| --- | --- | --- |
+| Full stack (`compose.yaml`) | `http://localhost:8000` (host Connector uses `http://agentic-layer:8000` inside Compose) | `ws://localhost:8000` |
+| Connector on host + `docker-compose.dev.yml` | `http://localhost:8001` | `ws://localhost:8001` |
+| Production (Caddy) | `http://agentic-layer:8000` (Docker network) | `wss://<APP_DOMAIN>/agentic` |
+
+At minimum, configure:
 
 ```dotenv
 DEPLAI_SERVICE_KEY=<long-random-secret>
@@ -153,8 +181,8 @@ WS_TOKEN_SECRET=<different-long-random-secret>
 SESSION_SECRET=<long-random-secret>
 
 NEXT_PUBLIC_APP_URL=http://localhost:3000
-AGENTIC_LAYER_URL=http://localhost:8001
-NEXT_PUBLIC_AGENTIC_WS_URL=ws://localhost:8001
+AGENTIC_LAYER_URL=http://localhost:8000
+NEXT_PUBLIC_AGENTIC_WS_URL=ws://localhost:8000
 
 DB_HOST=localhost
 DB_PORT=3306
@@ -169,34 +197,40 @@ GITHUB_PRIVATE_KEY=<github-app-private-key>
 GITHUB_WEBHOOK_SECRET=<github-webhook-secret>
 ```
 
-`DEPLAI_SERVICE_KEY` authenticates Connector-to-Agentic HTTP calls. `WS_TOKEN_SECRET` signs short-lived project-bound WebSocket tokens. In production, all secrets must be distinct, random values.
+`DEPLAI_SERVICE_KEY` authenticates Connector-to-Agentic HTTP calls. `WS_TOKEN_SECRET` signs short-lived project-bound WebSocket tokens. URL resolution for browsers lives in `Connector/src/lib/agentic-websocket.ts`. In production, all secrets must be distinct, random values.
 
-### 2. Initialize MySQL
+### 2. Initialize MySQL (host dev only)
 
-Create the baseline schema with the SQL file in the Connector:
+The full `compose.yaml` stack creates and initializes MySQL automatically from `Connector/database.sql`. Skip this step when using `docker compose up --build`.
+
+For a host-run Connector, create the baseline schema manually:
 
 ```bash
 mysql -u root -p < Connector/database.sql
 ```
 
-Use the credentials configured in `.env`. The Connector uses MySQL for identities, GitHub installations/repositories, projects, chat history, and settings records.
+Use the credentials configured in `.env`. Apply `Connector/migrations/*.sql` in date order on existing databases. The Connector uses MySQL for identities, GitHub data, projects, billing, AI platform records, workspace sessions, and settings.
 
-### 3. Start the Agentic Layer
+### 3. Start the Agentic Layer (split dev only)
 
-From the repository root:
+If you are **not** using the full `compose.yaml` stack and want Agentic hot-reload while running the Connector on the host:
 
 ```bash
-docker compose up --build agentic-layer
+docker compose -f docker-compose.dev.yml up --build
 ```
 
-The compose file exposes the service at `http://localhost:8001` and mounts local project uploads, cloned GitHub repositories, the Terraform Agent, remediation pipeline, optional KG agent, and Docker socket. Confirm startup with:
+This exposes Agentic at `http://localhost:8001`. Set `AGENTIC_LAYER_URL=http://localhost:8001` and `NEXT_PUBLIC_AGENTIC_WS_URL=ws://localhost:8001` in `.env`. Confirm startup with:
 
 ```bash
 curl http://localhost:8001/ready
 curl http://localhost:8001/health
 ```
 
-### 4. Start the Connector
+If you use the full stack from **Quick local Docker start** above, Agentic is already running on port **8000** — skip this step.
+
+### 4. Start the Connector (host dev only)
+
+Skip this if you started the full stack with `docker compose up --build` — the Connector container is already running.
 
 In a second terminal:
 
@@ -273,12 +307,16 @@ Run unit tests from the relevant service directories with the active virtual env
 
 - Never put populated `.env` values, GitHub private keys, OAuth secrets, AWS credentials, or generated private keys into source control.
 - All browser-facing protected routes must enforce Connector session ownership. Do not expose `DEPLAI_SERVICE_KEY` to the browser.
-- Agentic scan and remediation WebSockets require a short-lived HMAC token bound to both the user and project ID.
+- Agentic scan, remediation, and pipeline WebSockets require a short-lived HMAC token bound to both the user and project ID. Production browsers connect through Caddy at `wss://<APP_DOMAIN>/agentic/ws/*`; locally they connect directly to Agentic (e.g. `ws://localhost:8000/ws/*`). Ops diagnostic: authenticated `GET /api/scan/ws-health`.
 - `POST /api/cleanup` in the Agentic Layer is globally destructive and disabled unless `ALLOW_GLOBAL_CLEANUP=true`. Do not enable it in a shared or production environment without deliberate operational controls.
 - Runtime destruction is best-effort and targets resources tagged for the selected DeplAI project. Review the returned details and AWS console state after a destroy request.
 
 ## Further documentation
 
+- [Documentation index](docs/README.md)
+- [Engineering handbook](docs/internal/README.md)
+- [Client guide](docs/guide/README.md)
+- [Production deployment](deploy/README.md)
 - [Product overview](docs/product-overview.md)
 - [Technical architecture](docs/technical-architecture.md)
 - [Agent and workflow architecture](docs/agent-architecture.md)

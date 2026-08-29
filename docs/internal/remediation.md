@@ -36,7 +36,7 @@ Caps: `DEPLAI_MAX_REMEDIATION_COST_USD` (default 1.0), `REMEDIATION_LLM_TIMEOUT_
 | Path | Role |
 | --- | --- |
 | `POST /api/remediate/validate` | Preconditions (scan results exist, project_id allowlist) |
-| `WS /ws/remediate/{project_id}` | Live run; HMAC token from Connector |
+| `WS /ws/remediate/{project_id}` | Live run; HMAC token from Connector. Browser URL: `{ws_base}/ws/remediate/{project_id}?token=…` (production `ws_base` = `wss://<APP_DOMAIN>/agentic`) |
 | `POST /remediation/run` | Kick orchestrator |
 | `POST /remediation/status` | Poll |
 | `POST /remediation/pr` | Open PR after Review |

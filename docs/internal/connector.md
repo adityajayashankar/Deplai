@@ -43,6 +43,11 @@ Path: `Connector/`. Next.js 16 App Router, React 19, TypeScript, Tailwind. This 
 | `/dashboard/usage` | Year wrap (`UsageWrappedApp`) |
 | `/dashboard/documentation/[[...section]]` | Client guide |
 | `/dashboard/instances` | Runtime manage |
+| `/dashboard/dast` | DAST target configuration |
+| `/dashboard/cloud` | Cloud workspace chrome |
+| `/dashboard/code-reviewer` | Coming-soon shell (`CodeReviewerComingSoonApp`; nav tag **Soon**) |
+| `/dashboard/projects` | Project list |
+| `/dashboard/codeview` | Code view helper |
 | `/dashboard/pipeline` | Legacy pipeline chrome (workspace frame hidden) |
 | `/profile` | Canonical profile (`/dashboard/profile` redirects here) |
 
@@ -53,7 +58,14 @@ Nav is `Connector/src/features/workspace/WorkspaceNav.tsx`. Visual language: neo
 1. `requireAuth` + ownership (`verifyProjectOwnership` / `verifyRepositoryOwnership`)
 2. Clone or resolve local path
 3. `fetch(AGENTIC_URL + path, { headers: agenticHeaders() })` with `DEPLAI_SERVICE_KEY`
-4. For sockets: `GET /api/scan/ws-token` (or pipeline equivalent) mints HMAC token; browser connects to `NEXT_PUBLIC_AGENTIC_WS_URL`
+4. For live sockets (scan, remediate, pipeline):
+   - `GET /api/scan/ws-token?project_id=…` mints a short-lived HMAC token (`WS_TOKEN_SECRET`, 5 min TTL)
+   - Browser resolves a WebSocket **base** via `resolveBrowserAgenticWsBase()` in `src/lib/agentic-websocket.ts`
+   - Production (public hostname): same-origin `wss://<APP_DOMAIN>/agentic` — never trust a container-internal origin from `/api/pipeline/ws-config`
+   - Local (no Caddy): direct Agentic port, e.g. `ws://localhost:8000` → `ws://localhost:8000/ws/scan/{project_id}?token=…`
+   - Production path through Caddy: `wss://<APP_DOMAIN>/agentic/ws/scan/{project_id}?token=…` (Caddy strips `/agentic` before proxying to FastAPI `/ws/scan/{project_id}`)
+   - Fallback: `GET /api/pipeline/ws-config` returns `{ ws_base }` when mixed-content or host-mismatch blocks the env default
+   - Ops diagnostic: `GET /api/scan/ws-health` probes the Docker-network upgrade and echoes the resolved public URL
 
 Do not call Agentic from client components with the service key.
 
@@ -71,6 +83,7 @@ Do not call Agentic from client components with the service key.
 | Session | `src/lib/session.ts`, `src/lib/auth.ts` |
 | GitHub | `src/lib/github.ts` |
 | Agentic client | `src/lib/agentic.ts` |
+| Agentic WebSocket URLs | `src/lib/agentic-websocket.ts` (`buildAgenticWebSocketUrl`, `resolveBrowserAgenticWsBase`) |
 | AI gateway | `src/lib/ai-platform/` |
 | Credits | `src/lib/billing/credits.ts`, `credits-policy.ts` |
 | Sessions | `src/lib/sessions/` |

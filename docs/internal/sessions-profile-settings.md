@@ -10,7 +10,7 @@ Tables: `workspace_sessions`, `workspace_session_logs` (`Connector/migrations/20
 | `status` | `queued` \| `running` \| `completed` \| `failed` \| `needs_review` |
 | log `level` | `debug` \| `info` \| `warn` \| `error` |
 
-`code_reviewer` is reserved. Nav item is `placeholder: true` — no dashboard page.
+`code_reviewer` is reserved. Dashboard has a coming-soon page at `/dashboard/code-reviewer` (nav tag **Soon**); no agent implementation yet.
 
 API: `/api/sessions`, `/api/sessions/[id]`, `/api/sessions/[id]/logs`. UI: `/dashboard/sessions`, `/dashboard/sessions/[id]`.
 

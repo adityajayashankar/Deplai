@@ -42,4 +42,18 @@ Agentic also bind-mounts `./Agentic Layer` for `--reload`. Production images do 
 
 `deploy/Caddyfile` terminates TLS. Connector is the public origin. Agentic is reached from Connector over the Docker network (`AGENTIC_LAYER_URL=http://agentic-layer:8000`). `DEPLAI_AI_GATEWAY_URL=http://connector:3000` so Agentic meters through Connector, not a public URL.
 
+### Browser WebSockets (`/agentic/ws/*`)
+
+Only scan, remediate, and pipeline live logs are exposed publicly. Flow:
+
+```text
+Browser:  wss://<APP_DOMAIN>/agentic/ws/scan/{project_id}?token=…
+Caddy:    uri strip_prefix /agentic
+Agentic:  /ws/scan/{project_id}
+```
+
+Caddy must strip **`/agentic` only** (`handle_path /agentic/*` or `uri strip_prefix /agentic`). Using `handle_path /agentic/ws/*` strips `/agentic/ws` and forwards `/scan/{id}` — FastAPI will not match. After Caddyfile edits: `docker compose --env-file deploy/.env -f docker-compose.production.yml up -d --force-recreate caddy`.
+
+Connector-side helpers: `Connector/src/lib/agentic-websocket.ts`. Ops check: authenticated `GET /api/scan/ws-health`.
+
 Related: [Local development](local-development.md) · [Environment](environment.md)

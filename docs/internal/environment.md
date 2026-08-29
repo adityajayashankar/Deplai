@@ -13,7 +13,7 @@ This page lists **names and purpose**, not values.
 | `SESSION_SECRET` | Connector | iron-session; also BYOK encryption fallback |
 | `NEXT_PUBLIC_APP_URL` | Connector | OAuth callback origin |
 | `AGENTIC_LAYER_URL` | Connector server | HTTP to Agentic (template default `http://localhost:8001`) |
-| `NEXT_PUBLIC_AGENTIC_WS_URL` | Browser | WS origin (template default `ws://localhost:8000` — **can disagree** with HTTP; see [Local development](local-development.md)) |
+| `NEXT_PUBLIC_AGENTIC_WS_URL` | Browser | Public WebSocket origin. Local template default `ws://localhost:8000` (no `/agentic` — Agentic is reached directly). Production: `wss://<APP_DOMAIN>/agentic`. On a public hostname the client prefers same-origin `/agentic` and ignores stale localhost values. See [Local development](local-development.md) |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | Connector | OAuth |
 | `GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY` / `GITHUB_WEBHOOK_SECRET` | Connector | App JWT, webhooks |
 | `DB_HOST` `DB_PORT` `DB_USER` `DB_PASSWORD` `DB_NAME` | Connector | MySQL |

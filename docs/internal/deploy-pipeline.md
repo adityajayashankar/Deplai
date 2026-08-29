@@ -51,6 +51,6 @@ EC2 allowlist: `DEPLAI_FREE_TIER_EC2_TYPES` (default `t3.micro,t2.micro`). `DEPL
 
 ## Session
 
-Deploy writes `workspace_sessions` with `service=deploy` via `resolveOrCreateSession` / `tryAppendSessionLogs`. Live Terraform logs also stream on `/ws/pipeline/{project_id}`.
+Deploy writes `workspace_sessions` with `service=deploy` via `resolveOrCreateSession` / `tryAppendSessionLogs`. Live Terraform logs stream on `/ws/pipeline/{project_id}` using the same browser WebSocket base as scans (`resolveBrowserAgenticWsBase` in `DeploymentTrackApp` + `agentic-websocket.ts`). Production URL shape: `wss://<APP_DOMAIN>/agentic/ws/pipeline/{project_id}?token=…`.
 
 Related: [Terraform Agent](terraform-agent.md) · [Sessions](sessions-profile-settings.md)

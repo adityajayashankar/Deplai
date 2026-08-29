@@ -31,6 +31,8 @@ The Connector adds this header server-side. Do not put the service key in browse
 
 The Connector issues a short-lived HMAC token for scan/remediation/pipeline sockets. The token includes an expiry, user subject, and project ID. The Agentic Layer rejects tokens that are invalid, expired, for another project, or whose subject does not match the stored workflow context.
 
+Browsers resolve the WebSocket base in `Connector/src/lib/agentic-websocket.ts`. On a public hostname they use same-origin `wss://<APP_DOMAIN>/agentic`; locally (no Caddy) they connect directly to Agentic, e.g. `ws://localhost:8000`. Production Caddy exposes `/agentic/ws/*` and strips `/agentic` before proxying to FastAPI `/ws/*`. `GET /api/pipeline/ws-config` returns `{ ws_base }` as a fallback; `GET /api/scan/ws-health` is an authenticated ops probe.
+
 ## Connector authentication
 
 | Method | Route | Authentication | Description |
@@ -82,6 +84,7 @@ The response contains `success` and the new project’s ID, type, local path, fi
 | `GET` | `/api/scan/status?project_id=…` | Returns scan state. |
 | `GET` | `/api/scan/results?project_id=…` | Returns parsed scan results. |
 | `GET` | `/api/scan/ws-token?project_id=…` | Mints a short-lived WebSocket token for an owned project. |
+| `GET` | `/api/scan/ws-health` | Authenticated diagnostic: probes Agentic WebSocket upgrade on the Docker network and returns resolved `public_ws_base` / hints. |
 | `POST` | `/api/remediate/start` | Validates remediation context and forwards GitHub credentials/token data server-side. |
 | `POST` | `/api/pipeline/remediation-pr` | Queries remediation pull-request status for an owned project. |
 
@@ -137,7 +140,7 @@ The response contains `success` and the new project’s ID, type, local path, fi
 | `POST` | `/api/pipeline/runtime-details` | Retrieves AWS runtime/resource details. |
 | `POST` | `/api/pipeline/runtime-instance` | Performs `start`, `stop`, or `reboot` on a selected EC2 instance. |
 | `GET` | `/api/pipeline/keypair/ppk` | Converts/downloads a generated EC2 key in PPK form where available. |
-| `GET` | `/api/pipeline/ws-config` | Returns the Agentic WebSocket base derived from the configured Agentic URL. |
+| `GET` | `/api/pipeline/ws-config` | Returns `{ ws_base }` — the browser-facing Agentic WebSocket origin (includes `/agentic` in production). |
 | `GET` | `/api/pipeline/health` | Returns Agentic service health for the dashboard. |
 | `GET` | `/api/pipeline/diagram` | Serves pipeline/architecture diagram data. |
 
@@ -262,12 +265,16 @@ All routes in this table require `X-API-Key` unless marked otherwise.
 
 ## Agentic Layer WebSockets
 
+FastAPI paths (what Agentic serves internally):
+
 | Socket | Purpose | Start command |
 | --- | --- | --- |
 | `/ws/scan/{project_id}?token=…` | Scan progress and interactive scan actions. | `{ "action": "start" }` |
 | `/ws/remediate/{project_id}?token=…` | Remediation progress and decision/approval actions. | `{ "action": "start" }` |
 | `/ws/pipeline/{project_id}?token=…` | Dashboard pipeline-event stream. | Connect with a valid token. |
 | `/api/iac/ws/{run_id}` | IaC runner log/status stream. Requires `X-API-Key`. Not exposed on the public origin; Connector polls `/api/pipeline/iac-status` instead. | Connect after `generate-and-apply`. |
+
+Production browsers connect through Caddy at `/agentic/ws/{endpoint}/{project_id}?token=…` (same token and frames; Caddy strips `/agentic` before proxying).
 
 Shared scan/remediation command frames use:
 

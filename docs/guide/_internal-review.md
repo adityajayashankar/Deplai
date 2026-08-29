@@ -29,7 +29,7 @@ Landing `FALLBACK_PLANS` and `credits.ts`: Free $0 / 5 credits; Starter $20 or $
 
 ## Unfinished UI
 
-- **Code Reviewer**: `placeholder: true`, no page.
+- **Code Reviewer**: `/dashboard/code-reviewer` coming-soon shell (nav tag **Soon**); no agent yet.
 - **Organizations**: same.
 - **DAST**: configured in Security Agent with an authorized public URL.
 - Documentation **in-app** (`/dashboard/documentation`) renders `docs/guide` via `npm run docs:embed`. Client pages must not include host paths, Docker, DB tables, service keys, or internal architecture. Re-run the embed script after Markdown edits.
