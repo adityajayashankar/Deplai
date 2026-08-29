@@ -141,8 +141,19 @@ function sameOriginAgenticBase(): string {
   return `${normalizeWsBase(browserWsFallbackBase())}/agentic`;
 }
 
+function wsBaseMatchesCurrentHost(wsBase: string): boolean {
+  if (typeof window === 'undefined') return true;
+  try {
+    return new URL(wsBase).host === window.location.host;
+  } catch {
+    return false;
+  }
+}
+
 async function resolveWsBaseUrl(): Promise<string> {
-  if (resolvedWsBaseCache && !isMixedContentWs(resolvedWsBaseCache)) return resolvedWsBaseCache;
+  if (resolvedWsBaseCache && !isMixedContentWs(resolvedWsBaseCache) && wsBaseMatchesCurrentHost(resolvedWsBaseCache)) {
+    return resolvedWsBaseCache;
+  }
   if (wsBaseFetchInFlight) return wsBaseFetchInFlight;
 
   wsBaseFetchInFlight = (async () => {
@@ -160,7 +171,7 @@ async function resolveWsBaseUrl(): Promise<string> {
       // ignore and fallback
     }
     const publicWs = normalizeWsBase(WS_BASE_URL);
-    if (publicWs.endsWith('/agentic') && !isMixedContentWs(publicWs)) {
+    if (publicWs.endsWith('/agentic') && !isMixedContentWs(publicWs) && wsBaseMatchesCurrentHost(publicWs)) {
       resolvedWsBaseCache = publicWs;
       return resolvedWsBaseCache;
     }
@@ -207,9 +218,15 @@ function connectWebSocket(
   const workflowLabel = path.includes('/remediate') ? 'remediation' : 'scan';
   const ws = new WebSocket(wsToken ? `${base}?token=${encodeURIComponent(wsToken)}` : base);
   let opened = false;
+  let reportedError = false;
+  const reportError = (detail: string) => {
+    if (reportedError) return;
+    reportedError = true;
+    onError(projectId, detail);
+  };
   const connectTimeout = window.setTimeout(() => {
     if (opened || ws.readyState !== WebSocket.CONNECTING) return;
-    onError(projectId, `The live ${workflowLabel} connection timed out. Verify the production WebSocket URL and reverse proxy, then retry.`);
+    reportError(`The live ${workflowLabel} connection timed out. Verify the production WebSocket URL and reverse proxy, then retry.`);
     ws.close();
   }, WEBSOCKET_CONNECT_TIMEOUT_MS);
 
@@ -243,6 +260,7 @@ function connectWebSocket(
       case 'status':
         const status = typeof data.status === 'string' ? data.status : '';
         if (status === 'error' && typeof data.error === 'string' && data.error.trim()) {
+          reportedError = true;
           onMessage(projectId, {
             index: Date.now(),
             total: Date.now(),
@@ -259,10 +277,20 @@ function connectWebSocket(
   };
 
   ws.onerror = () => {
-    onError(projectId, `WebSocket transport error while streaming ${workflowLabel} logs. Verify the production WebSocket URL and reverse proxy, then retry.`);
+    if (reportedError) return;
+    if (!opened) {
+      reportError(`WebSocket transport error while streaming ${workflowLabel} logs. Verify the production WebSocket URL and reverse proxy, then retry.`);
+    }
   };
   ws.onclose = (event) => {
     window.clearTimeout(connectTimeout);
+    if (!opened && !reportedError) {
+      const reason = event.reason?.trim();
+      const suffix = reason ? ` ${reason}` : '';
+      reportError(
+        `WebSocket closed before the live ${workflowLabel} stream connected (code ${event.code || 0}).${suffix} Verify the production WebSocket URL and reverse proxy, then retry.`,
+      );
+    }
     onClose(projectId, { code: event.code, reason: event.reason });
   };
 

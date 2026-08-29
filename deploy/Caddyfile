@@ -2,8 +2,16 @@
     admin off
 }
 
-{$APP_DOMAIN} {
-    encode zstd gzip
+{$APP_DOMAIN}, www.{$APP_DOMAIN} {
+    # Users and OAuth providers may land on www; issue a cert for both hostnames
+    # and redirect www to the canonical apex domain used in deploy/.env.
+    @www host www.{$APP_DOMAIN}
+    handle @www {
+        redir https://{$APP_DOMAIN}{uri} permanent
+    }
+
+    @not_agentic_ws not path_regexp ^/agentic/ws
+    encode @not_agentic_ws zstd gzip
 
     header {
         -Server
@@ -26,7 +34,8 @@
     # Browser WebSockets only. HTTP Agentic APIs stay on the Docker network
     # and are called by Connector with X-API-Key. Strip /agentic so FastAPI
     # still receives /ws/scan|remediate|pipeline/...
-    @agentic_ws path /agentic/ws /agentic/ws/*
+    # Match nested scan/remediate/pipeline socket paths (/agentic/ws/scan/{id}, etc.).
+    @agentic_ws path_regexp ^/agentic/ws
     handle @agentic_ws {
         uri strip_prefix /agentic
         reverse_proxy agentic-layer:8000

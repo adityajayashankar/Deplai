@@ -130,6 +130,10 @@ Set `APP_DOMAIN`, `NEXT_PUBLIC_APP_URL=https://<APP_DOMAIN>`,
 `NEXT_PUBLIC_AGENTIC_WS_URL=wss://<APP_DOMAIN>/agentic`, and
 `CORS_ORIGINS=https://<APP_DOMAIN>` to the same hostname.
 
+Point both the apex and `www.<APP_DOMAIN>` DNS records at the Elastic IP.
+Caddy issues certificates for both and redirects `www` to the apex domain so
+browser WebSockets stay on the canonical hostname.
+
 Encode the GitHub App PEM as one line:
 
 ```bash
