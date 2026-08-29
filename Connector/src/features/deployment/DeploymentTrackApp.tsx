@@ -6,6 +6,7 @@ import { ArrowLeft, ArrowRight, CheckCircle2, ChevronRight, CircleDashed, Extern
 import { ApplyLogViewer } from '@/components/pipeline/ApplyLogViewer';
 import { AwsConsoleTerminal } from '@/components/pipeline/AwsConsoleTerminal';
 import { buildDeploymentWorkspace } from '@/lib/deployment-planning-contract';
+import { buildAgenticWebSocketUrl } from '@/lib/agentic-websocket';
 import { createWorkspaceSession, persistSessionProgress, finalizeWorkspaceSession } from '@/lib/sessions/client';
 import {
   Callout,
@@ -3172,7 +3173,12 @@ export default function DeploymentTrackApp() {
         }
         if (disposed) return;
 
-        const wsUrl = `${wsConfig.ws_base.replace(/\/$/, '')}/ws/pipeline/${encodeURIComponent(selectedProject.id)}?token=${encodeURIComponent(tokenData.token)}`;
+        const wsUrl = buildAgenticWebSocketUrl(
+          wsConfig.ws_base,
+          'pipeline',
+          selectedProject.id,
+          tokenData.token,
+        );
         socket = new WebSocket(wsUrl);
         pipelineSocketRef.current = socket;
 

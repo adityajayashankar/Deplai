@@ -15,6 +15,7 @@
     "test:settings": "tsx --test src/lib/user-settings.test.ts",
     "test:docs": "tsx --test src/features/docs/*.test.ts",
     "test:deployment": "tsx --test src/features/deployment/*.test.ts src/lib/terraform-apply-wait.test.ts",
+    "test:agentic-websocket": "tsx --test src/lib/agentic-websocket.test.ts",
     "test:usage": "tsx --test src/lib/usage/*.test.ts"
   },
   "dependencies": {

@@ -3,6 +3,13 @@
 import { createContext, useContext, useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { createWorkspaceSession, persistSessionProgress } from '@/lib/sessions/client';
 import type { SessionLogLevel, SessionStatus } from '@/lib/sessions/types';
+import {
+  buildAgenticWebSocketUrl,
+  isMixedContentWebSocket,
+  normalizeAgenticWsBase,
+  resolveAgenticWsBaseFromConfig,
+  wsBaseMatchesHost,
+} from '@/lib/agentic-websocket';
 
 const WS_BASE_URL = (process.env.NEXT_PUBLIC_AGENTIC_WS_URL || '').trim();
 const SCAN_CONTEXT_STORAGE_KEY = 'deplai.scan-context.v1';
@@ -122,36 +129,13 @@ async function fetchWsToken(projectId: string): Promise<string> {
 let resolvedWsBaseCache: string | null = null;
 let wsBaseFetchInFlight: Promise<string> | null = null;
 
-function normalizeWsBase(input: string): string {
-  return input.replace(/\/+$/, '');
-}
-
-function browserWsFallbackBase(): string {
-  if (typeof window === 'undefined') return 'ws://localhost:8000';
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}`;
-}
-
-function isMixedContentWs(wsBase: string): boolean {
-  if (typeof window === 'undefined') return false;
-  return window.location.protocol === 'https:' && wsBase.startsWith('ws://');
-}
-
-function sameOriginAgenticBase(): string {
-  return `${normalizeWsBase(browserWsFallbackBase())}/agentic`;
-}
-
-function wsBaseMatchesCurrentHost(wsBase: string): boolean {
-  if (typeof window === 'undefined') return true;
-  try {
-    return new URL(wsBase).host === window.location.host;
-  } catch {
-    return false;
-  }
-}
-
 async function resolveWsBaseUrl(): Promise<string> {
-  if (resolvedWsBaseCache && !isMixedContentWs(resolvedWsBaseCache) && wsBaseMatchesCurrentHost(resolvedWsBaseCache)) {
+  if (
+    resolvedWsBaseCache
+    && typeof window !== 'undefined'
+    && !isMixedContentWebSocket(resolvedWsBaseCache, window.location.protocol)
+    && wsBaseMatchesHost(resolvedWsBaseCache, window.location.host)
+  ) {
     return resolvedWsBaseCache;
   }
   if (wsBaseFetchInFlight) return wsBaseFetchInFlight;
@@ -161,8 +145,12 @@ async function resolveWsBaseUrl(): Promise<string> {
       const res = await fetch('/api/pipeline/ws-config', { cache: 'no-store' });
       if (res.ok) {
         const data = await res.json() as { ws_base?: string };
-        const fromServer = normalizeWsBase(String(data.ws_base || '').trim());
-        if (fromServer && !isMixedContentWs(fromServer)) {
+        const fromServer = normalizeAgenticWsBase(String(data.ws_base || '').trim());
+        if (
+          fromServer
+          && typeof window !== 'undefined'
+          && !isMixedContentWebSocket(fromServer, window.location.protocol)
+        ) {
           resolvedWsBaseCache = fromServer;
           return resolvedWsBaseCache;
         }
@@ -170,12 +158,12 @@ async function resolveWsBaseUrl(): Promise<string> {
     } catch {
       // ignore and fallback
     }
-    const publicWs = normalizeWsBase(WS_BASE_URL);
-    if (publicWs.endsWith('/agentic') && !isMixedContentWs(publicWs) && wsBaseMatchesCurrentHost(publicWs)) {
-      resolvedWsBaseCache = publicWs;
-      return resolvedWsBaseCache;
-    }
-    resolvedWsBaseCache = sameOriginAgenticBase();
+    resolvedWsBaseCache = resolveAgenticWsBaseFromConfig({
+      publicEnvWsUrl: WS_BASE_URL,
+      browser: typeof window !== 'undefined'
+        ? { protocol: window.location.protocol, host: window.location.host }
+        : undefined,
+    });
     return resolvedWsBaseCache;
   })();
 
@@ -206,7 +194,7 @@ function messagesIndicateSettledScan(messages: ScanMessage[]): boolean {
 
 function connectWebSocket(
   wsBaseUrl: string,
-  path: string,
+  path: '/ws/scan' | '/ws/remediate' | '/ws/pipeline',
   projectId: string,
   onMessage: (projectId: string, msg: ScanMessage) => void,
   onStatus: (projectId: string, status: string) => void,
@@ -214,11 +202,14 @@ function connectWebSocket(
   onClose: (projectId: string, detail?: { code?: number; reason?: string }) => void,
   wsToken: string,
 ): WebSocket {
-  const base = `${normalizeWsBase(wsBaseUrl)}${path}/${encodeURIComponent(projectId)}`;
-  const workflowLabel = path.includes('/remediate') ? 'remediation' : 'scan';
-  const ws = new WebSocket(wsToken ? `${base}?token=${encodeURIComponent(wsToken)}` : base);
+  const endpoint = path.replace('/ws/', '') as 'scan' | 'remediate' | 'pipeline';
+  const wsUrl = buildAgenticWebSocketUrl(wsBaseUrl, endpoint, projectId, wsToken);
+  const workflowLabel = endpoint === 'remediate' ? 'remediation' : endpoint === 'pipeline' ? 'pipeline' : 'scan';
+  const ws = new WebSocket(wsUrl);
   let opened = false;
   let reportedError = false;
+  let closeCode: number | undefined;
+  let closeReason = '';
   const reportError = (detail: string) => {
     if (reportedError) return;
     reportedError = true;
@@ -277,18 +268,24 @@ function connectWebSocket(
   };
 
   ws.onerror = () => {
-    if (reportedError) return;
-    if (!opened) {
-      reportError(`WebSocket transport error while streaming ${workflowLabel} logs. Verify the production WebSocket URL and reverse proxy, then retry.`);
-    }
+    window.setTimeout(() => {
+      if (reportedError || opened) return;
+      const suffix = closeReason ? ` ${closeReason}` : '';
+      reportError(
+        `WebSocket transport error while streaming ${workflowLabel} logs (${wsUrl.split('?')[0]}).` +
+        ` Close code ${closeCode ?? 'unknown'}.${suffix}`,
+      );
+    }, 0);
   };
   ws.onclose = (event) => {
     window.clearTimeout(connectTimeout);
+    closeCode = event.code;
+    closeReason = event.reason?.trim() || '';
     if (!opened && !reportedError) {
-      const reason = event.reason?.trim();
-      const suffix = reason ? ` ${reason}` : '';
+      const suffix = closeReason ? ` ${closeReason}` : '';
       reportError(
-        `WebSocket closed before the live ${workflowLabel} stream connected (code ${event.code || 0}).${suffix} Verify the production WebSocket URL and reverse proxy, then retry.`,
+        `WebSocket closed before the live ${workflowLabel} stream connected (${wsUrl.split('?')[0]}).` +
+        ` Code ${event.code || 0}.${suffix}`,
       );
     }
     onClose(projectId, { code: event.code, reason: event.reason });
@@ -640,15 +637,15 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
         current_stage: 'scan',
       });
       if (sessionId) securitySessionIdsRef.current[projectId] = sessionId;
+      const wsBaseUrl = await resolveWsBaseUrl();
+      const wsToken = await fetchWsToken(projectId);
       appendScanMessage(projectId, {
         index: Date.now(),
         total: Date.now(),
         type: 'info',
-        content: 'Connecting to the live scanner…',
+        content: `Connecting to the live scanner at ${buildAgenticWebSocketUrl(wsBaseUrl, 'scan', projectId).split('?')[0]}…`,
         timestamp: new Date().toISOString(),
       });
-      const wsBaseUrl = await resolveWsBaseUrl();
-      const wsToken = await fetchWsToken(projectId);
       wsRefs.current[projectId] = connectWebSocket(
         wsBaseUrl,
         '/ws/scan', projectId,
