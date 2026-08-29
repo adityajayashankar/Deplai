@@ -75,33 +75,138 @@ export function wsBaseMatchesHost(wsBase: string, host: string): boolean {
   }
 }
 
+/** Hostnames that must never be sent to browsers as the public WebSocket origin. */
+export function isInternalHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase().split(':')[0] || '';
+  if (!normalized) return true;
+  if (normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '0.0.0.0') {
+    return true;
+  }
+  if (normalized === 'connector' || normalized.endsWith('.internal')) return true;
+  return false;
+}
+
+export function isInternalHttpOrigin(origin: string): boolean {
+  try {
+    const parsed = new URL(origin);
+    return isInternalHostname(parsed.hostname);
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Resolve the browser-visible HTTP origin for a request behind Caddy/reverse proxies.
+ * Falls back to NEXT_PUBLIC_APP_URL when the app only sees its container listen address.
+ */
+export function resolvePublicHttpOrigin(options: {
+  requestOrigin?: string;
+  forwardedHost?: string | null;
+  forwardedProto?: string | null;
+  hostHeader?: string | null;
+  publicAppUrl?: string | null;
+}): string | null {
+  const forwardedHost = options.forwardedHost?.split(',')[0]?.trim();
+  const forwardedProto = options.forwardedProto?.split(',')[0]?.trim();
+  if (forwardedHost && forwardedProto) {
+    return `${forwardedProto}://${forwardedHost}`;
+  }
+
+  const hostHeader = options.hostHeader?.trim();
+  if (hostHeader && !isInternalHostname(hostHeader.split(':')[0] || '')) {
+    const proto = forwardedProto
+      || (options.requestOrigin?.startsWith('https://') ? 'https' : 'https');
+    return `${proto}://${hostHeader}`;
+  }
+
+  const requestOrigin = options.requestOrigin?.trim();
+  if (requestOrigin && !isInternalHttpOrigin(requestOrigin)) {
+    return requestOrigin;
+  }
+
+  const publicAppUrl = options.publicAppUrl?.trim().replace(/\/+$/, '');
+  if (publicAppUrl && !isInternalHttpOrigin(publicAppUrl)) {
+    return publicAppUrl;
+  }
+
+  return requestOrigin || publicAppUrl || null;
+}
+
 export function resolveAgenticWsBaseFromConfig(options: {
   requestOrigin?: string;
+  forwardedHost?: string | null;
+  forwardedProto?: string | null;
+  hostHeader?: string | null;
+  publicAppUrl?: string | null;
   publicEnvWsUrl?: string;
   browser?: { protocol: string; host: string };
 }): string {
-  const requestOrigin = options.requestOrigin?.trim();
-  if (requestOrigin) {
-    const fromOrigin = toWebSocketBaseFromHttpOrigin(requestOrigin);
+  const publicHttpOrigin = resolvePublicHttpOrigin({
+    requestOrigin: options.requestOrigin,
+    forwardedHost: options.forwardedHost,
+    forwardedProto: options.forwardedProto,
+    hostHeader: options.hostHeader,
+    publicAppUrl: options.publicAppUrl,
+  });
+  if (publicHttpOrigin) {
+    const fromOrigin = toWebSocketBaseFromHttpOrigin(publicHttpOrigin);
     if (fromOrigin) {
       return `${fromOrigin}${AGENTIC_PUBLIC_PATH_PREFIX}`;
     }
   }
 
   const publicWs = normalizeAgenticWsBase(options.publicEnvWsUrl || '');
-  const browser = options.browser;
-  if (
-    publicWs.endsWith(AGENTIC_PUBLIC_PATH_PREFIX)
-    && browser
-    && !isMixedContentWebSocket(publicWs, browser.protocol)
-    && wsBaseMatchesHost(publicWs, browser.host)
-  ) {
-    return publicWs;
+  if (publicWs.endsWith(AGENTIC_PUBLIC_PATH_PREFIX)) {
+    try {
+      if (!isInternalHostname(new URL(publicWs).hostname)) {
+        const browser = options.browser;
+        if (!browser || wsBaseMatchesHost(publicWs, browser.host)) {
+          return publicWs;
+        }
+      }
+    } catch {
+      // ignore invalid public ws url
+    }
   }
 
+  const browser = options.browser;
   if (browser) {
+    const browserHostname = browser.host.split(':')[0] || '';
+    if (isInternalHostname(browserHostname)) {
+      const publicWs = normalizeAgenticWsBase(options.publicEnvWsUrl || '');
+      try {
+        if (
+          publicWs.endsWith(AGENTIC_PUBLIC_PATH_PREFIX)
+          && !isInternalHostname(new URL(publicWs).hostname)
+        ) {
+          return publicWs;
+        }
+      } catch {
+        // ignore invalid configured ws url
+      }
+    }
     return sameOriginAgenticWsBase(browser);
   }
 
   return `ws://127.0.0.1:8000`;
+}
+
+/**
+ * Browser-side WebSocket base resolution.
+ * On a public hostname (deplai.in), always use same-origin /agentic and never
+ * trust container-internal origins from /api/pipeline/ws-config.
+ */
+export function resolveBrowserAgenticWsBase(options: {
+  browser: { protocol: string; host: string };
+  publicEnvWsUrl?: string;
+}): string {
+  const browserHostname = options.browser.host.split(':')[0] || '';
+  if (!isInternalHostname(browserHostname)) {
+    return sameOriginAgenticWsBase(options.browser);
+  }
+
+  return resolveAgenticWsBaseFromConfig({
+    publicEnvWsUrl: options.publicEnvWsUrl,
+    browser: options.browser,
+  });
 }

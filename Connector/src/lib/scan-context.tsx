@@ -8,6 +8,7 @@ import {
   isMixedContentWebSocket,
   normalizeAgenticWsBase,
   resolveAgenticWsBaseFromConfig,
+  resolveBrowserAgenticWsBase,
   wsBaseMatchesHost,
 } from '@/lib/agentic-websocket';
 
@@ -130,6 +131,21 @@ let resolvedWsBaseCache: string | null = null;
 let wsBaseFetchInFlight: Promise<string> | null = null;
 
 async function resolveWsBaseUrl(): Promise<string> {
+  if (typeof window !== 'undefined') {
+    const browser = { protocol: window.location.protocol, host: window.location.host };
+    const direct = resolveBrowserAgenticWsBase({ browser, publicEnvWsUrl: WS_BASE_URL });
+    if (
+      !resolvedWsBaseCache
+      || resolvedWsBaseCache !== direct
+      || !wsBaseMatchesHost(resolvedWsBaseCache, browser.host)
+    ) {
+      resolvedWsBaseCache = direct;
+    }
+    if (!isMixedContentWebSocket(resolvedWsBaseCache, browser.protocol)) {
+      return resolvedWsBaseCache;
+    }
+  }
+
   if (
     resolvedWsBaseCache
     && typeof window !== 'undefined'
@@ -150,6 +166,7 @@ async function resolveWsBaseUrl(): Promise<string> {
           fromServer
           && typeof window !== 'undefined'
           && !isMixedContentWebSocket(fromServer, window.location.protocol)
+          && wsBaseMatchesHost(fromServer, window.location.host)
         ) {
           resolvedWsBaseCache = fromServer;
           return resolvedWsBaseCache;

@@ -8,6 +8,11 @@ export async function GET(request: NextRequest) {
 
   const wsBase = resolveAgenticWsBaseFromConfig({
     requestOrigin: request.nextUrl.origin,
+    forwardedHost: request.headers.get('x-forwarded-host'),
+    forwardedProto: request.headers.get('x-forwarded-proto'),
+    hostHeader: request.headers.get('host'),
+    publicAppUrl: process.env.NEXT_PUBLIC_APP_URL,
+    publicEnvWsUrl: process.env.NEXT_PUBLIC_AGENTIC_WS_URL,
   });
   if (!wsBase) {
     return NextResponse.json(
@@ -18,4 +23,3 @@ export async function GET(request: NextRequest) {
 
   return NextResponse.json({ success: true, ws_base: wsBase });
 }
-

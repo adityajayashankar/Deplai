@@ -4,6 +4,8 @@ import {
   agenticUpstreamWebSocketPath,
   buildAgenticWebSocketUrl,
   resolveAgenticWsBaseFromConfig,
+  resolveBrowserAgenticWsBase,
+  resolvePublicHttpOrigin,
   stripAgenticPublicPrefix,
 } from './agentic-websocket';
 
@@ -62,20 +64,76 @@ describe('agentic-websocket Caddy prefix stripping', () => {
   });
 });
 
+describe('resolvePublicHttpOrigin', () => {
+  it('prefers X-Forwarded-Host/Proto from Caddy', () => {
+    const origin = resolvePublicHttpOrigin({
+      requestOrigin: 'http://localhost:3000',
+      forwardedHost: 'deplai.in',
+      forwardedProto: 'https',
+      hostHeader: 'connector:3000',
+    });
+    assert.equal(origin, 'https://deplai.in');
+  });
+
+  it('uses Host header when forwarded headers are absent', () => {
+    const origin = resolvePublicHttpOrigin({
+      requestOrigin: 'http://localhost:3000',
+      hostHeader: 'deplai.in',
+    });
+    assert.equal(origin, 'https://deplai.in');
+  });
+
+  it('falls back to NEXT_PUBLIC_APP_URL when request origin is internal', () => {
+    const origin = resolvePublicHttpOrigin({
+      requestOrigin: 'http://localhost:3000',
+      publicAppUrl: 'https://deplai.in',
+    });
+    assert.equal(origin, 'https://deplai.in');
+  });
+});
+
 describe('resolveAgenticWsBaseFromConfig', () => {
   it('prefers same-origin request origin in production', () => {
     const base = resolveAgenticWsBaseFromConfig({
-      requestOrigin: 'https://deplai.in',
+      forwardedHost: 'deplai.in',
+      forwardedProto: 'https',
+      requestOrigin: 'http://localhost:3000',
       publicEnvWsUrl: 'wss://deplai.in/agentic',
     });
     assert.equal(base, 'wss://deplai.in/agentic');
   });
 
-  it('falls back to same-origin /agentic when env host mismatches', () => {
+  it('uses configured public ws url when the browser is on localhost', () => {
     const base = resolveAgenticWsBaseFromConfig({
       publicEnvWsUrl: 'wss://deplai.in/agentic',
-      browser: { protocol: 'https:', host: 'localhost:3000' },
+      browser: { protocol: 'http:', host: 'localhost:3000' },
     });
-    assert.equal(base, 'wss://localhost:3000/agentic');
+    assert.equal(base, 'wss://deplai.in/agentic');
+  });
+
+  it('falls back to same-origin /agentic for local-only env', () => {
+    const base = resolveAgenticWsBaseFromConfig({
+      publicEnvWsUrl: 'ws://localhost:3000/agentic',
+      browser: { protocol: 'http:', host: 'localhost:3000' },
+    });
+    assert.equal(base, 'ws://localhost:3000/agentic');
+  });
+});
+
+describe('resolveBrowserAgenticWsBase', () => {
+  it('always uses same-origin on a public production hostname', () => {
+    const base = resolveBrowserAgenticWsBase({
+      browser: { protocol: 'https:', host: 'deplai.in' },
+      publicEnvWsUrl: 'wss://deplai.in/agentic',
+    });
+    assert.equal(base, 'wss://deplai.in/agentic');
+  });
+
+  it('ignores a stale localhost ws-config on production pages', () => {
+    const base = resolveBrowserAgenticWsBase({
+      browser: { protocol: 'https:', host: 'deplai.in' },
+      publicEnvWsUrl: 'ws://localhost:3000/agentic',
+    });
+    assert.equal(base, 'wss://deplai.in/agentic');
   });
 });

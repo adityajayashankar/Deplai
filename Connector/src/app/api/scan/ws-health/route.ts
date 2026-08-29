@@ -113,6 +113,7 @@ export async function GET() {
   const direct = await probeAgenticWebSocket(probePath);
   const publicWsBase = resolveAgenticWsBaseFromConfig({
     requestOrigin: process.env.NEXT_PUBLIC_APP_URL || undefined,
+    publicEnvWsUrl: process.env.NEXT_PUBLIC_AGENTIC_WS_URL,
   });
   const publicBrowserUrl = buildAgenticWebSocketUrl(publicWsBase, 'scan', projectId, token);
 

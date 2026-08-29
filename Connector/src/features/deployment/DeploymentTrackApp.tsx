@@ -6,7 +6,7 @@ import { ArrowLeft, ArrowRight, CheckCircle2, ChevronRight, CircleDashed, Extern
 import { ApplyLogViewer } from '@/components/pipeline/ApplyLogViewer';
 import { AwsConsoleTerminal } from '@/components/pipeline/AwsConsoleTerminal';
 import { buildDeploymentWorkspace } from '@/lib/deployment-planning-contract';
-import { buildAgenticWebSocketUrl } from '@/lib/agentic-websocket';
+import { buildAgenticWebSocketUrl, resolveBrowserAgenticWsBase } from '@/lib/agentic-websocket';
 import { createWorkspaceSession, persistSessionProgress, finalizeWorkspaceSession } from '@/lib/sessions/client';
 import {
   Callout,
@@ -3159,22 +3159,22 @@ export default function DeploymentTrackApp() {
     const connect = async () => {
       try {
         setDeploySocketState('connecting');
-        const [wsConfigRes, tokenRes] = await Promise.all([
-          fetch('/api/pipeline/ws-config', { cache: 'no-store' }),
-          fetch(`/api/scan/ws-token?project_id=${encodeURIComponent(selectedProject.id)}`, { cache: 'no-store' }),
-        ]);
-        const wsConfig = await wsConfigRes.json().catch(() => ({})) as { success?: boolean; ws_base?: string; error?: string };
+        const tokenRes = await fetch(
+          `/api/scan/ws-token?project_id=${encodeURIComponent(selectedProject.id)}`,
+          { cache: 'no-store' },
+        );
         const tokenData = await tokenRes.json().catch(() => ({})) as { token?: string; error?: string };
-        if (!wsConfigRes.ok || !wsConfig.success || !wsConfig.ws_base) {
-          throw new Error(wsConfig.error || 'Failed to resolve pipeline websocket base.');
-        }
         if (!tokenRes.ok || !tokenData.token) {
           throw new Error(tokenData.error || 'Failed to issue pipeline websocket token.');
         }
         if (disposed) return;
 
+        const wsBase = resolveBrowserAgenticWsBase({
+          browser: { protocol: window.location.protocol, host: window.location.host },
+          publicEnvWsUrl: (process.env.NEXT_PUBLIC_AGENTIC_WS_URL || '').trim(),
+        });
         const wsUrl = buildAgenticWebSocketUrl(
-          wsConfig.ws_base,
+          wsBase,
           'pipeline',
           selectedProject.id,
           tokenData.token,
