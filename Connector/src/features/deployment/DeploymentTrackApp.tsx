@@ -2,11 +2,18 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { ArrowLeft, ArrowRight, CheckCircle2, ChevronRight, CircleDashed, ExternalLink, RefreshCw, Rocket, Server, Terminal } from 'lucide-react';
+import { ArrowLeft, ArrowRight, CheckCircle2, ChevronRight, CircleDashed, ExternalLink, RefreshCw, Rocket, Server } from 'lucide-react';
 import { ApplyLogViewer } from '@/components/pipeline/ApplyLogViewer';
+import {
+  ProcessStatusTrack,
+  TERRAFORM_APPLY_STATUS_LABEL,
+  TERRAFORM_APPLY_STEPS,
+  TERRAFORM_GENERATION_STEPS,
+  normalizeProcessPhase,
+  progressForProcessPhase,
+} from '@/components/pipeline/ProcessStatusTrack';
 import { AwsConsoleTerminal } from '@/components/pipeline/AwsConsoleTerminal';
 import { buildDeploymentWorkspace } from '@/lib/deployment-planning-contract';
-import { buildAgenticWebSocketUrl, resolveBrowserAgenticWsBase } from '@/lib/agentic-websocket';
 import { createWorkspaceSession, persistSessionProgress, finalizeWorkspaceSession } from '@/lib/sessions/client';
 import {
   Callout,
@@ -15,7 +22,6 @@ import {
   CountUp,
   EmptyState,
   KeyValueRow,
-  LogConsole,
   MetaChip,
   Panel,
   PanelHeader,
@@ -175,7 +181,6 @@ type DeploymentPlanOption = {
   services: string[];
 };
 
-const PIPELINE_SOCKET_RETRY_DELAYS_MS = [1000, 2000, 5000, 5000];
 const CONNECTOR_READINESS_RETRY_DELAYS_MS = [0, 500, 1_500];
 const DEPLOY_RECONCILE_POLL_INTERVAL_MS = 5_000;
 const APPROVED_DECISION_KEY = 'deplai.pipeline.approvedDecision';
@@ -865,14 +870,38 @@ type ApprovalPayload = {
   };
 };
 
-type PipelineSocketState = 'idle' | 'connecting' | 'connected' | 'error';
-
 type DeployStatusResponse = {
   success?: boolean;
   status?: string;
   result?: unknown;
   error?: string;
 };
+
+function resolveDeployProcessPhase(
+  runtimeStatus: string,
+  runtimeResult: Record<string, unknown> | null,
+  dataResult: unknown,
+): string {
+  const nested = (runtimeResult || dataResult) as { phase?: string; status?: string } | null;
+  const phase = String(nested?.phase || '').trim().toLowerCase();
+  if (phase) return phase;
+  const status = String(runtimeStatus || nested?.status || 'idle').trim().toLowerCase();
+  if (status === 'awaiting_plan_confirmation') return 'awaiting_plan_confirmation';
+  if (status === 'running') return 'apply';
+  return status;
+}
+
+function resolveDeployProcessMessage(
+  phase: string,
+  runtimeResult: Record<string, unknown> | null,
+  dataResult: unknown,
+): string {
+  const nested = (runtimeResult || dataResult) as { phase_message?: string } | null;
+  const explicit = String(nested?.phase_message || '').trim();
+  if (explicit) return explicit;
+  const normalized = normalizeProcessPhase(phase);
+  return TERRAFORM_APPLY_STATUS_LABEL[normalized] || 'Processing deployment…';
+}
 
 type EndpointVerificationCheck = {
   label: string;
@@ -887,13 +916,6 @@ type OutputBannerState = {
   label: string;
   title: string;
   description: string;
-};
-
-type SocketNotice = {
-  key: string;
-  text: string;
-  ts: string;
-  tone: 'info' | 'error';
 };
 
 type TerraformRendererSummary = {
@@ -1850,13 +1872,7 @@ export default function DeploymentTrackApp() {
   const searchParams = useSearchParams();
   const customizationSnapshotId = (searchParams.get('customizationSnapshotId') || '').trim();
   const customizationTenantId = (searchParams.get('tenantId') || '').trim();
-  const logPanelRef = useRef<HTMLDivElement>(null);
-  const logStickToBottomRef = useRef(true);
-  const pipelineSocketRef = useRef<WebSocket | null>(null);
-  const pipelineSocketRetryRef = useRef<number | null>(null);
-  const pipelineSocketAttemptRef = useRef(0);
   const lastPrefillQuestionIdRef = useRef<string | null>(null);
-  const socketNoticeKeysRef = useRef<Set<string>>(new Set());
   const deployRequestRef = useRef<string | null>(null);
   const idleRecoveryRef = useRef<string | null>(null);
   const analysisRequestRef = useRef<string | null>(null);
@@ -1907,16 +1923,18 @@ export default function DeploymentTrackApp() {
   const [terraformRuntimeConfigWasStored, setTerraformRuntimeConfigWasStored] = useState(false);
   const [deployStatus, setDeployStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const [deployProgress, setDeployProgress] = useState(0);
-  const [deployLogs, setDeployLogs] = useState<DeployLogEntry[]>([]);
   const [deployResult, setDeployResult] = useState<DeployApiResult | null>(null);
   const [requiresPlanConfirmation, setRequiresPlanConfirmation] = useState(false);
   const [pendingPlanSummary, setPendingPlanSummary] = useState<Record<string, unknown> | null>(null);
   const [deploymentHistory, setDeploymentHistory] = useState<DeployStateSnapshot['deploymentHistory']>([]);
-  const [deploySocketState, setDeploySocketState] = useState<PipelineSocketState>('idle');
-  const [socketNotices, setSocketNotices] = useState<SocketNotice[]>([]);
   /** Local UI phase so the Deploy panel always shows feedback even if shared deploy state lags. */
   const [deployUiPhase, setDeployUiPhase] = useState<
     'idle' | 'starting' | 'waiting_api' | 'awaiting_plan' | 'reconciling' | 'done' | 'error'
+  >('idle');
+  const [deployProcessPhase, setDeployProcessPhase] = useState('idle');
+  const [deployProcessMessage, setDeployProcessMessage] = useState<string | null>(null);
+  const [terraformGenerationPhase, setTerraformGenerationPhase] = useState<
+    'idle' | 'starting' | 'generating' | 'completed' | 'failed'
   >('idle');
   const [deployElapsedSec, setDeployElapsedSec] = useState(0);
   const deployStartedAtRef = useRef<number | null>(null);
@@ -2070,55 +2088,20 @@ export default function DeploymentTrackApp() {
     type: 'info' | 'success' | 'error' = 'info',
     meta?: Omit<DeployLogEntry, 'text' | 'ts' | 'type'>,
   ) => {
-    const entry: DeployLogEntry = { text, ts: timestampLabel(), type, ...meta };
-    setDeployLogs((prev) => {
-      const last = prev[prev.length - 1];
-      if (
-        last
-        && last.text === text
-        && last.type === type
-        && last.worker_id === meta?.worker_id
-        && last.worker_status === meta?.worker_status
-      ) {
-        return prev;
-      }
-      return [...prev, entry];
-    });
-    patchState((prev) => {
-      const last = prev.logs[prev.logs.length - 1];
-      if (
-        last &&
-        last.text === text &&
-        last.type === type &&
-        last.worker_id === meta?.worker_id &&
-        last.worker_status === meta?.worker_status
-      ) {
-        return prev;
-      }
-      return {
-        ...prev,
-        logs: [...prev.logs, entry],
-      };
-    });
+    if (type !== 'error') return;
     const sessionId = workspaceSessionIdRef.current;
-    if (sessionId) {
-      try {
-        persistSessionProgress(sessionId, {
-          line: {
-            level: type === 'error' ? 'error' : 'info',
-            message: text,
-            stage: meta?.stage || null,
-          },
-        });
-      } catch {
-        // Session log persistence is best-effort.
-      }
+    if (!sessionId) return;
+    try {
+      persistSessionProgress(sessionId, {
+        line: {
+          level: 'error',
+          message: text,
+          stage: meta?.stage || null,
+        },
+      });
+    } catch {
+      // Session log persistence is best-effort.
     }
-  }, [patchState]);
-  const appendSocketNotice = useCallback((key: string, text: string, tone: 'info' | 'error' = 'info') => {
-    if (!key || socketNoticeKeysRef.current.has(key)) return;
-    socketNoticeKeysRef.current.add(key);
-    setSocketNotices((prev) => [...prev, { key, text, ts: timestampLabel(), tone }].slice(-4));
   }, []);
   const updateIacFileContent = useCallback((filePath: string, nextContent: string) => {
     setIacFiles((prev) => {
@@ -2186,18 +2169,10 @@ export default function DeploymentTrackApp() {
     }
     return 'No generated private key is available in this deployment result. Each deploy mints a new key; AWS never stores the private half.';
   }, [deployResult?.one_time_credentials?.credentials_downloaded, deploySummary.databaseEnv, deploySummary.generatedPem]);
-  const terraformWorkerStates = useMemo(() => {
-    const latest = new Map<string, DeployLogEntry>();
-    deployLogs.forEach((log) => {
-      if (!log.worker_id) return;
-      if (log.stage && log.stage !== 'terraform_generation') return;
-      latest.set(log.worker_id, log);
-    });
-    return Array.from(latest.values());
-  }, [deployLogs]);
-  const terraformGenerationLogs = useMemo(
-    () => deployLogs.filter((log) => log.stage === 'terraform_generation' || (!log.stage && Boolean(log.worker_id))),
-    [deployLogs],
+  const activePlanSummary = useMemo(
+    () => pendingPlanSummary
+      || ((deployResult?.plan_summary as Record<string, unknown> | null | undefined) || null),
+    [deployResult?.plan_summary, pendingPlanSummary],
   );
   const hasLiveRuntimeDetails = useMemo(() => {
     if (deployResult?.mode === 'iac_pipeline') {
@@ -2401,6 +2376,13 @@ export default function DeploymentTrackApp() {
   const deployButtonDisabled = deployFailed ? redeployDisabled : (!canStartDeploy || deployIsLive);
   const deployPhaseLabel = (() => {
     if (deployFailed) return 'Deploy failed';
+    if (deployProcessMessage && (deployIsLive || deployUiPhase === 'reconciling')) {
+      return deployProcessMessage;
+    }
+    const normalized = normalizeProcessPhase(deployProcessPhase);
+    if (normalized !== 'idle' && TERRAFORM_APPLY_STATUS_LABEL[normalized]) {
+      return TERRAFORM_APPLY_STATUS_LABEL[normalized];
+    }
     if (deployUiPhase === 'starting') return 'Starting deploy…';
     if (deployUiPhase === 'waiting_api') return `Terraform apply in progress (${deployElapsedSec}s)`;
     if (deployUiPhase === 'reconciling') return `Reconciling backend status (${deployElapsedSec}s)`;
@@ -2438,15 +2420,6 @@ export default function DeploymentTrackApp() {
     if (iacFiles.length > 0) return 'Cached bundle pending refresh';
     return 'Awaiting generation';
   }, [hasSuccessfulGeneration, iacFiles.length, sessionIacTruncated, shouldUseSavedRunForDeploy, terraformGenerating]);
-  const shouldConnectPipelineSocket = Boolean(
-    selectedProject && (
-      activeStage === 'terraform'
-      || activeStage === 'deploy'
-      || activeStage === 'outputs'
-      || deployStatus === 'running'
-      || terraformGenerating
-    )
-  );
   const canFetchRuntimeDetails = Boolean(selectedProject && hasAwsSecrets);
   const onIacPipelineComplete = useCallback((
     outputs: object,
@@ -2473,9 +2446,13 @@ export default function DeploymentTrackApp() {
       };
     });
     setError(null);
+    setDeployProcessPhase('completed');
+    setDeployProcessMessage(TERRAFORM_APPLY_STATUS_LABEL.completed);
   }, [patchState]);
   const onIacPipelineError = useCallback((message: string) => {
     setError(message);
+    setDeployProcessPhase('failed');
+    setDeployProcessMessage(message);
     appendLog(message, 'error', { stage: 'iac_pipeline' });
     setDeployUiPhase('error');
     if (selectedProject) {
@@ -2492,6 +2469,11 @@ export default function DeploymentTrackApp() {
       },
     }));
   }, [appendLog, patchState, selectedProject]);
+  const onIacPipelineStatusChange = useCallback((status: string, message?: string | null) => {
+    setDeployProcessPhase(status);
+    setDeployProcessMessage(message ?? null);
+    setDeployProgress((prev) => Math.max(prev, progressForProcessPhase(status, TERRAFORM_APPLY_STEPS)));
+  }, []);
   const canVerifyLiveEndpoints = Boolean(
     selectedProject &&
     deployStatus !== 'running' &&
@@ -2758,12 +2740,6 @@ export default function DeploymentTrackApp() {
   const analysisMetrics = useMemo(() => deriveAnalysisMetrics(repoContext), [repoContext]);
   const analysisDetectedServices = useMemo(() => deriveDetectedServices(repoContext), [repoContext]);
   useEffect(() => {
-    const node = logPanelRef.current;
-    if (!node || !logStickToBottomRef.current) return;
-    node.scrollTop = node.scrollHeight;
-  }, [deployLogs, socketNotices]);
-
-  useEffect(() => {
     try {
       writeSavedAws(aws);
     } catch {
@@ -2855,23 +2831,6 @@ export default function DeploymentTrackApp() {
     }
   }, [deployResult, deployStatus, deployUiPhase, requiresPlanConfirmation]);
 
-  // Restore plan log lines when UI resumes in awaiting_plan with an empty console.
-  useEffect(() => {
-    if (!(requiresPlanConfirmation || deployUiPhase === 'awaiting_plan')) return;
-    if (deployLogs.length > 0) return;
-    const summary = pendingPlanSummary
-      || ((deployResult?.plan_summary as Record<string, unknown> | null | undefined) || null);
-    appendLog(summarizePlanResources(summary), 'info');
-    appendLog('Terraform plan is ready. Click Confirm Plan & Deploy to continue apply.', 'info');
-  }, [
-    appendLog,
-    deployLogs.length,
-    deployResult?.plan_summary,
-    deployUiPhase,
-    pendingPlanSummary,
-    requiresPlanConfirmation,
-  ]);
-
   useEffect(() => () => {
     if (deployHeartbeatRef.current !== null) {
       window.clearInterval(deployHeartbeatRef.current);
@@ -2890,7 +2849,6 @@ export default function DeploymentTrackApp() {
     const apply = (next: ActiveDeployState) => {
       setDeployStatus(next.status);
       setDeployProgress(next.progress);
-      setDeployLogs(next.logs);
       setDeployResult(next.deployResult);
       const requiresConfirmation = Boolean(
         next.deployResult?.requires_plan_confirmation
@@ -2919,23 +2877,6 @@ export default function DeploymentTrackApp() {
     if (!selectedProjectId) return;
     writeSavedTerraformRuntimeConfig(selectedProjectId, terraformRuntimeConfig);
   }, [selectedProjectId, terraformRuntimeConfig]);
-
-  useEffect(() => {
-    if (!hasCurrentIacMeta || !hasSuccessfulGeneration || !terraformRendererSummary.warning) return;
-    const warningKey = `renderer-warning:${selectedProjectId || 'none'}:${savedIacMeta?.generated_at || expectedWorkspace}`;
-    if (socketNoticeKeysRef.current.has(warningKey)) return;
-    appendLog(terraformRendererSummary.warning, 'info', { stage: 'terraform_generation' });
-    appendSocketNotice(warningKey, terraformRendererSummary.warning, 'info');
-  }, [
-    appendLog,
-    appendSocketNotice,
-    expectedWorkspace,
-    hasCurrentIacMeta,
-    hasSuccessfulGeneration,
-    savedIacMeta?.generated_at,
-    selectedProjectId,
-    terraformRendererSummary.warning,
-  ]);
 
   useEffect(() => {
     fetch('/api/projects', { cache: 'no-store' })
@@ -2969,8 +2910,6 @@ export default function DeploymentTrackApp() {
     if (!nextProjectId) {
       idleRecoveryRef.current = null;
       decisionCostRequestKeyRef.current = null;
-      socketNoticeKeysRef.current.clear();
-      setSocketNotices([]);
       setSelectedProjectId(null);
       persistApprovedDecision(null);
       setDecisionCostEstimate(null);
@@ -2981,7 +2920,6 @@ export default function DeploymentTrackApp() {
       setActiveStage('analysis');
       setDeployStatus('idle');
       setDeployProgress(0);
-      setDeployLogs([]);
       setDeployResult(null);
       setRequiresPlanConfirmation(false);
       setPendingPlanSummary(null);
@@ -3003,7 +2941,6 @@ export default function DeploymentTrackApp() {
       reviewRequestRef.current = null;
       terraformAutostartRef.current = null;
       decisionCostRequestKeyRef.current = null;
-      socketNoticeKeysRef.current.clear();
       setAnalysisLoading(false);
       setReviewLoading(false);
       setRepoContext(null);
@@ -3032,11 +2969,9 @@ export default function DeploymentTrackApp() {
       setDecisionCostError(null);
       setDeployStatus('idle');
       setDeployProgress(0);
-      setDeployLogs([]);
       setDeployResult(null);
       setDeploymentHistory([]);
       setEndpointChecks([]);
-      setSocketNotices([]);
       setError(null);
     }
     setSelectedProjectId(nextProjectId);
@@ -3119,144 +3054,6 @@ export default function DeploymentTrackApp() {
     };
   }, [appendLog, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, deployResult?.details, deployStatus, hasAwsSecrets, patchState, pushDeploymentHistory, selectedProject, terraformRuntimeConfig.aws_region]);
 
-  useEffect(() => {
-    if (!selectedProject || !shouldConnectPipelineSocket) {
-      if (pipelineSocketRetryRef.current !== null) {
-        window.clearTimeout(pipelineSocketRetryRef.current);
-        pipelineSocketRetryRef.current = null;
-      }
-      pipelineSocketRef.current?.close();
-      pipelineSocketRef.current = null;
-      pipelineSocketAttemptRef.current = 0;
-      setDeploySocketState('idle');
-      return;
-    }
-
-    let disposed = false;
-    let socket: WebSocket | null = null;
-
-    const clearRetry = () => {
-      if (pipelineSocketRetryRef.current !== null) {
-        window.clearTimeout(pipelineSocketRetryRef.current);
-        pipelineSocketRetryRef.current = null;
-      }
-    };
-
-    const scheduleReconnect = (message: string) => {
-      if (disposed || !shouldConnectPipelineSocket) return;
-      const attemptIndex = Math.min(pipelineSocketAttemptRef.current, PIPELINE_SOCKET_RETRY_DELAYS_MS.length - 1);
-      const delayMs = PIPELINE_SOCKET_RETRY_DELAYS_MS[attemptIndex];
-      pipelineSocketAttemptRef.current += 1;
-      setDeploySocketState('error');
-      appendSocketNotice(`socket-error:${message}`, message, 'error');
-      clearRetry();
-      pipelineSocketRetryRef.current = window.setTimeout(() => {
-        if (disposed || !shouldConnectPipelineSocket) return;
-        void connect();
-      }, delayMs);
-    };
-
-    const connect = async () => {
-      try {
-        setDeploySocketState('connecting');
-        const tokenRes = await fetch(
-          `/api/scan/ws-token?project_id=${encodeURIComponent(selectedProject.id)}`,
-          { cache: 'no-store' },
-        );
-        const tokenData = await tokenRes.json().catch(() => ({})) as { token?: string; error?: string };
-        if (!tokenRes.ok || !tokenData.token) {
-          throw new Error(tokenData.error || 'Failed to issue pipeline websocket token.');
-        }
-        if (disposed) return;
-
-        const wsBase = resolveBrowserAgenticWsBase({
-          browser: { protocol: window.location.protocol, host: window.location.host },
-          publicEnvWsUrl: (process.env.NEXT_PUBLIC_AGENTIC_WS_URL || '').trim(),
-        });
-        const wsUrl = buildAgenticWebSocketUrl(
-          wsBase,
-          'pipeline',
-          selectedProject.id,
-          tokenData.token,
-        );
-        socket = new WebSocket(wsUrl);
-        pipelineSocketRef.current = socket;
-
-        socket.onopen = () => {
-          if (disposed) return;
-          clearRetry();
-          pipelineSocketAttemptRef.current = 0;
-          setDeploySocketState('connected');
-          appendSocketNotice(`socket-connected:${selectedProject.id}`, 'Live monitoring connected.', 'info');
-          socket?.send(JSON.stringify({ action: 'start' }));
-        };
-
-        socket.onmessage = (event) => {
-          if (disposed) return;
-          try {
-            const payload = JSON.parse(String(event.data || '')) as {
-              type?: string;
-              data?: {
-                type?: 'info' | 'success' | 'error';
-                content?: string;
-                message?: string;
-                worker_id?: string;
-                worker_role?: string;
-                worker_status?: string;
-                stage?: string;
-                model?: string;
-              };
-            };
-            const frameType = String(payload.type || '').toLowerCase();
-            if (frameType !== 'message' && frameType !== 'status') return;
-            const frameData = payload.data || {};
-            const content = String(frameData.content || frameData.message || '').trim();
-            if (!content) return;
-            appendLog(content, frameData.type || 'info', {
-              worker_id: frameData.worker_id,
-              worker_role: frameData.worker_role,
-              worker_status: frameData.worker_status,
-              stage: frameData.stage,
-              model: frameData.model,
-            });
-          } catch {
-            // ignore malformed websocket payloads
-          }
-        };
-
-        socket.onerror = () => {
-          if (disposed) return;
-          setDeploySocketState('error');
-          appendSocketNotice('socket-event:error', 'Live monitoring hit a websocket error. Reconnect will be attempted automatically.', 'error');
-        };
-
-        socket.onclose = () => {
-          if (disposed) return;
-          if (pipelineSocketRef.current === socket) {
-            pipelineSocketRef.current = null;
-          }
-          scheduleReconnect('Live monitoring disconnected. Retrying with backoff.');
-        };
-      } catch (reason) {
-        if (disposed) return;
-        scheduleReconnect(reason instanceof Error ? reason.message : 'Failed to connect to live pipeline websocket.');
-      }
-    };
-
-    void connect();
-
-    return () => {
-      disposed = true;
-      clearRetry();
-      socket?.close();
-      if (pipelineSocketRef.current === socket) {
-        pipelineSocketRef.current = null;
-      }
-      pipelineSocketAttemptRef.current = 0;
-      setDeploySocketState('idle');
-    };
-  }, [appendLog, appendSocketNotice, selectedProject, shouldConnectPipelineSocket]);
-
   const setAndPersistStage = useCallback((stage: PipelineStageId, options?: { force?: boolean }) => {
     const nextStage = normalizeDeployUiStage(stage);
     if (!selectedProjectId) {
@@ -3292,7 +3089,6 @@ export default function DeploymentTrackApp() {
     planAttemptedKeyRef.current = null;
     terraformAutostartRef.current = null;
     decisionCostRequestKeyRef.current = null;
-    socketNoticeKeysRef.current.clear();
     setAnalysisLoading(false);
     setReviewLoading(false);
     setRepoContext(null);
@@ -3312,11 +3108,9 @@ export default function DeploymentTrackApp() {
     setDecisionCostError(null);
     setDeployStatus('idle');
     setDeployProgress(0);
-    setDeployLogs([]);
     setDeployResult(null);
     setDeploymentHistory([]);
     setEndpointChecks([]);
-    setSocketNotices([]);
     setError(null);
     setAndPersistStage('analysis');
   }, [persistApprovedDecision, persistInfraConsultant, selectedProjectId, setAndPersistStage]);
@@ -3526,14 +3320,12 @@ export default function DeploymentTrackApp() {
     sessionStorage.removeItem(IAC_FILES_KEY);
     sessionStorage.removeItem(IAC_RUN_KEY);
     sessionStorage.removeItem(IAC_META_KEY);
-    socketNoticeKeysRef.current.clear();
-    setSocketNotices([]);
     setIacFiles([]);
     setSelectedFile('');
     setIacPrUrl(null);
     patchState((prev) => ({
       ...prev,
-      logs: prev.logs.filter((log) => log.stage !== 'terraform_generation'),
+      logs: [],
     }));
   }, [patchState]);
 
@@ -3841,6 +3633,7 @@ export default function DeploymentTrackApp() {
     setError(null);
     setIacPrUrl(null);
     setTerraformGenerating(true);
+    setTerraformGenerationPhase('starting');
     try {
       const workspaceSessionId = await createWorkspaceSession({
         service: 'deploy',
@@ -3857,6 +3650,7 @@ export default function DeploymentTrackApp() {
       // the same-origin API is ready; otherwise browsers surface only the
       // unhelpful TypeError: Failed to fetch.
       await ensureConnectorApiReady();
+      setTerraformGenerationPhase('generating');
       const response = await fetch('/api/pipeline/iac', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -3978,6 +3772,7 @@ export default function DeploymentTrackApp() {
         current_stage: 'terraform_generation',
         changed_files_count: files.length,
       });
+      setTerraformGenerationPhase('completed');
       return true;
     } catch (reason) {
       const rawMessage = reason instanceof Error ? reason.message : 'Infrastructure generation failed.';
@@ -3985,6 +3780,7 @@ export default function DeploymentTrackApp() {
         ? 'The connection to the DeplAI API was interrupted before Terraform generation returned a result. Select Regenerate Terraform to retry.'
         : rawMessage;
       appendLog(message, 'error', { stage: 'terraform_generation' });
+      setTerraformGenerationPhase('failed');
       finalizeWorkspaceSession(workspaceSessionIdRef.current, {
         status: 'failed',
         current_stage: 'terraform_generation',
@@ -4212,11 +4008,15 @@ export default function DeploymentTrackApp() {
     const runtimeResult = data.result && typeof data.result === 'object'
       ? data.result as DeployApiResult
       : null;
+    const runtimePhase = resolveDeployProcessPhase(runtimeStatus, runtimeResult as Record<string, unknown> | null, data.result);
+    const runtimeMessage = resolveDeployProcessMessage(runtimePhase, runtimeResult as Record<string, unknown> | null, data.result);
     const runtimeAwaitingPlan = isAwaitingPlanConfirmation({
       result: runtimeResult,
     }) || runtimeStatus === 'awaiting_plan_confirmation';
 
     if (runtimeAwaitingPlan) {
+      setDeployProcessPhase('awaiting_plan_confirmation');
+      setDeployProcessMessage(runtimeMessage);
       const gatedResult: DeployApiResult = {
         ...((runtimeResult || {}) as DeployApiResult),
         success: true,
@@ -4238,6 +4038,10 @@ export default function DeploymentTrackApp() {
     }
 
     if (['pending', 'selecting_params', 'validating', 'planning', 'applying', 'running'].includes(runtimeStatus)) {
+      const phaseProgress = progressForProcessPhase(runtimePhase, TERRAFORM_APPLY_STEPS);
+      setDeployProcessPhase(runtimePhase);
+      setDeployProcessMessage(runtimeMessage);
+      setDeployProgress((prev) => Math.max(prev, phaseProgress));
       patchState((prev) => {
         if (isFailedDeployAttempt({ status: prev.status, result: prev.deployResult })) {
           return prev;
@@ -4248,7 +4052,7 @@ export default function DeploymentTrackApp() {
         return {
           ...prev,
           status: 'running' as const,
-          progress: Math.max(prev.progress, 55),
+          progress: Math.max(prev.progress, phaseProgress, 55),
           deployResult: runtimeResult || prev.deployResult,
         };
       });
@@ -4259,6 +4063,8 @@ export default function DeploymentTrackApp() {
       (runtimeStatus === 'completed' || runtimeStatus === 'needs_review' || runtimeStatus === 'deployed')
       && runtimeResult?.success
     ) {
+      setDeployProcessPhase('completed');
+      setDeployProcessMessage(TERRAFORM_APPLY_STATUS_LABEL.completed);
       try {
         const hydratedResult = await hydrateTerminalDeployResult(runtimeResult);
         const hydratedChecks = normalizeVerificationChecks(hydratedResult.verification_checks);
@@ -4306,6 +4112,8 @@ export default function DeploymentTrackApp() {
 
     if (runtimeStatus === 'completed' || runtimeStatus === 'error') {
       const message = runtimeResult?.error || 'Deployment runtime returned an error.';
+      setDeployProcessPhase('failed');
+      setDeployProcessMessage(message);
       patchState((prev) => ({
         ...prev,
         status: 'error',
@@ -4397,6 +4205,8 @@ export default function DeploymentTrackApp() {
     const merged = mergeAcceptedApplyResult(null, payload) as DeployApiResult;
     setError(null);
     setDeployUiPhase('reconciling');
+    setDeployProcessPhase('apply');
+    setDeployProcessMessage(TERRAFORM_APPLY_STATUS_LABEL.apply);
     patchState((prev) => ({
       ...prev,
       status: 'running',
@@ -4448,7 +4258,7 @@ export default function DeploymentTrackApp() {
     const activeDeployment = getOrCreateActiveDeployment(selectedProject.id, {
       status: deployStatus,
       progress: deployProgress,
-      logs: deployLogs,
+      logs: [],
       deployResult,
       deploymentHistory,
     });
@@ -4474,9 +4284,6 @@ export default function DeploymentTrackApp() {
       deployStartedAtRef.current = null;
     };
 
-    // Fresh console on first start; keep plan logs when confirming apply.
-    socketNoticeKeysRef.current.clear();
-    setSocketNotices([]);
     activeDeployment.inFlight = true;
     deployRequestRef.current = selectedProject.id;
     setError(null);
@@ -4487,6 +4294,8 @@ export default function DeploymentTrackApp() {
       setPendingPlanSummary(null);
     }
     setDeployUiPhase('starting');
+    setDeployProcessPhase('starting');
+    setDeployProcessMessage(TERRAFORM_APPLY_STATUS_LABEL.starting);
     setDeployElapsedSec(0);
     const deploySessionId = await createWorkspaceSession({
       service: 'deploy',
@@ -4507,26 +4316,17 @@ export default function DeploymentTrackApp() {
       if (!startedAt) return;
       const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
       setDeployElapsedSec(elapsed);
-      if (elapsed > 0 && elapsed % 5 === 0) {
-        appendLog(`Deploy still in progress… ${elapsed}s elapsed (waiting on backend).`, 'info');
-      }
     }, 1000);
 
-    const startedLog: DeployLogEntry = confirmingPlan
-      ? { text: 'Plan confirmed. Submitting Terraform apply…', ts: timestampLabel(), type: 'info' }
-      : { text: 'Deploy started. Running preflight checks…', ts: timestampLabel(), type: 'info' };
     const nextProgress = confirmingPlan ? Math.max(deployProgress || 0, 65) : 5;
     setDeployStatus('running');
     setDeployProgress(nextProgress);
-    setDeployLogs(confirmingPlan ? [...deployLogs, startedLog] : [startedLog]);
 
     patchState((prev) => ({
       ...prev,
       status: 'running',
       progress: confirmingPlan ? Math.max(prev.progress || 0, 65) : 5,
-      logs: confirmingPlan
-        ? [...prev.logs, startedLog]
-        : [startedLog],
+      logs: [],
       // Keep prior result for continuity, but strip plan-gate flags so UI leaves confirm mode.
       deployResult: confirmingPlan
         ? {
@@ -4661,6 +4461,8 @@ export default function DeploymentTrackApp() {
         setPendingPlanSummary(summary);
         setDeployUiPhase('awaiting_plan');
         setDeployStatus('idle');
+        setDeployProcessPhase('awaiting_plan_confirmation');
+        setDeployProcessMessage(TERRAFORM_APPLY_STATUS_LABEL.awaiting_plan_confirmation);
         patchState((prev) => ({
           ...prev,
           status: 'idle',
@@ -4689,6 +4491,8 @@ export default function DeploymentTrackApp() {
         }));
         pushDeploymentHistory(data, 'done');
         setDeployUiPhase('done');
+        setDeployProcessPhase('completed');
+        setDeployProcessMessage(TERRAFORM_APPLY_STATUS_LABEL.completed);
         setError(null);
         finalizeWorkspaceSession(workspaceSessionIdRef.current, { status: 'completed', current_stage: 'apply' });
         if (data.deployment_verified === false) {
@@ -4702,6 +4506,8 @@ export default function DeploymentTrackApp() {
       setRequiresPlanConfirmation(false);
       setPendingPlanSummary(null);
       setDeployUiPhase('reconciling');
+      setDeployProcessPhase('apply');
+      setDeployProcessMessage(TERRAFORM_APPLY_STATUS_LABEL.apply);
       patchState((prev) => ({
         ...prev,
         status: 'running',
@@ -4774,7 +4580,7 @@ export default function DeploymentTrackApp() {
         deployHeartbeatRef.current = null;
       }
     }
-  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployLogs, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, finalizeDeployUiFromState, hasAwsSecrets, iacFiles, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, recoverDeployAfterTransportGap, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
+  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, finalizeDeployUiFromState, hasAwsSecrets, iacFiles, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, recoverDeployAfterTransportGap, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
 
   const stopDeployment = useCallback(async () => {
     if (!selectedProject || stopLoading || deployStatus !== 'running') return;
@@ -5031,7 +4837,7 @@ export default function DeploymentTrackApp() {
 
     const timerId = window.setInterval(() => {
       void probe();
-    }, 10_000);
+    }, 5000);
 
     void probe();
 
@@ -5780,11 +5586,6 @@ export default function DeploymentTrackApp() {
                 meta={
                   <>
                     <MetaChip label="files" value={String(iacFiles.length)} />
-                    <MetaChip
-                      label="ws"
-                      value={deploySocketState}
-                      tone={deploySocketState === 'connected' ? 'ok' : deploySocketState === 'error' ? 'warn' : 'neutral'}
-                    />
                     <StatusPill tone={terraformGenerating ? 'info' : hasSuccessfulGeneration ? 'ok' : 'neutral'} live={terraformGenerating}>
                       {terraformGenerating ? 'Generating' : terraformRunLabel}
                     </StatusPill>
@@ -5823,8 +5624,34 @@ export default function DeploymentTrackApp() {
               />
               {!hasSuccessfulGeneration ? (
                 <Callout tone="info">
-                  This stage shows generation status and artifacts. Use Planning to refine the consultant decision.
+                  Generation runs on the server. Status and generated files appear here when complete — detailed Terraform logs are kept in backend traces only.
                 </Callout>
+              ) : null}
+              {(terraformGenerating || terraformGenerationPhase !== 'idle') ? (
+                <Panel className="space-y-4" elevation="raised" glow={terraformGenerating}>
+                  <SectionLabel>Generation status</SectionLabel>
+                  <ProgressBar
+                    value={progressForProcessPhase(terraformGenerationPhase, TERRAFORM_GENERATION_STEPS)}
+                    tone={terraformGenerationPhase === 'failed' ? 'danger' : terraformGenerationPhase === 'completed' ? 'ok' : 'accent'}
+                    indeterminate={terraformGenerating && terraformGenerationPhase === 'generating'}
+                  />
+                  <ProcessStatusTrack
+                    steps={TERRAFORM_GENERATION_STEPS}
+                    activePhase={terraformGenerationPhase}
+                    failed={terraformGenerationPhase === 'failed'}
+                    statusMessage={
+                      terraformGenerationPhase === 'starting'
+                        ? 'Preparing workspace and validating deployment profile…'
+                        : terraformGenerationPhase === 'generating'
+                          ? 'Generating Terraform files on the server…'
+                          : terraformGenerationPhase === 'completed'
+                            ? `Generation complete — ${iacFiles.length} file(s) ready.`
+                            : terraformGenerationPhase === 'failed'
+                              ? (error || 'Infrastructure generation failed.')
+                              : null
+                    }
+                  />
+                </Panel>
               ) : null}
               <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
                 <div className="space-y-5">
@@ -5839,16 +5666,6 @@ export default function DeploymentTrackApp() {
                       <KeyValueRow label="Workspace" value={(shouldUseSavedRunForDeploy ? activeSavedRun?.workspace : savedIacMeta?.workspace) || expectedWorkspace || 'pending'} />
                       <KeyValueRow label="Files" value={String(iacFiles.length)} />
                     </div>
-                    {socketNotices.length > 0 ? (
-                      <div className="mt-4 space-y-2">
-                        <SectionLabel>Connection notices</SectionLabel>
-                        {socketNotices.map((notice) => (
-                          <Callout key={notice.key} tone={notice.tone === 'error' ? 'warn' : 'info'} title={notice.text}>
-                            <span className="font-mono text-[11px]">{notice.ts}</span>
-                          </Callout>
-                        ))}
-                      </div>
-                    ) : null}
                     {sessionIacTruncated ? (
                       <Callout tone="warn" className="mt-4" title="Truncated preview">
                         Regenerate before creating a PR or deploying from session files.
@@ -5859,46 +5676,6 @@ export default function DeploymentTrackApp() {
                         Pull request creation is available and does not block AWS Config or deploy readiness.
                       </Callout>
                     ) : null}
-                  </Panel>
-                  <Panel>
-                    <SectionLabel>Workers</SectionLabel>
-                    <div className="space-y-2">
-                      {terraformWorkerStates.length > 0 ? terraformWorkerStates.map((worker) => (
-                        <div key={worker.worker_id} className={`flex items-center justify-between gap-3 ${paperInsetClass} px-3 py-2.5`}>
-                          <div className="min-w-0">
-                            <div className="truncate text-[13px] font-medium text-[var(--dw-fg)]">{worker.worker_role || worker.worker_id}</div>
-                            <div className="font-mono text-[11px] text-[var(--dw-muted)]">{worker.worker_id}</div>
-                          </div>
-                          <StatusPill
-                            tone={worker.worker_status === 'completed' ? 'ok' : worker.worker_status === 'failed' ? 'danger' : 'info'}
-                            live={worker.worker_status !== 'completed' && worker.worker_status !== 'failed'}
-                          >
-                            {worker.worker_status || 'running'}
-                          </StatusPill>
-                        </div>
-                      )) : (
-                        <p className="text-[12.5px] text-[var(--dw-muted)]">Only workers whose latest activity is still in terraform generation appear here.</p>
-                      )}
-                    </div>
-                  </Panel>
-                  <Panel padded={false}>
-                    <PanelHeader
-                      title="Generation feed"
-                      icon={<Terminal className="h-3.5 w-3.5" />}
-                      tone="info"
-                      actions={<span className="font-mono text-[10px] text-[var(--dw-faint)]">{terraformGenerationLogs.length} events</span>}
-                    />
-                    <div className="p-3">
-                      <LogConsole
-                        lines={terraformGenerationLogs.slice(-40).map((log) => ({
-                          text: [log.worker_id, log.worker_status, log.text].filter(Boolean).join(' · '),
-                          tone: log.type === 'error' ? 'danger' : log.type === 'success' ? 'ok' : 'neutral',
-                        }))}
-                        streaming={terraformGenerating}
-                        emptyLabel={hasSuccessfulGeneration ? 'Generation already succeeded for this workspace. Regenerate to start a new attempt.' : 'The generation feed will populate as soon as live terraform-generation events arrive.'}
-                        maxHeight="20rem"
-                      />
-                    </div>
                   </Panel>
                 </div>
                 <div className="flex min-w-0 gap-4 xl:col-span-2">
@@ -6133,25 +5910,23 @@ export default function DeploymentTrackApp() {
                 }
                 description={
                   deployIsLive
-                    ? 'Backend is applying Terraform now. Live lines appear below even if WebSocket is still connecting.'
+                    ? 'Terraform apply is running on the server. Status updates automatically — detailed logs are kept in backend traces only.'
                     : awaitingPlanIdle
-                      ? 'Terraform plan finished. Confirm to apply these changes in AWS.'
+                      ? 'Terraform plan finished. Review the summary below, then confirm to apply in AWS.'
                       : deployFailed
                         ? 'Terraform apply stopped with an error. Redeploy retries against the existing state so already-created resources are reused.'
-                        : 'Live console from pipeline WebSocket events.'
+                        : 'Start deploy when AWS credentials and the generated bundle are ready.'
                 }
                 meta={(
                   <div className="flex items-center gap-2">
-                    <MetaChip
-                      label="WS"
-                      value={deploySocketState}
-                      tone={deploySocketState === 'connected' ? 'ok' : deploySocketState === 'error' ? 'warn' : 'neutral'}
-                    />
                     <MetaChip
                       label="Phase"
                       value={deployPhaseLabel}
                       tone={deployIsLive ? 'warn' : deployFailed ? 'danger' : deployStatus === 'done' ? 'ok' : 'neutral'}
                     />
+                    {deployIsLive && deployElapsedSec > 0 ? (
+                      <MetaChip label="Elapsed" value={`${deployElapsedSec}s`} tone="neutral" />
+                    ) : null}
                   </div>
                 )}
               />
@@ -6188,67 +5963,40 @@ export default function DeploymentTrackApp() {
                   {(error || backendErrorMessage)
                     ? (error || backendErrorMessage)
                     : deployIsLive
-                      ? 'Request accepted. Waiting on `/api/pipeline/deploy`. Multi-AZ RDS often takes 15–25 minutes (up to 45). Watch deployment.log for apply heartbeats.'
-                      : 'Review the plan summary in the log, then click Confirm Plan & Deploy.'}
+                      ? 'Request accepted. Multi-AZ RDS often takes 15–25 minutes (up to 45). This page will update when the backend reaches a terminal state.'
+                      : (deployUiPhase === 'awaiting_plan' || requiresPlanConfirmation)
+                        ? `${summarizePlanResources(activePlanSummary)} Click Confirm Plan & Deploy to continue.`
+                        : deployPhaseLabel}
                 </Callout>
               )}
               <div className="mt-6 grid grid-cols-1 gap-5 xl:grid-cols-3">
-                <Panel className="flex h-125 flex-col overflow-hidden xl:col-span-2" padded={false} elevation="recessed" glow={deployIsLive}>
-                  <PanelHeader
-                    title="deployment.log"
-                    icon={<Terminal className="h-3.5 w-3.5" />}
-                    tone="info"
-                    actions={<span className="font-mono text-[10px] text-[var(--dw-faint)]">{deployLogs.length} events</span>}
-                  />
-                  <div
-                    ref={logPanelRef}
-                    onScroll={() => {
-                      const node = logPanelRef.current;
-                      if (!node) return;
-                      logStickToBottomRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 32;
-                    }}
-                    className="dw-scrollbar dw-no-scroll-anchor flex-1 overflow-y-auto p-4 font-mono text-[12px] leading-[1.7] [overflow-anchor:none]"
-                  >
-                    {deployLogs.length === 0 && (
-                      <div className="flex h-full flex-col items-center justify-center gap-2 text-[12px] text-[var(--dw-faint)]">
-                        <span>Waiting for deployment events…</span>
-                        <span>Click Start Deploy — the first log line should appear immediately.</span>
-                      </div>
-                    )}
-                    {socketNotices.map((notice) => (
-                      <div key={notice.key} className={`mb-1 px-2 py-0.5 ${notice.tone === 'error' ? 'text-[var(--dw-danger)]' : 'text-[var(--dw-warn)]'}`}>
-                        [ws] {notice.text}
-                      </div>
-                    ))}
-                    {deployLogs.map((log, index) => (
-                      <div key={`${log.ts}-${index}`} className={`mb-0.5 flex gap-3 rounded px-2 py-0.5 ${index % 2 === 0 ? 'bg-transparent' : 'bg-white/[0.02]'}`}>
-                        <span className="mt-0.5 shrink-0 select-none text-[11px] text-[var(--dw-faint)]">{String(index + 1).padStart(2, '0')}</span>
-                        <span className={`flex-1 ${
-                          log.type === 'success' ? 'text-[var(--dw-ok)]'
-                          : log.type === 'error' ? 'text-[var(--dw-danger)]'
-                          : log.text.startsWith('✓') || log.text.includes('created') ? 'text-[var(--dw-ok)]'
-                          : log.text.startsWith('+') || log.text.includes('Creating') ? 'text-[var(--dw-info)]'
-                          : log.text.includes('Error') || log.text.includes('failed') ? 'text-[var(--dw-danger)]'
-                          : log.text.startsWith('[') ? 'text-[var(--dw-warn)]'
-                          : 'text-[var(--dw-fg-soft)]'
-                        }`}>
-                          {log.text}
-                        </span>
-                      </div>
-                    ))}
-                    {deployIsLive ? <span className="dw-caret ml-2 inline-block h-3.5 w-[7px] bg-[var(--dw-accent)]" /> : null}
-                  </div>
-                </Panel>
-                <Panel className="space-y-4" elevation="raised" glow={deployIsLive}>
+                <Panel className="space-y-4 xl:col-span-3" elevation="raised" glow={deployIsLive}>
                   <div>
                     <SectionLabel>Execution</SectionLabel>
                     <div className="mt-1 font-mono text-[28px] font-semibold tracking-tight text-[var(--dw-fg)]">{deployProgress}%</div>
                     <ProgressBar
                       className="mt-2"
-                      value={Math.max(deployProgress, deployIsLive ? 5 : 0)}
+                      value={Math.max(
+                        deployProgress,
+                        deployIsLive ? progressForProcessPhase(deployProcessPhase, TERRAFORM_APPLY_STEPS) : 0,
+                      )}
                       tone={deployStatus === 'done' ? 'ok' : deployFailed ? 'danger' : deployIsLive ? 'accent' : 'neutral'}
                       indeterminate={deployIsLive && deployProgress < 5}
                     />
+                    {(deployIsLive || awaitingPlanIdle || deployFailed || deployStatus === 'done' || deployUiPhase === 'reconciling') ? (
+                      <div className="mt-4">
+                        <ProcessStatusTrack
+                          steps={TERRAFORM_APPLY_STEPS}
+                          activePhase={
+                            awaitingPlanIdle || requiresPlanConfirmation
+                              ? 'awaiting_plan_confirmation'
+                              : deployProcessPhase
+                          }
+                          failed={deployFailed}
+                          statusMessage={deployPhaseLabel}
+                        />
+                      </div>
+                    ) : null}
                     <div className="mt-3 flex items-center gap-2 text-[12px] text-[var(--dw-muted)]">
                       <span>Status:</span>
                       <StatusPill
@@ -6349,7 +6097,13 @@ export default function DeploymentTrackApp() {
                 </Panel>
               </div>
               {deployResult?.mode === 'iac_pipeline' && deployResult?.run_id ? (
-                <ApplyLogViewer runId={deployResult.run_id} onComplete={onIacPipelineComplete} onError={onIacPipelineError} />
+                <ApplyLogViewer
+                  runId={deployResult.run_id}
+                  onComplete={onIacPipelineComplete}
+                  onError={onIacPipelineError}
+                  onStatusChange={onIacPipelineStatusChange}
+                  hideUi
+                />
               ) : null}
               {(() => {
                 const termInstanceId = deploySummary.instanceId && deploySummary.instanceId !== 'n/a' 

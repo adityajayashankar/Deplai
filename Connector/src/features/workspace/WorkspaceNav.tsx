@@ -138,7 +138,7 @@ export function buildWorkspaceNavGroups(projectId?: string | null, projectName?:
       items: [
         { id: 'overview', label: 'Home', icon: Home, href: '/dashboard' },
         { id: 'profile', label: 'Your Profile', icon: User, href: '/profile' },
-        { id: 'organization', label: 'Organizations', icon: Building2, href: '/dashboard/organization', placeholder: true },
+        { id: 'organization', label: 'Organizations', icon: Building2, href: '/dashboard/organization', tag: 'Soon' },
         { id: 'usage', label: 'Usage', icon: BarChart3, href: '/dashboard/usage' },
         { id: 'documentation', label: 'Documentation', icon: BookOpen, href: '/dashboard/documentation' },
       ],

@@ -945,39 +945,9 @@ async def terraform_generate(request: TerraformGenRequest):
     def progress_callback(event: dict[str, Any]) -> None:
         if not project_id:
             return
-        try:
-            event_type = str(event.get("type") or "info")
-            content = str(event.get("content") or "").strip()
-            meta = {
-                "worker_id": event.get("worker_id"),
-                "worker_role": event.get("worker_role"),
-                "worker_status": event.get("worker_status"),
-                "stage": event.get("stage"),
-                "model": event.get("model"),
-                "workspace": event.get("workspace"),
-                "aws_region": event.get("aws_region"),
-                "compute_strategy": event.get("compute_strategy"),
-                "service_count": event.get("service_count"),
-            }
-            asyncio.run_coroutine_threadsafe(
-                _broadcast_pipeline_event(project_id, event_type, content, meta=meta),
-                loop,
-            )
-        except RuntimeError:
-            return
+        logger.info("terraform generate progress [%s]: %s", project_id, event)
 
-    if project_id:
-        await _broadcast_pipeline_event(
-            project_id,
-            "info",
-            "Terraform agent workflow started.",
-            meta={
-                "worker_id": "terraform-orchestrator",
-                "worker_role": "Terraform Orchestrator",
-                "worker_status": "started",
-                "stage": "terraform_generation",
-            },
-        )
+    # Terraform generation logs stay on the server; the dashboard shows status via HTTP only.
     try:
         agent_result = await loop.run_in_executor(
             None,
@@ -1014,19 +984,7 @@ async def terraform_generate(request: TerraformGenRequest):
             ),
         )
     except Exception as exc:
-        logger.exception("terraform generate failed")
-        if project_id:
-            await _broadcast_pipeline_event(
-                project_id,
-                "error",
-                f"Terraform agent workflow failed: {exc}",
-                meta={
-                    "worker_id": "terraform-orchestrator",
-                    "worker_role": "Terraform Orchestrator",
-                    "worker_status": "failed",
-                    "stage": "terraform_generation",
-                },
-            )
+        logger.exception("terraform generate failed for project %s", project_id)
         return TerraformGenResponse(
             success=False,
             provider=request.provider,
@@ -1037,17 +995,7 @@ async def terraform_generate(request: TerraformGenRequest):
 
     if agent_result and agent_result.get("success"):
         if project_id:
-            await _broadcast_pipeline_event(
-                project_id,
-                "success",
-                "Terraform agent workflow completed successfully.",
-                meta={
-                    "worker_id": "terraform-orchestrator",
-                    "worker_role": "Terraform Orchestrator",
-                    "worker_status": "completed",
-                    "stage": "terraform_generation",
-                },
-            )
+            logger.info("terraform generate completed for project %s", project_id)
         return TerraformGenResponse(
             success=True,
             provider=request.provider,
@@ -1081,17 +1029,7 @@ async def terraform_generate(request: TerraformGenRequest):
     if isinstance(agent_result, dict):
         error_message = str(agent_result.get("error") or error_message)
     if project_id:
-        await _broadcast_pipeline_event(
-            project_id,
-            "error",
-            f"Terraform agent workflow failed: {error_message}",
-            meta={
-                "worker_id": "terraform-orchestrator",
-                "worker_role": "Terraform Orchestrator",
-                "worker_status": "failed",
-                "stage": "terraform_generation",
-            },
-        )
+        logger.error("terraform generate failed for project %s: %s", project_id, error_message)
     return TerraformGenResponse(
         success=False,
         provider=request.provider,
@@ -1186,16 +1124,25 @@ async def _execute_runtime_terraform_apply(request: TerraformApplyRequest, apply
     loop = asyncio.get_running_loop()
 
     def emit_apply_event(msg_type: str, content: str) -> None:
-        project_id = str(request.project_id or "").strip()
-        if not project_id:
+        """High-level deploy milestones for server logs only."""
+        text = str(content or "").strip()
+        if not text:
             return
-        try:
-            asyncio.run_coroutine_threadsafe(
-                _broadcast_pipeline_event(project_id, msg_type, content),
-                loop,
-            )
-        except Exception:
-            pass
+        level = logging.ERROR if str(msg_type or "").strip().lower() == "error" else logging.INFO
+        logger.log(level, "[terraform-apply][%s] %s", request.project_id, text)
+        lowered = text.lower()
+        if "started" in lowered:
+            apply_ctx["phase"] = "starting"
+            apply_ctx["phase_message"] = text
+        elif "awaiting confirmation" in lowered:
+            apply_ctx["phase"] = "awaiting_plan_confirmation"
+            apply_ctx["phase_message"] = text
+        elif "completed successfully" in lowered:
+            apply_ctx["phase"] = "completed"
+            apply_ctx["phase_message"] = text
+        elif str(msg_type or "").strip().lower() == "error":
+            apply_ctx["phase"] = "failed"
+            apply_ctx["phase_message"] = text
 
     apply_ctx["emit"] = emit_apply_event
     result: dict[str, Any] | None = None
@@ -1275,7 +1222,11 @@ async def terraform_apply_status(request: TerraformApplyStatusRequest):
         return TerraformApplyStatusResponse(
             success=True,
             status="running",
-            result={"container_id": ctx.get("container_id")},
+            result={
+                "container_id": ctx.get("container_id"),
+                "phase": ctx.get("phase") or "starting",
+                "phase_message": ctx.get("phase_message"),
+            },
         )
 
     cached = terraform_apply_results.get(apply_key)

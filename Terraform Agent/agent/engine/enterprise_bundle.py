@@ -1644,7 +1644,27 @@ variable "common_tags" { type = map(string) }
         "terraform/secrets.tf": secrets_tf,
         "terraform/main.tf": main_tf,
         "terraform/outputs.tf": outputs_tf,
-        "terraform/terraform.tfvars": f'project_name = "{project_slug}"\nenvironment = "{environment}"\naws_region = "{region}"\nregion = "{region}"\ncompute_strategy = "{strategy}"\ninstance_type = {_json(instance_type)}\napp_port = {app_port}\nteam = "platform-engineering"\ncost_center = "engineering"\nsecrets_manager_prefix = "{secrets_prefix}"\nrepository_url = {_json(repository_url)}\napp_kind = {_json(app_kind)}\nbuild_command = {_json(build_command)}\nstart_command = {_json(start_command)}\napp_subdir = {_json(app_subdir)}\npostgres_engine_version = {_json(postgres_engine_version)}\nredis_engine_version = {_json(redis_engine_version)}\ndeployment_package_id = {_json(str(bootstrap.get("package_id") or ""))}\n',
+        "terraform/terraform.tfvars": (
+            f'project_name = "{project_slug}"\n'
+            f'environment = "{environment}"\n'
+            f'aws_region = "{region}"\n'
+            f'region = "{region}"\n'
+            f'compute_strategy = "{strategy}"\n'
+            f'instance_type = {_json(instance_type)}\n'
+            f'app_port = {app_port}\n'
+            f'team = "platform-engineering"\n'
+            f'cost_center = "engineering"\n'
+            f'secrets_manager_prefix = "{secrets_prefix}"\n'
+            f'repository_url = {_json(repository_url)}\n'
+            f'app_kind = {_json(app_kind)}\n'
+            f'build_command = {_json(build_command)}\n'
+            f'start_command = {_json(start_command)}\n'
+            f'app_subdir = {_json(app_subdir)}\n'
+            f'postgres_engine_version = {_json(postgres_engine_version)}\n'
+            f'redis_engine_version = {_json(redis_engine_version)}\n'
+            f'deployment_package_id = {_json(str(bootstrap.get("package_id") or ""))}\n'
+            f'app_archive_base64 = {_json(str(bootstrap.get("package_base64") or ""))}\n'
+        ),
         "terraform/artifacts/.gitkeep": "",
         "terraform/envs/dev/terraform.tfvars": f'project_name = "{project_slug}"\nenvironment = "dev"\naws_region = "{region}"\nregion = "{region}"\ncompute_strategy = "{strategy}"\nteam = "platform-engineering"\ncost_center = "engineering"\nsecrets_manager_prefix = "/{project_slug}/dev"\n',
         "terraform/envs/staging/terraform.tfvars": f'project_name = "{project_slug}"\nenvironment = "staging"\naws_region = "{region}"\nregion = "{region}"\ncompute_strategy = "{strategy}"\nteam = "platform-engineering"\ncost_center = "engineering"\nsecrets_manager_prefix = "/{project_slug}/staging"\n',

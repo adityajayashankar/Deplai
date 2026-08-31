@@ -939,7 +939,7 @@ export default function DashboardHomeApp({ initialTab = 'overview' }: { initialT
       return;
     }
     if (key === 'organizations') {
-      router.push('/dashboard/projects');
+      router.push('/dashboard/organization');
       return;
     }
     if (key === 'deployments') {

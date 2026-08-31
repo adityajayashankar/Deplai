@@ -10,6 +10,7 @@ import ast
 import base64
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -27,6 +28,8 @@ from botocore.exceptions import ClientError
 from docker.errors import ContainerError
 
 from utils import decode_output, ensure_docker_image, get_docker_client
+
+logger = logging.getLogger(__name__)
 
 TERRAFORM_IMAGE = "hashicorp/terraform:1.9.0"
 # Docker Desktop's embedded resolver (192.168.65.7) can fail mid-apply
@@ -101,16 +104,59 @@ def _normalize_rel_path(path: str) -> str:
     return normalized
 
 
+def _set_apply_phase(apply_context: dict[str, Any] | None, phase: str, message: str | None = None) -> None:
+    if apply_context is None:
+        return
+    normalized = str(phase or "").strip().lower()
+    if normalized:
+        apply_context["phase"] = normalized
+    if message is not None:
+        apply_context["phase_message"] = str(message).strip()[:240]
+
+
+def _infer_apply_phase_from_message(text: str) -> str | None:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return None
+    if "staged into runtime workspace" in lowered:
+        return "staging"
+    if "awaiting confirmation" in lowered:
+        return "awaiting_plan_confirmation"
+    if "terraform plan completed" in lowered:
+        return "plan"
+    if "fetching terraform state" in lowered:
+        return "apply"
+    if "inspecting deployed website bucket" in lowered:
+        return "apply"
+    match = re.search(r"running terraform ([a-z0-9_-]+)", lowered)
+    if match:
+        command = match.group(1)
+        if command in {"fmt"}:
+            return "staging"
+        if command in {"init"}:
+            return "init"
+        if command in {"validate"}:
+            return "validate"
+        if command in {"plan"}:
+            return "plan"
+        if command in {"apply"}:
+            return "apply"
+    return None
+
+
 def _emit_progress(apply_context: dict[str, Any] | None, msg_type: str, content: str) -> None:
-    if not apply_context:
+    """Write Terraform apply progress to server logs only (not browser clients)."""
+    text = str(content or "").strip()
+    if not text:
         return
-    emitter = apply_context.get("emit")
-    if not callable(emitter):
-        return
-    try:
-        emitter(str(msg_type or "info"), str(content or "").strip())
-    except Exception:
-        pass
+    if apply_context is not None:
+        inferred = _infer_apply_phase_from_message(text)
+        if inferred:
+            _set_apply_phase(apply_context, inferred, text)
+        else:
+            apply_context["phase_message"] = text[:240]
+    level = logging.ERROR if str(msg_type or "").strip().lower() == "error" else logging.INFO
+    logger.log(level, "[terraform-apply] %s", text)
 
 
 def _redact_sensitive_text(text: str, secrets: list[str]) -> str:
@@ -1973,53 +2019,47 @@ def _inject_app_artifact_tarball(
     project_name: str = "",
 ) -> list[dict[str, Any]]:
     """Copy the packaged app tarball into the Terraform workspace for aws_s3_object.source."""
-    already = any(
-        str(item.get("path", "")).replace("\\", "/").rstrip("/").endswith("artifacts/app.tgz")
-        for item in files
-    )
-    if already:
+    from deployment_packager import attach_app_artifact_to_tf_files, bundle_has_app_artifact_tarball
+
+    if bundle_has_app_artifact_tarball(files):
         return files
 
     package_id = ""
+    package_base64 = ""
     for item in files:
         path = str(item.get("path", "")).replace("\\", "/")
         if not path.endswith(".tfvars"):
             continue
-        match = re.search(
+        text = _extract_text_payload(item)
+        package_match = re.search(
             r'deployment_package_id\s*=\s*"([^"]*)"',
-            _extract_text_payload(item),
+            text,
         )
-        if match:
-            package_id = str(match.group(1) or "").strip()
-            break
-
-    try:
-        from deployment_packager import load_persisted_app_tarball
-    except Exception:
-        load_persisted_app_tarball = None  # type: ignore[assignment,misc]
-
-    if load_persisted_app_tarball is not None:
-        loaded = load_persisted_app_tarball(package_id=package_id, project_slug=project_name)
-        if loaded:
-            loaded_id, payload = loaded
-            if payload:
-                return _append_app_artifact_tarball(
-                    files,
-                    payload,
-                    apply_context=apply_context,
-                    source_label=f"package store ({loaded_id})",
-                )
-
-    embedded = _extract_tfvars_app_archive_base64(files)
-    if embedded:
-        return _append_app_artifact_tarball(
-            files,
-            embedded,
-            apply_context=apply_context,
-            source_label="terraform.tfvars app_archive_base64",
+        if package_match:
+            package_id = str(package_match.group(1) or "").strip()
+        archive_match = re.search(
+            r'(?m)^\s*app_archive_base64\s*=\s*("(?:\\.|[^"\\])*")\s*$',
+            text,
         )
+        if archive_match:
+            try:
+                package_base64 = str(json.loads(archive_match.group(1)) or "").strip()
+            except json.JSONDecodeError:
+                package_base64 = ""
 
-    return files
+    updated = attach_app_artifact_to_tf_files(
+        files,
+        package_id=package_id,
+        project_slug=project_name,
+        package_base64=package_base64,
+    )
+    if bundle_has_app_artifact_tarball(updated) and not bundle_has_app_artifact_tarball(files):
+        _emit_progress(
+            apply_context,
+            "info",
+            "Attached deployment package as terraform/artifacts/app.tgz for S3 app delivery.",
+        )
+    return updated
 
 
 def _collect_terraform_text(files: list[dict[str, Any]]) -> str:
@@ -3402,6 +3442,8 @@ def apply_terraform_bundle(
     if provider.lower() != "aws":
         return {"success": False, "error": "Runtime apply currently supports AWS only."}
 
+    _set_apply_phase(apply_context, "starting", "Preparing Terraform runtime workspace.")
+
     aws_access_key_id = str(aws_access_key_id or "").strip().strip('"').strip("'")
     aws_secret_access_key = str(aws_secret_access_key or "").strip().strip('"').strip("'")
     aws_session_token = str(aws_session_token or "").strip().strip('"').strip("'")
@@ -3499,6 +3541,22 @@ def apply_terraform_bundle(
         files = _inject_app_artifact_tarball(files, apply_context, project_name)
         normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
         _write_files_to_volume(volume_name, files)
+        from deployment_packager import bundle_has_app_artifact_tarball, terraform_bundle_expects_s3_app_delivery
+
+        if terraform_bundle_expects_s3_app_delivery(files) and not bundle_has_app_artifact_tarball(files):
+            return {
+                "success": False,
+                "error": (
+                    "Deployment package (app.tgz) is missing for S3 app delivery. "
+                    "Regenerate infrastructure, then deploy again using the saved Terraform run."
+                ),
+                "details": {
+                    "hint": (
+                        "The app archive must be present in the saved Terraform run or package store "
+                        "before EC2 can download it from S3."
+                    ),
+                },
+            }
         _emit_progress(apply_context, "info", "Terraform files staged into runtime workspace.")
 
         if not any(path.endswith(".tf") for path in normalized_paths):
@@ -4785,6 +4843,8 @@ def apply_saved_terraform_run(
     apply_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from deployment_run_store import load_terraform_run
+
+    _set_apply_phase(apply_context, "starting", "Loading saved Terraform run.")
 
     saved_run = load_terraform_run(workspace=workspace, run_id=run_id)
     if saved_run is not None:

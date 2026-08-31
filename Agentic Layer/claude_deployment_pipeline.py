@@ -69,7 +69,7 @@ from terraform_agent.agent.engine.deployment_profile import (
 )
 from terraform_agent.agent.engine.runtime import DEFAULT_PROVIDER_CONSTRAINT
 from deployment_manifest import ManifestResolutionError
-from deployment_packager import build_deployment_package
+from deployment_packager import attach_app_artifact_to_tf_files, build_deployment_package
 from deployment_run_store import save_terraform_run
 from ec2_app_renderer import render_ec2_app_bundle
 
@@ -3043,6 +3043,7 @@ def _app_bootstrap_from_repo(
     bootstrap.update(
         {
             "package_id": package.package_id,
+            "package_base64": package.package_base64,
             "app_kind": package.app_kind,
             "build_command": package.build_command,
             "start_command": package.start_command,
@@ -4297,15 +4298,46 @@ def generate_terraform_bundle(
         all_warnings.append(f"Validation worker reported missing surfaced files: {', '.join(validation_missing)}")
 
     ordered_files = _rewrite_legacy_region_var_references(ordered_files)
+    ordered_files = attach_app_artifact_to_tf_files(
+        ordered_files,
+        package_id=str(app_bootstrap.get("package_id") or ""),
+        project_slug=project_name,
+        package_base64=str(app_bootstrap.get("package_base64") or ""),
+    )
     files_by_path = {str(item.get("path") or ""): str(item.get("content") or "") for item in ordered_files}
     fallback_report["generated_file_count"] = int(assembly_report.get("generated_file_count") or 0)
     fallback_report["fallback_file_count"] = int(assembly_report.get("fallback_file_count") or 0)
+
+    run_id = save_terraform_run(
+        workspace=resolved_workspace,
+        files=ordered_files,
+        metadata={
+            "renderer": "deplai_deterministic",
+            "project_name": project_name,
+            "aws_region": aws_region,
+            "deployment_package_id": str(app_bootstrap.get("package_id") or "").strip() or None,
+            "repository_url": repository_url,
+            "source_metadata": dict(source_metadata_json or {}),
+            "app_bootstrap": {
+                key: app_bootstrap.get(key)
+                for key in (
+                    "package_id",
+                    "app_kind",
+                    "build_command",
+                    "start_command",
+                    "app_subdir",
+                    "app_port",
+                    "repository_url",
+                )
+            },
+        },
+    )
 
     return {
         "success": True,
         "provider": "aws",
         "project_name": project_name,
-        "run_id": None,
+        "run_id": run_id,
         "workspace": resolved_workspace,
         "provider_version": DEFAULT_PROVIDER_CONSTRAINT,
         "state_bucket": None,

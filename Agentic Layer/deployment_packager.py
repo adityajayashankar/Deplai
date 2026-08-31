@@ -584,6 +584,69 @@ def load_persisted_app_tarball(
     return latest.parent.name, latest.read_bytes()
 
 
+def bundle_has_app_artifact_tarball(files: list[dict[str, Any]]) -> bool:
+    return any(
+        str(item.get("path", "")).replace("\\", "/").rstrip("/").endswith("artifacts/app.tgz")
+        for item in files
+    )
+
+
+def terraform_bundle_expects_s3_app_delivery(files: list[dict[str, Any]]) -> bool:
+    chunks: list[str] = []
+    for item in files:
+        path = str(item.get("path", "")).replace("\\", "/").lower()
+        if not path.endswith(".tf"):
+            continue
+        content = item.get("content", "")
+        if str(item.get("encoding") or "").strip().lower() == "base64":
+            try:
+                chunks.append(base64.b64decode(str(content).encode("ascii"), validate=True).decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+        else:
+            chunks.append(str(content))
+    text = "\n".join(chunks)
+    return "aws_s3_object" in text and "app.tgz" in text
+
+
+def attach_app_artifact_to_tf_files(
+    files: list[dict[str, Any]],
+    *,
+    package_id: str = "",
+    project_slug: str = "",
+    package_base64: str = "",
+) -> list[dict[str, Any]]:
+    """Ensure terraform/artifacts/app.tgz exists in a Terraform file bundle for S3 delivery."""
+    if bundle_has_app_artifact_tarball(files):
+        return files
+
+    payload: bytes | None = None
+    encoded = str(package_base64 or "").strip()
+    if encoded:
+        try:
+            payload = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except Exception:
+            payload = None
+
+    if payload is None:
+        loaded = load_persisted_app_tarball(package_id=package_id, project_slug=project_slug)
+        if loaded:
+            _, payload = loaded
+
+    if not payload:
+        return files
+
+    updated = list(files)
+    updated.append(
+        {
+            "path": "terraform/artifacts/app.tgz",
+            "content": base64.b64encode(payload).decode("ascii"),
+            "encoding": "base64",
+        }
+    )
+    return updated
+
+
 def _select_static_root(source_root: Path) -> Path | None:
     for rel in STATIC_DIR_CANDIDATES:
         candidate = source_root / rel
