@@ -1389,7 +1389,7 @@ resource "aws_s3_object" "app" {
   bucket = one(aws_s3_bucket.artifacts[*].id)
   key    = "app.tgz"
   source = "${path.root}/artifacts/app.tgz"
-  etag   = filemd5("${path.root}/artifacts/app.tgz")
+  etag   = fileexists("${path.root}/artifacts/app.tgz") ? filemd5("${path.root}/artifacts/app.tgz") : ""
 }
 
 resource "aws_iam_role_policy" "artifacts" {

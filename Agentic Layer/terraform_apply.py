@@ -1877,38 +1877,54 @@ def _ensure_ecr_pull_policy(
     return patched
 
 
-def _inject_app_artifact_tarball(
-    files: list[dict[str, Any]],
-    apply_context: dict[str, Any] | None = None,
-    project_name: str = "",
-) -> list[dict[str, Any]]:
-    """Copy the packaged app tarball into the Terraform workspace for aws_s3_object.source."""
-    already = any(
-        str(item.get("path", "")).replace("\\", "/").rstrip("/").endswith("artifacts/app.tgz")
-        for item in files
+def rewrite_app_artifact_filemd5_guard(text: str) -> tuple[str, bool]:
+    """Guard filemd5 so terraform validate passes when artifacts/app.tgz is absent.
+
+    Terraform still evaluates ``etag = filemd5(...)`` even when ``count = 0``.
+    """
+    pattern = re.compile(
+        r'etag\s*=\s*filemd5\("\$\{path\.root\}/artifacts/app\.tgz"\)',
     )
-    if already:
-        return files
-    package_id = ""
+    replacement = (
+        'etag   = fileexists("${path.root}/artifacts/app.tgz") '
+        '? filemd5("${path.root}/artifacts/app.tgz") : ""'
+    )
+    updated, count = pattern.subn(replacement, text)
+    return updated, count > 0
+
+
+def _extract_tfvars_app_archive_base64(files: list[dict[str, Any]]) -> bytes | None:
     for item in files:
-        path = str(item.get("path", "")).replace("\\", "/")
-        if not path.endswith("terraform.tfvars") or "/envs/" in path:
+        path = str(item.get("path", "")).replace("\\", "/").lower()
+        if not path.endswith(".tfvars"):
             continue
+        text = _extract_text_payload(item)
         match = re.search(
-            r'deployment_package_id\s*=\s*"([^"]*)"',
-            _extract_text_payload(item),
+            r'(?m)^\s*app_archive_base64\s*=\s*("(?:\\.|[^"\\])*")\s*$',
+            text,
         )
-        if match:
-            package_id = str(match.group(1) or "").strip()
-            break
-    try:
-        from deployment_packager import load_persisted_app_tarball
-    except Exception:
-        return files
-    loaded = load_persisted_app_tarball(package_id=package_id, project_slug=project_name)
-    if not loaded:
-        return files
-    loaded_id, payload = loaded
+        if not match:
+            continue
+        try:
+            encoded = str(json.loads(match.group(1)) or "").strip()
+        except json.JSONDecodeError:
+            continue
+        if not encoded:
+            continue
+        try:
+            return base64.b64decode(encoded.encode("ascii"), validate=True)
+        except Exception:
+            continue
+    return None
+
+
+def _append_app_artifact_tarball(
+    files: list[dict[str, Any]],
+    payload: bytes,
+    *,
+    apply_context: dict[str, Any] | None,
+    source_label: str,
+) -> list[dict[str, Any]]:
     if not payload:
         return files
     updated = list(files)
@@ -1922,9 +1938,88 @@ def _inject_app_artifact_tarball(
     _emit_progress(
         apply_context,
         "info",
-        f"Attached deployment package {loaded_id} as terraform/artifacts/app.tgz for S3 app delivery.",
+        f"Attached deployment package from {source_label} as terraform/artifacts/app.tgz for S3 app delivery.",
     )
     return updated
+
+
+def _remediate_app_artifact_filemd5(
+    files: list[dict[str, Any]],
+    apply_context: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    patched = [dict(item) for item in files]
+    changed = False
+    for idx, item in enumerate(patched):
+        path = str(item.get("path", "")).replace("\\", "/").lower()
+        if not path.endswith(".tf"):
+            continue
+        text = _extract_text_payload(item)
+        updated, did_change = rewrite_app_artifact_filemd5_guard(text)
+        if did_change:
+            patched[idx] = _set_text_payload(item, updated)
+            changed = True
+    if changed:
+        _emit_progress(
+            apply_context,
+            "info",
+            "Guarded aws_s3_object.app etag so terraform validate tolerates a missing artifacts/app.tgz.",
+        )
+    return patched, {"app_artifact_filemd5_guarded": changed}
+
+
+def _inject_app_artifact_tarball(
+    files: list[dict[str, Any]],
+    apply_context: dict[str, Any] | None = None,
+    project_name: str = "",
+) -> list[dict[str, Any]]:
+    """Copy the packaged app tarball into the Terraform workspace for aws_s3_object.source."""
+    already = any(
+        str(item.get("path", "")).replace("\\", "/").rstrip("/").endswith("artifacts/app.tgz")
+        for item in files
+    )
+    if already:
+        return files
+
+    package_id = ""
+    for item in files:
+        path = str(item.get("path", "")).replace("\\", "/")
+        if not path.endswith(".tfvars"):
+            continue
+        match = re.search(
+            r'deployment_package_id\s*=\s*"([^"]*)"',
+            _extract_text_payload(item),
+        )
+        if match:
+            package_id = str(match.group(1) or "").strip()
+            break
+
+    try:
+        from deployment_packager import load_persisted_app_tarball
+    except Exception:
+        load_persisted_app_tarball = None  # type: ignore[assignment,misc]
+
+    if load_persisted_app_tarball is not None:
+        loaded = load_persisted_app_tarball(package_id=package_id, project_slug=project_name)
+        if loaded:
+            loaded_id, payload = loaded
+            if payload:
+                return _append_app_artifact_tarball(
+                    files,
+                    payload,
+                    apply_context=apply_context,
+                    source_label=f"package store ({loaded_id})",
+                )
+
+    embedded = _extract_tfvars_app_archive_base64(files)
+    if embedded:
+        return _append_app_artifact_tarball(
+            files,
+            embedded,
+            apply_context=apply_context,
+            source_label="terraform.tfvars app_archive_base64",
+        )
+
+    return files
 
 
 def _collect_terraform_text(files: list[dict[str, Any]]) -> str:
@@ -3396,6 +3491,11 @@ def apply_terraform_bundle(
         files = _normalize_rds_engine_versions(files, apply_context)
         files = _ensure_ssm_managed_instance_core(files, apply_context)
         files = _ensure_ecr_pull_policy(files, apply_context)
+        files, artifact_guard = _remediate_app_artifact_filemd5(files, apply_context)
+        if artifact_guard.get("app_artifact_filemd5_guarded"):
+            bundle_remediation.update(artifact_guard)
+            normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
+            _write_files_to_volume(volume_name, files)
         files = _inject_app_artifact_tarball(files, apply_context, project_name)
         normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
         _write_files_to_volume(volume_name, files)

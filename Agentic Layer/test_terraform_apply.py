@@ -69,13 +69,16 @@ from terraform_apply import (
     _transient_aws_api_error_message,
     _missing_required_ec2_error,
     _normalize_aws_provider_to_registry_pin,
+    _inject_app_artifact_tarball,
     _normalize_rds_engine_versions,
     _region_has_default_vpc,
+    _remediate_app_artifact_filemd5,
     _remediate_legacy_runtime_bundle,
     _rewrite_hard_default_vpc_lookup,
     _summarize_ec2_plan_changes,
     _terraform_has_aws_instance,
     _terraform_has_variable,
+    rewrite_app_artifact_filemd5_guard,
     rewrite_ec2_module_v5_compat,
 )
 
@@ -1086,6 +1089,50 @@ class TerraformApplyRdsEngineVersionTests(unittest.TestCase):
         data = str(patched[0]["content"])
         self.assertIn("contains([", data)
         self.assertNotIn("engine_version              = var.postgres_engine_version", data)
+
+
+class AppArtifactTarballTests(unittest.TestCase):
+    def test_rewrite_app_artifact_filemd5_guard(self) -> None:
+        before = '  etag   = filemd5("${path.root}/artifacts/app.tgz")\n'
+        after, changed = rewrite_app_artifact_filemd5_guard(before)
+        self.assertTrue(changed)
+        self.assertIn("fileexists", after)
+        self.assertIn("filemd5", after)
+
+    def test_remediate_app_artifact_filemd5_updates_compute_module(self) -> None:
+        files = [
+            {
+                "path": "terraform/modules/compute/main.tf",
+                "content": (
+                    'resource "aws_s3_object" "app" {\n'
+                    '  count  = var.enabled && fileexists("${path.root}/artifacts/app.tgz") ? 1 : 0\n'
+                    '  etag   = filemd5("${path.root}/artifacts/app.tgz")\n'
+                    "}\n"
+                ),
+            }
+        ]
+        patched, remediation = _remediate_app_artifact_filemd5(files)
+        self.assertTrue(remediation["app_artifact_filemd5_guarded"])
+        self.assertIn("fileexists", str(patched[0]["content"]))
+
+    def test_inject_app_artifact_from_tfvars_base64(self) -> None:
+        import base64
+        from unittest import mock
+
+        payload = b"fake-tarball-bytes"
+        encoded = base64.b64encode(payload).decode("ascii")
+        files = [
+            {
+                "path": "terraform/terraform.tfvars",
+                "content": f'app_archive_base64 = "{encoded}"\n',
+            }
+        ]
+        with mock.patch("deployment_packager.load_persisted_app_tarball", return_value=None):
+            patched = _inject_app_artifact_tarball(files, None, "demo-app")
+        paths = [str(item.get("path", "")) for item in patched]
+        self.assertIn("terraform/artifacts/app.tgz", paths)
+        artifact = next(item for item in patched if item["path"] == "terraform/artifacts/app.tgz")
+        self.assertEqual(base64.b64decode(str(artifact["content"])), payload)
 
 
 class EcrPullPolicyInjectTests(unittest.TestCase):
