@@ -13,7 +13,7 @@ const TABLES = [
     auto_topup_threshold_usd INT NOT NULL DEFAULT 5,
     auto_topup_add_usd INT NOT NULL DEFAULT 20,
     payment_method_last4 VARCHAR(4) NULL,
-    referral_code VARCHAR(16) NOT NULL,
+    referral_code VARCHAR(24) NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY unique_referral_code (referral_code),
@@ -58,6 +58,13 @@ export async function ensureProfileSchema(): Promise<void> {
   if (ensured) return;
   for (const sql of TABLES) {
     await query(sql);
+  }
+  try {
+    await query(
+      `ALTER TABLE user_profiles MODIFY COLUMN referral_code VARCHAR(24) NOT NULL`,
+    );
+  } catch {
+    /* column already widened */
   }
   ensured = true;
 }

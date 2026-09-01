@@ -12,11 +12,11 @@ import {
   ChevronRight,
   CloudCog,
   Coins,
-  CreditCard,
   Folder,
   Home,
   KeyRound,
   List,
+  Lock,
   Menu,
   PanelLeftClose,
   Receipt,
@@ -30,11 +30,14 @@ import {
   Globe,
   User,
   BookOpen,
+  Wallet,
+  Gift,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { SELECTED_PROJECT_STORAGE_KEY } from '@/features/deployment/state';
 import { appFocusRing, applyUserChrome, readUserChrome, setProductTelemetryEnabled } from '@/features/workspace/theme';
-import { AppThemeToggle, AppThemeToggleSlot } from '@/features/workspace/AppThemeToggle';
+import { WorkspaceCreditsBadge, WorkspaceCreditsSlot } from '@/features/workspace/WorkspaceCreditsBadge';
+import { buildPlanFeatureMap, navFeatureForItem, type PlanFeature } from '@/lib/billing/plan-features';
 import { buildCustomizationHref } from '@/features/customization/utils';
 import { DeplaiLogo } from '@/components/deplai-logo';
 
@@ -51,7 +54,7 @@ export type WorkspaceNavId =
   | 'cloud'
   | 'security'
   | 'sessions'
-  | 'subscription'
+  | 'billing'
   | 'invoices'
   | 'byok'
   | 'ai-keys'
@@ -59,6 +62,7 @@ export type WorkspaceNavId =
   | 'ai-compare'
   | 'ai-usage'
   | 'credits'
+  | 'referrals'
   | 'integrations'
   | 'documentation'
   | 'settings';
@@ -105,13 +109,16 @@ export function resolveWorkspaceNavId(pathname: string): WorkspaceNavId {
   if (pathname.startsWith('/dashboard/documentation')) return 'documentation';
   if (pathname.startsWith('/dashboard/code-reviewer')) return 'code-reviewer';
   if (pathname.startsWith('/dashboard/sessions')) return 'sessions';
-  if (pathname.startsWith('/dashboard/subscription')) return 'subscription';
+  if (pathname.startsWith('/dashboard/billing')
+    || pathname.startsWith('/dashboard/payment')
+    || pathname.startsWith('/dashboard/subscription')) return 'billing';
   if (pathname.startsWith('/dashboard/invoices')) return 'invoices';
   if (pathname.startsWith('/dashboard/ai/catalog') || pathname.startsWith('/dashboard/ai/models') || pathname.startsWith('/dashboard/ai/providers')) return 'ai-catalog';
   if (pathname.startsWith('/dashboard/ai/compare') || pathname.startsWith('/dashboard/ai/playground')) return 'ai-compare';
   if (pathname.startsWith('/dashboard/ai/usage') || pathname.startsWith('/dashboard/ai/costs')) return 'ai-usage';
   if (pathname.startsWith('/dashboard/ai') || pathname.startsWith('/dashboard/byok')) return 'ai-keys';
   if (pathname.startsWith('/dashboard/credits')) return 'credits';
+  if (pathname.startsWith('/dashboard/referrals')) return 'referrals';
   if (pathname.startsWith('/dashboard/integrations')) return 'integrations';
   return 'overview';
 }
@@ -138,7 +145,7 @@ export function buildWorkspaceNavGroups(projectId?: string | null, projectName?:
       items: [
         { id: 'overview', label: 'Home', icon: Home, href: '/dashboard' },
         { id: 'profile', label: 'Your Profile', icon: User, href: '/profile' },
-        { id: 'organization', label: 'Organizations', icon: Building2, href: '/dashboard/organization', tag: 'Soon' },
+        { id: 'organization', label: 'Organizations', icon: Building2, href: '/dashboard/organization' },
         { id: 'usage', label: 'Usage', icon: BarChart3, href: '/dashboard/usage' },
         { id: 'documentation', label: 'Documentation', icon: BookOpen, href: '/dashboard/documentation' },
       ],
@@ -168,9 +175,10 @@ export function buildWorkspaceNavGroups(projectId?: string | null, projectName?:
     {
       label: 'Account',
       items: [
-        { id: 'subscription', label: 'Subscription', icon: CreditCard, href: '/dashboard/subscription' },
+        { id: 'billing', label: 'Billing', icon: Wallet, href: '/dashboard/billing' },
         { id: 'invoices', label: 'Invoices', icon: Receipt, href: '/dashboard/invoices' },
         { id: 'credits', label: 'Credits', icon: Coins, href: '/dashboard/credits' },
+        { id: 'referrals', label: 'Refer & Earn', icon: Gift, href: '/dashboard/referrals', tag: 'NEW' },
         { id: 'integrations', label: 'Integrations', icon: Blocks, href: '/dashboard/integrations' },
       ],
     },
@@ -191,6 +199,8 @@ export function WorkspaceNav({
   projects = [],
   onSelectProject,
   user,
+  planName,
+  features = null,
   collapsed = false,
   onToggleCollapsed,
 }: {
@@ -201,11 +211,13 @@ export function WorkspaceNav({
   projects?: ProjectOption[];
   onSelectProject?: (projectId: string) => void;
   user?: WorkspaceUser | null;
+  planName?: string | null;
+  features?: Partial<Record<PlanFeature, boolean>> | null;
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
 }) {
   const displayName = user?.name || user?.login || workspaceName || 'Workspace';
-  const displayEmail = user?.email || user?.login || '';
+  const displayPlanName = planName || 'Free';
   const selectedProject = projects.find((project) => project.id === projectId) || null;
   const groups = buildWorkspaceNavGroups(projectId, selectedProject?.name);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -245,13 +257,19 @@ export function WorkspaceNav({
   const renderItem = (item: NavItem, options?: { compact?: boolean }) => {
     const isActive = active === item.id;
     const Icon = item.icon;
+    const feature = navFeatureForItem(item.id);
+    const locked = Boolean(feature && features && features[feature] === false);
     return (
       <button
         key={item.id}
         type="button"
-        title={item.label}
+        title={locked ? `${item.label} requires a plan upgrade` : item.label}
         onClick={() => {
           if (item.placeholder) return;
+          if (locked) {
+            onNavigate('/dashboard/billing');
+            return;
+          }
           onNavigate(item.href);
         }}
         className={`group relative flex w-full items-center gap-2.5 text-left text-[13px] transition ${focusRing} ${
@@ -259,17 +277,21 @@ export function WorkspaceNav({
         } ${
           isActive
             ? 'border-2 border-black bg-white font-bold text-black shadow-[3px_3px_0_0_#fff]'
-            : 'border-2 border-transparent text-white/65 hover:bg-white/[0.06] hover:text-white'
+            : locked
+              ? 'border-2 border-transparent text-white/35 hover:bg-white/[0.04] hover:text-white/55'
+              : 'border-2 border-transparent text-white/65 hover:bg-white/[0.06] hover:text-white'
         }`}
       >
         <Icon
-          className={`h-4 w-4 shrink-0 ${isActive ? 'text-black' : 'text-white/45 group-hover:text-white'}`}
+          className={`h-4 w-4 shrink-0 ${isActive ? 'text-black' : locked ? 'text-white/25' : 'text-white/45 group-hover:text-white'}`}
           strokeWidth={1.7}
         />
         {collapsed ? null : (
           <>
             <span className="min-w-0 flex-1 truncate">{item.label}</span>
-            {item.tag ? (
+            {locked ? (
+              <Lock className="h-3.5 w-3.5 shrink-0 text-white/35" strokeWidth={2.2} />
+            ) : item.tag ? (
               <span
                 className={`border-2 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em] ${
                   isActive ? 'border-black bg-black text-white' : 'border-white/40 text-white/70'
@@ -425,11 +447,7 @@ export function WorkspaceNav({
           {collapsed ? null : (
             <div className="min-w-0">
               <p className={`truncate text-[13px] font-medium ${active === 'profile' ? 'text-black' : 'text-white'}`}>{displayName}</p>
-              {displayEmail ? (
-                <p className={`truncate text-[11px] ${active === 'profile' ? 'text-black/60' : 'text-white/45'}`}>{displayEmail}</p>
-              ) : (
-                <p className={`truncate text-[11px] ${active === 'profile' ? 'text-black/60' : 'text-white/45'}`}>{workspaceName}</p>
-              )}
+              <p className={`truncate text-[11px] ${active === 'profile' ? 'text-black/60' : 'text-white/45'}`}>{displayPlanName}</p>
             </div>
           )}
         </button>
@@ -583,6 +601,8 @@ function DashboardWorkspaceFrameInner({ children }: { children: React.ReactNode 
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [projects, setProjects] = useState<ProjectOption[]>([]);
   const [user, setUser] = useState<WorkspaceUser | null>(null);
+  const [planName, setPlanName] = useState<string | null>(null);
+  const [planFeatures, setPlanFeatures] = useState<Partial<Record<PlanFeature, boolean>> | null>(null);
   const [storedProjectId, setStoredProjectId] = useState<string | null>(null);
 
   const pathProjectId = pathname.match(/\/dashboard\/security-analysis\/([^/]+)/)?.[1] || null;
@@ -609,15 +629,24 @@ function DashboardWorkspaceFrameInner({ children }: { children: React.ReactNode 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      const [sessionRes, projectsRes, settingsRes] = await Promise.all([
+      const [sessionRes, projectsRes, settingsRes, planAccessRes] = await Promise.all([
         fetch('/api/auth/session', { cache: 'no-store' }).catch(() => null),
         fetch('/api/projects', { cache: 'no-store' }).catch(() => null),
         fetch('/api/settings', { cache: 'no-store' }).catch(() => null),
+        fetch('/api/billing/plan-access', { cache: 'no-store' }).catch(() => null),
       ]);
       if (cancelled) return;
       if (sessionRes?.ok) {
         const session = await sessionRes.json() as { user?: WorkspaceUser };
         setUser(session.user || null);
+      }
+      if (planAccessRes?.ok) {
+        const payload = await planAccessRes.json() as {
+          plan_name?: string;
+          features?: Partial<Record<PlanFeature, boolean>>;
+        };
+        setPlanName(typeof payload.plan_name === 'string' ? payload.plan_name : null);
+        setPlanFeatures(payload.features || null);
       }
       if (projectsRes?.ok) {
         const payload = await projectsRes.json() as { projects?: ProjectOption[] };
@@ -700,7 +729,7 @@ function DashboardWorkspaceFrameInner({ children }: { children: React.ReactNode 
     return (
       <>
         <div className="fixed right-4 top-3 z-[80]">
-          <AppThemeToggle />
+          <WorkspaceCreditsBadge />
         </div>
         {children}
       </>
@@ -730,7 +759,7 @@ function DashboardWorkspaceFrameInner({ children }: { children: React.ReactNode 
           />
         </span>
         <div className="ml-auto">
-          <AppThemeToggle compact />
+          <WorkspaceCreditsBadge compact />
         </div>
       </div>
       {mobileNavOpen ? (
@@ -753,6 +782,8 @@ function DashboardWorkspaceFrameInner({ children }: { children: React.ReactNode 
             projectId={projectId}
             projects={projects}
             user={user}
+            planName={planName}
+            features={planFeatures}
             collapsed={collapsed}
             onToggleCollapsed={onToggleCollapsed}
             onSelectProject={onSelectProject}
@@ -760,7 +791,7 @@ function DashboardWorkspaceFrameInner({ children }: { children: React.ReactNode 
           />
         </div>
         <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-white text-black">
-          <AppThemeToggleSlot />
+          <WorkspaceCreditsSlot />
           {children}
         </div>
       </div>

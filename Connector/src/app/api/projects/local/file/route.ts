@@ -21,13 +21,13 @@ export async function GET(request: NextRequest) {
     const access = await verifyLocalProjectAccess(user.id, projectId);
     if (access.error) return access.error;
 
-    const content = getFileContents(user.id, projectId, filePath);
+    const content = getFileContents(access.project.user_id, projectId, filePath);
 
     return NextResponse.json({ content, path: filePath });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('Error fetching local project file:', error);
     return NextResponse.json(
-      { error: error.message || 'Failed to fetch file' },
+      { error: error instanceof Error ? error.message : 'Failed to fetch file' },
       { status: 500 }
     );
   }

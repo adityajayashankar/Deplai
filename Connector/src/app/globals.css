@@ -199,6 +199,56 @@
   box-shadow: 6px 6px 0 0 #000000;
 }
 
+.deplai-app .app-btn-ink {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border: 3px solid #000000;
+  background-color: #000000;
+  padding: 0.5rem 1rem;
+  font-size: 13px;
+  font-weight: 700;
+  color: #ffffff;
+  box-shadow: 4px 4px 0 0 #000000;
+  transition: transform 150ms ease;
+}
+
+.deplai-app .app-btn-ink:hover:not(:disabled) {
+  transform: translate(2px, 2px);
+  box-shadow: none;
+}
+
+.deplai-app .app-btn-ink:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.deplai-app .app-btn-paper {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border: 3px solid #000000;
+  background-color: #ffffff;
+  padding: 0.5rem 1rem;
+  font-size: 13px;
+  font-weight: 700;
+  color: #000000;
+  box-shadow: 4px 4px 0 0 #000000;
+  transition: transform 150ms ease;
+}
+
+.deplai-app .app-btn-paper:hover:not(:disabled) {
+  transform: translate(2px, 2px);
+  box-shadow: none;
+}
+
+.deplai-app .app-btn-paper:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 /* Page copy inside the scrollable workspace sits on white paper. */
 .deplai-app .custom-scrollbar .text-white {
   color: #000000;
@@ -935,6 +985,37 @@ html {
 
 .compute-landing .animate-progress {
   animation: landing-progress 6s linear forwards;
+}
+
+@keyframes landing-how-it-works-progress {
+  from { width: 0%; }
+  to { width: 100%; }
+}
+
+.compute-landing .landing-how-it-works-code-line {
+  opacity: 0;
+  transform: translateX(-8px);
+  animation: landing-how-it-works-line-reveal 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+@keyframes landing-how-it-works-line-reveal {
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.compute-landing .landing-how-it-works-code-char {
+  opacity: 0;
+  filter: blur(8px);
+  animation: landing-how-it-works-char-reveal 0.3s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+@keyframes landing-how-it-works-char-reveal {
+  to {
+    opacity: 1;
+    filter: blur(0);
+  }
 }
 
 .compute-landing .animate-fadeSlideIn {

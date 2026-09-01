@@ -19,7 +19,7 @@ export function ProfileCard({
   return (
     <section
       className={`${appPaper} ${
-        danger ? 'border-rose-600 bg-rose-50' : ''
+        danger ? 'border-rose-600 !bg-rose-50 [background-image:none]' : ''
       } ${className}`}
     >
       {children}
@@ -275,7 +275,7 @@ export function Dialog({
   );
 }
 
-export type ToastTone = 'success' | 'error';
+export type ToastTone = 'success' | 'error' | 'info';
 
 export function ToastStack({
   toasts,
@@ -291,7 +291,7 @@ export function ToastStack({
         <div
           key={toast.id}
           className={`pointer-events-auto flex items-start justify-between gap-3 border-[3px] border-black px-4 py-3 text-[13px] font-bold shadow-[4px_4px_0_0_#000] ${
-            toast.tone === 'success'
+            toast.tone === 'success' || toast.tone === 'info'
               ? 'bg-white text-black'
               : 'bg-rose-600 text-white'
           }`}

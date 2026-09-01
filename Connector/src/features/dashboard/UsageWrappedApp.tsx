@@ -302,7 +302,7 @@ export default function UsageWrappedApp() {
                 { href: '/dashboard/credits', label: 'Credits' },
                 { href: '/dashboard/sessions', label: 'Sessions' },
                 { href: '/dashboard/ai/usage', label: 'AI usage' },
-                { href: '/dashboard/subscription', label: 'Plan' },
+                { href: '/dashboard/billing', label: 'Plan' },
               ].map((link) => (
                 <button key={link.href} type="button" onClick={() => open(link.href)} className={appBtnPaper}>
                   {link.label}

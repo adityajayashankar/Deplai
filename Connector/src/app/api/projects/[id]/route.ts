@@ -1,8 +1,32 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAuth } from '@/lib/auth';
+import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { query } from '@/lib/db';
 import { deleteProject } from '@/lib/local-projects';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
+
+type ProjectRow = {
+  id: string;
+  name: string;
+  project_type: string;
+  local_path: string | null;
+  file_count: number | null;
+  size_bytes: number | null;
+  created_at: string | Date;
+  user_id: string;
+  repository_id: string | null;
+  repo_full_name: string | null;
+  github_installation_id: string | null;
+};
+
+type GithubRepositoryRow = {
+  id: string;
+  full_name: string;
+  default_branch: string;
+  is_private: boolean | number;
+  created_at: string | Date;
+  installation_id: string;
+  user_id: string | null;
+};
 
 export async function DELETE(
   request: NextRequest,
@@ -13,8 +37,10 @@ export async function DELETE(
 
     const { user, error } = await requireAuth();
     if (error) return error;
+    const access = await verifyProjectOwnership(user.id, projectId, 'project.delete');
+    if (access.error) return access.error;
 
-    const [project] = await query<any[]>(
+    const [project] = await query<ProjectRow[]>(
       `SELECT 
         id,
         name,
@@ -33,13 +59,6 @@ export async function DELETE(
       );
     }
 
-    if (project.user_id !== user.id) {
-      return NextResponse.json(
-        { error: 'Forbidden: You do not own this project' },
-        { status: 403 }
-      );
-    }
-
     if (project.project_type !== 'local') {
       return NextResponse.json(
         { error: 'Cannot delete GitHub repositories through this endpoint' },
@@ -48,8 +67,8 @@ export async function DELETE(
     }
 
     try {
-      deleteProject(user.id, projectId);
-    } catch (fsError: any) {
+      deleteProject(project.user_id, projectId);
+    } catch (fsError: unknown) {
       console.error('Filesystem deletion error:', fsError);
     }
 
@@ -78,10 +97,10 @@ export async function DELETE(
         name: project.name,
       },
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('Delete project error:', error);
     return NextResponse.json(
-      { error: error.message || 'Failed to delete project' },
+      { error: error instanceof Error ? error.message : 'Failed to delete project' },
       { status: 500 }
     );
   }
@@ -96,9 +115,11 @@ export async function GET(
 
     const { user, error } = await requireAuth();
     if (error) return error;
+    const access = await verifyProjectOwnership(user.id, projectId, 'project.read');
+    if (access.error) return access.error;
 
     // Try local projects table first
-    const [project] = await query<any[]>(
+    const [project] = await query<ProjectRow[]>(
       `SELECT
         p.id,
         p.name,
@@ -119,13 +140,6 @@ export async function GET(
     );
 
     if (project) {
-      if (project.user_id !== user.id) {
-        return NextResponse.json(
-          { error: 'Forbidden: You do not own this project' },
-          { status: 403 }
-        );
-      }
-
       const response = {
         id: project.id,
         name: project.name,
@@ -145,7 +159,7 @@ export async function GET(
     }
 
     // Fallback: check github_repositories (GitHub repo IDs are used as projectId)
-    const [ghRepo] = await query<any[]>(
+    const [ghRepo] = await query<GithubRepositoryRow[]>(
       `SELECT
         r.id,
         r.full_name,
@@ -167,19 +181,6 @@ export async function GET(
       );
     }
 
-    if (ghRepo.user_id !== user.id) {
-      const [linkedProject] = await query<any[]>(
-        `SELECT id, user_id FROM projects WHERE repository_id = ? LIMIT 1`,
-        [projectId]
-      );
-      if (!linkedProject || linkedProject.user_id !== user.id) {
-        return NextResponse.json(
-          { error: 'Forbidden: You do not own this project' },
-          { status: 403 }
-        );
-      }
-    }
-
     const [owner, repoName] = ghRepo.full_name.split('/');
     const response = {
       id: ghRepo.id,
@@ -194,7 +195,7 @@ export async function GET(
     };
 
     return NextResponse.json({ project: response });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error('Get project error:', error);
     return NextResponse.json(
       { error: 'Failed to fetch project' },

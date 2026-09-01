@@ -8,6 +8,7 @@ import {
   CreditCard,
   Eye,
   EyeOff,
+  KeyRound,
   Loader2,
   Pencil,
   Plus,
@@ -18,17 +19,15 @@ import { WorkspaceCommandHeader } from '@/features/workspace/WorkspaceNav';
 import IntegrationsApp from '@/features/dashboard/IntegrationsApp';
 import { useRazorpayCheckout, type RazorpayCheckoutPayload } from '@/features/billing/useRazorpayCheckout';
 import { LOGIN_HREF } from '@/lib/auth-providers';
+import { buildReferralSignupUrl } from '@/lib/public-app-url';
 import {
-  MAX_CUSTOM_CREDIT_USD,
   MAX_EFFICIENT_POOL,
-  MIN_CUSTOM_CREDIT_USD,
   ROUTING_MODES,
   creditTone,
   displaySocial,
   formatCreditUsd,
   initialsFromName,
   routingModeById,
-  validateCustomCreditUsd,
   validateProfilePatch,
   validatePromoCode,
   type EfficientPoolEntry,
@@ -65,8 +64,20 @@ type ProfilePayload = {
     bonus_unlocked: boolean;
     plan_id?: string;
     plan_name?: string;
+    organization_id?: string;
+    never_expires?: boolean;
   } | null;
-  subscription: { planId: string; status: string; cadence: string } | null;
+  organizationCredits: {
+    total: number;
+    paid_remaining: number;
+    bonus_remaining: number;
+    bonus_unlocked: boolean;
+    plan_id?: string;
+    plan_name?: string;
+    organization_id?: string;
+    never_expires?: boolean;
+  } | null;
+  subscription: { planId: string; planName?: string; status: string; cadence: string } | null;
   routing: { mode: RoutingModeId; efficientPool: EfficientPoolEntry[] };
   autoTopup: {
     enabled: boolean;
@@ -81,13 +92,43 @@ type Plan = {
   id: string;
   displayName: string;
   description: string;
-  priceCents: number;
-  yearlyPriceCents: number;
+  pricePaise: number;
+  yearlyPricePaise: number;
   paidCreditAmount: number;
-  bonusCreditPercent: number;
+  annualCreditAmount: number;
   isCustom: boolean;
   isRecommended: boolean;
   features: string[];
+};
+
+function formatInr(paise: number): string {
+  const rupees = paise / 100;
+  return rupees.toLocaleString('en-IN', {
+    minimumFractionDigits: Number.isInteger(rupees) ? 0 : 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function isPerCreditRateFeature(feature: string): boolean {
+  return /(?:\d+\s*credit\s*=|per\s+credit|provider\s+(?:usage|value))/i.test(feature);
+}
+
+function isManagedCreditFeature(feature: string): boolean {
+  return /managed[- ]?llm credits/i.test(feature);
+}
+
+type PaymentsInfo = {
+  mode: 'test' | 'live';
+  testAmountOverride: boolean;
+  testAmountPaise: number | null;
+};
+
+type CreditPack = {
+  id: string;
+  name: string;
+  creditAmount: number;
+  pricePaise: number;
+  paidTiersOnly: boolean;
 };
 
 type CatalogModel = { id: string; displayName: string; providerId: string; variant: string; family: string };
@@ -111,8 +152,10 @@ export default function ProfileApp() {
   const [loadError, setLoadError] = useState('');
   const [bundle, setBundle] = useState<ProfilePayload | null>(null);
   const [plans, setPlans] = useState<Plan[]>([]);
+  const [creditPacks, setCreditPacks] = useState<CreditPack[]>([]);
   const [salesEmail, setSalesEmail] = useState('founders@deplai.tech');
   const [razorpayConfigured, setRazorpayConfigured] = useState(false);
+  const [payments, setPayments] = useState<PaymentsInfo | null>(null);
   const [models, setModels] = useState<CatalogModel[]>([]);
   const [yearly, setYearly] = useState(false);
 
@@ -123,10 +166,6 @@ export default function ProfileApp() {
   const [editBaseline, setEditBaseline] = useState('');
 
   const [checkoutBusy, setCheckoutBusy] = useState<string | null>(null);
-  const [selectedCredit, setSelectedCredit] = useState<string>('20');
-  const [customOpen, setCustomOpen] = useState(false);
-  const [customAmount, setCustomAmount] = useState('25');
-  const [customError, setCustomError] = useState('');
 
   const [topupOpen, setTopupOpen] = useState(false);
   const [topupDraft, setTopupDraft] = useState({ enabled: false, thresholdUsd: 5, addUsd: 20 });
@@ -148,6 +187,8 @@ export default function ProfileApp() {
   const [tokenVisible, setTokenVisible] = useState(false);
   const [tokenValue, setTokenValue] = useState('');
   const [tokenBusy, setTokenBusy] = useState(false);
+  const [tokenFresh, setTokenFresh] = useState(false);
+  const [curlCopied, setCurlCopied] = useState(false);
   const [copied, setCopied] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
 
@@ -178,10 +219,18 @@ export default function ProfileApp() {
     });
     setYearly(profilePayload.subscription?.cadence === 'yearly');
     if (plansRes.ok) {
-      const payload = await plansRes.json() as { plans?: Plan[]; salesEmail?: string; razorpayConfigured?: boolean };
+      const payload = await plansRes.json() as {
+        plans?: Plan[];
+        packs?: CreditPack[];
+        salesEmail?: string;
+        razorpayConfigured?: boolean;
+        payments?: PaymentsInfo;
+      };
       setPlans(Array.isArray(payload.plans) ? payload.plans : []);
+      setCreditPacks(Array.isArray(payload.packs) ? payload.packs : []);
       if (payload.salesEmail) setSalesEmail(payload.salesEmail);
       setRazorpayConfigured(Boolean(payload.razorpayConfigured));
+      if (payload.payments) setPayments(payload.payments);
     }
     if (routingRes.ok) {
       const payload = await routingRes.json() as { models?: CatalogModel[] };
@@ -207,16 +256,25 @@ export default function ProfileApp() {
     };
   }, [load]);
 
-  const maxBonus = useMemo(
-    () => Math.max(0, ...plans.map((plan) => plan.bonusCreditPercent || 0)),
-    [plans],
-  );
   const routingDirty = useMemo(() => {
     if (!bundle) return false;
     return routingMode !== bundle.routing.mode || JSON.stringify(pool) !== JSON.stringify(bundle.routing.efficientPool);
   }, [bundle, pool, routingMode]);
-  const referralUrl = bundle ? `${typeof window === 'undefined' ? '' : window.location.origin}/auth/signup?ref=${bundle.profile.referralCode}` : '';
-  const creditStatus = creditTone(bundle?.credits?.total ?? 0);
+  const referralUrl = bundle
+    ? buildReferralSignupUrl(bundle.profile.referralCode, typeof window === 'undefined' ? undefined : window.location.origin)
+    : '';
+  const activePlanName = bundle?.organizationCredits?.plan_name
+    || bundle?.subscription?.planName
+    || bundle?.credits?.plan_name
+    || null;
+  const hasPaidSubscription = Boolean(
+    (bundle?.subscription?.status === 'active' || bundle?.subscription?.status === 'trialing')
+    && bundle?.subscription?.planId
+    && bundle.subscription.planId !== 'free',
+  ) || Boolean(bundle?.organizationCredits?.plan_id && bundle.organizationCredits.plan_id !== 'free');
+  const displayCredits = bundle?.organizationCredits?.total ?? bundle?.credits?.total ?? 0;
+  const usesOrgCredits = Boolean(bundle?.organizationCredits);
+  const creditStatus = creditTone(displayCredits);
 
   const openEdit = () => {
     if (!bundle) return;
@@ -278,7 +336,11 @@ export default function ProfileApp() {
       const response = await fetch('/api/billing/checkout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ plan_id: plan.id, cadence: yearly ? 'yearly' : 'monthly' }),
+        body: JSON.stringify({
+          plan_id: plan.id,
+          cadence: yearly ? 'yearly' : 'monthly',
+          idempotency_key: `profile_plan_${crypto.randomUUID().replace(/-/g, '')}`,
+        }),
       });
       const payload = await response.json() as RazorpayCheckoutPayload & { error?: string };
       if (!response.ok) {
@@ -291,31 +353,31 @@ export default function ProfileApp() {
         toasts.push(result.message || 'Payment failed', 'error');
         return;
       }
+      if (result.status === 'pending') {
+        toasts.push(result.message, 'info');
+        return;
+      }
       await load();
-      toasts.push('Credits purchased', 'success');
+      toasts.push('Subscription updated', 'success');
     } finally {
       setCheckoutBusy(null);
     }
   };
 
-  const buyCredits = async (usd: number) => {
-    const parsed = validateCustomCreditUsd(usd);
-    if (!parsed.ok) {
-      setCustomError(parsed.error);
-      toasts.push(parsed.error, 'error');
-      return;
-    }
-    setCheckoutBusy(`credits-${usd}`);
-    setCustomError('');
+  const buyCreditPack = async (pack: CreditPack) => {
+    setCheckoutBusy(pack.id);
     try {
       const response = await fetch('/api/billing/credits/topup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ amount_usd: parsed.amount }),
+        body: JSON.stringify({
+          credit_pack_id: pack.id,
+          idempotency_key: `profile_pack_${crypto.randomUUID().replace(/-/g, '')}`,
+        }),
       });
       const payload = await response.json() as RazorpayCheckoutPayload & { error?: string };
       if (!response.ok) {
-        toasts.push(payload.error || 'Payment failed', 'error');
+        toasts.push(payload.error || 'Could not start top-up checkout', 'error');
         return;
       }
       const result = await start(payload);
@@ -324,9 +386,12 @@ export default function ProfileApp() {
         toasts.push(result.message || 'Payment failed', 'error');
         return;
       }
-      setCustomOpen(false);
+      if (result.status === 'pending') {
+        toasts.push(result.message, 'info');
+        return;
+      }
       await load();
-      toasts.push('Credits purchased', 'success');
+      toasts.push('Credit top-up purchased', 'success');
     } finally {
       setCheckoutBusy(null);
     }
@@ -431,6 +496,7 @@ export default function ProfileApp() {
   const showToken = async () => {
     if (tokenVisible) {
       setTokenVisible(false);
+      setTokenFresh(false);
       return;
     }
     setTokenBusy(true);
@@ -460,16 +526,70 @@ export default function ProfileApp() {
       }
       setTokenValue(payload.token);
       setTokenVisible(true);
+      setTokenFresh(true);
       setBundle((current) => (
         current
-          ? { ...current, apiToken: { ...current.apiToken, configured: true, masked: payload.masked || current.apiToken.masked } }
+          ? {
+            ...current,
+            apiToken: {
+              ...current.apiToken,
+              configured: true,
+              masked: payload.masked || current.apiToken.masked,
+              lastUsedAt: null,
+              lastUsedClient: null,
+            },
+          }
           : current
       ));
       setResetOpen(false);
-      toasts.push('API token reset', 'success');
+      toasts.push('API token rotated', 'success');
     } finally {
       setTokenBusy(false);
     }
+  };
+
+  const issueApiToken = async () => {
+    setTokenBusy(true);
+    try {
+      const response = await fetch('/api/profile/api-token', { method: 'POST' });
+      const payload = await response.json() as { token?: string; masked?: string; error?: string };
+      if (!response.ok || !payload.token) {
+        toasts.push(payload.error || 'Unable to create API token', 'error');
+        return;
+      }
+      setTokenValue(payload.token);
+      setTokenVisible(true);
+      setTokenFresh(true);
+      setBundle((current) => (
+        current
+          ? {
+            ...current,
+            apiToken: {
+              ...current.apiToken,
+              configured: true,
+              masked: payload.masked || current.apiToken.masked,
+              lastUsedAt: null,
+              lastUsedClient: null,
+            },
+          }
+          : current
+      ));
+      toasts.push('API token created — copy it now', 'success');
+    } finally {
+      setTokenBusy(false);
+    }
+  };
+
+  const apiOrigin = typeof window === 'undefined' ? 'https://app.deplai.tech' : window.location.origin;
+  const curlExample = useMemo(() => (
+    `curl -s "${apiOrigin}/api/billing/credits/balance" \\\n  -H "Authorization: Bearer ${tokenVisible && tokenValue ? tokenValue : 'YOUR_API_TOKEN'}"`
+  ), [apiOrigin, tokenValue, tokenVisible]);
+
+  const copyCurlExample = async () => {
+    await navigator.clipboard.writeText(curlExample);
+    setCurlCopied(true);
+    window.setTimeout(() => setCurlCopied(false), 1600);
+    toasts.push('Example copied', 'success');
   };
 
   const deleteAccount = async () => {
@@ -514,7 +634,14 @@ export default function ProfileApp() {
           <div className="mx-auto max-w-5xl space-y-6 pb-16">
             <div>
               <p className="font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-zinc-500">Account</p>
-              <h1 className="mt-2 font-display text-2xl font-semibold tracking-tight text-black">Profile</h1>
+              <div className="mt-2 flex flex-wrap items-center gap-3">
+                <h1 className="font-display text-2xl font-semibold tracking-tight text-black">Profile</h1>
+                {hasPaidSubscription && activePlanName ? (
+                  <span className="border-2 border-black bg-black px-2.5 py-1 font-mono text-[10px] font-bold uppercase tracking-[0.14em] text-white">
+                    Current plan: {activePlanName}
+                  </span>
+                ) : null}
+              </div>
             </div>
 
             {loadError ? <InlineError message={loadError} onRetry={() => void load()} /> : null}
@@ -545,12 +672,8 @@ export default function ProfileApp() {
                       )}
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-lg font-semibold tracking-wide text-white">{bundle.profile.displayName}</p>
-                        <p className="truncate text-[13px] text-zinc-400">{bundle.profile.email}</p>
-                        <dl className="mt-4 grid gap-3 sm:grid-cols-2">
-                          <div>
-                            <dt className="text-[11px] uppercase tracking-[0.14em] text-zinc-500">LinkedIn</dt>
-                            <dd className="mt-1 truncate text-[13px] text-zinc-300">{displaySocial(bundle.profile.linkedinUrl)}</dd>
-                          </div>
+                        <p className="truncate text-[13px] text-zinc-400">{activePlanName || 'Free'}</p>
+                        <dl className="mt-4">
                           <div>
                             <dt className="text-[11px] uppercase tracking-[0.14em] text-zinc-500">GitHub</dt>
                             <dd className="mt-1 truncate text-[13px] text-zinc-300">{displaySocial(bundle.profile.githubUrl)}</dd>
@@ -570,17 +693,24 @@ export default function ProfileApp() {
                   </ProfileCard>
 
                   <ProfileCard className="p-5">
-                    <p className="font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-zinc-500">Remaining credits</p>
+                    <p className="font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-zinc-500">
+                      {usesOrgCredits ? 'Organization credits' : 'Remaining credits'}
+                    </p>
                     {bundle.credits ? (
                       <>
                         <p className={`mt-3 font-display text-4xl font-semibold tracking-tight ${
-                          creditStatus === 'negative' ? 'text-rose-400' : creditStatus === 'warning' ? 'text-amber-200' : 'text-white'
+                          creditStatus === 'negative' ? 'text-rose-700' : creditStatus === 'warning' ? 'text-amber-700' : 'text-black'
                         }`}>
-                          {formatCreditUsd(bundle.credits.total)}
+                          {usesOrgCredits
+                            ? displayCredits.toLocaleString(undefined, { maximumFractionDigits: 2 })
+                            : formatCreditUsd(displayCredits)}
                         </p>
                         <p className="mt-2 text-[12px] text-zinc-500">
-                          {bundle.credits.plan_name ? `${bundle.credits.plan_name} plan` : 'Current balance'}
-                          {bundle.credits.bonus_unlocked ? ' · bonus unlocked' : ''}
+                          {activePlanName ? `${activePlanName} plan` : 'Current balance'}
+                          {usesOrgCredits
+                            ? ' · shared organization wallet'
+                            : bundle.credits.bonus_unlocked ? ' · bonus unlocked' : ''}
+                          {usesOrgCredits && bundle.credits.never_expires ? ' · never expire' : ''}
                         </p>
                       </>
                     ) : (
@@ -593,19 +723,27 @@ export default function ProfileApp() {
                   <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
                     <div>
                       <p className="font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-zinc-500">Billing</p>
-                      <h2 className="mt-2 flex items-center gap-2 font-display text-xl font-semibold text-white">
-                        <CreditCard className="h-5 w-5 text-zinc-300" aria-hidden="true" />
+                      <h2 className="mt-2 flex items-center gap-2 font-display text-xl font-semibold text-black">
+                        <CreditCard className="h-5 w-5 text-black" aria-hidden="true" />
                         Subscription
                       </h2>
                       <p className="mt-2 max-w-lg text-[13px] leading-relaxed text-zinc-500">
-                        Paid credits match your subscription dollars 1:1. Unlock up to {maxBonus || 40}% bonus credits after paid credits are used. Razorpay charges INR including GST.
+                        Fixed INR prices include GST. Managed-LLM credits are shared by your organization and never expire.
                       </p>
                     </div>
-                    <PrimaryButton variant="ghost" onClick={() => void copyReferral()}>
+                    <PrimaryButton variant="ghost" onClick={() => router.push('/dashboard/referrals')}>
                       Refer & earn
                       <span className="ml-2 border-2 border-black px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-widest text-black">New</span>
                     </PrimaryButton>
                   </div>
+
+                  {payments?.testAmountOverride ? (
+                    <div className="mt-5 flex flex-wrap items-center gap-x-3 gap-y-1 border-[3px] border-black bg-white px-3 py-2 shadow-[3px_3px_0_0_#000]">
+                      <span className="border-2 border-black bg-black px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-widest text-white">{payments.mode === 'live' ? 'Live checkout' : 'Test mode'}</span>
+                      <strong className="text-[13px] text-black">₹1 test charge</strong>
+                      <span className="text-[12px] text-neutral-600">Catalog prices are shown for reference; Razorpay charges ₹1 until testing is turned off.</span>
+                    </div>
+                  ) : null}
 
                   <div className="mt-6 flex flex-wrap items-center gap-3">
                     <Segmented
@@ -615,16 +753,15 @@ export default function ProfileApp() {
                     />
                     {yearly ? (
                       <span className="border-2 border-black px-2 py-0.5 font-mono text-[10px] uppercase tracking-widest text-black">
-                        Save 20%
+                        Save ~10%
                       </span>
                     ) : null}
                   </div>
 
                   <div className="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                     {plans.map((plan) => {
-                      const monthly = yearly && plan.yearlyPriceCents > 0
-                        ? Math.round(plan.yearlyPriceCents / 12)
-                        : plan.priceCents;
+                      const totalPaise = yearly && plan.yearlyPricePaise > 0 ? plan.yearlyPricePaise : plan.pricePaise;
+                      const credits = yearly ? plan.annualCreditAmount : plan.paidCreditAmount;
                       const current = bundle.subscription?.planId === plan.id || bundle.credits?.plan_id === plan.id;
                       const cta = plan.isCustom
                         ? 'Contact sales'
@@ -635,7 +772,9 @@ export default function ProfileApp() {
                           : current
                             ? 'Current plan'
                             : razorpayConfigured
-                              ? 'Upgrade'
+                              ? payments?.testAmountOverride
+                                ? 'Pay ₹1'
+                                : 'Upgrade'
                               : 'Checkout not configured';
                       return (
                         <div
@@ -645,7 +784,7 @@ export default function ProfileApp() {
                           }`}
                         >
                           <div className="flex items-start justify-between gap-2">
-                            <h3 className="font-display text-lg text-white">{plan.displayName}</h3>
+                            <h3 className="font-display text-lg text-black">{plan.displayName}</h3>
                             {plan.isRecommended ? (
                               <span className="border-2 border-black bg-black px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-widest text-white">
                                 Recommended
@@ -653,17 +792,30 @@ export default function ProfileApp() {
                             ) : null}
                           </div>
                           {plan.isCustom ? (
-                            <p className="mt-3 font-display text-3xl text-white">Custom</p>
+                            <p className="mt-3 font-display text-3xl text-black">Custom</p>
                           ) : (
-                            <p className="mt-3 font-display text-3xl text-white">
-                              ${Math.round(monthly / 100)}
-                              <span className="ml-1 text-sm font-normal text-zinc-500">/ month</span>
-                            </p>
+                            <>
+                              <p className="mt-3 font-display text-3xl text-black">₹{formatInr(totalPaise)}</p>
+                              <p className="mt-1 text-[12px] font-semibold text-zinc-500">
+                                GST-inclusive · {yearly ? 'billed yearly' : 'billed monthly'}
+                              </p>
+                            </>
                           )}
                           <p className="mt-2 text-[12px] text-zinc-500">{plan.description}</p>
-                          <ul className="mt-4 space-y-2 text-[13px] text-zinc-400">
-                            <li className="flex gap-2"><Check className="mt-0.5 h-4 w-4 text-white" /> ${plan.paidCreditAmount} paid credits</li>
-                            <li className="flex gap-2"><Check className="mt-0.5 h-4 w-4 text-white" /> {plan.bonusCreditPercent > 0 ? `Up to ${plan.bonusCreditPercent}% bonus` : 'No bonus credits'}</li>
+                          <ul className="mt-4 space-y-2 text-[13px] text-neutral-700">
+                            <li className="flex gap-2">
+                              <Check className="mt-0.5 h-4 w-4 text-black" />
+                              {credits} managed credits {yearly ? 'per year, released monthly' : 'per month'}
+                            </li>
+                            <li className="flex gap-2"><Check className="mt-0.5 h-4 w-4 text-black" />Credits never expire</li>
+                            {plan.features
+                              .filter((feature) => !isPerCreditRateFeature(feature) && !isManagedCreditFeature(feature))
+                              .map((feature) => (
+                                <li key={feature} className="flex gap-2">
+                                  <Check className="mt-0.5 h-4 w-4 text-black" />
+                                  {feature}
+                                </li>
+                              ))}
                           </ul>
                           <PrimaryButton
                             variant={plan.isRecommended && !current ? 'white' : 'default'}
@@ -681,39 +833,48 @@ export default function ProfileApp() {
                 </ProfileCard>
 
                 <ProfileCard className="p-6">
-                  <h2 className="font-display text-lg font-semibold text-white">Buy Credits</h2>
-                  <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-                    {[20, 50, 100].map((amount) => (
-                      <button
-                        key={amount}
-                        type="button"
-                        onClick={() => {
-                          setSelectedCredit(String(amount));
-                          void buyCredits(amount);
-                        }}
-                        disabled={Boolean(checkoutBusy)}
-                        className={`min-h-12 border-[3px] border-black px-4 py-3 text-[15px] font-bold transition duration-150 ${focusRing} ${
-                          selectedCredit === String(amount) ? 'bg-black text-white shadow-[4px_4px_0_0_#000]' : 'bg-white text-black shadow-[4px_4px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none'
-                        }`}
-                      >
-                        {checkoutBusy === `credits-${amount}` ? 'Starting…' : `$${amount}`}
-                      </button>
-                    ))}
-                    <button
-                      type="button"
-                      onClick={() => { setSelectedCredit('custom'); setCustomOpen(true); }}
-                      className={`min-h-12 border-[3px] border-black px-4 py-3 text-[15px] font-bold ${focusRing} ${
-                        selectedCredit === 'custom' ? 'bg-black text-white shadow-[4px_4px_0_0_#000]' : 'bg-white text-black shadow-[4px_4px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none'
-                      }`}
-                    >
-                      Custom
-                    </button>
+                  <h2 className="font-display text-lg font-semibold text-black">Buy Credits</h2>
+                  <p className="mt-2 text-[13px] text-neutral-600">
+                    Fixed GST-inclusive INR top-ups for paid organizations. Credits never expire.
+                  </p>
+                  <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                    {creditPacks.map((pack) => {
+                      const onFreePlan = !hasPaidSubscription;
+                      const blocked = pack.paidTiersOnly && onFreePlan;
+                      return (
+                        <div key={pack.id} className="app-paper p-5">
+                          <p className="font-display text-lg text-black">{pack.name}</p>
+                          <p className="mt-2 text-sm text-neutral-600">₹{formatInr(pack.pricePaise)} incl. GST</p>
+                          <p className="mt-1 font-mono text-[11px] text-neutral-500">{pack.creditAmount} credits</p>
+                          <PrimaryButton
+                            className="mt-4 w-full"
+                            disabled={blocked || !razorpayConfigured || Boolean(checkoutBusy)}
+                            loading={checkoutBusy === pack.id}
+                            onClick={() => void buyCreditPack(pack)}
+                          >
+                            {blocked
+                              ? 'Paid plans only'
+                              : !razorpayConfigured
+                                ? 'Checkout not configured'
+                                : payments?.testAmountOverride
+                                  ? 'Pay ₹1'
+                                  : 'Buy top-up'}
+                          </PrimaryButton>
+                        </div>
+                      );
+                    })}
                   </div>
+                  {!creditPacks.length ? (
+                    <p className="mt-4 text-[13px] text-neutral-500">Credit packs are unavailable right now.</p>
+                  ) : null}
+                  <PrimaryButton variant="ghost" className="mt-4" onClick={() => router.push('/dashboard/billing?view=credits')}>
+                    Open billing page
+                  </PrimaryButton>
                 </ProfileCard>
 
                 <ProfileCard className="p-6">
-                  <h2 className="font-display text-lg font-semibold text-white">Automatic Top Up</h2>
-                  <p className="mt-2 text-[13px] text-zinc-400">
+                  <h2 className="font-display text-lg font-semibold text-black">Automatic Top Up</h2>
+                  <p className="mt-2 text-[13px] text-neutral-600">
                     Automatically add credits when your balance falls below ${bundle.autoTopup.thresholdUsd}.
                   </p>
                   {bundle.autoTopup.enabled ? (
@@ -836,42 +997,100 @@ export default function ProfileApp() {
                 </ProfileCard>
 
                 <ProfileCard className="p-6">
-                  <h2 className="font-display text-lg font-semibold text-white">API token</h2>
-                  <p className="mt-2 text-[13px] text-zinc-500">
-                    Authenticate Deplai API requests. The token is masked until you show or copy it.
-                  </p>
-                  {bundle.apiToken.configured ? (
-                    <>
-                      <p className="mt-3 font-mono text-sm tracking-widest text-zinc-300">
-                        {tokenVisible && tokenValue ? tokenValue : bundle.apiToken.masked}
+                  <div className="flex items-start gap-3">
+                    <div className="border-[3px] border-black bg-black p-2 text-white">
+                      <KeyRound className="h-4 w-4" aria-hidden="true" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-zinc-500">Automation</p>
+                      <h2 className="mt-1 font-display text-lg font-semibold text-black">API token</h2>
+                      <p className="mt-2 max-w-2xl text-[13px] leading-relaxed text-zinc-600">
+                        Call DeplAI from scripts, CI, and internal tools. The token authenticates as you and inherits your
+                        organization permissions.
                       </p>
-                      {bundle.apiToken.lastUsedAt ? (
-                        <p className="mt-1 text-[12px] text-zinc-500">
-                          Last used {new Date(bundle.apiToken.lastUsedAt).toLocaleString()}
-                        </p>
-                      ) : null}
-                    </>
-                  ) : (
-                    <p className="mt-3 border-[3px] border-dashed border-black px-4 py-4 text-[13px] text-neutral-600">
-                      No API token issued yet. Reset generates a new token.
-                    </p>
-                  )}
+                    </div>
+                  </div>
+
+                  <ul className="mt-5 grid gap-2 sm:grid-cols-3">
+                    {[
+                      'Check credit balance in monitoring',
+                      'Trigger scans from GitHub Actions',
+                      'Automate project and billing reads',
+                    ].map((item) => (
+                      <li key={item} className="border-2 border-black bg-white px-3 py-2 text-[12px] text-neutral-700">
+                        {item}
+                      </li>
+                    ))}
+                  </ul>
+
+                  <div className="mt-5">
+                    <p className="font-mono text-[10px] font-medium uppercase tracking-[0.16em] text-neutral-500">Your token</p>
+                    {bundle.apiToken.configured || tokenValue ? (
+                      <div className="mt-2 border-[3px] border-black bg-neutral-950 px-4 py-3 font-mono text-[12px] leading-relaxed text-emerald-300 break-all">
+                        {tokenVisible && tokenValue ? tokenValue : bundle.apiToken.masked || 'dpl_live_••••••••••••••••••••••••'}
+                      </div>
+                    ) : (
+                      <div className="mt-2 border-[3px] border-dashed border-black bg-white px-4 py-5 text-[13px] text-neutral-600">
+                        No token yet. Generate one to authenticate API requests from outside the dashboard.
+                      </div>
+                    )}
+                    {tokenFresh && tokenVisible ? (
+                      <p className="mt-2 border-2 border-amber-500 bg-amber-50 px-3 py-2 text-[12px] text-amber-900">
+                        Copy this token now. After you hide it, only the masked value is shown again.
+                      </p>
+                    ) : null}
+                    {bundle.apiToken.configured && bundle.apiToken.lastUsedAt ? (
+                      <p className="mt-2 text-[12px] text-zinc-500">
+                        Last used {new Date(bundle.apiToken.lastUsedAt).toLocaleString()}
+                        {bundle.apiToken.lastUsedClient ? ` · ${bundle.apiToken.lastUsedClient}` : ''}
+                      </p>
+                    ) : bundle.apiToken.configured ? (
+                      <p className="mt-2 text-[12px] text-zinc-500">Not used yet — try the example request below.</p>
+                    ) : null}
+                  </div>
+
                   <div className="mt-4 flex flex-wrap gap-2">
-                    <PrimaryButton variant="ghost" loading={tokenBusy} disabled={!bundle.apiToken.configured && !tokenValue} onClick={() => void showToken()}>
-                      {tokenVisible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                      {tokenVisible ? 'Hide' : 'Show'}
-                    </PrimaryButton>
-                    <PrimaryButton variant="ghost" disabled={!bundle.apiToken.configured && !tokenValue} onClick={() => void copyToken()}>
-                      <Copy className="h-4 w-4" />
-                      {copied ? 'Copied' : 'Copy'}
-                    </PrimaryButton>
-                    <PrimaryButton variant="danger" onClick={() => setResetOpen(true)}>Reset API token</PrimaryButton>
+                    {bundle.apiToken.configured || tokenValue ? (
+                      <>
+                        <PrimaryButton variant="ghost" loading={tokenBusy} onClick={() => void showToken()}>
+                          {tokenVisible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                          {tokenVisible ? 'Hide' : 'Reveal'}
+                        </PrimaryButton>
+                        <PrimaryButton variant="ghost" disabled={!bundle.apiToken.configured && !tokenValue} onClick={() => void copyToken()}>
+                          <Copy className="h-4 w-4" />
+                          {copied ? 'Copied' : 'Copy token'}
+                        </PrimaryButton>
+                        <PrimaryButton variant="danger" onClick={() => setResetOpen(true)}>Rotate token</PrimaryButton>
+                      </>
+                    ) : (
+                      <PrimaryButton loading={tokenBusy} onClick={() => void issueApiToken()}>
+                        <KeyRound className="h-4 w-4" />
+                        Generate API token
+                      </PrimaryButton>
+                    )}
+                  </div>
+
+                  <div className="mt-6 border-t-2 border-neutral-200 pt-5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="font-mono text-[10px] font-medium uppercase tracking-[0.16em] text-neutral-500">Example request</p>
+                      <PrimaryButton variant="ghost" className="!px-2 !py-1 text-[11px]" onClick={() => void copyCurlExample()}>
+                        <Copy className="h-3.5 w-3.5" />
+                        {curlCopied ? 'Copied' : 'Copy curl'}
+                      </PrimaryButton>
+                    </div>
+                    <pre className="mt-2 overflow-x-auto border-[3px] border-black bg-neutral-950 p-3 font-mono text-[11px] leading-relaxed text-emerald-300 whitespace-pre-wrap">
+                      {curlExample}
+                    </pre>
+                    <p className="mt-3 text-[12px] leading-relaxed text-zinc-500">
+                      Send the token in an <code className="font-mono text-[11px]">Authorization: Bearer</code> header or as
+                      {' '}<code className="font-mono text-[11px]">X-Api-Key</code>. Store it in a secrets manager or CI variable — never commit it to git.
+                    </p>
                   </div>
                 </ProfileCard>
 
                 <ProfileCard danger className="p-6">
-                  <h2 className="font-display text-lg font-semibold text-rose-200">Danger Zone</h2>
-                  <p className="mt-2 max-w-2xl text-[13px] text-rose-100/80">
+                  <h2 className="font-display text-lg font-semibold text-rose-900">Danger Zone</h2>
+                  <p className="mt-2 max-w-2xl text-[13px] leading-relaxed text-neutral-700">
                     Account deletion is permanent. Cancel active subscriptions before starting.
                     Your account data will be deleted and anonymized. You will be signed out after the deletion request starts.
                   </p>
@@ -898,9 +1117,6 @@ export default function ProfileApp() {
           <Field label="Email" htmlFor="profile-email" error={editErrors.email}>
             <input id="profile-email" type="email" className={inputClass} value={editDraft.email} onChange={(event) => setEditDraft((current) => ({ ...current, email: event.target.value }))} />
           </Field>
-          <Field label="LinkedIn" htmlFor="profile-linkedin" error={editErrors.linkedinUrl} hint="Optional">
-            <input id="profile-linkedin" className={inputClass} placeholder="linkedin.com/in/you" value={editDraft.linkedinUrl} onChange={(event) => setEditDraft((current) => ({ ...current, linkedinUrl: event.target.value }))} />
-          </Field>
           <Field label="GitHub" htmlFor="profile-github" error={editErrors.githubUrl} hint="Optional">
             <input id="profile-github" className={inputClass} placeholder="github.com/you" value={editDraft.githubUrl} onChange={(event) => setEditDraft((current) => ({ ...current, githubUrl: event.target.value }))} />
           </Field>
@@ -910,35 +1126,6 @@ export default function ProfileApp() {
             <PrimaryButton type="submit" variant="white" disabled={!editDirty} loading={editSaving}>Save changes</PrimaryButton>
           </div>
         </form>
-      </Dialog>
-
-      <Dialog open={customOpen} title="Buy Custom Credits" onClose={() => setCustomOpen(false)}>
-        <Field label="Amount" htmlFor="custom-credits" error={customError} hint={`Minimum: $${MIN_CUSTOM_CREDIT_USD}. Maximum: $${MAX_CUSTOM_CREDIT_USD}.`}>
-          <input
-            id="custom-credits"
-            inputMode="numeric"
-            className={inputClass}
-            value={customAmount}
-            onChange={(event) => { setCustomAmount(event.target.value); setCustomError(''); }}
-          />
-        </Field>
-        <div className="mt-5 flex justify-end gap-2">
-          <PrimaryButton variant="ghost" onClick={() => setCustomOpen(false)}>Cancel</PrimaryButton>
-          <PrimaryButton
-            variant="white"
-            loading={Boolean(checkoutBusy)}
-            onClick={() => {
-              const parsed = validateCustomCreditUsd(customAmount);
-              if (!parsed.ok) {
-                setCustomError(parsed.error);
-                return;
-              }
-              void buyCredits(parsed.amount);
-            }}
-          >
-            Continue
-          </PrimaryButton>
-        </div>
       </Dialog>
 
       <Dialog open={topupOpen} title="Automatic Top Up" onClose={() => setTopupOpen(false)}>
@@ -1002,13 +1189,13 @@ export default function ProfileApp() {
         </div>
       </Dialog>
 
-      <Dialog open={resetOpen} title="Reset API Token?" onClose={() => setResetOpen(false)}>
-        <p className="text-[13px] leading-relaxed text-zinc-400">
-          Your current API token will stop working immediately. Applications using this token will need to be updated.
+      <Dialog open={resetOpen} title="Rotate API token?" onClose={() => setResetOpen(false)}>
+        <p className="text-[13px] leading-relaxed text-zinc-600">
+          Your current token stops working immediately. Update any scripts, CI jobs, or integrations that use it.
         </p>
         <div className="mt-5 flex justify-end gap-2">
           <PrimaryButton variant="ghost" onClick={() => setResetOpen(false)}>Cancel</PrimaryButton>
-          <PrimaryButton variant="danger" loading={tokenBusy} onClick={() => void resetToken()}>Reset token</PrimaryButton>
+          <PrimaryButton variant="danger" loading={tokenBusy} onClick={() => void resetToken()}>Rotate token</PrimaryButton>
         </div>
       </Dialog>
 
@@ -1025,7 +1212,7 @@ export default function ProfileApp() {
             disabled={deleteBusy}
           />
         </Field>
-        {deleteBusy ? <p className="mt-3 flex items-center gap-2 text-[13px] text-rose-200"><Loader2 className="h-4 w-4 animate-spin" /> Deleting account...</p> : null}
+        {deleteBusy ? <p className="mt-3 flex items-center gap-2 text-[13px] text-rose-800"><Loader2 className="h-4 w-4 animate-spin" /> Deleting account...</p> : null}
         <div className="mt-5 flex justify-end gap-2">
           <PrimaryButton variant="ghost" disabled={deleteBusy} onClick={() => setDeleteOpen(false)}>Cancel</PrimaryButton>
           <PrimaryButton variant="danger" disabled={deletePhrase !== 'DELETE'} loading={deleteBusy} onClick={() => void deleteAccount()}>

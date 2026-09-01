@@ -10,8 +10,8 @@ type ApiPlan = {
   id: string;
   displayName: string;
   description: string;
-  priceCents: number;
-  yearlyPriceCents: number;
+  pricePaise: number;
+  yearlyPricePaise: number;
   paidCreditAmount: number;
   bonusCreditPercent: number;
   isCustom: boolean;
@@ -25,59 +25,80 @@ const FALLBACK_PLANS: ApiPlan[] = [
     id: "free",
     displayName: "Free",
     description: "For exploring secure agentic deployment",
-    priceCents: 0,
-    yearlyPriceCents: 0,
-    paidCreditAmount: 5,
+    pricePaise: 0,
+    yearlyPricePaise: 0,
+    paidCreditAmount: 0,
     bonusCreditPercent: 0,
     isCustom: false,
     isRecommended: false,
-    bonusTermsCopy: "The Free plan includes a small monthly allotment of paid credits. Unused paid credits do not roll over, and this plan never receives bonus credits.",
-    features: ["1 project", "Repo analysis agent", "Basic security scan", "Community support"],
+    bonusTermsCopy: "Free organizations receive no managed credits. BYOK remains available.",
+    features: ["1 project", "BYOK model access", "Basic security scan", "Community support"],
   },
   {
     id: "starter_20",
     displayName: "Starter",
-    description: "For individuals shipping production workloads",
-    priceCents: 2000,
-    yearlyPriceCents: 19200,
-    paidCreditAmount: 20,
-    bonusCreditPercent: 25,
+    description: "Go from repo connect to approved AWS deploy without stitching scanners, agents, and Terraform yourself",
+    pricePaise: 59_900,
+    yearlyPricePaise: 649_900,
+    paidCreditAmount: 25,
+    bonusCreditPercent: 0,
     isCustom: false,
     isRecommended: false,
-    bonusTermsCopy: "Paid credits are granted at the start of each billing cycle. After you use every paid credit, up to 25% extra bonus credits unlock. Bonus credits expire at the end of the calendar month they were unlocked and never roll over.",
-    features: ["Unlimited projects", "Security scanning", "Terraform generation", "Email support"],
+    bonusTermsCopy: "Managed-LLM credits never expire. Annual credits are released monthly.",
+    features: [
+      "Security Agent: SAST, dependency scans, and AI remediation",
+      "Terraform generation with plan review before every apply",
+      "DeplAI-managed LLMs — no vendor API keys required",
+      "Unlimited projects and deployment pipelines",
+      "Organization workspace to share with collaborators",
+      "Email support when something blocks your release",
+    ],
   },
   {
     id: "pro_50",
     displayName: "Pro",
-    description: "For growing teams and platforms",
-    priceCents: 5000,
-    yearlyPriceCents: 48000,
-    paidCreditAmount: 50,
-    bonusCreditPercent: 40,
+    description: "For teams that need design iteration, fix velocity, and deploy confidence in one place",
+    pricePaise: 139_900,
+    yearlyPricePaise: 1_519_900,
+    paidCreditAmount: 62.5,
+    bonusCreditPercent: 0,
     isCustom: false,
     isRecommended: true,
-    bonusTermsCopy: "Paid credits are granted at the start of each billing cycle. After you use every paid credit, up to 40% extra bonus credits unlock. Bonus credits expire at the end of the calendar month they were unlocked and never roll over.",
-    features: ["Everything in Starter", "Frontend customizations", "Vulnerability fixes", "Priority support"],
+    bonusTermsCopy: "Managed-LLM credits never expire. Annual credits are released monthly.",
+    features: [
+      "Everything in Starter",
+      "UI/UX customizer for safe, frontend-only design changes",
+      "Guided vulnerability fixes with human review gates",
+      "Traffic-aware AWS cost estimates before infrastructure applies",
+      "Priority support for production incidents",
+      "Organization roles, teams, and shared billing context",
+    ],
   },
   {
     id: "enterprise",
     displayName: "Enterprise",
-    description: "For large-scale operations",
-    priceCents: 0,
-    yearlyPriceCents: 0,
+    description: "For organizations that need governance, procurement fit, and predictable capacity at scale",
+    pricePaise: 0,
+    yearlyPricePaise: 0,
     paidCreditAmount: 0,
     bonusCreditPercent: 0,
     isCustom: true,
     isRecommended: false,
-    bonusTermsCopy: "Enterprise credits are provisioned from your contract. Contact sales to set allotments, seats, bonus terms, and rollover.",
-    features: ["Everything in Pro", "Custom contracts", "24/7 dedicated support", "SLA and security review"],
+    bonusTermsCopy: "Credits and seats are provisioned from your contract. We align allotments to how your teams actually ship.",
+    features: [
+      "Everything in Pro",
+      "Pooled credits across seats and business units",
+      "Custom contracts, GST invoicing, and procurement workflows",
+      "Security policies, audit logs, and deployment evidence gates",
+      "Dedicated support channel with agreed response times",
+      "Onboarding and architecture review with the DeplAI team",
+    ],
   },
 ];
 
-function formatUsdFromCents(cents: number) {
-  const amount = cents / 100;
-  return amount.toLocaleString("en-US", {
+function formatInrFromPaise(paise: number) {
+  const amount = paise / 100;
+  return amount.toLocaleString("en-IN", {
     minimumFractionDigits: Number.isInteger(amount) ? 0 : 2,
     maximumFractionDigits: 2,
   });
@@ -118,7 +139,7 @@ export function PricingSection() {
             <span className="text-stroke">pricing</span>
           </h2>
           <p className="text-lg text-muted-foreground max-w-xl">
-            Paid credits convert 1:1 from your subscription. Bonus credits unlock after paid credits are used and expire at calendar month-end.
+            Clear, GST-inclusive INR pricing. Managed credits are shared by your organization and never expire.
           </p>
         </div>
 
@@ -149,18 +170,18 @@ export function PricingSection() {
           </span>
           {isAnnual && (
             <span className="ml-2 px-2 py-1 bg-foreground text-primary-foreground text-xs font-mono">
-              Save 20%
+              Save ~10%
             </span>
           )}
         </div>
 
         <div className="grid md:grid-cols-2 xl:grid-cols-4 gap-px bg-foreground/10">
           {plans.map((plan, idx) => {
-            const monthlyCents = plan.priceCents;
-            const yearlyMonthlyCents = plan.yearlyPriceCents > 0
-              ? Math.round(plan.yearlyPriceCents / 12)
-              : monthlyCents;
-            const displayCents = plan.isCustom ? null : isAnnual ? yearlyMonthlyCents : monthlyCents;
+            const monthlyPaise = plan.pricePaise;
+            const yearlyMonthlyPaise = plan.yearlyPricePaise > 0
+              ? plan.yearlyPricePaise / 12
+              : monthlyPaise;
+            const displayPaise = plan.isCustom ? null : isAnnual ? yearlyMonthlyPaise : monthlyPaise;
             const href = plan.isCustom ? `mailto:${salesEmail}` : signUpHref;
             const cta = plan.isCustom ? "Contact sales" : plan.id === "free" ? "Start free" : "Start trial";
 
@@ -186,17 +207,17 @@ export function PricingSection() {
                 </div>
 
                 <div className="mb-8 pb-8 border-b border-foreground/10">
-                  {displayCents !== null ? (
+                  {displayPaise !== null ? (
                     <div>
                       <div className="flex items-baseline gap-2">
                         <span className="font-display text-5xl text-foreground">
-                          ${formatUsdFromCents(displayCents)}
+                          ₹{formatInrFromPaise(displayPaise)}
                         </span>
                         <span className="text-muted-foreground">/month</span>
                       </div>
-                      {isAnnual && monthlyCents > 0 && (
+                      {isAnnual && monthlyPaise > 0 && (
                         <p className="text-sm text-muted-foreground mt-2">
-                          billed ${formatUsdFromCents(plan.yearlyPriceCents)}/year · 20% off
+                          billed ₹{formatInrFromPaise(plan.yearlyPricePaise)}/year · 10% off
                         </p>
                       )}
                     </div>
@@ -209,7 +230,7 @@ export function PricingSection() {
                   <li className="flex items-start gap-3">
                     <Check className="w-4 h-4 text-foreground mt-0.5 shrink-0" />
                     <span className="text-sm text-muted-foreground">
-                      Includes ${plan.paidCreditAmount}/month paid credits
+                      Includes {plan.paidCreditAmount} managed credits/month
                     </span>
                   </li>
                   <li className="flex items-start gap-3">

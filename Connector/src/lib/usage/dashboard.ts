@@ -457,7 +457,7 @@ export function buildUsageInsights(input: InsightInput): UsageInsight[] {
       tone: 'info',
       title: 'Free plan is almost through this month',
       detail: 'Free includes 5 credits per cycle. Starter adds a paid allotment and top-up packs.',
-      href: '/dashboard/subscription',
+      href: '/dashboard/billing',
       action: 'Compare plans',
     });
   }

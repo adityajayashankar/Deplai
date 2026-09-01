@@ -129,7 +129,7 @@ const SIDEBAR_SECTIONS: Array<{ label: string; items: SidebarItem[] }> = [
   {
     label: 'Account',
     items: [
-      { key: 'subscription', label: 'Subscription' },
+      { key: 'billing', label: 'Billing' },
       { key: 'invoices', label: 'Invoices' },
       { key: 'credits', label: 'Credits' },
       { key: 'byok', label: 'AI credentials' },
@@ -961,6 +961,10 @@ export default function DashboardHomeApp({ initialTab = 'overview' }: { initialT
     }
     if (key === 'byok') {
       router.push('/dashboard/ai');
+      return;
+    }
+    if (key === 'billing') {
+      router.push('/dashboard/billing');
       return;
     }
     if (key === 'credits') {

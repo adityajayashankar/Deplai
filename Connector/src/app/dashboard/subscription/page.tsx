@@ -1,5 +1,5 @@
-import SubscriptionApp from '@/features/billing/SubscriptionApp';
+import { redirect } from 'next/navigation';
 
 export default function DashboardSubscriptionPage() {
-  return <SubscriptionApp />;
+  redirect('/dashboard/billing');
 }

@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { query, withTransaction } from '@/lib/db';
-import { getBalance, getSubscription, grantPaidCredits } from '@/lib/billing/credits';
+import { getBalance, getOrganizationSubscription, getSubscription, grantPaidCredits } from '@/lib/billing/credits';
+import {
+  getOrganizationCreditBalance,
+  reconcileOrganizationSubscriptionCredits,
+} from '@/lib/billing/organization-credits';
+import { planDisplayName, unitsToCredits } from '@/lib/billing/credit-catalog';
+import { resolveActiveOrganization } from '@/lib/organizations/store';
 import { listRoutingPolicies, saveRoutingPolicy, defaultRoutingPolicy } from '@/lib/ai-platform/routing';
 import { listModels } from '@/lib/ai-platform/catalog/store';
 import { PROVIDER_IDS, type ProviderId } from '@/lib/ai-platform/types';
@@ -11,12 +17,12 @@ import {
   type EfficientPoolEntry,
   type ProfilePatch,
   type RoutingModeId,
-  referralCodeFromUserId,
   routingModeById,
   validateEfficientPool,
   validateProfilePatch,
   validatePromoCode,
 } from './logic';
+import { allocateUniqueReferralCode, ensureUserReferralCode } from '@/lib/referrals/codes';
 import { decryptApiToken, encryptApiToken, generateApiToken, hashApiToken } from './crypto';
 import { ensureProfileSchema } from './schema';
 
@@ -78,8 +84,23 @@ async function loadRow(userId: string): Promise<ProfileRow | null> {
 async function ensureRow(user: SessionUser): Promise<ProfileRow> {
   await ensureProfileSchema();
   const existing = await loadRow(user.id);
-  if (existing) return existing;
-  const referral = referralCodeFromUserId(user.id);
+  if (existing) {
+    await ensureUserReferralCode({
+      userId: user.id,
+      login: user.login,
+      displayName: user.name,
+      email: user.email,
+    });
+    const refreshed = await loadRow(user.id);
+    if (refreshed) return refreshed;
+    return existing;
+  }
+  const referral = await allocateUniqueReferralCode({
+    userId: user.id,
+    login: user.login,
+    displayName: user.name,
+    email: user.email,
+  });
   const githubUrl = user.login ? `https://github.com/${user.login}` : '';
   try {
     await query(
@@ -121,27 +142,33 @@ function publicProfile(user: SessionUser, row: ProfileRow) {
 
 export async function getProfileBundle(user: SessionUser) {
   const row = await ensureRow(user);
-  const [balance, subscription, token] = await Promise.all([
+  const [balance, subscription, token, organizationBilling] = await Promise.all([
     getBalance(user.id).catch(() => null),
     getSubscription(user.id).catch(() => null),
     getMaskedApiToken(user.id).catch(() => ({ configured: false, masked: '', lastUsedAt: null, lastUsedClient: null })),
+    loadOrganizationBilling(user).catch(() => null),
   ]);
+  const enrichedSubscription = subscription
+    ? { ...subscription, planName: planDisplayName(subscription.planId) }
+    : organizationBilling?.subscription || null;
+  const credits = organizationBilling?.credits || (balance
+    ? {
+        paid_remaining: balance.paidRemaining,
+        bonus_remaining: balance.bonusRemaining,
+        bonus_unlocked: balance.bonusUnlocked,
+        bonus_expires_at: balance.bonusExpiresAt,
+        total: balance.total,
+        plan_id: balance.planId,
+        plan_name: balance.planName,
+        cycle_start: balance.cycleStart,
+        cycle_end: balance.cycleEnd,
+      }
+    : null);
   return {
     profile: publicProfile(user, row),
-    credits: balance
-      ? {
-          paid_remaining: balance.paidRemaining,
-          bonus_remaining: balance.bonusRemaining,
-          bonus_unlocked: balance.bonusUnlocked,
-          bonus_expires_at: balance.bonusExpiresAt,
-          total: balance.total,
-          plan_id: balance.planId,
-          plan_name: balance.planName,
-          cycle_start: balance.cycleStart,
-          cycle_end: balance.cycleEnd,
-        }
-      : null,
-    subscription,
+    credits,
+    subscription: enrichedSubscription,
+    organizationCredits: organizationBilling?.credits || null,
     routing: {
       mode: routingModeById(row.routing_mode).id as RoutingModeId,
       efficientPool: parsePool(row.efficient_pool_json),
@@ -153,6 +180,36 @@ export async function getProfileBundle(user: SessionUser) {
       paymentMethodLast4: row.payment_method_last4 || '',
     },
     apiToken: token,
+  };
+}
+
+async function loadOrganizationBilling(user: SessionUser) {
+  const organization = await resolveActiveOrganization(user);
+  await reconcileOrganizationSubscriptionCredits(organization.id).catch(() => null);
+  const [subscription, wallet] = await Promise.all([
+    getOrganizationSubscription(organization.id).catch(() => null),
+    getOrganizationCreditBalance(organization.id).catch(() => null),
+  ]);
+  if (!wallet) return null;
+  const planId = subscription?.planId || 'free';
+  return {
+    organizationId: organization.id,
+    subscription: subscription
+      ? { ...subscription, planName: planDisplayName(subscription.planId) }
+      : null,
+    credits: {
+      paid_remaining: unitsToCredits(wallet.availableUnits),
+      bonus_remaining: 0,
+      bonus_unlocked: false,
+      bonus_expires_at: null,
+      total: unitsToCredits(wallet.availableUnits),
+      plan_id: planId,
+      plan_name: planDisplayName(planId),
+      cycle_start: null,
+      cycle_end: null,
+      organization_id: organization.id,
+      never_expires: true,
+    },
   };
 }
 
@@ -307,6 +364,48 @@ export async function rotateApiToken(userId: string) {
     token,
     masked: `${prefix}${'•'.repeat(16)}${last4}`,
     configured: true,
+  };
+}
+
+export async function resolveUserFromApiToken(
+  token: string,
+  clientHint?: string | null,
+): Promise<SessionUser | null> {
+  const trimmed = token.trim();
+  if (!trimmed.startsWith('dpl_live_')) return null;
+
+  await ensureProfileSchema();
+  const rows = await query<Array<{
+    user_id: string;
+    email: string;
+    name: string | null;
+    display_name: string | null;
+    github_url: string | null;
+  }>>(
+    `SELECT u.id AS user_id, u.email, u.name, p.display_name, p.github_url
+     FROM user_api_tokens t
+     JOIN users u ON u.id = t.user_id
+     LEFT JOIN user_profiles p ON p.user_id = u.id
+     WHERE t.token_hash = ?
+     LIMIT 1`,
+    [hashApiToken(trimmed)],
+  );
+  const row = rows[0];
+  if (!row) return null;
+
+  const client = clientHint?.trim().slice(0, 32) || 'api';
+  await query(
+    `UPDATE user_api_tokens SET last_used_at = NOW(), last_used_client = ? WHERE user_id = ?`,
+    [client, row.user_id],
+  );
+
+  const login = row.github_url?.match(/github\.com\/([^/?#]+)/i)?.[1] || '';
+  return {
+    id: row.user_id,
+    email: row.email,
+    name: row.display_name || row.name || 'DeplAI user',
+    login,
+    avatarUrl: '',
   };
 }
 

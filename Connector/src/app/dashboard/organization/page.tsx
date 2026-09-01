@@ -1,5 +1,5 @@
-import OrganizationsComingSoonApp from '@/features/dashboard/OrganizationsComingSoonApp';
+import OrganizationsApp from '@/features/organizations/OrganizationsApp';
 
 export default function OrganizationPage() {
-  return <OrganizationsComingSoonApp />;
+  return <OrganizationsApp />;
 }

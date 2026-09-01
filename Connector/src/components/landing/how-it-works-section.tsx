@@ -130,7 +130,7 @@ export function HowItWorksSection() {
                         <div 
                           className="h-full bg-background w-0"
                           style={{
-                            animation: 'progress 5s linear forwards'
+                            animation: 'landing-how-it-works-progress 5s linear forwards'
                           }}
                         />
                       </div>
@@ -160,7 +160,7 @@ export function HowItWorksSection() {
                   {steps[activeStep].code.split('\n').map((line, lineIndex) => (
                     <div 
                       key={`${activeStep}-${lineIndex}`} 
-                      className="leading-loose code-line-reveal"
+                      className="leading-loose landing-how-it-works-code-line"
                       style={{ 
                         animationDelay: `${lineIndex * 80}ms`,
                       }}
@@ -170,7 +170,7 @@ export function HowItWorksSection() {
                         {line.split('').map((char, charIndex) => (
                           <span
                             key={`${activeStep}-${lineIndex}-${charIndex}`}
-                            className="code-char-reveal"
+                            className="landing-how-it-works-code-char"
                             style={{
                               animationDelay: `${lineIndex * 80 + charIndex * 15}ms`,
                             }}
@@ -194,38 +194,6 @@ export function HowItWorksSection() {
         </div>
       </div>
 
-      <style jsx>{`
-        @keyframes progress {
-          from { width: 0%; }
-          to { width: 100%; }
-        }
-        
-        .code-line-reveal {
-          opacity: 0;
-          transform: translateX(-8px);
-          animation: lineReveal 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
-        }
-        
-        @keyframes lineReveal {
-          to {
-            opacity: 1;
-            transform: translateX(0);
-          }
-        }
-        
-        .code-char-reveal {
-          opacity: 0;
-          filter: blur(8px);
-          animation: charReveal 0.3s cubic-bezier(0.22, 1, 0.36, 1) forwards;
-        }
-        
-        @keyframes charReveal {
-          to {
-            opacity: 1;
-            filter: blur(0);
-          }
-        }
-      `}</style>
     </section>
   );
 }

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
+import { resolveAgenticBillingContext } from '@/lib/agentic-context';
 import { query } from '@/lib/db';
 import { githubService } from '@/lib/github';
 import fs from 'fs';
@@ -12,6 +13,7 @@ import {
 } from '@/lib/sessions/store';
 import { resolveWorkflowLlmConfig } from '@/lib/ai-platform/workflow-llm';
 import { mapConnectorSourceToCustomization } from '@/lib/customization-snapshot';
+import { denyUnlessPlanFeature } from '@/lib/billing/plan-access-guard';
 
 const DEFAULT_CUSTOMIZATION_BACKEND = 'http://127.0.0.1:8010';
 const DEFAULT_UIUX_AGENT_BACKEND = 'http://127.0.0.1:7777';
@@ -1031,6 +1033,18 @@ async function proxyRequest(request: NextRequest, pathSegments: string[] = []) {
   const { user, error } = await requireAuth();
   if (error) return error;
 
+  const isReadOnlyPreview =
+    request.method === 'GET'
+    && pathSegments[0] === 'preview';
+  const isResolveRepoPath =
+    request.method === 'GET'
+    && pathSegments.length === 1
+    && pathSegments[0] === 'resolve-repo-path';
+  if (!isReadOnlyPreview && !isResolveRepoPath && request.method !== 'GET') {
+    const denied = await denyUnlessPlanFeature(request, user, 'customization');
+    if (denied) return denied;
+  }
+
   if (pathSegments[0] === 'uiux') {
     return proxyUiuxAgentRequest(request, String(user.id), pathSegments);
   }
@@ -1126,11 +1140,13 @@ async function proxyRequest(request: NextRequest, pathSegments: string[] = []) {
     }
 
     headers.set('content-type', 'application/json');
-  body.user_id = String(user.id);
+    body.user_id = String(user.id);
     const needsLlm =
       pathSegments[0] === 'implement'
       || isFrontendRunCreate;
     if (needsLlm) {
+      const billing = await resolveAgenticBillingContext({ request, user });
+      body.organization_id = billing.organizationId;
       try {
         const llmError = await bindTrustedLlmConfig(String(user.id), body);
         if (llmError) return llmError;

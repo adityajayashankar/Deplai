@@ -12,7 +12,6 @@ function AnimatedCounter({ end, suffix = "", prefix = "" }: { end: number; suffi
       ([entry]) => {
         if (entry.isIntersecting && !hasAnimated) {
           setHasAnimated(true);
-          let start = 0;
           const duration = 2000;
           const startTime = performance.now();
 
@@ -72,12 +71,14 @@ const metrics = [
 ];
 
 export function MetricsSection() {
-  const [time, setTime] = useState(new Date());
+  const [time, setTime] = useState<string | null>(null);
   const [isVisible, setIsVisible] = useState(false);
   const sectionRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
-    const interval = setInterval(() => setTime(new Date()), 1000);
+    const updateTime = () => setTime(new Date().toLocaleTimeString());
+    updateTime();
+    const interval = setInterval(updateTime, 1000);
     return () => clearInterval(interval);
   }, []);
 
@@ -119,7 +120,7 @@ export function MetricsSection() {
               Live
             </span>
             <span className="text-foreground/30">|</span>
-            <span>{time.toLocaleTimeString()}</span>
+            <span>{time ?? "--:--:--"}</span>
           </div>
         </div>
         

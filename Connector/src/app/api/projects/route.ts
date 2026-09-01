@@ -1,7 +1,13 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
 import { query } from '@/lib/db';
 import { githubService } from '@/lib/github';
+import {
+  ACTIVE_ORGANIZATION_COOKIE,
+  requireOrganizationPermission,
+  resolveActiveOrganization,
+} from '@/lib/organizations/store';
+import { organizationApiError } from '@/lib/organizations/api';
 
 type DbError = {
   code?: string;
@@ -73,10 +79,19 @@ function parseLanguages(value: unknown): Record<string, number> | null {
   return null;
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
     const { user, error } = await requireAuth();
     if (error) return error;
+    const activeOrganization = await resolveActiveOrganization(
+      user,
+      request.cookies.get(ACTIVE_ORGANIZATION_COOKIE)?.value,
+    );
+    await requireOrganizationPermission({
+      userId: user.id,
+      organizationId: activeOrganization.id,
+      action: 'project.read',
+    });
 
     try {
       await githubService.linkUserInstallation(user.id, user.login);
@@ -87,11 +102,16 @@ export async function GET() {
     // Claim personal installations that are still unowned after webhook-only onboarding.
     await query(
       `UPDATE github_installations
-       SET user_id = ?
+       SET user_id = ?, organization_id = COALESCE(organization_id, ?)
        WHERE user_id IS NULL
          AND account_type = 'User'
          AND LOWER(account_login) = LOWER(?)`,
-      [user.id, user.login]
+      [user.id, activeOrganization.id, user.login]
+    );
+    await query(
+      `UPDATE github_installations SET organization_id = ?
+       WHERE user_id = ? AND organization_id IS NULL`,
+      [activeOrganization.id, user.id],
     );
 
     // Best-effort reconciliation so removed installations/repositories do not linger in UI.
@@ -113,9 +133,9 @@ export async function GET() {
           size_bytes,
           created_at
          FROM projects
-         WHERE user_id = ? AND project_type = 'local'
+         WHERE organization_id = ? AND project_type = 'local'
          ORDER BY created_at DESC`,
-        [user.id]
+        [activeOrganization.id]
       );
     } catch (localError: unknown) {
       const dbLocalError = localError as DbError;
@@ -126,9 +146,9 @@ export async function GET() {
             name,
             created_at
            FROM projects
-           WHERE user_id = ?
+           WHERE organization_id = ?
            ORDER BY created_at DESC`,
-          [user.id]
+          [activeOrganization.id]
         );
         localProjects = legacyLocalProjects.map(project => ({
           id: project.id,
@@ -165,17 +185,10 @@ export async function GET() {
           i.account_login
          FROM github_repositories r
          JOIN github_installations i ON i.id = r.installation_id
-         WHERE (
-           i.user_id = ?
-           OR (
-             i.user_id IS NULL
-             AND i.account_type = 'User'
-             AND LOWER(i.account_login) = LOWER(?)
-           )
-         )
+         WHERE i.organization_id = ?
            AND r.user_hidden = false
          ORDER BY r.full_name ASC`,
-        [user.id, user.login]
+        [activeOrganization.id]
       );
 
       // Fallback ownership path: legacy rows can miss github_installations.user_id.
@@ -195,18 +208,10 @@ export async function GET() {
            FROM github_repositories r
            JOIN github_installations i ON i.id = r.installation_id
            LEFT JOIN projects p ON p.repository_id = r.id
-           WHERE (
-             i.user_id = ?
-             OR p.user_id = ?
-             OR (
-               i.user_id IS NULL
-               AND i.account_type = 'User'
-               AND LOWER(i.account_login) = LOWER(?)
-             )
-           )
+           WHERE (i.organization_id = ? OR p.organization_id = ?)
              AND r.user_hidden = false
            ORDER BY r.full_name ASC`,
-          [user.id, user.id, user.login]
+          [activeOrganization.id, activeOrganization.id]
         );
       }
 
@@ -229,18 +234,10 @@ export async function GET() {
              FROM github_repositories r
              JOIN github_installations i ON i.id = r.installation_id
              LEFT JOIN projects p ON p.repository_id = r.id
-             WHERE (
-               i.user_id = ?
-               OR p.user_id = ?
-               OR (
-                 i.user_id IS NULL
-                 AND i.account_type = 'User'
-                 AND LOWER(i.account_login) = LOWER(?)
-               )
-             )
+             WHERE (i.organization_id = ? OR p.organization_id = ?)
                AND r.user_hidden = false
              ORDER BY r.full_name ASC`,
-            [user.id, user.id, user.login]
+            [activeOrganization.id, activeOrganization.id]
           );
         } catch (syncErr) {
           console.warn('GitHub installation sync in /api/projects failed:', syncErr);
@@ -265,17 +262,9 @@ export async function GET() {
              FROM github_repositories r
              JOIN github_installations i ON i.id = r.installation_id
              LEFT JOIN projects p ON p.repository_id = r.id
-             WHERE (
-               i.user_id = ?
-               OR p.user_id = ?
-               OR (
-                 i.user_id IS NULL
-                 AND i.account_type = 'User'
-                 AND LOWER(i.account_login) = LOWER(?)
-               )
-             )
+             WHERE (i.organization_id = ? OR p.organization_id = ?)
              ORDER BY r.full_name ASC`,
-            [user.id, user.id, user.login]
+            [activeOrganization.id, activeOrganization.id]
           );
         } catch (fallbackError: unknown) {
           const dbFallbackError = fallbackError as DbError;
@@ -333,6 +322,7 @@ export async function GET() {
 
     return NextResponse.json({
       projects: allProjects,
+      activeOrganizationId: activeOrganization.id,
       stats: {
         localCount: formattedLocalProjects.length,
         githubCount: formattedGithubRepos.length,
@@ -340,6 +330,7 @@ export async function GET() {
       },
     });
   } catch (error: unknown) {
+    if ((error as { name?: string })?.name === 'OrganizationError') return organizationApiError(error);
     const dbError = error as DbError;
     console.error('Error fetching projects:', {
       code: dbError?.code,

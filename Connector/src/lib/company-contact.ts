@@ -33,13 +33,6 @@ export const COMPANY_CONTACTS: CompanyContact[] = [
     description: 'Partnerships and sales.',
   },
   {
-    id: 'careers',
-    email: 'careers@deplai.tech',
-    label: 'Careers',
-    description: 'Hiring and internships.',
-    badge: 'Hiring',
-  },
-  {
     id: 'direct',
     email: 'adityajayashankar@deplai.tech',
     label: 'Direct',

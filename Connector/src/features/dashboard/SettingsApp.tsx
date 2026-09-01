@@ -86,7 +86,7 @@ const SETTINGS_NAV: Array<{ id: TabKey; label: string; adminOnly?: boolean }> = 
 const ELSEWHERE_LINKS = [
   { href: '/profile', label: 'Profile' },
   { href: '/dashboard/integrations', label: 'Integrations' },
-  { href: '/dashboard/subscription', label: 'Subscription' },
+  { href: '/dashboard/billing', label: 'Billing' },
   { href: '/dashboard/credits', label: 'Credits' },
   { href: '/dashboard/ai', label: 'BYOK keys' },
   { href: '/dashboard/usage', label: 'Usage' },
