@@ -202,9 +202,18 @@ async def _call_llm_json(system: str, user: str, provider: str = "", api_key: st
                 task="coding",
                 api_key=api_key or None,
                 provider=provider or None,
+                access_mode="byok" if str(api_key or "").strip() else "platform",
+                metadata={"product": "deployment", "stage": "architecture_generate"},
             )
     except Exception as exc:
         logger.warning("AI gateway failed in arch gen: %s", exc)
+        if not str(api_key or "").strip() and os.getenv("DEPLAI_ALLOW_DIRECT_LLM", "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            raise
 
     # 1. User-specified provider
     if provider and api_key:

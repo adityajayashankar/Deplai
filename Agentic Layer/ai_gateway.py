@@ -1,8 +1,9 @@
 """DeplAI AI gateway client.
 
-Security, Terraform, and customization workflows must call this instead of
-provider SDKs. The Connector AI platform resolves provider, model, credential
-source, routing, and fallback.
+Security remediation, Terraform generation, customization, and other agent
+workflows must call this instead of provider SDKs. The Connector AI platform
+resolves provider, model, credential source, routing, org-wallet metering, and
+fallback.
 """
 
 from __future__ import annotations
@@ -14,14 +15,33 @@ from typing import Any
 from urllib import error, request
 
 _bound_user_id: contextvars.ContextVar[str] = contextvars.ContextVar("deplai_ai_user_id", default="")
+_bound_organization_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "deplai_ai_organization_id",
+    default="",
+)
 
 
 def bind_user(user_id: str | None) -> None:
     _bound_user_id.set(str(user_id or "").strip())
 
 
+def bind_organization(organization_id: str | None) -> None:
+    _bound_organization_id.set(str(organization_id or "").strip())
+
+
+def bind_ai_context(*, user_id: str | None = None, organization_id: str | None = None) -> None:
+    if user_id is not None:
+        bind_user(user_id)
+    if organization_id is not None:
+        bind_organization(organization_id)
+
+
 def bound_user() -> str:
     return _bound_user_id.get() or os.getenv("DEPLAI_AI_USER_ID", "").strip()
+
+
+def bound_organization() -> str:
+    return _bound_organization_id.get() or os.getenv("DEPLAI_ORGANIZATION_ID", "").strip()
 
 
 def gateway_enabled() -> bool:
@@ -29,8 +49,23 @@ def gateway_enabled() -> bool:
     return flag in {"1", "true", "yes", "on"} and bool(_gateway_url())
 
 
-def gateway_ready(user_id: str | None = None) -> bool:
-    return gateway_enabled() and bool(str(user_id or bound_user()).strip())
+def _require_organization_id() -> bool:
+    return os.getenv("DEPLAI_AI_GATEWAY_REQUIRE_ORG", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def gateway_ready(user_id: str | None = None, organization_id: str | None = None) -> bool:
+    resolved_user = str(user_id or bound_user()).strip()
+    resolved_org = str(organization_id or bound_organization()).strip()
+    if not gateway_enabled() or not resolved_user:
+        return False
+    if _require_organization_id() and not resolved_org:
+        return False
+    return True
 
 
 def _gateway_url() -> str:
@@ -50,6 +85,7 @@ class DeplaiAI:
         self,
         *,
         user_id: str | None = None,
+        organization_id: str | None = None,
         model: str = "best_reasoning",
         messages: list[dict[str, str]] | None = None,
         prompt: str | None = None,
@@ -57,13 +93,18 @@ class DeplaiAI:
         task: str | None = None,
         api_key: str | None = None,
         provider: str | None = None,
+        credential_id: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        metadata: dict[str, Any] | None = None,
         timeout_seconds: int = 90,
     ) -> dict[str, Any]:
         resolved_user = str(user_id or bound_user()).strip()
+        resolved_org = str(organization_id or bound_organization()).strip()
         if not resolved_user:
             raise RuntimeError("AI gateway requires a user_id.")
+        if _require_organization_id() and not resolved_org:
+            raise RuntimeError("AI gateway requires an organization_id for credit metering.")
         payload: dict[str, Any] = {
             "model": model,
             "access_mode": access_mode,
@@ -77,10 +118,14 @@ class DeplaiAI:
             payload["api_key"] = api_key
         if provider:
             payload["provider"] = provider
+        if credential_id:
+            payload["credential_id"] = credential_id
         if temperature is not None:
             payload["temperature"] = temperature
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if metadata:
+            payload["metadata"] = metadata
 
         url = _gateway_url().rstrip("/") + "/api/ai/chat"
         headers = {
@@ -88,6 +133,7 @@ class DeplaiAI:
             "X-API-Key": _service_key(),
             "x-deplai-service-key": _service_key(),
             "x-deplai-user-id": resolved_user,
+            "x-deplai-organization-id": resolved_org,
         }
         req = request.Request(
             url,
@@ -125,11 +171,13 @@ def _map_provider(provider: str | None) -> str | None:
 def remediate_text(
     *,
     user_id: str | None,
+    organization_id: str | None = None,
     prompt: str,
     model: str | None = None,
     access_mode: str | None = None,
     api_key: str | None = None,
     provider: str | None = None,
+    credential_id: str | None = None,
     max_tokens: int | None = None,
     timeout_seconds: int = 120,
 ) -> tuple[bool, str]:
@@ -141,17 +189,22 @@ def remediate_text(
     if mode not in {"platform", "byok", "auto"}:
         mode = "auto"
     requested = (model or "").strip()
-    resolved_model = requested or "best_coding"
+    if not requested and mode == "platform":
+        requested = os.getenv("REMEDIATION_PLATFORM_MODEL", "glm-5.2-free").strip()
+    resolved_model = requested or ("glm-5.2-free" if mode == "platform" else "best_coding")
     return chat_text(
         user_id=resolved_user,
+        organization_id=organization_id,
         model=resolved_model,
         prompt=prompt,
         access_mode=mode,
         api_key=api_key,
         provider=None if resolved_model.startswith("best") else _map_provider(provider),
+        credential_id=credential_id,
         temperature=0.1,
         max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
+        metadata={"product": "security", "stage": "remediation"},
     )
 
 

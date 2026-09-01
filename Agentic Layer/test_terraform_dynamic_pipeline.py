@@ -106,8 +106,11 @@ if "terraform_agent.agent.engine.deployment_profile" not in sys.modules:
 
 from claude_deployment_pipeline import (
     _build_generation_context_summary,
+    _coerce_web_service_port,
     _enrich_deployment_profile_for_deterministic_rendering,
     _fallback_structure_plan,
+    _normalize_compute_services,
+    _project_slug,
     _rewrite_legacy_region_var_references,
     _run_terraform_json_worker,
     generate_terraform_bundle,
@@ -149,6 +152,67 @@ def _profile(strategy: str) -> dict:
 
 
 class TerraformDynamicPipelineTests(unittest.TestCase):
+    def test_normalize_compute_services_uses_homogeneous_terraform_shape(self) -> None:
+        normalized = _normalize_compute_services([
+            {
+                "id": "api",
+                "process_type": "web",
+                "cpu": 512,
+                "memory": 1024,
+                "port": 3000,
+                "desired_count": 2,
+                "autoscaling": {"min": 1, "max": 4, "target_cpu": 60, "target_memory": 70},
+            },
+            {
+                "id": "worker",
+                "process_type": "worker",
+                "cpu": 256,
+                "memory": 512,
+                "port": None,
+                "desired_count": 1,
+                "autoscaling": {"min": 1, "max": 5, "target_cpu": 70},
+            },
+            {
+                "id": "scheduler",
+                "process_type": "scheduler",
+                "desired_count": 1,
+                "autoscaling": {"min_count": 1, "max_count": 1},
+            },
+        ])
+
+        self.assertEqual(len(normalized), 3)
+        expected_keys = {
+            "id",
+            "process_type",
+            "image_source",
+            "cpu",
+            "memory",
+            "port",
+            "desired_count",
+            "command",
+            "autoscaling",
+        }
+        for service in normalized:
+            self.assertEqual(set(service.keys()), expected_keys)
+            self.assertEqual(set(service["autoscaling"].keys()), {"min", "max", "target_cpu", "target_memory"})
+        self.assertEqual(normalized[0]["port"], 3000)
+        self.assertEqual(normalized[1]["port"], 0)
+        self.assertEqual(normalized[2]["port"], 0)
+
+    def test_project_slug_strips_trailing_hyphens(self) -> None:
+        self.assertEqual(_project_slug("ifca-"), "ifca")
+        self.assertEqual(_project_slug("My--Repo!!"), "my-repo")
+
+    def test_normalize_compute_services_rejects_database_ports_for_web(self) -> None:
+        normalized = _normalize_compute_services([
+            {"id": "api", "process_type": "web", "port": 5432, "desired_count": 1},
+        ])
+        self.assertEqual(normalized[0]["port"], 3000)
+
+    def test_coerce_web_service_port_rejects_datastore_ports(self) -> None:
+        self.assertEqual(_coerce_web_service_port(5432), 3000)
+        self.assertEqual(_coerce_web_service_port(8080), 8080)
+
     def test_deterministic_enrichment_applies_budget_security_and_frontend_context(self) -> None:
         profile = _profile("ecs_fargate")
         enriched = _enrich_deployment_profile_for_deterministic_rendering(

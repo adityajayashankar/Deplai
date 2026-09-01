@@ -52,21 +52,25 @@ class LLMRouter:
         preferred_model: str | None = None,
         force_claude: bool = False,
         user_id: str | None = None,
+        organization_id: str | None = None,
         access_mode: str | None = None,
+        llm_credential_id: str | None = None,
     ) -> tuple[str, str, int]:
         self._reset_if_needed()
 
         mode = (access_mode or "auto").strip().lower() or "auto"
         if user_id:
             try:
-                from ai_gateway import remediate_text
+                from ai_gateway import bound_organization, remediate_text
                 ok, response = remediate_text(
                     user_id=str(user_id),
+                    organization_id=str(organization_id or bound_organization() or "").strip() or None,
                     prompt=prompt,
                     model=preferred_model,
                     access_mode=mode,
                     api_key=preferred_api_key,
                     provider=preferred_provider,
+                    credential_id=llm_credential_id,
                 )
                 if ok:
                     tokens_used = max(estimated_tokens, len(response) // 4)

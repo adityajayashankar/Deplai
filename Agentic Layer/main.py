@@ -41,12 +41,19 @@ from models import (
     TerraformApplyRequest, TerraformApplyResponse,
     TerraformApplyStopRequest, TerraformApplyStopResponse,
     TerraformApplyStatusRequest, TerraformApplyStatusResponse,
+    TerraformPreflightRequest, TerraformPreflightResponse,
+    BootstrapStatusRequest, BootstrapStatusResponse,
     AwsRuntimeDetailsRequest, AwsRuntimeDetailsResponse,
     AwsDestroyRequest, AwsDestroyResponse,
     AwsInstanceActionRequest, AwsInstanceActionResponse,
     AwsAppSecretsListRequest, AwsAppSecretsUpsertRequest, AwsAppSecretsDeleteRequest, AwsAppSecretsResponse,
 )
-from dast_agent.api import router as dast_router
+try:
+    from dast_agent.api import router as dast_router
+except Exception as exc:
+    dast_router = None
+    logging.getLogger(__name__).warning("DAST routes disabled during startup: %s", exc)
+
 from deploy_exec.api import router as deploy_exec_router
 from environment import EnvironmentInitializer
 from cleanup import cleanup_volumes, cleanup_project_reports
@@ -63,6 +70,7 @@ from runner_base import RunnerBase
 from architecture_gen import generate_architecture
 from architecture_contract import ArchitectureContractError, parse_architecture_document
 from architecture_decision import complete_architecture_review, start_architecture_review
+from aws_discovery import discover_aws_environment
 from cost_estimation import estimate_cost
 from deployment_planning_contract import (
     ArchitectureReviewCompleteRequest,
@@ -71,13 +79,19 @@ from deployment_planning_contract import (
     ArchitectureReviewStartResponse,
     RepositoryAnalysisRequest,
     RepositoryAnalysisResponse,
+    AwsDiscoveryRequest,
+    AwsDiscoveryResponse,
 )
 from claude_deployment_pipeline import generate_terraform_bundle
 from repository_analysis import run_repository_analysis
 from stage7_bridge import run_stage7_approval_payload
 from terraform_consult import run_terraform_consult
 from infra_advisor import run_infra_advise
-from utils import get_docker_client
+try:
+    from utils import get_docker_client
+except ImportError as exc:
+    get_docker_client = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning("Docker utilities disabled: %s", exc)
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +203,8 @@ app.add_middleware(
 if iac_router is not None:
     app.include_router(iac_router, dependencies=[Depends(verify_api_key)])
 
-app.include_router(dast_router, dependencies=[Depends(verify_api_key)])
+if dast_router is not None:
+    app.include_router(dast_router, dependencies=[Depends(verify_api_key)])
 app.include_router(deploy_exec_router, dependencies=[Depends(verify_api_key)])
 
 
@@ -229,6 +244,7 @@ def _normalize_remediation_request(request: RemediationRequest) -> RemediationRe
     raw_api_key = str(request.llm_api_key or "").strip() or None
     raw_model = str(request.llm_model or "").strip() or None
     raw_access = str(request.llm_access_mode or "auto").strip().lower() or "auto"
+    raw_credential_id = str(request.llm_credential_id or "").strip() or None
     if raw_access not in {"platform", "byok", "auto"}:
         raw_access = "auto"
     if raw_provider == "claude":
@@ -240,6 +256,7 @@ def _normalize_remediation_request(request: RemediationRequest) -> RemediationRe
             "llm_api_key": raw_api_key,
             "llm_model": raw_model,
             "llm_access_mode": raw_access,
+            "llm_credential_id": raw_credential_id,
         }
     )
 
@@ -290,6 +307,18 @@ async def _broadcast_pipeline_event(project_id: str, msg_type: str, content: str
             if not live:
                 pipeline_subscribers.pop(project_id, None)
                 pipeline_indices.pop(project_id, None)
+
+
+def _bind_ai_gateway_context(request: Any) -> None:
+    """Bind user/org for org-wallet metering on agent LLM calls."""
+    try:
+        from ai_gateway import bind_ai_context
+        bind_ai_context(
+            user_id=getattr(request, "user_id", None),
+            organization_id=getattr(request, "organization_id", None),
+        )
+    except Exception:
+        pass
 
 
 async def _handle_websocket(
@@ -427,6 +456,8 @@ async def _handle_websocket(
                     await _send_unauthorized()
                     return
 
+                _bind_ai_gateway_context(context)
+
                 runner = create_runner(websocket, project_id, context)
                 active[project_id] = runner
 
@@ -562,6 +593,7 @@ async def cleanup():
 async def validate_remediation(request: RemediationRequest):
     """Validate a remediation request and store context."""
     request = _normalize_remediation_request(request)
+    _bind_ai_gateway_context(request)
     logger.info(
         "Remediation request: project=%s type=%s user=%s",
         request.project_id, request.project_type, request.user_id,
@@ -737,6 +769,7 @@ async def repository_analysis_run(request: RepositoryAnalysisRequest):
 
 @app.post("/api/architecture/review/start", response_model=ArchitectureReviewStartResponse, dependencies=[Depends(verify_api_key)])
 async def architecture_review_start(request: ArchitectureReviewStartRequest):
+    _bind_ai_gateway_context(request)
     loop = asyncio.get_running_loop()
     try:
         review = await loop.run_in_executor(
@@ -759,6 +792,7 @@ async def architecture_review_start(request: ArchitectureReviewStartRequest):
 
 @app.post("/api/architecture/review/complete", response_model=ArchitectureReviewCompleteResponse, dependencies=[Depends(verify_api_key)])
 async def architecture_review_complete(request: ArchitectureReviewCompleteRequest):
+    _bind_ai_gateway_context(request)
     loop = asyncio.get_running_loop()
     try:
         answers_json, deployment_profile, architecture_view, approval_payload, runtime_paths = await loop.run_in_executor(
@@ -771,6 +805,7 @@ async def architecture_review_complete(request: ArchitectureReviewCompleteReques
                 answers=request.answers,
                 user_id=request.user_id,
                 repo_full_name=request.repo_full_name,
+                aws_context=request.aws_context,
             ),
         )
     except Exception as exc:
@@ -787,9 +822,30 @@ async def architecture_review_complete(request: ArchitectureReviewCompleteReques
     )
 
 
+@app.post("/api/architecture/aws-discovery", response_model=AwsDiscoveryResponse, dependencies=[Depends(verify_api_key)])
+async def architecture_aws_discovery(request: AwsDiscoveryRequest):
+    """Inspect AWS metadata with one-time credentials; never persist or echo credentials."""
+    loop = asyncio.get_running_loop()
+    try:
+        context = await loop.run_in_executor(
+            None,
+            lambda: discover_aws_environment(
+                aws_access_key_id=request.aws_access_key_id,
+                aws_secret_access_key=request.aws_secret_access_key,
+                aws_session_token=request.aws_session_token,
+                region=request.aws_region,
+            ),
+        )
+    except Exception as exc:
+        logger.warning("AWS architecture discovery failed: %s", type(exc).__name__)
+        return AwsDiscoveryResponse(success=False, error="AWS discovery failed. Verify the credentials, region, and read-only permissions.")
+    return AwsDiscoveryResponse(success=True, context=context)
+
+
 @app.post("/api/architecture/generate", response_model=ArchitectureGenResponse, dependencies=[Depends(verify_api_key)])
 async def architecture_generate(request: ArchitectureGenRequest):
     """Generate architecture JSON from a natural language prompt."""
+    _bind_ai_gateway_context(request)
     result = await generate_architecture(
         prompt=request.prompt,
         provider=request.provider,
@@ -842,6 +898,7 @@ async def cost_estimate(request: CostEstimateRequest):
 @app.post("/api/stage7/approval", response_model=Stage7ApprovalResponse, dependencies=[Depends(verify_api_key)])
 async def stage7_approval(request: Stage7ApprovalRequest):
     """Run Stage 7 diagram+cost+budget agent and return approval payload."""
+    _bind_ai_gateway_context(request)
     loop = asyncio.get_running_loop()
 
     try:
@@ -864,6 +921,7 @@ async def stage7_approval(request: Stage7ApprovalRequest):
 @app.post("/api/terraform/consult", response_model=TerraformConsultResponse, dependencies=[Depends(verify_api_key)])
 async def terraform_consult(request: TerraformConsultRequest):
     """Intake-aware infrastructure consultant for the deploy chat vertical slice."""
+    _bind_ai_gateway_context(request)
     try:
         result = await asyncio.to_thread(
             run_terraform_consult,
@@ -899,6 +957,7 @@ async def terraform_consult(request: TerraformConsultRequest):
 @app.post("/api/infra/advise", response_model=InfraAdviseResponse, dependencies=[Depends(verify_api_key)])
 async def infra_advise(request: InfraAdviseRequest):
     """LangGraph beginner infra advisor: project + budget aware interactive planning."""
+    _bind_ai_gateway_context(request)
     try:
         result = await asyncio.to_thread(
             run_infra_advise,
@@ -932,15 +991,11 @@ async def infra_advise(request: InfraAdviseRequest):
 @app.post("/api/terraform/generate", response_model=TerraformGenResponse, dependencies=[Depends(verify_api_key)])
 async def terraform_generate(request: TerraformGenRequest):
     """Generate Terraform IaC files from a Claude-derived deployment profile."""
+    _bind_ai_gateway_context(request)
     loop = asyncio.get_running_loop()
     architecture_json = dict(request.architecture_json or {})
     repository_context_json = dict(request.repository_context or {})
     project_id = str(request.project_id or "").strip()
-    try:
-        from ai_gateway import bind_user
-        bind_user(request.user_id)
-    except Exception:
-        pass
 
     def progress_callback(event: dict[str, Any]) -> None:
         if not project_id:
@@ -1102,6 +1157,13 @@ def _run_runtime_terraform_apply_sync(request: TerraformApplyRequest, apply_ctx:
             enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
             confirm_apply=request.confirm_plan_summary is True,
             apply_context=apply_ctx,
+            database_required=request.database_required,
+            customer_database_url=request.customer_database_url,
+            customer_host=request.customer_host,
+            customer_port=request.customer_port,
+            customer_database_name=request.customer_database_name,
+            customer_username=request.customer_username,
+            customer_password=request.customer_password,
         )
     return apply_terraform_bundle(
         files=[{"path": f.path, "content": f.content, "encoding": f.encoding} for f in request_files],
@@ -1116,6 +1178,13 @@ def _run_runtime_terraform_apply_sync(request: TerraformApplyRequest, apply_ctx:
         enforce_free_tier_ec2=request.enforce_free_tier_ec2 is not False,
         confirm_apply=request.confirm_plan_summary is True,
         apply_context=apply_ctx,
+        database_required=request.database_required,
+        customer_database_url=request.customer_database_url,
+        customer_host=request.customer_host,
+        customer_port=request.customer_port,
+        customer_database_name=request.customer_database_name,
+        customer_username=request.customer_username,
+        customer_password=request.customer_password,
     )
 
 
@@ -1192,6 +1261,7 @@ async def terraform_apply(request: TerraformApplyRequest):
         "cancel_requested": False,
         "container_id": None,
         "emit": None,
+        "apply_logs": [],
         "deployment_metadata": dict(request.deployment_metadata or {}),
     }
     active_terraform_applies[apply_key] = apply_ctx
@@ -1219,6 +1289,7 @@ async def terraform_apply_status(request: TerraformApplyStatusRequest):
 
     if apply_key in active_terraform_applies:
         ctx = active_terraform_applies.get(apply_key) or {}
+        apply_logs = ctx.get("apply_logs")
         return TerraformApplyStatusResponse(
             success=True,
             status="running",
@@ -1226,6 +1297,7 @@ async def terraform_apply_status(request: TerraformApplyStatusRequest):
                 "container_id": ctx.get("container_id"),
                 "phase": ctx.get("phase") or "starting",
                 "phase_message": ctx.get("phase_message"),
+                "logs": apply_logs[-150:] if isinstance(apply_logs, list) else [],
             },
         )
 
@@ -1257,6 +1329,8 @@ async def terraform_apply_stop(request: TerraformApplyStopRequest):
         return TerraformApplyStopResponse(success=True, message="Stop requested. Waiting for active Terraform command to start.")
 
     def _kill_container() -> tuple[bool, str]:
+        if get_docker_client is None:
+            return (False, "Docker SDK is not available in this runtime.")
         try:
             docker = get_docker_client()
             container = docker.containers.get(container_id)
@@ -1277,6 +1351,89 @@ async def terraform_apply_stop(request: TerraformApplyStopRequest):
     if not ok:
         return TerraformApplyStopResponse(success=False, error=msg)
     return TerraformApplyStopResponse(success=True, message=msg)
+
+
+@app.post("/api/terraform/preflight", response_model=TerraformPreflightResponse, dependencies=[Depends(verify_api_key)])
+async def terraform_preflight(request: TerraformPreflightRequest):
+    from database_preflight import run_database_preflight
+    from terraform_apply import _collect_terraform_text
+
+    terraform_text = str(request.terraform_text or "").strip()
+    if not terraform_text and request.files:
+        terraform_text = _collect_terraform_text(
+            [{"path": item.path, "content": item.content, "encoding": item.encoding} for item in request.files]
+        )
+    result = run_database_preflight(
+        terraform_text=terraform_text,
+        database_required=bool(request.database_required),
+        customer_database_url=request.customer_database_url,
+        customer_host=request.customer_host,
+        customer_port=request.customer_port,
+        customer_database_name=request.customer_database_name,
+        customer_username=request.customer_username,
+        customer_password=request.customer_password,
+    )
+    ok = bool(result.get("ok"))
+    return TerraformPreflightResponse(
+        success=ok,
+        stage=str(result.get("stage") or "static_preflight"),
+        code=None if ok else str(result.get("code") or "INVALID_DATABASE_CONFIGURATION"),
+        message=str(result.get("message") or ("Preflight passed." if ok else "Preflight failed.")),
+        details=result,
+    )
+
+
+@app.post("/api/deploy/bootstrap-status", response_model=BootstrapStatusResponse, dependencies=[Depends(verify_api_key)])
+async def deploy_bootstrap_status(request: BootstrapStatusRequest):
+    from bootstrap_status import read_bootstrap_status_once, wait_for_bootstrap_status
+
+    credentials = {
+        "aws_access_key_id": request.aws_access_key_id,
+        "aws_secret_access_key": request.aws_secret_access_key,
+        "aws_session_token": request.aws_session_token or "",
+        "aws_region": request.aws_region,
+    }
+    instance_id = str(request.instance_id or "").strip()
+    if not instance_id:
+        return BootstrapStatusResponse(
+            success=False,
+            error="instance_id is required",
+            terraform_status="unknown",
+            application_status="failed",
+            verification_status="failed",
+        )
+
+    loop = asyncio.get_running_loop()
+    if request.wait:
+        payload = await loop.run_in_executor(
+            None,
+            lambda: wait_for_bootstrap_status(
+                instance_id=instance_id,
+                credentials=credentials,
+                timeout_seconds=int(request.timeout_seconds),
+                interval_seconds=int(request.interval_seconds),
+            ),
+        )
+    else:
+        payload = await loop.run_in_executor(
+            None,
+            lambda: read_bootstrap_status_once(instance_id=instance_id, credentials=credentials),
+        )
+
+    app_status = str(payload.get("status") or "unknown")
+    bootstrap = payload.get("bootstrap_status") if isinstance(payload.get("bootstrap_status"), dict) else None
+    ok = bool(payload.get("ok"))
+    return BootstrapStatusResponse(
+        success=ok,
+        terraform_status="succeeded",
+        application_status="succeeded" if ok else ("failed" if app_status == "failed" else "running"),
+        bootstrap_status=bootstrap,
+        verification_status="pending" if app_status == "running" else ("passed" if ok else "failed"),
+        details={
+            "reachable": payload.get("reachable"),
+            "message": payload.get("message"),
+        },
+    )
 
 
 @app.post("/api/aws/runtime-details", response_model=AwsRuntimeDetailsResponse, dependencies=[Depends(verify_api_key)])

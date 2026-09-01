@@ -87,6 +87,7 @@ class RemediationState(TypedDict):
     llm_model: str
     user_id: str
     llm_access_mode: str
+    llm_credential_id: str
     budget_tracker: ClaudeBudgetTracker | None
     # ── Planner output ──────────────────────────────────────────────────────────
     planned_context: dict   # targeted snippets from Planner's tool calls
@@ -98,6 +99,7 @@ class RemediationState(TypedDict):
     # ── Output ────────────────────────────────────────────────────────────────
     final_result: dict
     error: str
+    persist_changes: bool
 
 
 # ── LLM dispatch  (rate-limit-aware) ──────────────────────────────────────────
@@ -126,7 +128,10 @@ def _dispatch_llm(
     budget_tracker: ClaudeBudgetTracker | None = None,
     stage: str = "remediation_supervisor",
     user_id: str = "",
+    organization_id: str = "",
     access_mode: str = "auto",
+    credential_id: str = "",
+    max_tokens: int | None = None,
 ) -> tuple[bool, str]:
     """Route remediation supervisor calls through the AI platform when possible."""
     provider = (provider or "").strip().lower()
@@ -136,14 +141,17 @@ def _dispatch_llm(
 
     if user_id:
         try:
-            from ai_gateway import remediate_text
+            from ai_gateway import bound_organization, remediate_text
             ok_gw, raw_gw = remediate_text(
                 user_id=str(user_id),
+                organization_id=str(organization_id or bound_organization() or "").strip() or None,
                 prompt=prompt,
                 model=model or "best_coding",
                 access_mode=mode,
                 api_key=api_key,
                 provider=provider,
+                credential_id=credential_id or None,
+                max_tokens=max_tokens,
             )
             if ok_gw:
                 return ok_gw, raw_gw
@@ -413,6 +421,8 @@ Evaluation criteria:
   2. CORRECTNESS — Is the code syntactically valid and functionally correct?
   3. SAFETY    — Does it introduce new vulnerabilities or break existing functionality?
   4. COMPLETENESS — Are complete file contents provided (not partial diffs)?
+  5. DEPENDENCY MIGRATIONS — Reject package.json-only major-version bumps (e.g. next 12→15,
+     swiper 8→12) without required config/code/lockfile updates and migration steps.
 
 Output ONLY valid JSON:
 {{
@@ -475,7 +485,9 @@ def _proposer_node(state: RemediationState) -> RemediationState:
         budget_tracker=state.get("budget_tracker"),
         stage=f"supervisor_proposer_round_{int(state.get('round', 0)) + 1}",
         user_id=state.get("user_id", ""),
+        organization_id=state.get("organization_id", ""),
         access_mode=state.get("llm_access_mode", "auto"),
+        credential_id=state.get("llm_credential_id", ""),
     )
     if not ok:
         return {**state, "error": f"Proposer LLM call failed: {raw_text}"}
@@ -513,7 +525,9 @@ def _critic_node(state: RemediationState) -> RemediationState:
         budget_tracker=state.get("budget_tracker"),
         stage=f"supervisor_critic_round_{int(state.get('round', 0)) + 1}",
         user_id=state.get("user_id", ""),
+        organization_id=state.get("organization_id", ""),
         access_mode=state.get("llm_access_mode", "auto"),
+        credential_id=state.get("llm_credential_id", ""),
     )
 
     if not ok:
@@ -569,7 +583,8 @@ def _synthesizer_node(state: RemediationState) -> RemediationState:
                     lineterm="",
                 )
             )
-            _write_file(change.path, change.content)
+            if state.get("persist_changes", True):
+                _write_file(change.path, change.content)
             changed_files.append({"path": change.path, "reason": change.reason, "diff": file_diff})
         except Exception as exc:
             return {**state, "error": f"Synthesizer failed writing {change.path}: {exc}"}
@@ -674,7 +689,10 @@ async def run_remediation_supervisor(
     budget_tracker: ClaudeBudgetTracker | None = None,
     on_message=None,
     user_id: str | None = None,
+    organization_id: str | None = None,
     access_mode: str | None = None,
+    llm_credential_id: str | None = None,
+    persist_changes: bool = True,
 ) -> tuple[bool, dict[str, Any] | str]:
     """
     Run the Proposer → Critic → Synthesizer negotiation loop.
@@ -685,6 +703,11 @@ async def run_remediation_supervisor(
     Returns (True, result_dict) on success or (False, error_string) on failure.
     """
     loop = asyncio.get_running_loop()
+    try:
+        from ai_gateway import bind_ai_context
+        bind_ai_context(user_id=user_id, organization_id=organization_id)
+    except Exception:
+        pass
     ctx = contextvars.copy_context()
 
     async def run_in_executor_ctx(fn):
@@ -716,7 +739,9 @@ async def run_remediation_supervisor(
         "llm_api_key":    llm_api_key or "",
         "llm_model":      llm_model or "",
         "user_id":        str(user_id or ""),
+        "organization_id": str(organization_id or ""),
         "llm_access_mode": (access_mode or "auto"),
+        "llm_credential_id": llm_credential_id or "",
         "budget_tracker": budget_tracker,
         "round":          0,
         "proposal":       {},
@@ -725,6 +750,7 @@ async def run_remediation_supervisor(
         "planned_context": {},
         "final_result":   {},
         "error":          "",
+        "persist_changes": persist_changes,
     }
 
     # ── Planner ───────────────────────────────────────────────────────────────

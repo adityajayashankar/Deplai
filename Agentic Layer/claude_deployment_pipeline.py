@@ -36,7 +36,7 @@ for candidate in (
         sys.path.insert(0, str(candidate))
 
 from architecture_decision.service import _profile_to_architecture_view, _profile_to_infra_plan
-from deployment_manifest import bootstrap_fallback_from_repository_context
+from deployment_manifest import DATASTORE_PORTS, bootstrap_fallback_from_repository_context
 from deployment_planning_contract import (
     ArchitectureAnswersDocument,
     ArchitectureQuestion,
@@ -330,6 +330,14 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     return parsed
 
 
+def _direct_llm_fallback_allowed() -> bool:
+    return os.getenv("DEPLAI_ALLOW_DIRECT_LLM", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _gateway_access_mode(*, api_key: str | None = None) -> str:
+    return "byok" if str(api_key or "").strip() else "platform"
+
+
 def _call_claude_json(
     *,
     workspace: str,
@@ -358,9 +366,17 @@ def _call_claude_json(
                 ],
                 task="coding",
                 max_tokens=max_tokens,
+                access_mode="platform",
+                metadata={"product": "deployment", "stage": stage},
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        if not _direct_llm_fallback_allowed():
+            raise RuntimeError(f"DeplAI AI gateway failed during {stage}: {exc}") from exc
+    if not _direct_llm_fallback_allowed():
+        raise RuntimeError(
+            "DeplAI AI gateway is required for deployment planning. "
+            "Configure DEPLAI_AI_GATEWAY_URL and pass organization billing context from Connector."
+        )
     client = _claude_client()
     try:
         response = client.messages.create(
@@ -804,9 +820,12 @@ def _call_terraform_free_llm_json(
                 api_key=api_key or None,
                 provider=None if provider in {"", "deplai"} else provider,
                 max_tokens=max_tokens,
+                access_mode=_gateway_access_mode(api_key=api_key or None),
+                metadata={"product": "deployment", "stage": "terraform_iac"},
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        if not _direct_llm_fallback_allowed():
+            raise RuntimeError(f"DeplAI AI gateway failed during Terraform generation: {exc}") from exc
 
     if provider == "ollama":
         endpoint = f"{base_url}/chat/completions"
@@ -1034,6 +1053,66 @@ def _as_records(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
+def _project_slug(value: str, *, fallback: str = "deplai-project") -> str:
+    slug = re.sub(r"[^a-z0-9-]+", "-", str(value or "").strip().lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug[:40] or fallback
+
+
+def _coerce_web_service_port(value: Any, *, fallback: int = 3000) -> int:
+    port = _decision_int(value)
+    if port is None or not 1 <= port <= 65535 or port in DATASTORE_PORTS:
+        return fallback
+    return port
+
+
+def _normalize_compute_service(service: dict[str, Any]) -> dict[str, Any]:
+    """Ensure every compute service object shares the same Terraform-friendly shape."""
+    process_type = str(service.get("process_type") or "web").strip().lower() or "web"
+    autoscaling_raw = _as_record(service.get("autoscaling"))
+    min_count = _decision_int(autoscaling_raw.get("min"))
+    if min_count is None:
+        min_count = _decision_int(autoscaling_raw.get("min_count"))
+    max_count = _decision_int(autoscaling_raw.get("max"))
+    if max_count is None:
+        max_count = _decision_int(autoscaling_raw.get("max_count"))
+    target_cpu = _decision_int(autoscaling_raw.get("target_cpu"))
+    if target_cpu is None:
+        target_cpu = _decision_int(autoscaling_raw.get("target_cpu_utilization"))
+    target_memory = _decision_int(autoscaling_raw.get("target_memory"))
+    if target_memory is None:
+        target_memory = _decision_int(autoscaling_raw.get("target_memory_utilization"))
+    desired_count = _decision_int(service.get("desired_count")) or 1
+    min_count = min_count if min_count is not None else desired_count
+    max_count = max_count if max_count is not None else max(desired_count, min_count)
+
+    if process_type != "web":
+        port_value = 0
+    else:
+        port_value = _coerce_web_service_port(service.get("port"), fallback=3000)
+
+    return {
+        "id": str(service.get("id") or process_type).strip() or process_type,
+        "process_type": process_type,
+        "image_source": str(service.get("image_source") or "placeholder").strip() or "placeholder",
+        "cpu": _decision_int(service.get("cpu")) or 256,
+        "memory": _decision_int(service.get("memory")) or 512,
+        "port": port_value,
+        "desired_count": desired_count,
+        "command": str(service.get("command") or "").strip(),
+        "autoscaling": {
+            "min": min_count,
+            "max": max_count,
+            "target_cpu": target_cpu or 60,
+            "target_memory": target_memory or 0,
+        },
+    }
+
+
+def _normalize_compute_services(value: Any) -> list[dict[str, Any]]:
+    return [_normalize_compute_service(service) for service in _as_records(value)]
+
+
 def _positive_float(value: Any) -> float | None:
     try:
         number = float(value)
@@ -1153,15 +1232,20 @@ def _enrich_deployment_profile_for_deterministic_rendering(
         operational["health_check_path"] = str(repo_health.get("endpoint")).strip()
         _append_profile_warning(enriched, "Repository analysis supplied operational.health_check_path for deterministic rendering.")
 
-    repo_port = repo_build.get("dockerfile_port")
-    repo_port_value = int(repo_port) if isinstance(repo_port, (int, float)) and int(repo_port) > 0 else None
+    repo_port_value = _coerce_web_service_port(repo_build.get("dockerfile_port"), fallback=0) or None
     services = _as_records(compute.get("services"))
     service_defaults_applied = False
     for service in services:
         if str(service.get("process_type") or "").strip().lower() != "web":
             continue
+        fallback_port = repo_port_value or 3000
+        coerced_port = _coerce_web_service_port(service.get("port"), fallback=fallback_port)
         if service.get("port") in {None, ""} and repo_port_value:
             service["port"] = repo_port_value
+            service_defaults_applied = True
+        elif coerced_port != _decision_int(service.get("port")):
+            service["port"] = coerced_port
+            service_defaults_applied = True
             service_defaults_applied = True
         if not str(service.get("command") or "").strip() and str(build_pipeline.get("start_command") or "").strip():
             service["command"] = str(build_pipeline.get("start_command")).strip()
@@ -1220,11 +1304,14 @@ def _enrich_deployment_profile_for_deterministic_rendering(
         networking["nat_gateway"] = True
         _append_profile_warning(enriched, "Security context contains critical/high findings; deterministic Terraform disables public load balancer exposure by default.")
 
+    compute["services"] = _normalize_compute_services(compute.get("services"))
     enriched["compute"] = compute
     enriched["networking"] = networking
     enriched["build_pipeline"] = build_pipeline
     enriched["runtime_config"] = runtime_config
     enriched["operational"] = operational
+    if str(enriched.get("project_name") or "").strip():
+        enriched["project_name"] = _project_slug(str(enriched.get("project_name")))
     return enriched
 
 
@@ -1362,7 +1449,7 @@ def _synthesize_deployment_profile_document(
                 "purpose": ["cache"],
             })
 
-    project = str(base.get("project_name") or project_name or repo.get("project_name") or "project").strip() or "project"
+    project = _project_slug(str(base.get("project_name") or project_name or repo.get("project_name") or "project"), fallback="project")
     workspace_name = str(base.get("workspace") or workspace or repo.get("workspace") or "deploy-workspace").strip() or "deploy-workspace"
     environment = str(base.get("environment") or "prod").strip() or "prod"
     application_type = str(base.get("application_type") or ("static_site" if strategy == "s3_cloudfront" else runtime)).strip() or runtime
@@ -2107,8 +2194,8 @@ def run_repository_analysis(
     repo_full_name: str | None = None,
 ) -> tuple[RepositoryContextDocument, str, dict[str, str]]:
     try:
-        from ai_gateway import bind_user
-        bind_user(user_id)
+        from ai_gateway import bind_ai_context
+        bind_ai_context(user_id=user_id)
     except Exception:
         pass
     root = resolve_repository_source(
@@ -2161,8 +2248,8 @@ def start_architecture_review(
     environment: str | None = None,
 ) -> ArchitectureReviewPayload:
     try:
-        from ai_gateway import bind_user
-        bind_user(user_id)
+        from ai_gateway import bind_ai_context
+        bind_ai_context(user_id=user_id)
     except Exception:
         pass
     cached_review_path = decision_review_payload_path(workspace)
@@ -2225,8 +2312,8 @@ def complete_architecture_review(
     repo_full_name: str | None = None,
 ) -> tuple[ArchitectureAnswersDocument, DeploymentProfileDocument, Any, dict[str, Any], dict[str, str]]:
     try:
-        from ai_gateway import bind_user
-        bind_user(user_id)
+        from ai_gateway import bind_ai_context
+        bind_ai_context(user_id=user_id)
     except Exception:
         pass
     cached_review_path = decision_review_payload_path(workspace)
@@ -2298,14 +2385,14 @@ def _render_ecs_curated_bundle(
     context_summary: str,
 ) -> tuple[dict[str, str], list[str]]:
     compute = payload.get("compute") if isinstance(payload.get("compute"), dict) else {}
-    services = [service for service in compute.get("services") or [] if isinstance(service, dict)]
+    services = _normalize_compute_services(compute.get("services"))
     networking = payload.get("networking") if isinstance(payload.get("networking"), dict) else {}
     data_layer = [item for item in payload.get("data_layer") or [] if isinstance(item, dict)]
     runtime_config = payload.get("runtime_config") if isinstance(payload.get("runtime_config"), dict) else {}
     build_pipeline = payload.get("build_pipeline") if isinstance(payload.get("build_pipeline"), dict) else {}
     operational = payload.get("operational") if isinstance(payload.get("operational"), dict) else {}
 
-    project_name = str(payload.get("project_name") or "deplai-project").strip() or "deplai-project"
+    project_name = _project_slug(str(payload.get("project_name") or "deplai-project"))
     workspace = str(payload.get("workspace") or project_name).strip() or project_name
     environment = str(payload.get("environment") or "dev").strip() or "dev"
     provider_scaffold = build_profile_bundle(
@@ -3558,8 +3645,8 @@ def generate_terraform_bundle(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     try:
-        from ai_gateway import bind_user
-        bind_user(user_id)
+        from ai_gateway import bind_ai_context
+        bind_ai_context(user_id=user_id)
     except Exception:
         pass
     requested_iac_mode = "llm" if str(iac_mode or "").strip().lower() == "llm" else "deterministic"

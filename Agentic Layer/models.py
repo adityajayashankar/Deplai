@@ -206,6 +206,7 @@ class RemediationRequest(BaseModel):
     def project_id_safe(cls, v: str) -> str:
         return _validate_project_id(v)
     user_id: str
+    organization_id: Optional[str] = None
     # GitHub-specific fields (only for github projects)
     github_token: Optional[str] = None
     repository_url: Optional[str] = None
@@ -214,7 +215,8 @@ class RemediationRequest(BaseModel):
     llm_api_key: Optional[str] = None
     llm_model: Optional[str] = None
     llm_access_mode: Optional[Literal["platform", "byok", "auto"]] = "auto"
-    remediation_scope: Literal["major", "all"] = "all"
+    llm_credential_id: Optional[str] = None
+    remediation_scope: Literal["major", "all"] = "major"
 
 
 class RemediationResponse(BaseModel):
@@ -229,6 +231,8 @@ class RemediationResponse(BaseModel):
 class ArchitectureGenRequest(BaseModel):
     prompt: str
     provider: str = "aws"
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
     llm_provider: Optional[str] = None
     llm_api_key: Optional[str] = None
     llm_model: Optional[str] = None
@@ -301,6 +305,7 @@ class TerraformGenRequest(BaseModel):
     repository_url: Optional[str] = None
     source_metadata: Optional[dict[str, Any]] = None
     user_id: Optional[str] = None
+    organization_id: Optional[str] = None
 
 
 class TerraformConsultRequest(BaseModel):
@@ -321,6 +326,8 @@ class TerraformConsultRequest(BaseModel):
     llm_api_key: Optional[str] = None
     llm_model: Optional[str] = None
     llm_api_base_url: Optional[str] = None
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
 
 
 class TerraformConsultResponse(BaseModel):
@@ -358,6 +365,8 @@ class InfraAdviseRequest(BaseModel):
     llm_api_key: Optional[str] = None
     llm_model: Optional[str] = None
     llm_api_base_url: Optional[str] = None
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
 
 
 class InfraAdviseResponse(BaseModel):
@@ -437,6 +446,13 @@ class TerraformApplyRequest(BaseModel):
     aws_region: Optional[str] = None
     enforce_free_tier_ec2: Optional[bool] = True
     confirm_plan_summary: Optional[bool] = False
+    database_required: bool = False
+    customer_database_url: Optional[str] = None
+    customer_host: Optional[str] = None
+    customer_port: Optional[str] = None
+    customer_database_name: Optional[str] = None
+    customer_username: Optional[str] = None
+    customer_password: Optional[str] = None
 
 
 class TerraformApplyResponse(BaseModel):
@@ -475,6 +491,47 @@ class TerraformApplyStatusResponse(BaseModel):
     success: bool
     status: str = "idle"  # idle | running | completed | error
     result: Optional[dict] = None
+    error: Optional[str] = None
+
+
+class TerraformPreflightRequest(BaseModel):
+    terraform_text: str = ""
+    files: list[TerraformApplyFile] = Field(default_factory=list)
+    database_required: bool = False
+    customer_database_url: Optional[str] = None
+    customer_host: Optional[str] = None
+    customer_port: Optional[str] = None
+    customer_database_name: Optional[str] = None
+    customer_username: Optional[str] = None
+    customer_password: Optional[str] = None
+
+
+class TerraformPreflightResponse(BaseModel):
+    success: bool
+    stage: str = "static_preflight"
+    code: Optional[str] = None
+    message: Optional[str] = None
+    details: Optional[dict] = None
+
+
+class BootstrapStatusRequest(BaseModel):
+    instance_id: str = Field(pattern=r"^i-[0-9a-f]{8,17}$")
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: Optional[str] = None
+    aws_region: str = "eu-north-1"
+    wait: bool = False
+    timeout_seconds: int = Field(default=900, ge=30, le=3600)
+    interval_seconds: int = Field(default=15, ge=5, le=60)
+
+
+class BootstrapStatusResponse(BaseModel):
+    success: bool
+    terraform_status: str = "unknown"
+    application_status: str = "unknown"
+    bootstrap_status: Optional[dict] = None
+    verification_status: str = "unknown"
+    details: Optional[dict] = None
     error: Optional[str] = None
 
 
@@ -576,6 +633,8 @@ class Stage7ApprovalRequest(BaseModel):
     budget_cap_usd: float = 100.0
     pipeline_run_id: str = ""
     environment: str = "dev"
+    user_id: Optional[str] = None
+    organization_id: Optional[str] = None
 
 
 class Stage7ApprovalResponse(BaseModel):

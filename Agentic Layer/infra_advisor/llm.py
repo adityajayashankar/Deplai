@@ -79,6 +79,8 @@ def call_advisor_chat(
                 provider=_text(llm_provider) or None,
                 temperature=0.3,
                 max_tokens=700,
+                access_mode="byok" if _text(llm_api_key) else "platform",
+                metadata={"product": "deployment", "stage": "infra_advise"},
             )
             if ok:
                 return text

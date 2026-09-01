@@ -1222,6 +1222,7 @@ def run_claude_remediation(
     budget_tracker: ClaudeBudgetTracker | None = None,
     user_id: str | None = None,
     access_mode: str | None = None,
+    llm_credential_id: str | None = None,
 ) -> tuple[bool, dict[str, Any] | str]:
     """Generate and apply remediation edits in the codebase volume."""
     contexts = _collect_context_files(scan_data)
@@ -1231,14 +1232,16 @@ def run_claude_remediation(
     def _run_chain(prompt: str) -> tuple[bool, str]:
         if user_id:
             try:
-                from ai_gateway import remediate_text
+                from ai_gateway import bound_organization, remediate_text
                 ok_gw, raw_gw = remediate_text(
                     user_id=str(user_id),
+                    organization_id=bound_organization() or None,
                     model=llm_model or "best_coding",
                     prompt=prompt,
                     access_mode=access_mode or "auto",
                     api_key=llm_api_key,
                     provider=llm_provider,
+                    credential_id=llm_credential_id,
                     max_tokens=MAX_COMPLETION_TOKENS,
                 )
                 if ok_gw:

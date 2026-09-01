@@ -142,6 +142,21 @@ class OperationSecurityTests(unittest.TestCase):
                 "digest": DIGEST_B,
             })
 
+    def test_read_bootstrap_status_is_allowlisted_and_read_only(self) -> None:
+        commands = render_operation(
+            "read_bootstrap_status",
+            {"status_path": "/var/log/deplai-bootstrap-status.json"},
+        )
+        self.assertEqual(len(commands), 1)
+        self.assertIn("cat -- /var/log/deplai-bootstrap-status.json", commands[0])
+        with self.assertRaises(DeployError):
+            render_operation("read_bootstrap_status", {"status_path": "/etc/passwd; rm -rf /"})
+        with self.assertRaises(DeployError):
+            render_operation(
+                "read_bootstrap_status",
+                {"status_path": "/var/log/deplai-bootstrap-status.json;id"},
+            )
+
 
 class RedactionLockRetryTests(unittest.TestCase):
     def setUp(self) -> None:

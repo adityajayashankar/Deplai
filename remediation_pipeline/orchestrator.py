@@ -26,7 +26,13 @@ from remediation_pipeline.models import (
     RemediationPRResponse,
     Vulnerability,
 )
+from remediation_pipeline.noise_triage import (
+    apply_heuristic_noise_triage,
+    filter_by_remediation_scope,
+    triage_vulnerabilities,
+)
 from remediation_pipeline.router import LLMRouter
+from remediation_pipeline.supervisor_bridge import _supervisor_enabled, run_supervised_remediation
 from remediation_pipeline.validator import DiffValidator
 from utils import CODEBASE_VOLUME, get_docker_client, resolve_host_projects_dir
 
@@ -61,18 +67,42 @@ class RemediationOrchestrator:
         on_fix: Callable[[Fix], None] | None = None,
         on_progress: Callable[[str, str], object] | None = None,
         *,
-        remediation_scope: str = "all",
+        remediation_scope: str = "major",
         llm_provider: str | None = None,
         llm_api_key: str | None = None,
         llm_model: str | None = None,
         force_claude: bool = False,
         user_id: str | None = None,
+        organization_id: str | None = None,
         access_mode: str | None = None,
+        llm_credential_id: str | None = None,
     ) -> list[Fix]:
         from utils import clear_repo_file_cache
         clear_repo_file_cache()
 
         vulnerabilities = self.ingester.ingest(project_id)
+        triage = await triage_vulnerabilities(
+            vulnerabilities,
+            user_id=user_id,
+            organization_id=organization_id,
+            access_mode=access_mode,
+            llm_model=llm_model,
+            llm_credential_id=llm_credential_id,
+            remediation_scope=remediation_scope,
+            on_progress=on_progress,
+        )
+        vulnerabilities = triage.keep
+        if not vulnerabilities:
+            if on_progress is not None:
+                await self._emit_progress(
+                    on_progress,
+                    "success",
+                    (
+                        "Noise triage filtered all findings as non-actionable. "
+                        "No remediation credits were spent on fix generation."
+                    ),
+                )
+            return []
         groups = self.grouper.group(vulnerabilities)
         snapshot = self._build_snapshot(vulnerabilities, groups, remediation_scope=remediation_scope)
         selected_groups = self._select_groups_for_run(groups, snapshot)
@@ -82,6 +112,7 @@ class RemediationOrchestrator:
 
         loop = asyncio.get_running_loop()
         fixes: list[Fix] = []
+        supervised_paths: set[str] = set()
 
         if on_progress is not None and snapshot["strategy_mode"] in {"critical_only", "high_only"}:
             reason = "Large repository strategy enabled" if snapshot["strategy_reason"] == "large_repo" else "Major-only scope enabled"
@@ -111,9 +142,73 @@ class RemediationOrchestrator:
                 "Claude SDK forced for staged large-repository remediation.",
             )
 
+        if _supervisor_enabled():
+            if on_progress is not None:
+                await self._emit_progress(
+                    on_progress,
+                    "phase",
+                    "Multi-agent remediation: Master -> Planner -> Implementor -> Reviewer",
+                )
+            try:
+                supervised_fixes = await run_supervised_remediation(
+                    project_id,
+                    remediation_scope,
+                    on_progress=on_progress,
+                    llm_provider=llm_provider,
+                    llm_api_key=llm_api_key,
+                    llm_model=llm_model,
+                    user_id=user_id,
+                    organization_id=organization_id,
+                    access_mode=access_mode,
+                    llm_credential_id=llm_credential_id,
+                )
+            except Exception as exc:
+                supervised_fixes = []
+                if on_progress is not None:
+                    await self._emit_progress(
+                        on_progress,
+                        "warning",
+                        f"Supervisor remediation unavailable ({type(exc).__name__}: {exc}); continuing with targeted fixes.",
+                    )
+            for fix in supervised_fixes:
+                validated = await loop.run_in_executor(self._validator_pool, self.validator.validate, project_id, fix)
+                if validated is None:
+                    if on_progress is not None:
+                        await self._emit_progress(
+                            on_progress,
+                            "warning",
+                            f"{fix.filepath}: supervisor diff could not be applied cleanly and was dropped.",
+                        )
+                    continue
+                fixes.append(validated)
+                supervised_paths.add(validated.filepath)
+                if on_fix is not None:
+                    on_fix(validated)
+
         batch_size = max(1, int(os.getenv("REMEDIATION_PIPELINE_GROUPS_PER_BATCH", "8")))
         ordered_groups = self._ordered_groups_for_run(selected_groups)
+        if supervised_paths:
+            ordered_groups = [group for group in ordered_groups if group.filepath not in supervised_paths]
         total_batches = max(1, (len(ordered_groups) + batch_size - 1) // batch_size) if ordered_groups else 1
+
+        if not ordered_groups:
+            return fixes
+
+        if on_progress is not None and supervised_paths:
+            await self._emit_progress(
+                on_progress,
+                "info",
+                (
+                    f"Supervisor handled {len(supervised_paths)} file(s); "
+                    f"continuing single-pass remediation for {len(ordered_groups)} remaining group(s)."
+                ),
+            )
+        elif on_progress is not None and not fixes and _supervisor_enabled():
+            await self._emit_progress(
+                on_progress,
+                "info",
+                "Supervisor produced no patches — falling back to targeted single-pass remediation.",
+            )
 
         for batch_index in range(0, len(ordered_groups), batch_size):
             group_batch = ordered_groups[batch_index:batch_index + batch_size]
@@ -170,7 +265,9 @@ class RemediationOrchestrator:
                             on_progress,
                             loop,
                             user_id,
+                            organization_id,
                             access_mode,
+                            llm_credential_id,
                         )
                     )
 
@@ -196,7 +293,9 @@ class RemediationOrchestrator:
         on_progress: Callable | None,
         loop: asyncio.AbstractEventLoop,
         user_id: str | None = None,
+        organization_id: str | None = None,
         access_mode: str | None = None,
+        llm_credential_id: str | None = None,
     ) -> Fix | None:
         try:
             fix = await loop.run_in_executor(
@@ -210,7 +309,9 @@ class RemediationOrchestrator:
                     llm_model=llm_model,
                     force_claude=force_claude,
                     user_id=user_id,
+                    organization_id=organization_id,
                     access_mode=access_mode,
+                    llm_credential_id=llm_credential_id,
                 ),
             )
         except Exception as exc:
@@ -247,13 +348,28 @@ class RemediationOrchestrator:
     def status(self) -> ProviderStatusResponse:
         return self.router.status()
 
-    def refresh(self, project_id: str, remediation_scope: str = "all") -> dict[str, int | str]:
+    def refresh(
+        self,
+        project_id: str,
+        remediation_scope: str = "major",
+        *,
+        user_id: str | None = None,
+        access_mode: str | None = None,
+        llm_model: str | None = None,
+        llm_credential_id: str | None = None,
+    ) -> dict[str, int | str]:
         from utils import clear_repo_file_cache
         clear_repo_file_cache()
 
         print(f"[DEBUG] refresh: starting ingester for {project_id}", flush=True)
-        vulnerabilities = self.ingester.ingest(project_id)
-        print(f"[DEBUG] refresh: ingester done. {len(vulnerabilities)} vulnerabilities found. starting grouper", flush=True)
+        raw_vulnerabilities = self.ingester.ingest(project_id)
+        triage = apply_heuristic_noise_triage(raw_vulnerabilities)
+        vulnerabilities, scope_dropped = filter_by_remediation_scope(triage.keep, remediation_scope)
+        print(
+            f"[DEBUG] refresh: {len(raw_vulnerabilities)} raw, {triage.heuristic_ignored} noise, "
+            f"{scope_dropped} below major scope, {len(vulnerabilities)} actionable",
+            flush=True,
+        )
         groups = self.grouper.group(vulnerabilities)
         print(f"[DEBUG] refresh: grouper done. building snapshot", flush=True)
         snapshot = self._build_snapshot(vulnerabilities, groups, remediation_scope=remediation_scope)
@@ -262,6 +378,9 @@ class RemediationOrchestrator:
         self._apply_selection_stats(snapshot, selected_groups)
         return {
             "vulnerabilities": len(vulnerabilities),
+            "raw_vulnerabilities": len(raw_vulnerabilities),
+            "noise_filtered": triage.heuristic_ignored,
+            "scope_filtered": scope_dropped,
             "groups": len(groups),
             "critical": snapshot["severity_counts"]["critical"],
             "high": snapshot["severity_counts"]["high"],
@@ -293,7 +412,7 @@ class RemediationOrchestrator:
         vulnerabilities: list[Vulnerability],
         groups: list,
         *,
-        remediation_scope: str = "all",
+        remediation_scope: str = "major",
     ) -> dict[str, object]:
         threshold = max(1, int(os.getenv("REMEDIATION_LARGE_FINDING_THRESHOLD", "1000")))
         normalized_scope = "major" if str(remediation_scope or "").strip().lower() == "major" else "all"
@@ -315,16 +434,22 @@ class RemediationOrchestrator:
             stop_after_major = True
             strategy_reason = "large_repo" if threshold_exceeded else "scope_major"
             force_claude = threshold_exceeded
-            critical_groups = [group for group in groups if group.max_severity == "critical"]
-            high_groups = [group for group in groups if group.max_severity == "high"]
-            if critical_groups:
+            major_groups = [
+                group for group in groups
+                if group.max_severity in {"critical", "high"}
+            ]
+            if strategy_reason == "scope_major":
+                strategy_mode = "major"
+                selected_severity = "critical,high"
+                selected_subset = major_groups
+            elif major_groups and any(group.max_severity == "critical" for group in major_groups):
                 strategy_mode = "critical_only"
                 selected_severity = "critical"
-                selected_subset = critical_groups
-            elif high_groups:
+                selected_subset = [group for group in major_groups if group.max_severity == "critical"]
+            elif major_groups:
                 strategy_mode = "high_only"
                 selected_severity = "high"
-                selected_subset = high_groups
+                selected_subset = [group for group in major_groups if group.max_severity == "high"]
             else:
                 strategy_mode = "major_complete"
                 selected_subset = []
@@ -351,7 +476,9 @@ class RemediationOrchestrator:
         return list(deduped.values())
 
     def _select_groups_for_run(self, groups: list, snapshot: dict[str, object]) -> list:
-        if snapshot.get("strategy_mode") == "critical_only":
+        if snapshot.get("strategy_mode") == "major":
+            selected = [group for group in groups if group.max_severity in {"critical", "high"}]
+        elif snapshot.get("strategy_mode") == "critical_only":
             selected = [group for group in groups if group.max_severity == "critical"]
         elif snapshot.get("strategy_mode") == "high_only":
             selected = [group for group in groups if group.max_severity == "high"]

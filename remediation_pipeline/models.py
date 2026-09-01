@@ -26,6 +26,10 @@ class Vulnerability(BaseModel):
     installed_version: Optional[str] = None
     fix_version: Optional[str] = None
     type: VulnType
+    triage_action: Optional[Literal["remediate", "ignore"]] = None
+    triage_reason: Optional[str] = None
+    triage_confidence: Optional[float] = None
+    triage_source: Optional[Literal["heuristic", "llm"]] = None
 
 
 class FileGroup(BaseModel):

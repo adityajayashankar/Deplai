@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from deployment_planning_contract import (
+    ArchitectureEvidence,
     BuildInfo,
     ConflictItem,
     DataStoreFinding,
@@ -23,6 +24,9 @@ from deployment_planning_contract import (
     ProcessFinding,
     RepositoryContextDocument,
     RepositoryFinding,
+    WorkloadDependency,
+    WorkloadProfile,
+    WorkloadService,
 )
 from planning_runtime import analyzer_context_md_path, analyzer_context_path, runtime_paths_for_workspace, write_json
 from repository_sources import resolve_repository_source
@@ -595,6 +599,207 @@ def _data_store_scanner(root: Path, files: list[Path], dependency_names: set[str
     return {"data_stores": data_stores, "low_confidence_items": low_confidence_items}
 
 
+def _workload_scanner(root: Path, files: list[Path], dependency_names: set[str], env_names: set[str]) -> WorkloadProfile:
+    """Detect deployment-relevant behavior using deterministic, non-secret signals."""
+
+    dependencies = {name.lower() for name in dependency_names}
+    source_files = [
+        path for path in files
+        if path.suffix.lower() in {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rb", ".java", ".cs", ".yml", ".yaml"}
+        and path.stat().st_size <= MAX_TEXT_BYTES
+    ][:1500]
+    texts: list[tuple[str, str]] = [(_relative(path, root), _read_text(path)) for path in source_files]
+    combined = "\n".join(raw for _, raw in texts)
+    lowered = combined.lower()
+
+    def dep_evidence(names: set[str]) -> list[ArchitectureEvidence]:
+        return [
+            ArchitectureEvidence(source="repository", signal=f"dependency:{name}", value=name, confidence=0.96)
+            for name in sorted(dependencies & names)
+        ]
+
+    def content_evidence(pattern: str, label: str, confidence: float = 0.86) -> list[ArchitectureEvidence]:
+        regex = re.compile(pattern, re.I | re.M)
+        for rel, raw in texts:
+            match = regex.search(raw)
+            if match:
+                return [ArchitectureEvidence(source="repository", signal=f"source:{rel}", value=label, confidence=confidence)]
+        return []
+
+    def workload_dependency(kind: str, provider: str, usage: str, evidence: list[ArchitectureEvidence]) -> WorkloadDependency:
+        return WorkloadDependency(type=kind, provider=provider, usage=usage, confidence=max((item.confidence for item in evidence), default=0.7), evidence=evidence)
+
+    services: list[WorkloadService] = []
+    workers: list[WorkloadService] = []
+    scheduled: list[WorkloadService] = []
+    queues: list[WorkloadDependency] = []
+    object_storage: list[WorkloadDependency] = []
+    persistent_storage: list[WorkloadDependency] = []
+    search: list[WorkloadDependency] = []
+    authentication: list[WorkloadDependency] = []
+    third_party: list[WorkloadDependency] = []
+    webhooks: list[WorkloadDependency] = []
+
+    worker_packages = {"bull", "bullmq", "@nestjs/bull", "@nestjs/bullmq", "celery", "rq", "sidekiq", "hangfire"}
+    worker_evidence = dep_evidence(worker_packages)
+    worker_evidence += content_evidence(r"(?:scripts?\s*[\"']?worker|\bqueue\.process\s*\(|\bcelery\s+-a\b|\bwhile\s+true\s*:)", "worker process")
+    for package_json in [path for path in files if path.name.lower() == "package.json"]:
+        payload = _parse_package_json(package_json)
+        for name, command in (payload.get("scripts") or {}).items():
+            if "worker" in str(name).lower() or "worker" in str(command).lower():
+                worker_evidence.append(ArchitectureEvidence(source="repository", signal=f"script:{_relative(package_json, root)}#{name}", value=str(command), confidence=0.92))
+    if worker_evidence:
+        framework = next((name for name in sorted(worker_packages) if name in dependencies), None)
+        worker = WorkloadService(id="worker", process_type="worker", framework=framework, visibility="none", confidence=max(item.confidence for item in worker_evidence), evidence=worker_evidence[:8])
+        workers.append(worker)
+        services.append(worker)
+
+    scheduler_packages = {"node-cron", "apscheduler", "celery", "quartz", "quartz-scheduler"}
+    scheduler_evidence = dep_evidence(scheduler_packages)
+    scheduler_evidence += content_evidence(r"(?:schedule\s*:\s*[{\[]|cron\.schedule\s*\(|@scheduled\b|celery\s+beat|apscheduler)", "scheduled job")
+    for rel, raw in texts:
+        if rel.startswith(".github/workflows/") and re.search(r"\bschedule\s*:\s*|\bcron\s*:", raw, re.I):
+            scheduler_evidence.append(ArchitectureEvidence(source="repository", signal=f"workflow:{rel}", value="scheduled workflow", confidence=0.98))
+    if scheduler_evidence:
+        job = WorkloadService(id="scheduler", process_type="scheduler", framework=next((name for name in sorted(scheduler_packages) if name in dependencies), None), visibility="none", confidence=max(item.confidence for item in scheduler_evidence), evidence=scheduler_evidence[:8])
+        scheduled.append(job)
+        services.append(job)
+
+    realtime_evidence = dep_evidence({"socket.io", "ws", "graphql-ws", "subscriptions-transport-ws"})
+    realtime_evidence += content_evidence(r"(?:new\s+websocket\s*\(|eventsource\s*\(|text/event-stream|graphql.{0,40}subscription)", "real-time connection")
+    protocols = ["http"]
+    if realtime_evidence:
+        protocols.append("websocket")
+
+    queue_definitions = [
+        ("sqs", "aws", {"@aws-sdk/client-sqs", "aws-sdk", "boto3"}, r"\b(?:sqsclient|sendmessagecommand|receive_message)\b"),
+        ("rabbitmq", "rabbitmq", {"amqplib", "pika", "amqp-connection-manager"}, r"\b(?:amqp|rabbitmq)://"),
+        ("kafka", "kafka", {"kafkajs", "confluent-kafka", "kafka-python", "node-rdkafka"}, r"\b(?:kafkajs|kafkaconsumer|kafkaproducer)\b"),
+        ("redis_queue", "redis", worker_packages & {"bull", "bullmq", "@nestjs/bull", "@nestjs/bullmq", "celery", "rq"}, r"\b(?:bullmq|queue\.process)\b"),
+    ]
+    for kind, provider, packages, pattern in queue_definitions:
+        evidence = dep_evidence(packages) + content_evidence(pattern, kind)
+        if evidence:
+            queues.append(workload_dependency("queue", provider, kind, evidence[:8]))
+
+    storage_definitions = [
+        ("s3", "aws", {"@aws-sdk/client-s3", "aws-sdk", "boto3"}, r"\b(?:s3client|putobjectcommand|upload_file)\b"),
+        ("gcs", "gcp", {"@google-cloud/storage", "google-cloud-storage"}, r"\bgoogle\.cloud\.storage\b"),
+        ("azure_blob", "azure", {"@azure/storage-blob", "azure-storage-blob"}, r"\bblobserviceclient\b"),
+        ("minio", "external", {"minio"}, r"\bminio(?:client)?\b"),
+        ("cloudinary", "external", {"cloudinary"}, r"\bcloudinary\b"),
+    ]
+    for usage, provider, packages, pattern in storage_definitions:
+        evidence = dep_evidence(packages) + content_evidence(pattern, usage)
+        if evidence:
+            object_storage.append(workload_dependency("object_storage", provider, usage, evidence[:8]))
+
+    upload_evidence = dep_evidence({"multer", "formidable", "busboy", "django-storages"})
+    upload_evidence += content_evidence(r"(?:fs\.(?:writefile|createwritestream)\s*\(|upload_folder|/uploads?[/\"']|/media[/\"'])", "local file writes")
+    if upload_evidence:
+        persistent_storage.append(workload_dependency("persistent_storage", "local_filesystem", "user_uploads", upload_evidence[:8]))
+
+    search_definitions = [
+        ("elasticsearch", {"@elastic/elasticsearch", "elasticsearch"}),
+        ("opensearch", {"@opensearch-project/opensearch", "opensearch-py"}),
+        ("meilisearch", {"meilisearch"}),
+        ("algolia", {"algoliasearch"}),
+        ("typesense", {"typesense"}),
+    ]
+    for provider, packages in search_definitions:
+        evidence = dep_evidence(packages)
+        if evidence:
+            search.append(workload_dependency("search", provider, "application_search", evidence))
+
+    auth_definitions = [
+        ("authjs", {"next-auth", "@auth/core"}), ("passport", {"passport"}),
+        ("cognito", {"amazon-cognito-identity-js", "@aws-sdk/client-cognito-identity-provider"}),
+        ("auth0", {"@auth0/nextjs-auth0", "auth0"}), ("clerk", {"@clerk/nextjs", "@clerk/backend"}),
+        ("firebase", {"firebase", "firebase-admin"}), ("jwt", {"jsonwebtoken", "pyjwt"}),
+    ]
+    for provider, packages in auth_definitions:
+        evidence = dep_evidence(packages)
+        if evidence:
+            authentication.append(workload_dependency("authentication", provider, "identity", evidence))
+
+    third_party_definitions = {
+        "stripe": {"stripe"}, "razorpay": {"razorpay"}, "sendgrid": {"@sendgrid/mail", "sendgrid"},
+        "twilio": {"twilio"}, "sentry": {"@sentry/nextjs", "@sentry/node", "sentry-sdk"},
+        "openai": {"openai"}, "anthropic": {"anthropic", "@anthropic-ai/sdk"},
+        "google_gemini": {"@google/generative-ai", "google-generativeai"}, "slack": {"@slack/web-api", "slack-sdk"},
+    }
+    upper_env = {name.upper() for name in env_names}
+    for provider, packages in third_party_definitions.items():
+        evidence = dep_evidence(packages)
+        related_env = sorted(name for name in upper_env if provider.split("_")[0].upper() in name and any(token in name for token in ("KEY", "TOKEN", "SECRET", "URL")))
+        if evidence or related_env:
+            item = workload_dependency("third_party", provider, "integration", evidence or [ArchitectureEvidence(source="repository", signal="environment_template", value=provider, confidence=0.78)])
+            item.required_environment_variables = related_env
+            third_party.append(item)
+
+    webhook_evidence = content_evidence(r"(?:/api/)?webhooks?/|stripe\.webhooks|x-hub-signature", "public webhook endpoint", 0.88)
+    if webhook_evidence:
+        webhooks.append(workload_dependency("webhook", "application", "public_ingress", webhook_evidence))
+
+    migration_map = [
+        ("prisma", {"prisma"}, "npx prisma migrate deploy"), ("alembic", {"alembic"}, "alembic upgrade head"),
+        ("django", {"django"}, "python manage.py migrate"), ("knex", {"knex"}, "npx knex migrate:latest"),
+        ("typeorm", {"typeorm"}, "npx typeorm migration:run"), ("sequelize", {"sequelize", "sequelize-cli"}, "npx sequelize-cli db:migrate"),
+        ("drizzle", {"drizzle-kit", "drizzle-orm"}, "npx drizzle-kit migrate"),
+    ]
+    migration: dict[str, Any] = {}
+    for framework, packages, command in migration_map:
+        evidence = dep_evidence(packages)
+        if evidence:
+            migration = {"required": True, "framework": framework, "command": command, "confidence": 0.92, "evidence": [item.model_dump() for item in evidence]}
+            break
+
+    session_storage: dict[str, Any] = {}
+    redis_session_evidence = dep_evidence({"connect-redis", "django-redis", "redis-store"})
+    memory_session_evidence = dep_evidence({"express-session"}) + content_evidence(r"memorystore|in-memory session", "in-memory sessions", 0.72)
+    cookie_session_evidence = dep_evidence({"cookie-session", "iron-session"})
+    if redis_session_evidence:
+        session_storage = {"type": "shared_redis", "horizontally_safe": True, "evidence": [item.model_dump() for item in redis_session_evidence]}
+    elif cookie_session_evidence:
+        session_storage = {"type": "signed_cookie", "horizontally_safe": True, "evidence": [item.model_dump() for item in cookie_session_evidence]}
+    elif memory_session_evidence:
+        session_storage = {"type": "in_memory", "horizontally_safe": False, "evidence": [item.model_dump() for item in memory_session_evidence]}
+
+    cpu_packages = {"sharp", "opencv-python", "pandas", "numpy", "tensorflow", "torch", "puppeteer", "playwright", "ffmpeg-python", "pdfkit"}
+    gpu_evidence = content_evidence(r"torch\.cuda|tensorflow.{0,30}gpu|\bcuda\b", "GPU/CUDA usage", 0.95)
+    graceful_evidence = content_evidence(r"(?:sigterm|sigint|server\.close\s*\(|gracefulshutdown)", "graceful shutdown", 0.9)
+    runtime_characteristics = {
+        "realtime": bool(realtime_evidence),
+        "cpu_or_memory_intensive": bool(dependencies & cpu_packages),
+        "gpu_required": bool(gpu_evidence),
+        "graceful_shutdown": bool(graceful_evidence),
+        "writes_local_persistent_data": bool(persistent_storage),
+        "evidence": [item.model_dump() for item in (realtime_evidence + gpu_evidence + graceful_evidence)[:12]],
+    }
+
+    if not services:
+        services.append(WorkloadService(id="application", process_type="web", visibility="public", protocols=protocols, confidence=0.7))
+    else:
+        services.insert(0, WorkloadService(id="application", process_type="web", visibility="public", protocols=protocols, confidence=0.78, evidence=realtime_evidence[:4]))
+
+    return WorkloadProfile(
+        services=services,
+        workers=workers,
+        scheduled_jobs=scheduled,
+        queues=queues,
+        persistent_storage=persistent_storage,
+        object_storage=object_storage,
+        search=search,
+        authentication=authentication,
+        third_party_dependencies=third_party,
+        webhooks=webhooks,
+        protocols=protocols,
+        migration=migration,
+        session_storage=session_storage,
+        runtime_characteristics=runtime_characteristics,
+    )
+
+
 def _build_ci_scanner(root: Path, files: list[Path]) -> dict[str, Any]:
     build = BuildInfo()
     for path in files:
@@ -693,6 +898,20 @@ def _summarize_context(context: RepositoryContextDocument) -> str:
         parts.append("Frameworks: " + ", ".join(sorted({item.name for item in context.frameworks})))
     if context.data_stores:
         parts.append("Data stores: " + ", ".join(sorted({item.type for item in context.data_stores})))
+    workload = context.workload_profile
+    workload_bits: list[str] = []
+    if workload.workers:
+        workload_bits.append(f"workers:{len(workload.workers)}")
+    if workload.scheduled_jobs:
+        workload_bits.append(f"schedulers:{len(workload.scheduled_jobs)}")
+    if workload.queues:
+        workload_bits.append("queues:" + ",".join(sorted({item.provider or item.usage or item.type for item in workload.queues})))
+    if workload.persistent_storage:
+        workload_bits.append("persistent-uploads")
+    if "websocket" in workload.protocols:
+        workload_bits.append("realtime")
+    if workload_bits:
+        parts.append("Workload: " + ", ".join(workload_bits))
     hints = context.infrastructure_hints
     infra_bits: list[str] = []
     if hints.has_dockerfile or context.build.has_dockerfile:
@@ -732,6 +951,15 @@ def _context_markdown(context: RepositoryContextDocument) -> str:
     )
     flags = [f"- {item.reason}" for item in context.low_confidence_items] + [f"- {item.reason}" for item in context.conflicts]
     flag_lines = "\n".join(flags) or "- No major flags"
+    workload = context.workload_profile
+    workload_lines = "\n".join(
+        f"- **{item.id}** — {item.process_type} ({round(item.confidence * 100)}%)"
+        for item in workload.services
+    ) or "- No deployable services detected"
+    dependency_lines = "\n".join(
+        f"- **{item.type}** — {item.provider or item.usage or 'detected'}"
+        for item in workload.queues + workload.persistent_storage + workload.object_storage + workload.search + workload.third_party_dependencies
+    ) or "- No additional workload dependencies detected"
     return f"""# Repository Analysis — {context.project_name}
 
 ## Detected Stack
@@ -753,6 +981,12 @@ def _context_markdown(context: RepositoryContextDocument) -> str:
 
 ## Processes
 {process_lines}
+
+## Workload Profile
+{workload_lines}
+
+## Workload Dependencies
+{dependency_lines}
 
 ## Required Secrets
 {', '.join(context.environment_variables.required_secrets) or 'None detected'}
@@ -793,6 +1027,13 @@ def run_repository_analysis(*, project_id: str, project_name: str, project_type:
         ).result()
         ci_result = executor.submit(_build_ci_scanner, source_root, files).result()
         health_result = executor.submit(_health_scanner, source_root, files, dependency_names).result()
+        workload_result = executor.submit(
+            _workload_scanner,
+            source_root,
+            files,
+            dependency_names,
+            set(env_result.get("env_names") or []),
+        ).result()
         frontend_result = executor.submit(_frontend_scanner, source_root, files, framework_names).result()
         docs_result = executor.submit(_docs_scanner, source_root, files).result()
 
@@ -826,7 +1067,11 @@ def run_repository_analysis(*, project_id: str, project_name: str, project_type:
         low_confidence_items=low_confidence_items,
         readme_notes=docs_result.get("readme_notes"),
         summary="",
+        workload_profile=workload_result,
     )
+    if context.health.endpoint:
+        context.workload_profile.health_checks["liveness"] = context.health.endpoint
+        context.workload_profile.health_checks["readiness"] = context.health.endpoint
     context.summary = _summarize_context(context)
     context_md = _context_markdown(context)
 

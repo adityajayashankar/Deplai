@@ -1091,13 +1091,16 @@ echo "PUSHED"
 
                     success, remediation_result = await run_remediation_supervisor(
                         scan_data=batch_scan_data,
+                        project_id=self.context.project_id,
                         llm_provider=effective_llm_provider,
                         llm_api_key=effective_llm_api_key,
                         llm_model=effective_llm_model,
                         budget_tracker=budget_tracker,
                         on_message=_on_supervisor_message,
                         user_id=getattr(self.context, "user_id", None),
+                        organization_id=getattr(self.context, "organization_id", None),
                         access_mode=getattr(self.context, "llm_access_mode", None),
+                        llm_credential_id=getattr(self.context, "llm_credential_id", None),
                     )
                 except Exception as _sup_exc:
                     success = False
@@ -1126,6 +1129,7 @@ echo "PUSHED"
                                 budget_tracker=budget_tracker,
                                 user_id=getattr(self.context, "user_id", None),
                                 access_mode=getattr(self.context, "llm_access_mode", None),
+                                llm_credential_id=getattr(self.context, "llm_credential_id", None),
                             )
                         )
                             if fb_ok:

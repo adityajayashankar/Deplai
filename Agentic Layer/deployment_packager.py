@@ -314,24 +314,33 @@ def detect_database_requirements(root: Path) -> DatabaseRequirements:
                     all_deps.update(deps.keys())
             matched = all_deps & _DB_NPM_PACKAGES
             if matched:
-                enabled = True
-                if not engine:
-                    # Infer engine from matched package names
-                    if "prisma" in matched or "@prisma/client" in matched:
-                        engine = "postgres"  # Prisma defaults to postgres
-                    elif "mysql" in matched or "mysql2" in matched:
-                        engine = "mysql"
-                    elif "mariadb" in matched:
-                        engine = "mariadb"
-                    elif "pg" in matched or "pg-native" in matched:
-                        engine = "postgres"
-                    else:
-                        engine = "postgres"
-                sources.append(
-                    f"package.json deps: {', '.join(sorted(matched))} "
-                    f"({pkg_path.relative_to(root).as_posix()})"
-                )
-                break
+                prisma_only = matched.issubset({"prisma", "@prisma/client"})
+                if prisma_only:
+                    # Prisma is an ORM — only require RDS when a concrete DB client is present.
+                    has_prisma = True
+                    if "pg" in matched or "pg-native" in matched or "@prisma/adapter-pg" in matched:
+                        enabled = True
+                        engine = engine or "postgres"
+                else:
+                    enabled = True
+                    if not engine:
+                        if "mysql" in matched or "mysql2" in matched:
+                            engine = "mysql"
+                        elif "mariadb" in matched:
+                            engine = "mariadb"
+                        elif "pg" in matched or "pg-native" in matched or "@prisma/adapter-pg" in matched:
+                            engine = "postgres"
+                        elif "prisma" in matched or "@prisma/client" in matched:
+                            engine = "postgres"
+                        else:
+                            engine = "postgres"
+                if enabled or prisma_only:
+                    sources.append(
+                        f"package.json deps: {', '.join(sorted(matched))} "
+                        f"({pkg_path.relative_to(root).as_posix()})"
+                    )
+                if enabled:
+                    break
 
     # ── 4. .env / .env.example containing DATABASE_URL ──────────────────────
     if not enabled:

@@ -62,6 +62,10 @@ from terraform_apply import (
     _ec2_addresses_from_state_list,
     _ensure_ecr_pull_policy,
     _ensure_unique_ec2_key_pair,
+    _extract_importable_aws_collisions,
+    _aws_tags_mark_terraform_owned,
+    _is_orphan_alb_collision,
+    _is_orphan_key_pair_collision,
     _is_missing_default_vpc_error,
     _is_transient_aws_api_error,
     _legacy_runtime_bundle_needs_remediation,
@@ -84,6 +88,60 @@ from terraform_apply import (
 
 
 class TerraformApplyKeyPairDiscoveryTests(unittest.TestCase):
+    def test_extracts_ecr_and_log_group_collisions_without_misclassifying_key_or_alb(self) -> None:
+        error = """Error: creating ECR Repository (ifca): operation error ECR: CreateRepository, RepositoryAlreadyExistsException: repository exists
+
+  with module.compute.aws_ecr_repository.app,
+  on modules/compute/main.tf line 7, in resource "aws_ecr_repository" "app":
+
+Error: creating CloudWatch Logs Log Group (/deplai/ifca): ResourceAlreadyExistsException: log group exists
+
+  with module.compute.aws_cloudwatch_log_group.ecs,
+  on modules/compute/main.tf line 13, in resource "aws_cloudwatch_log_group" "ecs":
+"""
+        collisions = _extract_importable_aws_collisions(error)
+        self.assertEqual(
+            [(item["kind"], item["address"], item["import_id"]) for item in collisions],
+            [
+                ("ecr_repository", "module.compute.aws_ecr_repository.app", "ifca"),
+                ("cloudwatch_log_group", "module.compute.aws_cloudwatch_log_group.ecs", "/deplai/ifca"),
+            ],
+        )
+        self.assertFalse(_is_orphan_key_pair_collision(error))
+        self.assertFalse(_is_orphan_alb_collision(error))
+
+    def test_extracts_rds_collision_for_state_recovery(self) -> None:
+        error = """Error: creating RDS DB Instance (ifca-postgres): DBInstanceAlreadyExists: DB instance already exists
+
+  with module.data.aws_db_instance.main[0],
+  on modules/data/main.tf line 42, in resource "aws_db_instance" "main":
+"""
+        self.assertEqual(
+            _extract_importable_aws_collisions(error),
+            [{"kind": "rds_instance", "address": "module.data.aws_db_instance.main[0]", "import_id": "ifca-postgres"}],
+        )
+
+    def test_import_ownership_requires_terraform_or_deplai_tags(self) -> None:
+        class EcrClient:
+            def describe_repositories(self, **_kwargs):
+                return {"repositories": [{"repositoryArn": "arn:ecr:ifca"}]}
+
+            def list_tags_for_resource(self, **_kwargs):
+                return {"tags": [{"Key": "ManagedBy", "Value": "deplai"}]}
+
+        class Session:
+            def client(self, service, **_kwargs):
+                self.assert_service = service
+                return EcrClient()
+
+        owned, tags = _aws_tags_mark_terraform_owned(
+            {"kind": "ecr_repository", "import_id": "ifca", "address": "module.compute.aws_ecr_repository.app"},
+            session=Session(),
+            aws_region="eu-north-1",
+        )
+        self.assertTrue(owned)
+        self.assertEqual(tags["managedby"], "deplai")
+
     def test_summarizes_ec2_create_and_replace_plan_changes(self) -> None:
         summary = _summarize_ec2_plan_changes(
             {
@@ -547,6 +605,22 @@ module "ec2" {
 
 
 class KeyPairReuseRemediationTests(unittest.TestCase):
+    def test_repairs_key_pair_variable_with_two_single_line_arguments(self) -> None:
+        files = [
+            {
+                "path": "terraform/modules/compute/variables.tf",
+                "content": 'variable "existing_ec2_key_pair_name" { type = string default = "" }\n',
+            }
+        ]
+        self.assertTrue(_legacy_runtime_bundle_needs_remediation(files))
+        patched, remediation = _remediate_legacy_runtime_bundle(files, {})
+        content = str(patched[0]["content"])
+        self.assertTrue(remediation.get("legacy_single_line_variable_blocks_rewritten"))
+        self.assertIn('variable "existing_ec2_key_pair_name" {\n', content)
+        self.assertIn("  type    = string\n", content)
+        self.assertIn('  default = ""\n', content)
+        self.assertNotIn('{ type = string default = "" }', content)
+
     def test_key_reuse_remediation_does_not_gate_ec2_module_count(self) -> None:
         # Bundle already has key-pair reuse locals/count; second pass must not
         # rewrite module.ec2 count to !local.use_existing_key.
@@ -698,6 +772,18 @@ resource "aws_key_pair" "generated" {
         })
         self.assertIn("PGPASSWORD=p@ss:word", env)
         self.assertIn("DATABASE_URL=postgresql://app:p%40ss%3Aword@db.internal:5432/appdb", env)
+
+    def test_database_env_from_secret_uses_rds_endpoint_fallback(self) -> None:
+        env = _database_env_from_secret(
+            {
+                "username": "app",
+                "password": "p@ss:word",
+                "port": 5432,
+                "dbname": "appdb",
+            },
+            rds_endpoint="postgres.rds.amazonaws.com",
+        )
+        self.assertIn("DATABASE_URL=postgresql://app:p%40ss%3Aword@postgres.rds.amazonaws.com:5432/appdb", env)
 
     def test_collect_one_time_credentials_names_pem_with_instance_id(self) -> None:
         creds = _collect_one_time_credentials(

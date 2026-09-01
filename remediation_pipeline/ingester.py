@@ -31,8 +31,14 @@ _DIRECTLY_EDITABLE_MANIFESTS = {
 }
 
 
+_NOISE_PATH_MARKERS = ("/node_modules/", "/vendor/", "/.next/", "/dist/", "/build/", "/coverage/")
+
+
 class VulnIngester:
     """Read scanner artifacts from Docker volumes and normalize into Vulnerability records."""
+
+    def __init__(self) -> None:
+        self._repo_file_cache: dict[tuple[str, str], str] = {}
 
     def ingest(self, project_id: str) -> list[Vulnerability]:
         vulns: list[Vulnerability] = []
@@ -96,23 +102,31 @@ class VulnIngester:
 
         matches = data.get("matches") if isinstance(data.get("matches"), list) else []
         out: list[Vulnerability] = []
+        seen_keys: set[str] = set()
         for idx, match in enumerate(matches):
             if not isinstance(match, dict):
                 continue
             vuln = match.get("vulnerability") if isinstance(match.get("vulnerability"), dict) else {}
             artifact = match.get("artifact") if isinstance(match.get("artifact"), dict) else {}
 
+            package_name = str(artifact.get("name") or "").strip()
+            if package_name.lower() in {"grype", "syft", "anchore", "bearer", "trivy", "semgrep"}:
+                continue
+
             severity = self._normalize_severity(str(vuln.get("severity") or "")) or "medium"
             cve = str(vuln.get("id") or "").strip() or f"SCA-{idx}"
-            package_name = str(artifact.get("name") or "").strip()
+            dedupe_key = f"{cve}:{package_name}"
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+
             installed_version = str(artifact.get("version") or "").strip() or None
             fix_versions = vuln.get("fix", {}).get("versions") if isinstance(vuln.get("fix"), dict) else []
             fix_version = str(fix_versions[0]).strip() if isinstance(fix_versions, list) and fix_versions else None
-            file_path, line_number = self._infer_manifest_location(project_id, match, package_name)
-            if not file_path:
-                file_path = self._fallback_manifest_for_package(artifact)
-            if not file_path:
-                file_path = "requirements.txt"
+
+            file_path, line_number = self._fast_manifest_location(project_id, match, package_name)
+            if self._is_noise_path(file_path):
+                continue
 
             description = str(vuln.get("description") or f"Dependency vulnerability in {package_name or 'package'}").strip()
             cwe = None
@@ -138,6 +152,37 @@ class VulnIngester:
             )
 
         return out
+
+    def _fast_manifest_location(self, project_id: str, match: dict[str, Any], package_name: str) -> tuple[str, int]:
+        """Resolve manifest path without per-finding Docker reads (ingest must stay fast)."""
+        artifact = match.get("artifact") if isinstance(match.get("artifact"), dict) else {}
+        locations = artifact.get("locations") if isinstance(artifact.get("locations"), list) else []
+
+        for location in locations:
+            if not isinstance(location, dict):
+                continue
+            path = self._normalize_file_path(str(location.get("path") or ""), project_id)
+            if not path or self._is_noise_path(path):
+                continue
+            basename = path.rsplit("/", 1)[-1]
+            if basename in _EDITABLE_MANIFEST_BY_LOCKFILE:
+                prefix = path.rsplit("/", 1)[0] if "/" in path else ""
+                for candidate_name in _EDITABLE_MANIFEST_BY_LOCKFILE[basename]:
+                    candidate = f"{prefix}/{candidate_name}" if prefix else candidate_name
+                    return candidate, 1
+            if basename in _DIRECTLY_EDITABLE_MANIFESTS or not basename.endswith((".lock", ".sum")):
+                line_number = self._safe_int(location.get("lineNumber"), 1)
+                return path, max(1, line_number)
+
+        fallback = self._fallback_manifest_for_package(artifact)
+        if fallback:
+            return fallback, 1
+        return "requirements.txt", 1
+
+    @staticmethod
+    def _is_noise_path(path: str) -> bool:
+        normalized = f"/{str(path or '').replace('\\', '/').lstrip('/')}"
+        return any(marker in normalized for marker in _NOISE_PATH_MARKERS)
 
     def _infer_manifest_location(self, project_id: str, match: dict[str, Any], package_name: str) -> tuple[str, int]:
         artifact = match.get("artifact") if isinstance(match.get("artifact"), dict) else {}
@@ -241,6 +286,9 @@ class VulnIngester:
         cleaned = rel_path.strip().replace("\\", "/")
         if not cleaned:
             return ""
+        cache_key = (project_id, cleaned)
+        if cache_key in self._repo_file_cache:
+            return self._repo_file_cache[cache_key]
         try:
             output = get_docker_client().containers.run(
                 "alpine",
@@ -248,9 +296,11 @@ class VulnIngester:
                 volumes={CODEBASE_VOLUME: {"bind": "/repo", "mode": "ro"}},
                 remove=True,
             )
-            return decode_output(output)
+            content = decode_output(output)
         except Exception:
-            return ""
+            content = ""
+        self._repo_file_cache[cache_key] = content
+        return content
 
     @staticmethod
     def _load_json(raw: str) -> Any:

@@ -5,10 +5,12 @@ import re
 from pathlib import Path
 from typing import Any
 
+from deployment_manifest import DATASTORE_PORTS
 from deployment_planning_contract import (
     ArchitectureAnswersDocument,
     ArchitectureQuestion,
     ArchitectureReviewPayload,
+    AwsDiscoveryContext,
     BuildPipelineProfile,
     ComplianceProfile,
     ComputeProfile,
@@ -35,6 +37,7 @@ from planning_runtime import (
 )
 from repository_analysis import run_repository_analysis
 from stage7_bridge import run_stage7_approval_payload
+from architecture_decision.planner import apply_aws_discovery, build_initial_decisions, critique, estimate_candidates, resolve_decisions
 
 
 def _load_or_build_context(*, project_id: str, project_name: str, project_type: str, workspace: str, user_id: str | None = None, repo_full_name: str | None = None) -> RepositoryContextDocument:
@@ -85,13 +88,15 @@ def _detected_redis_version(context: RepositoryContextDocument) -> str | None:
 def _default_answers(context: RepositoryContextDocument, environment_hint: str | None = None) -> dict[str, str]:
     has_sql = any(store.type in {"postgresql", "mysql", "mariadb"} for store in context.data_stores)
     redis_version = _detected_redis_version(context)
+    default_strategy = _default_compute_strategy(context)
     return {
         "q_environment": environment_hint or "production",
         "q_budget": "100",
-        "q_compute_strategy": _default_compute_strategy(context),
+        "q_compute_strategy": default_strategy,
         "q_traffic_scale": "10-100_rps",
         "q_worker_throughput": "10-100_jobs_per_minute",
         "q_root_volume": "35",
+        "q_load_balancer": "alb" if default_strategy == "ecs_fargate" else "elastic_ip",
         "q_elastic_ip": "true",
         "q_redis": "yes" if redis_version else "none",
         "q_redis_version": redis_version or "",
@@ -105,6 +110,11 @@ def _default_answers(context: RepositoryContextDocument, environment_hint: str |
         "q_log_retention": "30",
         "q_multi_region": "false",
         "q_service_selection": "all",
+        "q_availability": "same_day",
+        "q_data_loss": "15_minutes" if has_sql else "not_applicable",
+        "q_optimization": "balanced",
+        "q_planning_mode": "guided",
+        "q_upload_storage": "s3" if context.workload_profile.persistent_storage else "none",
     }
 
 
@@ -220,15 +230,16 @@ def _build_questions(context: RepositoryContextDocument, defaults: dict[str, str
         )
         questions.append(
             ArchitectureQuestion(
-                id="q_elastic_ip",
+                id="q_load_balancer",
                 category="networking",
-                question="Do you want a static Elastic IP so the public address does not change?",
-                default=defaults["q_elastic_ip"],
-                options=_question_options([
-                    ("true", "Yes, Elastic IP", "Keep a fixed public IP on the EC2 instance. No load balancer."),
-                    ("false", "No", "Use an Application Load Balancer instead if the app is public."),
-                ]),
-                affects=["networking.elastic_ip", "networking.load_balancer"],
+                question="How should public internet traffic reach your app?",
+                default=defaults["q_load_balancer"],
+                options=_question_options(
+                    _load_balancer_question_options(
+                        str(defaults.get("q_compute_strategy") or _default_compute_strategy(context)),
+                    ),
+                ),
+                affects=["networking.load_balancer", "networking.elastic_ip"],
             )
         )
 
@@ -325,6 +336,100 @@ def _build_questions(context: RepositoryContextDocument, defaults: dict[str, str
     return questions
 
 
+def _build_adaptive_questions(context: RepositoryContextDocument, defaults: dict[str, str]) -> list[ArchitectureQuestion]:
+    """Ask for business intent and only technical gaps that repository evidence cannot close."""
+
+    has_sql = any(store.type in {"postgresql", "mysql", "mariadb"} for store in context.data_stores)
+    questions = [
+        ArchitectureQuestion(
+            id="q_environment", category="business", priority=100, decision_id="environment",
+            question="Where is this application in its lifecycle?", default=defaults["q_environment"],
+            reason="Environment changes backup, availability, and security defaults.", recommended_answer=defaults["q_environment"],
+            options=_question_options([
+                ("production", "Live / production", "Protect customer traffic and data with production-safe defaults."),
+                ("staging", "Pre-production", "Stay close to production with lower baseline cost."),
+                ("dev", "Development", "Optimize for the lowest cost and fastest iteration."),
+            ]), affects=["environment", "reliability", "security", "data_layer"],
+        ),
+        ArchitectureQuestion(
+            id="q_budget", category="business", priority=98, decision_id="monthly_budget",
+            question="What monthly AWS budget should this plan stay within?", default=defaults["q_budget"],
+            reason="Deplai uses this as a hard architecture constraint, not just a cost report.", recommended_answer=defaults["q_budget"], cost_impact="Sets the monthly plan ceiling.",
+            options=_question_options([
+                ("25", "Up to $25", "Best for demos and low-traffic internal tools."),
+                ("50", "Up to $50", "Lean single-region deployment."),
+                ("100", "Up to $100", "Balanced small production baseline."),
+                ("250", "Up to $250", "Room for managed services and redundancy."),
+            ]), affects=["cost", "compute", "networking", "reliability"],
+        ),
+        ArchitectureQuestion(
+            id="q_traffic_scale", category="business", priority=92, decision_id="expected_usage",
+            question="What usage do you expect at launch?", default=defaults["q_traffic_scale"],
+            reason="Expected usage determines safe compute sizing and scaling headroom.", recommended_answer=defaults["q_traffic_scale"],
+            options=_question_options([
+                ("lt10_rps", "Early / internal", "A few concurrent users or irregular traffic."),
+                ("10-100_rps", "Small production", "Typical startup launch traffic."),
+                ("100-1000_rps", "Growing product", "Sustained traffic that benefits from autoscaling."),
+                ("gt1000_rps", "High traffic", "Requires deliberate performance and capacity planning."),
+            ]), affects=["compute.services", "autoscaling", "data_layer"],
+        ),
+        ArchitectureQuestion(
+            id="q_availability", category="reliability", priority=90, decision_id="availability_target",
+            question="If the service fails, how quickly should it recover?", default=defaults["q_availability"],
+            reason="This translates business downtime tolerance into redundancy and recovery choices.", recommended_answer=defaults["q_availability"], risk_impact="Lower recovery time increases redundancy and monthly cost.",
+            options=_question_options([
+                ("next_business_day", "By next business day", "Lowest cost; manual recovery is acceptable."),
+                ("same_day", "Within a few hours", "Balanced backups and operational recovery."),
+                ("under_one_hour", "Within an hour", "Requires stronger health checks and redundancy."),
+                ("near_immediate", "Near immediate", "High-availability services and multiple compute instances."),
+            ]), affects=["reliability", "compute.services", "data_layer.multi_az"],
+        ),
+        ArchitectureQuestion(
+            id="q_optimization", category="business", priority=88, decision_id="optimization_preference",
+            question="What should Deplai optimize for first?", default=defaults["q_optimization"],
+            reason="This breaks ties between equally valid architecture candidates.", recommended_answer="balanced",
+            options=_question_options([
+                ("lowest_cost", "Lowest cost", "Prefer simpler infrastructure and fewer managed services."),
+                ("balanced", "Balanced", "Balance cost, resilience, and operating effort."),
+                ("reliability", "Reliability", "Prefer redundancy and faster recovery."),
+                ("simplicity", "Operational simplicity", "Prefer managed services and fewer maintenance tasks."),
+                ("performance", "Performance", "Prefer latency and capacity headroom."),
+            ]), affects=["candidate_architecture", "compute", "networking", "data_layer"],
+        ),
+    ]
+    if has_sql:
+        questions.append(ArchitectureQuestion(
+            id="q_data_loss", category="reliability", priority=89, decision_id="data_loss_tolerance",
+            question="After a serious database failure, how much recent data could you afford to lose?",
+            default=defaults["q_data_loss"], reason="A database was detected; this sets backup frequency and point-in-time recovery policy.",
+            recommended_answer=defaults["q_data_loss"], risk_impact="Lower tolerance requires stronger backup and recovery controls.",
+            options=_question_options([
+                ("24_hours", "Up to one day", "Daily backups may be sufficient."),
+                ("1_hour", "Up to one hour", "Frequent backups and tested restores."),
+                ("15_minutes", "Up to 15 minutes", "Enable point-in-time recovery."),
+                ("near_zero", "Almost none", "Requires a higher-cost resilience design."),
+            ]), affects=["reliability.backups", "data_layer.backup_retention_days"],
+        ))
+    if context.workload_profile.persistent_storage:
+        questions.append(ArchitectureQuestion(
+            id="q_upload_storage", category="storage", priority=86, decision_id="durable_upload_storage",
+            question="The app writes persistent files locally. Use durable S3 storage before scaling?",
+            default=defaults["q_upload_storage"], reason="Local container or instance disks can lose customer uploads during replacement or scaling.",
+            recommended_answer="s3", risk_impact="Keeping local files limits safe scaling and increases data-loss risk.",
+            options=_question_options([
+                ("s3", "Use S3 (recommended)", "Durable object storage; may require a small application integration change."),
+                ("single_instance_ebs", "Keep one EBS-backed instance", "Avoids migration now, but prevents horizontal scaling."),
+            ]), affects=["storage", "compute.services", "deployment"],
+        ))
+    questions.append(ArchitectureQuestion(
+        id="q_domain", category="delivery", priority=40, decision_id="domain",
+        question="Optional: which domain should serve this application?", required=False, skip_allowed=True,
+        default=defaults["q_domain"], reason="A domain enables managed TLS and DNS planning; it can also be added later.",
+        affects=["dns_and_tls.domain"],
+    ))
+    return sorted(questions, key=lambda item: item.priority, reverse=True)
+
+
 def start_architecture_review(*, project_id: str, project_name: str, project_type: str, workspace: str, user_id: str | None = None, repo_full_name: str | None = None, environment: str | None = None) -> ArchitectureReviewPayload:
     context = _load_or_build_context(
         project_id=project_id,
@@ -335,13 +440,16 @@ def start_architecture_review(*, project_id: str, project_name: str, project_typ
         repo_full_name=repo_full_name,
     )
     defaults = _default_answers(context, environment)
-    questions = _build_questions(context, defaults)
+    questions = _build_adaptive_questions(context, defaults)
+    decisions = build_initial_decisions(context, defaults)
     return ArchitectureReviewPayload(
         context_json=context,
         questions=questions,
         defaults=defaults,
         conflicts=context.conflicts,
         low_confidence_items=context.low_confidence_items,
+        decisions=decisions,
+        planning_mode="guided",
     )
 
 
@@ -390,10 +498,46 @@ def _selected_redis_version(answers: dict[str, str], context: RepositoryContextD
     return None
 
 
+def _load_balancer_question_options(compute_strategy: str) -> list[tuple[str, str, str]]:
+    if compute_strategy == "ecs_fargate":
+        return [
+            ("alb", "Application Load Balancer", "Standard public entry for ECS. Distributes HTTP traffic to tasks."),
+            ("none", "No load balancer", "Keep the service internal or use a private entry only."),
+        ]
+    return [
+        ("elastic_ip", "Elastic IP on EC2", "One stable public IP on your server. Lowest cost for a single instance."),
+        ("alb", "Application Load Balancer", "Public HTTP entry that can scale across instances. Higher monthly cost."),
+    ]
+
+
+def _public_entry_mode(answers: dict[str, str], compute: ComputeProfile) -> str:
+    """Return alb | elastic_ip | none for how public traffic should enter the stack."""
+    public = str(answers.get("q_public_api") or "true").strip() == "true"
+    if not public or compute.strategy == "s3_cloudfront":
+        return "none"
+
+    explicit = str(answers.get("q_load_balancer") or "").strip().lower()
+    if explicit in {"alb", "elastic_ip", "none"}:
+        return explicit
+
+    # Legacy questionnaire: declining EIP implied ALB.
+    legacy_eip = str(answers.get("q_elastic_ip") or "").strip().lower()
+    if legacy_eip == "false":
+        return "alb"
+    if legacy_eip == "true":
+        return "elastic_ip" if compute.strategy == "ec2" else "alb"
+
+    if compute.strategy == "ecs_fargate":
+        return "alb"
+    return "elastic_ip"
+
+
 def _wants_elastic_ip(answers: dict[str, str], compute: ComputeProfile) -> bool:
-    if compute.strategy != "ec2":
-        return False
-    return str(answers.get("q_elastic_ip") or "true").strip() == "true"
+    return _public_entry_mode(answers, compute) == "elastic_ip"
+
+
+def _wants_load_balancer(answers: dict[str, str], compute: ComputeProfile) -> bool:
+    return _public_entry_mode(answers, compute) == "alb"
 
 
 def _redis_node_type(environment: str, traffic: str) -> str:
@@ -403,8 +547,14 @@ def _redis_node_type(environment: str, traffic: str) -> str:
     return "cache.t4g.micro"
 
 
+def _project_slug(value: str, *, fallback: str = "deplai-project") -> str:
+    slug = re.sub(r"[^a-z0-9-]+", "-", str(value or "").strip().lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    return slug[:40] or fallback
+
+
 def _service_port(context: RepositoryContextDocument) -> int | None:
-    if context.build.dockerfile_port:
+    if context.build.dockerfile_port and context.build.dockerfile_port not in DATASTORE_PORTS:
         return context.build.dockerfile_port
     if context.frontend.static_site_candidate:
         return None
@@ -418,7 +568,7 @@ def _service_port(context: RepositoryContextDocument) -> int | None:
 def _derive_application_type(context: RepositoryContextDocument) -> str:
     has_docker = bool(context.build.has_dockerfile)
     has_web = any(process.type in {"web", "service"} or "start" in (process.command or "").lower() for process in context.processes) or any(f.role == "http_api_server" for f in context.frameworks)
-    has_worker = any(process.type == "worker" or "worker" in (process.command or "").lower() for process in context.processes) or any(f.role == "background_worker" for f in context.frameworks)
+    has_worker = bool(context.workload_profile.workers) or any(process.type == "worker" or "worker" in (process.command or "").lower() for process in context.processes) or any(f.role == "background_worker" for f in context.frameworks)
     if context.frontend.static_site_candidate and not has_web:
         return "static_site"
     if has_docker and has_web:
@@ -480,6 +630,18 @@ def _derive_compute_profile(context: RepositoryContextDocument, answers: dict[st
                 autoscaling={"min": 1, "max": 5, "target_cpu": 70},
             )
         )
+    if context.workload_profile.scheduled_jobs:
+        services.append(
+            ComputeServiceProfile(
+                id="scheduler",
+                process_type="scheduler",
+                image_source="placeholder",
+                cpu=256,
+                memory=512,
+                desired_count=1,
+                autoscaling={"min": 1, "max": 1},
+            )
+        )
     return ComputeProfile(strategy=strategy, services=services, root_volume_gb=_root_volume_gb(context, strategy))
 
 
@@ -500,6 +662,12 @@ def _derive_data_layer(context: RepositoryContextDocument, answers: dict[str, st
     traffic = answers.get("q_traffic_scale", "10-100_rps")
     environment = answers.get("q_environment", "production")
     db_instance_class, storage_gb, multi_az, backup_retention = _agent_rds_shape(environment, traffic)
+    availability = str(answers.get("q_availability") or "same_day")
+    data_loss = str(answers.get("q_data_loss") or "15_minutes")
+    optimization = str(answers.get("q_optimization") or "balanced")
+    budget = _budget_cap_usd(answers)
+    multi_az = availability in {"under_one_hour", "near_immediate"} and optimization != "lowest_cost" and budget >= 100
+    backup_retention = {"24_hours": 3, "1_hour": 7, "15_minutes": 7, "near_zero": 14}.get(data_loss, backup_retention)
     redis_version = _selected_redis_version(answers, context)
     data_layer: list[DataLayerProfile] = []
     redis_purpose: list[str] = ["cache"]
@@ -537,21 +705,28 @@ def _derive_data_layer(context: RepositoryContextDocument, answers: dict[str, st
 def _derive_networking(context: RepositoryContextDocument, answers: dict[str, str], environment: str, compute: ComputeProfile) -> NetworkingProfile:
     public = answers.get("q_public_api", "true") == "true"
     has_public_entry = public and compute.strategy != "s3_cloudfront"
-    want_eip = _wants_elastic_ip(answers, compute)
-    use_alb = has_public_entry and not want_eip
+    use_alb = has_public_entry and _wants_load_balancer(answers, compute)
+    want_eip = has_public_entry and _wants_elastic_ip(answers, compute)
     layout = "private_subnets" if environment == "production" else "public_subnets"
+    budget_cap = _budget_cap_usd(answers)
+    optimization = str(answers.get("q_optimization") or "balanced").strip().lower()
+    enable_nat = (
+        environment == "production"
+        and budget_cap > 75
+        and optimization not in {"lowest_cost", "lowest-cost", "cost"}
+    )
     if compute.strategy == "s3_cloudfront":
         return NetworkingProfile(
             vpc=answers.get("q_existing_vpc", "new"),
             layout=layout,
-            nat_gateway=environment == "production",
+            nat_gateway=enable_nat,
             load_balancer={},
             ports_exposed=[443, 80],
         )
     return NetworkingProfile(
         vpc=answers.get("q_existing_vpc", "new"),
         layout=layout,
-        nat_gateway=environment == "production",
+        nat_gateway=enable_nat,
         load_balancer=(
             {
                 "type": "alb",
@@ -575,7 +750,7 @@ def _derive_runtime_config(context: RepositoryContextDocument, environment: str)
 
 
 def _derive_build_pipeline(context: RepositoryContextDocument, answers: dict[str, str]) -> BuildPipelineProfile:
-    project_slug = re.sub(r"[^a-zA-Z0-9-]+", "-", context.project_name.strip()).strip("-").lower() or "deplai-project"
+    project_slug = _project_slug(context.project_name)
     return BuildPipelineProfile(
         build_command=context.build.build_command,
         start_command=context.build.start_command,
@@ -586,7 +761,7 @@ def _derive_build_pipeline(context: RepositoryContextDocument, answers: dict[str
 
 
 def _derive_operational(context: RepositoryContextDocument, answers: dict[str, str]) -> OperationalProfile:
-    project_slug = re.sub(r"[^a-zA-Z0-9-]+", "-", context.project_name.strip()).strip("-").lower() or "deplai-project"
+    project_slug = _project_slug(context.project_name)
     return OperationalProfile(
         health_check_path=context.health.endpoint or "/",
         health_check_interval=30,
@@ -611,6 +786,45 @@ def _derive_compliance(answers: dict[str, str]) -> ComplianceProfile:
     if answers.get("q_multi_region", "false") == "true":
         requirements.append("multi_region")
     return ComplianceProfile(requirements=requirements, encryption_at_rest=True, encryption_in_transit=True)
+
+
+def _derive_reliability(context: RepositoryContextDocument, answers: dict[str, str]) -> dict[str, Any]:
+    environment = str(answers.get("q_environment") or "production")
+    availability = str(answers.get("q_availability") or "same_day")
+    data_loss = str(answers.get("q_data_loss") or "not_applicable")
+    return {
+        "availability_class": "high" if availability == "near_immediate" else "standard",
+        "recovery_time_target": availability,
+        "data_loss_tolerance": data_loss,
+        "point_in_time_recovery": data_loss in {"15_minutes", "near_zero"},
+        "backup_required": bool(context.data_stores) and environment != "dev",
+        "restore_testing": environment == "production",
+    }
+
+
+def _derive_observability(context: RepositoryContextDocument, environment: str) -> dict[str, Any]:
+    return {
+        "logs": "cloudwatch",
+        "existing_logging": context.monitoring.logging,
+        "existing_metrics": context.monitoring.metrics,
+        "existing_apm": context.monitoring.apm,
+        "alarms": ["deployment_failure", "http_5xx", "compute_saturation"] + (["database_connections", "database_storage"] if context.data_stores else []),
+        "retention_policy": "production_minimum" if environment == "production" else "development_minimum",
+    }
+
+
+def _derive_deployment_strategy(context: RepositoryContextDocument) -> dict[str, Any]:
+    workload = context.workload_profile
+    has_realtime = "websocket" in workload.protocols
+    graceful = bool(workload.runtime_characteristics.get("graceful_shutdown"))
+    strategy = "rolling" if graceful and not has_realtime else "in_place"
+    return {
+        "strategy": strategy,
+        "migration": workload.migration,
+        "drain_connections": has_realtime,
+        "graceful_shutdown_detected": graceful,
+        "migration_failure_blocks_success": bool(workload.migration.get("required")),
+    }
 
 
 def _profile_to_architecture_view(profile: DeploymentProfileDocument) -> DerivedArchitectureView:
@@ -770,7 +984,8 @@ def _profile_to_infra_plan(profile: DeploymentProfileDocument) -> dict[str, Any]
     }
 
 
-def complete_architecture_review(*, project_id: str, project_name: str, project_type: str, workspace: str, answers: dict[str, str], user_id: str | None = None, repo_full_name: str | None = None) -> tuple[ArchitectureAnswersDocument, DeploymentProfileDocument, DerivedArchitectureView, dict[str, Any], dict[str, str]]:
+def complete_architecture_review(*, project_id: str, project_name: str, project_type: str, workspace: str, answers: dict[str, str], user_id: str | None = None, repo_full_name: str | None = None, aws_context: AwsDiscoveryContext | dict[str, Any] | None = None) -> tuple[ArchitectureAnswersDocument, DeploymentProfileDocument, DerivedArchitectureView, dict[str, Any], dict[str, str]]:
+    project_name = _project_slug(project_name)
     review = start_architecture_review(
         project_id=project_id,
         project_name=project_name,
@@ -803,7 +1018,40 @@ def complete_architecture_review(*, project_id: str, project_name: str, project_
         operational=_derive_operational(context, resolved_answers),
         compliance=_derive_compliance(resolved_answers),
         warnings=[item.reason for item in context.low_confidence_items] + [item.reason for item in context.conflicts],
+        planning_mode=str(resolved_answers.get("q_planning_mode") or "guided"),
+        workload=context.workload_profile,
+        storage={
+            "durable_uploads": resolved_answers.get("q_upload_storage") if context.workload_profile.persistent_storage else None,
+            "object_storage": [item.model_dump(exclude_none=True) for item in context.workload_profile.object_storage],
+            "s3_block_public_access": True,
+        },
+        queues=[item.model_dump(exclude_none=True) for item in context.workload_profile.queues],
+        security={
+            "database_public": False,
+            "cache_public": False,
+            "encryption_at_rest": True,
+            "encryption_in_transit": True,
+            "administration": "ssm",
+            "unrestricted_ssh": False,
+            "secrets_delivery": "secrets_manager",
+        },
+        reliability=_derive_reliability(context, resolved_answers),
+        observability=_derive_observability(context, environment),
+        deployment=_derive_deployment_strategy(context),
+        cost={"budget_cap_usd": _budget_cap_usd(resolved_answers), "optimization_preference": resolved_answers.get("q_optimization", "balanced")},
+        decisions=resolve_decisions(review.decisions, resolved_answers),
     )
+    profile.candidate_architectures = estimate_candidates(profile)
+    profile.architecture_conflicts = critique(profile, _budget_cap_usd(resolved_answers))
+    profile.warnings.extend(item.message for item in profile.architecture_conflicts if item.severity != "info")
+    parsed_aws_context = (
+        aws_context
+        if isinstance(aws_context, AwsDiscoveryContext)
+        else AwsDiscoveryContext.model_validate(aws_context)
+        if isinstance(aws_context, dict)
+        else None
+    )
+    profile = apply_aws_discovery(profile, parsed_aws_context)
     architecture_view = _profile_to_architecture_view(profile)
     infra_plan = _profile_to_infra_plan(profile)
     approval_payload = run_stage7_approval_payload(

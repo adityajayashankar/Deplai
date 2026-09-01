@@ -267,6 +267,13 @@ def _collect_logs(inputs: dict[str, Any]) -> list[str]:
     return [f"docker logs --tail 80 {name} 2>&1 || true"]
 
 
+def _read_bootstrap_status(inputs: dict[str, Any]) -> list[str]:
+    raw_path = str(inputs.get("status_path") or "/var/log/deplai-bootstrap-status.json").strip()
+    if raw_path != "/var/log/deplai-bootstrap-status.json":
+        raise DeployError(code="CONFIGURATION_ERROR", technical_message="unsafe status_path")
+    return ["cat -- /var/log/deplai-bootstrap-status.json 2>/dev/null || echo '{}'"]
+
+
 REGISTRY: dict[str, Operation] = {
     "discover_host": Operation("discover_host", 30, True, True, _discover),
     "prepare_runtime": Operation("prepare_runtime", 180, True, True, _prepare_docker),
@@ -282,6 +289,7 @@ REGISTRY: dict[str, Operation] = {
     "render_runtime_configuration": Operation("render_runtime_configuration", 30, False, True, _write_env),
     "resolve_secrets": Operation("resolve_secrets", 60, True, True, _resolve_secrets),
     "collect_logs": Operation("collect_logs", 20, True, True, _collect_logs),
+    "read_bootstrap_status": Operation("read_bootstrap_status", 20, True, True, _read_bootstrap_status),
 }
 
 

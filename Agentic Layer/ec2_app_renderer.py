@@ -1148,7 +1148,7 @@ module "ec2" {
   user_data_base64 = base64encode(<<-USERDATA
 #!/bin/bash
 # deplai_key_rotation=${var.ec2_key_rotation}
-set -euxo pipefail
+set -euo pipefail
 exec > >(tee -a /var/log/deplai-bootstrap.log) 2>&1
 
 APP_ROOT="/opt/${var.project_name}"
@@ -1173,6 +1173,18 @@ BOOTSTRAP_STATUS_FILE="/var/log/deplai-bootstrap-status.json"
 write_status() {
   printf '{"phase":"%s","timestamp":"%s"}\n' "$1" "$(date -Is)" > "$BOOTSTRAP_STATUS_FILE"
 }
+
+BOOTSTRAP_TERMINAL=0
+bootstrap_exit_trap() {
+  exit_code="$?"
+  trap - EXIT
+  if [ "$exit_code" -ne 0 ] && [ "$BOOTSTRAP_TERMINAL" != "1" ]; then
+    printf '{"phase":"failed","status":"FAILED","error_code":"UNEXPECTED_BOOTSTRAP_FAILURE","exit_code":%s,"timestamp":"%s"}\n' \
+      "$exit_code" "$(date -Is)" > "$BOOTSTRAP_STATUS_FILE" || true
+  fi
+  exit "$exit_code"
+}
+trap bootstrap_exit_trap EXIT
 
 write_status "starting"
 
@@ -1344,7 +1356,7 @@ if [ "$APP_KIND" = "python" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ]; then
     python3 -m pip install .
   fi
   if [ -n "$BUILD_COMMAND" ] && [ "$BUILD_COMMAND" != "python3 -m pip install -r requirements.txt" ] && [ "$BUILD_COMMAND" != "python3 -m pip install ." ]; then
-    bash -lc "$BUILD_COMMAND" || true
+    bash -lc "$BUILD_COMMAND"
   fi
 fi
 if [ "$DEPLOYMENT_STRATEGY" != "buildpack" ] && { [ "$APP_KIND" = "go" ] || [ "$APP_KIND" = "java" ] || [ "$APP_KIND" = "dotnet" ] || [ "$APP_KIND" = "php" ] || [ "$APP_KIND" = "ruby" ] || [ "$APP_KIND" = "rust" ]; }; then
@@ -1401,20 +1413,22 @@ __DEPLAI_PUBLIC_URL_BOOTSTRAP__
 # ── Prisma: generate client and run migrations ───────────────────────────────
 # Run only for node apps that have a prisma directory (detected at build time).
 if [ "$WORKSPACE" != "1" ] && [ "$APP_KIND" = "node" ] && [ "$DEPLOYMENT_STRATEGY" != "buildpack" ] && [ "${var.has_prisma}" = "true" ]; then
-  export $(grep -v '^#' "$APP_DIR/.env" | xargs) 2>/dev/null || true
+  set -a
+  [ -f "$APP_DIR/.env" ] && . "$APP_DIR/.env"
+  set +a
   # Generate Prisma client (may already be done in node_modules from npm install)
   npx prisma generate --schema="$APP_DIR/prisma/schema.prisma" 2>/dev/null \
-    || npx prisma generate 2>/dev/null || true
+    || npx prisma generate
   # Run migrations if migrations directory exists; otherwise push schema
   if [ -d "$APP_DIR/prisma/migrations" ] && [ "$(ls -A "$APP_DIR/prisma/migrations" 2>/dev/null)" ]; then
     write_status "prisma_migrate_deploy_started"
     npx prisma migrate deploy --schema="$APP_DIR/prisma/schema.prisma" 2>/dev/null \
-      || npx prisma migrate deploy 2>/dev/null || true
+      || npx prisma migrate deploy
     write_status "prisma_migrate_deploy_done"
   else
     write_status "prisma_db_push_started"
     npx prisma db push --schema="$APP_DIR/prisma/schema.prisma" --accept-data-loss 2>/dev/null \
-      || npx prisma db push --accept-data-loss 2>/dev/null || true
+      || npx prisma db push --accept-data-loss
     write_status "prisma_db_push_done"
   fi
 fi
@@ -1470,8 +1484,8 @@ PY
       fi
     )
   }
-  dnf install -y nodejs npm || true
-  npm install -g pm2 || true
+  dnf install -y nodejs npm
+  npm install -g pm2
   WEB_PORT="$(infer_package_port "$WEB_DIR/package.json" 3000)"
   API_PORT="$(infer_package_port "$API_DIR/package.json" 5000)"
   mkdir -p "$API_DIR" "$WEB_DIR"
@@ -1489,11 +1503,11 @@ PY
       set -a
       [ -f .env ] && . ./.env
       set +a
-      npx prisma generate || true
+      npx prisma generate
       if [ -d prisma/migrations ] && [ "$(ls -A prisma/migrations 2>/dev/null)" ]; then
-        npx prisma migrate deploy || true
+        npx prisma migrate deploy
       else
-        npx prisma db push || true
+        npx prisma db push
       fi
     )
   fi
@@ -1502,6 +1516,11 @@ PY
   pm2 delete "$APP_NAME-web" >/dev/null 2>&1 || true
   start_pm2_dir "$API_DIR" "$APP_NAME-api" "$API_PORT"
   start_pm2_dir "$WEB_DIR" "$APP_NAME-web" "$WEB_PORT"
+  for process_name in "$APP_NAME-api" "$APP_NAME-web"; do
+    process_pid="$(pm2 pid "$process_name" 2>/dev/null | tail -n 1)"
+    [[ "$process_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$process_pid" >/dev/null 2>&1 \
+      || { write_status "failed"; exit 1; }
+  done
   pm2 save || true
   cat >/etc/nginx/conf.d/deplai-app.conf <<NGINX
 server {
@@ -1522,10 +1541,24 @@ server {
 }
 NGINX
   rm -f /etc/nginx/conf.d/default.conf /usr/share/nginx/html/index.html || true
+  nginx -t
   systemctl enable nginx
   systemctl restart nginx
   write_status "node_workspace_running"
-  exit 0
+  for attempt in $(seq 1 30); do
+    if curl -fsS "http://127.0.0.1:$WEB_PORT$HEALTH_PATH" \
+      || curl -fsS "http://127.0.0.1:$WEB_PORT/" \
+      || curl -fsS "http://127.0.0.1/api$HEALTH_PATH"; then
+      write_status "health_check_passed"
+      BOOTSTRAP_TERMINAL=1
+      write_status "ready"
+      exit 0
+    fi
+    sleep 5
+  done
+  write_status "health_check_failed"
+  BOOTSTRAP_TERMINAL=1
+  exit 1
 fi
 if [ "$APP_KIND" = "static" ]; then
   rm -rf /usr/share/nginx/html/*
@@ -1678,12 +1711,14 @@ for attempt in $(seq 1 30); do
     || curl -fsS "http://127.0.0.1$HEALTH_PATH" \
     || curl -fsS "http://127.0.0.1/"; then
     write_status "health_check_passed"
+    BOOTSTRAP_TERMINAL=1
     write_status "ready"
     exit 0
   fi
   sleep 5
 done
 write_status "health_check_failed"
+BOOTSTRAP_TERMINAL=1
 rollback_unhealthy_release() {
   # This function only invokes a certified local service/container name.  It
   # never receives a free-text command from the API or an LLM.
@@ -1706,6 +1741,7 @@ journalctl -u deplai-app --no-pager -n 80 || true
 pm2 status || true
 docker ps || true
 docker compose ps || true
+write_status "failed"
 exit 1
 USERDATA
   )

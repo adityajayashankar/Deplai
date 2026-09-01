@@ -6,6 +6,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 Confidence = Literal["high", "medium", "low"]
+DecisionAuthority = Literal["auto", "recommend_confirm", "user_required"]
+DecisionStatus = Literal["proposed", "confirmed", "overridden", "blocked"]
+EvidenceSource = Literal["repository", "security", "aws", "user", "policy", "runtime", "cost"]
 
 
 class DeploymentPlanningContractError(ValueError):
@@ -138,6 +141,147 @@ class LowConfidenceItem(BaseModel):
     reason: str
 
 
+class ArchitectureEvidence(BaseModel):
+    """A non-secret, traceable input to an architecture decision."""
+
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    source: EvidenceSource
+    signal: str
+    value: Any = None
+    confidence: float = Field(default=0.75, ge=0.0, le=1.0)
+
+
+class ArchitectureAlternative(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    value: Any
+    label: str
+    description: str | None = None
+    cost_delta_usd: float | None = None
+    risk_delta: str | None = None
+
+
+class ArchitectureDecision(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    decision_id: str
+    category: str
+    authority: DecisionAuthority
+    status: DecisionStatus = "proposed"
+    recommendation: Any = None
+    confidence: float = Field(default=0.75, ge=0.0, le=1.0)
+    reason_codes: list[str] = Field(default_factory=list)
+    evidence: list[ArchitectureEvidence] = Field(default_factory=list)
+    alternatives: list[ArchitectureAlternative] = Field(default_factory=list)
+    cost_delta_usd: float | None = None
+    requires_user_input: bool = False
+    depends_on: list[str] = Field(default_factory=list)
+
+
+class WorkloadService(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    id: str
+    process_type: Literal["web", "worker", "scheduler", "internal", "static"]
+    framework: str | None = None
+    command: str | None = None
+    visibility: Literal["public", "internal", "none"] = "internal"
+    protocols: list[str] = Field(default_factory=list)
+    port: int | None = None
+    confidence: float = Field(default=0.75, ge=0.0, le=1.0)
+    evidence: list[ArchitectureEvidence] = Field(default_factory=list)
+
+
+class WorkloadDependency(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    type: str
+    provider: str | None = None
+    usage: str | None = None
+    required_environment_variables: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.75, ge=0.0, le=1.0)
+    evidence: list[ArchitectureEvidence] = Field(default_factory=list)
+
+
+class WorkloadProfile(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    services: list[WorkloadService] = Field(default_factory=list)
+    workers: list[WorkloadService] = Field(default_factory=list)
+    scheduled_jobs: list[WorkloadService] = Field(default_factory=list)
+    queues: list[WorkloadDependency] = Field(default_factory=list)
+    persistent_storage: list[WorkloadDependency] = Field(default_factory=list)
+    object_storage: list[WorkloadDependency] = Field(default_factory=list)
+    search: list[WorkloadDependency] = Field(default_factory=list)
+    authentication: list[WorkloadDependency] = Field(default_factory=list)
+    third_party_dependencies: list[WorkloadDependency] = Field(default_factory=list)
+    webhooks: list[WorkloadDependency] = Field(default_factory=list)
+    protocols: list[str] = Field(default_factory=list)
+    health_checks: dict[str, str] = Field(default_factory=dict)
+    migration: dict[str, Any] = Field(default_factory=dict)
+    session_storage: dict[str, Any] = Field(default_factory=dict)
+    runtime_characteristics: dict[str, Any] = Field(default_factory=dict)
+    service_graph: list[dict[str, str]] = Field(default_factory=list)
+
+
+class AwsResourceMetadata(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    resource_type: str
+    resource_id: str
+    name: str | None = None
+    arn: str | None = None
+    region: str | None = None
+    state: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AwsReuseRecommendation(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    resource_type: str
+    resource_id: str
+    recommendation: str
+    authority: DecisionAuthority = "recommend_confirm"
+    reason: str
+    confirmed: bool = False
+
+
+class AwsDiscoveryContext(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    status: Literal["not_requested", "complete", "partial", "unavailable"] = "not_requested"
+    account_id: str | None = None
+    region: str | None = None
+    resources: list[AwsResourceMetadata] = Field(default_factory=list)
+    reuse_recommendations: list[AwsReuseRecommendation] = Field(default_factory=list)
+    permission_gaps: list[str] = Field(default_factory=list)
+    discovered_at: str | None = None
+
+
+class ArchitectureCriticFinding(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    severity: Literal["info", "warning", "high", "blocking"]
+    code: str
+    message: str
+    recommendation: str | None = None
+    affected_decisions: list[str] = Field(default_factory=list)
+
+
+class CandidateArchitecture(BaseModel):
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+    id: Literal["lean", "recommended", "high_availability"]
+    label: str
+    description: str
+    compute_strategy: str
+    estimated_monthly_usd: float | None = None
+    reliability: str
+    differences: list[str] = Field(default_factory=list)
+
+
 class RepositoryContextDocument(BaseModel):
     model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
 
@@ -161,6 +305,7 @@ class RepositoryContextDocument(BaseModel):
     low_confidence_items: list[LowConfidenceItem] = Field(default_factory=list)
     readme_notes: str | None = None
     summary: str | None = None
+    workload_profile: WorkloadProfile = Field(default_factory=WorkloadProfile)
 
 
 class QuestionOption(BaseModel):
@@ -181,6 +326,13 @@ class ArchitectureQuestion(BaseModel):
     default: str | None = None
     options: list[QuestionOption] = Field(default_factory=list)
     affects: list[str] = Field(default_factory=list)
+    priority: int = Field(default=50, ge=0, le=100)
+    reason: str | None = None
+    recommended_answer: str | None = None
+    cost_impact: str | None = None
+    risk_impact: str | None = None
+    skip_allowed: bool = False
+    decision_id: str | None = None
 
 
 class ArchitectureAnswersDocument(BaseModel):
@@ -319,7 +471,7 @@ class DeploymentProfileDocument(BaseModel):
     model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
 
     document_kind: Literal["deployment_profile"] = "deployment_profile"
-    profile_version: str = "1.0"
+    profile_version: str = "2.0"
     generated_at: str = Field(default_factory=utc_now_iso)
     workspace: str
     project_name: str
@@ -335,6 +487,19 @@ class DeploymentProfileDocument(BaseModel):
     operational: OperationalProfile = Field(default_factory=OperationalProfile)
     compliance: ComplianceProfile = Field(default_factory=ComplianceProfile)
     warnings: list[str] = Field(default_factory=list)
+    planning_mode: Literal["autopilot", "guided", "expert"] = "guided"
+    workload: WorkloadProfile = Field(default_factory=WorkloadProfile)
+    storage: dict[str, Any] = Field(default_factory=dict)
+    queues: list[dict[str, Any]] = Field(default_factory=list)
+    security: dict[str, Any] = Field(default_factory=dict)
+    reliability: dict[str, Any] = Field(default_factory=dict)
+    observability: dict[str, Any] = Field(default_factory=dict)
+    deployment: dict[str, Any] = Field(default_factory=dict)
+    cost: dict[str, Any] = Field(default_factory=dict)
+    aws_reuse: AwsDiscoveryContext = Field(default_factory=AwsDiscoveryContext)
+    decisions: list[ArchitectureDecision] = Field(default_factory=list)
+    architecture_conflicts: list[ArchitectureCriticFinding] = Field(default_factory=list)
+    candidate_architectures: list[CandidateArchitecture] = Field(default_factory=list)
 
 
 class DerivedArchitectureView(BaseModel):
@@ -357,6 +522,9 @@ class ArchitectureReviewPayload(BaseModel):
     defaults: dict[str, str] = Field(default_factory=dict)
     conflicts: list[ConflictItem] = Field(default_factory=list)
     low_confidence_items: list[LowConfidenceItem] = Field(default_factory=list)
+    decisions: list[ArchitectureDecision] = Field(default_factory=list)
+    aws_context: AwsDiscoveryContext = Field(default_factory=AwsDiscoveryContext)
+    planning_mode: Literal["autopilot", "guided", "expert"] = "guided"
 
 
 class RepositoryAnalysisRequest(BaseModel):
@@ -389,6 +557,7 @@ class ArchitectureReviewStartRequest(BaseModel):
     project_type: Literal["local", "github"]
     workspace: str
     user_id: str | None = None
+    organization_id: str | None = None
     repo_full_name: str | None = None
     environment: str | None = None
 
@@ -408,8 +577,10 @@ class ArchitectureReviewCompleteRequest(BaseModel):
     project_type: Literal["local", "github"]
     workspace: str
     user_id: str | None = None
+    organization_id: str | None = None
     repo_full_name: str | None = None
     answers: dict[str, str] = Field(default_factory=dict)
+    aws_context: AwsDiscoveryContext | None = None
 
 
 class ArchitectureReviewCompleteResponse(BaseModel):
@@ -420,6 +591,23 @@ class ArchitectureReviewCompleteResponse(BaseModel):
     architecture_view: DerivedArchitectureView | None = None
     approval_payload: dict[str, Any] | None = None
     runtime_paths: dict[str, str] | None = None
+    error: str | None = None
+
+
+class AwsDiscoveryRequest(BaseModel):
+    """One-time credentials are accepted in memory and are never part of the response."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    aws_access_key_id: str
+    aws_secret_access_key: str
+    aws_session_token: str | None = None
+    aws_region: str = "eu-north-1"
+
+
+class AwsDiscoveryResponse(BaseModel):
+    success: bool
+    context: AwsDiscoveryContext | None = None
     error: str | None = None
 
 

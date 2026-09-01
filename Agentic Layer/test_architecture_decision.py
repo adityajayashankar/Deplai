@@ -98,13 +98,14 @@ class ArchitectureDecisionQuestionTests(unittest.TestCase):
         self.assertNotIn("q_existing_vpc", ids)
         self.assertNotIn("q_root_volume", ids)
         self.assertNotIn("q_elastic_ip", ids)
+        self.assertNotIn("q_load_balancer", ids)
         self.assertNotIn("q_redis", ids)
 
     def test_asks_volume_eip_and_redis_for_apps(self) -> None:
         context = _context()
         questions = _build_questions(context, _default_answers(context))
         ids = [item.id for item in questions]
-        self.assertIn("q_elastic_ip", ids)
+        self.assertIn("q_load_balancer", ids)
         self.assertIn("q_redis", ids)
         self.assertNotIn("q_root_volume", ids)
         self.assertNotIn("q_db_size", ids)
@@ -156,7 +157,7 @@ class ArchitectureDecisionProfileTests(unittest.TestCase):
         self.assertEqual(compute.root_volume_gb, 35)
         networking = _derive_networking(
             context,
-            {"q_public_api": "true", "q_elastic_ip": "true", "q_existing_vpc": "new"},
+            {"q_public_api": "true", "q_load_balancer": "elastic_ip", "q_existing_vpc": "new"},
             "staging",
             compute,
         )
@@ -164,12 +165,19 @@ class ArchitectureDecisionProfileTests(unittest.TestCase):
         self.assertEqual(networking.load_balancer, {})
         alb_networking = _derive_networking(
             context,
-            {"q_public_api": "true", "q_elastic_ip": "false", "q_existing_vpc": "new"},
+            {"q_public_api": "true", "q_load_balancer": "alb", "q_existing_vpc": "new"},
             "staging",
             compute,
         )
         self.assertEqual(alb_networking.elastic_ip, {})
         self.assertEqual(alb_networking.load_balancer.get("type"), "alb")
+        low_budget_networking = _derive_networking(
+            context,
+            {"q_public_api": "true", "q_load_balancer": "alb", "q_existing_vpc": "new", "q_budget": "50", "q_optimization": "lowest_cost"},
+            "production",
+            compute,
+        )
+        self.assertFalse(low_budget_networking.nat_gateway)
         opted_in = _derive_data_layer(context, {"q_redis": "7.0"})
         self.assertEqual(opted_in[0].type, "redis")
         self.assertEqual(opted_in[0].engine_version, "7.0")
@@ -187,8 +195,8 @@ class ArchitectureDecisionProfileTests(unittest.TestCase):
             "q_compute_strategy": "ec2",
             "q_traffic_scale": "lt10_rps",
             "q_public_api": "true",
+            "q_load_balancer": "elastic_ip",
             "q_existing_vpc": "new",
-            "q_elastic_ip": "true",
             "q_redis": "7.0",
             "q_log_retention": "7",
             "q_multi_region": "false",

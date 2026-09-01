@@ -144,12 +144,28 @@ def _infer_apply_phase_from_message(text: str) -> str | None:
     return None
 
 
+def _append_apply_log(apply_context: dict[str, Any] | None, line: str) -> None:
+    if apply_context is None:
+        return
+    text = str(line or "").strip()
+    if not text:
+        return
+    logs = apply_context.get("apply_logs")
+    if not isinstance(logs, list):
+        logs = []
+        apply_context["apply_logs"] = logs
+    logs.append(text)
+    if len(logs) > 400:
+        apply_context["apply_logs"] = logs[-400:]
+
+
 def _emit_progress(apply_context: dict[str, Any] | None, msg_type: str, content: str) -> None:
-    """Write Terraform apply progress to server logs only (not browser clients)."""
+    """Write Terraform apply progress to server logs and the in-memory apply log buffer."""
     text = str(content or "").strip()
     if not text:
         return
     if apply_context is not None:
+        _append_apply_log(apply_context, text)
         inferred = _infer_apply_phase_from_message(text)
         if inferred:
             _set_apply_phase(apply_context, inferred, text)
@@ -582,17 +598,103 @@ def _transient_aws_api_error_message(text: str) -> str:
 
 def _is_orphan_key_pair_collision(text: str) -> bool:
     value = text or ""
-    return "InvalidKeyPair.Duplicate" in value or (
-        "aws_key_pair" in value and "already exists" in value.lower()
+    return bool(
+        "InvalidKeyPair.Duplicate" in value
+        or re.search(r"creating\s+(?:EC2\s+)?Key Pair[^\n]*already exists", value, flags=re.IGNORECASE)
+        or re.search(r"KeyPair[^\n]*Duplicate", value, flags=re.IGNORECASE)
     )
 
 
 def _is_orphan_alb_collision(text: str) -> bool:
-    value = (text or "").lower()
-    return (
-        ("load balancer" in value or "aws_lb" in value or "elbv2" in value)
-        and "already exists" in value
+    value = text or ""
+    return bool(
+        re.search(r"(?:creating|Load Balancer)\s+[^\n]*Load Balancer[^\n]*already exists", value, flags=re.IGNORECASE)
+        or re.search(r"DuplicateLoadBalancerName", value, flags=re.IGNORECASE)
     )
+
+
+def _extract_importable_aws_collisions(text: str) -> list[dict[str, str]]:
+    """Extract exact Terraform address/import IDs from supported AWS collision errors."""
+    collisions: list[dict[str, str]] = []
+    chunks = re.split(r"(?m)^Error:\s*", str(text or ""))
+    specs = (
+        (
+            "ecr_repository",
+            "RepositoryAlreadyExistsException",
+            r"ECR Repository \(([^)]+)\)",
+            r"(?:^|\.)aws_ecr_repository\.[A-Za-z0-9_-]+(?:\[\d+\])?$",
+        ),
+        (
+            "cloudwatch_log_group",
+            "ResourceAlreadyExistsException",
+            r"(?:CloudWatch Logs )?Log Group \(([^)]+)\)",
+            r"(?:^|\.)aws_cloudwatch_log_group\.[A-Za-z0-9_-]+(?:\[\d+\])?$",
+        ),
+        (
+            "rds_instance",
+            "DBInstanceAlreadyExists",
+            r"RDS DB Instance \(([^)]+)\)",
+            r"(?:^|\.)aws_db_instance\.[A-Za-z0-9_-]+(?:\[\d+\])?$",
+        ),
+    )
+    for chunk in chunks:
+        address_match = re.search(r"(?m)^\s*with\s+([^,\n]+),", chunk)
+        if not address_match:
+            continue
+        address = str(address_match.group(1) or "").strip()
+        for kind, marker, id_pattern, address_pattern in specs:
+            if marker.lower() not in chunk.lower() or not re.search(address_pattern, address):
+                continue
+            id_match = re.search(id_pattern, chunk, flags=re.IGNORECASE)
+            if not id_match:
+                continue
+            import_id = str(id_match.group(1) or "").strip()
+            if import_id and not any(item["address"] == address for item in collisions):
+                collisions.append({"kind": kind, "address": address, "import_id": import_id})
+            break
+    return collisions
+
+
+def _aws_tags_mark_terraform_owned(
+    collision: dict[str, str],
+    *,
+    session: Any,
+    aws_region: str,
+    expected_project: str | None = None,
+) -> tuple[bool, dict[str, str]]:
+    """Verify ownership from AWS tags; a matching resource name alone is never sufficient."""
+    kind = str(collision.get("kind") or "")
+    import_id = str(collision.get("import_id") or "")
+    raw_tags: list[dict[str, Any]] = []
+    if kind == "ecr_repository":
+        client = session.client("ecr", region_name=aws_region)
+        repositories = client.describe_repositories(repositoryNames=[import_id]).get("repositories") or []
+        if repositories:
+            arn = str(repositories[0].get("repositoryArn") or "")
+            raw_tags = client.list_tags_for_resource(resourceArn=arn).get("tags") or []
+    elif kind == "cloudwatch_log_group":
+        client = session.client("logs", region_name=aws_region)
+        raw = client.list_tags_log_group(logGroupName=import_id).get("tags") or {}
+        raw_tags = [{"key": key, "value": value} for key, value in raw.items()]
+    elif kind == "rds_instance":
+        client = session.client("rds", region_name=aws_region)
+        instances = client.describe_db_instances(DBInstanceIdentifier=import_id).get("DBInstances") or []
+        if instances:
+            arn = str(instances[0].get("DBInstanceArn") or "")
+            raw_tags = client.list_tags_for_resource(ResourceName=arn).get("TagList") or []
+
+    tags = {
+        str(item.get("Key") or item.get("key") or "").strip().lower():
+        str(item.get("Value") or item.get("value") or "").strip()
+        for item in raw_tags
+        if isinstance(item, dict)
+    }
+    managed_by = str(tags.get("managed_by") or tags.get("managed-by") or tags.get("managedby") or "").lower()
+    explicitly_managed = str(tags.get("deplai:managed") or "").lower() == "true"
+    project_tag = str(tags.get("project") or tags.get("deplai:project") or "").strip().lower()
+    expected = str(expected_project or "").strip().lower()
+    project_matches = not project_tag or not expected or project_tag == expected
+    return (explicitly_managed or managed_by in {"terraform", "deplai"}) and project_matches, tags
 
 
 def _extract_duplicate_key_pair_name(text: str) -> str | None:
@@ -835,7 +937,8 @@ def _legacy_runtime_bundle_needs_remediation(files: list[dict[str, Any]]) -> boo
         r'(?mi)^\s*compute_strategy\s*=\s*"?(ec2-instance|cloudfront|s3cloudfront)"?\s*$'
     )
     single_line_variable_block = re.compile(
-        r'variable\s+"[^"]+"\s*\{\s*type\s*=\s*[^{}\n]+,\s*default\s*=\s*[^{}\n]+\s*\}'
+        r'variable[ \t]+"[^"]+"[ \t]*\{[ \t]*type[ \t]*=[ \t]*[^{}\n]+?[ \t]*,?[ \t]+'
+        r'default[ \t]*=[ \t]*[^{}\n]+[ \t]*\}'
     )
     conditional_depends_on = re.compile(r"depends_on\s*=\s*[^\n]*\?")
 
@@ -1148,6 +1251,23 @@ def _remediate_legacy_runtime_bundle(
             if rewritten != updated:
                 updated = rewritten
                 remediation["legacy_single_line_variable_blocks_rewritten"] = True
+        generic_variable = re.compile(
+            r'variable[ \t]+"(?P<name>[^"]+)"[ \t]*\{[ \t]*'
+            r'type[ \t]*=[ \t]*(?P<type>[^{}\n]+?)[ \t]*,?[ \t]+'
+            r'default[ \t]*=[ \t]*(?P<default>[^{}\n]+?)[ \t]*\}',
+            flags=re.IGNORECASE,
+        )
+
+        def _expand_variable(match: re.Match[str]) -> str:
+            remediation["legacy_single_line_variable_blocks_rewritten"] = True
+            return (
+                f'variable "{match.group("name")}" {{\n'
+                f'  type    = {match.group("type").strip()}\n'
+                f'  default = {match.group("default").strip()}\n'
+                "}"
+            )
+
+        updated = generic_variable.sub(_expand_variable, updated)
         return updated
 
     def _rewrite_conditional_depends_on(text: str) -> str:
@@ -1501,7 +1621,12 @@ output "redis_endpoint" {
         compute_variables_text = tf_texts[compute_variables_idx]
         extras = ""
         if 'variable "existing_ec2_key_pair_name"' not in compute_variables_text:
-            extras += "variable \"existing_ec2_key_pair_name\" { type = string default = \"\" }\n"
+            extras += (
+                "variable \"existing_ec2_key_pair_name\" {\n"
+                "  type    = string\n"
+                "  default = \"\"\n"
+                "}\n"
+            )
         if 'variable "ec2_key_rotation"' not in compute_variables_text:
             extras += "variable \"ec2_key_rotation\" { type = string }\n"
         if extras:
@@ -2202,28 +2327,14 @@ def _fetch_secret_string(
         return None
 
 
-def _database_env_from_secret(secret: dict[str, Any] | None) -> str:
-    if not isinstance(secret, dict) or not secret:
-        return ""
-    user = str(secret.get("username") or secret.get("user") or "").strip()
-    password = str(secret.get("password") or "").strip()
-    host = str(secret.get("host") or secret.get("hostname") or "").strip()
-    port = str(secret.get("port") or "5432").strip() or "5432"
-    dbname = str(secret.get("dbname") or secret.get("database") or "appdb").strip() or "appdb"
-    lines = [
-        f"PGHOST={host}" if host else "",
-        f"PGPORT={port}",
-        f"PGUSER={user}" if user else "",
-        f"PGPASSWORD={password}" if password else "",
-        f"PGDATABASE={dbname}",
-    ]
-    if user and password and host:
-        engine = str(secret.get("engine") or "postgres").lower()
-        scheme = "mysql" if "mysql" in engine or "mariadb" in engine else "postgresql"
-        lines.append(
-            f"DATABASE_URL={scheme}://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{dbname}"
-        )
-    return "\n".join(item for item in lines if item) + ("\n" if any(lines) else "")
+def _database_env_from_secret(
+    secret: dict[str, Any] | None,
+    *,
+    rds_endpoint: str | None = None,
+) -> str:
+    from database_env import database_env_from_secret
+
+    return database_env_from_secret(secret, rds_endpoint=rds_endpoint)
 
 
 def _collect_one_time_credentials(
@@ -2250,6 +2361,11 @@ def _collect_one_time_credentials(
         or outputs.get("db_secret_arn")
         or ""
     ).strip()
+    rds_endpoint = str(
+        outputs.get("rds_endpoint")
+        or outputs.get("database_endpoint")
+        or ""
+    ).strip()
     database_env = ""
     if secret_arn:
         database_env = _database_env_from_secret(
@@ -2259,7 +2375,8 @@ def _collect_one_time_credentials(
                 aws_access_key_id=aws_access_key_id,
                 aws_secret_access_key=aws_secret_access_key,
                 aws_session_token=aws_session_token,
-            )
+            ),
+            rds_endpoint=rds_endpoint or None,
         )
     tag_info = _tag_key_pair_with_instance(
         key_name=key_name,
@@ -3438,6 +3555,13 @@ def apply_terraform_bundle(
     enforce_free_tier_ec2: bool = True,
     confirm_apply: bool = False,
     apply_context: dict[str, Any] | None = None,
+    database_required: bool = False,
+    customer_database_url: str | None = None,
+    customer_host: str | None = None,
+    customer_port: str | None = None,
+    customer_database_name: str | None = None,
+    customer_username: str | None = None,
+    customer_password: str | None = None,
 ) -> dict[str, Any]:
     if provider.lower() != "aws":
         return {"success": False, "error": "Runtime apply currently supports AWS only."}
@@ -3528,6 +3652,31 @@ def apply_terraform_bundle(
         tf_text_preflight = _collect_terraform_text(files)
         bundle_has_rds_or_elasticache = _terraform_has_rds_or_elasticache(tf_text_preflight)
         bundle_has_registry_module = _terraform_has_registry_module(tf_text_preflight)
+        from database_preflight import run_database_preflight
+
+        db_preflight = run_database_preflight(
+            terraform_text=tf_text_preflight,
+            database_required=database_required,
+            customer_database_url=customer_database_url,
+            customer_host=customer_host,
+            customer_port=customer_port,
+            customer_database_name=customer_database_name,
+            customer_username=customer_username,
+            customer_password=customer_password,
+        )
+        if not db_preflight.get("ok"):
+            message = str(db_preflight.get("message") or "Database configuration preflight failed.")
+            _emit_progress(apply_context, "error", f"Preflight blocked apply: {message}")
+            return {
+                "success": False,
+                "error": message,
+                "status": "failed",
+                "details": {
+                    "stage": "preflight",
+                    "code": str(db_preflight.get("code") or "INVALID_DATABASE_CONFIGURATION"),
+                    "preflight": db_preflight,
+                },
+            }
         if bundle_has_rds_or_elasticache:
             files = _normalize_rds_elasticache_provider_versions(files, apply_context)
         files = _normalize_rds_engine_versions(files, apply_context)
@@ -4160,6 +4309,147 @@ def apply_terraform_bundle(
 
             if apply_recovered:
                 pass
+            elif _extract_importable_aws_collisions(combined):
+                recovery_session = boto3.session.Session(
+                    aws_access_key_id=aws_access_key_id,
+                    aws_secret_access_key=aws_secret_access_key,
+                    aws_session_token=aws_session_token or None,
+                    region_name=aws_region,
+                )
+                imported_orphans: list[dict[str, Any]] = []
+                current_collision_error = combined
+                for recovery_attempt in range(1, 4):
+                    collisions = [
+                        item for item in _extract_importable_aws_collisions(current_collision_error)
+                        if not any(existing.get("address") == item.get("address") for existing in imported_orphans)
+                    ]
+                    if not collisions:
+                        break
+                    verified: list[dict[str, Any]] = []
+                    unverified: list[dict[str, Any]] = []
+                    for collision in collisions:
+                        try:
+                            owned, tags = _aws_tags_mark_terraform_owned(
+                                collision,
+                                session=recovery_session,
+                                aws_region=aws_region,
+                                expected_project=project_name,
+                            )
+                        except Exception as verify_exc:
+                            unverified.append({**collision, "reason": type(verify_exc).__name__})
+                            continue
+                        if owned:
+                            verified.append({**collision, "ownership_tags": tags})
+                        else:
+                            unverified.append({**collision, "reason": "missing_deplai_or_terraform_ownership_tags", "observed_tags": tags})
+
+                    if unverified:
+                        commands = [
+                            f"terraform import '{item['address']}' '{item['import_id']}'"
+                            for item in unverified
+                        ]
+                        _emit_progress(
+                            apply_context,
+                            "error",
+                            "Existing AWS resources matched this plan but could not be verified as DeplAI/Terraform-owned. Automatic adoption was blocked.",
+                        )
+                        return {
+                            "success": False,
+                            "error": (
+                                "Terraform found existing AWS resources outside the current state. "
+                                "DeplAI blocked automatic import because ownership tags could not be verified. "
+                                "Review details.orphan_collision before adopting or deleting them."
+                            ),
+                            "details": {
+                                "terraform_root": tf_root,
+                                "orphan_collision": {
+                                    "class": "state_aws_divergence",
+                                    "verified": verified,
+                                    "unverified": unverified,
+                                    "adopt_commands": commands,
+                                    "delete_automatically": False,
+                                },
+                                "bundle_remediation": bundle_remediation,
+                                "apply_log_tail": _tail(current_collision_error, 2400),
+                            },
+                        }
+
+                    try:
+                        for collision in verified:
+                            _emit_progress(
+                                apply_context,
+                                "info",
+                                f"Recovering Terraform state for verified {collision['kind']} {collision['import_id']}.",
+                            )
+                            common_var_args = [
+                                arg for arg in _build_apply_args(
+                                    selected_instance_type,
+                                    disable_ec2=precheck_disable_ec2,
+                                    preferred_azs_override=selected_az_order,
+                                    existing_key_name=existing_key_name_override,
+                                    force_default_vpc=False,
+                                )[1:]
+                                if str(arg).startswith("-var=")
+                            ]
+                            import_log = _run_terraform_with_tracking(
+                                volume_name,
+                                tf_root,
+                                [
+                                    "import", "-input=false", "-no-color", *common_var_args,
+                                    str(collision["address"]), str(collision["import_id"]),
+                                ],
+                                env,
+                                apply_context=apply_context,
+                            )
+                            imported_orphans.append(collision)
+                            apply_log = f"{apply_log}\n\n[orphan-import]\n{import_log}"
+
+                        retry_log = _run_terraform_with_tracking(
+                            volume_name,
+                            tf_root,
+                            _build_apply_args(
+                                selected_instance_type,
+                                disable_ec2=precheck_disable_ec2,
+                                preferred_azs_override=selected_az_order,
+                                existing_key_name=existing_key_name_override,
+                                force_default_vpc=False,
+                            ),
+                            env,
+                            apply_context=apply_context,
+                        )
+                        apply_log = f"{apply_log}\n\n[orphan-recovery-retry:{recovery_attempt}]\n{retry_log}"
+                        apply_mode = "verified_orphan_import_recovery"
+                        apply_recovered = True
+                        break
+                    except Exception as recovery_exc:
+                        current_collision_error = str(recovery_exc).strip()
+                        combined = current_collision_error
+                        stderr = current_collision_error
+                        if not _extract_importable_aws_collisions(current_collision_error):
+                            return {
+                                "success": False,
+                                "error": "Terraform state recovery imported verified resources, but the follow-up apply still failed.",
+                                "details": {
+                                    "terraform_root": tf_root,
+                                    "orphan_collision": {
+                                        "class": "state_aws_divergence",
+                                        "imported": imported_orphans,
+                                        "recovery_attempt": recovery_attempt,
+                                    },
+                                    "bundle_remediation": bundle_remediation,
+                                    "apply_log_tail": _tail(current_collision_error, 2400),
+                                },
+                            }
+                if not apply_recovered:
+                    return {
+                        "success": False,
+                        "error": "Terraform state recovery did not converge after three verified import attempts.",
+                        "details": {
+                            "terraform_root": tf_root,
+                            "orphan_collision": {"class": "state_aws_divergence", "imported": imported_orphans},
+                            "apply_log_tail": _tail(current_collision_error, 2400),
+                        },
+                    }
             elif _is_missing_default_vpc_error(combined) and has_use_default_vpc_var:
                 _emit_progress(
                     apply_context,
@@ -4841,6 +5131,13 @@ def apply_saved_terraform_run(
     enforce_free_tier_ec2: bool = True,
     confirm_apply: bool = False,
     apply_context: dict[str, Any] | None = None,
+    database_required: bool = False,
+    customer_database_url: str | None = None,
+    customer_host: str | None = None,
+    customer_port: str | None = None,
+    customer_database_name: str | None = None,
+    customer_username: str | None = None,
+    customer_password: str | None = None,
 ) -> dict[str, Any]:
     from deployment_run_store import load_terraform_run
 
@@ -4883,6 +5180,13 @@ def apply_saved_terraform_run(
             enforce_free_tier_ec2=enforce_free_tier_ec2,
             confirm_apply=confirm_apply,
             apply_context=apply_context,
+            database_required=database_required,
+            customer_database_url=customer_database_url,
+            customer_host=customer_host,
+            customer_port=customer_port,
+            customer_database_name=customer_database_name,
+            customer_username=customer_username,
+            customer_password=customer_password,
         )
 
     deployment_metadata = (

@@ -159,22 +159,49 @@ class RemediationTrackRunner(RunnerBase):
 
         while current_round <= MAX_ROUNDS:
             await self._send_message("phase", f"Round {current_round}: ingesting findings and generating fixes")
+            await self._send_message(
+                "info",
+                "Noise triage filters scanner noise; critical/high findings go through Master -> Planner -> Implementor -> Reviewer.",
+            )
 
             try:
-                snapshot = self.orchestrator.refresh(
-                    self.context.project_id,
-                    remediation_scope=self.context.remediation_scope,
+                snapshot = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: self.orchestrator.refresh(
+                        self.context.project_id,
+                        remediation_scope=self.context.remediation_scope,
+                    ),
                 )
             except Exception as exc:
                 return await self._terminate(f"Failed to refresh remediation inputs: {exc}")
             await self._send_message(
                 "info",
                 (
-                    f"Loaded {snapshot.get('vulnerabilities', 0)} vulnerabilities across {snapshot.get('groups', 0)} file groups "
+                    f"Loaded {snapshot.get('raw_vulnerabilities', snapshot.get('vulnerabilities', 0))} scanner findings; "
+                    f"{snapshot.get('noise_filtered', 0)} filtered as noise; "
+                    f"{snapshot.get('scope_filtered', 0)} skipped (medium/low); "
+                    f"{snapshot.get('vulnerabilities', 0)} critical/high actionable across {snapshot.get('groups', 0)} file groups "
                     f"(critical={snapshot.get('critical', 0)}, high={snapshot.get('high', 0)}, "
                     f"medium={snapshot.get('medium', 0)}, low={snapshot.get('low', 0)})."
                 ),
             )
+            if snapshot.get("raw_vulnerabilities", snapshot.get("vulnerabilities", 0)) == 0:
+                await self._send_message(
+                    "warning",
+                    "No scanner artifacts were found for this project. Run a security scan first, then retry remediation.",
+                )
+                return await self._terminate("No scan results available for remediation.")
+
+            if int(snapshot.get("vulnerabilities", 0) or 0) == 0:
+                await self._send_message(
+                    "success",
+                    (
+                        f"Noise triage filtered all {snapshot.get('noise_filtered', 0)} scanner finding(s) "
+                        "as non-actionable. No remediation credits were spent."
+                    ),
+                )
+                return True
+
             if snapshot.get("strategy_mode") == "major_complete":
                 await self._send_message(
                     "success",
@@ -222,7 +249,9 @@ class RemediationTrackRunner(RunnerBase):
                     llm_model=self.context.llm_model,
                     force_claude=bool(snapshot.get("force_claude")) and str(getattr(self.context, "llm_access_mode", "auto") or "auto").lower() not in {"platform", "byok"},
                     user_id=getattr(self.context, "user_id", None),
+                    organization_id=getattr(self.context, "organization_id", None),
                     access_mode=getattr(self.context, "llm_access_mode", None),
+                    llm_credential_id=getattr(self.context, "llm_credential_id", None),
                 )
             except Exception as exc:
                 return await self._terminate(f"Remediation pipeline execution failed: {type(exc).__name__}: {exc}")
@@ -247,8 +276,8 @@ class RemediationTrackRunner(RunnerBase):
                     approved_for_push = True
                     break
                 return await self._terminate(
-                    "No candidate fixes were generated for the selected large-repository slice. "
-                    "The run stopped without changes instead of opening an empty approval gate."
+                    "Noise triage found no actionable vulnerabilities to patch in this round. "
+                    "Scanner findings were filtered as non-actionable noise — no credits were spent on fix generation."
                 )
 
             actionable_fixes = [fix for fix in fixes if fix.diff]
@@ -273,7 +302,8 @@ class RemediationTrackRunner(RunnerBase):
             changed = [
                 {
                     "path": fix.filepath,
-                    "reason": f"status={fix.status}",
+                    "reason": f"{fix.provider_used} · {fix.status}"
+                    + (f" · {fix.warnings[0][:120]}" if fix.warnings else ""),
                     "diff": fix.diff,
                 }
                 for fix in actionable_fixes

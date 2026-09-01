@@ -26,7 +26,9 @@ class FixGenerator:
         llm_model: str | None = None,
         force_claude: bool = False,
         user_id: str | None = None,
+        organization_id: str | None = None,
         access_mode: str | None = None,
+        llm_credential_id: str | None = None,
     ) -> Fix:
         ordered_vulns = [vuln_lookup[s.vuln_id] for s in bundle.snippets if s.vuln_id in vuln_lookup]
         deterministic_vulns = self._deterministic_sca_vulnerabilities(ordered_vulns)
@@ -53,9 +55,12 @@ class FixGenerator:
                 preferred_model=llm_model,
                 force_claude=force_claude,
                 user_id=user_id,
+                organization_id=organization_id,
                 access_mode=access_mode,
+                llm_credential_id=llm_credential_id,
             )
         except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
             return Fix(
                 filepath=bundle.filepath,
                 diff="",
@@ -63,8 +68,8 @@ class FixGenerator:
                 provider_used="none",
                 tokens_used=0,
                 status="needs_review",
-                raw_response=str(exc),
-                warnings=["Provider routing failed"],
+                raw_response=detail,
+                warnings=[f"Provider routing failed: {detail}"],
             )
 
         diff = self._extract_unified_diff(response_text, bundle)
@@ -157,7 +162,7 @@ Code:
 
     @classmethod
     def _patch_requirements_txt(cls, source: str, vulnerabilities: list[Vulnerability]) -> str:
-        updates = cls._dependency_updates(vulnerabilities)
+        updates = cls._safe_dependency_updates(vulnerabilities)
         if not updates:
             return source
 
@@ -196,7 +201,7 @@ Code:
         if not isinstance(data, dict):
             return source
 
-        updates = cls._dependency_updates(vulnerabilities)
+        updates = cls._safe_dependency_updates(vulnerabilities)
         changed = False
         for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
             deps = data.get(section)
@@ -261,6 +266,39 @@ Code:
             if current is None or cls._version_key(fix_version) > cls._version_key(current):
                 updates[package_name] = fix_version
         return updates
+
+    @classmethod
+    def _safe_dependency_updates(cls, vulnerabilities: list[Vulnerability]) -> dict[str, str]:
+        """Only allow deterministic manifest bumps within the same major version."""
+        updates = cls._dependency_updates(vulnerabilities)
+        installed_by_package: dict[str, str] = {}
+        for vuln in vulnerabilities:
+            package = str(vuln.package_name or "").strip()
+            installed = str(vuln.installed_version or "").strip()
+            if package and installed:
+                installed_by_package.setdefault(package, installed)
+
+        safe: dict[str, str] = {}
+        for package_name, fix_version in updates.items():
+            installed = installed_by_package.get(package_name, "")
+            if installed and not cls._is_safe_manifest_bump(installed, fix_version):
+                continue
+            safe[package_name] = fix_version
+        return safe
+
+    @staticmethod
+    def _major_version_number(version: str) -> int | None:
+        cleaned = re.sub(r"^[\^~<>=\s]+", "", str(version or "").strip())
+        match = re.match(r"(\d+)", cleaned)
+        return int(match.group(1)) if match else None
+
+    @classmethod
+    def _is_safe_manifest_bump(cls, installed_version: str, fix_version: str) -> bool:
+        installed_major = cls._major_version_number(installed_version)
+        fix_major = cls._major_version_number(fix_version)
+        if installed_major is None or fix_major is None:
+            return True
+        return fix_major == installed_major
 
     @staticmethod
     def _version_key(version: str) -> tuple[tuple[int | str, ...], str]:
