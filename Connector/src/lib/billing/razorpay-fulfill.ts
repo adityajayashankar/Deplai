@@ -5,6 +5,7 @@ import {
   grantPaidCredits,
   grantTopUpCredits,
   provisionCreditsOnRenewal,
+  linkSubscriptionToOrganization,
 } from './credits';
 import {
   type BillingInvoice,
@@ -14,6 +15,7 @@ import {
   findInvoiceByPaymentId,
   getCheckoutIntent,
   markIntentPaid,
+  transitionCheckoutIntentState,
 } from './invoices';
 import {
   completeFulfillmentAttempt,
@@ -22,8 +24,14 @@ import {
   type FulfillmentSource,
 } from './fulfillment-attempts';
 import { withPaymentLock } from './fulfillment-lock';
-import { cancelRazorpaySubscription, type RazorpayPayment } from './razorpay';
+import {
+  assertCapturedPaymentMatchesIntent,
+  cancelRazorpaySubscription,
+  type RazorpayPayment,
+} from './razorpay';
 import { verifyRazorpayPaymentSignature } from './razorpay-signature';
+import { isConfirmedPaymentState } from './payment-state';
+import { fulfillOrganizationCreditPurchase } from './organization-credits';
 
 export type FulfillResult = {
   invoiceId: string;
@@ -40,6 +48,8 @@ export type FulfillmentIO = {
   grantPaidCredits: typeof grantPaidCredits;
   grantTopUpCredits: typeof grantTopUpCredits;
   createPaidInvoice: typeof createPaidInvoice;
+  fulfillOrganizationCreditPurchase?: typeof fulfillOrganizationCreditPurchase;
+  linkSubscriptionToOrganization?: typeof linkSubscriptionToOrganization;
 };
 
 const productionIo: FulfillmentIO = {
@@ -51,6 +61,8 @@ const productionIo: FulfillmentIO = {
   grantPaidCredits,
   grantTopUpCredits,
   createPaidInvoice,
+  fulfillOrganizationCreditPurchase,
+  linkSubscriptionToOrganization,
 };
 
 export type FulfillVerifiedInput = {
@@ -62,6 +74,7 @@ export type FulfillVerifiedInput = {
   subscriptionId?: string | null;
   source?: FulfillmentSource;
   rawPayload?: unknown;
+  captured: true;
 };
 
 function notesOf(value: unknown): Record<string, string> {
@@ -75,6 +88,7 @@ export async function fulfillOnceLocked(
   input: FulfillVerifiedInput,
   io: FulfillmentIO = productionIo,
 ): Promise<FulfillResult> {
+  if (input.captured !== true) throw new Error('Captured payment evidence is required before fulfillment');
   const existing = await io.findInvoiceByPaymentId(input.paymentId);
   if (existing) {
     await io.markIntentPaid(input.intent.id);
@@ -94,23 +108,45 @@ export async function fulfillOnceLocked(
       cadence: input.intent.cadence || 'monthly',
       razorpaySubscriptionId: input.subscriptionId || input.intent.razorpaySubscriptionId,
     });
+    if (input.intent.organizationId && io.linkSubscriptionToOrganization) {
+      await io.linkSubscriptionToOrganization(input.userId, input.intent.organizationId);
+    }
     if (previousSubId && previousSubId !== (input.subscriptionId || input.intent.razorpaySubscriptionId)) {
       await io.cancelRazorpaySubscription(previousSubId);
     }
-  } else if (input.intent.kind === 'topup' && input.intent.creditPackId === 'custom') {
-    const credits = Math.max(1, Math.round(input.intent.displayAmountCents / 100));
-    await io.grantPaidCredits(input.userId, credits, { source: 'topup:custom' });
-  } else if (input.intent.kind === 'topup' && input.intent.creditPackId) {
-    await io.grantTopUpCredits(input.userId, input.intent.creditPackId);
-  } else {
+  } else if (input.intent.kind !== 'topup' || !input.intent.creditPackId || input.intent.creditPackId === 'custom') {
     throw new Error('Checkout intent is missing a plan or credit pack');
+  }
+
+  if (input.intent.organizationId && io.fulfillOrganizationCreditPurchase) {
+    await io.fulfillOrganizationCreditPurchase({
+      organizationId: input.intent.organizationId,
+      userId: input.userId,
+      paymentId: input.paymentId,
+      planId: input.intent.planId,
+      creditPackId: input.intent.creditPackId,
+      cadence: input.intent.cadence,
+      paymentMode: input.intent.paymentMode,
+    });
+  } else if (input.intent.kind === 'topup' && input.intent.creditPackId) {
+    // Compatibility only for checkout intents created before organization wallets.
+    await io.grantTopUpCredits(input.userId, input.intent.creditPackId);
+  }
+
+  if (input.intent.kind === 'subscription' && input.intent.planId && input.intent.planId !== 'free') {
+    const { processReferralConversion } = await import('@/lib/referrals/rewards');
+    await processReferralConversion({
+      referredUserId: input.userId,
+      paymentId: input.paymentId,
+      checkoutIntentId: input.intent.id,
+      planId: input.intent.planId,
+      cadence: input.intent.cadence,
+    });
   }
 
   const description = input.intent.kind === 'subscription'
     ? `DeplAI ${input.intent.planId} ${input.intent.cadence || 'monthly'} subscription`
-    : input.intent.creditPackId === 'custom'
-      ? `DeplAI custom credits $${(input.intent.displayAmountCents / 100).toFixed(0)}`
-      : `DeplAI credit pack ${input.intent.creditPackId}`;
+    : `DeplAI credit pack ${input.intent.creditPackId}`;
 
   const invoice = await io.createPaidInvoice({
     userId: input.userId,
@@ -174,16 +210,29 @@ export async function fulfillFromWebhookPayload(
   const orderId = typeof paymentEntity?.order_id === 'string' ? paymentEntity.order_id : null;
   if (!paymentId) return null;
 
-  const notes = {
-    ...notesOf(paymentEntity?.notes),
-    ...notesOf(subscriptionEntity?.notes),
-  };
   const intent = await findCheckoutIntent({ orderId, subscriptionId });
-  const userId = notes.user_id || intent?.userId || (subscriptionId ? await findUserIdByRazorpaySubscription(subscriptionId) : null);
+  const userId = intent?.userId || (subscriptionId ? await findUserIdByRazorpaySubscription(subscriptionId) : null);
   if (!intent || !userId) return null;
 
+  const payment: RazorpayPayment = {
+    id: paymentId,
+    status: String(paymentEntity?.status || ''),
+    amount: Number(paymentEntity?.amount || 0),
+    amountRefunded: Number(paymentEntity?.amount_refunded || 0),
+    currency: String(paymentEntity?.currency || ''),
+    order_id: orderId,
+    email: typeof paymentEntity?.email === 'string' ? paymentEntity.email : null,
+    notes: paymentEntity?.notes && typeof paymentEntity.notes === 'object'
+      ? paymentEntity.notes as Record<string, unknown>
+      : null,
+    captured: Boolean(paymentEntity?.captured) || paymentEntity?.status === 'captured',
+  };
+  const wasPreviouslyCaptured = isConfirmedPaymentState(intent.status);
+  assertCapturedPaymentMatchesIntent(payment, intent);
+  await transitionCheckoutIntentState(intent.id, 'captured', { paymentId });
+
   const existing = await findInvoiceByPaymentId(paymentId);
-  const isRenewal = Boolean(subscriptionId && intent.kind === 'subscription' && intent.status === 'paid');
+  const isRenewal = Boolean(subscriptionId && intent.kind === 'subscription' && wasPreviouslyCaptured);
   if (!existing && isRenewal && intent.planId) {
     await provisionCreditsOnRenewal(userId, intent.planId, {
       source: 'subscription_renewal',
@@ -200,6 +249,7 @@ export async function fulfillFromWebhookPayload(
     orderId,
     subscriptionId,
     source: 'webhook',
+    captured: true,
     rawPayload: payload,
   });
 }
@@ -223,6 +273,8 @@ export async function fulfillCapturedRazorpayPayment(payment: RazorpayPayment): 
       code: 'intent_not_found',
     });
   }
+  assertCapturedPaymentMatchesIntent(payment, intent);
+  await transitionCheckoutIntentState(intent.id, 'captured', { paymentId: payment.id });
   return fulfillVerifiedPayment({
     userId,
     email: payment.email || undefined,
@@ -231,6 +283,7 @@ export async function fulfillCapturedRazorpayPayment(payment: RazorpayPayment): 
     orderId,
     subscriptionId: subscriptionId || intent.razorpaySubscriptionId,
     source: 'admin_retry',
+    captured: true,
     rawPayload: { payment },
   });
 }

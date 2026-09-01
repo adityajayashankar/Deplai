@@ -1,5 +1,5 @@
 import PDFDocument from 'pdfkit';
-import { amountInWordsInr, formatInrFromPaise, formatUsdFromCents } from './money';
+import { amountInWordsInr, formatInrFromPaise } from './money';
 import { type BillingInvoice } from './invoices';
 
 function bufferPdf(doc: PDFKit.PDFDocument): Promise<Buffer> {
@@ -73,9 +73,6 @@ export async function renderInvoicePdf(invoice: BillingInvoice): Promise<Buffer>
   doc.text(`Grand total  ${formatInrFromPaise(invoice.totalPaise)}`);
   doc.moveDown(0.4);
   doc.font('Helvetica').fontSize(9).fillColor('#334155').text(amountInWordsInr(invoice.totalPaise));
-  doc.moveDown(0.4);
-  doc.text(`Listed price ${formatUsdFromCents(invoice.displayAmountCents)} ${invoice.displayCurrency} (converted and taxed in INR).`);
-
   doc.moveDown(1);
   doc.font('Helvetica-Bold').fontSize(10).fillColor('#0f172a').text('Payment proof');
   doc.font('Helvetica').fontSize(9).fillColor('#334155');

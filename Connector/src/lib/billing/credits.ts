@@ -14,6 +14,13 @@ import {
   type LedgerSnapshot,
 } from './credits-policy';
 import { isBillingEnforced } from '@/lib/ai-platform/subscription-access';
+import {
+  CREDIT_CATALOG_VERSION,
+  CREDIT_PACKS,
+  CREDIT_PLANS,
+  catalogPlan,
+  planDisplayName,
+} from './credit-catalog';
 
 export {
   ENTERPRISE_PLAN_ID,
@@ -39,6 +46,14 @@ export type BillingPlan = {
   bonusTermsCopy: string;
   features: string[];
   sortOrder: number;
+  pricePaise: number;
+  yearlyPricePaise: number;
+  priceIncludesTax: boolean;
+  providerBudgetPaise: number;
+  yearlyProviderBudgetPaise: number;
+  annualCreditAmount: number;
+  annualReleaseSchedule: { creditsPerRelease: number; interval: 'monthly'; releases: number } | null;
+  catalogVersion: string;
 };
 
 export type CreditPack = {
@@ -47,6 +62,9 @@ export type CreditPack = {
   creditAmount: number;
   priceCents: number;
   paidTiersOnly: boolean;
+  pricePaise: number;
+  providerBudgetPaise: number;
+  catalogVersion: string;
 };
 
 export type CreditBalance = {
@@ -159,22 +177,31 @@ function parseFeatures(value: unknown): string[] {
 }
 
 function mapPlan(row: PlanRow): BillingPlan {
+  const v2 = catalogPlan(row.id);
   return {
     id: row.id,
     name: row.name,
     displayName: row.display_name,
     description: row.description,
-    priceCents: Number(row.price_cents),
-    yearlyPriceCents: Number(row.yearly_price_cents),
+    priceCents: v2 ? Math.round(v2.monthlyPricePaise / 100) : Number(row.price_cents),
+    yearlyPriceCents: v2 ? Math.round(v2.annualPricePaise / 100) : Number(row.yearly_price_cents),
     billingCadence: row.billing_cadence,
-    paidCreditAmount: Number(row.paid_credit_amount),
-    bonusCreditPercent: Number(row.bonus_credit_percent),
-    rolloverMonthsCap: Number(row.rollover_months_cap),
+    paidCreditAmount: v2?.monthlyCredits ?? Number(row.paid_credit_amount),
+    bonusCreditPercent: v2 ? 0 : Number(row.bonus_credit_percent),
+    rolloverMonthsCap: v2 ? 0 : Number(row.rollover_months_cap),
     isCustom: asBool(row.is_custom),
     isRecommended: asBool(row.is_recommended),
-    bonusTermsCopy: row.bonus_terms_copy,
-    features: parseFeatures(row.features_json),
+    bonusTermsCopy: v2 ? 'Managed-LLM credits never expire. Annual credits are released monthly.' : row.bonus_terms_copy,
+    features: v2?.features || parseFeatures(row.features_json),
     sortOrder: Number(row.sort_order),
+    pricePaise: v2?.monthlyPricePaise || 0,
+    yearlyPricePaise: v2?.annualPricePaise || 0,
+    priceIncludesTax: Boolean(v2),
+    providerBudgetPaise: v2?.providerBudgetPaiseMonthly || 0,
+    yearlyProviderBudgetPaise: v2?.providerBudgetPaiseAnnual || 0,
+    annualCreditAmount: v2?.annualCredits || 0,
+    annualReleaseSchedule: v2?.annualReleaseSchedule || null,
+    catalogVersion: v2 ? CREDIT_CATALOG_VERSION : 'legacy',
   };
 }
 
@@ -196,63 +223,77 @@ export const FALLBACK_PLANS: BillingPlan[] = [
     priceCents: 0,
     yearlyPriceCents: 0,
     billingCadence: 'monthly',
-    paidCreditAmount: 5,
+    paidCreditAmount: 0,
     bonusCreditPercent: 0,
     rolloverMonthsCap: 0,
     isCustom: false,
     isRecommended: false,
-    bonusTermsCopy:
-      'The Free plan includes a small monthly allotment of paid credits. Unused paid credits do not roll over, and this plan never receives bonus credits.',
-    features: ['1 project', 'Repo analysis agent', 'Basic security scan', 'Community support'],
+    bonusTermsCopy: 'Free organizations receive no managed-LLM credits. BYOK remains available.',
+    features: ['1 project', 'BYOK model access', 'Basic security scan', 'Community support'],
     sortOrder: 10,
+    pricePaise: 0, yearlyPricePaise: 0, priceIncludesTax: true,
+    providerBudgetPaise: 0, yearlyProviderBudgetPaise: 0, annualCreditAmount: 0,
+    annualReleaseSchedule: null, catalogVersion: CREDIT_CATALOG_VERSION,
   },
   {
     id: 'starter_20',
     name: 'starter_20',
     displayName: 'Starter',
-    description: 'For individuals shipping production workloads',
-    priceCents: 2000,
-    yearlyPriceCents: 19200,
+    description: 'Go from repo connect to approved AWS deploy without stitching scanners, agents, and Terraform yourself',
+    priceCents: 599,
+    yearlyPriceCents: 6499,
     billingCadence: 'monthly',
-    paidCreditAmount: 20,
-    bonusCreditPercent: 25,
-    rolloverMonthsCap: 1,
+    paidCreditAmount: 25,
+    bonusCreditPercent: 0,
+    rolloverMonthsCap: 0,
     isCustom: false,
     isRecommended: false,
-    bonusTermsCopy:
-      'Paid credits are granted at the start of each billing cycle. After you use every paid credit, up to 25% extra bonus credits unlock. Bonus credits expire at the end of the calendar month they were unlocked and never roll over. Unused paid credits may roll over for one additional month.',
-    features: ['Unlimited projects', 'Security scanning', 'Terraform generation', 'Email support'],
+    bonusTermsCopy: 'Managed-LLM credits never expire. Annual credits are released 25 per month.',
+    features: [
+      'Security Agent: SAST, dependency scans, and AI remediation',
+      'Terraform generation with plan review before every apply',
+      'DeplAI-managed LLMs — no vendor API keys required',
+      'Unlimited projects and deployment pipelines',
+      'Organization workspace to share with collaborators',
+      'Email support when something blocks your release',
+    ],
     sortOrder: 20,
+    pricePaise: 59900, yearlyPricePaise: 649900, priceIncludesTax: true,
+    providerBudgetPaise: 32500, yearlyProviderBudgetPaise: 390000, annualCreditAmount: 300,
+    annualReleaseSchedule: { creditsPerRelease: 25, interval: 'monthly', releases: 12 }, catalogVersion: CREDIT_CATALOG_VERSION,
   },
   {
     id: 'pro_50',
     name: 'pro_50',
     displayName: 'Pro',
-    description: 'For growing teams and platforms',
-    priceCents: 5000,
-    yearlyPriceCents: 48000,
+    description: 'For teams that need design iteration, fix velocity, and deploy confidence in one place',
+    priceCents: 1399,
+    yearlyPriceCents: 15199,
     billingCadence: 'monthly',
-    paidCreditAmount: 50,
-    bonusCreditPercent: 40,
-    rolloverMonthsCap: 2,
+    paidCreditAmount: 62.5,
+    bonusCreditPercent: 0,
+    rolloverMonthsCap: 0,
     isCustom: false,
     isRecommended: true,
-    bonusTermsCopy:
-      'Paid credits are granted at the start of each billing cycle. After you use every paid credit, up to 40% extra bonus credits unlock. Bonus credits expire at the end of the calendar month they were unlocked and never roll over. Unused paid credits may roll over for up to two additional months.',
+    bonusTermsCopy: 'Managed-LLM credits never expire. Annual credits are released 62.5 per month.',
     features: [
       'Everything in Starter',
-      'Frontend customizations',
-      'Vulnerability fixes',
-      'Traffic-based cost estimation',
-      'Priority support',
+      'UI/UX customizer for safe, frontend-only design changes',
+      'Guided vulnerability fixes with human review gates',
+      'Traffic-aware AWS cost estimates before infrastructure applies',
+      'Priority support for production incidents',
+      'Organization roles, teams, and shared billing context',
     ],
     sortOrder: 30,
+    pricePaise: 139900, yearlyPricePaise: 1519900, priceIncludesTax: true,
+    providerBudgetPaise: 81250, yearlyProviderBudgetPaise: 975000, annualCreditAmount: 750,
+    annualReleaseSchedule: { creditsPerRelease: 62.5, interval: 'monthly', releases: 12 }, catalogVersion: CREDIT_CATALOG_VERSION,
   },
   {
     id: ENTERPRISE_PLAN_ID,
     name: ENTERPRISE_PLAN_ID,
     displayName: 'Enterprise',
-    description: 'For large-scale operations',
+    description: 'For organizations that need governance, procurement fit, and predictable capacity at scale',
     priceCents: 0,
     yearlyPriceCents: 0,
     billingCadence: 'monthly',
@@ -262,30 +303,40 @@ export const FALLBACK_PLANS: BillingPlan[] = [
     isCustom: true,
     isRecommended: false,
     bonusTermsCopy:
-      'Enterprise credits are provisioned from your contract rather than standard plan math. Contact sales to set pooled allotments, seats, bonus terms, and rollover. Bonus credits still expire at calendar month-end after they unlock.',
+      'Credits and seats are provisioned from your contract. We align allotments to how your teams actually ship — not a one-size-fits-all shelf plan.',
     features: [
       'Everything in Pro',
-      'Custom contracts',
-      'Pooled credits across seats',
-      '24/7 dedicated support',
-      'SLA and security review',
+      'Pooled credits across seats and business units',
+      'Custom contracts, GST invoicing, and procurement workflows',
+      'Security policies, audit logs, and deployment evidence gates',
+      'Dedicated support channel with agreed response times',
+      'Onboarding and architecture review with the DeplAI team',
     ],
     sortOrder: 40,
+    pricePaise: 0, yearlyPricePaise: 0, priceIncludesTax: true,
+    providerBudgetPaise: 0, yearlyProviderBudgetPaise: 0, annualCreditAmount: 0,
+    annualReleaseSchedule: null, catalogVersion: CREDIT_CATALOG_VERSION,
   },
 ];
 
-export const FALLBACK_PACKS: CreditPack[] = [
-  { id: 'pack_10', name: '10 extra credits', creditAmount: 10, priceCents: 1200, paidTiersOnly: true },
-  { id: 'pack_25', name: '25 extra credits', creditAmount: 25, priceCents: 3200, paidTiersOnly: true },
-  { id: 'pack_50', name: '50 extra credits', creditAmount: 50, priceCents: 7000, paidTiersOnly: true },
-];
+export const FALLBACK_PACKS: CreditPack[] = CREDIT_PACKS.map((pack) => ({
+  id: pack.id,
+  name: pack.name,
+  creditAmount: pack.credits,
+  priceCents: Math.round(pack.pricePaise / 100),
+  paidTiersOnly: pack.paidTiersOnly,
+  pricePaise: pack.pricePaise,
+  providerBudgetPaise: pack.providerBudgetPaise,
+  catalogVersion: CREDIT_CATALOG_VERSION,
+}));
 
 export async function listPlans(): Promise<BillingPlan[]> {
   try {
     const rows = await query<PlanRow[]>(
       `SELECT * FROM billing_plans ORDER BY sort_order ASC, name ASC`,
     );
-    return rows.map(mapPlan);
+    const mapped = rows.map(mapPlan);
+    return mapped.filter((plan) => plan.id === ENTERPRISE_PLAN_ID || CREDIT_PLANS.some((item) => item.id === plan.id));
   } catch (error) {
     if (isMissingTable(error)) return FALLBACK_PLANS;
     throw error;
@@ -293,25 +344,7 @@ export async function listPlans(): Promise<BillingPlan[]> {
 }
 
 export async function listCreditPacks(): Promise<CreditPack[]> {
-  try {
-    const rows = await query<Array<{
-      id: string;
-      name: string;
-      credit_amount: number;
-      price_cents: number;
-      paid_tiers_only: number | boolean;
-    }>>(`SELECT * FROM credit_packs ORDER BY credit_amount ASC`);
-    return rows.map((row) => ({
-      id: row.id,
-      name: row.name,
-      creditAmount: Number(row.credit_amount),
-      priceCents: Number(row.price_cents),
-      paidTiersOnly: asBool(row.paid_tiers_only),
-    }));
-  } catch (error) {
-    if (isMissingTable(error)) return FALLBACK_PACKS;
-    throw error;
-  }
+  return FALLBACK_PACKS;
 }
 
 async function getPlan(exec: SqlExecutor, planId: string): Promise<BillingPlan> {
@@ -334,6 +367,9 @@ function resolveGrantAmounts(plan: BillingPlan, contract: ContractRow | null): {
   bonusPercent: number;
   rolloverMonthsCap: number;
 } {
+  if (plan.id === FREE_PLAN_ID) {
+    return { paidCreditAmount: 0, bonusPercent: 0, rolloverMonthsCap: 0 };
+  }
   if (plan.isCustom) {
     if (!contract) {
       return { paidCreditAmount: 0, bonusPercent: 0, rolloverMonthsCap: 0 };
@@ -605,25 +641,9 @@ export async function provisionCreditsOnRenewal(
   return withTransaction((exec) => provisionCreditsOnRenewalWithExec(exec, userId, planId, options));
 }
 
-export async function ensureUserBilling(userId: string): Promise<void> {
-  if (!isBillingEnforced()) return;
-  try {
-    const existingSub = await query<Array<{ id: string }>>(
-      `SELECT id FROM billing_subscriptions WHERE user_id = ? LIMIT 1`,
-      [userId],
-    );
-    if (existingSub[0]) return;
-    const existingLedger = await query<Array<{ id: string }>>(
-      `SELECT id FROM credit_ledgers WHERE user_id = ? LIMIT 1`,
-      [userId],
-    );
-    if (existingLedger[0]) return;
-    // TODO: rate-limit/cap free-tier grants per user/IP/payment-fingerprint once fraud tooling exists.
-    await provisionCreditsOnRenewal(userId, FREE_PLAN_ID, { source: 'free_tier_grant' });
-  } catch (error) {
-    if (isMissingTable(error)) return;
-    console.warn('ensureUserBilling failed', error);
-  }
+export async function ensureUserBilling(_userId: string): Promise<void> {
+  void _userId;
+  // v2 org wallets: free organizations receive zero managed credits. No user-ledger provisioning.
 }
 
 export async function consumeCredits(
@@ -648,19 +668,7 @@ export async function consumeCredits(
   }
 
   return withTransaction(async (exec) => {
-    let ledger = await currentLedgerForUpdate(exec, userId, now);
-    if (!ledger) {
-      const subs = await exec<Array<{ plan_id: string }>>(
-        `SELECT plan_id FROM billing_subscriptions WHERE user_id = ? LIMIT 1`,
-        [userId],
-      );
-      const planId = subs[0]?.plan_id || FREE_PLAN_ID;
-      if (!subs[0]) {
-        // TODO: rate-limit/cap free-tier grants per user/IP/payment-fingerprint once fraud tooling exists.
-      }
-      await provisionCreditsOnRenewalWithExec(exec, userId, planId, { now, source: 'free_tier_grant' });
-      ledger = await currentLedgerForUpdate(exec, userId, now);
-    }
+    const ledger = await currentLedgerForUpdate(exec, userId, now);
     if (!ledger) {
       throw new InsufficientCreditsError(0, 0);
     }
@@ -783,7 +791,7 @@ export async function getBalance(userId: string, options?: { now?: Date }): Prom
       const sub = await getSubscription(userId);
       return withReportedCreditBalance({
         planId: sub?.planId || FREE_PLAN_ID,
-        planName: sub?.planId || FREE_PLAN_ID,
+        planName: planDisplayName(sub?.planId || FREE_PLAN_ID),
         paidRemaining: 0,
         bonusRemaining: 0,
         bonusUnlocked: false,
@@ -797,7 +805,7 @@ export async function getBalance(userId: string, options?: { now?: Date }): Prom
     const expires = asDate(ledger.bonus_expires_at);
     return withReportedCreditBalance({
       planId: ledger.plan_id,
-      planName: planRows[0]?.name || ledger.plan_id,
+      planName: planDisplayName(ledger.plan_id) || planRows[0]?.display_name || ledger.plan_id,
       paidRemaining: Number(ledger.paid_credits_remaining),
       bonusRemaining: Number(ledger.bonus_credits_remaining),
       bonusUnlocked: asBool(ledger.bonus_unlocked),
@@ -810,7 +818,7 @@ export async function getBalance(userId: string, options?: { now?: Date }): Prom
     if (isMissingTable(error)) {
       return withReportedCreditBalance({
         planId: FREE_PLAN_ID,
-        planName: FREE_PLAN_ID,
+        planName: planDisplayName(FREE_PLAN_ID),
         paidRemaining: 0,
         bonusRemaining: 0,
         bonusUnlocked: false,
@@ -899,7 +907,7 @@ export async function grantTopUpCredits(
       `SELECT plan_id FROM billing_subscriptions WHERE user_id = ? LIMIT 1`,
       [userId],
     );
-    let ledger = await currentLedgerForUpdate(exec, userId, now);
+    const ledger = await currentLedgerForUpdate(exec, userId, now);
     const planId = ledger?.plan_id || planRows[0]?.plan_id || FREE_PLAN_ID;
     const plan = await getPlan(exec, planId);
     if (asBool(pack.paid_tiers_only) && plan.name === FREE_PLAN_ID && !options?.allowFreeTier) {
@@ -1011,7 +1019,7 @@ async function applyPlanChangeWithExec(
   const nextPlan = await getPlan(exec, input.nextPlanId);
   const contract = nextPlan.isCustom ? await getContract(exec, input.userId) : null;
   const nextGrant = resolveGrantAmounts(nextPlan, contract);
-  let ledger = await currentLedgerForUpdate(exec, input.userId, now);
+  const ledger = await currentLedgerForUpdate(exec, input.userId, now);
   if (!ledger) {
     return { paidRemaining: 0, bonusRemaining: 0, proratedDelta: 0 };
   }
@@ -1112,6 +1120,29 @@ export async function applyPlanChange(input: {
     }
     return applyPlanChangeWithExec(exec, input);
   });
+}
+
+export async function linkSubscriptionToOrganization(userId: string, organizationId: string): Promise<void> {
+  await query(
+    `UPDATE billing_subscriptions SET organization_id = ? WHERE user_id = ?`,
+    [organizationId, userId],
+  );
+}
+
+export async function getOrganizationSubscription(organizationId: string) {
+  const rows = await query<SubscriptionRow[]>(
+    `SELECT * FROM billing_subscriptions
+     WHERE organization_id = ? AND status IN ('active', 'trialing')
+     ORDER BY updated_at DESC LIMIT 1`,
+    [organizationId],
+  );
+  return rows[0] ? {
+    planId: rows[0].plan_id,
+    status: rows[0].status,
+    cadence: rows[0].billing_cadence,
+    razorpayCustomerId: rows[0].razorpay_customer_id ?? null,
+    razorpaySubscriptionId: rows[0].razorpay_subscription_id ?? null,
+  } : null;
 }
 
 export async function getSubscription(userId: string): Promise<{

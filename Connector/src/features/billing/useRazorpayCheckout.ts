@@ -8,8 +8,11 @@ export type RazorpayCheckoutPayload = {
   description: string;
   prefill?: { name?: string; email?: string };
   notes?: Record<string, string>;
-  order_id?: string;
-  subscription_id?: string;
+  order_id: string;
+  payment_id: string;
+  intent_id: string;
+  mode: 'test' | 'live';
+  test_charge: boolean;
 };
 
 export type VerifiedPayment = {
@@ -17,10 +20,11 @@ export type VerifiedPayment = {
   invoice_number: string;
 };
 
+export type CheckoutPhase = 'checkout' | 'verifying' | 'pending' | 'confirmed' | 'failed' | 'cancelled';
+
 type RazorpayHandlerResponse = {
   razorpay_payment_id: string;
   razorpay_order_id?: string;
-  razorpay_subscription_id?: string;
   razorpay_signature: string;
 };
 
@@ -45,23 +49,69 @@ function loadCheckoutScript(): Promise<RazorpayConstructor> {
     const script = found || document.createElement('script');
     script.src = src;
     script.async = true;
+    script.referrerPolicy = 'strict-origin-when-cross-origin';
     script.onload = () => {
       const ctor = razorpayCtor();
       if (ctor) resolve(ctor);
-      else reject(new Error('Razorpay checkout did not initialize'));
+      else reject(new Error('Secure checkout did not initialize'));
     };
-    script.onerror = () => reject(new Error('Failed to load Razorpay checkout'));
+    script.onerror = () => reject(new Error('Secure checkout could not be loaded'));
     if (!found) document.body.appendChild(script);
   });
 }
 
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function pollCanonicalStatus(paymentId: string): Promise<
+  | { status: 'paid'; invoice: VerifiedPayment }
+  | { status: 'failed'; message: string }
+  | { status: 'pending'; message: string }
+> {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    if (attempt > 0) await wait(1_500);
+    const response = await fetch(`/api/billing/payments/${encodeURIComponent(paymentId)}/status`, {
+      cache: 'no-store',
+    }).catch(() => null);
+    if (!response) continue;
+    const payload = await response.json().catch(() => ({})) as {
+      status?: string;
+      confirmed?: boolean;
+      invoice?: VerifiedPayment | null;
+      error?: string;
+    };
+    if (response.ok && payload.confirmed && payload.invoice) {
+      return { status: 'paid', invoice: payload.invoice };
+    }
+    if (payload.status === 'failed') {
+      return { status: 'failed', message: 'Payment failed. No access was activated.' };
+    }
+  }
+  return {
+    status: 'pending',
+    message: 'Payment is still being confirmed. No access has been activated yet.',
+  };
+}
+
 export function useRazorpayCheckout() {
-  const start = async (session: RazorpayCheckoutPayload): Promise<
+  const start = async (
+    session: RazorpayCheckoutPayload,
+    onPhase?: (phase: CheckoutPhase) => void,
+  ): Promise<
     | { status: 'paid'; invoice: VerifiedPayment }
     | { status: 'cancelled' }
+    | { status: 'pending'; message: string }
     | { status: 'failed'; message: string }
   > => {
-    const Razorpay = await loadCheckoutScript();
+    let Razorpay: RazorpayConstructor;
+    try {
+      Razorpay = await loadCheckoutScript();
+    } catch (error) {
+      onPhase?.('failed');
+      return { status: 'failed', message: error instanceof Error ? error.message : 'Secure checkout could not be loaded' };
+    }
+
     return new Promise((resolve) => {
       let settled = false;
       const finish = (result: Awaited<ReturnType<typeof start>>) => {
@@ -72,56 +122,77 @@ export function useRazorpayCheckout() {
 
       const options: Record<string, unknown> = {
         key: session.key_id,
+        order_id: session.order_id,
         amount: session.amount,
         currency: session.currency,
         name: session.name,
         description: session.description,
         prefill: session.prefill,
         notes: session.notes,
-        theme: { color: '#3b82f6' },
+        theme: { color: '#111111' },
         handler: async (response: RazorpayHandlerResponse) => {
+          onPhase?.('verifying');
           try {
             const verify = await fetch('/api/verify-payment', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
+                payment_id: session.payment_id,
                 razorpay_order_id: response.razorpay_order_id || session.order_id,
                 razorpay_payment_id: response.razorpay_payment_id,
-                razorpay_subscription_id: response.razorpay_subscription_id || session.subscription_id,
                 razorpay_signature: response.razorpay_signature,
               }),
             });
-            const payload = await verify.json() as { invoice_id?: string; invoice_number?: string; error?: string };
-            if (!verify.ok || !payload.invoice_id || !payload.invoice_number) {
-              finish({ status: 'failed', message: payload.error || 'Payment verification failed' });
+            const payload = await verify.json().catch(() => ({})) as {
+              pending?: boolean;
+              invoice_id?: string;
+              invoice_number?: string;
+              error?: string;
+            };
+            if (verify.ok && payload.invoice_id && payload.invoice_number) {
+              onPhase?.('confirmed');
+              finish({
+                status: 'paid',
+                invoice: { invoice_id: payload.invoice_id, invoice_number: payload.invoice_number },
+              });
               return;
             }
-            finish({
-              status: 'paid',
-              invoice: { invoice_id: payload.invoice_id, invoice_number: payload.invoice_number },
-            });
-          } catch (error) {
+            if (verify.status === 202 || payload.pending) {
+              onPhase?.('pending');
+              const result = await pollCanonicalStatus(session.payment_id);
+              onPhase?.(result.status === 'paid' ? 'confirmed' : result.status);
+              finish(result);
+              return;
+            }
+            onPhase?.('failed');
             finish({
               status: 'failed',
-              message: error instanceof Error ? error.message : 'Payment verification failed',
+              message: payload.error || 'We could not confirm the payment. No access has been activated yet.',
             });
+          } catch {
+            onPhase?.('pending');
+            const result = await pollCanonicalStatus(session.payment_id);
+            onPhase?.(result.status === 'paid' ? 'confirmed' : result.status);
+            finish(result);
           }
         },
         modal: {
-          ondismiss: () => finish({ status: 'cancelled' }),
+          ondismiss: () => {
+            onPhase?.('cancelled');
+            finish({ status: 'cancelled' });
+          },
         },
       };
-      if (session.order_id) options.order_id = session.order_id;
-      if (session.subscription_id) options.subscription_id = session.subscription_id;
 
       const checkout = new Razorpay(options);
-
       checkout.on('payment.failed', (response) => {
+        onPhase?.('failed');
         finish({
           status: 'failed',
           message: response.error?.description || response.error?.reason || 'Payment failed',
         });
       });
+      onPhase?.('checkout');
       checkout.open();
     });
   };

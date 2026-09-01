@@ -13,6 +13,11 @@ function topupIntent(overrides?: Partial<CheckoutIntent>): CheckoutIntent {
   return {
     id: 'intent_1',
     userId: 'user_1',
+    organizationId: null,
+    idempotencyKey: 'checkout_1234567890',
+    receipt: 'dpl_intent_1',
+    provider: 'razorpay',
+    paymentMode: 'test',
     kind: 'topup',
     planId: null,
     creditPackId: 'pack_10',
@@ -30,10 +35,19 @@ function topupIntent(overrides?: Partial<CheckoutIntent>): CheckoutIntent {
     buyerAddress: null,
     buyerStateCode: null,
     buyerStateName: null,
+    referralAttributionId: null,
+    discountPaise: 0,
     razorpayOrderId: 'order_1',
+    razorpayPaymentId: null,
     razorpaySubscriptionId: null,
     razorpayPlanId: null,
+    signatureVerified: false,
+    failureCode: null,
+    failureDescription: null,
+    capturedAt: null,
     status: 'pending',
+    createdAt: null,
+    updatedAt: null,
     ...overrides,
   };
 }
@@ -42,6 +56,7 @@ function invoice(paymentId: string): BillingInvoice {
   return {
     id: `inv_${paymentId}`,
     userId: 'user_1',
+    checkoutIntentId: 'intent_1',
     invoiceNumber: 'DPL-1',
     invoiceDate: '2026-08-27',
     status: 'paid',
@@ -123,6 +138,7 @@ const input: FulfillVerifiedInput = {
   paymentId: 'pay_concurrent',
   orderId: 'order_1',
   source: 'client_verify',
+  captured: true,
 };
 
 describe('webhookDeliveryDecision', () => {
@@ -178,6 +194,15 @@ describe('fulfillOnceLocked', () => {
     assert.equal(result.alreadyProvisioned, true);
     assert.equal(harness.grantCount(), 0);
     assert.equal(harness.paidIntents.has('intent_1'), true);
+  });
+
+  it('does not grant an entitlement without captured-payment evidence', async () => {
+    const harness = createHarness();
+    await assert.rejects(
+      () => fulfillOnceLocked({ ...input, captured: false } as unknown as FulfillVerifiedInput, harness.io),
+      /captured payment evidence/i,
+    );
+    assert.equal(harness.grantCount(), 0);
   });
 });
 

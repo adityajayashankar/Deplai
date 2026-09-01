@@ -3,12 +3,22 @@ import { requireAuth } from '@/lib/auth';
 import { ENTERPRISE_PLAN_ID, FREE_PLAN_ID, listPlans } from '@/lib/billing/credits';
 import { SALES_EMAIL } from '@/lib/billing/config';
 import { createPlanSubscriptionCheckout, isRazorpayConfigured, razorpayErrorMessage, razorpayHttpStatus } from '@/lib/billing/razorpay';
+import { takeBillingRateLimit } from '@/lib/billing/rate-limit';
+import { resolveBillingOrganization } from '@/lib/billing/organization-context';
 
 export const runtime = 'nodejs';
 
 export async function POST(request: NextRequest) {
   const auth = await requireAuth();
   if (auth.error) return auth.error;
+
+  const rateLimit = takeBillingRateLimit({ userId: auth.user.id, action: 'create_order' });
+  if (!rateLimit.allowed) {
+    return NextResponse.json(
+      { error: 'Too many checkout attempts. Please wait and try again.' },
+      { status: 429, headers: { 'Retry-After': String(rateLimit.retryAfterSeconds) } },
+    );
+  }
 
   if (!isRazorpayConfigured()) {
     return NextResponse.json(
@@ -20,6 +30,7 @@ export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => ({})) as {
     plan_id?: string;
     cadence?: 'monthly' | 'yearly';
+    idempotency_key?: string;
   };
   const planId = String(body.plan_id || '').trim();
   const cadence = body.cadence === 'yearly' ? 'yearly' : 'monthly';
@@ -36,12 +47,15 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    const organization = await resolveBillingOrganization({ request, user: auth.user, permission: 'billing.manage' });
     const checkout = await createPlanSubscriptionCheckout({
       userId: auth.user.id,
+      organizationId: organization.id,
       email: auth.user.email,
       name: auth.user.name,
       plan,
       cadence,
+      idempotencyKey: String(body.idempotency_key || ''),
     });
     return NextResponse.json(checkout);
   } catch (error) {

@@ -129,6 +129,61 @@ export function quoteInrCharge(input: {
   };
 }
 
+export function quoteGstInclusiveInrCharge(input: {
+  totalPaise: number;
+  gstPercent: number;
+  sellerStateCode: string;
+  buyerStateCode?: string | null;
+  displayAmountCents?: number;
+}): MoneyQuote {
+  if (!Number.isInteger(input.totalPaise) || input.totalPaise < 0) throw new Error('Invalid GST-inclusive INR total');
+  const taxablePaise = Math.round(input.totalPaise / (1 + input.gstPercent / 100));
+  const split = gstSplit({
+    taxablePaise,
+    gstPercent: input.gstPercent,
+    sellerStateCode: input.sellerStateCode,
+    buyerStateCode: input.buyerStateCode,
+  });
+  return retargetQuoteTotal({
+    displayAmountCents: input.displayAmountCents ?? Math.round(input.totalPaise / 100),
+    usdToInr: 0,
+    ...split,
+  }, input.totalPaise);
+}
+
+/** Preserve the real catalog price for display while making the provider total
+ * match the centrally resolved checkout amount. The GST split is recomputed so
+ * invoices always add up to the exact amount charged. */
+export function retargetQuoteTotal(quote: MoneyQuote, totalPaise: number): MoneyQuote {
+  if (!Number.isInteger(totalPaise) || totalPaise < 100) {
+    throw new Error('Payment total must be an integer of at least 100 paise');
+  }
+  if (quote.totalPaise === totalPaise) return quote;
+
+  const taxablePaise = Math.max(1, Math.round(totalPaise / (1 + quote.gstPercent / 100)));
+  const taxPaise = totalPaise - taxablePaise;
+  if (quote.taxSplit === 'intra') {
+    const cgstPaise = Math.floor(taxPaise / 2);
+    const sgstPaise = taxPaise - cgstPaise;
+    return {
+      ...quote,
+      taxablePaise,
+      cgstPaise,
+      sgstPaise,
+      igstPaise: 0,
+      totalPaise,
+    };
+  }
+  return {
+    ...quote,
+    taxablePaise,
+    cgstPaise: 0,
+    sgstPaise: 0,
+    igstPaise: taxPaise,
+    totalPaise,
+  };
+}
+
 export function normalizeStateCode(value: string | null | undefined): string {
   const digits = String(value || '').replace(/\D/g, '').slice(0, 2);
   return digits.padStart(2, '0').slice(-2) === '00' ? '' : digits.padStart(2, '0');

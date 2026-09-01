@@ -1,25 +1,29 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
-import { getBalance, getSubscription } from '@/lib/billing/credits';
+import { getOrganizationSubscription } from '@/lib/billing/credits';
+import {
+  getOrganizationCreditBalance,
+  publicCreditBalance,
+  reconcileOrganizationSubscriptionCredits,
+} from '@/lib/billing/organization-credits';
+import { planDisplayName } from '@/lib/billing/credit-catalog';
+import { resolveBillingOrganization } from '@/lib/billing/organization-context';
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   const auth = await requireAuth();
   if (auth.error) return auth.error;
 
   try {
-    const balance = await getBalance(auth.user.id);
-    const subscription = await getSubscription(auth.user.id).catch(() => null);
+    const organization = await resolveBillingOrganization({ request, user: auth.user, permission: 'billing.read' });
+    await reconcileOrganizationSubscriptionCredits(organization.id).catch(() => null);
+    const balance = await getOrganizationCreditBalance(organization.id);
+    const subscription = await getOrganizationSubscription(organization.id).catch(() => null);
+    const planId = subscription?.planId || 'free';
 
     return NextResponse.json({
-      paid_remaining: balance.paidRemaining,
-      bonus_remaining: balance.bonusRemaining,
-      bonus_unlocked: balance.bonusUnlocked,
-      bonus_expires_at: balance.bonusExpiresAt,
-      total: balance.total,
-      plan_id: balance.planId,
-      plan_name: balance.planName,
-      cycle_start: balance.cycleStart,
-      cycle_end: balance.cycleEnd,
+      ...publicCreditBalance(balance),
+      plan_id: planId,
+      plan_name: planDisplayName(planId),
       subscription,
     });
   } catch (error) {

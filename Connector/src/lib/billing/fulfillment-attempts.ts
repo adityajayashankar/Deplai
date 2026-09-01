@@ -5,6 +5,30 @@ import { ensureFulfillmentSchema } from './fulfillment-schema';
 export type FulfillmentSource = 'webhook' | 'client_verify' | 'admin_retry';
 export type FulfillmentAttemptStatus = 'processing' | 'completed' | 'failed';
 
+const SENSITIVE_PAYMENT_FIELDS = new Set([
+  'card',
+  'contact',
+  'email',
+  'vpa',
+  'bank',
+  'wallet',
+  'acquirer_data',
+  'razorpay_signature',
+]);
+
+export function sanitizePaymentPayload(value: unknown, depth = 0): unknown {
+  if (depth > 5) return '[truncated]';
+  if (Array.isArray(value)) return value.slice(0, 20).map((entry) => sanitizePaymentPayload(entry, depth + 1));
+  if (!value || typeof value !== 'object') {
+    return typeof value === 'string' && value.length > 512 ? `${value.slice(0, 512)}…` : value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => !SENSITIVE_PAYMENT_FIELDS.has(key.toLowerCase()))
+      .map(([key, entry]) => [key, sanitizePaymentPayload(entry, depth + 1)]),
+  );
+}
+
 function isMissingTable(error: unknown): boolean {
   const code = (error as { code?: string }).code;
   return code === 'ER_NO_SUCH_TABLE' || code === 'ER_BAD_TABLE_ERROR';
@@ -18,7 +42,7 @@ export async function startFulfillmentAttempt(input: {
 }): Promise<string> {
   await ensureFulfillmentSchema();
   const id = uuidv4();
-  const payload = input.rawPayload == null ? null : JSON.stringify(input.rawPayload);
+  const payload = input.rawPayload == null ? null : JSON.stringify(sanitizePaymentPayload(input.rawPayload));
   try {
     await query(
       `INSERT INTO billing_fulfillment_attempts
