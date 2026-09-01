@@ -1,65 +1,71 @@
 # How it works
 
-From a connected repository (or ZIP) to a pull request or an AWS apply, work stays on one **project** in the workspace.
+From a connected repository (or ZIP) to a pull request or an AWS apply, work stays on one **project** in the workspace. Organizations add members, roles, and deployment gates on top.
 
 ```mermaid
 flowchart TD
   A[Sign in with GitHub] --> B[Install GitHub App or upload ZIP]
-  B --> C[Select the project]
-  C --> D[Security Agent]
-  C --> E[UI/UX customizer]
-  C --> F[Deploy]
-  D --> D1[Scan]
-  D1 --> D2[Results]
-  D2 --> D3[Agent setup]
-  D3 --> D4[Remediation]
-  D4 --> D5[Review]
-  D5 --> D6[GitHub and verify]
-  E --> E1[Frontend-only edits]
-  E1 --> E2[Final review]
-  F --> F1[Analyze the repo]
-  F1 --> F2[Choose a deployment profile]
-  F2 --> F3[Generate Terraform]
-  F3 --> F4[Read the plan]
-  F4 --> F5[Confirm]
-  F5 --> F6[Apply in your AWS account]
+  B --> C[Select project]
+  C --> O{Organization?}
+  O -->|yes| O1[Members roles policies]
+  O -->|no| D[Services]
+  O1 --> D
+  D --> SA[Security Agent]
+  D --> DAST[DAST verified targets]
+  D --> UX[UI/UX customizer]
+  D --> DEP[Deploy]
+  SA --> SA1[Scan to GitHub verify]
+  DAST --> SA
+  DEP --> DEP1[Plan confirm apply]
+  DEP1 --> IM[Instance Management]
 ```
 
 ## Connect a repo
 
-1. Sign in with GitHub. DeplAI asks only for identity: email, profile, and org membership so you can pick the right account.
-2. Install the GitHub App and grant the repositories you want DeplAI to see. Anything you do not grant will not appear.
-3. Or upload a ZIP from the project picker if the code is not in GitHub yet.
+1. Sign in with GitHub—identity only (email, profile, org membership).
+2. Install the GitHub App and grant repositories DeplAI may access.
+3. Or upload a ZIP from the project picker.
 
-Signing in does **not** let DeplAI push to your default branch. Pull requests use the GitHub App, and only after you approve **Review**.
+Signing in does **not** authorize pushes to your default branch. Pull requests use the GitHub App after you approve **Review**.
 
 ## Security path (repo → PR)
 
 | Stage | What you do |
 | --- | --- |
-| **Scan** | Run SAST, SCA, or Full Scan. |
-| **Results** | Read grouped findings and choose what to fix. |
-| **Agent setup** | Pick a platform or BYOK model. Optional GitHub PAT for that push only. |
-| **Remediation** | The agent proposes diffs. Nothing is pushed yet. |
-| **Review** | You approve before anything is persisted to GitHub. |
-| **GitHub & verify** | DeplAI opens or updates a pull request, then re-scans. |
+| **Scan** | SAST, SCA, or Full Scan; optional DAST when a verified target exists. |
+| **Results** | Review grouped findings; export or select for remediation. |
+| **Agent setup** | Pick platform or BYOK model; optional GitHub PAT for one push. |
+| **Remediation** | Agent proposes diffs; nothing persisted yet. |
+| **Review** | Approve or reject before GitHub write. |
+| **GitHub & verify** | Pull request opened or updated; rescan. |
 
-Details: [Security Agent](agents/security-agent.md).
+Details: [Security Agent](agents/security-agent.md) · [DAST](dast.md).
 
 ## Deploy path (repo → AWS)
 
-Deploy reads the repository, helps you choose a profile and budget, generates Terraform, shows a plan, and applies **only after you confirm**. Azure and GCP may appear in cost notes; apply in this product is AWS.
+Deploy analyzes the repo, helps choose a profile and budget, generates Terraform, shows a **plan**, and applies **only after you confirm**. Organization **Security policy** may block apply until scan evidence passes.
 
-Details: [Deploy](agents/deploy.md).
+After apply, **Instance Management** covers start/stop/restart/destroy for tagged resources.
+
+Details: [Deploy](agents/deploy.md) · [Instance management](instance-management.md).
 
 ## UI/UX path (frontend only)
 
-UI/UX customizer restyles the frontend. It does not change APIs or other business logic. You review diffs and can open a PR when the project is on GitHub.
+UI/UX customizer restyles the frontend without changing APIs or backend business logic. Review diffs and open a PR on GitHub projects.
 
 Details: [UI/UX customizer](agents/uiux-customizer.md).
 
+## Account and governance
+
+| Area | Path | Role |
+| --- | --- | --- |
+| **Billing** | `/dashboard/billing` | Plans + credit packs; Razorpay INR checkout. |
+| **Organizations** | `/dashboard/organization` | Teams, roles, policies, audit. |
+| **BYOK** | `/dashboard/ai` | Keys, catalog, compare, usage. |
+| **Profile / Usage / Invoices** | `/profile`, `/dashboard/usage`, `/dashboard/invoices` | Identity, activity wrap, PDFs. |
+
 ## After a run finishes
 
-Open **Sessions** to find past Security Agent, UI/UX, and Deploy runs and their logs.
+Open **Sessions** for Security Agent, UI/UX, and Deploy history and logs. Live work resumes from the service page, not from Sessions alone.
 
-Related: [Getting started](getting-started.md) · [Sessions](sessions.md) · [Security and data](security-and-data.md) · [Billing](billing.md)
+Related: [Getting started](getting-started.md) · [Organizations](organizations.md) · [Billing](billing.md) · [Sessions](sessions.md)

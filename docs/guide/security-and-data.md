@@ -1,132 +1,119 @@
 # Security and data handling
 
-What DeplAI can access, what you approve, and what **BYOK** changes. This page does not describe DeplAI’s internal hosting or how the platform stores its own credentials.
+What DeplAI can access, what you approve, and what **BYOK** changes. This page describes customer-visible behavior—not DeplAI’s internal hosting architecture.
 
 ## GitHub
 
 ### Sign-in
 
-GitHub login is identity only:
+GitHub login is **identity only**:
 
-| GitHub asks for | Why |
+| GitHub scope | Why |
 | --- | --- |
-| Email | Bind your DeplAI user to an email. |
+| Email | Bind your DeplAI user. |
 | Profile | Display name, login, avatar. |
-| Organization membership | So you can pick the right GitHub App install. |
+| Organization membership | Pick the correct GitHub App installation. |
 
-That grant does **not** include repository contents. You still install the GitHub App and choose which repos DeplAI may see.
+Repository contents require the **GitHub App** install and repo grant.
 
 ### Repositories
 
-You pick the repositories when you install the GitHub App. DeplAI clones those repos on its servers for scans and analysis. A ZIP upload is stored under your account instead of GitHub.
+You choose repositories when installing the GitHub App. DeplAI clones granted repos for scans and analysis. ZIP uploads are stored under your account.
 
-Pull requests use the GitHub App with **Contents: Read & write** and **Pull requests: Read & write**. Those permissions are used only after you approve **Review**. They are not your OAuth login token.
+Pull requests use the GitHub App (**Contents: Read & write**, **Pull requests: Read & write**) only after you approve **Review**—not your OAuth login token.
 
 ### Optional GitHub PAT
 
-On **Agent setup** (page heading **Configure AI Agent**) the field **GitHub PAT (Optional)** is for that run’s push only. Copy on the field: it is not stored persistently. Use it if the GitHub App token cannot create the PR.
+On **Agent setup** (**Configure AI Agent**), **GitHub PAT (Optional)** applies to that remediation push only. It is not stored in BYOK keys.
 
-ZIP projects can still produce diffs. They cannot open a GitHub pull request until the project is a GitHub repo.
+## AWS and cloud accounts
 
-## AWS
+Deploy and **Instance Management** use AWS credentials you provide or an organization-approved cloud account. DeplAI can create, start/stop/reboot, and destroy **project-tagged** resources. Scope IAM principals narrowly. Charges appear on **your AWS bill**.
 
-Deploy uses the AWS credentials you submit for that run. DeplAI can create, start/stop/reboot, and destroy **project-tagged** resources from the Deploy UI. Scope the IAM principal you provide. AWS usage is billed to that account, not as DeplAI credits.
+Organization **Cloud & AI** tracks which accounts are approved for members. See [Organizations](organizations.md).
+
+## DAST and authorization
+
+Dynamic tests run only against **verified** targets (DNS or HTTP proof). Unverified hosts are rejected. Do not configure targets you do not own or lack written permission to test.
 
 ## Your code, keys, and logs
 
-| What | What happens |
+| Asset | Handling |
 | --- | --- |
-| Repository or ZIP | Held on DeplAI servers for the duration of scans, customization, and deploy work. |
-| Scan / remediation | Progress is live in the workspace. If you close the tab, reopen **Sessions** for logs. |
-| Terraform plan / apply | Stays with that Deploy run. Confirm the plan before apply. |
-| BYOK keys | You save them under **BYOK → Credentials**. They are encrypted. The UI shows a masked suffix only, never the full key. |
-| GitHub PAT on Agent setup | Sent with that one remediation start. Not saved in Credentials. |
-| LLM prompts and replies | Not stored unless you turn on **Prompt logging** or **Response logging** under **BYOK → Policies** (both off by default). |
+| Repository or ZIP | Held on DeplAI servers for active scans, customization, deploy work. |
+| Scan / remediation | Live in the workspace; **Sessions** for history if you leave the tab. |
+| Terraform plan / apply | Tied to the Deploy session; confirm before apply. |
+| BYOK keys | Encrypted at **BYOK → Keys**; UI shows masked suffix only. |
+| GitHub PAT on Agent setup | One-run push only; not saved as a credential. |
+| LLM prompts / responses | Not stored by default; logging toggles may exist in advanced workspace policy. |
 
-DeplAI is not the source of record. GitHub remains the repository of record. Your AWS account remains the account of record.
+DeplAI is not the system of record—GitHub for code, your AWS account for infrastructure.
 
 ## BYOK across the platform
 
-**BYOK** means the model call uses a provider key **you** stored, not DeplAI’s platform keys.
+**BYOK** means the model call uses a provider key **you** stored, not DeplAI platform keys.
 
-Add keys at **BYOK → Credentials** (`/dashboard/byok` opens the same page). Validate the key; you will see statuses such as **VALID**. Full key material is never shown again.
+Add keys at **BYOK → Keys** (`/dashboard/ai`). Validate; status shows **VALID** when healthy. Full key material is never shown again.
 
 ```mermaid
 flowchart TD
-  C[BYOK: Credentials] --> P[Agent setup / UI/UX / Playground / Routing]
-  P --> M{Who pays the provider?}
-  M -->|Platform| Plat[DeplAI keys]
+  K[BYOK Keys] --> P[Agent setup / UI/UX / Compare]
+  P --> M{Access mode}
+  M -->|Platform| Plat[DeplAI keys — credits]
   M -->|BYOK| Key[Your key]
-  M -->|Auto| Auto[Your key if saved, otherwise platform]
-  Plat --> U[BYOK: Usage and Costs]
+  M -->|Auto| Auto[Your key if saved else platform]
+  Plat --> U[BYOK Usage]
   Key --> U
   Auto --> U
 ```
 
-### Access modes
+### BYOK navigation
 
-Security Agent **Agent setup** and UI/UX customizer use **Platform**, **BYOK**, and **Auto**. **Routing** uses the same three values with different labels:
-
-| Picker | Routing | Meaning |
+| Item | Path | Purpose |
 | --- | --- | --- |
-| **Platform** | **Platform only** | DeplAI-hosted keys. Blocked if **BYOK required** is on. Free plan: **Best fast** and **Best cost** only. |
-| **BYOK** | **BYOK only** | Your saved key. Fails if none is valid for that provider. |
-| **Auto** | **BYOK preferred** | Use your key if one is saved; otherwise platform. |
+| **Keys** | `/dashboard/ai` | Add, validate, revoke provider keys. |
+| **Catalog** | `/dashboard/ai/catalog` | Models and providers available to the workspace. |
+| **Compare** | `/dashboard/ai/compare` | Side-by-side model comparison / playground. |
+| **Usage** | `/dashboard/ai/usage` | Tokens, requests, estimated USD—platform vs BYOK. |
 
-Defaults on **Agent setup**:
+**Dashboard → Usage** is a year-style activity summary. **BYOK → Usage** is LLM token metering.
 
-| Plan | BYOK key saved? | Starts on | Default model |
-| --- | --- | --- | --- |
-| Starter / Pro / Enterprise | either | **Platform** | **Best coding** |
-| Free | yes | **BYOK** | **Best fast** unless you change it |
-| Free | no | **Platform** | **Best fast** |
+### Access modes (agents)
 
-### BYOK nav
-
-| Item | What it is |
+| Picker label | Meaning |
 | --- | --- |
-| **Overview** | Counts of models, keys, and provider health. |
-| **Playground** | Chat with an explicit access mode. Same model routing as agents. |
-| **Models** | Catalog of models you can pick. |
-| **Providers** | Which vendors are available, and whether BYOK is supported. |
-| **Credentials** | Add, validate, or revoke keys. Masked suffix only. |
-| **Routing** | Per-task alias and access mode. |
-| **Policies** | Workspace gates (table below). |
-| **Usage** | Token and request totals, platform vs BYOK. Last 30 days. |
-| **Costs** | Estimated USD, platform vs BYOK. |
-| **Health** | Whether a provider looks healthy. |
-| **Audit** | Credential and routing events. |
+| **Platform** | DeplAI-hosted keys; gated by plan and credits. Free: **Best fast**, **Best cost** only. |
+| **BYOK** | Your saved key; fails if none valid for that provider. |
+| **Auto** | Your key if present; otherwise platform. |
 
-**Dashboard → Usage** is a year-style activity wrap. **BYOK → Usage** is LLM token metering.
+**Your Profile → Routing** sets workspace-default routing modes that align with these picks.
 
-### Policies
-
-| Title | Effect |
-| --- | --- |
-| **BYOK required** | Every call must use your key. Platform keys are ignored. |
-| **Platform credentials** | Allow DeplAI keys when Auto is on or no customer key is present. |
-| **Fallback allowed** | If the chosen model fails, try another eligible model. |
-| **Cross-provider fallback** | A fallback may use a different vendor. |
-| **Prompt logging** | Store prompt text. Off by default. |
-| **Response logging** | Store model output. Off by default. |
-| **Spend and token caps** | Optional limits. Empty means no cap. |
-| **Allowed providers** | Empty = all. A selection is an allowlist. |
-
-### What BYOK changes
-
-- The provider invoice goes to **your** account.
-- DeplAI still sends the prompt the workflow needs (findings, frontend context, chat). Your clone or ZIP is unchanged.
-- **Usage** and **Costs** split platform vs BYOK. Platform calls show list price plus a platform surcharge. BYOK calls show $0 provider cost on DeplAI’s side (you pay the vendor) plus a platform surcharge. The USD is on **Costs**, not subtracted from credits. See [Billing](billing.md).
-
-### Where you pick it
+### Where you choose access mode
 
 | Surface | Control |
 | --- | --- |
-| Security Agent → **Agent setup** | **Platform** / **BYOK** / **Auto** + model. Optional GitHub PAT. |
-| UI/UX customizer | Same picker. If blocked: “Choose a platform model or a saved BYOK credential first.” |
-| Deploy | Uses the same access-mode setting when an LLM refine step runs. |
-| **Playground** / **Routing** | Explicit access mode. |
+| Security Agent → **Agent setup** | Platform / BYOK / Auto + model; optional GitHub PAT. |
+| UI/UX customizer | Same picker before start. |
+| Deploy | Same setting when an LLM refine step runs. |
+| **Compare** | Explicit mode for ad-hoc chat. |
 
-On Free, flagship **platform** models stay locked until you add a BYOK key or upgrade to Starter.
+### What BYOK changes economically
 
-Related: [Security Agent](agents/security-agent.md) · [Billing](billing.md) · [Core concepts](concepts.md)
+- Provider invoice goes to **your** vendor account for BYOK calls.
+- DeplAI still processes workflow context (findings, frontend files) required for the task.
+- **Usage** splits platform vs BYOK; USD estimates on Usage—not deducted from credits. See [Billing](billing.md).
+
+## Organization security
+
+- **Roles** limit who can connect repos, run agents, approve deploys, or read audit logs.
+- **Security policy** can require scan types and block deploys on critical findings or secrets.
+- **Audit log** records membership and governance events (role-dependent).
+
+## Compliance-oriented practices
+
+- Use **Organizations** with least-privilege roles in production workspaces.
+- Prefer BYOK when contractual data residency requires your provider agreement.
+- Download **Invoices** and audit exports for your retention policy.
+- Rotate BYOK keys from **Keys** after personnel changes.
+
+Related: [Organizations](organizations.md) · [Billing](billing.md) · [DAST](dast.md) · [Security Agent](agents/security-agent.md)

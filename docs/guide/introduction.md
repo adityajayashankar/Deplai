@@ -1,17 +1,35 @@
 # Introduction
 
-DeplAI is a workspace that takes one application — a GitHub repository you authorize, or a ZIP you upload — through security review, optional source fixes, frontend-only UI changes, and an AWS deploy that does not run until you confirm the Terraform plan.
+DeplAI is an application delivery workspace: connect a **GitHub repository** or **ZIP**, run security and dynamic testing, optionally fix findings and restyle the frontend, generate AWS infrastructure as Terraform, and apply only after you confirm the plan.
 
-It exists because those steps usually live in different tools. A scan report sits in one place, a pull request in another, architecture notes in a third, and `terraform apply` in a fourth. Context drops between them. DeplAI keeps the work on one **project**, owned by the GitHub account you signed in with.
+Those steps usually live in different tools—a scanner, a PR bot, a diagram, and a terminal. Context drops between them. DeplAI keeps work on one **project** (and optionally one **organization**) with explicit human gates before anything mutates source or cloud.
 
-You stay in control of anything that mutates source or cloud:
+## What you control
 
-- Security Agent proposes diffs; **Review** is the gate before they persist, and **GitHub & verify** is how a pull request is opened.
-- UI/UX customizer edits frontend files only. It identifies business-logic boundaries and fails a run if those files change.
-- Deploy generates Terraform, shows a plan, and waits until you confirm before apply.
+| Action | Gate |
+| --- | --- |
+| Source fixes from Security Agent | **Review** before persist; **GitHub & verify** for pull requests. |
+| Frontend changes | UI/UX customizer is frontend-only; business-logic files fail **Functional safety**. |
+| Cloud changes | Deploy shows a Terraform **plan**; **no apply** until you confirm. |
+| Dynamic testing | DAST runs only against **verified** targets you authorize. |
+| Model calls | **Platform** credits or **BYOK** keys you store; routing on **Your Profile**. |
 
-DeplAI is not a managed cloud account and not the source of record. GitHub remains the repository of record. The AWS account you point Deploy at remains the account of record. LLM calls can use DeplAI platform credentials (gated by your plan) or **BYOK** keys you store under **BYOK → Credentials**.
+DeplAI is not a managed cloud account. **GitHub** remains the repository of record. **Your AWS account** remains the infrastructure of record. DeplAI orchestrates; you approve.
 
-**Who it is for.** A team that already has an application and wants a repeatable path: connect the repo, scan it, optionally fix what the scanners found, optionally restyle the frontend, then generate and apply AWS infrastructure with a human confirmation in between.
+## Who it is for
 
-Related: [Core concepts](concepts.md) · [How it works](how-it-works.md) · [Getting started](getting-started.md)
+- **Developers** shipping features who want scan → fix → PR in one flow.
+- **DevOps / platform** teams generating Terraform and operating instances after apply.
+- **Security** teams requiring SAST, SCA, secrets, and DAST evidence before production.
+- **Admins** governing members, roles, billing, and audit in **Organizations**.
+
+## Where to go next
+
+| Goal | Start here |
+| --- | --- |
+| First scan in 10 minutes | [Getting started](getting-started.md) |
+| Team setup | [Organizations](organizations.md) |
+| Plans and Razorpay checkout | [Billing](billing.md) |
+| Keys and data handling | [Security and data](security-and-data.md) |
+
+Related: [Core concepts](concepts.md) · [How it works](how-it-works.md)

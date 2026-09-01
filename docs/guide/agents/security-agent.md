@@ -1,85 +1,406 @@
 # Security Agent
 
-Security Agent scans a project, shows findings, then (if you continue) proposes source fixes and can open a GitHub pull request. The stage rail is labeled **Pipeline**.
+**Security Agent** is DeplAI’s end-to-end application security workflow: scan a connected project, review grouped findings, configure an AI remediation agent, approve proposed fixes, and—when you use GitHub—open a pull request and verify the result with a follow-up scan.
+
+Open it from **Services → Security Agent** after selecting a **project** in the workspace nav. The URL is `/dashboard/security-analysis/{projectId}`.
+
+DeplAI is not a black-box auto-patcher. Every change to source code waits for your **Review** approval. Pull requests use the **GitHub App**, not your OAuth login token.
+
+---
+
+## At a glance
+
+| Question | Answer |
+| --- | --- |
+| **What does it scan?** | Source (SAST), dependencies (SCA/SBOM), secrets, IaC, containers, Kubernetes, CI/CD, APIs, optional DAST, and cloud posture when available. |
+| **What does it fix?** | Proposes source patches for selected findings; you approve before anything is written. |
+| **What does it need?** | A GitHub project or ZIP upload, scan modules enabled, and—for remediation—a platform model or BYOK key. |
+| **What is the output?** | Grouped findings, proposed diffs, optional GitHub PR, PDF report, and a **Session** record. |
+
+---
+
+## Pipeline overview
+
+The stage rail is labeled **Pipeline**. The header shows progress such as `01 / 06 · Scan`. Later stages stay **locked** until the previous stage completes.
 
 ```mermaid
 flowchart LR
-  S[Scan] --> R[Results]
-  R --> A[Agent setup]
-  A --> M[Remediation]
-  M --> V[Review]
-  V --> G[GitHub and verify]
+  S[01 Scan] --> R[02 Results]
+  R --> A[03 Agent setup]
+  A --> M[04 Remediation]
+  M --> V[05 Review]
+  V --> G[06 GitHub and verify]
 ```
 
-| Stage | What goes in | What you get |
-| --- | --- | --- |
-| **Scan** | The selected project and pipeline modules | Code, dependency, secret, infrastructure, API, and optional DAST findings |
-| **Results** | The finished scan | Grouped findings you can select |
-| **Agent setup** | Your plan and BYOK vault | The model that will propose fixes |
-| **Remediation** | Selected findings + that model | Proposed diffs; you may run another round |
-| **Review** | Proposed diffs | Your approval, or you stop |
-| **GitHub & verify** | Approved diffs | Pull request, then a rescan |
+```mermaid
+stateDiagram-v2
+  [*] --> Scan
+  Scan --> Results: scan completes
+  Results --> AgentSetup: continue to remediation
+  AgentSetup --> Remediation: model ready
+  Remediation --> Review: diffs proposed
+  Review --> GitHubVerify: approved
+  Review --> [*]: rejected or stopped
+  GitHubVerify --> [*]: PR + rescan done
+```
 
-## Scan
+| Stage | UI label | What goes in | What you get |
+| --- | --- | --- | --- |
+| **01** | **Scan** | Project + selected modules | Raw findings from all enabled scanners |
+| **02** | **Results** | Finished scan | KPIs, grouped findings, export, remediation entry |
+| **03** | **Agent setup** | Plan + model access | Configured AI agent (page title: **Configure AI Agent**) |
+| **04** | **Remediation** | Selected findings + model | Proposed diffs only—nothing written to GitHub yet |
+| **05** | **Review** | Proposed diffs | Approve, reject, or copy patches manually |
+| **06** | **GitHub & verify** | Approved diffs | PR opened/updated + verification rescan |
 
-| Dialog label | What runs |
+---
+
+## Stage 1 — Scan
+
+### Quick-start presets
+
+When you launch a scan, choose a preset or customize modules:
+
+| Preset | What runs |
 | --- | --- |
-| **SAST** | Static code analysis. Grouped by CWE under code security. |
-| **SCA** | Inventory + CVE match. Grouped by package/CVE under supply chain. |
-| **Full Scan** | Both, plus secret scanning and infrastructure / Kubernetes / CI/CD / API checks when matching files exist. |
+| **SAST** | Static application security testing—injection, XSS, and similar code patterns. |
+| **SCA** | Dependency inventory and CVE matching (supply chain). |
+| **Full Scan** (recommended) | SAST + SCA + secrets + infrastructure checks when matching files exist. DAST is configured separately. |
 
-Dynamic testing (DAST) is configured inside Security Agent with an authorized public URL. It is not a generic “attack this target” control.
+### Pipeline modules
 
-Severity is `critical`, `high`, `medium`, or `low`. Remediation’s **major** scope is critical and high.
+On the **Scan** stage you can enable individual modules:
 
-Leave the tab open while the scan runs. When it completes, the pipeline moves to **Results**.
-
-## Results
-
-Code findings share a CWE (for example `CWE-79`). Supply-chain findings share a CVE and package. Counts are occurrences, not separate root causes.
-
-Example from a real scan-report fixture:
-
-| Category | Identifier | Detail |
+| Module | What it checks | When it is skipped |
 | --- | --- | --- |
-| SCA | `CVE-2021-23337` | `lodash` `4.17.20`, severity `high` |
-| SAST | `CWE-79` | Cross-site scripting grouping |
+| **SAST** | Static code analysis | No scannable source for the configured languages |
+| **SCA** | Known vulnerabilities in dependencies | No lockfiles or manifests detected |
+| **SBOM** | Software bill of materials inventory | Same as SCA prerequisites |
+| **Secrets** | Hard-coded credentials and tokens | No matching paths |
+| **IaC** | Infrastructure-as-code misconfigurations | No Terraform/CloudFormation/etc. files |
+| **Containers** | Container image and Dockerfile issues | No container artifacts |
+| **Kubernetes** | Workload and manifest security | No Kubernetes manifests |
+| **CI/CD** | Pipeline and workflow security | No CI config files |
+| **API Security** | OpenAPI/Swagger and API surface risks | No API specs detected |
+| **DAST** | Dynamic tests against a **verified** HTTP target | No verified target linked—see [DAST](../dast.md) |
+| **Cloud** | Live AWS posture (Results tab) | Shown after deploy when cloud context exists |
 
-An SCA fix usually bumps the package toward Grype’s fix version. A SAST fix is a source patch at the reported file and line.
+Skipped modules display a reason in the scan output—they are not treated as failures.
 
-## Agent setup
+### Severity model
 
-This is the model picker, not a second scan. The page heading is **Configure AI Agent**; the rail still says **Agent setup**.
+Findings use four severities: **critical**, **high**, **medium**, and **low**.
 
-| Access mode | What DeplAI uses |
+Remediation’s default **major** scope includes **critical** and **high** only. You can widen scope when starting remediation.
+
+### Running the scan
+
+1. Select your **project** in the workspace nav.
+2. Open **Security Agent**.
+3. Choose presets or enable modules on **Scan**.
+4. If using **DAST**, select a **verified target** (configured under **Services → DAST**).
+5. Click **Run first scan** (or equivalent run control).
+6. **Keep the browser tab open** while the scan runs. When it completes, the pipeline advances to **Results**.
+
+```mermaid
+sequenceDiagram
+  participant You
+  participant DeplAI
+  participant Scanners
+  participant Target as Verified DAST target
+
+  You->>DeplAI: Enable modules + Run scan
+  DeplAI->>Scanners: SAST / SCA / Secrets / IaC / ...
+  opt DAST enabled
+    DeplAI->>Target: Authorized dynamic tests only
+    Target-->>DeplAI: Runtime findings
+  end
+  Scanners-->>DeplAI: Normalized findings
+  DeplAI-->>You: Results stage unlocked
+```
+
+---
+
+## Stage 2 — Results
+
+### Results surfaces
+
+The **Results** stage organizes evidence for triage:
+
+| Surface | Contents |
 | --- | --- |
-| **Platform** | DeplAI-hosted keys. Free: **Best fast**, **Best cost**. Starter and above: full list including **Best coding**. |
-| **BYOK** | A key from **BYOK → Credentials**. |
-| **Auto** | Your key if one is saved; otherwise platform. |
+| **Overview** | Summary KPIs and entry to remediation |
+| **Findings** | Primary vulnerability list with filters |
+| **Secrets** | Exposed credentials and sensitive values |
+| **Supply Chain** | Packages, CVEs, fix versions |
+| **Infrastructure** | IaC and cloud configuration issues |
+| **Cloud** | Post-deploy AWS posture when available |
+| **APIs** | API specification findings |
+| **Dynamic Testing** | DAST results from verified targets |
+| **Risk** | Aggregated risk view |
+| **Assets** | Discovered asset inventory |
+| **Attack Paths** | Chained risk visualization |
 
-**GitHub PAT (Optional)** is only for pushing the fix branch on this run and is not stored persistently.
+### Saved views
 
-## Remediation
+Filter quickly with built-in views such as **All open**, **Critical**, **Secrets**, **Exploitable**, and **Infrastructure**.
 
-1. Filters by the scope you chose (major vs all severities).
+### KPIs
+
+The header shows counts for **Critical**, **High**, **Medium**, **Low**, and **Auto-fixable** findings.
+
+### How findings are grouped
+
+| Category | Grouped by | Example |
+| --- | --- | --- |
+| **Code security (SAST)** | CWE identifier | `CWE-79` (cross-site scripting) across files |
+| **Supply chain (SCA)** | CVE + package | `CVE-2021-23337` on `lodash@4.17.20` |
+| **DAST** | Runtime check + endpoint | Misconfiguration on a verified URL |
+
+Counts reflect **occurrences**, not necessarily distinct root causes. Remediation groups the same root cause into one work item.
+
+### Export
+
+Use **Download PDF** on Results to export a security report for stakeholders or compliance records.
+
+### Continue to remediation
+
+When findings exist, an **AI Auto-Remediation Available** banner appears. Continue to **Agent setup** when you are ready to generate patches—not before you have reviewed what matters.
+
+---
+
+## Stage 3 — Agent setup
+
+This stage configures **which model** proposes fixes. It does **not** run another scan.
+
+The page heading is **Configure AI Agent**; the pipeline rail still shows **Agent setup**.
+
+### Access modes
+
+| Mode | What DeplAI uses |
+| --- | --- |
+| **Platform** | DeplAI-hosted provider keys. Consumes **credits** on paid platform models. |
+| **BYOK** | A key you saved under **BYOK → Keys** (`/dashboard/ai`). |
+| **Auto** | Your BYOK key if one exists; otherwise platform. |
+
+### Plan limits (platform mode)
+
+| Plan | Platform model access |
+| --- | --- |
+| **Free** | **Best fast** and **Best cost** aliases only |
+| **Starter / Pro / Enterprise** | Full catalog including **Best coding**, **Best reasoning**, and flagship models |
+
+Add a BYOK key or upgrade your plan to unlock flagship models on Free. See [BYOK models](../byok-models.md) for the September 2026 catalog and performance recommendations.
+
+### Model aliases (common picks)
+
+| Alias | Typical use in Security Agent |
+| --- | --- |
+| **Best coding** | Source patches and multi-file fixes |
+| **Best reasoning** | Complex vulnerability chains |
+| **Best fast** | Quick triage on smaller repos |
+| **Best cost** | High-volume scans on a budget |
+
+For peak agentic performance, DeplAI recommends **MiniMax M3** or **Grok 4.6** with **high** or **extrahigh** thinking effort when you supply those provider keys. Details: [BYOK models](../byok-models.md).
+
+### GitHub PAT (optional)
+
+**GitHub PAT (Optional)** on this screen is used **only for pushing the fix branch on this run**. It is **not** stored in the BYOK vault and is **not** your persistent GitHub login.
+
+Use it when the GitHub App alone cannot push to the branch you need. Pull request creation still flows through the App after **Review**.
+
+### Organization context
+
+If your project belongs to an **organization**, org **Security policy** may require certain scan types before downstream deploy steps. Security Agent itself does not bypass policy—you still approve every fix in **Review**.
+
+---
+
+## Stage 4 — Remediation
+
+Remediation turns selected findings into **proposed diffs**. Nothing is written to GitHub on this stage.
+
+### What happens
+
+1. Filters findings by the scope you chose (**major** = critical + high by default).
 2. Groups the same root cause across files into one work item.
-3. Asks the model for a patch, then checks that the diff stays in the project and addresses critical/high items.
-4. Waits: run another round, or take this round’s fixes.
+3. Sends grouped items to the configured model.
+4. Validates that diffs stay inside the project and address the requested severities.
+5. Presents patches for your decision: **run another round** or proceed to **Review**.
 
-It does **not** write to GitHub on this stage.
+### States you may see
 
-## Review
+| State | Meaning |
+| --- | --- |
+| **Awaiting your decision** | Patches ready—choose another round or continue |
+| **Awaiting final approval** | Transitioning toward Review |
+| **Remediation Failed** | Model error, access issue, or validation failure—see troubleshooting |
 
-You approve before anything is persisted. If you reject, you can still copy the diff and apply it yourself.
+### Credits and BYOK
 
-## GitHub & verify
+Platform remediation consumes **credits** according to your plan. BYOK remediation bills your provider account directly. Token detail appears under **BYOK → Usage**.
 
-For a GitHub project, DeplAI opens or updates a pull request with the approved files (GitHub App, not your login token), then re-runs Bearer, Syft, and Grype.
+---
 
-Local ZIP projects save diffs on the upload instead of opening a PR.
+## Stage 5 — Review
+
+**Review** is the human gate. DeplAI does not persist fixes or open pull requests until you approve.
+
+### Your options
+
+| Action | Result |
+| --- | --- |
+| **Approve** | Unlocks **GitHub & verify** (GitHub projects) or saves diffs (ZIP projects) |
+| **Reject** | Stops the pipeline; you can copy diffs manually if useful |
+| **Copy diff** | Apply patches outside DeplAI |
+
+Inspect every hunk. Security Agent proposes fixes; **you** remain accountable for merged code.
+
+---
+
+## Stage 6 — GitHub & verify
+
+For **GitHub-connected projects**:
+
+1. DeplAI opens or updates a **pull request** with approved files.
+2. The PR uses the **GitHub App** installation you granted—not your OAuth token.
+3. DeplAI re-runs static and dependency scanners on the result.
+4. When clean, you may **Continue to deployment** from the security flow.
+
+For **ZIP uploads**:
+
+- Approved diffs are saved on the upload record.
+- No pull request is created—connect GitHub if you need PR-based workflow.
+
+### Verification rescan
+
+The follow-up scan confirms that critical/high items from the remediation scope are addressed. If issues remain, the UI tells you before you treat the run as complete.
+
+---
+
+## Integrations
+
+### GitHub
+
+| Step | Integration |
+| --- | --- |
+| Sign in | Identity only (email, profile, org membership) |
+| Repository access | **GitHub App** install on **Account → Integrations** or **Your Profile → Integrations** |
+| Pull requests | GitHub App after **Review** approval |
+| Optional push | Single-run **GitHub PAT** on **Agent setup** |
+
+### DAST
+
+Dynamic testing never uses a free-form URL in Security Agent.
+
+1. Add and **verify** targets under **Services → DAST** (`/dashboard/dast`).
+2. On **Scan**, enable **DAST** and select the verified target.
+3. Findings appear under **Dynamic Testing** in Results.
+
+Full workflow: [DAST](../dast.md).
+
+### Organizations
+
+Organization **Security policy** can require SAST, SCA, container scan, or DAST evidence before production deploys. Security Agent supplies the scan evidence; **Deploy** enforces policy at apply time.
+
+Details: [Organizations](../organizations.md).
+
+### Deploy
+
+After a clean **GitHub & verify** pass, use **Continue to deployment** to move into the Deploy pipeline with security context carried forward.
+
+Details: [Deploy](deploy.md).
+
+### BYOK
+
+Store provider keys under **BYOK → Keys**. Pick **Platform**, **BYOK**, or **Auto** on **Agent setup**.
+
+Details: [BYOK models](../byok-models.md) · [Security and data](../security-and-data.md).
+
+---
 
 ## Sessions
 
-A Security Agent run appears under **Sessions**. Reopen the row for logs. The live scan does not resume from that page.
+Every Security Agent run creates a **Session** under **Services → Sessions** (`/dashboard/sessions`).
 
-Related: [How it works](../how-it-works.md) · [BYOK](../security-and-data.md) · [Sessions](../sessions.md)
+| Field | Use |
+| --- | --- |
+| **Status** | queued, running, completed, failed, needs review |
+| **Service** | Security Agent |
+| **Logs** | Scanner output and pipeline events |
+
+**Important:** Reopening a session shows the pipeline rail as **history**. It does **not** resume a live scan. Start a **new scan** from Security Agent to continue interactive work.
+
+Copy the **session id** when contacting support.
+
+Details: [Sessions](../sessions.md).
+
+---
+
+## Troubleshooting
+
+### Scan stage
+
+| Symptom | Likely cause | What to do |
+| --- | --- | --- |
+| **Scan Error** / **Scan Failed** | Scanner timeout, repo access, or tool failure | Read the scanner log; retry with fewer modules |
+| **Project Access Required** | GitHub App not installed or repo not granted | **Integrations** → reinstall or add repository |
+| **No scan results yet** | Scan not started or still running | Enable modules → **Run first scan**; keep tab open |
+| Module shows **SKIPPED** | No matching files or module not selected | Expected—enable relevant modules or add files |
+| **DAST skipped** | No verified target | Open **DAST** → verify host → select on Scan |
+| Progress lost after closing tab | Live scan is tab-scoped | Check **Sessions** for logs; start new scan |
+
+### Results stage
+
+| Symptom | Likely cause | What to do |
+| --- | --- | --- |
+| **Results Unavailable** | Transient load or incomplete scan | **Retry Loading Results** |
+| Empty findings but scan “completed” | Clean repo or modules skipped | Confirm modules; check skipped reasons |
+| **Unauthorized target** (DAST) | Verification expired or wrong hostname | Re-verify in **DAST** |
+
+### Agent setup & remediation
+
+| Symptom | Likely cause | What to do |
+| --- | --- | --- |
+| Cannot start remediation | No findings or scan incomplete | Return to **Results** |
+| **Choose a platform model or BYOK credential** | No valid model for your plan/mode | Add BYOK key or pick allowed platform alias |
+| **Remediation Failed** | Model error or diff validation | Retry; try different model; check BYOK key health |
+| BYOK call failed | Invalid or revoked key | **BYOK → Keys** → validate; check provider quota |
+
+### Review & GitHub
+
+| Symptom | Likely cause | What to do |
+| --- | --- | --- |
+| PR not created | ZIP project or approval missing | Use GitHub project; complete **Review** |
+| Push failed | Branch protection or missing PAT | Add optional **GitHub PAT** on Agent setup |
+| Verify still shows critical/high | Fix incomplete or new issues | Review PR diff; run another remediation round |
+
+### Organization policy
+
+| Symptom | Likely cause | What to do |
+| --- | --- | --- |
+| Deploy blocked after security pass | Org policy requires additional scan types | Run required modules; check **Organizations → Security policy** |
+| DAST required but missing | Policy on, no verified target | Complete [DAST](../dast.md) setup |
+
+---
+
+## Best practices
+
+1. **Run Full Scan** on first connect, then tune modules per repo type.
+2. **Verify staging URLs** in DAST before enabling dynamic tests on production.
+3. **Use major scope** for first remediation pass; widen only when needed.
+4. **Always Review** diffs—treat AI patches like any other contributor’s PR.
+5. **Prefer BYOK** with **MiniMax M3** or **Grok 4.6** at high/extrahigh effort for complex multi-file fixes.
+6. **Export PDF** from Results for audit trails before remediation changes the picture.
+7. **Link GitHub** early if you want PR-based workflow; ZIP is fine for evaluation only.
+
+---
+
+## Related documentation
+
+- [DAST](../dast.md) — verify targets and scan profiles
+- [Deploy](deploy.md) — infrastructure after security sign-off
+- [Organizations](../organizations.md) — roles and security policy
+- [BYOK models](../byok-models.md) — model catalog and recommendations
+- [Sessions](../sessions.md) — run history and logs
+- [Security and data](../security-and-data.md) — GitHub scopes and key handling
+- [Glossary and FAQ](../glossary.md) — quick answers

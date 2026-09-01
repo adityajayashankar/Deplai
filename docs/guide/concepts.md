@@ -1,12 +1,12 @@
 # Core concepts
 
-These terms match labels in the dashboard.
+These terms match labels in the DeplAI dashboard.
 
 ## Agent
 
-A named item under **Services**: UI/UX customizer, Security Agent, Deploy, Code Reviewer, and Sessions. Each one is a bounded workflow with optional model steps — not an unconstrained model with your cloud credentials.
+A named workflow under **Services**: UI/UX customizer, Security Agent, Deploy, DAST, Cloud, Instance Management, and Sessions. **Code Reviewer** is listed with a **Soon** tag. Each agent is a bounded pipeline—not an open-ended model with your cloud credentials.
 
-Example: Security Agent runs Bearer (SAST) and Syft+Grype (SCA), then a remediator only after **Results** and **Agent setup**.
+Example: Security Agent runs Bearer (SAST) and Syft+Grype (SCA), then remediation only after **Results** and **Agent setup**.
 
 ## Pipeline
 
@@ -28,32 +28,41 @@ Example: **GitHub & verify** stays locked until **Review** is done.
 
 ## Finding
 
-One grouped vulnerability. Code findings (Bearer) are grouped by CWE. Supply-chain findings (Grype) have a CVE, package, installed version, and optional fix version. Severity: `critical`, `high`, `medium`, `low`.
-
-Example: `lodash@4.17.20` / `CVE-2021-23337` at `high`, and a code row `CWE-79`.
+One grouped vulnerability. Code findings (Bearer) group by CWE. Supply-chain findings (Grype) include CVE, package, version, and optional fix. DAST findings come from authorized runtime targets. Severity: `critical`, `high`, `medium`, `low`.
 
 ## Remediation
 
-The pass that turns selected findings into proposed diffs. It stops before GitHub. Persistence and a pull request wait for **Review** and **GitHub & verify**.
+The pass that turns selected findings into proposed diffs. It stops before GitHub. Persistence and pull requests wait for **Review** and **GitHub & verify**.
 
-Example: after a round you can run another pass or take the current fixes. Nothing is pushed until you approve.
+## Workspace / project / organization
 
-## Workspace / project
+- **Workspace** — the signed-in DeplAI dashboard.
+- **Project** — the selected GitHub repo (via GitHub App) or ZIP upload in the nav picker.
+- **Organization** — optional team boundary for members, roles, policies, and shared cloud context. See [Organizations](organizations.md).
 
-The dashboard is the workspace. Work applies to the **project** in the nav: a GitHub repo from your GitHub App, or a ZIP you uploaded. **Organizations** in the nav is a placeholder.
-
-Example: the project picker lists GitHub repos you granted and ZIP projects you own.
+Personal work uses your profile and billing; org work adds governance on top.
 
 ## BYOK
 
-You store a provider API key under **BYOK → Credentials**. DeplAI encrypts it and shows only a masked suffix. Agents and Playground pick **Platform**, **BYOK**, or **Auto**.
+**Bring your own key**: store a provider API key under **BYOK → Keys** (`/dashboard/ai`). DeplAI encrypts it and shows only a masked suffix. Agents use **Platform**, **BYOK**, or **Auto** access modes.
+
+| Item | Path | Purpose |
+| --- | --- | --- |
+| **Keys** | `/dashboard/ai` | Add, validate, revoke provider keys. |
+| **Catalog** | `/dashboard/ai/catalog` | Models and providers in your workspace. |
+| **Compare** | `/dashboard/ai/compare` | Side-by-side model comparison and ad-hoc chat. |
+| **Usage** | `/dashboard/ai/usage` | Tokens, requests, estimated USD—platform vs BYOK. |
+
+Open **Compare** for the September 2026 model landscape. For **best performance**, use **MiniMax M3** or **Grok 4.6** with **high** or **extrahigh** reasoning effort—see the [BYOK model catalog](byok-models.md) for the full list, pricing, and effort tiers.
+
+DeplAI uses **GPT-5.6 Sol** as the platform baseline for internal routing. The catalog also includes **Gemini 3.1 Pro**, **Grok 4.5**, **MiniMax M2.7**, **Claude Opus 5**, **Sonnet 5**, and **Fable 5**. Rankings in Compare are relative to DeplAI jobs—not a generic chat leaderboard.
 
 Example: on Free, flagship platform models stay locked until you add a key or upgrade. Full map: [Security and data](security-and-data.md).
 
 ## Credits
 
-An integer on **Account → Credits**, granted with your plan (and packs/promos). On Starter and Pro, bonus credits unlock after paid remaining hits zero, then expire at UTC month end.
+Integer balance on **Billing** and **Your Profile**, granted with your plan and packs. Starter and Pro unlock **bonus** credits after paid remaining hits zero; bonus expires at UTC month end.
 
 Example: Starter grants 20 paid credits; after those are gone, up to 5 bonus credits unlock. Details: [Billing](billing.md).
 
-Related: [How it works](how-it-works.md) · [Security and data](security-and-data.md) · [Billing](billing.md)
+Related: [How it works](how-it-works.md) · [Organizations](organizations.md) · [Security and data](security-and-data.md) · [Billing](billing.md)
