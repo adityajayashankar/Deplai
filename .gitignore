@@ -5,6 +5,7 @@ Agentic Layer/.env
 
 # dependencies
 Connector/node_modules
+admin-console/node_modules/
 Connector/.pnp
 Connector/.pnp.*
 Connector/.yarn/*
@@ -17,13 +18,17 @@ terraforge/
 
 # testing
 Connector/coverage
+admin-console/coverage/
 
 # next.js
 Connector/.next/
 Connector/out/
+admin-console/.next/
+admin-console/out/
 
 # production
 Connector/build
+admin-console/build/
 
 # misc
 .DS_Store
@@ -41,10 +46,12 @@ Agentic Layer/.deplai_runtime/
 
 # vercel
 Connector/.vercel
+admin-console/.vercel
 
 # typescript
 *.tsbuildinfo
 Connector/next-env.d.ts
+admin-console/next-env.d.ts
 
 # runtime data (cloned repos & uploaded projects) — keep directory structure via .gitkeep
 Connector/tmp/repos/*
@@ -69,6 +76,13 @@ Terraform-generation-plan.md
 *.jsonl
 *.mjs
 *.map
+
+# Allow admin console source/config files hidden by the broad artifact ignores.
+!admin-console/package.json
+!admin-console/package-lock.json
+!admin-console/tsconfig.json
+!admin-console/postcss.config.mjs
+!admin-console/scripts/start-server.mjs
 
 # Allow tracked config/source artifacts in Customization Agent
 !Customization Agent/**/*.json
@@ -97,6 +111,7 @@ Customization Agent/tenant_builder_app/backend/tenants/
 # Temp folders
 tmp/
 temp_tf_fmt_check/
+Plans/
 
 # scratch_puppeteer dependencies
 scratch_puppeteer/node_modules/

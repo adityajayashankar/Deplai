@@ -1,0 +1,45 @@
+{
+  "name": "deplai-admin-console",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3100 -H 127.0.0.1",
+    "build": "next build",
+    "start": "node scripts/start-server.mjs",
+    "lint": "eslint",
+    "admin:bootstrap": "tsx scripts/bootstrap-owner.ts",
+    "admin:reset-owner": "tsx scripts/reset-owner.ts",
+    "migrate": "tsx scripts/apply-migration.ts",
+    "test": "tsx --test src/**/*.test.ts"
+  },
+  "dependencies": {
+    "@node-rs/argon2": "^2.0.2",
+    "@simplewebauthn/browser": "^13.1.0",
+    "@simplewebauthn/server": "^13.1.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.577.0",
+    "mysql2": "^3.16.0",
+    "next": "^16.3.3",
+    "otpauth": "^9.4.0",
+    "qrcode": "^1.5.4",
+    "razorpay": "^2.9.8",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "server-only": "^0.0.1",
+    "tailwind-merge": "^3.6.0",
+    "uuid": "^14.0.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20.19.30",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/uuid": "^10.0.0",
+    "eslint": "^9",
+    "eslint-config-next": "^16.3.3",
+    "tailwindcss": "^4",
+    "tsx": "^4.23.12",
+    "typescript": "^5"
+  }
+}
