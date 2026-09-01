@@ -27,6 +27,11 @@
     @not_customization_preview not path /api/customization/preview/*
     header @not_customization_preview X-Frame-Options "DENY"
 
+    @blocked_admin_paths path /admin /admin/* /administrator /internal-admin /internal-admin/* /api/admin /api/admin/*
+    handle @blocked_admin_paths {
+        respond 404
+    }
+
     # Browser WebSockets only (scan, remediate, pipeline live logs).
     #
     # Browser:  wss://{$APP_DOMAIN}/agentic/ws/scan/{project_id}?token=...

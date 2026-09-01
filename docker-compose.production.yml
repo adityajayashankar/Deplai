@@ -191,6 +191,46 @@ services:
     networks:
       - backend
 
+  admin-console:
+    build:
+      context: .
+      dockerfile: admin-console/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./deploy/.env
+    environment:
+      NODE_ENV: production
+      ADMIN_ENABLED: "true"
+      ADMIN_BIND_HOST: 127.0.0.1
+      ADMIN_PORT: "3100"
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: ${MYSQL_DATABASE}
+      DB_USER: ${MYSQL_USER}
+      DB_PASSWORD: ${MYSQL_PASSWORD}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      ADMIN_SESSION_SECRET: ${ADMIN_SESSION_SECRET:?Set ADMIN_SESSION_SECRET in deploy/.env}
+      ADMIN_AUDIT_HMAC_SECRET: ${ADMIN_AUDIT_HMAC_SECRET:?Set ADMIN_AUDIT_HMAC_SECRET in deploy/.env}
+      ADMIN_MFA_ENCRYPTION_KEY: ${ADMIN_MFA_ENCRYPTION_KEY:?Set ADMIN_MFA_ENCRYPTION_KEY in deploy/.env}
+      ADMIN_WEBAUTHN_RP_ID: localhost
+      ADMIN_WEBAUTHN_ORIGIN: http://127.0.0.1:3100
+    expose:
+      - "3100"
+    ports:
+      - "127.0.0.1:3100:3100"
+    networks:
+      - backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
 networks:
   backend:
     driver: bridge

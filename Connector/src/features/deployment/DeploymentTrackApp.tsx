@@ -22,6 +22,7 @@ import {
   CountUp,
   EmptyState,
   KeyValueRow,
+  LogConsole,
   MetaChip,
   Panel,
   PanelHeader,
@@ -53,6 +54,13 @@ import {
   deriveDetectedServices,
 } from '@/features/deployment/DeploymentPipelineChrome';
 import { InfraOutputsStage } from '@/features/deployment/deployment-outputs';
+import { DecisionTopologyDiagram } from '@/features/deployment/DecisionTopologyDiagram';
+import {
+  buildDecisionArchitectureDiagram,
+  componentDetails,
+  describeTopologyFlows,
+  topologyComponentLabel,
+} from '@/features/deployment/decision-topology-diagram';
 import { buildInfraAccessBriefing, firstProvisioned } from '@/features/deployment/infra-access-briefing';
 import { coerceHttpAppPort } from '@/features/deployment/http-ports';
 import {
@@ -75,7 +83,9 @@ import {
   SELECTED_PROJECT_STORAGE_KEY,
   clearPlanningState,
   clearSavedAws,
+  commitSuccessfulDeployment,
   awsOperatorCredRemainingMs,
+  deploymentHasProvisionedInfrastructure,
   readAppSecretsMeta,
   writeAppSecretsMeta,
   downloadTextFile,
@@ -85,6 +95,7 @@ import {
   isAwaitingPlanConfirmation,
   isFailedDeployAttempt,
   isLiveDeployAttempt,
+  isRealAwsInstanceId,
   loadDeploySnapshot,
   loadDeployUiStage,
   persistDeploySnapshot,
@@ -94,6 +105,7 @@ import {
   readSavedIacMeta,
   readSavedAws,
   readSavedIacRun,
+  resolveRestoredDeployUiStage,
   readStoredJson,
   resolveTerraformRuntimeConfig,
   saveDeployUiStage,
@@ -134,6 +146,7 @@ import {
   resolveScriptedQuestionCursor,
 } from '@/features/deployment/decision-from-profile';
 import {
+  extractApplyLogLines,
   isRecoverableApplyTransportError,
   isTransportFalseFailureMessage,
   mergeAcceptedApplyResult,
@@ -182,7 +195,7 @@ type DeploymentPlanOption = {
 };
 
 const CONNECTOR_READINESS_RETRY_DELAYS_MS = [0, 500, 1_500];
-const DEPLOY_RECONCILE_POLL_INTERVAL_MS = 5_000;
+const DEPLOY_RECONCILE_POLL_INTERVAL_MS = 2_000;
 const APPROVED_DECISION_KEY = 'deplai.pipeline.approvedDecision';
 const DECISION_COST_ESTIMATE_KEY = 'deplai.pipeline.decisionCostEstimate';
 const DEPLOYMENT_PLAN_KEY = 'deplai.pipeline.deploymentPlan';
@@ -800,32 +813,6 @@ function readCostEstimate() {
   return { total: Number(raw?.total_monthly_usd || 0), cap: Number(raw?.budget_cap_usd || 100) };
 }
 
-type DecisionDiagramNode = {
-  id: string;
-  label: string;
-  x: number;
-  y: number;
-  color: string;
-  category: 'networking' | 'compute' | 'data' | 'security' | 'observability';
-  details: string[];
-};
-
-type DecisionDiagramEdge = {
-  from: string;
-  to: string;
-  label: string;
-};
-
-type DecisionDiagramModel = {
-  awsRegion: string;
-  components: string[];
-  nodes: DecisionDiagramNode[];
-  edges: DecisionDiagramEdge[];
-  hasVpcBoundary: boolean;
-  hasMultiAz: boolean;
-  hasPrivateTier: boolean;
-};
-
 type DecisionCostLineItem = {
   component: string;
   label: string;
@@ -875,6 +862,9 @@ type DeployStatusResponse = {
   status?: string;
   result?: unknown;
   error?: string;
+  logs?: string[];
+  phase?: string;
+  phase_message?: string;
 };
 
 function resolveDeployProcessPhase(
@@ -959,6 +949,23 @@ type AwsRuntimeLiveDetails = {
   resource_counts?: AwsRuntimeLiveCounts;
 };
 
+type AwsDiscoveryResource = {
+  resource_type?: string;
+  resource_id?: string;
+  name?: string;
+  region?: string;
+  state?: string;
+  metadata?: Record<string, unknown>;
+};
+
+type AwsDiscoveryContext = {
+  status?: 'not_requested' | 'complete' | 'partial' | 'unavailable';
+  account_id?: string;
+  region?: string;
+  resources?: AwsDiscoveryResource[];
+  permission_gaps?: string[];
+};
+
 type DeployStatus = DeployStateSnapshot['status'];
 type DeployLog = DeployStateSnapshot['logs'][number];
 
@@ -968,7 +975,7 @@ type ActiveDeployState = {
   logs: DeployLog[];
   deployResult: DeployApiResult | null;
   deploymentHistory: DeployStateSnapshot['deploymentHistory'];
-  updatedAt?: string;
+  updatedAt: string;
 };
 
 type ActiveDeployEntry = {
@@ -991,6 +998,22 @@ function matchesCurrentIacWorkspace(
     if (!legacyGeneratedWorkspace) return false;
   }
   return true;
+}
+
+function repoContextMatchesWorkspace(
+  repoContext: RepositoryContextJson | null | undefined,
+  projectId: string | null | undefined,
+  expectedWorkspace: string,
+): boolean {
+  if (!repoContext) return false;
+  const workspace = String(repoContext.workspace || '').trim();
+  if (!workspace) return true;
+  if (workspace === expectedWorkspace) return true;
+  const projectKey = String(projectId || '').trim();
+  if (projectKey && workspace === projectKey) return true;
+  if (projectKey && workspace === `deploy-${projectKey}`) return true;
+  if (projectKey && expectedWorkspace === `deploy-${projectKey}` && !workspace.startsWith('deploy-')) return true;
+  return false;
 }
 
 function getCurrentSavedRun(
@@ -1066,7 +1089,7 @@ function toDeployState(snapshot?: Partial<ActiveDeployState>): ActiveDeployState
     logs: Array.isArray(snapshot?.logs) ? snapshot.logs : [],
     deployResult: snapshot?.deployResult && typeof snapshot.deployResult === 'object' ? snapshot.deployResult : null,
     deploymentHistory: Array.isArray(snapshot?.deploymentHistory) ? snapshot.deploymentHistory : [],
-    updatedAt: typeof snapshot?.updatedAt === 'string' ? snapshot.updatedAt : undefined,
+    updatedAt: typeof snapshot?.updatedAt === 'string' ? snapshot.updatedAt : new Date().toISOString(),
   };
 }
 
@@ -1593,134 +1616,6 @@ function toPositiveNumber(value: unknown): number | null {
   return parsed;
 }
 
-function decisionCategory(component: string): DecisionDiagramNode['category'] {
-  const key = String(component || '').toLowerCase();
-  if (
-    key.includes('vpc')
-    || key.includes('alb')
-    || key.includes('eip')
-    || key.includes('nat')
-    || key.includes('subnet')
-    || key.includes('igw')
-    || key.includes('route')
-  ) {
-    return 'networking';
-  }
-  if (key.includes('ecs') || key.includes('ec2') || key.includes('lambda') || key.includes('compute')) return 'compute';
-  if (key.includes('rds') || key.includes('redis') || key.includes('cache') || key.includes('db') || key.includes('s3') || key.includes('elasticache')) return 'data';
-  if (key.includes('waf') || key.includes('iam') || key.includes('sg') || key.includes('security')) return 'security';
-  return 'observability';
-}
-
-function decisionColor(category: DecisionDiagramNode['category']): string {
-  if (category === 'networking') return '#93c5fd';
-  if (category === 'compute') return '#fdba74';
-  if (category === 'data') return '#86efac';
-  if (category === 'security') return '#fca5a5';
-  return '#d4d4d8';
-}
-
-function componentDetails(component: string, stackConfig: Record<string, unknown>): string[] {
-  const config = toRecord(stackConfig[component] || (component === 'ec2' ? stackConfig['ec2-instance'] : undefined));
-  const key = String(component || '').toLowerCase();
-
-  if (key === 'ecs' || key === 'ec2') {
-    const parts: string[] = [];
-    const instanceType = String(config.instance_type || '').trim();
-    const appPort = toPositiveNumber(config.app_port);
-    const desired = toPositiveNumber(config.desired_count);
-    if (instanceType) parts.push(instanceType);
-    if (appPort) parts.push(`:${appPort}`);
-    if (desired && desired > 1) parts.push(`×${desired}`);
-    return parts.slice(0, 2);
-  }
-
-  if (key === 'rds') {
-    const parts: string[] = [];
-    const engine = String(config.engine || '').trim();
-    const instance = String(config.instance_class || '').trim();
-    if (engine) parts.push(engine);
-    if (instance) parts.push(instance);
-    if (config.multi_az === true) parts.push('Multi-AZ');
-    return parts.slice(0, 2);
-  }
-
-  if (key === 'elasticache' || key === 'redis') {
-    const parts: string[] = [];
-    const engine = String(config.engine || 'redis').trim();
-    const nodeType = String(config.node_type || '').trim();
-    if (engine) parts.push(engine);
-    if (nodeType) parts.push(nodeType);
-    return parts.slice(0, 2);
-  }
-
-  if (key === 'alb') {
-    return ['HTTP · HTTPS'];
-  }
-
-  if (key === 'eip') {
-    return ['Static public IP'];
-  }
-
-  if (key === 's3_cloudfront' || key === 'cloudfront') {
-    return ['CDN'];
-  }
-
-  // Skip dumping raw stack_config key=value noise onto the diagram.
-  return [];
-}
-
-function getDecisionNodeHeight(node: DecisionDiagramNode): number {
-  return 44 + Math.min(2, node.details.length) * 14;
-}
-
-function isBoundaryOnlyComponent(component: string): boolean {
-  const key = String(component || '').toLowerCase();
-  return key === 'vpc' || key === 'subnet' || key === 'public_subnet' || key === 'private_subnet';
-}
-
-function isPrivatePlacement(component: string): boolean {
-  const key = String(component || '').toLowerCase();
-  return key.includes('rds') || key.includes('redis') || key.includes('elasticache') || key.includes('db');
-}
-
-function buildMeaningfulEdges(components: string[], entryNodeByComponent: Map<string, string>): DecisionDiagramEdge[] {
-  const edges: DecisionDiagramEdge[] = [];
-  const id = (component: string) => entryNodeByComponent.get(component) || '';
-  const has = (component: string) => Boolean(id(component));
-  const push = (from: string, to: string, label = '') => {
-    if (!from || !to || from === to) return;
-    if (edges.some((item) => item.from === from && item.to === to)) return;
-    edges.push({ from, to, label });
-  };
-
-  const frontDoor = has('alb') ? 'alb' : has('eip') ? 'eip' : has('ec2') ? 'ec2' : has('ecs') ? 'ecs' : components[0] || '';
-  if (frontDoor) push('internet', id(frontDoor));
-
-  if (has('alb') && has('ec2')) push(id('alb'), id('ec2'));
-  if (has('alb') && has('ecs')) push(id('alb'), id('ecs'));
-  if (!has('alb') && has('eip') && has('ec2')) push(id('eip'), id('ec2'));
-  if (!has('alb') && has('eip') && has('ecs')) push(id('eip'), id('ecs'));
-  if (has('ec2') && has('rds')) push(id('ec2'), id('rds'));
-  if (has('ecs') && has('rds')) push(id('ecs'), id('rds'));
-  if (has('ec2') && (has('elasticache') || has('redis'))) {
-    push(id('ec2'), id('elasticache') || id('redis'));
-  }
-  if (has('ecs') && (has('elasticache') || has('redis'))) {
-    push(id('ecs'), id('elasticache') || id('redis'));
-  }
-
-  if (edges.length <= 1) {
-    const chain = components.map((component) => id(component)).filter(Boolean);
-    if (chain[0]) push('internet', chain[0]);
-    for (let index = 1; index < chain.length; index += 1) {
-      push(chain[index - 1], chain[index]);
-    }
-  }
-
-  return edges;
-}
-
 function humanizeConsultantNotes(notes: string[]): string[] {
   const skip = [
     /heuristic planner/i,
@@ -1749,124 +1644,6 @@ function humanizeConsultantNotes(notes: string[]): string[] {
   return unique.slice(0, 3);
 }
 
-function buildDecisionArchitectureDiagram(
-  decision: InfraConsultantDecision | null | undefined,
-  awsRegion: string,
-): DecisionDiagramModel {
-  const components = normalizeDecisionComponents(decision);
-  const deploySequence = normalizeDecisionSequence(decision);
-  const orderedComponents: string[] = [];
-  const seen = new Set<string>();
-  for (const component of [...deploySequence, ...components]) {
-    if (!component || seen.has(component)) continue;
-    seen.add(component);
-    orderedComponents.push(component);
-  }
-  const stackConfig = decision?.stack_config && typeof decision.stack_config === 'object'
-    ? decision.stack_config as Record<string, unknown>
-    : {};
-  const rds = stackConfig.rds && typeof stackConfig.rds === 'object' ? stackConfig.rds as Record<string, unknown> : {};
-  const hasMultiAz = Boolean(rds.multi_az);
-  const visibleComponents = orderedComponents.filter((component) => !isBoundaryOnlyComponent(component));
-  const hasVpcBoundary = orderedComponents.includes('vpc') || visibleComponents.length > 0;
-  const publicRank = (component: string) => {
-    const key = String(component || '').toLowerCase();
-    if (key === 'alb') return 0;
-    if (key === 'eip') return 1;
-    if (key === 'ec2' || key === 'ecs') return 2;
-    return 3;
-  };
-  const publicComponents = visibleComponents
-    .filter((component) => !isPrivatePlacement(component))
-    .sort((left, right) => publicRank(left) - publicRank(right));
-  const privateComponents = visibleComponents.filter((component) => isPrivatePlacement(component));
-
-  const nodes: DecisionDiagramNode[] = [];
-  const entryNodeByComponent = new Map<string, string>();
-  const pushNode = (node: DecisionDiagramNode) => {
-    if (!nodes.some((item) => item.id === node.id)) nodes.push(node);
-  };
-
-  pushNode({
-    id: 'internet',
-    label: 'Internet',
-    x: 48,
-    y: publicComponents.length > 0 ? 158 : 210,
-    color: '#a1a1aa',
-    category: 'networking',
-    details: [],
-  });
-
-  const placeRow = (items: string[], startY: number) => {
-    const columnWidth = 176;
-    let column = 0;
-    for (const component of items) {
-      const category = decisionCategory(component);
-      const color = decisionColor(category);
-      const label = formatComponentName(component);
-      const details = componentDetails(component, stackConfig);
-      const x = 250 + column * columnWidth;
-      const y = startY;
-
-      if (component === 'rds' && hasMultiAz) {
-        const primaryId = 'rds-primary';
-        const replicaId = 'rds-replica';
-        pushNode({ id: primaryId, label: 'RDS Primary', x, y, color, category, details });
-        pushNode({
-          id: replicaId,
-          label: 'RDS Standby',
-          x: x + columnWidth,
-          y,
-          color,
-          category,
-          details: ['failover'],
-        });
-        entryNodeByComponent.set(component, primaryId);
-        column += 2;
-        continue;
-      }
-
-      // Skip aliases that already have a placed node (e.g. redis after elasticache).
-      if (entryNodeByComponent.has(component)) continue;
-
-      const nodeId = component.replace(/[^a-zA-Z0-9_\-]/g, '_').toLowerCase();
-      if (nodes.some((item) => item.id === nodeId)) {
-        entryNodeByComponent.set(component, nodeId);
-        continue;
-      }
-      pushNode({
-        id: nodeId,
-        label,
-        x,
-        y,
-        color,
-        category,
-        details,
-      });
-      entryNodeByComponent.set(component, nodeId);
-      column += 1;
-    }
-  };
-
-  placeRow(publicComponents, 150);
-  placeRow(privateComponents, 340);
-
-  const edges = buildMeaningfulEdges(visibleComponents, entryNodeByComponent);
-  if (hasMultiAz && entryNodeByComponent.get('rds') === 'rds-primary') {
-    edges.push({ from: 'rds-primary', to: 'rds-replica', label: '' });
-  }
-
-  return {
-    awsRegion: String(awsRegion || DEFAULT_AWS_REGION).trim() || DEFAULT_AWS_REGION,
-    components: visibleComponents.length > 0 ? visibleComponents : orderedComponents,
-    nodes,
-    edges,
-    hasVpcBoundary,
-    hasMultiAz,
-    hasPrivateTier: privateComponents.length > 0,
-  };
-}
-
 export default function DeploymentTrackApp() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -1880,6 +1657,7 @@ export default function DeploymentTrackApp() {
   const generatePlanInFlightRef = useRef(false);
   const planAttemptedKeyRef = useRef<string | null>(null);
   const terraformAutostartRef = useRef<string | null>(null);
+  const terraformProfileRecoveryRef = useRef<string | null>(null);
   const decisionCostRequestKeyRef = useRef<string | null>(null);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [projectsLoaded, setProjectsLoaded] = useState(false);
@@ -1915,6 +1693,9 @@ export default function DeploymentTrackApp() {
   const [appSecretsMeta, setAppSecretsMeta] = useState<AppSecretMeta[]>([]);
   const [terraformGenerating, setTerraformGenerating] = useState(false);
   const [aws, setAws] = useState<AwsSessionConfig>(() => readSavedAws());
+  const [awsDiscovery, setAwsDiscovery] = useState<AwsDiscoveryContext | null>(null);
+  const [awsDiscoveryLoading, setAwsDiscoveryLoading] = useState(false);
+  const [awsDiscoveryError, setAwsDiscoveryError] = useState<string | null>(null);
   const [terraformRuntimeConfig, setTerraformRuntimeConfig] = useState<TerraformRuntimeConfig>(() => ({
     aws_region: DEFAULT_AWS_REGION,
     state_bucket: '',
@@ -1932,7 +1713,9 @@ export default function DeploymentTrackApp() {
     'idle' | 'starting' | 'waiting_api' | 'awaiting_plan' | 'reconciling' | 'done' | 'error'
   >('idle');
   const [deployProcessPhase, setDeployProcessPhase] = useState('idle');
-  const [deployProcessMessage, setDeployProcessMessage] = useState<string | null>(null);
+  const [, setDeployProcessMessage] = useState<string | null>(null);
+  const [deployLogs, setDeployLogs] = useState<DeployLogEntry[]>([]);
+  const [deployApplyLogs, setDeployApplyLogs] = useState<string[]>([]);
   const [terraformGenerationPhase, setTerraformGenerationPhase] = useState<
     'idle' | 'starting' | 'generating' | 'completed' | 'failed'
   >('idle');
@@ -1998,8 +1781,16 @@ export default function DeploymentTrackApp() {
     [deploymentSelectionDecision],
   );
   const decisionDiagram = useMemo(
-    () => buildDecisionArchitectureDiagram(decisionForVisualization, terraformRuntimeConfig.aws_region),
+    () => buildDecisionArchitectureDiagram(
+      decisionForVisualization,
+      terraformRuntimeConfig.aws_region,
+      DEFAULT_AWS_REGION,
+    ),
     [decisionForVisualization, terraformRuntimeConfig.aws_region],
+  );
+  const topologyFlowLines = useMemo(
+    () => describeTopologyFlows(decisionDiagram),
+    [decisionDiagram],
   );
   const consultantNotesList = useMemo(
     () => humanizeConsultantNotes(
@@ -2051,6 +1842,38 @@ export default function DeploymentTrackApp() {
     && aws.aws_secret_access_key.trim()
     && hasSessionTokenWhenRequired,
   );
+  const discoverAwsResources = useCallback(async () => {
+    if (!hasAwsSecrets) return;
+    setAwsDiscoveryLoading(true);
+    setAwsDiscoveryError(null);
+    try {
+      const response = await fetch('/api/architecture/aws-discovery', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          aws_access_key_id: aws.aws_access_key_id,
+          aws_secret_access_key: aws.aws_secret_access_key,
+          aws_session_token: aws.aws_session_token,
+          aws_region: terraformRuntimeConfig.aws_region || DEFAULT_AWS_REGION,
+        }),
+      });
+      const data = await response.json().catch(() => ({})) as { success?: boolean; context?: AwsDiscoveryContext; error?: string };
+      if (!response.ok || data.success !== true || !data.context) throw new Error(data.error || 'AWS discovery failed.');
+      setAwsDiscovery(data.context);
+      if (deploymentProfile) {
+        const nextProfile = {
+          ...deploymentProfile,
+          aws_reuse: data.context,
+        };
+        setDeploymentProfile(nextProfile);
+        writeStoredJson(DEPLOYMENT_PROFILE_KEY, nextProfile);
+      }
+    } catch (reason) {
+      setAwsDiscoveryError(reason instanceof Error ? reason.message : 'AWS discovery failed.');
+    } finally {
+      setAwsDiscoveryLoading(false);
+    }
+  }, [aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, deploymentProfile, hasAwsSecrets, terraformRuntimeConfig.aws_region]);
   const costEstimate = readCostEstimate();
   const effectiveCostTotal = Number(
     decisionCostEstimate?.subtotal_monthly_usd
@@ -2088,13 +1911,42 @@ export default function DeploymentTrackApp() {
     type: 'info' | 'success' | 'error' = 'info',
     meta?: Omit<DeployLogEntry, 'text' | 'ts' | 'type'>,
   ) => {
-    if (type !== 'error') return;
+    const entry: DeployLogEntry = { text, ts: timestampLabel(), type, ...meta };
+    setDeployLogs((prev) => {
+      const last = prev[prev.length - 1];
+      if (
+        last
+        && last.text === text
+        && last.type === type
+        && last.worker_id === meta?.worker_id
+        && last.worker_status === meta?.worker_status
+      ) {
+        return prev;
+      }
+      return [...prev, entry];
+    });
+    patchState((prev) => {
+      const last = prev.logs[prev.logs.length - 1];
+      if (
+        last
+        && last.text === text
+        && last.type === type
+        && last.worker_id === meta?.worker_id
+        && last.worker_status === meta?.worker_status
+      ) {
+        return prev;
+      }
+      return {
+        ...prev,
+        logs: [...prev.logs, entry],
+      };
+    });
     const sessionId = workspaceSessionIdRef.current;
     if (!sessionId) return;
     try {
       persistSessionProgress(sessionId, {
         line: {
-          level: 'error',
+          level: type === 'error' ? 'error' : 'info',
           message: text,
           stage: meta?.stage || null,
         },
@@ -2102,7 +1954,7 @@ export default function DeploymentTrackApp() {
     } catch {
       // Session log persistence is best-effort.
     }
-  }, []);
+  }, [patchState]);
   const updateIacFileContent = useCallback((filePath: string, nextContent: string) => {
     setIacFiles((prev) => {
       const nextFiles = prev.map((file) => (
@@ -2133,6 +1985,18 @@ export default function DeploymentTrackApp() {
       };
     });
   }, [patchState, terraformRuntimeConfig.aws_region]);
+  const finalizeSuccessfulDeploy = useCallback((result: DeployApiResult) => {
+    patchState((prev) => commitSuccessfulDeployment(prev, result, terraformRuntimeConfig.aws_region));
+    if (selectedProjectId) {
+      saveDeployUiStage(selectedProjectId, 'outputs');
+      localStorage.setItem(`${CURRENT_STAGE_STORAGE_PREFIX}${selectedProjectId}`, 'outputs');
+    }
+    setDeployUiPhase('done');
+    setDeployProcessPhase('completed');
+    setDeployProcessMessage(TERRAFORM_APPLY_STATUS_LABEL.completed);
+    setError(null);
+    finalizeWorkspaceSession(workspaceSessionIdRef.current, { status: 'completed', current_stage: 'apply' });
+  }, [patchState, selectedProjectId, terraformRuntimeConfig.aws_region]);
   const mergeRuntimeDetailsIntoResult = useCallback((details: AwsRuntimeLiveDetails) => {
     patchState((prev) => ({
       ...prev,
@@ -2376,9 +2240,6 @@ export default function DeploymentTrackApp() {
   const deployButtonDisabled = deployFailed ? redeployDisabled : (!canStartDeploy || deployIsLive);
   const deployPhaseLabel = (() => {
     if (deployFailed) return 'Deploy failed';
-    if (deployProcessMessage && (deployIsLive || deployUiPhase === 'reconciling')) {
-      return deployProcessMessage;
-    }
     const normalized = normalizeProcessPhase(deployProcessPhase);
     if (normalized !== 'idle' && TERRAFORM_APPLY_STATUS_LABEL[normalized]) {
       return TERRAFORM_APPLY_STATUS_LABEL[normalized];
@@ -2392,6 +2253,26 @@ export default function DeploymentTrackApp() {
     if (awaitingPlanIdle) return 'Plan ready — confirm to continue';
     return 'Idle — click Start Deploy';
   })();
+  const executionLogLines = useMemo(() => {
+    const lines = deployLogs.map((log) => ({
+      text: log.text,
+      tone: log.type === 'error' ? 'danger' as const : log.type === 'success' ? 'ok' as const : 'neutral' as const,
+    }));
+    for (const line of deployApplyLogs) {
+      lines.push({
+        text: line,
+        tone: line.startsWith('✗') ? 'danger' as const : line.startsWith('✓') ? 'ok' as const : 'neutral' as const,
+      });
+    }
+    if (
+      deployFailed
+      && backendErrorMessage
+      && !lines.some((line) => line.text === backendErrorMessage)
+    ) {
+      lines.push({ text: backendErrorMessage, tone: 'danger' });
+    }
+    return lines;
+  }, [backendErrorMessage, deployApplyLogs, deployFailed, deployLogs]);
   const activeIacFilePath = selectedFile || iacFiles[0]?.path || '';
   const hasCurrentIacMeta = useMemo(
     () => matchesCurrentIacWorkspace(savedIacMeta, selectedProjectId, expectedWorkspace) && snapshotIacMatches,
@@ -2425,30 +2306,20 @@ export default function DeploymentTrackApp() {
     outputs: object,
     keypair?: object | null,
   ) => {
-    patchState((prev) => {
-      const nextResult: DeployApiResult = {
-        ...((prev.deployResult || {}) as DeployApiResult),
-        success: true,
-        outputs: outputs as Record<string, unknown>,
+    const mappedKeypair = keypair as IacKeypair | null | undefined;
+    const nextResult: DeployApiResult = {
+      success: true,
+      mode: 'iac_pipeline',
+      outputs: outputs as Record<string, unknown>,
+    };
+    if (mappedKeypair?.private_key_pem) {
+      nextResult.keypair = {
+        key_name: mappedKeypair.keypair_name,
+        private_key_pem: mappedKeypair.private_key_pem,
       };
-      const mappedKeypair = keypair as IacKeypair | null | undefined;
-      if (mappedKeypair?.private_key_pem) {
-        nextResult.keypair = {
-          key_name: mappedKeypair.keypair_name,
-          private_key_pem: mappedKeypair.private_key_pem,
-        };
-      }
-      return {
-        ...prev,
-        status: 'done',
-        progress: 100,
-        deployResult: nextResult,
-      };
-    });
-    setError(null);
-    setDeployProcessPhase('completed');
-    setDeployProcessMessage(TERRAFORM_APPLY_STATUS_LABEL.completed);
-  }, [patchState]);
+    }
+    finalizeSuccessfulDeploy(nextResult);
+  }, [finalizeSuccessfulDeploy]);
   const onIacPipelineError = useCallback((message: string) => {
     setError(message);
     setDeployProcessPhase('failed');
@@ -2849,6 +2720,7 @@ export default function DeploymentTrackApp() {
     const apply = (next: ActiveDeployState) => {
       setDeployStatus(next.status);
       setDeployProgress(next.progress);
+      setDeployLogs(next.logs);
       setDeployResult(next.deployResult);
       const requiresConfirmation = Boolean(
         next.deployResult?.requires_plan_confirmation
@@ -2933,13 +2805,15 @@ export default function DeploymentTrackApp() {
     const nextWorkspace = buildDeploymentWorkspace(nextProjectId, nextProject?.name || nextProjectId);
     const previousPlanningProjectId = sessionStorage.getItem(PLANNING_PROJECT_KEY);
     const freshLaunch = entry === 'card' || entry === 'selector';
-    const projectChanged = !previousPlanningProjectId || previousPlanningProjectId !== nextProjectId;
-    if (freshLaunch || projectChanged) {
+    const switchedProject = Boolean(previousPlanningProjectId && previousPlanningProjectId !== nextProjectId);
+    const snapshot = loadDeploySnapshot(nextProjectId);
+    if (freshLaunch || switchedProject) {
       clearPlanningState();
       idleRecoveryRef.current = null;
       analysisRequestRef.current = null;
       reviewRequestRef.current = null;
       terraformAutostartRef.current = null;
+    terraformProfileRecoveryRef.current = null;
       decisionCostRequestKeyRef.current = null;
       setAnalysisLoading(false);
       setReviewLoading(false);
@@ -2967,12 +2841,14 @@ export default function DeploymentTrackApp() {
       persistApprovedDecision(null);
       setDecisionCostEstimate(null);
       setDecisionCostError(null);
-      setDeployStatus('idle');
-      setDeployProgress(0);
-      setDeployResult(null);
-      setDeploymentHistory([]);
       setEndpointChecks([]);
       setError(null);
+      if (freshLaunch) {
+        setDeployStatus('idle');
+        setDeployProgress(0);
+        setDeployResult(null);
+        setDeploymentHistory([]);
+      }
     }
     setSelectedProjectId(nextProjectId);
     const existingRuntimeConfig = readSavedTerraformRuntimeConfig(nextProjectId);
@@ -2984,8 +2860,11 @@ export default function DeploymentTrackApp() {
     setTerraformRuntimeConfig(existingRuntimeConfig || seededRuntimeConfig);
     localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, nextProjectId);
     sessionStorage.setItem(PLANNING_PROJECT_KEY, nextProjectId);
-    setActiveStage(freshLaunch ? 'analysis' : normalizeDeployUiStage(loadDeployUiStage(nextProjectId)));
-    const snapshot = loadDeploySnapshot(nextProjectId);
+    setActiveStage(
+      freshLaunch
+        ? 'analysis'
+        : normalizeDeployUiStage(resolveRestoredDeployUiStage(snapshot, loadDeployUiStage(nextProjectId))),
+    );
     const existing = activeDeployments.get(nextProjectId);
     const nextState = existing?.state || toDeployState(snapshot || undefined);
     setActiveDeploymentState(nextProjectId, nextState);
@@ -3088,6 +2967,7 @@ export default function DeploymentTrackApp() {
     generatePlanInFlightRef.current = false;
     planAttemptedKeyRef.current = null;
     terraformAutostartRef.current = null;
+    terraformProfileRecoveryRef.current = null;
     decisionCostRequestKeyRef.current = null;
     setAnalysisLoading(false);
     setReviewLoading(false);
@@ -3152,7 +3032,7 @@ export default function DeploymentTrackApp() {
 
   useEffect(() => {
     if (activeStage !== 'analysis' || !selectedProject) return;
-    if (repoContext && repoContext.workspace === expectedWorkspace) return;
+    if (repoContext && repoContextMatchesWorkspace(repoContext, selectedProject.id, expectedWorkspace)) return;
     void runAnalysis().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Repository analysis failed.'));
   }, [activeStage, expectedWorkspace, repoContext, runAnalysis, selectedProject]);
 
@@ -3195,8 +3075,8 @@ export default function DeploymentTrackApp() {
 
   useEffect(() => {
     if (activeStage !== 'qa' || !selectedProject) return;
-    if (review && review.context_json.workspace === expectedWorkspace && review.questions.length > 0) return;
-    if (!repoContext || repoContext.workspace !== expectedWorkspace) {
+    if (review && repoContextMatchesWorkspace(review.context_json, selectedProject.id, expectedWorkspace) && review.questions.length > 0) return;
+    if (!repoContextMatchesWorkspace(repoContext, selectedProject.id, expectedWorkspace)) {
       setAndPersistStage('analysis');
       return;
     }
@@ -3224,7 +3104,7 @@ export default function DeploymentTrackApp() {
     const response = await fetch('/api/architecture/review/complete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project_id: selectedProject.id, workspace: review.context_json.workspace || buildDeploymentWorkspace(selectedProject.id, selectedProject.name), answers: mergedAnswers }),
+      body: JSON.stringify({ project_id: selectedProject.id, workspace: review.context_json.workspace || buildDeploymentWorkspace(selectedProject.id, selectedProject.name), answers: mergedAnswers, aws_context: awsDiscovery }),
     });
     const data = await response.json().catch(() => ({})) as {
       success?: boolean;
@@ -3668,7 +3548,7 @@ export default function DeploymentTrackApp() {
           approval_payload: approvalPayload || undefined,
           architecture_json: deploymentProfile || architectureView || consultantArchitectureSeed,
           user_answers: infraUserAnswers,
-          consultant_decision: approvedConsultantDecision || undefined,
+          consultant_decision: approvedConsultantDecision || decisionForVisualization || undefined,
           aws_region: terraformRuntimeConfig.aws_region.trim() || DEFAULT_AWS_REGION,
           customization_snapshot_id: customizationSnapshotId || undefined,
           tenant_id: customizationTenantId || undefined,
@@ -3781,6 +3661,8 @@ export default function DeploymentTrackApp() {
         : rawMessage;
       appendLog(message, 'error', { stage: 'terraform_generation' });
       setTerraformGenerationPhase('failed');
+      terraformAutostartRef.current = null;
+      terraformProfileRecoveryRef.current = null;
       finalizeWorkspaceSession(workspaceSessionIdRef.current, {
         status: 'failed',
         current_stage: 'terraform_generation',
@@ -3791,7 +3673,7 @@ export default function DeploymentTrackApp() {
     } finally {
       setTerraformGenerating(false);
     }
-  }, [appendLog, approvalPayload, approvedConsultantDecision, architectureView, consultantArchitectureSeed, customizationSnapshotId, customizationTenantId, deploymentProfile, expectedWorkspace, infraUserAnswers, qaSummary, repoContext, selectedProject, terraformRuntimeConfig.aws_region, terraformRuntimeConfigWasStored]);
+  }, [appendLog, approvalPayload, approvedConsultantDecision, architectureView, consultantArchitectureSeed, customizationSnapshotId, customizationTenantId, decisionForVisualization, deploymentProfile, expectedWorkspace, infraUserAnswers, qaSummary, repoContext, selectedProject, terraformRuntimeConfig.aws_region, terraformRuntimeConfigWasStored]);
 
   const createIacPr = useCallback(async () => {
     if (!selectedProject || iacPrCreating || terraformGenerating || deployableIacFiles.length === 0) return;
@@ -3824,23 +3706,26 @@ export default function DeploymentTrackApp() {
   useEffect(() => {
     if (activeStage !== 'terraform' || !selectedProject) return;
     if (terraformGenerating || infraConsultantLoading || hasSuccessfulGeneration) return;
-    if (!repoContext || repoContext.workspace !== expectedWorkspace) return;
+    if (!canContinueToTerraform) return;
+    if (!repoContextMatchesWorkspace(repoContext, selectedProject.id, expectedWorkspace)) return;
 
-    if (!approvedConsultantDecision && !deploymentProfile) return;
     const autostartKey = `${selectedProject.id}:${expectedWorkspace}:${decisionSignature}:${Boolean(hasSuccessfulGeneration)}`;
     if (terraformAutostartRef.current === autostartKey) return;
     terraformAutostartRef.current = autostartKey;
 
     resetCurrentIacSessionArtifacts();
     appendLog('Planning answers locked. Starting deterministic Terraform generation.', 'info', { stage: 'terraform_generation' });
-    void generateTerraform().catch((reason: unknown) => {
+    void generateTerraform().then((ok) => {
+      if (!ok) terraformAutostartRef.current = null;
+    }).catch((reason: unknown) => {
+      terraformAutostartRef.current = null;
+      terraformProfileRecoveryRef.current = null;
       setError(reason instanceof Error ? reason.message : 'Infrastructure generation failed.');
     });
   }, [
     activeStage,
     appendLog,
-    approvedConsultantDecision,
-    deploymentProfile,
+    canContinueToTerraform,
     decisionSignature,
     expectedWorkspace,
     generateTerraform,
@@ -3850,6 +3735,39 @@ export default function DeploymentTrackApp() {
     resetCurrentIacSessionArtifacts,
     selectedProject,
     terraformGenerating,
+  ]);
+
+  useEffect(() => {
+    if (activeStage !== 'terraform' || !selectedProject) return;
+    if (repoContextMatchesWorkspace(repoContext, selectedProject.id, expectedWorkspace)) return;
+    void runAnalysis().catch((reason: unknown) => {
+      setError(reason instanceof Error ? reason.message : 'Repository analysis failed.');
+    });
+  }, [activeStage, expectedWorkspace, repoContext, runAnalysis, selectedProject]);
+
+  useEffect(() => {
+    if (activeStage !== 'terraform' || !selectedProject) return;
+    if (deploymentProfile || approvedConsultantDecision || decisionForVisualization) return;
+    if (!review || !repoContextMatchesWorkspace(review.context_json, selectedProject.id, expectedWorkspace)) return;
+    if (infraConsultantLoading || generatePlanInFlightRef.current) return;
+    const recoveryKey = `${selectedProject.id}:${expectedWorkspace}`;
+    if (terraformProfileRecoveryRef.current === recoveryKey) return;
+    terraformProfileRecoveryRef.current = recoveryKey;
+    void generatePlan(answers).catch((reason: unknown) => {
+      terraformProfileRecoveryRef.current = null;
+      setError(reason instanceof Error ? reason.message : 'Failed to generate deployment profile.');
+    });
+  }, [
+    activeStage,
+    answers,
+    approvedConsultantDecision,
+    decisionForVisualization,
+    deploymentProfile,
+    expectedWorkspace,
+    generatePlan,
+    infraConsultantLoading,
+    review,
+    selectedProject,
   ]);
 
   const submitInfraConsultantMessage = useCallback(async () => {
@@ -3964,11 +3882,17 @@ export default function DeploymentTrackApp() {
     if (baseResult.mode === 'iac_pipeline') {
       return baseResult;
     }
+    if (deploymentHasProvisionedInfrastructure(baseResult) && !isRealAwsInstanceId(extractDeploymentSummary(baseResult).instanceId)) {
+      return baseResult;
+    }
     const existingInstanceId = getLiveRuntimeInstanceId(baseResult);
     if (existingInstanceId && existingInstanceId !== 'n/a') {
       return baseResult;
     }
     if (!selectedProject || !hasAwsSecrets) {
+      if (deploymentHasProvisionedInfrastructure(baseResult)) {
+        return baseResult;
+      }
       throw new Error('Deployment completed, but live runtime details are missing for this repo.');
     }
 
@@ -3987,6 +3911,9 @@ export default function DeploymentTrackApp() {
     const data = await response.json().catch(() => ({})) as { success?: boolean; details?: AwsRuntimeLiveDetails; error?: string };
     const hydratedInstanceId = String(data.details?.instance?.instance_id || '').trim();
     if (!response.ok || data.success !== true || !data.details || !hydratedInstanceId || hydratedInstanceId === 'n/a') {
+      if (deploymentHasProvisionedInfrastructure(baseResult)) {
+        return baseResult;
+      }
       throw new Error(data.error || 'Deployment completed, but live runtime details could not be verified.');
     }
     return mergeDeployResultWithRuntimeDetails(baseResult, data.details);
@@ -4009,7 +3936,16 @@ export default function DeploymentTrackApp() {
       ? data.result as DeployApiResult
       : null;
     const runtimePhase = resolveDeployProcessPhase(runtimeStatus, runtimeResult as Record<string, unknown> | null, data.result);
-    const runtimeMessage = resolveDeployProcessMessage(runtimePhase, runtimeResult as Record<string, unknown> | null, data.result);
+    const runtimeMessage = resolveDeployProcessMessage(runtimePhase, runtimeResult as Record<string, unknown> | null, data);
+    const polledLogs = extractApplyLogLines(data);
+    const resultLogs = extractApplyLogLines(runtimeResult);
+    const mergedPolledLogs = [...polledLogs];
+    for (const line of resultLogs) {
+      if (!mergedPolledLogs.includes(line)) mergedPolledLogs.push(line);
+    }
+    if (mergedPolledLogs.length > 0) {
+      setDeployApplyLogs(mergedPolledLogs);
+    }
     const runtimeAwaitingPlan = isAwaitingPlanConfirmation({
       result: runtimeResult,
     }) || runtimeStatus === 'awaiting_plan_confirmation';
@@ -4071,17 +4007,8 @@ export default function DeploymentTrackApp() {
         if (hydratedChecks.length > 0) {
           setEndpointChecks(hydratedChecks);
         }
-        patchState((prev) => ({
-          ...prev,
-          status: 'done',
-          progress: 100,
-          deployResult: {
-            ...hydratedResult,
-            error: undefined,
-          },
-        }));
+        finalizeSuccessfulDeploy(hydratedResult);
         getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
-        pushDeploymentHistory(hydratedResult, 'done');
         const verificationPending = hydratedResult.deployment_verified === false
           || (hydratedChecks.length > 0 && hydratedChecks.every((check) => !check.ok));
         appendLog(
@@ -4112,6 +4039,10 @@ export default function DeploymentTrackApp() {
 
     if (runtimeStatus === 'completed' || runtimeStatus === 'error') {
       const message = runtimeResult?.error || 'Deployment runtime returned an error.';
+      const tailLines = extractApplyLogLines(runtimeResult);
+      if (tailLines.length > 0) {
+        setDeployApplyLogs(tailLines);
+      }
       setDeployProcessPhase('failed');
       setDeployProcessMessage(message);
       patchState((prev) => ({
@@ -4143,7 +4074,7 @@ export default function DeploymentTrackApp() {
     }
     getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
     appendLog('No active deployment process found. Marking stale UI run as stopped.', 'error');
-  }, [appendLog, deployResult?.run_id, hydrateTerminalDeployResult, patchState, pushDeploymentHistory, selectedProject]);
+  }, [appendLog, deployResult?.run_id, finalizeSuccessfulDeploy, hydrateTerminalDeployResult, patchState, pushDeploymentHistory, selectedProject]);
 
   const pollDeploymentReconciliation = useCallback(async (
     runIdOverride?: string,
@@ -4156,6 +4087,7 @@ export default function DeploymentTrackApp() {
         logs: [],
         deployResult: null,
         deploymentHistory: [],
+        updatedAt: new Date().toISOString(),
       };
     }
     const pollStart = Date.now();
@@ -4192,11 +4124,15 @@ export default function DeploymentTrackApp() {
     if (latest.status === 'done') {
       setDeployUiPhase('done');
       setError(null);
+      if (selectedProjectId) {
+        saveDeployUiStage(selectedProjectId, 'outputs');
+        localStorage.setItem(`${CURRENT_STAGE_STORAGE_PREFIX}${selectedProjectId}`, 'outputs');
+      }
       finalizeWorkspaceSession(workspaceSessionIdRef.current, { status: 'completed', current_stage: 'apply' });
       return;
     }
     setDeployUiPhase('reconciling');
-  }, []);
+  }, [selectedProjectId]);
 
   const recoverDeployAfterTransportGap = useCallback(async (
     payload: Record<string, unknown>,
@@ -4296,6 +4232,9 @@ export default function DeploymentTrackApp() {
     setDeployUiPhase('starting');
     setDeployProcessPhase('starting');
     setDeployProcessMessage(TERRAFORM_APPLY_STATUS_LABEL.starting);
+    if (!confirmingPlan) {
+      setDeployApplyLogs([]);
+    }
     setDeployElapsedSec(0);
     const deploySessionId = await createWorkspaceSession({
       service: 'deploy',
@@ -4326,7 +4265,7 @@ export default function DeploymentTrackApp() {
       ...prev,
       status: 'running',
       progress: confirmingPlan ? Math.max(prev.progress || 0, 65) : 5,
-      logs: [],
+      logs: confirmingPlan ? prev.logs : [],
       // Keep prior result for continuity, but strip plan-gate flags so UI leaves confirm mode.
       deployResult: confirmingPlan
         ? {
@@ -4365,6 +4304,9 @@ export default function DeploymentTrackApp() {
         setPendingPlanSummary(null);
       }
       appendLog('Calling /api/pipeline/deploy — Terraform apply can take 15–25 minutes when RDS Multi-AZ is included…');
+      void reconcileDeploymentStatus().catch(() => {
+        // Status polling starts immediately; the POST may still be in flight.
+      });
       const retryRunId = String(deployResult?.run_id || activeSavedRun?.run_id || '').trim();
       const retryWorkspace = String(deployResult?.workspace || activeSavedRun?.workspace || '').trim();
       const canReuseSavedRun = shouldUseSavedRunForDeploy || Boolean(retryingFailedDeploy && retryRunId);
@@ -4441,6 +4383,10 @@ export default function DeploymentTrackApp() {
           deployResult: data || { success: false, error: message },
         }));
         pushDeploymentHistory(data || null, 'error');
+        const tailLines = extractApplyLogLines(data);
+        if (tailLines.length > 0) {
+          setDeployApplyLogs(tailLines);
+        }
         appendLog(message, 'error');
         finalizeWorkspaceSession(workspaceSessionIdRef.current, {
           status: 'failed',
@@ -4480,21 +4426,10 @@ export default function DeploymentTrackApp() {
 
       if (data.mode !== 'iac_pipeline' && !data.run_id) {
         clearHeartbeat();
-        patchState((prev) => ({
-          ...prev,
-          status: 'done',
-          progress: 100,
-          deployResult: {
-            ...data,
-            error: undefined,
-          },
-        }));
-        pushDeploymentHistory(data, 'done');
-        setDeployUiPhase('done');
-        setDeployProcessPhase('completed');
-        setDeployProcessMessage(TERRAFORM_APPLY_STATUS_LABEL.completed);
-        setError(null);
-        finalizeWorkspaceSession(workspaceSessionIdRef.current, { status: 'completed', current_stage: 'apply' });
+        finalizeSuccessfulDeploy({
+          ...data,
+          error: undefined,
+        });
         if (data.deployment_verified === false) {
           appendLog('Infrastructure is provisioned. HTTP verification is still pending — use Verify live endpoints when the app is ready.', 'info');
         } else {
@@ -4580,7 +4515,7 @@ export default function DeploymentTrackApp() {
         deployHeartbeatRef.current = null;
       }
     }
-  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, finalizeDeployUiFromState, hasAwsSecrets, iacFiles, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, recoverDeployAfterTransportGap, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
+  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, finalizeDeployUiFromState, finalizeSuccessfulDeploy, hasAwsSecrets, iacFiles, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, recoverDeployAfterTransportGap, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
 
   const stopDeployment = useCallback(async () => {
     if (!selectedProject || stopLoading || deployStatus !== 'running') return;
@@ -4811,14 +4746,13 @@ export default function DeploymentTrackApp() {
     const transportGap = deployStatus === 'error'
       && isTransportFalseFailureMessage(String(deployResult?.error || ''))
       && deployResult?.success !== false;
-    if (deployStatus !== 'running' && !transportGap) return;
+    if (deployStatus !== 'running' && !transportGap) {
+      const liveUiPhase = String(deployUiPhase || '').trim().toLowerCase();
+      if (!['starting', 'waiting_api', 'reconciling'].includes(liveUiPhase)) return;
+    }
     if (isAwaitingPlanConfirmation({
-      uiPhase: deployUiPhase,
-      requiresPlanConfirmation,
       result: deployResult,
     })) return;
-    const activeDeployment = getOrCreateActiveDeployment(selectedProject.id);
-    if (activeDeployment.inFlight) return;
     let cancelled = false;
 
     const probe = async () => {
@@ -4837,7 +4771,7 @@ export default function DeploymentTrackApp() {
 
     const timerId = window.setInterval(() => {
       void probe();
-    }, 5000);
+    }, DEPLOY_RECONCILE_POLL_INTERVAL_MS);
 
     void probe();
 
@@ -5084,6 +5018,9 @@ export default function DeploymentTrackApp() {
               ? 'Generate plan'
               : 'Next question'
           }
+          decisions={review.decisions}
+          architectureConflicts={Array.isArray(deploymentProfile?.architecture_conflicts) ? deploymentProfile.architecture_conflicts as Array<{ severity?: string; code?: string; message?: string; recommendation?: string | null }> : []}
+          candidateArchitectures={Array.isArray(deploymentProfile?.candidate_architectures) ? deploymentProfile.candidate_architectures as Array<{ id?: string; label?: string; description?: string; estimated_monthly_usd?: number | null; reliability?: string }> : []}
         />
       ) : (
         <Panel padded={false}>
@@ -5097,159 +5034,6 @@ export default function DeploymentTrackApp() {
     </StageShell>
   );
 
-  const decisionNodePositions = useMemo(() => {
-    const map = new Map<string, { x: number; y: number; height: number }>();
-    for (const node of decisionDiagram.nodes) {
-      map.set(node.id, { x: node.x, y: node.y, height: getDecisionNodeHeight(node) });
-    }
-    return map;
-  }, [decisionDiagram.nodes]);
-  const decisionCanvasHeight = decisionDiagram.hasPrivateTier ? 520 : 360;
-  const decisionDiagramCanvas = (
-    <svg
-      viewBox={`0 0 980 ${decisionCanvasHeight}`}
-      className="w-full rounded-xl"
-      style={{ background: 'radial-gradient(120% 90% at 50% 0%, #101015 0%, #07070a 60%)' }}
-    >
-      <defs>
-        <marker id="decision-flow-arrow" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
-          <polygon points="0 0, 7 2.5, 0 5" fill="rgba(163,230,53,0.65)" />
-        </marker>
-        <pattern id="decision-grid" width="28" height="28" patternUnits="userSpaceOnUse">
-          <path d="M 28 0 L 0 0 0 28" fill="none" stroke="rgba(255,255,255,0.035)" strokeWidth="1" />
-        </pattern>
-        <linearGradient id="decision-edge" x1="0" y1="0" x2="1" y2="0">
-          <stop offset="0%" stopColor="rgba(163,230,53,0.12)" />
-          <stop offset="100%" stopColor="rgba(163,230,53,0.6)" />
-        </linearGradient>
-        <filter id="decision-node-shadow" x="-40%" y="-40%" width="180%" height="180%">
-          <feDropShadow dx="0" dy="6" stdDeviation="8" floodColor="#000" floodOpacity="0.55" />
-        </filter>
-      </defs>
-      <rect x="0" y="0" width="980" height={decisionCanvasHeight} fill="url(#decision-grid)" />
-      {decisionDiagram.hasVpcBoundary ? (
-        <>
-          <rect
-            x="190"
-            y="48"
-            width="740"
-            height={decisionDiagram.hasPrivateTier ? 420 : 260}
-            rx="20"
-            fill="rgba(255,255,255,0.012)"
-            stroke="rgba(255,255,255,0.09)"
-            strokeWidth="1"
-          />
-          <text
-            x="214"
-            y="76"
-            fill="#a3e635"
-            fontSize="10"
-            letterSpacing="0.18em"
-            style={{ fontFamily: 'var(--font-mono, monospace)' }}
-          >
-            VPC · {String(decisionDiagram.awsRegion).toUpperCase()}
-          </text>
-          <rect
-            x="220"
-            y="100"
-            width="680"
-            height={decisionDiagram.hasPrivateTier ? 170 : 180}
-            rx="16"
-            fill="rgba(255,255,255,0.018)"
-            stroke="rgba(255,255,255,0.07)"
-            strokeDasharray="4 5"
-          />
-          <text x="240" y="124" fill="#6b6b75" fontSize="9.5" letterSpacing="0.2em" style={{ fontFamily: 'var(--font-mono, monospace)' }}>
-            PUBLIC SUBNET
-          </text>
-          {decisionDiagram.hasPrivateTier ? (
-            <>
-              <rect
-                x="220"
-                y="292"
-                width="680"
-                height="150"
-                rx="16"
-                fill="rgba(255,255,255,0.01)"
-                stroke="rgba(255,255,255,0.055)"
-                strokeDasharray="4 5"
-              />
-              <text x="240" y="316" fill="#6b6b75" fontSize="9.5" letterSpacing="0.2em" style={{ fontFamily: 'var(--font-mono, monospace)' }}>
-                PRIVATE SUBNET{decisionDiagram.hasMultiAz ? ' · MULTI-AZ' : ''}
-              </text>
-            </>
-          ) : null}
-        </>
-      ) : null}
-      {decisionDiagram.edges.map((edge, index) => {
-        const from = decisionNodePositions.get(edge.from);
-        const to = decisionNodePositions.get(edge.to);
-        if (!from || !to) return null;
-        const x1 = from.x + 64;
-        const y1 = from.y + from.height / 2;
-        const x2 = to.x + 64;
-        const y2 = to.y + to.height / 2;
-        return (
-          <g key={`${edge.from}-${edge.to}-${index}`}>
-            <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="url(#decision-edge)" strokeWidth="1.5" markerEnd="url(#decision-flow-arrow)" />
-            {/* Packet dot travelling the edge conveys direction of traffic flow. */}
-            <circle className="dw-edge-packet" r="2.5" fill="#a3e635" opacity="0.85">
-              <animateMotion
-                dur="2.6s"
-                begin={`${index * 0.35}s`}
-                repeatCount="indefinite"
-                path={`M ${x1} ${y1} L ${x2} ${y2}`}
-              />
-            </circle>
-          </g>
-        );
-      })}
-      {Array.from(new Map(decisionDiagram.nodes.map((node) => [node.id, node])).values()).map((node) => {
-        const details = node.details.slice(0, 2);
-        const height = getDecisionNodeHeight(node);
-        const isInternet = node.id === 'internet';
-        return (
-          <g key={node.id} transform={`translate(${node.x},${node.y})`} filter="url(#decision-node-shadow)">
-            <rect
-              width="128"
-              height={height}
-              rx="14"
-              fill={isInternet ? 'rgba(255,255,255,0.055)' : 'rgba(255,255,255,0.035)'}
-              stroke={isInternet ? 'rgba(255,255,255,0.18)' : `${node.color}66`}
-              strokeWidth="1"
-            />
-            <rect width="128" height="1" rx="0.5" fill="rgba(255,255,255,0.1)" />
-            <circle cx="18" cy="18" r="3.5" fill={node.color} />
-            <circle cx="18" cy="18" r="6.5" fill="none" stroke={node.color} strokeOpacity="0.3" strokeWidth="1" />
-            <text
-              x="64"
-              y={details.length ? 22 : height / 2 + 4}
-              textAnchor="middle"
-              fill="#ededf0"
-              fontSize="12"
-              fontWeight="600"
-              style={{ fontFamily: 'var(--font-display, sans-serif)' }}
-            >
-              {node.label}
-            </text>
-            {details.map((line, index) => (
-              <text
-                key={`${node.id}-detail-${index}`}
-                x="64"
-                y={40 + index * 14}
-                textAnchor="middle"
-                fill="#8b8b95"
-                fontSize="9.5"
-                style={{ fontFamily: 'var(--font-mono, monospace)' }}
-              >
-                {line}
-              </text>
-            ))}
-          </g>
-        );
-      })}
-    </svg>
-  );
   const decisionCostRows = decisionCostEstimate?.line_items || [];
   const decisionCostSubtotal = Number(decisionCostEstimate?.subtotal_monthly_usd || 0);
   const decisionCostVariance = String(decisionCostEstimate?.variance_note || 'Estimated monthly cost can vary by +/-20% depending on runtime usage.');
@@ -5258,15 +5042,16 @@ export default function DeploymentTrackApp() {
     <div className="deployment-workspace flex h-full overflow-hidden bg-[var(--dw-canvas)] font-sans text-[var(--dw-fg-soft)]">
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <DeploymentCommandHeader onExit={() => router.push('/dashboard')} />
-        <DeploymentPipelineHeader
-          projects={projects}
-          selectedProjectId={selectedProjectId}
-          onSelectProject={handleSelectDeploymentProject}
-          onRestart={restartPipeline}
-          restartDisabled={!selectedProjectId || analysisLoading}
-        />
-        <DeploymentStageRail activeStage={activeStage} onSelectStage={setAndPersistStage} />
-        <div className="dw-scrollbar relative flex-1 overflow-y-auto p-6 lg:p-8">
+        <div className="dw-scrollbar min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+          <DeploymentPipelineHeader
+            projects={projects}
+            selectedProjectId={selectedProjectId}
+            onSelectProject={handleSelectDeploymentProject}
+            onRestart={restartPipeline}
+            restartDisabled={!selectedProjectId || analysisLoading}
+          />
+          <DeploymentStageRail activeStage={activeStage} onSelectStage={setAndPersistStage} />
+          <div className="relative p-6 lg:p-8">
           {error && (
             <div className="mx-auto mb-6 max-w-5xl">
               <Callout
@@ -5322,6 +5107,7 @@ export default function DeploymentTrackApp() {
                   loading={analysisLoading}
                   metrics={analysisMetrics}
                   services={analysisDetectedServices}
+                  conflictLines={analysisFlagLines}
                   continueDisabled={analysisLoading || !repoContext || repoContext.workspace !== expectedWorkspace}
                   onContinue={() => setAndPersistStage('qa')}
                 />
@@ -5371,14 +5157,16 @@ export default function DeploymentTrackApp() {
                     title="Topology"
                     subtitle={
                       decisionDiagram.components.length > 0
-                        ? decisionDiagram.components.map((item) => formatComponentName(item)).join(' · ')
+                        ? decisionDiagram.components.map((item) => topologyComponentLabel(item)).join(' · ')
                         : 'Waiting for a planning decision'
                     }
                     tone="accent"
                   />
                   <div className="p-4">
                     {decisionDiagram.nodes.length > 0 ? (
-                      <div className="overflow-hidden rounded-xl dw-panel-recessed">{decisionDiagramCanvas}</div>
+                      <div className="dw-panel-recessed overflow-hidden">
+                        <DecisionTopologyDiagram model={decisionDiagram} />
+                      </div>
                     ) : (
                       <EmptyState
                         icon={<Server className="h-5 w-5" />}
@@ -5395,12 +5183,28 @@ export default function DeploymentTrackApp() {
                       <div className="flex flex-wrap gap-2">
                         {decisionDiagram.components.map((item, index) => (
                           <Chip key={`stack-${index}-${item}`} mono>
-                            {formatComponentName(item)}
+                            {topologyComponentLabel(item)}
                           </Chip>
                         ))}
                       </div>
                     ) : (
                       <p className="text-[13px] text-[var(--dw-muted)]">No components yet.</p>
+                    )}
+                  </Panel>
+                  <Panel>
+                    <SectionLabel>Traffic flow</SectionLabel>
+                    {topologyFlowLines.length > 0 ? (
+                      <ul className="space-y-2 text-[12px] leading-relaxed text-[var(--dw-fg-soft)]">
+                        {topologyFlowLines.map((line, index) => (
+                          <li key={`flow-${index}`} className="font-mono text-[11px] text-[var(--dw-muted)]">
+                            {line}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="text-[13px] text-[var(--dw-muted)]">
+                        Flow labels appear once the topology is locked.
+                      </p>
                     )}
                   </Panel>
                   <Panel>
@@ -5595,11 +5399,13 @@ export default function DeploymentTrackApp() {
                   <div className="flex flex-wrap items-center gap-2">
                     <button
                       onClick={() => {
+                        terraformAutostartRef.current = null;
+    terraformProfileRecoveryRef.current = null;
                         resetCurrentIacSessionArtifacts();
                         void generateTerraform().catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Infrastructure generation failed.'));
                       }}
-                      disabled={terraformGenerating || !(approvedConsultantDecision || deploymentProfile)}
-                      className={buttonClass('secondary', { disabled: terraformGenerating || !approvedConsultantDecision })}
+                      disabled={terraformGenerating || !canContinueToTerraform}
+                      className={buttonClass('secondary', { disabled: terraformGenerating || !canContinueToTerraform })}
                     >
                       {terraformGenerating ? 'Generating…' : 'Regenerate'}
                     </button>
@@ -5728,15 +5534,24 @@ export default function DeploymentTrackApp() {
               <StickyActionBar hint={hasSuccessfulGeneration ? 'Bundle ready. Continue to AWS credentials.' : 'Generate Terraform from the approved decision to continue.'}>
                 <button
                   onClick={async () => {
-                    if (!approvedConsultantDecision && !deploymentProfile) return;
+                    if (!canContinueToTerraform) {
+                      setError('Continue from Planning before generating infrastructure.');
+                      return;
+                    }
+                    if (!lockDecisionForTerraform()) {
+                      setError('Continue from Planning before generating infrastructure.');
+                      return;
+                    }
+                    terraformAutostartRef.current = null;
+    terraformProfileRecoveryRef.current = null;
                     if (!hasSuccessfulGeneration) {
                       const generated = await generateTerraform();
                       if (!generated) return;
                     }
                     setAndPersistStage('aws_config', { force: true });
                   }}
-                  disabled={terraformGenerating || !(approvedConsultantDecision || deploymentProfile)}
-                  className={primaryButtonClass(terraformGenerating || !(approvedConsultantDecision || deploymentProfile))}
+                  disabled={terraformGenerating || !canContinueToTerraform}
+                  className={primaryButtonClass(terraformGenerating || !canContinueToTerraform)}
                 >
                   {terraformGenerating ? 'Generating…' : hasSuccessfulGeneration ? 'Continue to AWS config' : 'Generate & continue'}
                 </button>
@@ -5796,6 +5611,18 @@ export default function DeploymentTrackApp() {
                     Operator AWS keys are kept in <span className="font-mono">sessionStorage</span> only
                     (never localStorage), expire after {needsSessionToken ? '1 hour' : '2 hours'}, and are wiped from this browser when the tab closes.
                   </Callout>
+                  <div className="flex flex-wrap items-center gap-3 border-t-[3px] border-black pt-4">
+                    <button
+                      type="button"
+                      onClick={() => { void discoverAwsResources(); }}
+                      disabled={!hasAwsSecrets || awsDiscoveryLoading}
+                      className={buttonClass('secondary', { disabled: !hasAwsSecrets || awsDiscoveryLoading })}
+                    >
+                      {awsDiscoveryLoading ? 'Inspecting AWS…' : 'Discover existing resources'}
+                    </button>
+                    <p className="text-[11.5px] text-[var(--dw-muted)]">Read-only metadata only. Secret values are never fetched.</p>
+                  </div>
+                  {awsDiscoveryError ? <Callout tone="warn">{awsDiscoveryError}</Callout> : null}
                 </Panel>
                 <div className="space-y-4">
                   <Panel>
@@ -5821,6 +5648,33 @@ export default function DeploymentTrackApp() {
                         ? 'Complete infrastructure generation to unlock deploy.'
                         : 'Enter AWS access key and secret key to unlock deployment.'}
                   </Callout>
+                  {awsDiscovery ? (
+                    <Panel padded={false}>
+                      <PanelHeader
+                        title="Potential reuse"
+                        subtitle={`${awsDiscovery.resources?.length || 0} resources found · explicit confirmation required before reuse.`}
+                        actions={<StatusPill tone={awsDiscovery.status === 'complete' ? 'ok' : 'warn'}>{awsDiscovery.status || 'unknown'}</StatusPill>}
+                      />
+                      <div className="max-h-64 overflow-y-auto px-4 py-3">
+                        <KeyValueRow label="Account" value={awsDiscovery.account_id || 'unavailable'} />
+                        {(awsDiscovery.resources || [])
+                          .filter((item) => ['vpc', 'route53_zone', 'acm_certificate', 'rds', 'ecr_repository', 's3_bucket'].includes(String(item.resource_type || '')))
+                          .slice(0, 12)
+                          .map((item) => (
+                            <KeyValueRow
+                              key={`${item.resource_type}-${item.resource_id}`}
+                              label={String(item.resource_type || 'resource').replaceAll('_', ' ')}
+                              value={String(item.name || item.resource_id || 'unnamed')}
+                            />
+                          ))}
+                        {(awsDiscovery.permission_gaps || []).length > 0 ? (
+                          <p className="mt-3 font-mono text-[10px] uppercase tracking-[0.12em] text-amber-700">
+                            Partial visibility · {awsDiscovery.permission_gaps?.length} permission gaps
+                          </p>
+                        ) : null}
+                      </div>
+                    </Panel>
+                  ) : null}
                   {sessionIacTruncated && !activeSavedRun && (
                     <Callout tone="warn">
                       Session-cached generation files are truncated preview data and cannot be deployed. Regenerate infrastructure to produce a fresh bundle.
@@ -5910,7 +5764,7 @@ export default function DeploymentTrackApp() {
                 }
                 description={
                   deployIsLive
-                    ? 'Terraform apply is running on the server. Status updates automatically — detailed logs are kept in backend traces only.'
+                    ? 'Terraform apply is running on the server. Status and live logs update automatically below.'
                     : awaitingPlanIdle
                       ? 'Terraform plan finished. Review the summary below, then confirm to apply in AWS.'
                       : deployFailed
@@ -6006,7 +5860,6 @@ export default function DeploymentTrackApp() {
                         {deployIsLive ? 'running' : awaitingPlanIdle ? 'awaiting confirmation' : deployStatus}
                       </StatusPill>
                     </div>
-                    <div className="mt-2 text-[12px] text-[var(--dw-muted)]">{deployPhaseLabel}</div>
                     {deployProgress >= 100 && deployStatus === 'running' && (
                       <Callout tone="info" className="mt-3">
                         The deterministic executor is building and verifying the release on EC2. Status updates appear here automatically.
@@ -6095,13 +5948,29 @@ export default function DeploymentTrackApp() {
                     )}
                   </div>
                 </Panel>
+                <Panel className="flex min-h-72 flex-col overflow-hidden xl:col-span-3" padded={false} elevation="recessed" glow={deployIsLive}>
+                  <PanelHeader
+                    title="deployment.log"
+                    tone="info"
+                    actions={<span className="font-mono text-[10px] text-[var(--dw-faint)]">{executionLogLines.length} events</span>}
+                  />
+                  <div className="flex-1 p-3">
+                    <LogConsole
+                      lines={executionLogLines}
+                      streaming={deployIsLive}
+                      emptyLabel="Waiting for deployment events… Click Start Deploy to begin."
+                      maxHeight="20rem"
+                    />
+                  </div>
+                </Panel>
               </div>
-              {deployResult?.mode === 'iac_pipeline' && deployResult?.run_id ? (
+              {deployResult && (deployResult.mode === 'iac_pipeline' || deployResult.mode === 'runtime_apply') && deployResult.run_id ? (
                 <ApplyLogViewer
                   runId={deployResult.run_id}
                   onComplete={onIacPipelineComplete}
                   onError={onIacPipelineError}
                   onStatusChange={onIacPipelineStatusChange}
+                  onLogsChange={setDeployApplyLogs}
                   hideUi
                 />
               ) : null}
@@ -6292,8 +6161,6 @@ export default function DeploymentTrackApp() {
         </div>
       </div>
     </div>
+    </div>
   );
 }
-
-
-

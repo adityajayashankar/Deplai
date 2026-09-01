@@ -52,16 +52,24 @@ services:
       AGENTIC_LAYER_URL: http://agentic-layer:8000
       CUSTOMIZATION_AGENT_BASE_URL: http://customization:8010
       CUSTOMIZATION_BACKEND_URL: http://customization:8010
-      DEPLAI_SERVICE_KEY: local-only-service-key-change-before-production
-      WS_TOKEN_SECRET: local-only-websocket-secret-change-before-production
+      DEPLAI_SERVICE_KEY: ${DEPLAI_SERVICE_KEY:-local-only-service-key-change-before-production}
+      WS_TOKEN_SECRET: ${WS_TOKEN_SECRET:-local-only-websocket-secret-change-before-production}
       SESSION_SECRET: local-only-session-secret-change-before-production
       ADMIN_EMAILS: ${ADMIN_EMAILS:-admin@local.test}
       ADMIN_ACCESS_KEY: local-only-admin-key-change-before-production
       BILLING_ENFORCEMENT: ${BILLING_ENFORCEMENT:-false}
       NEXT_PUBLIC_BILLING_ENFORCEMENT: ${NEXT_PUBLIC_BILLING_ENFORCEMENT:-false}
+      PAYMENTS_ENABLED: ${PAYMENTS_ENABLED:-true}
+      PAYMENTS_PROVIDER: ${PAYMENTS_PROVIDER:-razorpay}
+      PAYMENTS_MODE: ${PAYMENTS_MODE:-test}
+      PAYMENTS_TEST_AMOUNT_OVERRIDE: ${PAYMENTS_TEST_AMOUNT_OVERRIDE:-true}
+      PAYMENTS_TEST_AMOUNT_PAISE: ${PAYMENTS_TEST_AMOUNT_PAISE:-100}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
       AI_PLATFORM_ENABLED: ${AI_PLATFORM_ENABLED:-true}
       AI_CREDENTIAL_ENCRYPTION_KEY: ${AI_CREDENTIAL_ENCRYPTION_KEY:-local-only-session-secret-change-before-production}
-      DEPLAI_AI_GATEWAY_URL: http://connector:3000
+      DEPLAI_AI_GATEWAY_URL: http://127.0.0.1:3000
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       CLAUDE_API_KEY: ${CLAUDE_API_KEY:-}
@@ -102,24 +110,31 @@ services:
     user: "0:0"
     environment:
       APP_ENV: development
-      DEPLAI_SERVICE_KEY: local-only-service-key-change-before-production
-      WS_TOKEN_SECRET: local-only-websocket-secret-change-before-production
+      DEPLAI_SERVICE_KEY: ${DEPLAI_SERVICE_KEY:-local-only-service-key-change-before-production}
+      WS_TOKEN_SECRET: ${WS_TOKEN_SECRET:-local-only-websocket-secret-change-before-production}
       CORS_ORIGINS: http://localhost:3000
-      DEPLAI_AI_GATEWAY_URL: http://connector:3000
+      DEPLAI_AI_GATEWAY_URL: ${DEPLAI_AI_GATEWAY_URL:-http://host.docker.internal:3000}
       AI_PLATFORM_ENABLED: ${AI_PLATFORM_ENABLED:-true}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      AI_PLATFORM_UPSTREAM_OPENROUTER: ${AI_PLATFORM_UPSTREAM_OPENROUTER:-true}
+      REMEDIATION_OPENROUTER_MODEL: ${REMEDIATION_OPENROUTER_MODEL:-z-ai/glm-5.2:free}
+      REMEDIATION_OPENROUTER_PROMPT_CHAR_CAP: ${REMEDIATION_OPENROUTER_PROMPT_CHAR_CAP:-5000}
+      REMEDIATION_OPENROUTER_IMPLEMENTOR_MAX_TOKENS: ${REMEDIATION_OPENROUTER_IMPLEMENTOR_MAX_TOKENS:-2048}
+      REMEDIATION_OPENROUTER_REVIEW_MAX_TOKENS: ${REMEDIATION_OPENROUTER_REVIEW_MAX_TOKENS:-1024}
+      OPENROUTER_APP_NAME: ${OPENROUTER_APP_NAME:-deplai-agentic}
       DEPLAI_LOCAL_PROJECTS_ROOT: /local-projects
       DEPLAI_GITHUB_REPOS_ROOT: /repos
       IAC_WORKSPACE_ROOT: /workspace/iac-workspaces
       ALLOW_GLOBAL_CLEANUP: "false"
     ports:
       - "8000:8000"
+    # This user-facing stack must keep long-running scan/remediation WebSockets
+    # alive.  Use docker-compose.dev.yml when intentional backend hot reload is
+    # needed; Uvicorn reload terminates active WebSockets with browser code 1006.
     command:
       [
         "uvicorn",
         "main:app",
-        "--reload",
-        "--reload-dir",
-        "/workspace/Agentic Layer",
         "--host",
         "0.0.0.0",
         "--port",
@@ -127,6 +142,7 @@ services:
       ]
     volumes:
       - "./Agentic Layer:/workspace/Agentic Layer"
+      - "./remediation_pipeline:/workspace/remediation_pipeline"
       - /var/run/docker.sock:/var/run/docker.sock
       - ./Connector/tmp/local-projects:/local-projects:ro
       - ./Connector/tmp/repos:/repos:ro
@@ -150,7 +166,7 @@ services:
       APP_ENV: development
       CUSTOMIZATION_PREVIEW_HOST: 127.0.0.1
       CUSTOMIZATION_PREVIEW_AUTO_INSTALL: "1"
-      DEPLAI_AI_GATEWAY_URL: http://connector:3000
+      DEPLAI_AI_GATEWAY_URL: ${DEPLAI_AI_GATEWAY_URL:-http://host.docker.internal:3000}
       AI_PLATFORM_ENABLED: ${AI_PLATFORM_ENABLED:-true}
       DEPLAI_SERVICE_KEY: local-only-service-key-change-before-production
     ports:

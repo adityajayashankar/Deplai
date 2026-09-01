@@ -30,8 +30,65 @@ module "ec2" {
   user_data_base64 = base64encode(<<-USERDATA
 #!/bin/bash
 # deplai_key_rotation=${var.ec2_key_rotation}
-set -euxo pipefail
+set -euo pipefail
 exec > >(tee -a /var/log/deplai-bootstrap.log) 2>&1
+
+BOOTSTRAP_STATUS_FILE="/var/log/deplai-bootstrap-status.json"
+HEALTH_PATH="/health"
+CURRENT_PHASE="STARTING"
+BOOTSTRAP_TERMINAL="0"
+
+write_bootstrap_status() {
+  local phase="$1"
+  local status="$2"
+  local error_code="$${3:-}"
+  local exit_code="$${4:-0}"
+  local status_tmp="$BOOTSTRAP_STATUS_FILE.tmp"
+  python3 - "$phase" "$status" "$error_code" "$exit_code" > "$status_tmp" <<'PY'
+import json, sys, datetime
+phase, status, error_code, exit_code = sys.argv[1:5]
+payload = {
+    "phase": phase,
+    "status": status,
+    "exit_code": int(exit_code or 0),
+    "timestamp": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+}
+if error_code:
+    payload["error_code"] = error_code
+print(json.dumps(payload))
+PY
+  mv -f "$status_tmp" "$BOOTSTRAP_STATUS_FILE"
+  chmod 600 "$BOOTSTRAP_STATUS_FILE"
+}
+
+bootstrap_fail() {
+  BOOTSTRAP_TERMINAL="1"
+  write_bootstrap_status "$1" "FAILED" "$2" 1
+  exit 1
+}
+
+bootstrap_complete() {
+  BOOTSTRAP_TERMINAL="1"
+  write_bootstrap_status "COMPLETED" "SUCCESS" "" 0
+}
+
+bootstrap_exit_trap() {
+  local exit_code="$?"
+  trap - EXIT
+  if [ "$exit_code" -ne 0 ] && [ "$BOOTSTRAP_TERMINAL" != "1" ]; then
+    BOOTSTRAP_TERMINAL="1"
+    write_bootstrap_status "$CURRENT_PHASE" "FAILED" "UNEXPECTED_BOOTSTRAP_FAILURE" "$exit_code" || true
+  fi
+  exit "$exit_code"
+}
+
+set_bootstrap_phase() {
+  CURRENT_PHASE="$1"
+  write_bootstrap_status "$CURRENT_PHASE" "RUNNING" "" 0
+}
+
+trap bootstrap_exit_trap EXIT
+write_bootstrap_status "STARTING" "RUNNING" "" 0
 
 APP_ROOT="/opt/${var.project_name}"
 APP_SUBDIR="${var.app_subdir}"
@@ -93,15 +150,20 @@ clone_from_git() {
   return 0
 }
 
+set_bootstrap_phase "ARTIFACT_EXTRACT"
 if ! unpack_from_s3 || [ ! -d "$APP_DIR" ]; then
   if ! clone_from_git || [ ! -d "$APP_DIR" ]; then
+    write_bootstrap_status "ARTIFACT_EXTRACT" "FAILED" "ARTIFACT_UNAVAILABLE" 1
+    BOOTSTRAP_TERMINAL="1"
     write_placeholder
-    exit 0
+    exit 1
   fi
 fi
+write_bootstrap_status "ARTIFACT_EXTRACT" "COMPLETED" "" 0
 
 write_app_env() {
   local dest="$${1:-$APP_DIR}"
+  local require_db="$${2:-0}"
   mkdir -p "$dest"
   cat > "$dest/.env" <<ENV
 PORT=$APP_PORT
@@ -113,30 +175,72 @@ ENV
   fi
   if [ -n "$DATABASE_SECRET_ARN" ] && [ "$DATABASE_SECRET_ARN" != "null" ]; then
     cat > /tmp/deplai-db-env.py <<'PY'
-import json, sys, urllib.parse
+import json, os, re, shlex, sys, urllib.parse
 raw = sys.stdin.read().strip()
+require_db = sys.argv[1] == "1"
+rds_endpoint = str(os.environ.get("DEPLAI_RDS_ENDPOINT") or "").strip()
+invalid = {"", "null", "undefined", "none"}
 if not raw or raw == "None":
+    if require_db:
+        print("DATABASE_URL generation failed: PostgreSQL credentials are unavailable.", file=sys.stderr)
+        raise SystemExit(1)
     raise SystemExit(0)
 d = json.loads(raw)
-user = urllib.parse.quote(str(d.get("username") or ""), safe="")
-pw = urllib.parse.quote(str(d.get("password") or ""), safe="")
-host = str(d.get("host") or "")
-port = d.get("port") or 5432
-db = str(d.get("dbname") or "appdb")
-print(f"DATABASE_URL=postgresql://{user}:{pw}@{host}:{port}/{db}")
-print(f"PGHOST={host}")
+user = str(d.get("username") or d.get("user") or "").strip()
+pw = str(d.get("password") or "").strip()
+host = str(d.get("host") or d.get("hostname") or "").strip()
+if host.lower() in invalid:
+    host = ""
+if not host and rds_endpoint.lower() not in invalid:
+    host = rds_endpoint
+if not host or host.lower() in invalid or re.search(r"[\x00-\x20\x7f/@?#]", host):
+    print("DATABASE_URL generation failed: PostgreSQL hostname is unavailable.", file=sys.stderr)
+    raise SystemExit(1)
+if not user or not pw:
+    print("DATABASE_URL generation failed: PostgreSQL credentials are incomplete.", file=sys.stderr)
+    raise SystemExit(1)
+if any(re.search(r"[\x00-\x1f\x7f]", value) for value in (user, pw)):
+    print("DATABASE_URL generation failed: PostgreSQL credentials are invalid.", file=sys.stderr)
+    raise SystemExit(1)
+try:
+    port = int(d.get("port") or 5432)
+except (TypeError, ValueError):
+    raise SystemExit(1)
+if not 1 <= port <= 65535:
+    raise SystemExit(1)
+db = str(d.get("dbname") or d.get("database") or "appdb").strip() or "appdb"
+if re.search(r"[\x00-\x1f\x7f]", db):
+    raise SystemExit(1)
+engine = str(d.get("engine") or "postgres").lower()
+scheme = "mysql" if "mysql" in engine or "mariadb" in engine else "postgresql"
+user_q = urllib.parse.quote(user, safe="")
+pw_q = urllib.parse.quote(pw, safe="")
+db_q = urllib.parse.quote(db, safe="")
+print(f"DATABASE_URL={scheme}://{user_q}:{pw_q}@{host}:{port}/{db_q}")
+print(f"PGHOST={shlex.quote(host)}")
 print(f"PGPORT={port}")
-print(f"PGUSER={d.get('username') or ''}")
-print(f"PGPASSWORD={d.get('password') or ''}")
-print(f"PGDATABASE={db}")
+print(f"PGUSER={shlex.quote(user)}")
+print(f"PGPASSWORD={shlex.quote(pw)}")
+print(f"PGDATABASE={shlex.quote(db)}")
 PY
-    aws secretsmanager get-secret-value --secret-id "$DATABASE_SECRET_ARN" --query SecretString --output text 2>/dev/null \
-      | python3 /tmp/deplai-db-env.py >> "$dest/.env" || true
+    export DEPLAI_RDS_ENDPOINT="$RDS_ENDPOINT"
+    if ! aws secretsmanager get-secret-value --secret-id "$DATABASE_SECRET_ARN" --query SecretString --output text \
+      | python3 /tmp/deplai-db-env.py "$require_db" >> "$dest/.env"; then
+      bootstrap_fail "ENVIRONMENT" "DATABASE_URL_GENERATION_FAILED"
+    fi
+  elif [ "$require_db" = "1" ]; then
+    bootstrap_fail "ENVIRONMENT" "DATABASE_SECRET_UNAVAILABLE"
   fi
-  chmod 600 "$dest/.env" || true
+  chmod 600 "$dest/.env"
 }
 
-write_app_env
+set_bootstrap_phase "ENVIRONMENT"
+ROOT_REQUIRE_DB="0"
+if [ -d "$APP_DIR/prisma" ]; then
+  ROOT_REQUIRE_DB="1"
+fi
+write_app_env "$APP_DIR" "$ROOT_REQUIRE_DB"
+write_bootstrap_status "ENVIRONMENT" "COMPLETED" "" 0
 cd "$APP_DIR"
 
 ensure_swap() {
@@ -168,9 +272,27 @@ NGINX
 
 serve_static() {
   mkdir -p /usr/share/nginx/html
-  cp -R "$APP_DIR"/. /usr/share/nginx/html/ || true
+  cp -R "$APP_DIR"/. /usr/share/nginx/html/
   systemctl enable nginx
+  nginx -t
   systemctl restart nginx
+}
+
+verify_local_http() {
+  local port="$${1:-}"
+  set_bootstrap_phase "HEALTH_CHECK"
+  for attempt in $(seq 1 30); do
+    if curl -fsS "http://127.0.0.1$HEALTH_PATH" >/dev/null \
+      || curl -fsS "http://127.0.0.1/" >/dev/null \
+      || { [ -n "$port" ] && curl -fsS "http://127.0.0.1:$port$HEALTH_PATH" >/dev/null; } \
+      || { [ -n "$port" ] && curl -fsS "http://127.0.0.1:$port/" >/dev/null; }; then
+      write_bootstrap_status "HEALTH_CHECK" "COMPLETED" "" 0
+      bootstrap_complete
+      return 0
+    fi
+    sleep 5
+  done
+  bootstrap_fail "HEALTH_CHECK" "HEALTH_CHECK_FAILED"
 }
 
 infer_package_port() {
@@ -230,6 +352,26 @@ start_pm2_dir() {
   )
 }
 
+verify_pm2_online() {
+  local name="$1"
+  local pid
+  pm2 describe "$name" >/dev/null 2>&1 || return 1
+  pid="$(pm2 pid "$name" 2>/dev/null | tail -n 1)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "$pid" >/dev/null 2>&1
+}
+
+has_node_workspace() {
+  local rel web_found="0" api_found="0"
+  for rel in frontend web client; do
+    [ -f "$APP_ROOT/$rel/package.json" ] && web_found="1" && break
+  done
+  for rel in backend server api; do
+    [ -f "$APP_ROOT/$rel/package.json" ] && api_found="1" && break
+  done
+  [ "$web_found" = "1" ] && [ "$api_found" = "1" ]
+}
+
 deploy_node_workspace() {
   local web_dir="" api_dir=""
   local rel
@@ -249,42 +391,59 @@ deploy_node_workspace() {
     return 1
   fi
 
+  set_bootstrap_phase "DEPENDENCIES"
   dnf install -y nodejs npm git
-  npm install -g pm2 || true
+  npm install -g pm2
   ensure_swap
   WEB_PORT="$(infer_package_port "$web_dir/package.json" 3000)"
   API_PORT="$(infer_package_port "$api_dir/package.json" 5000)"
   SAVED_PORT="$APP_PORT"
   APP_PORT="$API_PORT"
-  write_app_env "$api_dir"
+  local require_db="0"
+  if [ -d "$api_dir/prisma" ]; then
+    require_db="1"
+  fi
+  write_app_env "$api_dir" "$require_db"
   APP_PORT="$WEB_PORT"
-  write_app_env "$web_dir"
+  write_app_env "$web_dir" "0"
+  # Relative API base — nginx proxies /api/ to the backend. Customer apps must not
+  # append another /api segment in next.config when using this value.
   cat >> "$web_dir/.env" <<WEBENV
 NEXT_PUBLIC_API_URL=/api
 WEBENV
   APP_PORT="$SAVED_PORT"
+  write_bootstrap_status "DEPENDENCIES" "COMPLETED" "" 0
 
+  set_bootstrap_phase "BUILD"
   npm_in_dir "$api_dir"
   if [ -d "$api_dir/prisma" ]; then
+    set_bootstrap_phase "DATABASE_MIGRATION"
     (
       cd "$api_dir"
       set -a
       [ -f .env ] && . ./.env
       set +a
-      npx prisma generate || true
+      npx prisma generate
       if [ -d prisma/migrations ] && [ "$(ls -A prisma/migrations 2>/dev/null)" ]; then
-        npx prisma migrate deploy || true
+        npx prisma migrate deploy
       else
-        npx prisma db push || true
+        npx prisma db push
       fi
-    )
+    ) || bootstrap_fail "DATABASE_MIGRATION" "DATABASE_MIGRATION_FAILED"
+    write_bootstrap_status "DATABASE_MIGRATION" "COMPLETED" "" 0
   fi
-  npm_in_dir "$web_dir"
 
+  set_bootstrap_phase "BUILD"
+  npm_in_dir "$web_dir"
+  write_bootstrap_status "BUILD" "COMPLETED" "" 0
+
+  set_bootstrap_phase "START"
   pm2 delete "$APP_NAME-api" >/dev/null 2>&1 || true
   pm2 delete "$APP_NAME-web" >/dev/null 2>&1 || true
-  start_pm2_dir "$api_dir" "$APP_NAME-api" "$API_PORT"
-  start_pm2_dir "$web_dir" "$APP_NAME-web" "$WEB_PORT"
+  start_pm2_dir "$api_dir" "$APP_NAME-api" "$API_PORT" || bootstrap_fail "START" "BACKEND_START_FAILED"
+  start_pm2_dir "$web_dir" "$APP_NAME-web" "$WEB_PORT" || bootstrap_fail "START" "FRONTEND_START_FAILED"
+  verify_pm2_online "$APP_NAME-api" || bootstrap_fail "START" "BACKEND_NOT_ONLINE"
+  verify_pm2_online "$APP_NAME-web" || bootstrap_fail "START" "FRONTEND_NOT_ONLINE"
   pm2 save || true
   env PATH="$PATH" pm2 startup systemd -u root --hp /root >/dev/null 2>&1 || true
 
@@ -311,36 +470,65 @@ server {
 }
 NGINX
   rm -f /etc/nginx/conf.d/default.conf /usr/share/nginx/html/index.html || true
+  nginx -t || bootstrap_fail "START" "NGINX_CONFIG_INVALID"
   systemctl enable nginx
-  systemctl restart nginx
-  return 0
+  systemctl restart nginx || bootstrap_fail "START" "NGINX_START_FAILED"
+  write_bootstrap_status "START" "COMPLETED" "" 0
+
+  write_bootstrap_status "HEALTH_CHECK" "RUNNING" "" 0
+  for attempt in $(seq 1 30); do
+    if curl -fsS "http://127.0.0.1:$WEB_PORT$HEALTH_PATH" \
+      || curl -fsS "http://127.0.0.1:$WEB_PORT/" \
+      || curl -fsS "http://127.0.0.1/api$HEALTH_PATH" \
+      || curl -fsS "http://127.0.0.1/"; then
+      write_bootstrap_status "HEALTH_CHECK" "COMPLETED" "" 0
+      bootstrap_complete
+      return 0
+    fi
+    sleep 5
+  done
+  bootstrap_fail "HEALTH_CHECK" "HEALTH_CHECK_FAILED"
 }
 
-if deploy_node_workspace; then
+if has_node_workspace; then
+  deploy_node_workspace
   exit 0
 fi
 
 if [ -d "$APP_DIR/dist" ] && [ -f "$APP_DIR/dist/index.html" ]; then
   APP_DIR="$APP_DIR/dist"
+  set_bootstrap_phase "START"
   serve_static
+  write_bootstrap_status "START" "COMPLETED" "" 0
+  verify_local_http
   exit 0
 fi
 if [ -d "$APP_DIR/build" ] && [ -f "$APP_DIR/build/index.html" ]; then
   APP_DIR="$APP_DIR/build"
+  set_bootstrap_phase "START"
   serve_static
+  write_bootstrap_status "START" "COMPLETED" "" 0
+  verify_local_http
   exit 0
 fi
 if [ -d "$APP_DIR/out" ] && [ -f "$APP_DIR/out/index.html" ]; then
   APP_DIR="$APP_DIR/out"
+  set_bootstrap_phase "START"
   serve_static
+  write_bootstrap_status "START" "COMPLETED" "" 0
+  verify_local_http
   exit 0
 fi
 if [ -f "$APP_DIR/index.html" ] && [ "$APP_KIND" = "static" ]; then
+  set_bootstrap_phase "START"
   serve_static
+  write_bootstrap_status "START" "COMPLETED" "" 0
+  verify_local_http
   exit 0
 fi
 
 if [ "$APP_KIND" = "docker" ]; then
+  set_bootstrap_phase "DEPENDENCIES"
   dnf install -y docker
   systemctl enable --now docker
   mkdir -p /usr/local/lib/docker/cli-plugins
@@ -350,40 +538,76 @@ if [ "$APP_KIND" = "docker" ]; then
     chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
   fi
   if [ -f docker-compose.yml ] || [ -f docker-compose.yaml ]; then
-    docker compose up -d --build || true
+    set_bootstrap_phase "BUILD"
+    docker compose up -d --build
+    [ -n "$(docker compose ps --status running --services)" ] || bootstrap_fail "START" "CONTAINER_NOT_RUNNING"
     systemctl stop nginx || true
+    write_bootstrap_status "START" "COMPLETED" "" 0
+    verify_local_http "$APP_PORT"
     exit 0
   elif [ -f Dockerfile ]; then
+    set_bootstrap_phase "BUILD"
     docker build -t "$APP_NAME:latest" .
+    set_bootstrap_phase "START"
+    docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
     docker run -d --name "$APP_NAME" --restart unless-stopped -p "127.0.0.1:$APP_PORT:$APP_PORT" --env-file "$APP_DIR/.env" -e PORT="$APP_PORT" "$APP_NAME:latest"
+    docker container top "$APP_NAME" >/dev/null 2>&1 || bootstrap_fail "START" "CONTAINER_NOT_RUNNING"
     start_nginx_proxy
+    write_bootstrap_status "START" "COMPLETED" "" 0
+    verify_local_http "$APP_PORT"
     exit 0
   fi
 fi
 
 if [ "$APP_KIND" = "node" ]; then
+  set_bootstrap_phase "DEPENDENCIES"
   dnf install -y nodejs npm
-  npm install -g pm2 || true
-  pm2 delete "$APP_NAME" || true
-  if [ ! -d "$APP_DIR/.next" ] && [ ! -d "$APP_DIR/node_modules" ]; then
+  npm install -g pm2
+  pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+  if [ ! -d "$APP_DIR/node_modules" ]; then
     ensure_swap
     if [ -f package-lock.json ]; then npm ci --legacy-peer-deps || npm install --legacy-peer-deps; else npm install --legacy-peer-deps; fi
-    if [ -n "$BUILD_COMMAND" ]; then export NODE_OPTIONS="--max-old-space-size=2048"; bash -lc "$BUILD_COMMAND" || true; fi
   fi
+  write_bootstrap_status "DEPENDENCIES" "COMPLETED" "" 0
+  if [ -d "$APP_DIR/prisma" ]; then
+    set_bootstrap_phase "DATABASE_MIGRATION"
+    set -a
+    [ -f .env ] && . ./.env
+    set +a
+    npx prisma generate
+    if [ -d prisma/migrations ] && [ "$(ls -A prisma/migrations 2>/dev/null)" ]; then
+      npx prisma migrate deploy
+    else
+      npx prisma db push
+    fi
+    write_bootstrap_status "DATABASE_MIGRATION" "COMPLETED" "" 0
+  fi
+  set_bootstrap_phase "BUILD"
+  if [ -n "$BUILD_COMMAND" ]; then export NODE_OPTIONS="--max-old-space-size=2048"; bash -lc "$BUILD_COMMAND"; fi
+  write_bootstrap_status "BUILD" "COMPLETED" "" 0
+  set_bootstrap_phase "START"
   if [ -x node_modules/next/dist/bin/next ]; then
     PORT="$APP_PORT" pm2 start node_modules/next/dist/bin/next --name "$APP_NAME" -- start -p "$APP_PORT"
   elif [ -n "$START_COMMAND" ]; then
     PORT="$APP_PORT" pm2 start bash --name "$APP_NAME" -- -lc "cd '$APP_DIR' && set -a && [ -f .env ] && . ./.env && set +a && PORT='$APP_PORT' $START_COMMAND"
+  else
+    bootstrap_fail "START" "START_COMMAND_UNAVAILABLE"
   fi
+  verify_pm2_online "$APP_NAME" || bootstrap_fail "START" "APPLICATION_NOT_ONLINE"
   pm2 save || true
   start_nginx_proxy
+  write_bootstrap_status "START" "COMPLETED" "" 0
+  verify_local_http "$APP_PORT"
   exit 0
 fi
 
 if [ "$APP_KIND" = "python" ]; then
+  set_bootstrap_phase "DEPENDENCIES"
   dnf install -y python3 python3-pip
   if [ -f requirements.txt ]; then python3 -m pip install -r requirements.txt; elif [ -f pyproject.toml ]; then python3 -m pip install .; fi
-  if [ -n "$BUILD_COMMAND" ]; then bash -lc "$BUILD_COMMAND" || true; fi
+  if [ -n "$BUILD_COMMAND" ]; then set_bootstrap_phase "BUILD"; bash -lc "$BUILD_COMMAND"; fi
+  [ -n "$START_COMMAND" ] || bootstrap_fail "START" "START_COMMAND_UNAVAILABLE"
+  set_bootstrap_phase "START"
   cat >/etc/systemd/system/deplai-app.service <<SERVICE
 [Unit]
 Description=DeplAI app
@@ -399,12 +623,16 @@ WantedBy=multi-user.target
 SERVICE
   systemctl daemon-reload
   systemctl enable --now deplai-app
+  systemctl is-active --quiet deplai-app || bootstrap_fail "START" "APPLICATION_NOT_ONLINE"
   start_nginx_proxy
+  write_bootstrap_status "START" "COMPLETED" "" 0
+  verify_local_http "$APP_PORT"
   exit 0
 fi
 
 if [ -n "$START_COMMAND" ]; then
-  if [ -n "$BUILD_COMMAND" ]; then bash -lc "$BUILD_COMMAND" || true; fi
+  if [ -n "$BUILD_COMMAND" ]; then set_bootstrap_phase "BUILD"; bash -lc "$BUILD_COMMAND"; fi
+  set_bootstrap_phase "START"
   cat >/etc/systemd/system/deplai-app.service <<SERVICE
 [Unit]
 Description=DeplAI app
@@ -420,7 +648,10 @@ WantedBy=multi-user.target
 SERVICE
   systemctl daemon-reload
   systemctl enable --now deplai-app
+  systemctl is-active --quiet deplai-app || bootstrap_fail "START" "APPLICATION_NOT_ONLINE"
   start_nginx_proxy
+  write_bootstrap_status "START" "COMPLETED" "" 0
+  verify_local_http "$APP_PORT"
   exit 0
 fi
 
@@ -429,7 +660,10 @@ if [ -f "$APP_ROOT/frontend/package.json" ] || [ -f "$APP_ROOT/backend/package.j
   exit 1
 fi
 
+set_bootstrap_phase "START"
 serve_static
+write_bootstrap_status "START" "COMPLETED" "" 0
+verify_local_http
 USERDATA
   )
 

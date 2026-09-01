@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  commitSuccessfulDeployment,
+  deploymentHasProvisionedInfrastructure,
   isApplyingDeployment,
   isAwaitingPlanConfirmation,
   isFailedDeployAttempt,
@@ -9,6 +11,7 @@ import {
   isLiveManagedDeployment,
   isRealAwsInstanceId,
   iacRunIdFromResult,
+  resolveRestoredDeployUiStage,
   type DeployStateSnapshot,
 } from './state';
 
@@ -41,6 +44,71 @@ test('live management requires a successful apply that has not been destroyed', 
     isLiveManagedDeployment(snapshot({ status: 'done', deployResult: { mode: 'iac_pipeline', run_id: 'run-2' } })),
     true,
   );
+  assert.equal(
+    isLiveManagedDeployment(snapshot({
+      status: 'done',
+      deployResult: { success: true, outputs: { alb_dns_name: 'ifca-alb.eu-north-1.elb.amazonaws.com' } },
+    })),
+    true,
+  );
+  assert.equal(
+    isLiveManagedDeployment(snapshot({
+      status: 'idle',
+      deployResult: null,
+      deploymentHistory: [{
+        id: 'history-run-history',
+        createdAt: new Date().toISOString(),
+        status: 'done',
+        region: 'eu-north-1',
+        instanceId: 'n/a',
+        cloudfrontUrl: 'n/a',
+        deployResult: { success: true, run_id: 'run-history' },
+      }],
+    })),
+    true,
+  );
+});
+
+test('provisioned infrastructure is detected from ECS and ALB outputs', () => {
+  assert.equal(deploymentHasProvisionedInfrastructure(null), false);
+  assert.equal(deploymentHasProvisionedInfrastructure({ success: false }), false);
+  assert.equal(
+    deploymentHasProvisionedInfrastructure({ success: true, outputs: { ecs_cluster_name: 'ifca-cluster' } }),
+    true,
+  );
+  assert.equal(
+    deploymentHasProvisionedInfrastructure({ success: true, outputs: { alb_dns_name: 'ifca-alb.elb.amazonaws.com' } }),
+    true,
+  );
+  assert.equal(
+    deploymentHasProvisionedInfrastructure({ success: true, ec2: { instance_id: 'i-0abc123def' } }),
+    true,
+  );
+});
+
+test('refresh restores outputs stage for completed deployments', () => {
+  const completed = snapshot({
+    status: 'done',
+    deployResult: { success: true, run_id: 'run-1' },
+  });
+  assert.equal(resolveRestoredDeployUiStage(completed, 'analysis'), 'outputs');
+  assert.equal(resolveRestoredDeployUiStage(snapshot({ status: 'running' }), 'terraform'), 'deploy');
+  assert.equal(resolveRestoredDeployUiStage(snapshot({ status: 'idle' }), 'terraform'), 'terraform');
+});
+
+test('successful deploy commits durable history and terminal state', () => {
+  const base = snapshot({ status: 'running', progress: 80 });
+  const committed = commitSuccessfulDeployment(base, {
+    success: true,
+    run_id: 'run-9',
+    outputs: { alb_dns_name: 'ifca-alb.elb.amazonaws.com' },
+  }, 'eu-north-1');
+  assert.equal(committed.status, 'done');
+  assert.equal(committed.progress, 100);
+  assert.equal(committed.deployResult?.run_id, 'run-9');
+  assert.equal(committed.deploymentHistory.length, 1);
+  const again = commitSuccessfulDeployment(committed, committed.deployResult!, 'eu-north-1');
+  assert.equal(again.deploymentHistory.length, 1);
 });
 
 test('failed apply is retryable even if the UI still looks in-progress', () => {

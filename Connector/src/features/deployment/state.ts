@@ -33,6 +33,20 @@ export interface RepositoryContextJson {
   readme_notes?: string | null;
   conflicts?: Array<{ field?: string; reason?: string }>;
   low_confidence_items?: Array<{ field?: string; reason?: string }>;
+  workload_profile?: {
+    services?: Array<Record<string, unknown>>;
+    workers?: Array<Record<string, unknown>>;
+    scheduled_jobs?: Array<Record<string, unknown>>;
+    queues?: Array<Record<string, unknown>>;
+    persistent_storage?: Array<Record<string, unknown>>;
+    object_storage?: Array<Record<string, unknown>>;
+    search?: Array<Record<string, unknown>>;
+    authentication?: Array<Record<string, unknown>>;
+    third_party_dependencies?: Array<Record<string, unknown>>;
+    webhooks?: Array<Record<string, unknown>>;
+    protocols?: string[];
+    runtime_characteristics?: Record<string, unknown>;
+  };
 }
 
 export interface ArchitectureQuestionOption {
@@ -48,6 +62,25 @@ export interface ArchitectureQuestion {
   required: boolean;
   default?: string | null;
   options?: ArchitectureQuestionOption[];
+  affects?: string[];
+  priority?: number;
+  reason?: string | null;
+  recommended_answer?: string | null;
+  cost_impact?: string | null;
+  risk_impact?: string | null;
+  skip_allowed?: boolean;
+  decision_id?: string | null;
+}
+
+export interface ArchitectureDecision {
+  decision_id: string;
+  category: string;
+  authority: 'auto' | 'recommend_confirm' | 'user_required';
+  status: 'proposed' | 'confirmed' | 'overridden' | 'blocked';
+  recommendation?: unknown;
+  confidence: number;
+  reason_codes?: string[];
+  evidence?: Array<Record<string, unknown>>;
 }
 
 export interface ArchitectureReviewPayload {
@@ -56,6 +89,8 @@ export interface ArchitectureReviewPayload {
   defaults: Record<string, string>;
   conflicts: Array<{ field?: string; reason?: string }>;
   low_confidence_items: Array<{ field?: string; reason?: string }>;
+  decisions?: ArchitectureDecision[];
+  planning_mode?: 'autopilot' | 'guided' | 'expert';
 }
 
 export interface InfraConsultantMessage {
@@ -193,6 +228,12 @@ export interface DeployApiResult {
   plan_summary?: Record<string, unknown> | null;
   deployment_summary?: Record<string, unknown> | null;
   deployment_verified?: boolean;
+  terraform_status?: 'succeeded' | 'failed' | 'unknown';
+  application_status?: 'succeeded' | 'failed' | 'running' | 'unknown';
+  bootstrap_status?: Record<string, unknown> | null;
+  verification_status?: 'passed' | 'failed' | 'pending' | 'unknown';
+  infrastructure_only_success?: boolean;
+  partial_deployment?: boolean;
   verification_checks?: Array<{
     label?: string;
     url?: string;
@@ -1250,7 +1291,7 @@ export function projectHasSuccessfulDeploy(projectId: string): boolean {
 export function isAwaitingPlanConfirmation(args: {
   uiPhase?: string | null;
   requiresPlanConfirmation?: boolean;
-  result?: Pick<DeployApiResult, 'requires_plan_confirmation' | 'status'> | null;
+  result?: Pick<DeployApiResult, 'requires_plan_confirmation' | 'status' | 'success'> | null;
 }): boolean {
   if (args.requiresPlanConfirmation) return true;
   if (String(args.uiPhase || '').trim().toLowerCase() === 'awaiting_plan') return true;
@@ -1313,12 +1354,90 @@ export function isLiveDeployAttempt(args: {
 }
 
 /** True after a successful apply that has not been destroyed (status reset to idle). */
+function hasMeaningfulProvisionedValue(value: string | null | undefined): boolean {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return !['n/a', 'na', 'null', 'undefined', 'none', '-', '—'].includes(lower);
+}
+
+export function deploymentHasProvisionedInfrastructure(result: DeployApiResult | null | undefined): boolean {
+  if (!result || result.success === false) return false;
+  if (iacRunIdFromResult(result)) return true;
+  const summary = extractDeploymentSummary(result);
+  if (isRealAwsInstanceId(summary.instanceId)) return true;
+  if (hasMeaningfulProvisionedValue(summary.albDns)) return true;
+  if (hasMeaningfulProvisionedValue(summary.ecsCluster)) return true;
+  if (hasMeaningfulProvisionedValue(summary.ecrRepositoryUrl)) return true;
+  if (hasMeaningfulProvisionedValue(summary.cloudfrontUrl)) return true;
+  if (hasMeaningfulProvisionedValue(summary.rdsEndpoint)) return true;
+  if (hasMeaningfulProvisionedValue(summary.appUrl)) return true;
+  const outputs = flattenDeployOutputs(result.raw_outputs || result.outputs);
+  return Boolean(
+    pickOutputRaw(outputs, [
+      'alb_dns_name',
+      'ecs_cluster_name',
+      'ecs_cluster',
+      'ecr_repository_url',
+      'rds_endpoint',
+      'cloudfront_url',
+    ]),
+  );
+}
+
 export function isLiveManagedDeployment(snapshot: DeployStateSnapshot | null | undefined): boolean {
-  if (!snapshot || snapshot.status !== 'done') return false;
-  const result = snapshot.deployResult;
-  if (!result || typeof result !== 'object') return false;
-  if (result.success === false) return false;
-  return true;
+  if (!snapshot) return false;
+  if (snapshot.status === 'done' && deploymentHasProvisionedInfrastructure(snapshot.deployResult)) {
+    return true;
+  }
+  return snapshot.deploymentHistory.some(
+    (entry) => entry.status === 'done' && deploymentHasProvisionedInfrastructure(entry.deployResult),
+  );
+}
+
+export function resolveRestoredDeployUiStage(
+  snapshot: DeployStateSnapshot | null | undefined,
+  savedStage: string | null | undefined,
+): string {
+  if (snapshot?.status === 'done' && deploymentHasProvisionedInfrastructure(snapshot.deployResult)) {
+    return 'outputs';
+  }
+  if (snapshot?.status === 'running') {
+    return 'deploy';
+  }
+  const stage = String(savedStage || '').trim();
+  return stage || 'analysis';
+}
+
+export function commitSuccessfulDeployment(
+  snapshot: DeployStateSnapshot,
+  result: DeployApiResult,
+  region: string,
+): DeployStateSnapshot {
+  const normalizedResult: DeployApiResult = {
+    ...result,
+    success: result.success !== false,
+    error: undefined,
+  };
+  const entry = toHistoryEntry(normalizedResult, 'done', region);
+  const duplicateRecent = snapshot.deploymentHistory.some((previous) => (
+    previous.status === 'done'
+    && previous.deployResult?.success !== false
+    && previous.instanceId === entry.instanceId
+    && previous.cloudfrontUrl === entry.cloudfrontUrl
+    && String(previous.deployResult?.mode || '') === String(normalizedResult.mode || '')
+    && String(previous.deployResult?.run_id || '') === String(normalizedResult.run_id || '')
+  ));
+  return {
+    ...snapshot,
+    status: 'done',
+    progress: 100,
+    deployResult: normalizedResult,
+    deploymentHistory: duplicateRecent
+      ? snapshot.deploymentHistory
+      : [entry, ...snapshot.deploymentHistory].slice(0, DEPLOY_HISTORY_MAX),
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 export function isApplyingDeployment(snapshot: DeployStateSnapshot | null | undefined): boolean {

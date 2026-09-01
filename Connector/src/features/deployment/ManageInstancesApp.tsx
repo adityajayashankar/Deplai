@@ -479,6 +479,15 @@ export default function ManageInstancesApp({ embedded = false }: { embedded?: bo
   const iacStackCount = scopedEnvironments.length;
   const hasAwsCreds = Boolean(readSavedAws().aws_access_key_id && readSavedAws().aws_secret_access_key);
 
+  useEffect(() => {
+    if (requestedTab !== 'runtime') return;
+    if (scopedEnvironments.length === 0) return;
+    const hasEc2Summary = scopedEnvironments.some((env) => isRealAwsInstanceId(env.summary.instanceId));
+    if (hasEc2Summary) return;
+    setTab('iac');
+    replaceQuery({ tab: 'iac' });
+  }, [replaceQuery, requestedTab, scopedEnvironments]);
+
   const openDeploy = useCallback((projectId: string, stage: 'outputs' | 'terraform' | 'deploy') => {
     saveDeployUiStage(projectId, stage);
     try {

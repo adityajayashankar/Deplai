@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
+import { resolveAgenticBillingContext } from '@/lib/agentic-context';
 import { ArchitectureJson, validateArchitectureJson } from '@/lib/architecture-contract';
 
 interface ArchitectureBody {
@@ -280,7 +281,7 @@ function buildDeterministicAwsArchitecture(
  */
 export async function POST(req: NextRequest) {
   try {
-    const { error } = await requireAuth();
+    const { user, error } = await requireAuth();
     if (error) return error;
 
     const body = await req.json() as ArchitectureBody;
@@ -313,6 +314,8 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    const billing = await resolveAgenticBillingContext({ request: req, user });
+
     const agenticRes = await fetch(`${AGENTIC_URL}/api/architecture/generate`, {
       method: 'POST',
       headers: {
@@ -322,6 +325,7 @@ export async function POST(req: NextRequest) {
       body: JSON.stringify({
         prompt,
         provider,
+        ...billing.fields,
         llm_provider: body.llm_provider || null,
         llm_api_key: body.llm_api_key || null,
         llm_model: body.llm_model || null,

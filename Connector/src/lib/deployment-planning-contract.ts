@@ -34,6 +34,7 @@ export interface RepositoryContextJson {
   conflicts?: ConflictItem[];
   low_confidence_items?: LowConfidenceItem[];
   readme_notes?: string | null;
+  workload_profile?: Record<string, unknown>;
 }
 
 export interface ArchitectureQuestionOption {
@@ -50,6 +51,13 @@ export interface ArchitectureQuestion {
   default?: string | null;
   options?: ArchitectureQuestionOption[];
   affects?: string[];
+  priority?: number;
+  reason?: string | null;
+  recommended_answer?: string | null;
+  cost_impact?: string | null;
+  risk_impact?: string | null;
+  skip_allowed?: boolean;
+  decision_id?: string | null;
 }
 
 export interface DeploymentProfileJson {
@@ -70,6 +78,19 @@ export interface DeploymentProfileJson {
   operational?: Record<string, unknown>;
   compliance?: Record<string, unknown>;
   warnings?: string[];
+  planning_mode?: 'autopilot' | 'guided' | 'expert';
+  workload?: Record<string, unknown>;
+  storage?: Record<string, unknown>;
+  queues?: Array<Record<string, unknown>>;
+  security?: Record<string, unknown>;
+  reliability?: Record<string, unknown>;
+  observability?: Record<string, unknown>;
+  deployment?: Record<string, unknown>;
+  cost?: Record<string, unknown>;
+  aws_reuse?: Record<string, unknown>;
+  decisions?: Array<Record<string, unknown>>;
+  architecture_conflicts?: Array<Record<string, unknown>>;
+  candidate_architectures?: Array<Record<string, unknown>>;
 }
 
 export interface ArchitectureReviewPayload {
@@ -78,6 +99,8 @@ export interface ArchitectureReviewPayload {
   defaults: Record<string, string>;
   conflicts: ConflictItem[];
   low_confidence_items: LowConfidenceItem[];
+  decisions?: Array<Record<string, unknown>>;
+  planning_mode?: 'autopilot' | 'guided' | 'expert';
 }
 
 export interface PlanningValidationResult<T> {

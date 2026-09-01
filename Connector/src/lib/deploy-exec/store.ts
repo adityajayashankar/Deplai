@@ -7,6 +7,7 @@ export type DeployExecRow = {
   id: string;
   project_id: string;
   user_id: string;
+  organization_id: string | null;
   environment_id: string;
   status: string;
   result_class: string;
@@ -58,11 +59,13 @@ async function agentic<T>(path: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
-export async function listDeployments(userId: string, projectId: string): Promise<DeployExecRow[]> {
+export async function listDeployments(userId: string, projectId: string, organizationId?: string | null): Promise<DeployExecRow[]> {
   await ensureDeployExecSchema();
   return query<DeployExecRow[]>(
-    `SELECT * FROM deploy_exec_deployments WHERE user_id = ? AND project_id = ? ORDER BY created_at DESC LIMIT 50`,
-    [userId, projectId],
+    `SELECT * FROM deploy_exec_deployments
+     WHERE project_id = ? AND (organization_id = ? OR (organization_id IS NULL AND user_id = ?))
+     ORDER BY created_at DESC LIMIT 50`,
+    [projectId, organizationId || '', userId],
   );
 }
 
@@ -78,6 +81,7 @@ export async function getDeployment(userId: string, id: string): Promise<DeployE
 export async function insertDeployment(input: {
   id: string;
   userId: string;
+  organizationId?: string | null;
   projectId: string;
   environmentId: string;
   digest: string;
@@ -92,13 +96,14 @@ export async function insertDeployment(input: {
   await ensureDeployExecSchema();
   await query(
     `INSERT INTO deploy_exec_deployments (
-      id, project_id, user_id, environment_id, status, result_class, artifact_digest, artifact_image,
+      id, project_id, user_id, organization_id, environment_id, status, result_class, artifact_digest, artifact_image,
       instance_id, account_id, region, source_commit, public_endpoint, dry_run, started_at
-    ) VALUES (?, ?, ?, ?, 'CREATED', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())`,
+    ) VALUES (?, ?, ?, ?, ?, 'CREATED', 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())`,
     [
       input.id,
       input.projectId,
       input.userId,
+      input.organizationId || null,
       input.environmentId,
       input.digest,
       input.image,
@@ -139,9 +144,9 @@ export async function syncDeployment(id: string, remote: Record<string, unknown>
 export async function recordEvent(deploymentId: string, projectId: string, eventName: string, status?: string, payload?: unknown) {
   await ensureDeployExecSchema();
   await query(
-    `INSERT INTO deploy_exec_events (id, deployment_id, project_id, event_name, status, payload_json)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [randomUUID(), deploymentId, projectId, eventName, status || null, payload ? JSON.stringify(payload) : null],
+    `INSERT INTO deploy_exec_events (id, deployment_id, project_id, organization_id, event_name, status, payload_json)
+     VALUES (?, ?, ?, (SELECT organization_id FROM deploy_exec_deployments WHERE id = ?), ?, ?, ?)`,
+    [randomUUID(), deploymentId, projectId, deploymentId, eventName, status || null, payload ? JSON.stringify(payload) : null],
   );
 }
 

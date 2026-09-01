@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
+import { resolveAgenticBillingContext } from '@/lib/agentic-context';
 
 interface Stage7Body {
   project_id?: string;
@@ -46,6 +47,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'infra_plan is required' }, { status: 400 });
     }
 
+    const billing = await resolveAgenticBillingContext({ request: req, user });
+
     const agenticRes = await fetch(`${AGENTIC_URL}/api/stage7/approval`, {
       method: 'POST',
       headers: {
@@ -57,6 +60,7 @@ export async function POST(req: NextRequest) {
         budget_cap_usd: Number(body.budget_cap_usd || 100),
         pipeline_run_id: String(body.pipeline_run_id || ''),
         environment: String(body.environment || 'dev'),
+        ...billing.fields,
       }),
       signal: AbortSignal.timeout(90_000),
     });

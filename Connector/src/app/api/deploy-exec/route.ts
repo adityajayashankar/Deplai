@@ -16,9 +16,9 @@ export async function GET(request: NextRequest) {
   if (auth.error) return auth.error;
   const projectId = String(request.nextUrl.searchParams.get('project_id') || '').trim();
   if (!projectId) return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
-  const ownership = await verifyProjectOwnership(auth.user.id, projectId);
+  const ownership = await verifyProjectOwnership(auth.user.id, projectId, 'deployment.read');
   if ('error' in ownership) return ownership.error;
-  const deployments = await listDeployments(auth.user.id, projectId);
+  const deployments = await listDeployments(auth.user.id, projectId, ownership.project.organization_id);
   return NextResponse.json({ deployments });
 }
 
@@ -28,7 +28,7 @@ export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => ({})) as Record<string, unknown>;
   const projectId = String(body.project_id || '').trim();
   if (!projectId) return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
-  const ownership = await verifyProjectOwnership(auth.user.id, projectId);
+  const ownership = await verifyProjectOwnership(auth.user.id, projectId, 'deployment.create');
   if ('error' in ownership) return ownership.error;
   const environmentId = String(body.environment_id || 'production').trim() || 'production';
   const image = String(body.image || '').trim();
@@ -76,6 +76,7 @@ export async function POST(request: NextRequest) {
     await insertDeployment({
       id: deploymentId,
       userId: auth.user.id,
+      organizationId: ownership.project.organization_id,
       projectId,
       environmentId,
       digest,

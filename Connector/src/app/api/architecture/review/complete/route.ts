@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
+import { resolveAgenticBillingContext } from '@/lib/agentic-context';
 import { resolveProjectMeta } from '@/lib/project-meta';
 import {
   buildDeploymentWorkspace,
@@ -13,6 +14,7 @@ interface ArchitectureReviewCompleteBody {
   project_id: string;
   workspace: string;
   answers: Record<string, string>;
+  aws_context?: Record<string, unknown> | null;
 }
 
 function classifyAgenticRouteError(err: unknown, action: string): { message: string; status: number } {
@@ -55,6 +57,8 @@ export async function POST(req: NextRequest) {
     const owned = await verifyProjectOwnership(user.id, projectId);
     if ('error' in owned) return owned.error;
 
+    const billing = await resolveAgenticBillingContext({ request: req, user });
+
     const meta = await resolveProjectMeta(String(user.id), projectId);
     if (!meta) {
       return NextResponse.json({ error: 'Project metadata could not be resolved.' }, { status: 404 });
@@ -73,9 +77,10 @@ export async function POST(req: NextRequest) {
         project_name: projectName,
         project_type: meta.project_type,
         workspace,
-        user_id: String(user.id),
+        ...billing.fields,
         repo_full_name: meta.repo_full_name,
         answers: body.answers || {},
+        aws_context: body.aws_context || null,
       }),
       signal: AbortSignal.timeout(120_000),
     });

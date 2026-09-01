@@ -8,7 +8,7 @@ export async function POST(request: NextRequest) {
   const body = await request.json().catch(() => ({})) as Record<string, string>;
   const projectId = String(body.project_id || '').trim();
   if (!projectId) return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
-  const ownership = await verifyProjectOwnership(auth.user.id, projectId);
+  const ownership = await verifyProjectOwnership(auth.user.id, projectId, 'deployment.read');
   if ('error' in ownership) return ownership.error;
   const environmentId = String(body.environment_id || '').trim();
   const image = String(body.image || '').trim();

@@ -320,9 +320,11 @@ def build_enterprise_profile_bundle(
     locals_tf = f"""locals {{
   common_tags = {{
     environment = var.environment
+    project     = var.project_name
     team        = var.team
     cost_center = var.cost_center
     managed_by  = "terraform"
+    "deplai:managed" = "true"
   }}
 
   enable_compute     = startswith(var.compute_strategy, "ec2")

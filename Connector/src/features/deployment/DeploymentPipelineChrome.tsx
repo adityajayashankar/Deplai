@@ -10,8 +10,9 @@ import {
   RotateCcw,
   Send,
 } from 'lucide-react';
-import type { ArchitectureQuestion, RepositoryContextJson } from '@/features/deployment/state';
+import type { ArchitectureDecision, ArchitectureQuestion, RepositoryContextJson } from '@/features/deployment/state';
 import {
+  Callout,
   Chip,
   EmptyState,
   KeyValueRow,
@@ -203,7 +204,7 @@ export function DeploymentStageRail({
   const activeLabel = PIPELINE_STEPS[activeIndex]?.label || 'Analysis';
 
   return (
-    <div className="shrink-0 border-b-[3px] border-black bg-white px-5 pb-4 sm:px-8">
+    <div className="sticky top-0 z-30 shrink-0 border-b-[3px] border-black bg-white px-5 pb-4 shadow-[0_8px_0_0_rgba(0,0,0,0.04)] sm:px-8">
       <div className="mb-3 flex items-end justify-between gap-4">
         <p className="font-mono text-[10px] font-medium uppercase tracking-[0.2em] text-neutral-500">
           Stages
@@ -346,6 +347,39 @@ export type DetectedService = {
   confidence: 'high' | 'medium' | 'low';
 };
 
+function formatDatastoreLabel(type: string): string {
+  const key = String(type || '').trim().toLowerCase();
+  if (key === 'postgresql' || key === 'postgres') return 'PostgreSQL';
+  if (key === 'mysql') return 'MySQL';
+  if (key === 'redis') return 'Redis';
+  if (key === 'mongodb') return 'MongoDB';
+  return type.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function formatDatastoreDetail(type: string, signals: string[]): string {
+  const configSignal = signals.find((signal) => signal.startsWith('config:'));
+  const dependencySignal = signals.find((signal) => signal.startsWith('dependency:'));
+  const key = String(type || '').trim().toLowerCase();
+
+  if (configSignal && configSignal.toLowerCase().includes('schema.prisma')) {
+    if (key === 'postgresql' || key === 'postgres') {
+      return 'Prisma schema targets PostgreSQL — AWS RDS can host this';
+    }
+    return `declared in ${configSignal.replace('config:', '')}`;
+  }
+
+  if (dependencySignal) {
+    const dep = dependencySignal.replace('dependency:', '');
+    if (dep === 'prisma' || dep === '@prisma/client') {
+      return 'Prisma ORM dependency — database engine comes from schema.prisma';
+    }
+    return `found '${dep}' dependency`;
+  }
+
+  if (signals.length > 0) return signals.slice(0, 2).join(', ');
+  return `${formatDatastoreLabel(type)} signals detected in repository scan`;
+}
+
 export function deriveDetectedServices(repoContext: RepositoryContextJson | null): DetectedService[] {
   if (!repoContext) return [];
 
@@ -361,15 +395,9 @@ export function deriveDetectedServices(repoContext: RepositoryContextJson | null
     const signals = Array.isArray(raw?.signals)
       ? raw.signals.map((item) => String(item || '').trim()).filter(Boolean)
       : [];
-    const signalHint = signals.find((signal) => signal.startsWith('dependency:'));
-    const detail = signalHint
-      ? `found '${signalHint.replace('dependency:', '')}' dependency`
-      : signals.length > 0
-        ? signals.slice(0, 2).join(', ')
-        : `${type} signals detected in repository scan`;
     services.push({
-      name: type.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase()),
-      detail,
+      name: formatDatastoreLabel(type),
+      detail: formatDatastoreDetail(type, signals),
       confidence,
     });
   }
@@ -383,13 +411,30 @@ export function deriveDetectedServices(repoContext: RepositoryContextJson | null
     });
   }
 
-  const hasRedis = dataStores.some((item) => String(item?.type || '').toLowerCase().includes('redis'));
-  if (!hasRedis) {
-    services.push({
-      name: 'Redis',
-      detail: 'no clear caching layer detected, may be required',
-      confidence: 'low',
-    });
+  const workload = repoContext.workload_profile || {};
+  const workloadGroups: Array<[string, unknown, string]> = [
+    ['Worker', workload.workers, 'background process'],
+    ['Scheduler', workload.scheduled_jobs, 'scheduled workload'],
+    ['Queue', workload.queues, 'queue dependency'],
+    ['Durable storage', workload.persistent_storage, 'persistent local writes'],
+    ['Object storage', workload.object_storage, 'object storage integration'],
+    ['Search', workload.search, 'search provider'],
+    ['Authentication', workload.authentication, 'identity integration'],
+    ['Webhook', workload.webhooks, 'public callback endpoint'],
+  ];
+  for (const [label, rawItems, fallback] of workloadGroups) {
+    if (!Array.isArray(rawItems)) continue;
+    for (const raw of rawItems) {
+      if (!raw || typeof raw !== 'object') continue;
+      const item = raw as Record<string, unknown>;
+      const evidence = Array.isArray(item.evidence) ? item.evidence[0] as Record<string, unknown> | undefined : undefined;
+      const confidenceNumber = Number(item.confidence || 0.75);
+      services.push({
+        name: String(item.framework || item.provider || item.usage || item.id || label),
+        detail: evidence ? `${fallback} — ${String(evidence.signal || 'repository evidence')}` : fallback,
+        confidence: confidenceNumber >= 0.9 ? 'high' : confidenceNumber < 0.65 ? 'low' : 'medium',
+      });
+    }
   }
 
   return services;
@@ -466,15 +511,18 @@ export function AnalysisStagePanel({
   loading,
   metrics,
   services,
+  conflictLines,
   continueDisabled,
   onContinue,
 }: {
   loading: boolean;
   metrics: AnalysisMetrics;
   services: DetectedService[];
+  conflictLines?: string[];
   continueDisabled: boolean;
   onContinue: () => void;
 }) {
+  const conflicts = (conflictLines || []).filter(Boolean);
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-5">
       {loading ? (
@@ -486,6 +534,15 @@ export function AnalysisStagePanel({
             Reading the codebase and waiting on the Agentic Layer…
           </span>
         </Panel>
+      ) : null}
+      {conflicts.length > 0 ? (
+        <Callout tone="warn" title="Analysis conflicts">
+          <ul className="space-y-1.5 text-[13px] leading-6">
+            {conflicts.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </Callout>
       ) : null}
       <AnalysisMetricCards metrics={metrics} loading={loading} />
       <DetectedServicesList services={services} loading={loading} />
@@ -543,6 +600,9 @@ export function PlanningAgentPanel({
   backDisabled,
   nextDisabled,
   nextLabel,
+  decisions,
+  architectureConflicts,
+  candidateArchitectures,
 }: {
   projectName: string;
   loading: boolean;
@@ -581,6 +641,9 @@ export function PlanningAgentPanel({
   backDisabled?: boolean;
   nextDisabled?: boolean;
   nextLabel?: string;
+  decisions?: ArchitectureDecision[];
+  architectureConflicts?: Array<{ severity?: string; code?: string; message?: string; recommendation?: string | null }>;
+  candidateArchitectures?: Array<{ id?: string; label?: string; description?: string; estimated_monthly_usd?: number | null; reliability?: string }>;
 }) {
   const latestAssistant = useMemo(() => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -607,9 +670,51 @@ export function PlanningAgentPanel({
   const rows = componentRows || [];
   const sequence = deploySequence || [];
   const showBudget = Boolean(budgetChips?.length && onSelectBudget && !showDecision);
+  const automaticDecisions = (decisions || []).filter((item) => item.authority === 'auto');
+  const recommendDecisions = (decisions || []).filter((item) => item.authority === 'recommend_confirm');
+  const criticFindings = (architectureConflicts || []).filter((item) => item.message);
+  const candidates = candidateArchitectures || [];
 
   return (
     <div className="flex w-full flex-col gap-5">
+      {!showDecision && automaticDecisions.length > 0 ? (
+        <Panel padded={false}>
+          <PanelHeader
+            title="Automatically configured"
+            subtitle={`${automaticDecisions.length} evidence-backed decisions already resolved from the repository and platform policy.`}
+            actions={<StatusPill tone="ok">No input needed</StatusPill>}
+          />
+          <ul className="grid gap-px bg-black/15 sm:grid-cols-2 lg:grid-cols-3">
+            {automaticDecisions.slice(0, 9).map((decision) => (
+              <li key={decision.decision_id} className="flex items-start gap-2 bg-white px-4 py-3">
+                <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-black" strokeWidth={2.5} />
+                <div className="min-w-0">
+                  <div className="text-[12.5px] font-semibold text-black">{decision.decision_id.replaceAll('_', ' ')}</div>
+                  <div className="mt-0.5 truncate font-mono text-[10.5px] text-neutral-500" title={String(decision.recommendation ?? '')}>
+                    {String(decision.recommendation ?? 'enabled')} · {Math.round(Number(decision.confidence || 0) * 100)}%
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </Panel>
+      ) : null}
+      {!showDecision && recommendDecisions.length > 0 ? (
+        <Panel padded={false}>
+          <PanelHeader
+            title="Recommended decisions"
+            subtitle="These tradeoffs affect cost, reliability, or operations. Defaults are pre-selected where evidence is strong."
+          />
+          <ul className="divide-y divide-black/15">
+            {recommendDecisions.slice(0, 6).map((decision) => (
+              <li key={decision.decision_id} className="px-4 py-3">
+                <div className="text-[12.5px] font-semibold text-black">{decision.decision_id.replaceAll('_', ' ')}</div>
+                <div className="mt-1 text-[12px] text-[var(--dw-muted)]">{String(decision.recommendation ?? 'pending')}</div>
+              </li>
+            ))}
+          </ul>
+        </Panel>
+      ) : null}
       {showDecision ? (
         <Panel elevation="raised" padded={false}>
           <PanelHeader
@@ -681,6 +786,40 @@ export function PlanningAgentPanel({
                 />
               </div>
             </div>
+
+            {candidates.length > 0 ? (
+              <div>
+                <SectionLabel>Architecture options</SectionLabel>
+                <div className="mt-2 grid gap-3 md:grid-cols-3">
+                  {candidates.map((candidate) => (
+                    <div key={String(candidate.id || candidate.label)} className="border-[3px] border-black bg-white p-3">
+                      <div className="text-[13px] font-semibold text-black">{candidate.label || candidate.id}</div>
+                      <div className="mt-1 text-[12px] text-[var(--dw-muted)]">{candidate.description || '—'}</div>
+                      <div className="mt-2 font-mono text-[11px] text-neutral-500">
+                        {candidate.estimated_monthly_usd != null ? `$${Number(candidate.estimated_monthly_usd).toFixed(0)}/mo` : 'estimate pending'}
+                        {candidate.reliability ? ` · ${candidate.reliability}` : ''}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            {criticFindings.length > 0 ? (
+              <div>
+                <SectionLabel>Architecture review</SectionLabel>
+                <ul className="mt-2 space-y-2">
+                  {criticFindings.map((finding) => (
+                    <li key={`${finding.code}-${finding.message}`} className="border-l-[3px] border-black pl-3 text-[13px] leading-6">
+                      <div className="font-semibold text-black">{finding.message}</div>
+                      {finding.recommendation ? (
+                        <div className="text-[12px] text-[var(--dw-muted)]">{finding.recommendation}</div>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
 
             {onRefine ? (
               <button
@@ -778,6 +917,28 @@ export function PlanningAgentPanel({
               )}
             </p>
             )}
+            {scripted && (currentQuestion?.reason || currentQuestion?.cost_impact || currentQuestion?.risk_impact) ? (
+              <div className={`${paperInsetClass} grid gap-3 px-4 py-3 sm:grid-cols-3`}>
+                {currentQuestion?.reason ? (
+                  <div>
+                    <SectionLabel>Why we ask</SectionLabel>
+                    <p className="text-[12.5px] leading-relaxed text-[var(--dw-fg-soft)]">{currentQuestion.reason}</p>
+                  </div>
+                ) : null}
+                {currentQuestion?.cost_impact ? (
+                  <div>
+                    <SectionLabel>Cost impact</SectionLabel>
+                    <p className="text-[12.5px] leading-relaxed text-[var(--dw-fg-soft)]">{currentQuestion.cost_impact}</p>
+                  </div>
+                ) : null}
+                {currentQuestion?.risk_impact ? (
+                  <div>
+                    <SectionLabel>Reliability impact</SectionLabel>
+                    <p className="text-[12.5px] leading-relaxed text-[var(--dw-fg-soft)]">{currentQuestion.risk_impact}</p>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             {scripted && questionOptions.length > 0 ? (
               <div>
                 <SectionLabel>{currentAnswered ? 'Your choice' : 'Choose one'}</SectionLabel>
@@ -796,6 +957,11 @@ export function PlanningAgentPanel({
                       }`}
                     >
                       <div className="text-[13px] font-semibold">{option.label}</div>
+                      {currentQuestion?.recommended_answer === option.value ? (
+                        <div className={`mt-1 font-mono text-[9.5px] uppercase tracking-[0.16em] ${selected ? 'text-white/70' : 'text-neutral-500'}`}>
+                          Deplai recommends
+                        </div>
+                      ) : null}
                       {option.description ? (
                         <div className="mt-0.5 text-[12px] leading-relaxed opacity-80">{option.description}</div>
                       ) : null}

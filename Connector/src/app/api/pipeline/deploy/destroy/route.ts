@@ -51,7 +51,7 @@ export async function POST(req: NextRequest) {
     if (!projectId) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
     }
-    const owned = await verifyProjectOwnership(user.id, projectId);
+    const owned = await verifyProjectOwnership(user.id, projectId, 'environment.delete');
     if ('error' in owned) return owned.error;
 
     const awsAccessKeyId = String(body.aws_access_key_id || '').trim();

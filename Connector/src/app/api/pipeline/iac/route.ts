@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
+import { resolveAgenticBillingContext } from '@/lib/agentic-context';
 import { validateTerraformArchitectureInput } from '@/lib/deployment-planning-contract';
 import { type RepoPersistenceResult } from '@/lib/iac-pr';
 import { coerceHttpAppPort } from '@/features/deployment/http-ports';
@@ -693,7 +694,8 @@ function parseConnectorChatIntakes(
       .filter(Boolean)
     : [];
   if (latestUserText.trim()) userParts.push(latestUserText.trim());
-  const search = `${userParts.join('\n')}\n${JSON.stringify(answers)}`.toLowerCase();
+  const userSearch = userParts.join('\n').toLowerCase();
+  const search = `${userSearch}\n${JSON.stringify(answers)}`.toLowerCase();
   const intakes: Record<string, unknown> = {};
 
   const parseNum = (raw: string): number | null => {
@@ -711,8 +713,8 @@ function parseConnectorChatIntakes(
     return Number.isFinite(value) ? value * multiplier : null;
   };
 
-  const monthlyMatch = search.match(/(?:monthly|per\s*month|\/\s*mo)\D{0,24}(\d+(?:\.\d+)?\s*[km]?)/i)
-    || search.match(/(\d+(?:\.\d+)?\s*[km]?)\s*(?:requests?|hits?)\s*(?:per|\/)\s*month/i);
+  const monthlyMatch = userSearch.match(/(?:monthly|per\s*month|\/\s*mo)\D{0,24}(\d+(?:\.\d+)?\s*[km]?)/i)
+    || userSearch.match(/(\d+(?:\.\d+)?\s*[km]?)\s*(?:requests?|hits?)\s*(?:per|\/)\s*month/i);
   if (monthlyMatch) {
     const value = parseNum(monthlyMatch[1]);
     if (value != null) intakes.monthly_traffic = Math.round(value);
@@ -721,8 +723,8 @@ function parseConnectorChatIntakes(
     if (value != null) intakes.monthly_traffic = Math.round(value);
   }
 
-  const peakMatch = search.match(/(?:peak(?:\s+concurrent)?(?:\s+users?)?|concurrent\s+users?)\D{0,24}(\d+(?:\.\d+)?\s*[km]?)/i)
-    || search.match(/(\d+(?:\.\d+)?\s*[km]?)\s*(?:rps|req(?:uests?)?\s*\/\s*s)/i);
+  const peakMatch = userSearch.match(/(?:peak(?:\s+concurrent)?(?:\s+users?)?|concurrent\s+users?)\D{0,24}(\d+(?:\.\d+)?\s*[km]?)/i)
+    || userSearch.match(/(\d+(?:\.\d+)?\s*[km]?)\s*(?:rps|req(?:uests?)?\s*\/\s*s)/i);
   if (peakMatch) {
     const value = parseNum(peakMatch[1]);
     if (value != null) {
@@ -731,15 +733,27 @@ function parseConnectorChatIntakes(
     }
   }
 
-  if (/\b(?:no|without|don'?t\s+need)\b.{0,24}\b(?:alb|load\s*balanc)/i.test(search)) intakes.need_alb = false;
-  else if (/\b(?:alb|application\s+load\s*balanc|load\s*balanc(?:er|ing)?)\b/i.test(search)) intakes.need_alb = true;
+  const loadBalancerAnswer = String(answers.q_load_balancer || '').trim().toLowerCase();
+  if (loadBalancerAnswer === 'alb') {
+    intakes.need_alb = true;
+    intakes.need_eip = false;
+  } else if (loadBalancerAnswer === 'elastic_ip') {
+    intakes.need_alb = false;
+    intakes.need_eip = true;
+  } else if (loadBalancerAnswer === 'none') {
+    intakes.need_alb = false;
+    intakes.need_eip = false;
+  }
+
+  if (/\b(?:no|without|don'?t\s+need)\b.{0,24}\b(?:alb|load\s*balanc)/i.test(userSearch)) intakes.need_alb = false;
+  else if (/\b(?:alb|application\s+load\s*balanc|load\s*balanc(?:er|ing)?)\b/i.test(userSearch)) intakes.need_alb = true;
   else if (readBoolLike(answers.need_alb) != null) intakes.need_alb = readBoolLike(answers.need_alb);
 
-  if (/\b(?:no|without|don'?t\s+need)\b.{0,24}\b(?:eip|elastic\s*ip)/i.test(search)) intakes.need_eip = false;
-  else if (/\b(?:eip|elastic\s*ip|static\s*(?:public\s*)?ip)\b/i.test(search)) intakes.need_eip = true;
+  if (/\b(?:no|without|don'?t\s+need)\b.{0,24}\b(?:eip|elastic\s*ip)/i.test(userSearch)) intakes.need_eip = false;
+  else if (/\b(?:eip|elastic\s*ip|static\s*(?:public\s*)?ip)\b/i.test(userSearch)) intakes.need_eip = true;
   else if (readBoolLike(answers.need_eip) != null) intakes.need_eip = readBoolLike(answers.need_eip);
 
-  if (/\b(?:ha|high\s*availability|multi[\s-]?az)\b/i.test(search)) intakes.ha = true;
+  if (/\b(?:ha|high\s*availability)\b/i.test(userSearch)) intakes.ha = true;
   else if (readBoolLike(answers.ha) != null) intakes.ha = readBoolLike(answers.ha);
 
   const regionMatch = search.match(/\b((?:us|eu|ap|ca|sa)-(?:east|west|north|south|central|northeast|southeast)-\d)\b/i);
@@ -755,6 +769,23 @@ function parseConnectorChatIntakes(
   else if (/\b(?:need|want|include|add|with)\b.{0,20}\b(?:redis|elasticache|cache)\b/i.test(search)) intakes.need_redis = true;
 
   return intakes;
+}
+
+function publicEntryFromQuestionnaire(userAnswers: Record<string, unknown>): 'alb' | 'elastic_ip' | 'none' | null {
+  const answers = asRecord(userAnswers);
+  const publicApi = String(answers.q_public_api || '').trim().toLowerCase();
+  if (publicApi === 'false') return 'none';
+
+  const loadBalancer = String(answers.q_load_balancer || '').trim().toLowerCase();
+  if (loadBalancer === 'alb' || loadBalancer === 'elastic_ip' || loadBalancer === 'none') {
+    return loadBalancer;
+  }
+
+  const legacyEip = String(answers.q_elastic_ip || '').trim().toLowerCase();
+  if (legacyEip === 'false') return 'alb';
+  if (legacyEip === 'true') return 'elastic_ip';
+
+  return null;
 }
 
 function buildDeterministicConsultantDecision(params: {
@@ -801,10 +832,22 @@ function buildDeterministicConsultantDecision(params: {
   const peak = Number(intakes.peak_traffic || intakes.peak_concurrent_users);
   const trafficSuggestsAlb = (Number.isFinite(monthly) && monthly >= 100_000)
     || (Number.isFinite(peak) && peak >= 50);
-  const needAlb = intakes.need_alb === true
-    || (intakes.need_alb !== false && (Boolean(intakes.ha) || trafficSuggestsAlb));
-  const needEip = intakes.need_eip === true
-    || (intakes.need_eip !== false && !needAlb);
+  const questionnaireEntry = publicEntryFromQuestionnaire(userAnswers);
+  let needAlb = false;
+  let needEip = false;
+  if (questionnaireEntry === 'alb') {
+    needAlb = true;
+  } else if (questionnaireEntry === 'elastic_ip') {
+    needEip = true;
+  } else if (questionnaireEntry === 'none') {
+    needAlb = false;
+    needEip = false;
+  } else {
+    needAlb = intakes.need_alb === true
+      || (intakes.need_alb !== false && (Boolean(intakes.ha) || trafficSuggestsAlb));
+    needEip = intakes.need_eip === true
+      || (intakes.need_eip !== false && !needAlb);
+  }
 
   const components = ['vpc', 'ec2'];
   if (needAlb) components.push('alb');
@@ -1510,6 +1553,7 @@ function mergeGeneratedFiles(primary: GeneratedFile[], secondary: GeneratedFile[
 
 async function generateIacBundleWithTerraformAgent(params: {
   userId?: string;
+  organizationId?: string;
   projectId: string;
   projectName: string;
   workspace: string;
@@ -1605,6 +1649,7 @@ async function generateIacBundleWithTerraformAgent(params: {
       repository_url: params.repositoryUrl || undefined,
       source_metadata: params.sourceMetadata || undefined,
       user_id: params.userId || undefined,
+      organization_id: params.organizationId || undefined,
     }),
   }, {
     timeoutMs: 600_000,
@@ -1959,6 +2004,8 @@ export async function POST(req: NextRequest) {
     const owned = await verifyProjectOwnership(user.id, projectId);
     if ('error' in owned) return owned.error;
 
+    const billing = await resolveAgenticBillingContext({ request: req, user });
+
     const provider = clampProvider(body.provider);
     const iacMode = clampIacMode(body.iac_mode);
     const llmApiKey = String(body.llm_api_key || body.openai_api_key || '').trim();
@@ -2241,6 +2288,7 @@ export async function POST(req: NextRequest) {
           llm_api_key: body.llm_api_key || undefined,
           llm_model: body.llm_model || undefined,
           llm_api_base_url: body.llm_api_base_url || undefined,
+          ...billing.fields,
         };
 
         try {
@@ -2471,6 +2519,7 @@ export async function POST(req: NextRequest) {
       try {
         agentBundle = await generateIacBundleWithTerraformAgent({
           userId: String(user.id),
+          organizationId: billing.organizationId,
           projectId,
           projectName,
           workspace: terraformSafeProjectSlug(projectName),

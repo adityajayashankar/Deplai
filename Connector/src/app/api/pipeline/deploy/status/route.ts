@@ -45,7 +45,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
     }
 
-    const owned = await verifyProjectOwnership(user.id, projectId);
+    const owned = await verifyProjectOwnership(user.id, projectId, 'deployment.read');
     if ('error' in owned) return owned.error;
 
     const projectName = String(body.project_name || owned.project?.name || projectId).trim();
@@ -101,6 +101,7 @@ export async function POST(req: NextRequest) {
             ? 'IaC pipeline completed but no EC2 instance was provisioned in AWS.'
             : (data.error || undefined),
         },
+        logs: Array.isArray((data as { logs?: unknown }).logs) ? (data as { logs: string[] }).logs : [],
       });
     }
 
@@ -144,6 +145,11 @@ export async function POST(req: NextRequest) {
       success: true,
       status: String(data.status || 'idle'),
       result: (data.result ?? null),
+      logs: Array.isArray((data.result as { logs?: unknown } | null)?.logs)
+        ? ((data.result as { logs: string[] }).logs)
+        : [],
+      phase: String((data.result as { phase?: unknown } | null)?.phase || ''),
+      phase_message: String((data.result as { phase_message?: unknown } | null)?.phase_message || ''),
     });
   } catch (err) {
     const msg = classifyStatusError(err);

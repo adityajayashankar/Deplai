@@ -5,6 +5,7 @@ import {
   terraformApplyNeedsPolling,
   waitForTerraformApplyResult,
 } from './terraform-apply-wait';
+import { extractApplyLogLines } from '@/features/deployment/apply-status';
 
 describe('terraform apply wait', () => {
   it('treats running/accepted apply responses as needing a poll', () => {
@@ -86,4 +87,13 @@ describe('terraform apply wait', () => {
     it('treats applying as still needing a poll', () => {
       assert.equal(terraformApplyNeedsPolling({ status: 'applying' }), true);
     });
+
+  it('extracts terraform log lines from status payloads and tails', () => {
+    const lines = extractApplyLogLines({
+      logs: ['[plan] module.networking: Reading...'],
+      details: { apply_log_tail: 'Error: identifier cannot contain two consecutive hyphens\n\n  with module.data.aws_db_instance.main[0]' },
+    });
+    assert.ok(lines.some((line) => line.includes('module.networking')));
+    assert.ok(lines.some((line) => line.includes('consecutive hyphens')));
+  });
 });

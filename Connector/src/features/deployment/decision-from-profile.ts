@@ -32,6 +32,26 @@ function wantsRedis(answers: Record<string, string> | undefined, dataLayerHasRed
   return dataLayerHasRedis;
 }
 
+function publicEntryMode(
+  answers: Record<string, string> | undefined,
+  strategy: string,
+): 'alb' | 'elastic_ip' | 'none' {
+  const publicApi = asString(answers?.q_public_api) !== 'false';
+  if (!publicApi || strategy === 's3_cloudfront') return 'none';
+
+  const explicit = asString(answers?.q_load_balancer).toLowerCase();
+  if (explicit === 'alb' || explicit === 'elastic_ip' || explicit === 'none') {
+    return explicit;
+  }
+
+  const eipAnswer = asString(answers?.q_elastic_ip);
+  if (eipAnswer === 'false') return 'alb';
+  if (eipAnswer === 'true') return strategy === 'ec2' ? 'elastic_ip' : 'alb';
+
+  if (strategy === 'ecs_fargate') return 'alb';
+  return 'elastic_ip';
+}
+
 export function decisionFromDeploymentProfile(params: {
   deploymentProfile: Record<string, unknown> | null | undefined;
   answers?: Record<string, string>;
@@ -53,13 +73,9 @@ export function decisionFromDeploymentProfile(params: {
   const redisFromLayer = dataLayer.some((item) => asString(item.type).toLowerCase() === 'redis');
   const hasRedis = wantsRedis(params.answers, redisFromLayer);
   const rds = dataLayer.find((item) => ['postgresql', 'postgres', 'mysql', 'mariadb'].includes(asString(item.type).toLowerCase())) || {};
-  const eipAnswer = asString(params.answers?.q_elastic_ip);
-  const profileWantsEip = Boolean(asRecord(networking.elastic_ip).enabled);
-  const albFromProfile = Boolean(loadBalancer.type) && publicApi && strategy !== 's3_cloudfront';
-  const needEip =
-    strategy === 'ec2' &&
-    (eipAnswer === 'true' || (eipAnswer !== 'false' && (profileWantsEip || (publicApi && !albFromProfile))));
-  const needAlb = albFromProfile && !needEip;
+  const entryMode = publicEntryMode(params.answers, strategy);
+  const needAlb = entryMode === 'alb';
+  const needEip = entryMode === 'elastic_ip';
 
   const components: string[] = [];
   if (strategy !== 's3_cloudfront') components.push('vpc');

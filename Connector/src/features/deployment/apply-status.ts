@@ -141,3 +141,52 @@ export function mergeAcceptedApplyResult(
   delete merged.error;
   return merged;
 }
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function splitLogTail(value: unknown): string[] {
+  const text = String(value || '').trim();
+  if (!text) return [];
+  return text.split(/\r?\n/).map((line) => line.trimEnd()).filter(Boolean);
+}
+
+/** Collect terraform apply log lines from status payloads, error bodies, or result details. */
+export function extractApplyLogLines(payload: unknown): string[] {
+  const root = asRecord(payload);
+  if (!root) return [];
+
+  const lines: string[] = [];
+  const pushUnique = (candidate: unknown) => {
+    for (const line of Array.isArray(candidate) ? candidate : splitLogTail(candidate)) {
+      const text = String(line || '').trimEnd();
+      if (!text || lines.includes(text)) continue;
+      lines.push(text);
+    }
+  };
+
+  pushUnique(root.logs);
+  pushUnique(root.apply_logs);
+
+  const details = detailsRecord(root) || asRecord(root.result);
+  if (details) {
+    pushUnique(details.logs);
+    pushUnique(details.apply_logs);
+    pushUnique(details.apply_log_tail);
+    pushUnique(details.upstream_raw_response_tail);
+  }
+
+  const result = asRecord(root.result);
+  if (result) {
+    pushUnique(result.logs);
+    const resultDetails = detailsRecord(result);
+    if (resultDetails) {
+      pushUnique(resultDetails.apply_log_tail);
+      pushUnique(resultDetails.logs);
+    }
+  }
+
+  return lines;
+}

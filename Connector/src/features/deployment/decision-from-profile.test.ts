@@ -122,6 +122,7 @@ test('decisionFromDeploymentProfile skips EIP and Redis when the user says no', 
     answers: {
       q_public_api: 'true',
       q_compute_strategy: 'ec2',
+      q_load_balancer: 'alb',
       q_elastic_ip: 'false',
       q_redis: 'none',
     },

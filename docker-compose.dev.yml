@@ -27,6 +27,8 @@ services:
     environment:
       DEPLAI_LOCAL_PROJECTS_ROOT: /local-projects
       DEPLAI_GITHUB_REPOS_ROOT: /repos
+      DEPLAI_AI_GATEWAY_URL: ${DEPLAI_AI_GATEWAY_URL:-http://host.docker.internal:3000}
+      DEPLAI_SERVICE_KEY: ${DEPLAI_SERVICE_KEY:-dev-service-key}
       PYTHONPATH: /workspace/Agentic Layer:/workspace:/workspace/Terraform Agent
       AGENT_LLM_BACKEND: openrouter
       GROQ_API_KEY: ${GROQ_API_KEY}

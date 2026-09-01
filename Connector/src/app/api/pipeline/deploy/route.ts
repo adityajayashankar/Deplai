@@ -14,6 +14,7 @@ import {
   SnapshotResolutionError,
   type CustomizationSnapshotSource,
 } from '@/lib/customization-snapshot';
+import { denyUnlessPlanFeature } from '@/lib/billing/plan-access-guard';
 import {
   resolveOrCreateSession,
   tryAppendSessionLogs,
@@ -56,6 +57,13 @@ interface DeployBody {
   aws_session_token?: string;
   aws_region?: string;
   confirm_plan_summary?: boolean;
+  database_required?: boolean;
+  customer_database_url?: string;
+  customer_host?: string;
+  customer_port?: string;
+  customer_database_name?: string;
+  customer_username?: string;
+  customer_password?: string;
   user_answers?: Record<string, unknown>;
   enforce_free_tier_ec2?: boolean;
   estimated_monthly_usd?: number;
@@ -579,6 +587,89 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+type BootstrapLifecycle = {
+  terraform_status: 'succeeded' | 'failed' | 'unknown';
+  application_status: 'succeeded' | 'failed' | 'running' | 'unknown';
+  bootstrap_status: Record<string, unknown> | null;
+  verification_status: 'passed' | 'failed' | 'pending' | 'unknown';
+  bootstrap_ok: boolean;
+};
+
+async function waitForBootstrapApplicationStatus(params: {
+  instanceId: string;
+  awsAccessKeyId: string;
+  awsSecretAccessKey: string;
+  awsSessionToken?: string;
+  awsRegion: string;
+  timeoutMs?: number;
+}): Promise<BootstrapLifecycle> {
+  const instanceId = String(params.instanceId || '').trim();
+  if (!instanceId) {
+    return {
+      terraform_status: 'succeeded',
+      application_status: 'unknown',
+      bootstrap_status: null,
+      verification_status: 'unknown',
+      bootstrap_ok: false,
+    };
+  }
+  try {
+    const response = await fetch(`${AGENTIC_URL}/api/deploy/bootstrap-status`, {
+      method: 'POST',
+      headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        instance_id: instanceId,
+        aws_access_key_id: params.awsAccessKeyId,
+        aws_secret_access_key: params.awsSecretAccessKey,
+        aws_session_token: params.awsSessionToken || undefined,
+        aws_region: params.awsRegion,
+        wait: true,
+        timeout_seconds: Math.max(60, Math.floor((params.timeoutMs || 900_000) / 1000)),
+        interval_seconds: 15,
+      }),
+      signal: AbortSignal.timeout(Math.max(120_000, Number(params.timeoutMs || 900_000) + 30_000)),
+    });
+    const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+    if (!response.ok) {
+      return {
+        terraform_status: 'succeeded',
+        application_status: 'unknown',
+        bootstrap_status: null,
+        verification_status: 'pending',
+        bootstrap_ok: false,
+      };
+    }
+    const applicationStatus = String(payload.application_status || 'unknown').toLowerCase();
+    const bootstrapStatus = (
+      payload.bootstrap_status
+      && typeof payload.bootstrap_status === 'object'
+      && !Array.isArray(payload.bootstrap_status)
+    ) ? payload.bootstrap_status as Record<string, unknown> : null;
+    const bootstrapOk = payload.success === true;
+    return {
+      terraform_status: 'succeeded',
+      application_status: applicationStatus === 'succeeded'
+        ? 'succeeded'
+        : applicationStatus === 'failed'
+          ? 'failed'
+          : applicationStatus === 'running'
+            ? 'running'
+            : 'unknown',
+      bootstrap_status: bootstrapStatus,
+      verification_status: bootstrapOk ? 'passed' : (applicationStatus === 'failed' ? 'failed' : 'pending'),
+      bootstrap_ok: bootstrapOk,
+    };
+  } catch {
+    return {
+      terraform_status: 'succeeded',
+      application_status: 'unknown',
+      bootstrap_status: null,
+      verification_status: 'pending',
+      bootstrap_ok: false,
+    };
+  }
+}
+
 async function waitForRuntimeVerification(params: {
   cloudfrontUrl?: string | null;
   albUrl?: string | null;
@@ -825,8 +916,13 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
     }
 
-    const owned = await verifyProjectOwnership(user.id, projectId);
+    const owned = await verifyProjectOwnership(user.id, projectId, 'deployment.create');
     if ('error' in owned) return owned.error;
+
+    if (body.runtime_apply === true) {
+      const denied = await denyUnlessPlanFeature(req, user, 'deploy');
+      if (denied) return denied;
+    }
 
     const provider = clampProvider(body.provider);
     const projectName = String(owned.project?.name || owned.project?.full_name || projectId).split('/').pop() || projectId;
@@ -1099,6 +1195,13 @@ export async function POST(req: NextRequest) {
         aws_region: awsRegion,
         enforce_free_tier_ec2: enforceFreeTierEc2,
         confirm_plan_summary: body.confirm_plan_summary === true,
+        database_required: body.database_required === true,
+        customer_database_url: String(body.customer_database_url || '').trim() || undefined,
+        customer_host: String(body.customer_host || '').trim() || undefined,
+        customer_port: String(body.customer_port || '').trim() || undefined,
+        customer_database_name: String(body.customer_database_name || '').trim() || undefined,
+        customer_username: String(body.customer_username || '').trim() || undefined,
+        customer_password: String(body.customer_password || '').trim() || undefined,
         deployment_metadata: {
           user_customizations: {
             ...(body.user_customizations || {}),
@@ -1206,6 +1309,7 @@ export async function POST(req: NextRequest) {
         if (pem) runtimeOutputPayload.generated_ec2_private_key_pem = pem;
         if (keyName) runtimeOutputPayload.ec2_key_name = keyName;
       }
+      const expectedEc2 = containsAwsInstanceResource(baseFiles);
       if (applyStatus === 'awaiting_plan_confirmation') {
         return NextResponse.json(await bindDeploySession({
           success: true,
@@ -1261,15 +1365,25 @@ export async function POST(req: NextRequest) {
               runtimeDetails: recoveredRuntimeDetails,
               oneTimeCredentials,
             });
-            const verification = await waitForRuntimeVerification({
-              cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
-              albUrl: normalizedRuntime.network.alb_url,
-              appUrl: normalizedRuntime.cdn.app_url
-                || extractOutputString(runtimeOutputPayload, ['app_url', 'application_url', 'site_url']),
-              healthCheckUrl: extractOutputString(runtimeOutputPayload, ['health_check_url', 'health_url']),
-              publicIp: normalizedRuntime.network.elastic_ip || normalizedRuntime.ec2.public_ip,
-            });
-            if (!verification.verified) {
+            const [verification, bootstrapLifecycle] = await Promise.all([
+              waitForRuntimeVerification({
+                cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
+                albUrl: normalizedRuntime.network.alb_url,
+                appUrl: normalizedRuntime.cdn.app_url
+                  || extractOutputString(runtimeOutputPayload, ['app_url', 'application_url', 'site_url']),
+                healthCheckUrl: extractOutputString(runtimeOutputPayload, ['health_check_url', 'health_url']),
+                publicIp: normalizedRuntime.network.elastic_ip || normalizedRuntime.ec2.public_ip,
+              }),
+              waitForBootstrapApplicationStatus({
+                instanceId: recoveredInstanceId,
+                awsAccessKeyId,
+                awsSecretAccessKey,
+                awsSessionToken,
+                awsRegion,
+              }),
+            ]);
+            const applicationReady = verification.verified && bootstrapLifecycle.bootstrap_ok;
+            if (!applicationReady) {
               return NextResponse.json(await bindDeploySession({
                 success: true,
                 provider,
@@ -1294,9 +1408,18 @@ export async function POST(req: NextRequest) {
                 cdn: normalizedRuntime.cdn,
                 status: 'needs_review',
                 deployment_verified: false,
+                terraform_status: 'succeeded',
+                application_status: bootstrapLifecycle.application_status,
+                bootstrap_status: bootstrapLifecycle.bootstrap_status,
+                verification_status: bootstrapLifecycle.application_status === 'failed' || !verification.verified
+                  ? 'failed'
+                  : 'pending',
+                infrastructure_only_success: true,
                 partial_deployment: true,
                 verification_checks: verification.checks,
-              }, 'needs_review', 'apply', 'EC2 is up in AWS; the app endpoint is still booting.'));
+              }, 'needs_review', 'apply', bootstrapLifecycle.application_status === 'failed'
+                ? 'Infrastructure recovered, but application bootstrap failed.'
+                : 'EC2 is up in AWS; application verification is incomplete.'));
             }
 
             return NextResponse.json(await bindDeploySession({
@@ -1328,6 +1451,11 @@ export async function POST(req: NextRequest) {
                 normalizedRuntime,
               }),
               deployment_verified: true,
+              terraform_status: 'succeeded',
+              application_status: 'succeeded',
+              bootstrap_status: bootstrapLifecycle.bootstrap_status,
+              verification_status: 'passed',
+              infrastructure_only_success: false,
               verification_checks: verification.checks,
               recovered_from_apply_error: true,
               ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
@@ -1354,10 +1482,8 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const expectedEc2 = containsAwsInstanceResource(baseFiles);
       const hasDbResources = liveDatabaseEndpoints(runtimeOutputPayload);
       const ec2FallbackApplied = Boolean(applyDetails?.ec2_fallback_applied);
-      const provisioningReport = applyData.provisioning_report || applyDetails?.provisioning_report;
       const runtimeDetails = awsAccessKeyId && awsSecretAccessKey
         ? await fetchAwsRuntimeDetails({
           projectName,
@@ -1403,14 +1529,44 @@ export async function POST(req: NextRequest) {
         oneTimeCredentials,
       });
 
-      const verification = await waitForRuntimeVerification({
-        cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
-        albUrl: normalizedRuntime.network.alb_url,
-        appUrl: normalizedRuntime.cdn.app_url
-          || extractOutputString(runtimeOutputPayload, ['app_url', 'application_url', 'site_url']),
-        healthCheckUrl: extractOutputString(runtimeOutputPayload, ['health_check_url', 'health_url']),
-        publicIp: normalizedRuntime.network.elastic_ip || normalizedRuntime.ec2.public_ip,
-      });
+      const ec2InstanceIdForBootstrap = ec2InstanceId
+        || normalizedRuntime.ec2.instance_id
+        || extractOutputString(runtimeOutputPayload, ['ec2_instance_id', 'instance_id']);
+      const [verification, bootstrapLifecycle] = await Promise.all([
+        waitForRuntimeVerification({
+          cloudfrontUrl: normalizedRuntime.cdn.cloudfront_url,
+          albUrl: normalizedRuntime.network.alb_url,
+          appUrl: normalizedRuntime.cdn.app_url
+            || extractOutputString(runtimeOutputPayload, ['app_url', 'application_url', 'site_url']),
+          healthCheckUrl: extractOutputString(runtimeOutputPayload, ['health_check_url', 'health_url']),
+          publicIp: normalizedRuntime.network.elastic_ip || normalizedRuntime.ec2.public_ip,
+        }),
+        expectedEc2 && ec2InstanceIdForBootstrap
+          ? waitForBootstrapApplicationStatus({
+            instanceId: ec2InstanceIdForBootstrap,
+            awsAccessKeyId,
+            awsSecretAccessKey,
+            awsSessionToken,
+            awsRegion,
+          })
+          : Promise.resolve({
+            terraform_status: 'succeeded' as const,
+            application_status: expectedEc2 ? 'unknown' as const : 'succeeded' as const,
+            bootstrap_status: null,
+            verification_status: expectedEc2 ? 'pending' as const : 'passed' as const,
+            bootstrap_ok: !expectedEc2,
+          }),
+      ]);
+      const applicationStatus = expectedEc2
+        ? bootstrapLifecycle.application_status
+        : verification.verified ? 'succeeded' : 'failed';
+      const applicationReady = verification.verified && (!expectedEc2 || bootstrapLifecycle.bootstrap_ok);
+      const infraOnlySuccess = !applicationReady && bootstrapLifecycle.terraform_status === 'succeeded';
+      const verificationStatus = applicationReady
+        ? 'passed'
+        : applicationStatus === 'failed' || !verification.verified
+          ? 'failed'
+          : 'pending';
       if (!verification.verified && expectedEc2 && !ec2InstanceId) {
         return NextResponse.json(
           {
@@ -1450,19 +1606,26 @@ export async function POST(req: NextRequest) {
         ec2: normalizedRuntime.ec2,
         network: normalizedRuntime.network,
         cdn: normalizedRuntime.cdn,
-        status: verification.verified ? 'deployed' : 'needs_review',
+        status: applicationReady ? 'deployed' : 'needs_review',
         has_database_resources: hasDbResources,
         deployment_summary: buildDeploymentSummary({
           outputs: runtimeOutputPayload ?? {},
           normalizedRuntime,
         }),
-        deployment_verified: verification.verified,
-        partial_deployment: Boolean(expectedEc2 && ec2InstanceId && !verification.verified),
+        deployment_verified: applicationReady,
+        terraform_status: bootstrapLifecycle.terraform_status,
+        application_status: applicationStatus,
+        bootstrap_status: bootstrapLifecycle.bootstrap_status,
+        verification_status: verificationStatus,
+        infrastructure_only_success: infraOnlySuccess,
+        partial_deployment: Boolean(expectedEc2 && ec2InstanceId && !applicationReady),
         verification_checks: verification.checks,
         ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
-      }, verification.verified ? 'completed' : 'needs_review', 'apply', verification.verified
-        ? 'Runtime Terraform apply finished.'
-        : 'Infrastructure is in AWS; the app endpoint is still booting.'));
+      }, applicationReady ? 'completed' : 'needs_review', 'apply', applicationReady
+        ? 'Runtime Terraform apply finished and application bootstrap verified.'
+        : applicationStatus === 'failed'
+          ? 'Infrastructure succeeded but application bootstrap failed.'
+          : 'Infrastructure is in AWS; the app endpoint is still booting.'));
     }
 
     const githubPat = String(body.github_pat || '').trim();
