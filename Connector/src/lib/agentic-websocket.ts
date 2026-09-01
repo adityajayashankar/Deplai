@@ -132,6 +132,32 @@ export function resolvePublicHttpOrigin(options: {
   return requestOrigin || publicAppUrl || null;
 }
 
+/** True when the browser should connect straight to FastAPI (no /agentic prefix). */
+export function isDirectLocalAgenticWsBase(wsBase: string): boolean {
+  const normalized = normalizeAgenticWsBase(wsBase);
+  if (!normalized || normalized.endsWith(AGENTIC_PUBLIC_PATH_PREFIX)) return false;
+  try {
+    return isInternalHostname(new URL(normalized).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function resolveConfiguredAgenticWsBase(publicEnvWsUrl?: string): string | null {
+  const publicWs = normalizeAgenticWsBase(publicEnvWsUrl || '');
+  if (!publicWs) return null;
+  if (isDirectLocalAgenticWsBase(publicWs)) return publicWs;
+  if (!publicWs.endsWith(AGENTIC_PUBLIC_PATH_PREFIX)) return null;
+  try {
+    if (!isInternalHostname(new URL(publicWs).hostname)) {
+      return publicWs;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export function resolveAgenticWsBaseFromConfig(options: {
   requestOrigin?: string;
   forwardedHost?: string | null;
@@ -141,6 +167,14 @@ export function resolveAgenticWsBaseFromConfig(options: {
   publicEnvWsUrl?: string;
   browser?: { protocol: string; host: string };
 }): string {
+  const configuredWs = resolveConfiguredAgenticWsBase(options.publicEnvWsUrl);
+  if (configuredWs && isDirectLocalAgenticWsBase(configuredWs)) {
+    const browser = options.browser;
+    if (!browser || isInternalHostname(browser.host.split(':')[0] || '')) {
+      return configuredWs;
+    }
+  }
+
   const publicHttpOrigin = resolvePublicHttpOrigin({
     requestOrigin: options.requestOrigin,
     forwardedHost: options.forwardedHost,
@@ -148,10 +182,17 @@ export function resolveAgenticWsBaseFromConfig(options: {
     hostHeader: options.hostHeader,
     publicAppUrl: options.publicAppUrl,
   });
-  if (publicHttpOrigin) {
+  if (publicHttpOrigin && !isInternalHttpOrigin(publicHttpOrigin)) {
     const fromOrigin = toWebSocketBaseFromHttpOrigin(publicHttpOrigin);
     if (fromOrigin) {
       return `${fromOrigin}${AGENTIC_PUBLIC_PATH_PREFIX}`;
+    }
+  }
+
+  if (configuredWs) {
+    const browser = options.browser;
+    if (!browser || isDirectLocalAgenticWsBase(configuredWs) || wsBaseMatchesHost(configuredWs, browser.host)) {
+      return configuredWs;
     }
   }
 
@@ -173,16 +214,9 @@ export function resolveAgenticWsBaseFromConfig(options: {
   if (browser) {
     const browserHostname = browser.host.split(':')[0] || '';
     if (isInternalHostname(browserHostname)) {
-      const publicWs = normalizeAgenticWsBase(options.publicEnvWsUrl || '');
-      try {
-        if (
-          publicWs.endsWith(AGENTIC_PUBLIC_PATH_PREFIX)
-          && !isInternalHostname(new URL(publicWs).hostname)
-        ) {
-          return publicWs;
-        }
-      } catch {
-        // ignore invalid configured ws url
+      const externalWs = resolveConfiguredAgenticWsBase(options.publicEnvWsUrl);
+      if (externalWs && !isDirectLocalAgenticWsBase(externalWs)) {
+        return externalWs;
       }
     }
     return sameOriginAgenticWsBase(browser);

@@ -1,14 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
-import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
+import { AGENTIC_URL, agenticHeaders, formatAgenticFetchError } from '@/lib/agentic';
+import { resolveAgenticBillingContext } from '@/lib/agentic-context';
 import { query } from '@/lib/db';
 import { githubService } from '@/lib/github';
 import { getBalance } from '@/lib/billing/credits';
-import { listCredentials } from '@/lib/ai-platform/credentials';
+import { getCredentialRecord } from '@/lib/ai-platform/credentials';
 import { canonicalizeProviderId } from '@/lib/ai-platform/providers/definitions';
 import {
   assertPlatformModelAllowed,
   defaultRemediationModel,
+  isLogicalAliasName,
   parseAccessMode,
 } from '@/lib/ai-platform/subscription-access';
 import {
@@ -71,6 +73,8 @@ export async function POST(request: NextRequest) {
     const { user, error } = await requireAuth();
     if (error) return error;
 
+    const billing = await resolveAgenticBillingContext({ request, user });
+
     const {
       project_id,
       github_token,
@@ -78,6 +82,7 @@ export async function POST(request: NextRequest) {
       llm_api_key,
       llm_model,
       llm_access_mode,
+      llm_credential_id,
       remediation_scope,
     } = await request.json();
     const runtimeGithubToken =
@@ -98,8 +103,12 @@ export async function POST(request: NextRequest) {
       typeof llm_model === 'string' && llm_model.trim().length > 0
         ? llm_model.trim()
         : null;
+    const normalizedLlmCredentialId =
+      typeof llm_credential_id === 'string' && llm_credential_id.trim().length > 0
+        ? llm_credential_id.trim()
+        : null;
     const accessMode = parseAccessMode(llm_access_mode) || 'auto';
-    const scope = remediation_scope === 'major' ? 'major' : 'all';
+    const scope = remediation_scope === 'all' ? 'all' : 'major';
     let usedInstallationToken = false;
 
     if (!project_id) {
@@ -114,22 +123,46 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: allowed.message }, { status: 403 });
       }
     }
+    let resolvedByokCredential = null as Awaited<ReturnType<typeof getCredentialRecord>>;
     if (accessMode === 'byok' && !normalizedLlmApiKey) {
-      const creds = await listCredentials(user.id, canonicalProvider || undefined).catch(() => []);
-      const usable = creds.filter((item) => item.status === 'VALID' || item.status === 'PENDING');
-      if (!usable.length) {
+      if (!normalizedLlmCredentialId) {
         return NextResponse.json(
-          { error: 'Add a BYOK key in AI Platform credentials before starting BYOK remediation.' },
+          { error: 'Select a saved BYOK credential before starting BYOK remediation.' },
+          { status: 400 },
+        );
+      }
+      resolvedByokCredential = await getCredentialRecord(user.id, normalizedLlmCredentialId);
+      if (!resolvedByokCredential) {
+        return NextResponse.json({ error: 'BYOK credential not found.' }, { status: 400 });
+      }
+      if (resolvedByokCredential.status !== 'VALID' && resolvedByokCredential.status !== 'PENDING') {
+        return NextResponse.json({ error: 'Selected BYOK credential is not usable.' }, { status: 400 });
+      }
+      if (normalizedLlmProvider && resolvedByokCredential.providerId !== normalizedLlmProvider) {
+        return NextResponse.json(
+          { error: 'Selected BYOK credential does not match the chosen provider.' },
+          { status: 400 },
+        );
+      }
+      if (
+        resolvedByokCredential.allowedModelIds?.length
+        && normalizedLlmModel
+        && !isLogicalAliasName(normalizedLlmModel)
+        && !resolvedByokCredential.allowedModelIds.includes(normalizedLlmModel)
+      ) {
+        return NextResponse.json(
+          { error: 'Selected model is not allowed for this BYOK credential.' },
           { status: 400 },
         );
       }
     }
 
     const llmFields = {
-      llm_provider: normalizedLlmProvider,
+      llm_provider: normalizedLlmProvider || resolvedByokCredential?.providerId || null,
       llm_api_key: normalizedLlmApiKey,
       llm_model: normalizedLlmModel,
       llm_access_mode: accessMode,
+      llm_credential_id: normalizedLlmCredentialId,
     };
 
     const projectRows = await query<ProjectRow[]>(
@@ -171,7 +204,7 @@ export async function POST(request: NextRequest) {
           project_id,
           project_name: project.name || repo,
           project_type: 'github',
-          user_id: String(user.id),
+          ...billing.fields,
           github_token: token,
           repository_url: `https://github.com/${owner}/${repo}`,
           ...llmFields,
@@ -182,7 +215,7 @@ export async function POST(request: NextRequest) {
           project_id,
           project_name: project.name,
           project_type: 'local',
-          user_id: String(user.id),
+          ...billing.fields,
           ...llmFields,
           remediation_scope: scope,
         };
@@ -219,7 +252,7 @@ export async function POST(request: NextRequest) {
         project_id,
         project_name: repo,
         project_type: 'github',
-        user_id: String(user.id),
+        ...billing.fields,
         github_token: token,
         repository_url: `https://github.com/${owner}/${repo}`,
         ...llmFields,
@@ -227,12 +260,17 @@ export async function POST(request: NextRequest) {
       };
     }
 
-    const response = await fetch(`${AGENTIC_URL}/api/remediate/validate`, {
-      method: 'POST',
-      headers: agenticHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify(backendPayload),
-      signal: AbortSignal.timeout(30_000),
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${AGENTIC_URL}/api/remediate/validate`, {
+        method: 'POST',
+        headers: agenticHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(backendPayload),
+        signal: AbortSignal.timeout(30_000),
+      });
+    } catch (fetchError) {
+      throw new Error(formatAgenticFetchError(fetchError));
+    }
 
     if (!response.ok) {
       const detail = await response.json().catch(() => null);
@@ -279,7 +317,7 @@ export async function POST(request: NextRequest) {
     });
   } catch (error: unknown) {
     console.error('Remediation start error:', error);
-    const message = error instanceof Error ? error.message : 'Failed to start remediation';
+    const message = formatAgenticFetchError(error);
     return NextResponse.json(
       { error: message },
       { status: 500 }

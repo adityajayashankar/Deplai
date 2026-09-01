@@ -118,6 +118,14 @@ describe('resolveAgenticWsBaseFromConfig', () => {
     });
     assert.equal(base, 'ws://localhost:3000/agentic');
   });
+
+  it('uses a direct local agentic ws base when configured', () => {
+    const base = resolveAgenticWsBaseFromConfig({
+      publicEnvWsUrl: 'ws://127.0.0.1:8000',
+      browser: { protocol: 'http:', host: 'localhost:3000' },
+    });
+    assert.equal(base, 'ws://127.0.0.1:8000');
+  });
 });
 
 describe('resolveBrowserAgenticWsBase', () => {
@@ -135,5 +143,13 @@ describe('resolveBrowserAgenticWsBase', () => {
       publicEnvWsUrl: 'ws://localhost:3000/agentic',
     });
     assert.equal(base, 'wss://deplai.in/agentic');
+  });
+
+  it('uses direct local agentic ws when configured on localhost', () => {
+    const base = resolveBrowserAgenticWsBase({
+      browser: { protocol: 'http:', host: 'localhost:3000' },
+      publicEnvWsUrl: 'ws://127.0.0.1:8000',
+    });
+    assert.equal(base, 'ws://127.0.0.1:8000');
   });
 });

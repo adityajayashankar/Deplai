@@ -26,12 +26,23 @@ import type { AccessMode, GatewayContext, ProviderId } from './types';
 import { ALIAS_CAPABILITY } from './catalog/seed';
 import { rankModels, defaultRoutingPolicy } from './routing';
 import { userModelSetup } from './model-setup';
+import {
+  ACTIVE_ORGANIZATION_COOKIE,
+  requireOrganizationPermission,
+  resolveActiveOrganization,
+} from '@/lib/organizations/store';
 
 function jsonError(error: unknown) {
   if (error instanceof AiPlatformError) {
+    const retryAfterSeconds = Number(error.detail?.retryAfterSeconds);
     return NextResponse.json(
-      { error: error.message, code: error.code, detail: error.sanitizedProviderDetail || undefined },
-      { status: error.status },
+      { error: error.message, code: error.code, detail: error.detail || error.sanitizedProviderDetail || undefined },
+      {
+        status: error.status,
+        headers: Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? { 'Retry-After': String(Math.ceil(retryAfterSeconds)) }
+          : undefined,
+      },
     );
   }
   const message = error instanceof Error ? error.message : 'Unexpected AI platform error';
@@ -42,14 +53,31 @@ async function actor(request: NextRequest): Promise<{ context: GatewayContext } 
   const serviceError = requireServiceKey(request);
   if (!serviceError) {
     const userId = request.headers.get('x-deplai-user-id')?.trim();
+    const organizationId = request.headers.get('x-deplai-organization-id')?.trim();
     if (!userId) {
       return { error: NextResponse.json({ error: 'x-deplai-user-id is required for internal AI calls' }, { status: 400 }) };
     }
-    return { context: { userId, actor: 'service', source: 'internal' } };
+    if (!organizationId) {
+      return { error: NextResponse.json({ error: 'x-deplai-organization-id is required for internal AI calls' }, { status: 400 }) };
+    }
+    await requireOrganizationPermission({ userId, organizationId, action: 'ai_provider.use' });
+    return { context: { userId, organizationId, actor: 'service', source: 'internal' } };
   }
   const auth = await requireAuth();
   if (auth.error) return { error: auth.error };
-  return { context: { userId: auth.user.id, actor: auth.user.email || auth.user.id, source: 'ui' } };
+  const organization = await resolveActiveOrganization(
+    auth.user,
+    request.cookies.get(ACTIVE_ORGANIZATION_COOKIE)?.value,
+  );
+  await requireOrganizationPermission({ userId: auth.user.id, organizationId: organization.id, action: 'ai_provider.use' });
+  return {
+    context: {
+      userId: auth.user.id,
+      organizationId: organization.id,
+      actor: auth.user.email || auth.user.id,
+      source: 'ui',
+    },
+  };
 }
 
 function publicProvider(adapterId: string) {
@@ -106,7 +134,10 @@ export async function handleAiRequest(request: NextRequest, path: string[]): Pro
     if (head === 'model-setup' && method === 'GET') {
       const auth = await actor(request);
       if ('error' in auth) return auth.error;
-      return NextResponse.json(await userModelSetup(auth.context.userId));
+      return NextResponse.json(await userModelSetup({
+        userId: auth.context.userId,
+        organizationId: auth.context.organizationId,
+      }));
     }
 
     if (head === 'providers' && method === 'GET') {
@@ -243,13 +274,13 @@ export async function handleAiRequest(request: NextRequest, path: string[]): Pro
     if (head === 'usage' && method === 'GET') {
       const auth = await actor(request);
       if ('error' in auth) return auth.error;
-      return NextResponse.json(await summarizeUsage(auth.context.userId));
+      return NextResponse.json(await summarizeUsage(auth.context.userId, auth.context.organizationId));
     }
 
     if (head === 'costs' && method === 'GET') {
       const auth = await actor(request);
       if ('error' in auth) return auth.error;
-      const summary = await summarizeUsage(auth.context.userId);
+      const summary = await summarizeUsage(auth.context.userId, auth.context.organizationId);
       return NextResponse.json({
         ...summary.costs,
         byBillingSource: summary.byBillingSource,
@@ -291,6 +322,7 @@ export async function handleAiRequest(request: NextRequest, path: string[]): Pro
         metadata?: Record<string, unknown>;
         api_key?: string;
         provider?: string;
+        credential_id?: string;
         system?: string;
       };
       const payload = {
@@ -306,6 +338,7 @@ export async function handleAiRequest(request: NextRequest, path: string[]): Pro
         metadata: body.metadata,
         ephemeralApiKey: body.api_key,
         ephemeralProvider: canonicalizeProviderId(body.provider || '') || undefined,
+        credentialId: typeof body.credential_id === 'string' ? body.credential_id : undefined,
       };
       if (body.stream) {
         const encoder = new TextEncoder();

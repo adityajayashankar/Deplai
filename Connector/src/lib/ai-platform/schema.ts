@@ -214,11 +214,34 @@ async function seedCatalog() {
 
   for (const model of SEED_MODELS) {
     await query(
-      `INSERT IGNORE INTO ai_models (
+      `INSERT INTO ai_models (
         id, provider_id, provider_model_id, display_name, family, version, aliases_json, status, lifecycle,
         release_date, deprecation_date, retirement_date, replacement_model_id, context_window, max_output_tokens,
         capabilities_json, latency_profile, pricing_json, region_support_json, compliance_tags_json, model_owner, metadata_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        provider_id = VALUES(provider_id),
+        provider_model_id = VALUES(provider_model_id),
+        display_name = VALUES(display_name),
+        family = VALUES(family),
+        version = VALUES(version),
+        aliases_json = VALUES(aliases_json),
+        status = VALUES(status),
+        lifecycle = VALUES(lifecycle),
+        release_date = VALUES(release_date),
+        deprecation_date = VALUES(deprecation_date),
+        retirement_date = VALUES(retirement_date),
+        replacement_model_id = VALUES(replacement_model_id),
+        context_window = VALUES(context_window),
+        max_output_tokens = VALUES(max_output_tokens),
+        capabilities_json = VALUES(capabilities_json),
+        latency_profile = VALUES(latency_profile),
+        pricing_json = VALUES(pricing_json),
+        region_support_json = VALUES(region_support_json),
+        compliance_tags_json = VALUES(compliance_tags_json),
+        model_owner = VALUES(model_owner),
+        metadata_json = VALUES(metadata_json),
+        updated_at = CURRENT_TIMESTAMP`,
       [
         model.id,
         model.providerId,

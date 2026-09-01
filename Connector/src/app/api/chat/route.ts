@@ -8,6 +8,9 @@ import pool from '@/lib/db';
 import { isAiPlatformEnabled } from '@/lib/ai-platform/config';
 import { aiChat } from '@/lib/ai-platform/client';
 import { canonicalizeProviderId } from '@/lib/ai-platform/providers/registry';
+import { AiPlatformError } from '@/lib/ai-platform/errors';
+import { creditMeteringMode } from '@/lib/billing/organization-credits';
+import { ACTIVE_ORGANIZATION_COOKIE, resolveActiveOrganization } from '@/lib/organizations/store';
 
 const GROQ_API = 'https://api.groq.com/openai/v1/chat/completions';
 const OPENAI_API = 'https://api.openai.com/v1/chat/completions';
@@ -331,11 +334,13 @@ async function callLLM(
   temperature = 0.7,
   clientConfig?: LLMConfig | null,
   userId?: string,
+  organizationId?: string,
 ): Promise<string | null> {
-  if (isAiPlatformEnabled() && userId) {
+  if (isAiPlatformEnabled() && userId && organizationId) {
     try {
       const result = await aiChat({
         userId,
+        organizationId,
         model: clientConfig?.model || 'best',
         messages: messages.map((message) => ({
           role: message.role === 'assistant' ? 'assistant' : 'user',
@@ -352,6 +357,7 @@ async function callLLM(
       if (result.output?.trim()) return result.output.trim();
     } catch (error) {
       console.error('[chat/ai-platform]', error instanceof Error ? error.message : error);
+      if (creditMeteringMode() === 'enforce' && !clientConfig?.api_key) throw error;
     }
   }
 
@@ -715,6 +721,7 @@ async function generateArchitecturePlan(
   params: Record<string, string>,
   clientConfig?: LLMConfig | null,
   userId?: string,
+  organizationId?: string,
 ): Promise<string> {
   const { app_type = 'static', name = 'my-app', description = '', requirements = '' } = params;
   const planningPrompt =
@@ -732,6 +739,7 @@ async function generateArchitecturePlan(
     0.1,
     clientConfig,
     userId,
+    organizationId,
   );
 
   return text?.trim() || '';
@@ -741,10 +749,11 @@ async function generateCode(
   params: Record<string, string>,
   clientConfig?: LLMConfig | null,
   userId?: string,
+  organizationId?: string,
 ): Promise<CodeGenResult> {
   const { app_type = 'static', name = 'MyApp', description = '', style = 'dark', requirements = '' } = params;
   const normalizedAppType = normalizeAppType(app_type);
-  const architecturePlan = await generateArchitecturePlan(params, clientConfig, userId);
+  const architecturePlan = await generateArchitecturePlan(params, clientConfig, userId, organizationId);
   const MAX_ATTEMPTS = 3;
   let lastFiles: GeneratedFile[] = [];
   let lastIssues: string[] = ['No generation attempt performed yet'];
@@ -779,7 +788,7 @@ async function generateCode(
       `- README with setup and deployment instructions\n\n` +
       `Return ONLY the JSON array.`;
 
-    const raw = await callLLM([{ role: 'user', content: prompt }], codegenSystem, 16000, 0.15, clientConfig, userId);
+    const raw = await callLLM([{ role: 'user', content: prompt }], codegenSystem, 16000, 0.15, clientConfig, userId, organizationId);
     if (!raw) {
       lastIssues = ['LLM returned no output'];
       continue;
@@ -1027,6 +1036,7 @@ async function runReAct(
   userId: string,
   projects: ConnectedProject[],
   clientConfig?: LLMConfig | null,
+  organizationId?: string,
 ): Promise<ReActResult> {
   const history: ApiMessage[] = [...userMessages];
   const observations: string[] = [];
@@ -1036,7 +1046,7 @@ async function runReAct(
   let repeatedStepCount = 0;
 
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
-    const raw = await callLLM(history, system, 2048, 0.7, clientConfig, userId);
+    const raw = await callLLM(history, system, 2048, 0.7, clientConfig, userId, organizationId);
     if (!raw) break;
 
     const step = parseStep(raw);
@@ -1120,7 +1130,7 @@ async function runReAct(
       const obs = `Iteration ${i + 1}: calling generate_code for "${String(params.name)}"…`;
       observations.push(obs);
 
-      const codegen = await generateCode(params as Record<string, string>, clientConfig, userId);
+      const codegen = await generateCode(params as Record<string, string>, clientConfig, userId, organizationId);
       const files = codegen.files;
 
       if (files.length > 0) {
@@ -1233,6 +1243,10 @@ export async function POST(req: NextRequest) {
   if (error) return error;
 
   try {
+    const organization = await resolveActiveOrganization(
+      user,
+      req.cookies.get(ACTIVE_ORGANIZATION_COOKIE)?.value,
+    );
     const body = await req.json();
     const messages: ApiMessage[] = body.messages ?? [];
     const projects: { id: string; name: string; type: string }[] = body.context?.projects ?? [];
@@ -1266,8 +1280,8 @@ export async function POST(req: NextRequest) {
         const newId = randomUUID();
         const title = deriveTitle(messages);
         await conn.execute(
-          'INSERT INTO chat_sessions (id, user_id, title) VALUES (?, ?, ?)',
-          [newId, user.id, title],
+          'INSERT INTO chat_sessions (id, user_id, organization_id, title) VALUES (?, ?, ?, ?)',
+          [newId, user.id, organization.id, title],
         );
         await conn.commit();
         resolvedSessionId = newId;
@@ -1280,7 +1294,7 @@ export async function POST(req: NextRequest) {
     }
 
     const system = buildSystemPrompt(projects);
-    let result = await runReAct(messages, system, user.id, projects, clientConfig);
+    let result = await runReAct(messages, system, user.id, projects, clientConfig, organization.id);
 
     // Guard: if the LLM returned a confirmation-required tool call (run_scan /
     // start_remediation) but its message also contains a clarifying question,
@@ -1390,6 +1404,17 @@ export async function POST(req: NextRequest) {
     });
   } catch (err: unknown) {
     console.error('[/api/chat]', err);
+    if (err instanceof AiPlatformError) {
+      return NextResponse.json({
+        thought: '',
+        message: err.message,
+        code: err.code,
+        detail: err.detail,
+        tool_call: null,
+        generated_files: null,
+        observations: [],
+      }, { status: err.status });
+    }
     return NextResponse.json({
       thought: '',
       message: 'Something went wrong. Please try again.',

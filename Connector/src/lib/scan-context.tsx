@@ -5,6 +5,7 @@ import { createWorkspaceSession, persistSessionProgress } from '@/lib/sessions/c
 import type { SessionLogLevel, SessionStatus } from '@/lib/sessions/types';
 import {
   buildAgenticWebSocketUrl,
+  isInternalHostname,
   isMixedContentWebSocket,
   normalizeAgenticWsBase,
   resolveAgenticWsBaseFromConfig,
@@ -89,6 +90,7 @@ interface ScanContextValue {
     llmModel?: string,
     remediationScope?: 'major' | 'all',
     accessMode?: 'platform' | 'byok' | 'auto',
+    llmCredentialId?: string,
   ) => Promise<void>;
   continueRemediationRound: (projectId: string) => void;
   pushCurrentRemediationChanges: (projectId: string) => void;
@@ -133,6 +135,25 @@ let wsBaseFetchInFlight: Promise<string> | null = null;
 async function resolveWsBaseUrl(): Promise<string> {
   if (typeof window !== 'undefined') {
     const browser = { protocol: window.location.protocol, host: window.location.host };
+    const browserHostname = browser.host.split(':')[0] || '';
+
+    // Server-side env is authoritative for local dev (avoids stale NEXT_PUBLIC bundles).
+    if (isInternalHostname(browserHostname)) {
+      try {
+        const res = await fetch('/api/pipeline/ws-config', { cache: 'no-store' });
+        if (res.ok) {
+          const data = await res.json() as { ws_base?: string };
+          const fromServer = normalizeAgenticWsBase(String(data.ws_base || '').trim());
+          if (fromServer && !isMixedContentWebSocket(fromServer, browser.protocol)) {
+            resolvedWsBaseCache = fromServer;
+            return fromServer;
+          }
+        }
+      } catch {
+        // Fall through to client-side resolution.
+      }
+    }
+
     const direct = resolveBrowserAgenticWsBase({ browser, publicEnvWsUrl: WS_BASE_URL });
     if (
       !resolvedWsBaseCache
@@ -424,11 +445,23 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
 
   const normalizeRemediationStates = useCallback((input: Record<string, ProjectRemediationState> | undefined) => {
     const out: Record<string, ProjectRemediationState> = {};
+    const interruptedMessage = {
+      index: Date.now(),
+      total: Date.now(),
+      type: 'error' as const,
+      content: 'Remediation session was interrupted (page refresh or backend reload). Reset and start again from Agent setup.',
+      timestamp: new Date().toISOString(),
+    };
     for (const [projectId, state] of Object.entries(input || {})) {
       if (!projectId || !state) continue;
+      const restored = state.state || 'idle';
+      const wasLiveSession = ['running', 'waiting_decision', 'waiting_approval'].includes(restored);
+      const messages = trimMessages(Array.isArray(state.messages) ? state.messages : []);
       out[projectId] = {
-        state: state.state || 'idle',
-        messages: trimMessages(Array.isArray(state.messages) ? state.messages : []),
+        state: wasLiveSession ? 'error' : restored,
+        messages: wasLiveSession
+          ? trimMessages([...messages, interruptedMessage])
+          : messages,
       };
     }
     return clampMapSize(out);
@@ -759,8 +792,9 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     llmProvider?: string,
     llmApiKey?: string,
     llmModel?: string,
-    remediationScope: 'major' | 'all' = 'all',
+    remediationScope: 'major' | 'all' = 'major',
     accessMode: 'platform' | 'byok' | 'auto' = 'auto',
+    llmCredentialId?: string,
   ) => {
     const existingRemWs = remWsRefs.current[projectId];
     if (existingRemWs && existingRemWs.readyState === WebSocket.OPEN) existingRemWs.close();
@@ -781,6 +815,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
           llm_api_key: llmApiKey || null,
           llm_model: llmModel || null,
           llm_access_mode: accessMode || 'auto',
+          llm_credential_id: llmCredentialId || null,
           remediation_scope: remediationScope,
         }),
       });

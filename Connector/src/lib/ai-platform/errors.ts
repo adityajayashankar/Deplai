@@ -6,6 +6,7 @@ export class AiPlatformError extends Error {
   readonly providerId?: string;
   readonly retryable: boolean;
   readonly sanitizedProviderDetail?: string;
+  readonly detail?: Record<string, unknown>;
 
   constructor(
     code: CanonicalErrorCode,
@@ -16,6 +17,7 @@ export class AiPlatformError extends Error {
       retryable?: boolean;
       sanitizedProviderDetail?: string;
       cause?: unknown;
+      detail?: Record<string, unknown>;
     },
   ) {
     super(message, options?.cause ? { cause: options.cause } : undefined);
@@ -25,6 +27,7 @@ export class AiPlatformError extends Error {
     this.providerId = options?.providerId;
     this.retryable = options?.retryable ?? isRetryableCode(code);
     this.sanitizedProviderDetail = options?.sanitizedProviderDetail;
+    this.detail = options?.detail;
   }
 }
 

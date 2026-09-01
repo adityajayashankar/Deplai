@@ -254,12 +254,49 @@ export function platformSecretFor(providerId: ProviderId): string {
   return definition ? firstEnv(definition.envKeyNames) : '';
 }
 
+async function resolveStoredCredentialRow(
+  row: CredentialRow,
+  providerId: ProviderId,
+  modelId?: string,
+): Promise<ResolvedCredential | { error: string; code: 'POLICY_DENIED' | 'AUTHENTICATION_ERROR' }> {
+  if (row.provider_id !== providerId) {
+    return { error: 'BYOK credential does not match the requested provider', code: 'POLICY_DENIED' };
+  }
+  if (!['BYOK', 'ENTERPRISE'].includes(row.type) || !['VALID', 'PENDING'].includes(row.status)) {
+    return { error: 'BYOK credential is not usable', code: 'POLICY_DENIED' };
+  }
+  const allowed = parseIds(row.allowed_model_ids_json);
+  if (allowed && modelId && !allowed.includes(modelId)) {
+    return { error: 'Selected model is not allowed for this BYOK credential', code: 'POLICY_DENIED' };
+  }
+  try {
+    const secret = decryptSecret(row.secret_encrypted);
+    await query('UPDATE ai_provider_credentials SET last_used_at = NOW() WHERE id = ?', [row.id]);
+    return {
+      source: 'byok',
+      credentialId: row.id,
+      providerId,
+      secret,
+      masked: row.secret_masked,
+    };
+  } catch {
+    return { error: 'Failed to decrypt BYOK credential', code: 'AUTHENTICATION_ERROR' };
+  }
+}
+
+export async function getCredentialRecord(userId: string, id: string): Promise<CredentialRecord | null> {
+  const row = await getCredential(userId, id);
+  return row ? toRecord(row) : null;
+}
+
 export async function resolveCredential(input: {
   userId: string;
+  organizationId?: string;
   providerId: ProviderId;
   accessMode: AccessMode;
   ephemeralSecret?: string;
   modelId?: string;
+  credentialId?: string;
 }): Promise<ResolvedCredential | { error: string; code: 'POLICY_DENIED' | 'AUTHENTICATION_ERROR' }> {
   if (input.ephemeralSecret?.trim()) {
     return {
@@ -269,6 +306,15 @@ export async function resolveCredential(input: {
       secret: input.ephemeralSecret.trim(),
       masked: maskSecret(input.ephemeralSecret),
     };
+  }
+
+  const explicitCredentialId = input.credentialId?.trim();
+  if (explicitCredentialId && input.accessMode !== 'platform') {
+    const row = await getCredential(input.userId, explicitCredentialId);
+    if (!row) {
+      return { error: 'BYOK credential not found', code: 'POLICY_DENIED' };
+    }
+    return resolveStoredCredentialRow(row, input.providerId, input.modelId);
   }
 
   if (input.accessMode !== 'platform') {
@@ -281,33 +327,29 @@ export async function resolveCredential(input: {
     for (const row of rows) {
       const allowed = parseIds(row.allowed_model_ids_json);
       if (allowed && input.modelId && !allowed.includes(input.modelId)) continue;
-      try {
-        const secret = decryptSecret(row.secret_encrypted);
-        await query('UPDATE ai_provider_credentials SET last_used_at = NOW() WHERE id = ?', [row.id]);
-        return {
-          source: 'byok',
-          credentialId: row.id,
-          providerId: input.providerId,
-          secret,
-          masked: row.secret_masked,
-        };
-      } catch {
-        continue;
-      }
+      const resolved = await resolveStoredCredentialRow(row, input.providerId, input.modelId);
+      if ('error' in resolved) continue;
+      return resolved;
     }
     if (input.accessMode === 'byok') {
       return { error: 'No valid BYOK credential is available for this provider', code: 'POLICY_DENIED' };
     }
   }
 
-  const secret = platformSecretFor(input.providerId);
-  if (secret) {
+  const orgSecret = input.providerId === 'openrouter' && input.organizationId
+    ? await (async () => {
+      const { resolveOrganizationOpenRouterSecret } = await import('@/lib/billing/openrouter-provisioning');
+      return resolveOrganizationOpenRouterSecret(input.organizationId!);
+    })()
+    : '';
+  const platformSecret = orgSecret || platformSecretFor(input.providerId);
+  if (platformSecret) {
     return {
       source: 'platform',
       credentialId: null,
       providerId: input.providerId,
-      secret,
-      masked: maskSecret(secret),
+      secret: platformSecret,
+      masked: maskSecret(platformSecret),
     };
   }
   if (input.accessMode === 'platform') {

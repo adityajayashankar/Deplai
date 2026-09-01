@@ -51,6 +51,7 @@ type Model = {
     scores: Record<string, { value: number; source: string }>;
   };
   pricing: { inputPerMillionUsd: number | null; outputPerMillionUsd: number | null; source: string };
+  metadata?: Record<string, unknown>;
 };
 
 type Credential = {

@@ -16,6 +16,8 @@ type UsageSummary = {
   byProvider?: Array<{ provider_id: string; requests: number; tokens: number; input_tokens?: number; output_tokens?: number }>;
   byCredentialSource?: Array<{ credential_source: string; requests: number; tokens: number }>;
   byModel?: Array<{ provider_id: string; model_id: string; requests: number; tokens: number }>;
+  byMember?: Array<{ user_id: string; requests: number; tokens: number }>;
+  byProject?: Array<{ project_id: string | null; requests: number; tokens: number }>;
 };
 
 type CostRow = {
@@ -180,6 +182,50 @@ export function UsageCosts({ providers }: { providers: Array<{ id: string; displ
               </Panel>
             ))}
           </div>
+
+          {(usage?.byModel?.length || 0) > 0 ? (
+            <>
+              <h3 className="mt-10 font-display text-lg text-black">By model</h3>
+              <div className="mt-4 space-y-2">
+                {(usage?.byModel || []).slice(0, 12).map((row) => (
+                  <Panel key={`${row.provider_id}:${row.model_id}`} className="flex flex-wrap items-center justify-between gap-3 p-4">
+                    <p className="text-[13px] font-semibold text-black">{row.model_id}</p>
+                    <p className="font-mono text-[11px] text-zinc-500">
+                      {providerLabel(row.provider_id, providers)} · {row.requests} req · {formatTokens(row.tokens)}
+                    </p>
+                  </Panel>
+                ))}
+              </div>
+            </>
+          ) : null}
+
+          {(usage?.byMember?.length || 0) > 0 ? (
+            <>
+              <h3 className="mt-10 font-display text-lg text-black">By member</h3>
+              <div className="mt-4 space-y-2">
+                {(usage?.byMember || []).slice(0, 12).map((row) => (
+                  <Panel key={row.user_id} className="flex flex-wrap items-center justify-between gap-3 p-4">
+                    <p className="font-mono text-[12px] text-black">{row.user_id.slice(0, 8)}…</p>
+                    <p className="font-mono text-[11px] text-zinc-500">{row.requests} req · {formatTokens(row.tokens)}</p>
+                  </Panel>
+                ))}
+              </div>
+            </>
+          ) : null}
+
+          {(usage?.byProject?.length || 0) > 0 ? (
+            <>
+              <h3 className="mt-10 font-display text-lg text-black">By project</h3>
+              <div className="mt-4 space-y-2">
+                {(usage?.byProject || []).slice(0, 12).map((row) => (
+                  <Panel key={row.project_id || 'none'} className="flex flex-wrap items-center justify-between gap-3 p-4">
+                    <p className="text-[13px] font-semibold text-black">{row.project_id || 'Unscoped'}</p>
+                    <p className="font-mono text-[11px] text-zinc-500">{row.requests} req · {formatTokens(row.tokens)}</p>
+                  </Panel>
+                ))}
+              </div>
+            </>
+          ) : null}
         </>
       )}
     </div>

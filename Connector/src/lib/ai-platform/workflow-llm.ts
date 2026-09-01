@@ -1,10 +1,12 @@
 import { getBalance } from '@/lib/billing/credits';
+import { planIncludesFeature } from '@/lib/billing/plan-features';
 import { listCredentials } from '@/lib/ai-platform/credentials';
 import { canonicalizeProviderId } from '@/lib/ai-platform/providers/definitions';
 import type { AccessMode } from '@/lib/ai-platform/types';
 import {
   assertPlatformModelAllowed,
   defaultRemediationModel,
+  isBillingEnforced,
   parseAccessMode,
 } from '@/lib/ai-platform/subscription-access';
 
@@ -26,7 +28,15 @@ export async function resolveWorkflowLlmConfig(
 
   if (accessMode === 'platform') {
     const balance = await getBalance(userId).catch(() => null);
-    const resolvedModel = model || defaultRemediationModel(balance?.planId);
+    const planId = balance?.planId || 'free';
+    if (isBillingEnforced() && !planIncludesFeature(planId, 'managed_llm')) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'Starter plan or higher is required for DeplAI-managed LLM calls. Connect BYOK or upgrade on Billing.',
+      };
+    }
+    const resolvedModel = model || defaultRemediationModel(planId);
     const allowed = assertPlatformModelAllowed(balance?.planId, resolvedModel);
     if (!allowed.ok) {
       return { ok: false, status: 403, error: allowed.message };

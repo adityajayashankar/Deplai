@@ -10,10 +10,24 @@ import { listCredentials, resolveCredential, platformSecretFor } from './credent
 import { getOrganizationPolicy } from './policies';
 import { defaultRoutingPolicy, rankModels, resolveRoutingPolicy } from './routing';
 import { getProviderHealthMap, recordProviderHealth } from './health';
-import { estimateCost, recordUsage } from './metering';
+import { estimateCost, platformMeteringCostUsd, recordUsage } from './metering';
+import { canonicalizeRequestedModel } from './model-resolution';
 import { redactUnknown } from './redact';
-import { getBalance } from '@/lib/billing/credits';
-import { assertPlatformModelAllowed } from './subscription-access';
+import {
+  InsufficientOrganizationCreditsError,
+  releaseOrganizationCreditReservation,
+  reserveOrganizationCredits,
+  settleOrganizationCreditReservation,
+  type CreditReservation,
+} from '@/lib/billing/organization-credits';
+import { filterModelsForPlatformAccess, isPlatformModelAllowed } from './platform-allowlist';
+import { resolvePlatformDispatch } from './openrouter-catalog';
+import { constrainOpenRouterRequest } from './openrouter-request-budget';
+import {
+  expandProvidersForPlatformOpenRouter,
+  isPlatformOpenRouterUpstream,
+  shouldUsePlatformOpenRouterUpstream,
+} from './platform-upstream';
 import type {
   AccessMode,
   CanonicalStreamEvent,
@@ -54,7 +68,12 @@ function validateSecuritySchema(text: string): string | null {
   }
 }
 
-async function providersWithCredentials(userId: string, accessMode: AccessMode, ephemeralProvider?: ProviderId): Promise<Set<string>> {
+async function providersWithCredentials(
+  userId: string,
+  accessMode: AccessMode,
+  ephemeralProvider?: ProviderId,
+  organizationId?: string,
+): Promise<Set<string>> {
   const available = new Set<string>();
   if (ephemeralProvider) available.add(ephemeralProvider);
   if (accessMode !== 'byok') {
@@ -68,7 +87,14 @@ async function providersWithCredentials(userId: string, accessMode: AccessMode, 
       if (cred.status === 'VALID' || cred.status === 'PENDING') available.add(cred.providerId);
     }
   }
-  return available;
+  const orgOpenRouter = organizationId
+    ? await (async () => {
+      const { resolveOrganizationOpenRouterSecret } = await import('@/lib/billing/openrouter-provisioning');
+      return resolveOrganizationOpenRouterSecret(organizationId);
+    })()
+    : null;
+  const hasOpenRouter = Boolean(orgOpenRouter || platformSecretFor('openrouter'));
+  return expandProvidersForPlatformOpenRouter(accessMode, available, hasOpenRouter);
 }
 
 type PreparedChat = {
@@ -97,6 +123,56 @@ function estimatedUsage(messages: ChatMessage[], text: string): UsageBreakdown {
   };
 }
 
+function maximumUsage(request: NormalizedChatRequest, policy: OrganizationPolicy): UsageBreakdown {
+  const inputTokens = Math.max(1, Math.ceil(request.messages.reduce((sum, message) => sum + message.content.length, 0) / 4));
+  const outputTokens = Math.max(1, request.maxTokens || policy.maxTokenLimit || 4096);
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    cachedTokens: 0,
+    reasoningTokens: 0,
+    toolCalls: request.tools?.length || 0,
+    estimated: true,
+  };
+}
+
+function assertManagedPricing(model: RoutingCandidate['model']): void {
+  if (
+    model.pricing.inputPerMillionUsd == null
+    || model.pricing.outputPerMillionUsd == null
+    || model.pricing.inputPerMillionUsd < 0
+    || model.pricing.outputPerMillionUsd < 0
+  ) {
+    throw new AiPlatformError('POLICY_DENIED', 'Managed-key pricing is unavailable for this model', {
+      status: 503,
+      retryable: false,
+    });
+  }
+  const maxAgeHours = Math.max(1, Number(process.env.CREDIT_MODEL_PRICING_MAX_AGE_HOURS || 720));
+  const updatedAt = model.updatedAt ? new Date(model.updatedAt).getTime() : null;
+  if (updatedAt && Date.now() - updatedAt > maxAgeHours * 3_600_000) {
+    throw new AiPlatformError('POLICY_DENIED', 'Managed-key pricing is stale for this model', {
+      status: 503,
+      retryable: false,
+    });
+  }
+}
+
+function insufficientCreditsError(error: InsufficientOrganizationCreditsError): AiPlatformError {
+  return new AiPlatformError('QUOTA_EXCEEDED', error.message, {
+    status: 402,
+    retryable: false,
+    detail: {
+      available_credits: Number(error.availableUnits) / 1_000_000,
+      required_credits: Number(error.requiredUnits) / 1_000_000,
+      organization_id: error.organizationId,
+      top_up_path: error.topUpPath,
+      upgrade_required: error.availableUnits <= 0,
+    },
+  });
+}
+
 async function prepareChat(context: GatewayContext, request: NormalizedChatRequest): Promise<PreparedChat> {
   if (!isAiPlatformEnabled()) {
     throw new AiPlatformError('POLICY_DENIED', 'AI platform is disabled');
@@ -120,20 +196,22 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
   }
 
   const routing = await resolveRoutingPolicy(context.userId, request.routingPolicy || 'default', request.task);
-  const models = await listModels();
+  const platformUpstream = isPlatformOpenRouterUpstream();
+  const models = filterModelsForPlatformAccess(
+    await listModels(),
+    accessMode,
+    platformUpstream,
+  );
   const health = await getProviderHealthMap();
   const ephemeralProvider = request.ephemeralProvider || (request.ephemeralApiKey ? canonicalizeProviderId(String(request.metadata?.provider || '')) || undefined : undefined);
-  const available = await providersWithCredentials(context.userId, accessMode, ephemeralProvider || undefined);
-  if (accessMode === 'platform') {
-    const balance = await getBalance(context.userId).catch(() => null);
-    const allowed = assertPlatformModelAllowed(balance?.planId, request.model);
-    if (!allowed.ok) {
-      throw new AiPlatformError('POLICY_DENIED', allowed.message);
-    }
-  }
-
+  const available = await providersWithCredentials(
+    context.userId,
+    accessMode,
+    ephemeralProvider || undefined,
+    context.organizationId,
+  );
   const ranked = rankModels({
-    requested: request.model,
+    requested: canonicalizeRequestedModel(request.model, models),
     models,
     policy,
     routing,
@@ -191,16 +269,36 @@ export async function executeChat(
       if (!policy.crossProviderFallbackAllowed && candidate.model.providerId !== primary.model.providerId) continue;
       fallbackCount += 1;
     }
-    const adapter = getAdapter(candidate.model.providerId);
-    if (!adapter) continue;
 
-    const credential = await resolveCredential({
+    const credentialProbe = await resolveCredential({
       userId: context.userId,
+      organizationId: context.organizationId,
       providerId: candidate.model.providerId,
       accessMode: request.ephemeralApiKey ? 'byok' : accessMode,
       ephemeralSecret: request.ephemeralApiKey,
       modelId: candidate.model.id,
+      credentialId: request.credentialId,
     });
+    const platformUpstream = shouldUsePlatformOpenRouterUpstream({
+      accessMode: request.ephemeralApiKey ? 'byok' : accessMode,
+      modelId: candidate.model.id,
+      hasEphemeralApiKey: Boolean(request.ephemeralApiKey),
+    });
+    const dispatch = resolvePlatformDispatch(candidate.model, platformUpstream);
+    const adapter = getAdapter(dispatch.adapterProviderId);
+    if (!adapter) continue;
+
+    const credential = dispatch.adapterProviderId === candidate.model.providerId
+      ? credentialProbe
+      : await resolveCredential({
+        userId: context.userId,
+        organizationId: context.organizationId,
+        providerId: dispatch.adapterProviderId,
+        accessMode: request.ephemeralApiKey ? 'byok' : accessMode,
+        ephemeralSecret: request.ephemeralApiKey,
+        modelId: candidate.model.id,
+        credentialId: request.credentialId,
+      });
     if ('error' in credential) {
       skipped.push({ model: candidate.model.displayName, reason: credential.error });
       lastError = new AiPlatformError(credential.code, credential.error);
@@ -208,15 +306,46 @@ export async function executeChat(
     }
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      let reservation: CreditReservation | null = null;
+      let providerCompleted = false;
       try {
+        const requestedMaxTokens = request.maxTokens || policy.maxTokenLimit || undefined;
+        const openRouterBudget = dispatch.adapterProviderId === 'openrouter'
+          ? constrainOpenRouterRequest({
+            secret: credential.secret,
+            model: dispatch.upstreamModelId,
+            messages: request.messages,
+            requestedMaxTokens,
+            tools: request.tools,
+          })
+          : null;
+        const boundedRequest = openRouterBudget
+          ? { ...request, maxTokens: openRouterBudget.maxTokens }
+          : request;
+        const managed = credential.source === 'platform';
+        if (managed) {
+          assertManagedPricing(candidate.model);
+          const maximumCostUsd = platformMeteringCostUsd(candidate.model, maximumUsage(boundedRequest, policy));
+          reservation = await reserveOrganizationCredits({
+            organizationId: context.organizationId,
+            userId: context.userId,
+            projectId: context.projectId || null,
+            requestId,
+            attemptKey: `${requestId}:${candidate.model.id}:${attempt}`,
+            providerId: dispatch.billingProviderId,
+            modelId: dispatch.billingModelId,
+            maximumProviderCostUsd: maximumCostUsd,
+          });
+        }
         const result = await adapter.chat({
           secret: credential.secret,
-          model: candidate.model.providerModelId,
+          model: dispatch.upstreamModelId,
           messages: request.messages,
           temperature: request.temperature,
-          maxTokens: request.maxTokens || policy.maxTokenLimit || undefined,
+          maxTokens: boundedRequest.maxTokens || policy.maxTokenLimit || undefined,
           tools: request.tools,
         });
+        providerCompleted = true;
         if (request.task === 'security_analysis') {
           const schemaError = validateSecuritySchema(result.text);
           if (schemaError) {
@@ -225,9 +354,22 @@ export async function executeChat(
         }
         const billingSource = credential.source === 'platform' ? 'platform' : 'byok';
         const cost = estimateCost(candidate.model, result.usage, billingSource);
+        const billedProviderCostUsd = billingSource === 'platform'
+          ? platformMeteringCostUsd(candidate.model, result.usage)
+          : cost.providerCostUsd;
+        const billedCost = billedProviderCostUsd !== cost.providerCostUsd
+          ? { ...cost, providerCostUsd: billedProviderCostUsd, customerChargeUsd: billedProviderCostUsd }
+          : cost;
         const maxCost = policy.maxRequestCostUsd ?? maxRequestCostUsd();
-        if (maxCost != null && cost.customerChargeUsd > maxCost) {
+        if (maxCost != null && billedCost.customerChargeUsd > maxCost) {
           throw new AiPlatformError('QUOTA_EXCEEDED', 'Request exceeds the configured cost limit');
+        }
+        if (reservation) {
+          await settleOrganizationCreditReservation({
+            reservation,
+            actualProviderCostUsd: billedProviderCostUsd,
+          });
+          reservation = null;
         }
         const latencyMs = Date.now() - started;
         const response: NormalizedChatResponse = {
@@ -241,7 +383,7 @@ export async function executeChat(
           toolCalls: result.toolCalls,
           finishReason: result.finishReason,
           usage: result.usage,
-          cost,
+          cost: billedCost,
           latencyMs,
           timeToFirstTokenMs: null,
           routingExplanation: candidate.reasons,
@@ -255,17 +397,21 @@ export async function executeChat(
         };
         await recordUsage({
           userId: context.userId,
+          organizationId: context.organizationId,
+          projectId: context.projectId || null,
           requestId,
           providerId: candidate.model.providerId,
           modelId: candidate.model.id,
           credentialSource: credential.source,
           usage: result.usage,
-          cost,
+          cost: billedCost,
+          failClosed: billingSource === 'platform',
         });
         await persistLog({
           requestId,
           traceId,
           userId: context.userId,
+          organizationId: context.organizationId,
           providerId: candidate.model.providerId,
           modelId: candidate.model.id,
           credentialSource: credential.source,
@@ -289,6 +435,19 @@ export async function executeChat(
         });
         return response;
       } catch (error) {
+        if (reservation && !providerCompleted) {
+          await releaseOrganizationCreditReservation(reservation).catch(() => undefined);
+        }
+        if (error instanceof InsufficientOrganizationCreditsError) {
+          throw insufficientCreditsError(error);
+        }
+        if (providerCompleted && !(error instanceof AiPlatformError)) {
+          throw new AiPlatformError('PROVIDER_UNAVAILABLE', 'Managed credit accounting is unavailable', {
+            status: 503,
+            retryable: false,
+            cause: error,
+          });
+        }
         const normalized = adapter.normalizeError(error);
         lastError = normalized;
         retryCount += 1;
@@ -310,6 +469,7 @@ export async function executeChat(
     requestId,
     traceId,
     userId: context.userId,
+    organizationId: context.organizationId,
     providerId: primary.model.providerId,
     modelId: primary.model.id,
     credentialSource: null,
@@ -347,16 +507,36 @@ export async function* streamChat(
       if (!policy.crossProviderFallbackAllowed && candidate.model.providerId !== primary.model.providerId) continue;
       fallbackCount += 1;
     }
-    const adapter = getAdapter(candidate.model.providerId);
-    if (!adapter) continue;
 
-    const credential = await resolveCredential({
+    const credentialProbe = await resolveCredential({
       userId: context.userId,
+      organizationId: context.organizationId,
       providerId: candidate.model.providerId,
       accessMode: request.ephemeralApiKey ? 'byok' : accessMode,
       ephemeralSecret: request.ephemeralApiKey,
       modelId: candidate.model.id,
+      credentialId: request.credentialId,
     });
+    const platformUpstream = shouldUsePlatformOpenRouterUpstream({
+      accessMode: request.ephemeralApiKey ? 'byok' : accessMode,
+      modelId: candidate.model.id,
+      hasEphemeralApiKey: Boolean(request.ephemeralApiKey),
+    });
+    const dispatch = resolvePlatformDispatch(candidate.model, platformUpstream);
+    const adapter = getAdapter(dispatch.adapterProviderId);
+    if (!adapter) continue;
+
+    const credential = dispatch.adapterProviderId === candidate.model.providerId
+      ? credentialProbe
+      : await resolveCredential({
+        userId: context.userId,
+        organizationId: context.organizationId,
+        providerId: dispatch.adapterProviderId,
+        accessMode: request.ephemeralApiKey ? 'byok' : accessMode,
+        ephemeralSecret: request.ephemeralApiKey,
+        modelId: candidate.model.id,
+        credentialId: request.credentialId,
+      });
     if ('error' in credential) {
       skipped.push({ model: candidate.model.displayName, reason: credential.error });
       lastError = new AiPlatformError(credential.code, credential.error);
@@ -364,17 +544,47 @@ export async function* streamChat(
     }
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      let reservation: CreditReservation | null = null;
+      let providerCompleted = false;
       try {
+        const requestedMaxTokens = request.maxTokens || policy.maxTokenLimit || undefined;
+        const openRouterBudget = dispatch.adapterProviderId === 'openrouter'
+          ? constrainOpenRouterRequest({
+            secret: credential.secret,
+            model: dispatch.upstreamModelId,
+            messages: request.messages,
+            requestedMaxTokens,
+            tools: request.tools,
+          })
+          : null;
+        const boundedRequest = openRouterBudget
+          ? { ...request, maxTokens: openRouterBudget.maxTokens }
+          : request;
+        const managed = credential.source === 'platform';
+        if (managed) {
+          assertManagedPricing(candidate.model);
+          const maximumCostUsd = platformMeteringCostUsd(candidate.model, maximumUsage(boundedRequest, policy));
+          reservation = await reserveOrganizationCredits({
+            organizationId: context.organizationId,
+            userId: context.userId,
+            projectId: context.projectId || null,
+            requestId,
+            attemptKey: `${requestId}:${candidate.model.id}:stream:${attempt}`,
+            providerId: dispatch.billingProviderId,
+            modelId: dispatch.billingModelId,
+            maximumProviderCostUsd: maximumCostUsd,
+          });
+        }
         let text = '';
         let usage: UsageBreakdown | null = null;
         let providerRequestId: string | null = null;
         let timeToFirstTokenMs: number | null = null;
         for await (const event of adapter.stream({
           secret: credential.secret,
-          model: candidate.model.providerModelId,
+          model: dispatch.upstreamModelId,
           messages: request.messages,
           temperature: request.temperature,
-          maxTokens: request.maxTokens || policy.maxTokenLimit || undefined,
+          maxTokens: boundedRequest.maxTokens || policy.maxTokenLimit || undefined,
           tools: request.tools,
         })) {
           if (event.type === 'output.delta' && event.text) {
@@ -391,6 +601,7 @@ export async function* streamChat(
             yield event;
           }
         }
+        providerCompleted = true;
         if (request.task === 'security_analysis') {
           const schemaError = validateSecuritySchema(text);
           if (schemaError) throw new AiPlatformError('INVALID_REQUEST', schemaError);
@@ -398,9 +609,22 @@ export async function* streamChat(
         const finalUsage = usage && usage.totalTokens > 0 ? usage : estimatedUsage(request.messages, text);
         const billingSource = credential.source === 'platform' ? 'platform' : 'byok';
         const cost = estimateCost(candidate.model, finalUsage, billingSource);
+        const billedProviderCostUsd = billingSource === 'platform'
+          ? platformMeteringCostUsd(candidate.model, finalUsage)
+          : cost.providerCostUsd;
+        const billedCost = billedProviderCostUsd !== cost.providerCostUsd
+          ? { ...cost, providerCostUsd: billedProviderCostUsd, customerChargeUsd: billedProviderCostUsd }
+          : cost;
         const maxCost = policy.maxRequestCostUsd ?? maxRequestCostUsd();
-        if (maxCost != null && cost.customerChargeUsd > maxCost) {
+        if (maxCost != null && billedCost.customerChargeUsd > maxCost) {
           throw new AiPlatformError('QUOTA_EXCEEDED', 'Request exceeds the configured cost limit');
+        }
+        if (reservation) {
+          await settleOrganizationCreditReservation({
+            reservation,
+            actualProviderCostUsd: billedProviderCostUsd,
+          });
+          reservation = null;
         }
         const latencyMs = Date.now() - started;
         const response: NormalizedChatResponse = {
@@ -414,7 +638,7 @@ export async function* streamChat(
           toolCalls: [],
           finishReason: 'stop',
           usage: finalUsage,
-          cost,
+          cost: billedCost,
           latencyMs,
           timeToFirstTokenMs,
           routingExplanation: candidate.reasons,
@@ -428,17 +652,21 @@ export async function* streamChat(
         };
         await recordUsage({
           userId: context.userId,
+          organizationId: context.organizationId,
+          projectId: context.projectId || null,
           requestId,
           providerId: candidate.model.providerId,
           modelId: candidate.model.id,
           credentialSource: credential.source,
           usage: finalUsage,
-          cost,
+          cost: billedCost,
+          failClosed: billingSource === 'platform',
         });
         await persistLog({
           requestId,
           traceId,
           userId: context.userId,
+          organizationId: context.organizationId,
           providerId: candidate.model.providerId,
           modelId: candidate.model.id,
           credentialSource: credential.source,
@@ -463,6 +691,21 @@ export async function* streamChat(
         yield { type: 'stream.completed', response };
         return;
       } catch (error) {
+        if (reservation && !providerCompleted) {
+          await releaseOrganizationCreditReservation(reservation).catch(() => undefined);
+        }
+        if (error instanceof InsufficientOrganizationCreditsError) {
+          lastError = insufficientCreditsError(error);
+          break;
+        }
+        if (providerCompleted && !(error instanceof AiPlatformError)) {
+          lastError = new AiPlatformError('PROVIDER_UNAVAILABLE', 'Managed credit accounting is unavailable', {
+            status: 503,
+            retryable: false,
+            cause: error,
+          });
+          break;
+        }
         const normalized = adapter.normalizeError(error);
         lastError = normalized;
         retryCount += 1;
@@ -480,6 +723,7 @@ export async function* streamChat(
     requestId,
     traceId,
     userId: context.userId,
+    organizationId: context.organizationId,
     providerId: primary.model.providerId,
     modelId: primary.model.id,
     credentialSource: null,
@@ -502,6 +746,7 @@ async function persistLog(input: {
   requestId: string;
   traceId: string;
   userId: string;
+  organizationId: string;
   providerId: string | null;
   modelId: string | null;
   credentialSource: string | null;
@@ -516,12 +761,13 @@ async function persistLog(input: {
   try {
     await query(
       `INSERT INTO ai_request_logs (
-        id, user_id, trace_id, provider_id, model_id, credential_source, routing_policy, status, error_code,
+        id, user_id, organization_id, trace_id, provider_id, model_id, credential_source, routing_policy, status, error_code,
         latency_ms, retry_count, fallback_count, routing_explanation_json, metadata_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         input.requestId,
         input.userId,
+        input.organizationId,
         input.traceId,
         input.providerId,
         input.modelId,

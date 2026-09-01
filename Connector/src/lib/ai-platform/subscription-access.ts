@@ -1,8 +1,27 @@
 import { FREE_PLAN_ID } from '@/lib/billing/credits-policy';
 import { LOGICAL_ALIASES } from './types';
 import type { AccessMode } from './types';
+import { DEFAULT_REMEDIATION_PLATFORM_MODEL } from './remediation-platform-models';
+
+export { DEFAULT_REMEDIATION_PLATFORM_MODEL };
 
 export const FREE_PLATFORM_ALIASES = ['best_fast', 'best_cost'] as const;
+
+/** Concrete platform catalog models available on the free plan when billing is enforced. */
+export const FREE_PLATFORM_MODEL_IDS = [
+  'claude-haiku-4-5',
+  'gpt-5.6-luna',
+  'gpt-5.4-mini',
+  'gemini-3.5-flash-lite',
+  'llama-3.3-70b-versatile',
+  'llama-3.1-8b-instant',
+  'glm-5.2-free',
+  'MiniMax-M3-free',
+  'nemotron-3.5-content-safety-free',
+] as const;
+
+export const DEFAULT_PAID_PLATFORM_MODEL = 'grok-4.6';
+export const DEFAULT_FREE_PLATFORM_MODEL = 'claude-haiku-4-5';
 
 const PAID_PLAN_PREFIXES = ['starter', 'pro', 'enterprise'] as const;
 
@@ -48,6 +67,16 @@ export function isLogicalAliasName(model: string): boolean {
   return (LOGICAL_ALIASES as readonly string[]).includes(model.trim());
 }
 
+export function isPlatformModelAllowedForPlan(
+  planId: string | null | undefined,
+  providerModelId: string,
+): boolean {
+  const requested = providerModelId.trim();
+  if (!requested) return false;
+  if (hasOpenPlatformAccess(planId)) return true;
+  return (FREE_PLATFORM_MODEL_IDS as readonly string[]).includes(requested);
+}
+
 export function assertPlatformModelAllowed(
   planId: string | null | undefined,
   model: string,
@@ -56,21 +85,17 @@ export function assertPlatformModelAllowed(
   if (!requested) {
     return { ok: false, message: 'Select a platform model to continue.' };
   }
-  const aliases = platformAliasesForPlan(planId);
-  if (aliases.includes(requested)) return { ok: true };
-  if (isLogicalAliasName(requested) && !aliases.includes(requested)) {
+  if (isLogicalAliasName(requested)) {
+    return { ok: false, message: 'Select a specific platform model from the catalog.' };
+  }
+  if (!isPlatformModelAllowedForPlan(planId, requested)) {
     return {
       ok: false,
       message:
-        'Your current plan includes DeplAI Fast and Cost-optimized models. Upgrade to Starter to use flagship platform models, or connect a BYOK key.',
+        'Your current plan includes a limited set of platform models. Upgrade to Starter for the full catalog, or connect a BYOK key.',
     };
   }
-  if (planAllowsCatalogModels(planId)) return { ok: true };
-  return {
-    ok: false,
-    message:
-      'Specific vendor models on the platform require a Starter plan or higher. Connect a BYOK key to use your own models, or upgrade your subscription.',
-  };
+  return { ok: true };
 }
 
 export function defaultRemediationAccessMode(input: {
@@ -83,7 +108,10 @@ export function defaultRemediationAccessMode(input: {
 }
 
 export function defaultRemediationModel(planId: string | null | undefined): string {
-  return hasOpenPlatformAccess(planId) ? 'best_coding' : 'best_fast';
+  if (!hasOpenPlatformAccess(planId) && isBillingEnforced()) {
+    return DEFAULT_FREE_PLATFORM_MODEL;
+  }
+  return DEFAULT_REMEDIATION_PLATFORM_MODEL;
 }
 
 export function parseAccessMode(value: unknown): AccessMode | null {

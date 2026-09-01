@@ -122,8 +122,11 @@ describe('cost accounting', () => {
     const platform = estimateCost(model, usage, 'platform');
     const byok = estimateCost(model, usage, 'byok');
     assert.ok(platform.providerCostUsd > 0);
-    assert.equal(byok.providerCostUsd, 0);
-    assert.ok(byok.platformCostUsd > 0);
+    assert.equal(platform.customerChargeUsd, platform.providerCostUsd);
+    assert.equal(platform.platformCostUsd, 0);
+    assert.equal(byok.providerCostUsd, platform.providerCostUsd);
+    assert.equal(byok.platformCostUsd, 0);
+    assert.equal(byok.customerChargeUsd, 0);
     assert.notEqual(platform.billingSource, byok.billingSource);
   });
 });

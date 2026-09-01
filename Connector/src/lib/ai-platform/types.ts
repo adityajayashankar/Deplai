@@ -296,6 +296,7 @@ export interface NormalizedChatRequest {
   metadata?: Record<string, unknown>;
   ephemeralApiKey?: string;
   ephemeralProvider?: ProviderId;
+  credentialId?: string;
 }
 
 export interface NormalizedChatResponse {
@@ -378,6 +379,8 @@ export interface RoutingCandidate {
 
 export interface GatewayContext {
   userId: string;
+  organizationId: string;
+  projectId?: string;
   workspaceId?: string;
   actor?: string;
   source?: 'ui' | 'chat' | 'security' | 'customization' | 'terraform' | 'internal';

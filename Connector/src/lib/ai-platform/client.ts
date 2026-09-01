@@ -4,6 +4,8 @@ import type { AccessMode, GatewayContext, NormalizedChatResponse } from './types
 
 export async function aiChat(input: {
   userId: string;
+  organizationId: string;
+  projectId?: string;
   model?: string;
   messages: Array<{ role: string; content: string }>;
   system?: string;
@@ -16,7 +18,12 @@ export async function aiChat(input: {
   maxTokens?: number;
 }): Promise<NormalizedChatResponse> {
   return executeChat(
-    { userId: input.userId, source: input.source || 'internal' },
+    {
+      userId: input.userId,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+      source: input.source || 'internal',
+    },
     {
       model: input.model || 'best',
       messages: toGatewayMessages(input.messages, input.system),

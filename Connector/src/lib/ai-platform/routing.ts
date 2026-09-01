@@ -11,9 +11,31 @@ import type {
 } from './types';
 import { DEFAULT_ROUTING_WEIGHTS, LOGICAL_ALIASES } from './types';
 import { ALIAS_CAPABILITY, isSelectableLifecycle } from './catalog/seed';
-import { randomUUID } from 'node:crypto';
+import { canonicalizeRequestedModel, modelMatchesRequest } from './model-resolution';
+import { isPlatformOpenRouterUpstream } from './platform-upstream';
 import { query } from '@/lib/db';
 import { ensureAiPlatformSchema } from './schema';
+
+export const DEFAULT_ROUTING_PROVIDER_IDS: ProviderId[] = [
+  'openai',
+  'anthropic',
+  'gemini',
+  'xai',
+  'minimax',
+  'kimi',
+  'glm',
+  'groq',
+  'openrouter',
+];
+
+function withPlatformOpenRouterProvider(policy: RoutingPolicy): RoutingPolicy {
+  if (!isPlatformOpenRouterUpstream()) return policy;
+  if (policy.allowedProviders.includes('openrouter')) return policy;
+  return {
+    ...policy,
+    allowedProviders: [...policy.allowedProviders, 'openrouter'],
+  };
+}
 
 export function isLogicalAlias(value: string): value is LogicalAlias {
   return (LOGICAL_ALIASES as readonly string[]).includes(value);
@@ -94,12 +116,7 @@ export function rankModels(input: {
     }
 
     if (!isLogicalAlias(requested)) {
-      const needle = requested.toLowerCase();
-      const exact =
-        model.id.toLowerCase() === needle
-        || model.providerModelId.toLowerCase() === needle
-        || model.aliases.some((item) => item.toLowerCase() === needle);
-      if (!exact) {
+      if (!modelMatchesRequest(model, requested)) {
         skip('Does not match requested model');
         continue;
       }
@@ -149,7 +166,7 @@ export function defaultRoutingPolicy(userId: string, name = 'default'): RoutingP
     secondaryAlias: 'best_fast',
     fallbackModelId: null,
     accessMode: 'auto',
-    allowedProviders: ['openai', 'anthropic', 'gemini', 'xai', 'minimax', 'kimi', 'glm', 'groq'],
+    allowedProviders: [...DEFAULT_ROUTING_PROVIDER_IDS],
     weights: DEFAULT_ROUTING_WEIGHTS,
     isDefault: true,
   };
@@ -256,10 +273,12 @@ export async function saveRoutingPolicy(userId: string, policy: Partial<RoutingP
 export async function resolveRoutingPolicy(userId: string, nameOrId: string, task?: string): Promise<RoutingPolicy> {
   const policies = await listRoutingPolicies(userId);
   if (task === 'security_analysis') {
-    return policies.find((policy) => policy.taskType === 'security_analysis' || policy.name === 'security_analysis')
+    const policy = policies.find((policy) => policy.taskType === 'security_analysis' || policy.name === 'security_analysis')
       || securityAnalysisPolicy(userId);
+    return withPlatformOpenRouterProvider(policy);
   }
-  return policies.find((policy) => policy.id === nameOrId || policy.name === nameOrId)
+  const policy = policies.find((policy) => policy.id === nameOrId || policy.name === nameOrId)
     || policies.find((policy) => policy.isDefault)
     || defaultRoutingPolicy(userId);
+  return withPlatformOpenRouterProvider(policy);
 }

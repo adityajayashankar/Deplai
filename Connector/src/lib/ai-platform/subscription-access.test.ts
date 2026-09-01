@@ -2,10 +2,13 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   assertPlatformModelAllowed,
+  DEFAULT_FREE_PLATFORM_MODEL,
+  DEFAULT_REMEDIATION_PLATFORM_MODEL,
   defaultRemediationAccessMode,
   defaultRemediationModel,
   isBillingEnforced,
   isPaidPlanId,
+  isPlatformModelAllowedForPlan,
   parseAccessMode,
   platformAliasesForPlan,
 } from './subscription-access';
@@ -37,29 +40,32 @@ describe('subscription platform model access', () => {
   it('opens every platform model while billing is not enforced', () => {
     withBillingEnforced(false, () => {
       assert.equal(isBillingEnforced(), false);
-      assert.equal(assertPlatformModelAllowed('free', 'best_coding').ok, true);
+      assert.equal(assertPlatformModelAllowed('free', 'claude-sonnet-5').ok, true);
       assert.equal(assertPlatformModelAllowed('free', 'gpt-5.6-sol').ok, true);
-      assert.equal(defaultRemediationModel('free'), 'best_coding');
+      assert.equal(assertPlatformModelAllowed('free', 'best_coding').ok, false);
+      assert.equal(defaultRemediationModel('free'), DEFAULT_REMEDIATION_PLATFORM_MODEL);
       assert.ok(platformAliasesForPlan('free').includes('best_coding'));
     });
   });
 
-  it('limits free plans to fast and cost aliases when billing is enforced', () => {
+  it('limits free plans to the free catalog when billing is enforced', () => {
     withBillingEnforced(true, () => {
       assert.equal(isBillingEnforced(), true);
-      assert.deepEqual(platformAliasesForPlan('free'), ['best_fast', 'best_cost']);
-      assert.equal(assertPlatformModelAllowed('free', 'best_fast').ok, true);
-      assert.equal(assertPlatformModelAllowed('free', 'best_coding').ok, false);
+      assert.equal(isPlatformModelAllowedForPlan('free', 'claude-haiku-4-5'), true);
+      assert.equal(isPlatformModelAllowedForPlan('free', 'claude-sonnet-5'), false);
+      assert.equal(assertPlatformModelAllowed('free', 'claude-haiku-4-5').ok, true);
+      assert.equal(assertPlatformModelAllowed('free', 'best_fast').ok, false);
+      assert.equal(assertPlatformModelAllowed('free', 'claude-sonnet-5').ok, false);
       assert.equal(assertPlatformModelAllowed('free', 'gpt-5.6-sol').ok, false);
     });
   });
 
-  it('unlocks aliases and catalog models on paid plans', () => {
+  it('unlocks the full catalog on paid plans', () => {
     withBillingEnforced(true, () => {
-      assert.equal(assertPlatformModelAllowed('starter_20', 'best_coding').ok, true);
-      assert.equal(assertPlatformModelAllowed('pro_50', 'anthropic:claude-sonnet-4-6').ok, true);
-      assert.equal(defaultRemediationModel('pro_50'), 'best_coding');
-      assert.equal(defaultRemediationModel('free'), 'best_fast');
+      assert.equal(assertPlatformModelAllowed('starter_20', 'claude-sonnet-5').ok, true);
+      assert.equal(assertPlatformModelAllowed('pro_50', 'anthropic:claude-sonnet-5').ok, true);
+      assert.equal(defaultRemediationModel('pro_50'), DEFAULT_REMEDIATION_PLATFORM_MODEL);
+      assert.equal(defaultRemediationModel('free'), DEFAULT_FREE_PLATFORM_MODEL);
     });
   });
 
