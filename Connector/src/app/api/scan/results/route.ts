@@ -12,7 +12,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
     }
 
-    const { error: ownershipError } = await verifyProjectOwnership(user!.id, projectId);
+    const { error: ownershipError } = await verifyProjectOwnership(user!.id, projectId, 'security.scan.read');
     if (ownershipError) return ownershipError;
 
     const response = await fetch(`${AGENTIC_URL}/api/scan/results/${projectId}`, {

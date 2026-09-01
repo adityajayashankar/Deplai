@@ -58,6 +58,7 @@ import {
 } from '@/features/security';
 import { readStoredDastAsset, readStoredDastTarget, storeDastAsset, storeDastTarget } from '@/features/security/dastTarget';
 import { projectHasSuccessfulDeploy, readSavedAws, writeSavedAws } from '@/features/deployment/state';
+import { UnifiedDiffStats, UnifiedDiffViewer } from '@/components/diff/UnifiedDiffViewer';
 import { appBtnInk, appBtnPaper, appInput, secPaper } from '@/features/workspace/theme';
 
 type PipelineStageId = 'scan' | 'results' | 'remediate_setup' | 'remediate_run' | 'approval' | 'pr_rescan';
@@ -81,7 +82,7 @@ const STAGE_INDEX: Record<PipelineStageId, number> = {
 };
 
 const RESULTS_HEARTBEAT_MS = 30_000;
-const REMEDIATION_DEFAULT_MODEL = 'best_coding';
+const REMEDIATION_DEFAULT_MODEL = '';
 
 const EMPTY_STATS = { total: 0, critical: 0, high: 0, medium: 0, low: 0, autoFixable: 0 };
 
@@ -836,30 +837,6 @@ function AlertCard({
   );
 }
 
-function DiffViewer({ diff }: { diff: string }) {
-  const lines = diff.split('\n');
-  return (
-    <div className="overflow-hidden border-[3px] border-black bg-black">
-      <div className="border-b border-[#1A1A1A] px-4 py-2 text-[11px] font-medium uppercase tracking-widest text-zinc-500">
-        Unified Diff
-      </div>
-      <div className="max-h-90 overflow-auto px-4 py-3 font-mono text-[12px] leading-relaxed">
-        {lines.map((line, index) => {
-          let classes = 'text-zinc-400';
-          if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) classes = 'text-indigo-300';
-          else if (line.startsWith('+')) classes = 'text-emerald-400';
-          else if (line.startsWith('-')) classes = 'text-rose-400';
-          return (
-            <div key={`${line}-${index}`} className={classes}>
-              {line || ' '}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
 function inferBaseStage({
   setupOpen,
   approvalSent,
@@ -875,11 +852,10 @@ function inferBaseStage({
   hasVulnerabilities: boolean;
   scanState: 'idle' | 'running' | 'completed' | 'error' | 'waiting_decision' | 'waiting_approval';
 }): PipelineStageId {
-  if (approvalSent || remediationState === 'completed') return 'pr_rescan';
-  if (remediationState === 'waiting_decision') return 'approval';
-  if (remediationState === 'waiting_approval') return 'approval';
-  if (remediationState === 'running' || remediationState === 'error') return 'remediate_run';
   if (setupOpen && hasScanOutcome && hasVulnerabilities) return 'remediate_setup';
+  if (approvalSent || remediationState === 'completed') return 'pr_rescan';
+  if (remediationState === 'waiting_decision' || remediationState === 'waiting_approval') return 'approval';
+  if (remediationState === 'running' || remediationState === 'error') return 'remediate_run';
   if (hasScanOutcome || scanState === 'completed') return 'results';
   return 'scan';
 }
@@ -909,6 +885,7 @@ export default function SecurityAnalysisPage() {
     accessMode: 'platform',
     model: REMEDIATION_DEFAULT_MODEL,
     provider: null,
+    credentialId: null,
     ready: false,
     blockedReason: 'Loading model options…',
     sourceLabel: 'Platform',
@@ -988,7 +965,6 @@ export default function SecurityAnalysisPage() {
   const scanLogEndRef = useRef<HTMLDivElement>(null);
   const remediateLogEndRef = useRef<HTMLDivElement>(null);
   const fetchVersionRef = useRef(0);
-  const previousBaseStageRef = useRef<PipelineStageId>('scan');
   const userStartedScanRef = useRef(false);
   const dastAutoStartRef = useRef(false);
   const cloudAutoStartRef = useRef(false);
@@ -1417,16 +1393,39 @@ export default function SecurityAnalysisPage() {
     scanState,
   });
   const canOpenResults = hasScanOutcome && (scanState !== 'running' || modulesSettled);
-  const maxUnlockedIndex = Math.max(
-    STAGE_INDEX[baseStage],
-    canOpenResults ? STAGE_INDEX.results : STAGE_INDEX.scan,
-    canOpenRemediationSetup ? STAGE_INDEX.remediate_setup : STAGE_INDEX.scan,
-  );
+  const maxUnlockedIndex = useMemo(() => {
+    const indices = [
+      STAGE_INDEX[baseStage],
+      STAGE_INDEX[activeStage],
+      canOpenResults ? STAGE_INDEX.results : STAGE_INDEX.scan,
+      canOpenRemediationSetup ? STAGE_INDEX.remediate_setup : STAGE_INDEX.scan,
+    ];
+    if (activeStage === 'remediate_run') {
+      indices.push(STAGE_INDEX.remediate_run);
+    }
+    if (['running', 'error', 'waiting_decision', 'waiting_approval'].includes(remediationState)) {
+      indices.push(STAGE_INDEX.remediate_run);
+    }
+    if (remediationState === 'waiting_decision' || remediationState === 'waiting_approval') {
+      indices.push(STAGE_INDEX.approval);
+    }
+    if (approvalSent || remediationState === 'completed') {
+      indices.push(STAGE_INDEX.pr_rescan);
+    }
+    return Math.max(...indices);
+  }, [
+    activeStage,
+    approvalSent,
+    baseStage,
+    canOpenRemediationSetup,
+    canOpenResults,
+    remediationState,
+  ]);
 
   useEffect(() => {
-    const previousBase = previousBaseStageRef.current;
-    if (activeStage === previousBase || STAGE_INDEX[activeStage] > maxUnlockedIndex) setActiveStage(baseStage);
-    previousBaseStageRef.current = baseStage;
+    if (STAGE_INDEX[activeStage] > maxUnlockedIndex) {
+      setActiveStage(baseStage);
+    }
   }, [activeStage, baseStage, maxUnlockedIndex]);
 
   const getStageStatus = useCallback(
@@ -1442,6 +1441,7 @@ export default function SecurityAnalysisPage() {
   const progressPercentage = useMemo(() => (remediationFinished ? 100 : Math.round(((maxUnlockedIndex + 1) / SIDEBAR_STAGES.length) * 100)), [maxUnlockedIndex, remediationFinished]);
   const handleStageClick = useCallback((stageId: PipelineStageId) => {
     if (STAGE_INDEX[stageId] > maxUnlockedIndex) return;
+    setSetupOpen(stageId === 'remediate_setup');
     setActiveStage(stageId);
   }, [maxUnlockedIndex]);
 
@@ -1579,9 +1579,18 @@ export default function SecurityAnalysisPage() {
         }),
       });
 
+      const validateBody = await validateRes.json().catch(() => ({})) as {
+        error?: string;
+        code?: string;
+        warnings?: Array<{ module?: string; message?: string }>;
+      };
       if (!validateRes.ok) {
-        const body = await validateRes.json().catch(() => ({}));
-        throw new Error(body.error || 'Failed to validate scan');
+        throw new Error(validateBody.error || 'Failed to validate scan');
+      }
+
+      const dastWarning = validateBody.warnings?.find((item) => item.module === 'dast');
+      if (dastWarning?.message) {
+        setError(`DAST skipped: ${dastWarning.message} Continuing with SAST/SCA only.`);
       }
 
       await startScan(projectId, projectName || projectId, (options?.dastOnly || options?.cloudOnly) ? { preserveRemediation: true } : undefined);
@@ -1699,20 +1708,24 @@ export default function SecurityAnalysisPage() {
     setActiveStage('remediate_run');
 
     try {
+      if (remediationState !== 'idle') {
+        resetRemediation(projectId);
+      }
       await startRemediation(
         projectId,
         trimmedToken || undefined,
         agentModel.provider || undefined,
         undefined,
         agentModel.model,
-        'all',
+        'major',
         agentModel.accessMode,
+        agentModel.credentialId || undefined,
       );
       setGithubToken('');
     } catch (remediationError) {
       setError(remediationError instanceof Error ? remediationError.message : 'Failed to start remediation');
     }
-  }, [agentModel, canLaunchRemediation, githubToken, loadingProject, projectAuthError, projectId, projectMeta, startRemediation]);
+  }, [agentModel, canLaunchRemediation, githubToken, loadingProject, projectAuthError, projectId, projectMeta, remediationState, resetRemediation, startRemediation]);
 
   const handleContinueRound = useCallback(() => {
     continueRemediationRound(projectId);
@@ -1727,6 +1740,17 @@ export default function SecurityAnalysisPage() {
     setLocallyApproved(true);
     approveRemediationPush(projectId);
   }, [approveRemediationPush, projectId]);
+
+  const handleResetRemediation = useCallback(() => {
+    resetRemediation(projectId);
+    setError(null);
+    setSetupOpen(true);
+    setLocallyApproved(false);
+    setApproved(false);
+    setPrUrl(null);
+    setSelectedDiffPath(null);
+    setActiveStage('remediate_setup');
+  }, [projectId, resetRemediation]);
 
   const handleVerificationRerun = useCallback(async () => {
     if (loadingProject) {
@@ -2201,18 +2225,26 @@ export default function SecurityAnalysisPage() {
               </p>
             </div>
           </div>
-          <RemediationModelPicker value={agentModel} onChange={setAgentModel} />
+          <RemediationModelPicker value={agentModel} onChange={setAgentModel} persistKey={projectId} />
           <div className="border-t border-[#1A1A1A] pt-4">
             <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">GitHub PAT (Optional)</label>
             <input type="password" value={githubToken} onChange={(event) => setGithubToken(event.target.value)} placeholder="ghp_..." className={appInput} />
             <p className="mt-2 text-[11px] text-zinc-500">Required only for pushing the fix branch automatically. Not stored persistently.</p>
           </div>
         </div>
-        <div className="pt-6">
+        <div className="pt-6 flex flex-wrap items-center gap-3">
           <RunButton onClick={() => void handleStartRemediation()} disabled={remediatingThisProject || !canLaunchRemediation || !agentModel.ready}>
             <Sparkles className="h-4 w-4" />
             <span>Start Remediation Engine</span>
           </RunButton>
+          {!agentModel.ready ? (
+            <p className="text-xs text-amber-800">{agentModel.blockedReason || 'Loading remediation models…'}</p>
+          ) : null}
+          {remediationState !== 'idle' ? (
+            <button type="button" onClick={handleResetRemediation} className={appBtnPaper}>
+              Reset remediation
+            </button>
+          ) : null}
         </div>
       </div>
     </div>
@@ -2317,7 +2349,24 @@ export default function SecurityAnalysisPage() {
         </div>
 
         {remediationState === 'error' ? (
-          <AlertCard tone="error" title="Remediation Failed" message={[...remMessages].reverse().find((message) => message.type === 'error')?.content || error || 'The remediation run failed.'} />
+          <AlertCard
+            tone="error"
+            title="Remediation Failed"
+            message={[...remMessages].reverse().find((message) => message.type === 'error')?.content || error || 'The remediation run failed.'}
+            action={
+              <button type="button" onClick={handleResetRemediation} className={appBtnPaper}>
+                Reset &amp; reconfigure
+              </button>
+            }
+          />
+        ) : null}
+
+        {['running', 'waiting_decision', 'waiting_approval'].includes(remediationState) ? (
+          <div className="flex justify-end">
+            <button type="button" onClick={handleResetRemediation} className={appBtnPaper}>
+              Stop &amp; reset remediation
+            </button>
+          </div>
         ) : null}
       </div>
     );
@@ -2354,7 +2403,28 @@ export default function SecurityAnalysisPage() {
           </div>
         </div>
 
-        {selectedDiff ? <div className="space-y-3"><div className="flex items-center justify-between"><div className="text-sm font-semibold text-zinc-200">{selectedDiff.path}</div>{selectedDiff.reason ? <div className="text-xs text-zinc-500">{selectedDiff.reason}</div> : null}</div>{selectedDiff.diff ? <DiffViewer diff={selectedDiff.diff} /> : <AlertCard tone="warning" title="Diff Unavailable" message="This file change did not include a diff payload." />}</div> : null}
+        {selectedDiff ? (
+          <div className={`${secPaper} overflow-hidden`}>
+            <div className="flex items-center justify-between gap-4 border-b-[3px] border-black px-4 py-3">
+              <div className="min-w-0">
+                <div className="truncate font-mono text-sm font-semibold text-black">{selectedDiff.path}</div>
+                {selectedDiff.reason ? (
+                  <div className="mt-0.5 text-xs text-neutral-600">{selectedDiff.reason}</div>
+                ) : null}
+              </div>
+              {selectedDiff.diff ? <UnifiedDiffStats diff={selectedDiff.diff} /> : null}
+            </div>
+            {selectedDiff.diff ? (
+              <div className="p-4">
+                <UnifiedDiffViewer diff={selectedDiff.diff} embedded />
+              </div>
+            ) : (
+              <div className="p-4">
+                <AlertCard tone="warning" title="Diff Unavailable" message="This file change did not include a diff payload." />
+              </div>
+            )}
+          </div>
+        ) : null}
 
         {waitingForDecision ? (
           <div className={`grid gap-4 ${secPaper} p-6 md:grid-cols-2`}>

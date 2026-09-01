@@ -3,6 +3,7 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
+import { Suspense } from "react"
 import { AlertCircle } from "lucide-react"
 import { Button } from "@/components/auth/ui/button"
 import { Input } from "@/components/auth/ui/input"
@@ -13,9 +14,11 @@ import { PasswordStrength } from "@/components/auth/password-strength"
 import { PasswordMatch } from "@/components/auth/password-match"
 import { PhoneInput } from "@/components/auth/phone-input"
 import { THANK_YOU_HREF, submitEmailAuth } from "@/lib/auth-providers"
+import { ReferralSignupBanner, useReferralCapture } from "@/features/referrals/useReferralCapture"
 
-export default function SignUpPage() {
+function SignUpContent() {
   const router = useRouter()
+  const referralBanner = useReferralCapture()
   const [isLoading, setIsLoading] = React.useState(false)
   const [errors, setErrors] = React.useState<Record<string, string>>({})
   const [password, setPassword] = React.useState("")
@@ -89,6 +92,8 @@ export default function SignUpPage() {
           Enter your details below to create your account
         </p>
       </div>
+
+      <ReferralSignupBanner banner={referralBanner} />
 
       <OAuthButtons isLoading={isLoading} onUnavailable={handleUnavailableProvider} />
 
@@ -287,5 +292,13 @@ export default function SignUpPage() {
         </Link>
       </p>
     </div>
+  )
+}
+
+export default function SignUpPage() {
+  return (
+    <Suspense fallback={null}>
+      <SignUpContent />
+    </Suspense>
   )
 }

@@ -5,6 +5,7 @@ const TABLES = [
     id VARCHAR(36) PRIMARY KEY,
     project_id VARCHAR(36) NOT NULL,
     user_id VARCHAR(36) NOT NULL,
+    organization_id VARCHAR(36) NULL,
     target_url VARCHAR(2048) NOT NULL,
     normalized_url VARCHAR(2048) NOT NULL,
     hostname VARCHAR(255) NOT NULL,
@@ -27,13 +28,16 @@ const TABLES = [
     updated_at DATETIME NULL,
     INDEX idx_dast_assets_project_status (project_id, status),
     INDEX idx_dast_assets_user (user_id),
+    INDEX idx_dast_assets_org (organization_id, project_id),
     INDEX idx_dast_assets_host (project_id, hostname),
-    CONSTRAINT fk_dast_assets_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    CONSTRAINT fk_dast_assets_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_dast_assets_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE SET NULL
   )`,
   `CREATE TABLE IF NOT EXISTS dast_scans (
     id VARCHAR(36) PRIMARY KEY,
     project_id VARCHAR(36) NOT NULL,
     user_id VARCHAR(36) NOT NULL,
+    organization_id VARCHAR(36) NULL,
     asset_id VARCHAR(36) NOT NULL,
     target_url VARCHAR(2048) NOT NULL,
     scan_profile VARCHAR(16) NOT NULL DEFAULT 'BASELINE',
@@ -52,13 +56,16 @@ const TABLES = [
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uniq_dast_scans_idempotency (user_id, idempotency_key),
     INDEX idx_dast_scans_project (project_id, created_at),
+    INDEX idx_dast_scans_org (organization_id, project_id, created_at),
     CONSTRAINT fk_dast_scans_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    CONSTRAINT fk_dast_scans_asset FOREIGN KEY (asset_id) REFERENCES dast_assets(id) ON DELETE CASCADE
+    CONSTRAINT fk_dast_scans_asset FOREIGN KEY (asset_id) REFERENCES dast_assets(id) ON DELETE CASCADE,
+    CONSTRAINT fk_dast_scans_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE SET NULL
   )`,
   `CREATE TABLE IF NOT EXISTS dast_audit_events (
     id VARCHAR(40) PRIMARY KEY,
     project_id VARCHAR(36) NOT NULL,
     user_id VARCHAR(36) NOT NULL,
+    organization_id VARCHAR(36) NULL,
     asset_id VARCHAR(36) NULL,
     scan_id VARCHAR(36) NULL,
     action VARCHAR(64) NOT NULL,
@@ -69,7 +76,9 @@ const TABLES = [
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_dast_audit_project (project_id, created_at),
     INDEX idx_dast_audit_scan (scan_id),
-    CONSTRAINT fk_dast_audit_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    INDEX idx_dast_audit_org (organization_id, created_at),
+    CONSTRAINT fk_dast_audit_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_dast_audit_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE SET NULL
   )`,
 ];
 

@@ -9,6 +9,7 @@ export type DastAssetRow = {
   id: string;
   project_id: string;
   user_id: string;
+  organization_id: string | null;
   target_url: string;
   normalized_url: string;
   hostname: string;
@@ -106,11 +107,13 @@ export function publicAsset(row: DastAssetRow, { includeToken = false } = {}) {
   };
 }
 
-export async function listAssets(userId: string, projectId: string): Promise<DastAssetRow[]> {
+export async function listAssets(userId: string, projectId: string, organizationId?: string | null): Promise<DastAssetRow[]> {
   await ensureDastSchema();
   return query<DastAssetRow[]>(
-    `SELECT * FROM dast_assets WHERE user_id = ? AND project_id = ? ORDER BY created_at DESC`,
-    [userId, projectId],
+    `SELECT * FROM dast_assets
+     WHERE project_id = ? AND (organization_id = ? OR (organization_id IS NULL AND user_id = ?))
+     ORDER BY created_at DESC`,
+    [projectId, organizationId || '', userId],
   );
 }
 
@@ -135,6 +138,7 @@ export async function getAssetById(assetId: string): Promise<DastAssetRow | null
 export async function writeAudit(input: {
   projectId: string;
   userId: string;
+  organizationId?: string | null;
   assetId?: string | null;
   scanId?: string | null;
   action: string;
@@ -144,12 +148,13 @@ export async function writeAudit(input: {
   await ensureDastSchema();
   await query(
     `INSERT INTO dast_audit_events
-      (id, project_id, user_id, asset_id, scan_id, action, decision, reason, policy_version, correlation_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      (id, project_id, user_id, organization_id, asset_id, scan_id, action, decision, reason, policy_version, correlation_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       randomUUID(),
       input.projectId,
       input.userId,
+      input.organizationId || null,
       input.assetId || null,
       input.scanId || null,
       input.action,
@@ -163,6 +168,7 @@ export async function writeAudit(input: {
 
 export async function createAsset(input: {
   userId: string;
+  organizationId?: string | null;
   projectId: string;
   targetUrl: string;
   environment: string;
@@ -177,13 +183,14 @@ export async function createAsset(input: {
   const id = randomUUID();
   await query(
     `INSERT INTO dast_assets (
-      id, project_id, user_id, target_url, normalized_url, hostname, scheme, port, path_prefix,
+      id, project_id, user_id, organization_id, target_url, normalized_url, hostname, scheme, port, path_prefix,
       environment, scope_mode, status, verification_token_hash, verification_token, created_by
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)`,
     [
       id,
       input.projectId,
       input.userId,
+      input.organizationId || null,
       input.targetUrl.trim(),
       parsed.url,
       parsed.hostname,
@@ -200,6 +207,7 @@ export async function createAsset(input: {
   await writeAudit({
     projectId: input.projectId,
     userId: input.userId,
+    organizationId: input.organizationId,
     assetId: id,
     action: 'DAST_ASSET_CREATED',
     decision: 'allow',
@@ -336,7 +344,7 @@ export async function resolveAuthorizedAsset(input: {
   targetUrl?: string;
 }): Promise<{ asset: DastAssetRow; grant: ReturnType<typeof issueGrant>; targetUrl: string }> {
   let asset: DastAssetRow | null = null;
-  let targetUrl = String(input.targetUrl || '').trim();
+  const targetUrl = String(input.targetUrl || '').trim();
 
   if (input.assetId) {
     asset = await getAsset(input.userId, input.assetId);
@@ -408,12 +416,13 @@ export async function createScanRecord(input: {
   const id = randomUUID();
   await query(
     `INSERT INTO dast_scans (
-      id, project_id, user_id, asset_id, target_url, scan_profile, scan_intent, status, idempotency_key, started_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, UTC_TIMESTAMP())`,
+      id, project_id, user_id, organization_id, asset_id, target_url, scan_profile, scan_intent, status, idempotency_key, started_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, UTC_TIMESTAMP())`,
     [
       id,
       input.projectId,
       input.userId,
+      input.asset.organization_id || null,
       input.asset.id,
       input.targetUrl,
       input.profile,
@@ -424,6 +433,7 @@ export async function createScanRecord(input: {
   await writeAudit({
     projectId: input.projectId,
     userId: input.userId,
+    organizationId: input.asset.organization_id,
     assetId: input.asset.id,
     scanId: id,
     action: 'DAST_SCAN_AUTHORIZED',

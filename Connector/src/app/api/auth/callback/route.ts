@@ -207,6 +207,7 @@ export async function GET(request: NextRequest) {
       [primaryEmail]
     );
 
+    const isNewUser = !user;
     if (!user) {
       const userId = uuidv4();
       await query(
@@ -214,6 +215,23 @@ export async function GET(request: NextRequest) {
         [userId, primaryEmail, githubUser.name || githubUser.login]
       );
       user = { id: userId };
+    }
+
+    if (isNewUser) {
+      try {
+        const { readReferralCookie, clearReferralCookie } = await import('@/lib/referrals/cookie');
+        const { createReferralAttribution } = await import('@/lib/referrals/store');
+        const referralCode = await readReferralCookie();
+        if (referralCode) {
+          await createReferralAttribution({
+            referredUserId: user.id,
+            referralCode,
+          });
+          await clearReferralCookie();
+        }
+      } catch (referralError) {
+        console.warn('Failed to attribute referral after signup:', referralError);
+      }
     }
 
     try {

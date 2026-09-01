@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { Suspense } from "react"
 import { AlertCircle } from "lucide-react"
 import { Button } from "@/components/auth/ui/button"
 import { Input } from "@/components/auth/ui/input"
@@ -10,10 +11,12 @@ import { Checkbox } from "@/components/auth/ui/checkbox"
 import { OAuthButtons } from "@/components/auth/oauth-buttons"
 import { PasswordInput } from "@/components/auth/password-input"
 import { POST_LOGIN_HREF, submitEmailAuth } from "@/lib/auth-providers"
+import { ReferralSignupBanner, useReferralCapture } from "@/features/referrals/useReferralCapture"
 
-export default function LoginPage() {
+function LoginContent() {
   const [isLoading, setIsLoading] = React.useState(false)
   const [errors, setErrors] = React.useState<Record<string, string>>({})
+  const referralBanner = useReferralCapture()
   
   const errorSummaryRef = React.useRef<HTMLDivElement>(null)
 
@@ -74,6 +77,8 @@ export default function LoginPage() {
           Enter your credentials to access your account
         </p>
       </div>
+
+      <ReferralSignupBanner banner={referralBanner} />
 
       <OAuthButtons isLoading={isLoading} onUnavailable={handleUnavailableProvider} />
 
@@ -193,5 +198,13 @@ export default function LoginPage() {
         </Link>
       </p>
     </div>
+  )
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginContent />
+    </Suspense>
   )
 }

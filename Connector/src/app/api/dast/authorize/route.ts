@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { createScanRecord, resolveAuthorizedAsset } from '@/lib/dast/store';
+import { denyUnlessPlanFeature } from '@/lib/billing/plan-access-guard';
 
 function profileIntent(profile: string): { profile: 'BASELINE' | 'FULL' | 'API'; intent: 'PASSIVE' | 'ACTIVE' | 'API_ACTIVE' } {
   const value = String(profile || 'BASELINE').toUpperCase();
@@ -12,6 +13,8 @@ function profileIntent(profile: string): { profile: 'BASELINE' | 'FULL' | 'API';
 export async function POST(request: NextRequest) {
   const auth = await requireAuth();
   if (auth.error) return auth.error;
+  const denied = await denyUnlessPlanFeature(request, auth.user, 'dast');
+  if (denied) return denied;
   const body = await request.json().catch(() => ({})) as {
     project_id?: string;
     asset_id?: string;
@@ -21,7 +24,7 @@ export async function POST(request: NextRequest) {
   };
   const projectId = String(body.project_id || '').trim();
   if (!projectId) return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
-  const ownership = await verifyProjectOwnership(auth.user.id, projectId);
+  const ownership = await verifyProjectOwnership(auth.user.id, projectId, 'security.scan.run');
   if ('error' in ownership) return ownership.error;
   try {
     const { asset, grant, targetUrl } = await resolveAuthorizedAsset({

@@ -151,6 +151,7 @@ export async function POST(request: NextRequest) {
     const requestedModules = Array.isArray(body.enabled_modules)
       ? body.enabled_modules.map((item) => String(item).trim().toLowerCase())
       : [];
+    const scanWarnings: Array<{ module: string; code: string; message: string }> = [];
     const dastTarget = String(body.dast_target_url || '').trim();
     const dastAssetId = String(body.dast_asset_id || '').trim();
     const dastOnly = requestedModules.length === 1 && requestedModules[0] === 'dast';
@@ -182,15 +183,18 @@ export async function POST(request: NextRequest) {
       } catch (dastError) {
         const code = (dastError as { code?: string }).code || 'DAST_TARGET_NOT_AUTHORIZED';
         const status = Number((dastError as { status?: number }).status || 403);
-        return NextResponse.json(
-          {
-            error: dastError instanceof Error
-              ? dastError.message
-              : 'This target is not associated with the selected project and ownership has not been verified.',
-            code,
-          },
-          { status },
-        );
+        const message = dastError instanceof Error
+          ? dastError.message
+          : 'This target is not associated with the selected project and ownership has not been verified.';
+        if (dastOnly) {
+          return NextResponse.json({ error: message, code }, { status });
+        }
+        scanWarnings.push({ module: 'dast', code, message });
+        if (Array.isArray(backendPayload.enabled_modules)) {
+          backendPayload.enabled_modules = backendPayload.enabled_modules.filter(
+            (module) => String(module).trim().toLowerCase() !== 'dast',
+          );
+        }
       }
     }
     if (requestedModules.includes('cloud')) {
@@ -349,6 +353,9 @@ export async function POST(request: NextRequest) {
     }
 
     const data = await response.json();
+    if (scanWarnings.length > 0) {
+      data.warnings = [...(Array.isArray(data.warnings) ? data.warnings : []), ...scanWarnings];
+    }
     return NextResponse.json(data);
   } catch (routeError: unknown) {
     if (isBackendTimeoutError(routeError)) {

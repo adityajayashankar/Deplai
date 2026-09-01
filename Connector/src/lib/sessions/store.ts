@@ -17,6 +17,7 @@ const SESSION_ID_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno
 type SessionRow = {
   id: string;
   user_id: string;
+  organization_id: string | null;
   project_id: string | null;
   service: string;
   title: string;
@@ -44,6 +45,7 @@ type CountRow = { n: number | string };
 
 export type CreateSessionInput = {
   userId: string;
+  organizationId?: string | null;
   projectId?: string | null;
   service: SessionService;
   title: string;
@@ -78,6 +80,7 @@ const TABLES = [
   `CREATE TABLE IF NOT EXISTS workspace_sessions (
     id VARCHAR(40) PRIMARY KEY,
     user_id VARCHAR(36) NOT NULL,
+    organization_id VARCHAR(36) NULL,
     project_id VARCHAR(36) NULL,
     service VARCHAR(32) NOT NULL,
     title VARCHAR(255) NOT NULL,
@@ -95,7 +98,9 @@ const TABLES = [
     INDEX idx_workspace_sessions_user_status (user_id, status),
     INDEX idx_workspace_sessions_project (user_id, project_id, started_at),
     INDEX idx_workspace_sessions_external (user_id, service, external_id),
-    CONSTRAINT fk_workspace_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    INDEX idx_workspace_org (organization_id, started_at),
+    CONSTRAINT fk_workspace_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_workspace_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE SET NULL
   )`,
   `CREATE TABLE IF NOT EXISTS workspace_session_logs (
     id VARCHAR(40) PRIMARY KEY,
@@ -213,12 +218,14 @@ export async function createSession(input: CreateSessionInput): Promise<Workspac
   const completedAt = isTerminalStatus(status) ? toMysqlDateTime(new Date()) : null;
   await query(
     `INSERT INTO workspace_sessions (
-      id, user_id, project_id, service, title, repo, status, current_stage,
+      id, user_id, organization_id, project_id, service, title, repo, status, current_stage,
       completed_at, changed_files_count, triggered_by, external_id, metadata_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, COALESCE(?, (SELECT organization_id FROM projects WHERE id = ?)), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       input.userId,
+      input.organizationId || null,
+      input.projectId || null,
       input.projectId || null,
       input.service,
       String(input.title || 'Untitled session').slice(0, 255),
@@ -251,7 +258,7 @@ export async function tryCreateSession(input: CreateSessionInput): Promise<Works
 export async function getSession(id: string): Promise<WorkspaceSession | null> {
   await ensureWorkspaceSessionsSchema();
   const rows = await query<SessionRow[]>(
-    `SELECT id, user_id, project_id, service, title, repo, status, current_stage,
+    `SELECT id, user_id, organization_id, project_id, service, title, repo, status, current_stage,
             started_at, completed_at, changed_files_count, triggered_by, external_id, metadata_json
      FROM workspace_sessions WHERE id = ? LIMIT 1`,
     [id],
@@ -273,7 +280,7 @@ export async function findLatestSession(options: {
 }): Promise<WorkspaceSession | null> {
   await ensureWorkspaceSessionsSchema();
   const params: unknown[] = [options.userId, options.service];
-  let sql = `SELECT id, user_id, project_id, service, title, repo, status, current_stage,
+  let sql = `SELECT id, user_id, organization_id, project_id, service, title, repo, status, current_stage,
                     started_at, completed_at, changed_files_count, triggered_by, external_id, metadata_json
              FROM workspace_sessions
              WHERE user_id = ? AND service = ?`;

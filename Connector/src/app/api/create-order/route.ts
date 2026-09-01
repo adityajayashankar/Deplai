@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
-import { ENTERPRISE_PLAN_ID, FREE_PLAN_ID, getBalance, listCreditPacks, listPlans } from '@/lib/billing/credits';
+import { ENTERPRISE_PLAN_ID, FREE_PLAN_ID, getOrganizationSubscription, listCreditPacks, listPlans } from '@/lib/billing/credits';
 import { SALES_EMAIL } from '@/lib/billing/config';
 import {
   createCreditPackOrder,
@@ -9,12 +9,22 @@ import {
   razorpayErrorMessage,
   razorpayHttpStatus,
 } from '@/lib/billing/razorpay';
+import { takeBillingRateLimit } from '@/lib/billing/rate-limit';
+import { resolveBillingOrganization } from '@/lib/billing/organization-context';
 
 export const runtime = 'nodejs';
 
 export async function POST(request: NextRequest) {
   const auth = await requireAuth();
   if (auth.error) return auth.error;
+
+  const rateLimit = takeBillingRateLimit({ userId: auth.user.id, action: 'create_order' });
+  if (!rateLimit.allowed) {
+    return NextResponse.json(
+      { error: 'Too many checkout attempts. Please wait and try again.' },
+      { status: 429, headers: { 'Retry-After': String(rateLimit.retryAfterSeconds) } },
+    );
+  }
 
   if (!isRazorpayConfigured()) {
     return NextResponse.json({ error: 'Razorpay is not configured' }, { status: 501 });
@@ -24,33 +34,28 @@ export async function POST(request: NextRequest) {
     plan_id?: string;
     credit_pack_id?: string;
     cadence?: 'monthly' | 'yearly';
+    idempotency_key?: string;
   };
 
   try {
+    const organization = await resolveBillingOrganization({ request, user: auth.user, permission: 'billing.manage' });
     if (body.credit_pack_id) {
       const packs = await listCreditPacks();
       const pack = packs.find((item) => item.id === String(body.credit_pack_id).trim());
       if (!pack) return NextResponse.json({ error: 'Unknown credit pack' }, { status: 400 });
-      const balance = await getBalance(auth.user.id);
-      if (pack.paidTiersOnly && (balance.planId === 'free' || balance.planName === 'free')) {
+      const subscription = await getOrganizationSubscription(organization.id).catch(() => null);
+      if (pack.paidTiersOnly && (!subscription || subscription.planId === 'free')) {
         return NextResponse.json({ error: 'Top-up packs are available on paid plans only' }, { status: 403 });
       }
       const checkout = await createCreditPackOrder({
         userId: auth.user.id,
+        organizationId: organization.id,
         email: auth.user.email,
         name: auth.user.name,
         pack,
+        idempotencyKey: String(body.idempotency_key || ''),
       });
-      return NextResponse.json({
-        order_id: checkout.order_id,
-        amount: checkout.amount,
-        currency: checkout.currency,
-        key_id: checkout.key_id,
-        name: checkout.name,
-        description: checkout.description,
-        prefill: checkout.prefill,
-        notes: checkout.notes,
-      });
+      return NextResponse.json(checkout);
     }
 
     const planId = String(body.plan_id || '').trim();
@@ -69,21 +74,14 @@ export async function POST(request: NextRequest) {
 
     const checkout = await createPlanSubscriptionCheckout({
       userId: auth.user.id,
+      organizationId: organization.id,
       email: auth.user.email,
       name: auth.user.name,
       plan,
       cadence,
+      idempotencyKey: String(body.idempotency_key || ''),
     });
-    return NextResponse.json({
-      order_id: checkout.order_id,
-      amount: checkout.amount,
-      currency: checkout.currency,
-      key_id: checkout.key_id,
-      name: checkout.name,
-      description: checkout.description,
-      prefill: checkout.prefill,
-      notes: checkout.notes,
-    });
+    return NextResponse.json(checkout);
   } catch (error) {
     const message = razorpayErrorMessage(error);
     return NextResponse.json({ error: message }, { status: razorpayHttpStatus(error) });

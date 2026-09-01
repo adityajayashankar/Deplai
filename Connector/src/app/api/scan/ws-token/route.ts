@@ -15,7 +15,7 @@ export async function GET(request: NextRequest) {
   }
 
   // Verify the user actually owns this project before issuing a WS token
-  const ownership = await verifyProjectOwnership(user!.id, projectId);
+  const ownership = await verifyProjectOwnership(user!.id, projectId, 'security.scan.run');
   if ('error' in ownership) {
     return NextResponse.json({ error: 'Project not found or access denied' }, { status: 403 });
   }

@@ -10,6 +10,7 @@ const files = [
   path.resolve(__dirname, '../migrations/20260826_credit_provisioning.sql'),
   path.resolve(__dirname, '../migrations/20260826_razorpay_gst_invoices.sql'),
   path.resolve(__dirname, '../migrations/20260827_fulfillment_reliability.sql'),
+  path.resolve(__dirname, '../migrations/20260901_razorpay_payment_hardening.sql'),
 ];
 
 async function main() {
@@ -36,7 +37,12 @@ async function main() {
           console.log(`ok: ${statement.slice(0, 60).replace(/\s+/g, ' ')}...`);
         } catch (error) {
           const code = (error as { code?: string }).code;
-          if (code === 'ER_DUP_FIELDNAME' || code === 'ER_DUP_KEYNAME') {
+          if (
+            code === 'ER_DUP_FIELDNAME'
+            || code === 'ER_DUP_KEYNAME'
+            || code === 'ER_TABLE_EXISTS_ERROR'
+            || code === 'ER_CANT_CREATE_TABLE'
+          ) {
             console.log(`skip existing: ${code} ${statement.slice(0, 50).replace(/\s+/g, ' ')}`);
             continue;
           }

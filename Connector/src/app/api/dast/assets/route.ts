@@ -8,9 +8,9 @@ export async function GET(request: NextRequest) {
   if (auth.error) return auth.error;
   const projectId = String(request.nextUrl.searchParams.get('project_id') || '').trim();
   if (!projectId) return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
-  const ownership = await verifyProjectOwnership(auth.user.id, projectId);
+  const ownership = await verifyProjectOwnership(auth.user.id, projectId, 'security.scan.read');
   if ('error' in ownership) return ownership.error;
-  const rows = await listAssets(auth.user.id, projectId);
+  const rows = await listAssets(auth.user.id, projectId, ownership.project.organization_id);
   return NextResponse.json({ assets: rows.map((row) => publicAsset(row, { includeToken: row.status === 'PENDING' })) });
 }
 
@@ -25,7 +25,7 @@ export async function POST(request: NextRequest) {
   };
   const projectId = String(body.project_id || '').trim();
   if (!projectId) return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
-  const ownership = await verifyProjectOwnership(auth.user.id, projectId);
+  const ownership = await verifyProjectOwnership(auth.user.id, projectId, 'security.scan.run');
   if ('error' in ownership) return ownership.error;
   const scopeMode = String(body.scope_mode || 'VERIFIED_HOST').toUpperCase() as DastScopeMode;
   if (scopeMode !== 'VERIFIED_HOST' && scopeMode !== 'VERIFIED_DOMAIN' && scopeMode !== 'PROJECT_ASSET') {
@@ -34,6 +34,7 @@ export async function POST(request: NextRequest) {
   try {
     const asset = await createAsset({
       userId: auth.user.id,
+      organizationId: ownership.project.organization_id,
       projectId,
       targetUrl: String(body.target_url || ''),
       environment: String(body.environment || 'production'),
