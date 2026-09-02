@@ -9,6 +9,7 @@ from fastapi import WebSocket
 from models import RemediationRequest, StreamStatus, WebSocketCommand
 from remediation_pipeline.models import Fix, RemediationPRRequest
 from remediation_pipeline.orchestrator import RemediationOrchestrator
+from remediation_pipeline.remediation_store import bind_remediation_run, remediation_runs
 from runner_base import RunnerBase
 from utils import set_current_project_id
 
@@ -24,12 +25,29 @@ class RemediationTrackRunner(RunnerBase):
         super().__init__(websocket, TOTAL_STEPS)
         self.context = context
         self.orchestrator = orchestrator
+        self.remediation_run_id = str(context.remediation_run_id or "")
         self._command_event = asyncio.Event()
         self._pending_action: str | None = None
         self._decision_requested = False
         self._approval_requested = False
         self._latest_fixes: list[Fix] = []
         self._accepted_fixes: list[Fix] = []
+
+    async def _send_message(self, msg_type: str, content: str):
+        await super()._send_message(msg_type, content)
+        await asyncio.to_thread(
+            remediation_runs.append_event,
+            self.remediation_run_id,
+            project_id=self.context.project_id,
+            message_type=msg_type,
+            content=content,
+            stage="remediation",
+        )
+
+    async def _send_status(self, status: StreamStatus):
+        await super()._send_status(status)
+        mapped = "failed" if status == StreamStatus.error else status.value
+        await asyncio.to_thread(remediation_runs.mark_status, self.remediation_run_id, mapped)
 
     @staticmethod
     def _accepted_filepaths(fixes: list[Fix]) -> list[str]:
@@ -152,6 +170,8 @@ class RemediationTrackRunner(RunnerBase):
 
     async def _run_pipeline(self) -> bool:
         set_current_project_id(self.context.project_id)
+        bind_remediation_run(self.remediation_run_id)
+        await asyncio.to_thread(remediation_runs.mark_status, self.remediation_run_id, "running")
         await self._send_message("phase", "Initializing remediation pipeline")
 
         approved_for_push = False
@@ -252,6 +272,7 @@ class RemediationTrackRunner(RunnerBase):
                     organization_id=getattr(self.context, "organization_id", None),
                     access_mode=getattr(self.context, "llm_access_mode", None),
                     llm_credential_id=getattr(self.context, "llm_credential_id", None),
+                    remediation_run_id=self.remediation_run_id,
                 )
             except Exception as exc:
                 return await self._terminate(f"Remediation pipeline execution failed: {type(exc).__name__}: {exc}")

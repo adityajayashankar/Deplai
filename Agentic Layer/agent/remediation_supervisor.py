@@ -139,9 +139,30 @@ def _dispatch_llm(
     model = (model or "").strip()
     mode = (access_mode or "auto").strip().lower() or "auto"
 
+    def journal(
+        success: bool | None = None,
+        error: str | None = None,
+        *,
+        effective_provider: str | None = None,
+        effective_model: str | None = None,
+    ) -> None:
+        try:
+            from remediation_pipeline.remediation_store import record_llm_dispatch
+            record_llm_dispatch(
+                stage=stage,
+                provider=effective_provider if effective_provider is not None else provider,
+                model=effective_model if effective_model is not None else model,
+                access_mode=mode,
+                success=success,
+                error=error,
+            )
+        except Exception:
+            pass
+
     if user_id:
         try:
             from ai_gateway import bound_organization, remediate_text
+            journal()
             ok_gw, raw_gw = remediate_text(
                 user_id=str(user_id),
                 organization_id=str(organization_id or bound_organization() or "").strip() or None,
@@ -153,11 +174,13 @@ def _dispatch_llm(
                 credential_id=credential_id or None,
                 max_tokens=max_tokens,
             )
+            journal(ok_gw, None if ok_gw else raw_gw)
             if ok_gw:
                 return ok_gw, raw_gw
             if mode in {"platform", "byok"}:
                 return False, raw_gw
         except Exception as exc:
+            journal(False, str(exc))
             if mode in {"platform", "byok"}:
                 return False, str(exc)
 
@@ -173,7 +196,9 @@ def _dispatch_llm(
         )
 
     if provider == "groq":
+        journal(effective_provider="groq")
         ok, text = _call_with_backoff(lambda: _call_groq(prompt))
+        journal(ok, None if ok else text, effective_provider="groq")
         if ok:
             return ok, text
         # Fall back to the Claude SDK only if a Claude key is available.
@@ -186,7 +211,9 @@ def _dispatch_llm(
 
     effective_api_key = api_key if provider in ("", "claude") else ""
     effective_model = model if provider in ("", "claude") else ""
+    journal(effective_provider="claude", effective_model=effective_model)
     ok, text = _claude(effective_api_key, effective_model)
+    journal(ok, None if ok else text, effective_provider="claude", effective_model=effective_model)
     if ok:
         return ok, text
 

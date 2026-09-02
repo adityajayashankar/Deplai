@@ -82,6 +82,7 @@ async def run_supervised_remediation(
     organization_id: str | None = None,
     access_mode: str | None = None,
     llm_credential_id: str | None = None,
+    remediation_run_id: str | None = None,
 ) -> list[Fix]:
     """Run Master -> Planner -> Implementor -> Reviewer on filtered scan batches."""
     if not _supervisor_enabled():
@@ -147,6 +148,7 @@ async def run_supervised_remediation(
             organization_id=organization_id,
             access_mode=access_mode,
             llm_credential_id=llm_credential_id,
+            remediation_run_id=remediation_run_id,
             persist_changes=False,
         )
 

@@ -217,11 +217,14 @@ class RemediationRequest(BaseModel):
     llm_access_mode: Optional[Literal["platform", "byok", "auto"]] = "auto"
     llm_credential_id: Optional[str] = None
     remediation_scope: Literal["major", "all"] = "major"
+    # Created server-side after validation. Never accepted as a client identity.
+    remediation_run_id: Optional[str] = None
 
 
 class RemediationResponse(BaseModel):
     success: bool
     message: str
+    run_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

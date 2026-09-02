@@ -11,6 +11,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from remediation_pipeline.models import ProviderQuota, ProviderStatusResponse
+from remediation_pipeline.remediation_store import record_llm_dispatch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Agentic Layer"))
 
@@ -59,9 +60,27 @@ class LLMRouter:
         self._reset_if_needed()
 
         mode = (access_mode or "auto").strip().lower() or "auto"
+
+        def journal(
+            success: bool | None = None,
+            error: str | None = None,
+            *,
+            provider: str | None = None,
+            model: str | None = None,
+        ) -> None:
+            record_llm_dispatch(
+                stage="pipeline_targeted",
+                provider=provider or preferred_provider or "auto",
+                model=model or preferred_model or "auto",
+                access_mode=mode,
+                success=success,
+                error=error,
+            )
+
         if user_id:
             try:
                 from ai_gateway import bound_organization, remediate_text
+                journal()
                 ok, response = remediate_text(
                     user_id=str(user_id),
                     organization_id=str(organization_id or bound_organization() or "").strip() or None,
@@ -72,6 +91,7 @@ class LLMRouter:
                     provider=preferred_provider,
                     credential_id=llm_credential_id,
                 )
+                journal(ok, None if ok else response)
                 if ok:
                     tokens_used = max(estimated_tokens, len(response) // 4)
                     return response, f"gateway:{mode}", tokens_used
@@ -80,16 +100,19 @@ class LLMRouter:
             except RuntimeError:
                 raise
             except Exception as exc:
+                journal(False, str(exc))
                 if mode in {"platform", "byok"}:
                     raise RuntimeError(f"AI platform {mode} remediation failed: {exc}") from exc
 
         provider_name = str(preferred_provider or "").strip().lower()
         if force_claude or provider_name in {"claude", "anthropic"}:
+            journal(provider="claude", model=preferred_model)
             ok, response = self._dispatch_claude_sdk(
                 prompt,
                 api_key=str(preferred_api_key or "").strip(),
                 model=str(preferred_model or "").strip(),
             )
+            journal(ok, None if ok else response, provider="claude", model=preferred_model)
             if ok:
                 tokens_used = max(estimated_tokens, len(response) // 4)
                 return response, "claude", tokens_used
@@ -100,7 +123,9 @@ class LLMRouter:
             if not self._has_quota(cfg):
                 continue
 
+            journal(provider=cfg.name, model=cfg.model)
             ok, response = self._dispatch(cfg, prompt)
+            journal(ok, None if ok else response, provider=cfg.name, model=cfg.model)
             if ok:
                 with self._lock:
                     self._used_today[cfg.name] = self._used_today.get(cfg.name, 0) + 1

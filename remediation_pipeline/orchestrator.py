@@ -76,6 +76,7 @@ class RemediationOrchestrator:
         organization_id: str | None = None,
         access_mode: str | None = None,
         llm_credential_id: str | None = None,
+        remediation_run_id: str | None = None,
     ) -> list[Fix]:
         from utils import clear_repo_file_cache
         clear_repo_file_cache()
@@ -161,6 +162,7 @@ class RemediationOrchestrator:
                     organization_id=organization_id,
                     access_mode=access_mode,
                     llm_credential_id=llm_credential_id,
+                    remediation_run_id=remediation_run_id,
                 )
             except Exception as exc:
                 supervised_fixes = []

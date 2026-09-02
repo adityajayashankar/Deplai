@@ -38,6 +38,7 @@ from claude_remediator import (
     _write_file,
 )
 from remediation_pipeline.validator import DiffValidator
+from remediation_pipeline.remediation_store import bind_remediation_run, remediation_runs
 from utils import get_repo_root, set_current_project_id
 
 from .remediation_supervisor import (
@@ -83,6 +84,7 @@ _LOW_QUOTA_OPENROUTER_MARKERS = (
 
 class RemediationWorkflowState(TypedDict):
     project_id: str
+    remediation_run_id: str
     scan_data: dict[str, Any]
     contexts: dict[str, str]
     allowed_paths: list[str]
@@ -561,6 +563,7 @@ Relevant source context:
 
 def _bind_runtime_context(state: RemediationWorkflowState) -> None:
     set_current_project_id(state.get("project_id", ""))
+    bind_remediation_run(state.get("remediation_run_id"))
     try:
         from ai_gateway import bind_ai_context
 
@@ -857,12 +860,15 @@ async def run_remediation_workflow(
     access_mode: str | None = None,
     llm_credential_id: str | None = None,
     persist_changes: bool = False,
+    remediation_run_id: str | None = None,
 ) -> tuple[bool, dict[str, Any] | str]:
     async def emit(message_type: str, content: str) -> None:
         if on_message:
             await on_message(message_type, content)
 
     set_current_project_id(project_id)
+    run_id = str(remediation_run_id or "").strip()
+    bind_remediation_run(run_id)
     await emit("supervisor_phase", "Master is collecting vulnerability-centered repository context.")
     try:
         contexts = await asyncio.to_thread(collect_remediation_contexts, scan_data)
@@ -873,6 +879,7 @@ async def run_remediation_workflow(
 
     state: RemediationWorkflowState = {
         "project_id": project_id,
+        "remediation_run_id": run_id,
         "scan_data": scan_data,
         "contexts": contexts,
         "allowed_paths": list(contexts),
@@ -896,8 +903,12 @@ async def run_remediation_workflow(
         "error": "",
     }
 
-    thread_id = f"remediation:{project_id}:{uuid4()}"
-    graph = build_remediation_graph(checkpointer=MemorySaver())
+    thread_id = f"remediation:{project_id}:{run_id or uuid4()}"
+    checkpointer, checkpoint_backend = remediation_runs.checkpoint_saver(
+        direct_api_key_present=bool(str(llm_api_key or "").strip())
+    )
+    remediation_runs.mark_status(run_id, "running", checkpoint_backend=checkpoint_backend)
+    graph = build_remediation_graph(checkpointer=checkpointer or MemorySaver())
     config = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": max(12, MAX_ROUNDS * 4 + 4),
@@ -958,6 +969,7 @@ async def run_remediation_workflow(
     if not final:
         return False, "LangGraph remediation ended without a synthesized result."
     final["graph_thread_id"] = thread_id
+    final["checkpoint_backend"] = checkpoint_backend
     return True, final
 
 

@@ -882,31 +882,22 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
           updateRemediationStatus(id, 'error');
         },
         (id, detail) => {
-          // If WS closes while remediation is still running, mark as error
+          // A browser/proxy can drop the WebSocket (often code 1006) while the
+          // server continues the remediation. Keep the UI recoverable and ask
+          // the authenticated status endpoint for the durable server truth.
           setRemediationStates(prev => {
             const cur = prev[id];
             if (cur && !['completed', 'error', 'idle'].includes(cur.state)) {
               const reason = detail?.reason?.trim();
               const message = reason
-                ? `WebSocket closed unexpectedly (${detail?.code || 1006}): ${reason}`
-                : `WebSocket closed unexpectedly (${detail?.code || 1006}).`;
-              const alreadyLogged = cur.messages.some((entry) => entry.type === 'error' && entry.content === message);
-              if (!alreadyLogged) {
-                const remSessionId = securitySessionIdsRef.current[id];
-                if (remSessionId) {
-                  persistSessionProgress(remSessionId, {
-                    status: 'failed',
-                    current_stage: 'remediate_run',
-                    completed: true,
-                    line: { level: 'error', message, stage: 'remediate_run' },
-                  });
-                }
-              }
+                ? `Live log connection closed (${detail?.code || 1006}): ${reason}. Checking server-side remediation status…`
+                : `Live log connection closed (${detail?.code || 1006}). Checking server-side remediation status…`;
+              const alreadyLogged = cur.messages.some((entry) => entry.type === 'warning' && entry.content === message);
               return {
                 ...prev,
                 [id]: {
                   ...cur,
-                  state: 'error',
+                  state: 'running',
                   messages: alreadyLogged
                     ? cur.messages
                     : trimMessages([
@@ -914,7 +905,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
                         {
                           index: Date.now(),
                           total: Date.now(),
-                          type: 'error',
+                          type: 'warning',
                           content: message,
                           timestamp: new Date().toISOString(),
                         },
@@ -924,6 +915,51 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
             }
             return prev;
           });
+          void fetch(`/api/remediate/status/${encodeURIComponent(id)}`, { cache: 'no-store' })
+            .then(async (response) => {
+              if (!response.ok) return null;
+              return response.json() as Promise<{
+                run?: { status?: string };
+                events?: Array<{ sequence?: number; type?: string; content?: string; created_at?: string }>;
+              }>;
+            })
+            .then((payload) => {
+              const rawStatus = String(payload?.run?.status || '');
+              const recoveredState: RemediationState | null = rawStatus === 'failed'
+                ? 'error'
+                : ['running', 'waiting_decision', 'waiting_approval', 'completed', 'error'].includes(rawStatus)
+                  ? rawStatus as RemediationState
+                  : null;
+              if (!recoveredState) return;
+              setRemediationStates(prev => {
+                const current = prev[id];
+                if (!current) return prev;
+                const recoveredMessages = (payload?.events || [])
+                  .filter((event) => event.content && event.type !== 'changed_files')
+                  .map((event, offset) => ({
+                    index: Number(event.sequence || Date.now() + offset),
+                    total: Date.now(),
+                    type: String(event.type || 'info'),
+                    content: String(event.content),
+                    timestamp: String(event.created_at || new Date().toISOString()),
+                  })) as ScanMessage[];
+                const known = new Set(current.messages.map((event) => `${event.type}:${event.content}`));
+                const newMessages = recoveredMessages.filter((event) => !known.has(`${event.type}:${event.content}`));
+                return {
+                  ...prev,
+                  [id]: {
+                    ...current,
+                    state: recoveredState,
+                    messages: trimMessages([...current.messages, ...newMessages]),
+                  },
+                };
+              });
+              updateRemediationStatus(id, recoveredState);
+            })
+            .catch(() => {
+              // The warning above already tells the user how to recover. Do
+              // not convert a transport hiccup into a false remediation fail.
+            });
           delete remWsRefs.current[id];
         },
         wsToken,

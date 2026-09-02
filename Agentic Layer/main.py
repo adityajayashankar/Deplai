@@ -65,6 +65,7 @@ from remediation_pipeline.models import (
     RemediationRunRequest as PipelineRemediationRunRequest,
 )
 from remediation_pipeline.orchestrator import RemediationOrchestrator
+from remediation_pipeline.remediation_store import remediation_runs
 from remediation_pipeline.track_runner import RemediationTrackRunner
 from runner_base import RunnerBase
 from architecture_gen import generate_architecture
@@ -364,6 +365,7 @@ async def _handle_websocket(
         await websocket.close(code=1008, reason="Unauthorized")
 
     async def run_workflow(runner: RunnerBase):
+        remediation_run_id = str(getattr(runner, "remediation_run_id", "") or "")
         try:
             success = await runner.run()
             if success:
@@ -371,11 +373,13 @@ async def _handle_websocket(
                 # any cache invalidation happens before the frontend re-fetches.
                 if on_complete:
                     on_complete()
+                remediation_runs.mark_status(remediation_run_id, "completed")
                 await websocket.send_json({
                     "type": "status",
                     "status": StreamStatus.completed.value,
                 })
             else:
+                remediation_runs.mark_status(remediation_run_id, "failed")
                 # Pipeline returned False — error status was already sent by _terminate(),
                 # but send it again as a safety net in case the pipeline exited a different way.
                 try:
@@ -386,8 +390,11 @@ async def _handle_websocket(
                 except Exception:
                     pass
         except WebSocketDisconnect:
+            # The browser may leave after the server-side workflow succeeded.
+            # Runner messaging is deliberately best-effort; keep its last state.
             pass
         except Exception as e:
+            remediation_runs.mark_status(remediation_run_id, "failed")
             try:
                 await websocket.send_json({
                     "type": "status",
@@ -594,6 +601,13 @@ async def validate_remediation(request: RemediationRequest):
     """Validate a remediation request and store context."""
     request = _normalize_remediation_request(request)
     _bind_ai_gateway_context(request)
+    run_id = remediation_runs.begin_run(
+        project_id=request.project_id,
+        user_id=request.user_id,
+        organization_id=request.organization_id,
+        scope=request.remediation_scope,
+    )
+    request = request.model_copy(update={"remediation_run_id": run_id})
     logger.info(
         "Remediation request: project=%s type=%s user=%s",
         request.project_id, request.project_type, request.user_id,
@@ -602,7 +616,17 @@ async def validate_remediation(request: RemediationRequest):
     return RemediationResponse(
         success=True,
         message="Remediation request accepted",
+        run_id=run_id,
     )
+
+
+@app.get("/api/remediate/runs/{project_id}", dependencies=[Depends(verify_api_key)])
+async def remediation_run_status(project_id: str):
+    """Return redacted status/events so clients can recover after a WS disconnect."""
+    status = remediation_runs.latest_for_project(project_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="No remediation run was found for this project.")
+    return status
 
 
 @app.websocket("/ws/remediate/{project_id}")

@@ -86,6 +86,7 @@ The response contains `success` and the new project’s ID, type, local path, fi
 | `GET` | `/api/scan/ws-token?project_id=…` | Mints a short-lived WebSocket token for an owned project. |
 | `GET` | `/api/scan/ws-health` | Authenticated diagnostic: probes Agentic WebSocket upgrade on the Docker network and returns resolved `public_ws_base` / hints. |
 | `POST` | `/api/remediate/start` | Validates remediation context and forwards GitHub credentials/token data server-side. |
+| `GET` | `/api/remediate/status/{project_id}` | Authenticated, ownership-checked recovery status and redacted progress events for the latest remediation run. |
 | `POST` | `/api/pipeline/remediation-pr` | Queries remediation pull-request status for an owned project. |
 
 ### Scan validation request
@@ -218,6 +219,7 @@ All routes in this table require `X-API-Key` unless marked otherwise.
 | `GET` | `/api/scan/status/{project_id}` | Returns `running`, `found`, `not_found`, `not_initiated`, or other current status. |
 | `DELETE` | `/api/scan/results/{project_id}` | Deletes scan reports for one project. |
 | `POST` | `/api/remediate/validate` | Stores a remediation context with source type, optional GitHub data, optional LLM configuration, and scope. |
+| `GET` | `/api/remediate/runs/{project_id}` | Internal service-key route for the latest redacted remediation run journal. |
 | `POST` | `/remediation/run` | Runs remediation-pipeline work. |
 | `GET` | `/remediation/status` | Returns remediation status. |
 | `POST` | `/remediation/pr` | Performs remediation pull-request operation. |
