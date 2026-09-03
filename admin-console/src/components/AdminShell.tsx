@@ -71,7 +71,11 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
           Sign out
         </button>
       </aside>
-      <main className="p-6 lg:p-8">{children}</main>
+      <main className="p-6 lg:p-8">
+        <div key={pathname} className="page-enter">
+          {children}
+        </div>
+      </main>
     </div>
   );
 }

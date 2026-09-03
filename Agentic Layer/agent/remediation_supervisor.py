@@ -132,6 +132,7 @@ def _dispatch_llm(
     access_mode: str = "auto",
     credential_id: str = "",
     max_tokens: int | None = None,
+    response_format: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Route remediation supervisor calls through the AI platform when possible."""
     provider = (provider or "").strip().lower()
@@ -173,6 +174,7 @@ def _dispatch_llm(
                 provider=provider,
                 credential_id=credential_id or None,
                 max_tokens=max_tokens,
+                response_format=response_format,
             )
             journal(ok_gw, None if ok_gw else raw_gw)
             if ok_gw:
@@ -183,6 +185,9 @@ def _dispatch_llm(
             journal(False, str(exc))
             if mode in {"platform", "byok"}:
                 return False, str(exc)
+
+    if response_format:
+        return False, "Strict JSON-schema remediation requires the configured AI platform gateway."
 
     def _claude(effective_key: str, effective_model: str) -> tuple[bool, str]:
         return _call_with_backoff(

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { AiPlatformError } from './errors';
-import type { ChatMessage, ChatTool } from './types';
+import type { ChatMessage, ChatTool, JsonSchemaResponseFormat } from './types';
 
 const WINDOW_MS = 60_000;
 const DEFAULT_REQUEST_TOKEN_CAP = 7_500;
@@ -49,16 +49,21 @@ export function openRouterRequestTokenCap(): number {
   return envInteger('OPENROUTER_LOW_QUOTA_REQUEST_TOKEN_CAP', DEFAULT_REQUEST_TOKEN_CAP, 512, 8_191);
 }
 
-export function estimateOpenRouterInputTokens(messages: ChatMessage[], tools?: ChatTool[]): number {
+export function estimateOpenRouterInputTokens(
+  messages: ChatMessage[],
+  tools?: ChatTool[],
+  responseFormat?: JsonSchemaResponseFormat,
+): number {
   const messageBytes = messages.reduce(
     (sum, message) => sum + Buffer.byteLength(message.content, 'utf8') + Buffer.byteLength(message.role, 'utf8') + 12,
     0,
   );
   const toolBytes = tools?.length ? Buffer.byteLength(JSON.stringify(tools), 'utf8') : 0;
+  const responseFormatBytes = responseFormat ? Buffer.byteLength(JSON.stringify(responseFormat), 'utf8') : 0;
   // Tokenizers cannot emit more ordinary input tokens than their UTF-8 byte
   // stream. Reserving one token per byte therefore keeps code, JSON, and
   // non-ASCII source safely below the configured upstream request ceiling.
-  return Math.max(1, messageBytes + toolBytes + 24);
+  return Math.max(1, messageBytes + toolBytes + responseFormatBytes + 24);
 }
 
 function keyForSecret(secret: string): string {
@@ -99,13 +104,14 @@ export function constrainOpenRouterRequest(input: {
   messages: ChatMessage[];
   requestedMaxTokens?: number;
   tools?: ChatTool[];
+  responseFormat?: JsonSchemaResponseFormat;
 }): { maxTokens: number | undefined; reservedTokens: number } {
   const requestedMaxTokens = Math.max(1, Math.floor(input.requestedMaxTokens || 4096));
   if (!isOpenRouterLowQuotaModel(input.model)) {
     return { maxTokens: input.requestedMaxTokens, reservedTokens: 0 };
   }
 
-  const inputTokens = estimateOpenRouterInputTokens(input.messages, input.tools);
+  const inputTokens = estimateOpenRouterInputTokens(input.messages, input.tools, input.responseFormat);
   const cap = openRouterRequestTokenCap();
   const remainingOutputTokens = cap - inputTokens;
   if (remainingOutputTokens < MIN_COMPLETION_TOKENS) {

@@ -170,6 +170,33 @@
   font-family: var(--font-sans);
 }
 
+/* ── Page-enter animation ─────────────────────────────────────────────────── */
+@keyframes page-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Applied to the scrollable content area so every page transition has a
+   smooth, ultra-fast (140ms) fade-and-rise effect rather than an instant
+   white flash. The animation only plays once per mount so it doesn't
+   repeat on data re-renders. */
+.deplai-app .page-enter {
+  animation: page-enter 140ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* View Transitions API — smooth cross-fade when the browser supports it */
+@supports (view-transition-name: page) {
+  :root {
+    view-transition-name: none;
+  }
+}
+
 .deplai-app h1,
 .deplai-app h2,
 .deplai-app h3,

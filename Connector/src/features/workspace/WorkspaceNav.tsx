@@ -1,6 +1,7 @@
 'use client';
 
 import React, { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import {
   BarChart3,
@@ -259,29 +260,20 @@ export function WorkspaceNav({
     const Icon = item.icon;
     const feature = navFeatureForItem(item.id);
     const locked = Boolean(feature && features && features[feature] === false);
-    return (
-      <button
-        key={item.id}
-        type="button"
-        title={locked ? `${item.label} requires a plan upgrade` : item.label}
-        onClick={() => {
-          if (item.placeholder) return;
-          if (locked) {
-            onNavigate('/dashboard/billing');
-            return;
-          }
-          onNavigate(item.href);
-        }}
-        className={`group relative flex w-full items-center gap-2.5 text-left text-[13px] transition ${focusRing} ${
-          collapsed || options?.compact ? 'h-9 justify-center px-0' : 'h-9 px-2.5'
-        } ${
-          isActive
-            ? 'border-2 border-black bg-white font-bold text-black shadow-[3px_3px_0_0_#fff]'
-            : locked
-              ? 'border-2 border-transparent text-white/35 hover:bg-white/[0.04] hover:text-white/55'
-              : 'border-2 border-transparent text-white/65 hover:bg-white/[0.06] hover:text-white'
-        }`}
-      >
+    const targetHref = locked ? '/dashboard/billing' : item.href;
+
+    const classNames = `group relative flex w-full items-center gap-2.5 text-left text-[13px] transition ${focusRing} ${
+      collapsed || options?.compact ? 'h-9 justify-center px-0' : 'h-9 px-2.5'
+    } ${
+      isActive
+        ? 'border-2 border-black bg-white font-bold text-black shadow-[3px_3px_0_0_#fff]'
+        : locked
+          ? 'border-2 border-transparent text-white/35 hover:bg-white/[0.04] hover:text-white/55'
+          : 'border-2 border-transparent text-white/65 hover:bg-white/[0.06] hover:text-white'
+    }`;
+
+    const content = (
+      <>
         <Icon
           className={`h-4 w-4 shrink-0 ${isActive ? 'text-black' : locked ? 'text-white/25' : 'text-white/45 group-hover:text-white'}`}
           strokeWidth={1.7}
@@ -302,7 +294,36 @@ export function WorkspaceNav({
             ) : null}
           </>
         )}
-      </button>
+      </>
+    );
+
+    if (item.placeholder) {
+      return (
+        <button
+          key={item.id}
+          type="button"
+          disabled
+          title={item.label}
+          className={`${classNames} cursor-not-allowed opacity-50`}
+        >
+          {content}
+        </button>
+      );
+    }
+
+    return (
+      <Link
+        key={item.id}
+        href={targetHref}
+        prefetch={true}
+        title={locked ? `${item.label} requires a plan upgrade` : item.label}
+        onClick={() => {
+          onNavigate?.(targetHref);
+        }}
+        className={classNames}
+      >
+        {content}
+      </Link>
     );
   };
 
@@ -319,17 +340,18 @@ export function WorkspaceNav({
           </button>
         ) : (
           <>
-            <button
-              type="button"
+            <Link
+              href="/dashboard"
+              prefetch={true}
               className={`flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 hover:bg-white/[0.05] ${focusRing}`}
-              onClick={() => onNavigate('/dashboard')}
+              onClick={() => onNavigate?.('/dashboard')}
             >
               <DeplaiLogo
                 size={22}
                 wordmarkClassName="font-display text-[15px] font-semibold tracking-tight text-white"
               />
               <ChevronDown className="h-3.5 w-3.5 text-white/40" />
-            </button>
+            </Link>
             <button
               type="button"
               onClick={onToggleCollapsed}
@@ -428,9 +450,10 @@ export function WorkspaceNav({
           { id: 'settings', label: 'Settings', icon: Settings, href: '/dashboard/settings' },
           { compact: collapsed },
         )}
-        <button
-          type="button"
-          onClick={() => onNavigate('/profile')}
+        <Link
+          href="/profile"
+          prefetch={true}
+          onClick={() => onNavigate?.('/profile')}
           aria-label="Your Profile"
           title="Your Profile"
           className={`mt-2 flex w-full items-center gap-2.5 text-left transition ${focusRing} ${
@@ -450,7 +473,7 @@ export function WorkspaceNav({
               <p className={`truncate text-[11px] ${active === 'profile' ? 'text-black/60' : 'text-white/45'}`}>{displayPlanName}</p>
             </div>
           )}
-        </button>
+        </Link>
       </div>
 
       {searchOpen ? (
@@ -472,26 +495,40 @@ export function WorkspaceNav({
             </div>
             <div className="max-h-80 overflow-y-auto py-2">
               <p className="px-3 pb-1 font-mono text-[10px] font-medium uppercase tracking-[0.16em] text-neutral-500">Pages</p>
-              {searchHits.pageHits.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => {
-                    if (!item.placeholder) onNavigate(item.href);
-                    setSearchOpen(false);
-                    setQuery('');
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] hover:bg-black hover:text-white"
-                >
-                  <item.icon className="h-4 w-4" />
-                  <span className="flex-1">{item.label}</span>
-                  {item.tag ? (
-                    <span className="border-2 border-black px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em]">
-                      {item.tag}
-                    </span>
-                  ) : null}
-                </button>
-              ))}
+              {searchHits.pageHits.map((item) => {
+                if (item.placeholder) {
+                  return (
+                    <div
+                      key={item.id}
+                      className="flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] text-neutral-400 cursor-not-allowed"
+                    >
+                      <item.icon className="h-4 w-4" />
+                      <span className="flex-1">{item.label}</span>
+                    </div>
+                  );
+                }
+                return (
+                  <Link
+                    key={item.id}
+                    href={item.href}
+                    prefetch={true}
+                    onClick={() => {
+                      onNavigate?.(item.href);
+                      setSearchOpen(false);
+                      setQuery('');
+                    }}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] hover:bg-black hover:text-white"
+                  >
+                    <item.icon className="h-4 w-4" />
+                    <span className="flex-1">{item.label}</span>
+                    {item.tag ? (
+                      <span className="border-2 border-black px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em]">
+                        {item.tag}
+                      </span>
+                    ) : null}
+                  </Link>
+                );
+              })}
               {searchHits.projectHits.length > 0 ? (
                 <>
                   <p className="mt-2 px-3 pb-1 font-mono text-[10px] font-medium uppercase tracking-[0.16em] text-neutral-500">Projects</p>
@@ -736,9 +773,8 @@ function DashboardWorkspaceFrameInner({ children }: { children: React.ReactNode 
     );
   }
 
-  const navigate = (href: string) => {
+  const navigate = (_href?: string) => {
     setMobileNavOpen(false);
-    router.push(href);
   };
 
   return (
@@ -792,7 +828,9 @@ function DashboardWorkspaceFrameInner({ children }: { children: React.ReactNode 
         </div>
         <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden bg-white text-black">
           <WorkspaceCreditsSlot />
-          {children}
+          <div key={pathname} className="page-enter h-full">
+            {children}
+          </div>
         </div>
       </div>
     </div>

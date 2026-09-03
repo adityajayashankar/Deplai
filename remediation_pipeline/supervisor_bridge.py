@@ -18,16 +18,14 @@ def _supervisor_enabled() -> bool:
 
 def _critic_min_score() -> int:
     try:
-        return max(0, min(10, int(os.getenv("REMEDIATION_CRITIC_MIN_SCORE", "6"))))
+        return max(0, min(100, int(os.getenv("REMEDIATION_LOCAL_REVIEW_MIN_SCORE", "80"))))
     except ValueError:
-        return 6
+        return 80
 
 
 def _max_supervisor_batches() -> int:
-    try:
-        return max(1, int(os.getenv("REMEDIATION_MAX_BATCHES_PER_CYCLE", "4")))
-    except ValueError:
-        return 4
+    # One bounded context packet per run keeps the workflow at exactly two LLM calls.
+    return 1
 
 
 def supervisor_result_to_fixes(result: dict, *, min_score: int | None = None) -> list[Fix]:
@@ -40,7 +38,7 @@ def supervisor_result_to_fixes(result: dict, *, min_score: int | None = None) ->
     warnings: list[str] = []
     if not accepted:
         warnings.append(
-            f"Critic {verdict} (quality {score}/10; threshold {threshold}/10) — manual review recommended."
+            f"Local reviewer {verdict} (quality {score}/100; threshold {threshold}/100) — manual review recommended."
         )
 
     fixes: list[Fix] = []
@@ -109,15 +107,32 @@ async def run_supervised_remediation(
         await emit("success", "Critical and high findings are already cleared for this remediation stage.")
         return []
 
-    batches = _build_remediation_batches(cycle_scan, remediation_scope)[:_max_supervisor_batches()]
+    all_batches = _build_remediation_batches(cycle_scan, remediation_scope)
+    batches = all_batches[:_max_supervisor_batches()]
     if not batches:
         await emit("info", "Supervisor found no critical/high findings to remediate in this batch.")
         return []
 
+    deferred_findings = sum(
+        len(batch_scan.get("code_security", []) or []) + len(batch_scan.get("supply_chain", []) or [])
+        for batch_scan, _ in all_batches[len(batches):]
+    )
+    from remediation_pipeline.remediation_store import remediation_runs
+    remediation_runs.store_agent_artifact(
+        remediation_run_id,
+        "master",
+        {
+            "selected_packets": len(batches),
+            "deferred_packets": max(0, len(all_batches) - len(batches)),
+            "pending_findings": deferred_findings,
+            "policy": "highest-priority packet only",
+        },
+    )
+
     await emit(
         "supervisor_phase",
         (
-            f"Starting multi-agent remediation on {len(batches)} batch(es) "
+            f"Starting two-call remediation on {len(batches)} bounded context packet "
             f"({strategy.get('stage_severity', 'critical/high')} scope)."
         ),
     )
@@ -129,7 +144,7 @@ async def run_supervised_remediation(
         await emit(
             "supervisor_phase",
             (
-                f"Batch {index}/{len(batches)}: Master -> Planner -> Implementor -> Reviewer "
+                f"Run {index}/{len(batches)}: Master -> Planner -> Implementor -> Local Reviewer "
                 f"({code_count} code root cause(s), {supply_count} supply root cause(s))."
             ),
         )
@@ -166,8 +181,8 @@ async def run_supervised_remediation(
                 "success",
                 (
                     f"Supervisor batch {index}: {len(batch_fixes)} patch(es) ready "
-                    f"(critic {result.get('critic_verdict', 'unknown')}, "
-                    f"quality {result.get('critic_score', 0)}/10)."
+                    f"(local review {result.get('critic_verdict', 'unknown')}, "
+                    f"quality {result.get('critic_score', 0)}/100)."
                 ),
             )
         else:

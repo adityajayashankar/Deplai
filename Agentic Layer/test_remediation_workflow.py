@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import unittest
 from unittest.mock import patch
-
-from langgraph.checkpoint.memory import MemorySaver
 
 from claude_remediator import ClaudeBudgetTracker
 from agent.remediation_workflow import (
     RemediationWorkflowState,
     _implementor_prompt,
+    _implementor_node,
+    _master_node,
+    _planner_node,
+    _reviewer_node,
+    _synthesizer_node,
     _stage_max_tokens,
-    build_remediation_graph,
     collect_remediation_contexts,
 )
 
@@ -30,6 +31,7 @@ def _base_state() -> RemediationWorkflowState:
     source = "dangerous(user)\n"
     return {
         "project_id": PROJECT_ID,
+        "remediation_run_id": "run-1",
         "scan_data": {
             "code_security": [
                 {
@@ -137,11 +139,13 @@ class RemediationGraphTests(unittest.TestCase):
         state["contexts"] = {"app.py": "x" * 30_000}
         state["allowed_paths"] = ["app.py"]
 
-        self.assertLessEqual(len(_implementor_prompt(state)), 5_000)
-        self.assertEqual(_stage_max_tokens(state, "implementor"), 2_048)
-        self.assertEqual(_stage_max_tokens(state, "reviewer"), 1_024)
+        prompt = _implementor_prompt(state)
+        self.assertLessEqual(len(prompt), 4_000)
+        self.assertEqual(json.loads(prompt)["stage"], "implementor")
+        self.assertEqual(_stage_max_tokens(state, "implementor"), 1_800)
+        self.assertEqual(_stage_max_tokens(state, "planner"), 512)
 
-    def test_reviewer_feedback_persists_into_implementor_retry(self) -> None:
+    def test_graph_uses_two_json_llm_calls_and_a_local_reviewer(self) -> None:
         diff = "\n".join(
             [
                 "--- a/app.py",
@@ -151,11 +155,10 @@ class RemediationGraphTests(unittest.TestCase):
                 "+safe(user)",
             ]
         )
-        implementor_prompts: list[str] = []
-        reviewer_calls = 0
+        calls: list[tuple[str, dict, dict]] = []
 
         def fake_dispatch(prompt: str, *args, stage: str = "", **kwargs):
-            nonlocal reviewer_calls
+            calls.append((stage, json.loads(prompt), kwargs.get("response_format") or {}))
             if stage == "workflow_planner":
                 return True, json.dumps(
                     {
@@ -172,7 +175,6 @@ class RemediationGraphTests(unittest.TestCase):
                     }
                 )
             if "implementor" in stage:
-                implementor_prompts.append(prompt)
                 return True, json.dumps(
                     {
                         "summary": "Use the safe sink.",
@@ -186,49 +188,25 @@ class RemediationGraphTests(unittest.TestCase):
                         ],
                     }
                 )
-            if "reviewer" in stage:
-                reviewer_calls += 1
-                if reviewer_calls == 1:
-                    return True, json.dumps(
-                        {
-                            "verdict": "reject",
-                            "feedback": "Add an explicit regression assertion.",
-                            "missing": ["regression assertion"],
-                            "quality_score": 4,
-                        }
-                    )
-                return True, json.dumps(
-                    {
-                        "verdict": "accept",
-                        "feedback": "Patch is now acceptable.",
-                        "missing": [],
-                        "quality_score": 9,
-                    }
-                )
             raise AssertionError(f"Unexpected stage: {stage}")
-
-        async def run_graph():
-            graph = build_remediation_graph(checkpointer=MemorySaver())
-            return await graph.ainvoke(
-                _base_state(),
-                config={"configurable": {"thread_id": "test-remediation"}},
-            )
 
         with (
             patch("agent.remediation_workflow._dispatch_llm", side_effect=fake_dispatch),
             patch("agent.remediation_workflow.set_current_project_id"),
         ):
-            final = asyncio.run(run_graph())
+            final = _base_state()
+            for node in (_master_node, _planner_node, _implementor_node, _reviewer_node, _synthesizer_node):
+                final = node(final)
 
-        self.assertEqual(final["round"], 1)
-        self.assertEqual(len(final["attempt_history"]), 2)
-        self.assertEqual(final["attempt_history"][0]["critique"]["verdict"], "reject")
+        self.assertEqual(final["round"], 0)
+        self.assertEqual(len(final["attempt_history"]), 1)
         self.assertEqual(final["critique"]["verdict"], "accept")
+        self.assertEqual(final["critique"]["quality_score"], 100)
         self.assertEqual(final["final_result"]["applied_change_count"], 1)
         self.assertEqual(final["final_result"]["changed_files"][0]["vulns_addressed"], ["CWE-79"])
-        self.assertEqual(len(implementor_prompts), 2)
-        self.assertIn("Add an explicit regression assertion", implementor_prompts[1])
-        self.assertIn("Replace the unsafe sink", implementor_prompts[1])
+        self.assertEqual([stage for stage, _, _ in calls], ["workflow_planner", "workflow_implementor"])
+        self.assertTrue(all(payload["schema_version"] == "remediation.request.v2" for _, payload, _ in calls))
+        self.assertTrue(all(response_format["json_schema"]["strict"] for _, _, response_format in calls))
 
 
 if __name__ == "__main__":

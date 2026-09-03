@@ -1,68 +1,75 @@
 # Core concepts
 
-These terms match labels in the DeplAI dashboard.
+DeplAI organizes work around a small set of durable nouns and bounded execution concepts. Understanding their relationships makes every service easier to reason about.
+
+## Resource hierarchy
+
+```mermaid
+flowchart TD
+  U[User] --> O[Organization]
+  O --> P[Project]
+  P --> R[Repository workspace]
+  P --> S[Sessions and runs]
+  P --> A[Artifacts]
+  P --> D[Deployments]
+  O --> E[Environment and policy context]
+  O --> C[Credentials and billing context]
+```
+
+## User
+
+A user authenticates with GitHub and receives an encrypted browser session. Identity and profile data are distinct from GitHub App repository access. A personal API token can authenticate supported server routes, but it carries the same user identity and does not bypass ownership checks.
+
+## Organization
+
+An organization is a tenant and governance boundary for members, teams, roles, projects, policies, integrations, usage, billing context, and audit activity. Every user receives a personal organization. Shared organization management is currently Beta.
+
+## Project
+
+A project is the stable scope for application work. It points to either a GitHub repository or an uploaded ZIP workspace and records ownership, organization, source metadata, and links to workflow output. A project is not a deployment and does not imply that its source has been changed.
+
+## Repository workspace
+
+The repository workspace is the server-side source snapshot used by analysis and workflows. GitHub repositories are synchronized through an installation; uploaded ZIPs are extracted into a user-scoped path. Service routes resolve the path after authorization instead of accepting an arbitrary browser path.
+
+## Environment
+
+An environment represents deployment context such as development, staging, or production. Environment permissions exist in the organization model, while individual deployment flows also carry an environment name and environment-specific configuration. Environment isolation is therefore a governance and execution concern, not merely a label.
+
+## Session and run
+
+A session is the durable dashboard record for a Security Agent, UI/UX customizer, Deploy, or reserved Code Reviewer workflow. Its status is `queued`, `running`, `needs_review`, `completed`, or `failed`. A run is the service-specific execution behind that record and may have finer-grained stages, live events, and artifacts.
+
+Do not assume that reopening a session resumes an in-memory live workflow. Sessions preserve summary and logs; live process state depends on the subsystem. See [Artifacts, state, and recovery](artifacts-and-state.md).
+
+## Workflow
+
+A workflow is an ordered set of deterministic and optionally model-assisted steps. Some workflows are LangGraph state machines; others are explicit TypeScript or Python orchestration. The shared property is a bounded contract, not the framework used to implement it.
 
 ## Agent
 
-A named workflow under **Services**: UI/UX customizer, Security Agent, Deploy, DAST, Cloud, Instance Management, and Sessions. **Code Reviewer** is listed with a **Soon** tag. Each agent is a bounded pipeline—not an open-ended model with your cloud credentials.
+In DeplAI, an agent is a specialized reasoning role inside a workflow or the user-facing service built around that workflow. An agent does not automatically receive shell, repository, GitHub, or cloud authority. Tools and mutations remain mediated by normal application services and approval gates.
 
-Example: Security Agent runs Bearer (SAST) and Syft+Grype (SCA), then remediation only after **Results** and **Agent setup**.
+## Artifact
 
-## Pipeline
+An artifact is a reviewable output: a repository context document, scan report, SBOM, finding set, diff, snapshot, ZIP, architecture decision, diagram, cost estimate, Terraform bundle, plan, log stream, runtime output, or pull request reference. Artifacts have different durability; the guide calls this out per subsystem.
 
-The ordered stage rail for one run. Security Agent’s rail is labeled **Pipeline** and has six stages.
+## Finding and remediation
 
-Example: the header shows `01 / 06 · Scan` and advances as later stages unlock.
+A finding is normalized security evidence from a scanner, including severity and source-specific metadata such as CWE, CVE, package, file, or endpoint. Remediation is the process that groups findings, gathers source context, generates candidate changes, validates them, and waits for review before persistence or GitHub handoff.
 
-## Session
+Severity describes security impact. Remediation priority also considers patchability, location, grouping, and selected scope.
 
-A saved record of a run: service, project, status, stage, logs, files changed. Open **Sessions** after the live view is gone.
+## Deployment and infrastructure
 
-Example: a scan creates a Security Agent session that moves from Scan to Results when it finishes.
+Infrastructure is the cloud resource configuration represented by an architecture decision and Terraform. A deployment is an execution record that promotes a particular application artifact into an environment. Planning, Terraform generation, plan, apply, bootstrap, and health verification are separate states; infrastructure creation alone is not application readiness.
 
-## Stage
+## Provider, model, and credential
 
-One named step. Locked stages cannot be skipped.
+A provider is an adapter for a model API. A model is a catalog entry with lifecycle, capabilities, context, pricing, and aliases. A credential supplies authority to call a provider. Access mode chooses platform-managed credentials, BYOK, or automatic selection.
 
-Example: **GitHub & verify** stays locked until **Review** is done.
+## Policy and approval
 
-## Finding
+Permissions decide whether a member may request an action. Policy decides whether the project or deployment meets organization rules. Approval is an explicit decision for a particular high-impact transition. These are separate layers: permission to deploy does not mean every plan automatically satisfies policy.
 
-One grouped vulnerability. Code findings (Bearer) group by CWE. Supply-chain findings (Grype) include CVE, package, version, and optional fix. DAST findings come from authorized runtime targets. Severity: `critical`, `high`, `medium`, `low`.
-
-## Remediation
-
-The pass that turns selected findings into proposed diffs. It stops before GitHub. Persistence and pull requests wait for **Review** and **GitHub & verify**.
-
-## Workspace / project / organization
-
-- **Workspace** — the signed-in DeplAI dashboard.
-- **Project** — the selected GitHub repo (via GitHub App) or ZIP upload in the nav picker.
-- **Organization** — optional team boundary for members, roles, policies, and shared cloud context. See [Organizations](organizations.md).
-
-Personal work uses your profile and billing; org work adds governance on top.
-
-## BYOK
-
-**Bring your own key**: store a provider API key under **BYOK → Keys** (`/dashboard/ai`). DeplAI encrypts it and shows only a masked suffix. Agents use **Platform**, **BYOK**, or **Auto** access modes.
-
-| Item | Path | Purpose |
-| --- | --- | --- |
-| **Keys** | `/dashboard/ai` | Add, validate, revoke provider keys. |
-| **Catalog** | `/dashboard/ai/catalog` | Models and providers in your workspace. |
-| **Compare** | `/dashboard/ai/compare` | Side-by-side model comparison and ad-hoc chat. |
-| **Usage** | `/dashboard/ai/usage` | Tokens, requests, estimated USD—platform vs BYOK. |
-
-Open **Compare** for the September 2026 model landscape. For **best performance**, use **MiniMax M3** or **Grok 4.6** with **high** or **extrahigh** reasoning effort—see the [BYOK model catalog](byok-models.md) for the full list, pricing, and effort tiers.
-
-DeplAI uses **GPT-5.6 Sol** as the platform baseline for internal routing. The catalog also includes **Gemini 3.1 Pro**, **Grok 4.5**, **MiniMax M2.7**, **Claude Opus 5**, **Sonnet 5**, and **Fable 5**. Rankings in Compare are relative to DeplAI jobs—not a generic chat leaderboard.
-
-Example: on Free, flagship platform models stay locked until you add a key or upgrade. Full map: [Security and data](security-and-data.md).
-
-## Credits
-
-Integer balance on **Billing** and **Your Profile**, granted with your plan and packs. Starter and Pro unlock **bonus** credits after paid remaining hits zero; bonus expires at UTC month end.
-
-Example: Starter grants 20 paid credits; after those are gone, up to 5 bonus credits unlock. Details: [Billing](billing.md).
-
-Related: [How it works](how-it-works.md) · [Organizations](organizations.md) · [Security and data](security-and-data.md) · [Billing](billing.md)
+Related: [Repository intelligence](repository-intelligence.md) | [Agents and workflows](agents-and-workflows.md) | [Organizations](organizations.md) | [Models and providers](model-providers.md)

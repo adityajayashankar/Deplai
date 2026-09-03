@@ -1,6 +1,6 @@
-import http from 'node:http';
-import https from 'node:https';
-import type { Duplex } from 'node:stream';
+import http from 'http';
+import https from 'https';
+import type { Duplex } from 'stream';
 import { AGENTIC_URL } from '@/lib/agentic';
 
 const AGENTIC_PREFIX = '/agentic';

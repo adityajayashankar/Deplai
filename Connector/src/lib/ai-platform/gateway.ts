@@ -20,7 +20,7 @@ import {
   settleOrganizationCreditReservation,
   type CreditReservation,
 } from '@/lib/billing/organization-credits';
-import { filterModelsForPlatformAccess, isPlatformModelAllowed } from './platform-allowlist';
+import { filterModelsForPlatformAccess } from './platform-allowlist';
 import { resolvePlatformDispatch } from './openrouter-catalog';
 import { constrainOpenRouterRequest } from './openrouter-request-budget';
 import {
@@ -51,6 +51,12 @@ function sleep(ms: number): Promise<void> {
 function backoff(attempt: number): number {
   const base = Math.min(2000, 250 * 2 ** attempt);
   return base + Math.floor(Math.random() * 100);
+}
+
+function isStrictRemediation(request: NormalizedChatRequest): boolean {
+  return request.metadata?.product === 'security'
+    && request.metadata?.stage === 'remediation'
+    && request.responseFormat?.type === 'json_schema';
 }
 
 function validateSecuritySchema(text: string): string | null {
@@ -265,6 +271,7 @@ export async function executeChat(
   for (let index = 0; index < chain.length; index += 1) {
     const candidate = chain[index];
     if (index > 0) {
+      if (isStrictRemediation(request)) break;
       if (!policy.fallbackAllowed) break;
       if (!policy.crossProviderFallbackAllowed && candidate.model.providerId !== primary.model.providerId) continue;
       fallbackCount += 1;
@@ -305,7 +312,8 @@ export async function executeChat(
       continue;
     }
 
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    const maximumAttempts = isStrictRemediation(request) ? 1 : 3;
+    for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
       let reservation: CreditReservation | null = null;
       let providerCompleted = false;
       try {
@@ -317,6 +325,7 @@ export async function executeChat(
             messages: request.messages,
             requestedMaxTokens,
             tools: request.tools,
+            responseFormat: request.responseFormat,
           })
           : null;
         const boundedRequest = openRouterBudget
@@ -344,6 +353,7 @@ export async function executeChat(
           temperature: request.temperature,
           maxTokens: boundedRequest.maxTokens || policy.maxTokenLimit || undefined,
           tools: request.tools,
+          responseFormat: request.responseFormat,
         });
         providerCompleted = true;
         if (request.task === 'security_analysis') {
@@ -451,7 +461,7 @@ export async function executeChat(
         const normalized = adapter.normalizeError(error);
         lastError = normalized;
         retryCount += 1;
-        if (normalized.retryable && attempt < 2 && isFeatureEnabled('ai_fallback')) {
+        if (normalized.retryable && attempt + 1 < maximumAttempts && isFeatureEnabled('ai_fallback')) {
           await sleep(backoff(attempt));
           continue;
         }
@@ -503,6 +513,7 @@ export async function* streamChat(
   for (let index = 0; index < chain.length; index += 1) {
     const candidate = chain[index];
     if (index > 0) {
+      if (isStrictRemediation(request)) break;
       if (!policy.fallbackAllowed) break;
       if (!policy.crossProviderFallbackAllowed && candidate.model.providerId !== primary.model.providerId) continue;
       fallbackCount += 1;
@@ -543,7 +554,8 @@ export async function* streamChat(
       continue;
     }
 
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    const maximumAttempts = isStrictRemediation(request) ? 1 : 3;
+    for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
       let reservation: CreditReservation | null = null;
       let providerCompleted = false;
       try {
@@ -555,6 +567,7 @@ export async function* streamChat(
             messages: request.messages,
             requestedMaxTokens,
             tools: request.tools,
+            responseFormat: request.responseFormat,
           })
           : null;
         const boundedRequest = openRouterBudget
@@ -586,6 +599,7 @@ export async function* streamChat(
           temperature: request.temperature,
           maxTokens: boundedRequest.maxTokens || policy.maxTokenLimit || undefined,
           tools: request.tools,
+          responseFormat: request.responseFormat,
         })) {
           if (event.type === 'output.delta' && event.text) {
             if (timeToFirstTokenMs == null) timeToFirstTokenMs = Date.now() - started;
@@ -709,7 +723,7 @@ export async function* streamChat(
         const normalized = adapter.normalizeError(error);
         lastError = normalized;
         retryCount += 1;
-        if (normalized.retryable && attempt < 2 && isFeatureEnabled('ai_fallback')) {
+        if (normalized.retryable && attempt + 1 < maximumAttempts && isFeatureEnabled('ai_fallback')) {
           await sleep(backoff(attempt));
           continue;
         }

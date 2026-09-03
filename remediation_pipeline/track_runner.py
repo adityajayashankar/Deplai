@@ -14,7 +14,7 @@ from runner_base import RunnerBase
 from utils import set_current_project_id
 
 
-MAX_ROUNDS = 2
+MAX_ROUNDS = 1  # One bounded Planner + Implementor cycle per remediation run.
 TOTAL_STEPS = 8
 
 
@@ -181,7 +181,7 @@ class RemediationTrackRunner(RunnerBase):
             await self._send_message("phase", f"Round {current_round}: ingesting findings and generating fixes")
             await self._send_message(
                 "info",
-                "Noise triage filters scanner noise; critical/high findings go through Master -> Planner -> Implementor -> Reviewer.",
+                "Noise triage filters scanner noise; critical/high findings go through Master -> Planner -> Implementor -> Local Reviewer (two LLM calls maximum).",
             )
 
             try:

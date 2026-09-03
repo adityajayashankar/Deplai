@@ -66,6 +66,37 @@ describe('OpenRouter low-quota request budget', () => {
     });
   });
 
+  it('includes the strict JSON response schema in the request-token reservation', () => {
+    const responseFormat = {
+      type: 'json_schema' as const,
+      json_schema: {
+        name: 'remediation_plan',
+        strict: true as const,
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['summary'],
+          properties: { summary: { type: 'string' } },
+        },
+      },
+    };
+    const withoutSchema = constrainOpenRouterRequest({
+      secret: 'sk-without-schema',
+      model: 'minimax/minimax-m3',
+      messages: [{ role: 'user', content: '{"stage":"planner"}' }],
+      requestedMaxTokens: 512,
+    });
+    const withSchema = constrainOpenRouterRequest({
+      secret: 'sk-with-schema',
+      model: 'minimax/minimax-m3',
+      messages: [{ role: 'user', content: '{"stage":"planner"}' }],
+      requestedMaxTokens: 512,
+      responseFormat,
+    });
+    assert.ok(withSchema.reservedTokens > withoutSchema.reservedTokens);
+    assert.ok(withSchema.reservedTokens < 8_000);
+  });
+
   it('rejects a request whose input alone cannot leave a safe completion budget', () => {
     assert.throws(
       () => constrainOpenRouterRequest({

@@ -33,6 +33,10 @@ _TOKEN_PATTERN = re.compile(
     r"|(?:api[_-]?key|authorization|token|secret)\s*[=:]\s*[^\s,;]+"
     r")"
 )
+_MONGO_AUTH_PATTERN = re.compile(r"(?i)(mongodb(?:\+srv)?://[^:/\s]+:)[^@\s]+(@)")
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(\b(?:password|passwd|api[_-]?key|secret|token)\b\s*[:=]\s*[\"']?)[^\s,;\"']+"
+)
 _MAX_EVENT_CONTENT = 2_000
 
 
@@ -57,7 +61,28 @@ def _retention_days() -> int:
 
 
 def _redact(value: str) -> str:
-    return _TOKEN_PATTERN.sub("[redacted]", value)
+    redacted = _MONGO_AUTH_PATTERN.sub(r"\1[redacted]\2", value)
+    redacted = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(r"\1[redacted]", redacted)
+    return _TOKEN_PATTERN.sub("[redacted]", redacted)
+
+
+def _sanitize_artifact(value: Any, *, key: str = "", depth: int = 0) -> Any:
+    if depth > 8:
+        return "[depth limited]"
+    if isinstance(value, dict):
+        return {
+            str(item_key)[:80]: _sanitize_artifact(item_value, key=str(item_key), depth=depth + 1)
+            for item_key, item_value in list(value.items())[:80]
+            if str(item_key).lower() not in {"api_key", "credential", "secret", "source_context", "contexts"}
+        }
+    if isinstance(value, list):
+        return [_sanitize_artifact(item, key=key, depth=depth + 1) for item in value[:100]]
+    if isinstance(value, str):
+        limit = 20_000 if key.lower() in {"diff", "content"} else 4_000
+        return _redact(value)[:limit]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _redact(str(value))[:1_000]
 
 
 def _safe_event_content(message_type: str, content: str) -> str:
@@ -148,6 +173,15 @@ class RemediationRunStore:
             "scope": str(scope or "major"),
             "status": "queued",
             "checkpoint_backend": "memory",
+            "agent_context": {
+                "schema_version": "remediation.v2",
+                "calls_limit": 2,
+                "calls_used": 0,
+                "master": None,
+                "planner": None,
+                "implementor": None,
+                "reviewer": None,
+            },
             "created_at": created_at,
             "updated_at": created_at,
             "expire_at": created_at + timedelta(days=_retention_days()),
@@ -162,6 +196,50 @@ class RemediationRunStore:
             except Exception as exc:
                 logger.warning("Could not persist remediation run start: %s", type(exc).__name__)
         return run_id
+
+    def store_agent_artifact(
+        self,
+        run_id: str | None,
+        stage: str,
+        artifact: dict[str, Any],
+        *,
+        count_llm_call: bool = False,
+    ) -> None:
+        """Embed a compact, redacted agent result in its run document.
+
+        This intentionally follows MongoDB's extended-reference pattern: the
+        status endpoint can recover the current workflow without joining a
+        second collection or storing the complete source context.
+        """
+        resolved_run_id = str(run_id or "").strip()
+        normalized_stage = str(stage or "").strip().lower()
+        if not resolved_run_id or normalized_stage not in {"master", "planner", "implementor", "reviewer"}:
+            return
+        safe = _sanitize_artifact(artifact)
+        safe["stored_at"] = _now().isoformat()
+        updated_at = _now()
+        with self._lock:
+            run = self._runs.get(resolved_run_id)
+            if run:
+                context = run.setdefault("agent_context", {})
+                context[normalized_stage] = safe
+                if count_llm_call:
+                    context["calls_used"] = min(2, int(context.get("calls_used", 0) or 0) + 1)
+                run["updated_at"] = updated_at
+        db = self._mongo_db()
+        if db is not None:
+            update: dict[str, Any] = {
+                "$set": {
+                    f"agent_context.{normalized_stage}": safe,
+                    "updated_at": updated_at,
+                }
+            }
+            if count_llm_call:
+                update["$inc"] = {"agent_context.calls_used": 1}
+            try:
+                db.remediation_runs.update_one({"run_id": resolved_run_id}, update)
+            except Exception as exc:
+                logger.warning("Could not persist remediation agent artifact: %s", type(exc).__name__)
 
     def append_event(
         self,

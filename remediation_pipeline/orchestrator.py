@@ -187,6 +187,14 @@ class RemediationOrchestrator:
                 if on_fix is not None:
                     on_fix(validated)
 
+            if on_progress is not None:
+                await self._emit_progress(
+                    on_progress,
+                    "info",
+                    "Two-call supervisor cycle complete; remaining findings are deferred to a later remediation run.",
+                )
+            return fixes
+
         batch_size = max(1, int(os.getenv("REMEDIATION_PIPELINE_GROUPS_PER_BATCH", "8")))
         ordered_groups = self._ordered_groups_for_run(selected_groups)
         if supervised_paths:

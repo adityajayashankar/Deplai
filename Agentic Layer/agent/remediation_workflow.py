@@ -2,15 +2,11 @@
 
 The workflow is deliberately stateful:
 
-    Master -> Planner -> Implementor -> Reviewer
-                                  ^          |
-                                  |-- retry -|
-                                             -> Synthesizer
+    Master -> Planner -> Implementor -> deterministic Reviewer -> Synthesizer
 
-Every node receives the same ``RemediationWorkflowState``.  The reviewer writes
-its critique into that state before the retry edge sends it back to the
-implementor, so plans, repository snippets, previous proposals, and feedback are
-not reconstructed or lost between agents.
+Planner and Implementor are the only LLM nodes. Their inputs and outputs use
+strict JSON contracts. The reviewer performs local, reproducible validation and
+never consumes an LLM request.
 """
 
 from __future__ import annotations
@@ -43,7 +39,6 @@ from utils import get_repo_root, set_current_project_id
 
 from .remediation_supervisor import (
     AGENT_NODE_TIMEOUT_SECONDS,
-    MAX_ROUNDS,
     SUPERVISOR_MAX_CONTEXT_CHARS,
     SUPERVISOR_MAX_FILES,
     SUPERVISOR_MAX_FINDINGS,
@@ -73,7 +68,7 @@ def _env_int(name: str, default: int, *, minimum: int, maximum: int | None = Non
     return min(maximum, value) if maximum is not None else value
 
 
-_REVIEW_MIN_SCORE = _env_int("REMEDIATION_CRITIC_MIN_SCORE", 6, minimum=0, maximum=10)
+_REVIEW_MIN_SCORE = _env_int("REMEDIATION_LOCAL_REVIEW_MIN_SCORE", 80, minimum=0, maximum=100)
 _SOURCE_WINDOW_LINES = _env_int("REMEDIATION_SUPERVISOR_CONTEXT_LINES", 30, minimum=8)
 _LOW_QUOTA_OPENROUTER_MARKERS = (
     "minimax-m3",
@@ -106,6 +101,95 @@ class RemediationWorkflowState(TypedDict):
     attempt_history: list[dict[str, Any]]
     final_result: dict[str, Any]
     error: str
+
+
+_PLANNER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["summary", "targets", "constraints"],
+    "properties": {
+        "summary": {"type": "string", "maxLength": 800},
+        "targets": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path", "findings", "approach", "verification"],
+                "properties": {
+                    "path": {"type": "string", "maxLength": 500},
+                    "findings": {"type": "array", "maxItems": 16, "items": {"type": "string", "maxLength": 160}},
+                    "approach": {"type": "string", "maxLength": 1200},
+                    "verification": {"type": "string", "maxLength": 800},
+                },
+            },
+        },
+        "constraints": {"type": "array", "maxItems": 12, "items": {"type": "string", "maxLength": 300}},
+    },
+}
+
+_IMPLEMENTOR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["summary", "changes"],
+    "properties": {
+        "summary": {"type": "string", "maxLength": 800},
+        "changes": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path", "reason", "format", "content"],
+                "properties": {
+                    "path": {"type": "string", "maxLength": 500},
+                    "reason": {"type": "string", "maxLength": 800},
+                    "format": {"type": "string", "const": "unified_diff"},
+                    "content": {"type": "string", "maxLength": 20000},
+                },
+            },
+        },
+    },
+}
+
+
+def _response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "json_schema", "json_schema": {"name": name, "strict": True, "schema": schema}}
+
+
+def _validate_planner_json(value: dict[str, Any], allowed_paths: list[str]) -> dict[str, Any]:
+    if set(value) != {"summary", "targets", "constraints"}:
+        raise ValueError("Planner response keys do not match the strict schema")
+    if not isinstance(value["summary"], str) or not isinstance(value["targets"], list) or not isinstance(value["constraints"], list):
+        raise ValueError("Planner response has invalid field types")
+    allowed = set(allowed_paths)
+    if not value["targets"]:
+        raise ValueError("Planner returned no targets")
+    for target in value["targets"]:
+        if not isinstance(target, dict) or set(target) != {"path", "findings", "approach", "verification"}:
+            raise ValueError("Planner target does not match the strict schema")
+        if _normalize_path(target["path"]) not in allowed:
+            raise ValueError(f"Planner selected a path outside the allowlist: {target.get('path')}")
+        if not isinstance(target["findings"], list) or not all(isinstance(item, str) for item in target["findings"]):
+            raise ValueError("Planner target findings must be strings")
+        if not isinstance(target["approach"], str) or not isinstance(target["verification"], str):
+            raise ValueError("Planner target text fields must be strings")
+    return value
+
+
+def _validate_implementor_json(value: dict[str, Any]) -> dict[str, Any]:
+    if set(value) != {"summary", "changes"}:
+        raise ValueError("Implementor response keys do not match the strict schema")
+    if not isinstance(value["summary"], str) or not isinstance(value["changes"], list):
+        raise ValueError("Implementor response has invalid field types")
+    for change in value["changes"]:
+        if not isinstance(change, dict) or set(change) != {"path", "reason", "format", "content"}:
+            raise ValueError("Implementor change does not match the strict schema")
+        if change["format"] != "unified_diff" or not all(
+            isinstance(change[field], str) for field in ("path", "reason", "content")
+        ):
+            raise ValueError("Implementor change contains invalid values")
+    return value
 
 
 def _normalize_path(value: Any) -> str:
@@ -253,8 +337,8 @@ def _occurrence_lines(scan_data: dict[str, Any], path: str) -> list[int]:
     return sorted(lines)
 
 
-def _render_contexts(state: RemediationWorkflowState, max_chars: int = SUPERVISOR_MAX_CONTEXT_CHARS) -> str:
-    sections: list[str] = []
+def _render_contexts(state: RemediationWorkflowState, max_chars: int = SUPERVISOR_MAX_CONTEXT_CHARS) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = []
     consumed = 0
     contexts = state.get("contexts", {})
     paths = list(contexts)
@@ -284,20 +368,19 @@ def _render_contexts(state: RemediationWorkflowState, max_chars: int = SUPERVISO
             chunks = ["\n".join(source_lines[start - 1:end]) for start, end in ranges]
             imports = "\n".join(source_lines[:20])
             rendered = imports + "\n\n" + "\n\n".join(chunks)
-            location = ", ".join(f"{start}-{end}" for start, end in ranges)
-            header = f"### {path} (imports plus vulnerable lines {location})"
+            location_value = [f"{start}-{end}" for start, end in ranges]
         else:
             rendered = text
-            header = f"### {path}"
+            location_value = []
 
         remaining = max_chars - consumed
         path_cap = manifest_cap if os.path.basename(path) in _EDITABLE_MANIFESTS else source_cap
         rendered = rendered[: min(remaining, path_cap)]
         if not rendered.strip():
             continue
-        sections.append(f"{header}\n```text\n{rendered}\n```")
+        sections.append({"path": path, "line_ranges": location_value, "excerpt": rendered})
         consumed += len(rendered)
-    return "\n\n".join(sections)
+    return sections
 
 
 def _compact_findings(scan_data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -341,89 +424,81 @@ def _uses_low_quota_openrouter_model(state: RemediationWorkflowState) -> bool:
     return provider == "openrouter" or any(marker in model for marker in _LOW_QUOTA_OPENROUTER_MARKERS)
 
 
-def _prompt_char_limit(state: RemediationWorkflowState) -> int:
+def _prompt_char_limit(state: RemediationWorkflowState, stage: str) -> int:
     if not _uses_low_quota_openrouter_model(state):
         return SUPERVISOR_MAX_PROMPT_CHARS
     # The Connector gateway budgets low-quota prompts byte-conservatively.
     # Leave enough headroom for the implementor's 2K completion below 8K.
-    return min(
-        SUPERVISOR_MAX_PROMPT_CHARS,
-        _env_int("REMEDIATION_OPENROUTER_PROMPT_CHAR_CAP", 5_000, minimum=1_024, maximum=5_000),
-    )
+    default = 3_000 if stage == "planner" else 4_000
+    return min(SUPERVISOR_MAX_PROMPT_CHARS, default)
 
 
 def _stage_max_tokens(state: RemediationWorkflowState, stage: str) -> int | None:
     if not _uses_low_quota_openrouter_model(state):
         return None
     if stage == "implementor":
-        return _env_int("REMEDIATION_OPENROUTER_IMPLEMENTOR_MAX_TOKENS", 2_048, minimum=256, maximum=2_048)
-    return _env_int("REMEDIATION_OPENROUTER_REVIEW_MAX_TOKENS", 1_024, minimum=256, maximum=1_024)
+        return _env_int("REMEDIATION_OPENROUTER_IMPLEMENTOR_MAX_TOKENS", 1_800, minimum=256, maximum=1_800)
+    return _env_int("REMEDIATION_OPENROUTER_PLANNER_MAX_TOKENS", 512, minimum=256, maximum=512)
 
 
-def _bounded_prompt(value: str, *, max_chars: int = SUPERVISOR_MAX_PROMPT_CHARS) -> str:
-    if len(value) <= max_chars:
-        return value
-    marker = "\n[context truncated at configured prompt limit]"
-    return value[: max_chars - len(marker)] + marker
+def _json_prompt(payload: dict[str, Any], *, max_chars: int) -> str:
+    """Serialize a valid JSON request while shrinking only repository context."""
+    document = json.loads(json.dumps(payload, ensure_ascii=False))
+    raw = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+    context = (document.get("input") or {}).get("repository_context") or []
+    while len(raw) > max_chars and isinstance(context, list) and context:
+        last = context[-1]
+        excerpt = str(last.get("excerpt") or "") if isinstance(last, dict) else ""
+        excess = len(raw) - max_chars
+        if len(excerpt) > excess + 128:
+            last["excerpt"] = excerpt[: len(excerpt) - excess - 64] + "[truncated]"
+        else:
+            context.pop()
+        raw = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+    if len(raw) > max_chars:
+        raise ValueError("Structured remediation request exceeds the configured JSON prompt limit")
+    return raw
 
 
 def _planner_prompt(state: RemediationWorkflowState) -> str:
-    return _bounded_prompt(
-        f"""You are the Planner in a security remediation workflow.
-
-Create a minimal implementation plan that maps every critical/high finding to
-an allowed repository file and a concrete safe fix. Do not write code yet.
-Return ONLY JSON:
-{{"summary":"...","targets":[{{"path":"...","findings":["CWE/CVE"],"approach":"...","verification":"..."}}],"constraints":["..."]}}
-
-Allowed paths:
-{json.dumps(state['allowed_paths'])}
-
-Findings:
-{json.dumps(_compact_findings(state['scan_data']), indent=2)}
-
-Vulnerability-centered repository context:
-        {_render_contexts(state)}""",
-        max_chars=_prompt_char_limit(state),
+    return _json_prompt(
+        {
+            "schema_version": "remediation.request.v2",
+            "stage": "planner",
+            "instructions": [
+                "Map every supplied critical or high finding to an allowed path and a minimal safe fix.",
+                "Do not write code or propose changes outside allowed_paths.",
+                "Return only data conforming to the supplied response JSON schema.",
+            ],
+            "input": {
+                "allowed_paths": state["allowed_paths"],
+                "findings": _compact_findings(state["scan_data"]),
+                "repository_context": _render_contexts(state),
+            },
+        },
+        max_chars=_prompt_char_limit(state, "planner"),
     )
 
 
 def _implementor_prompt(state: RemediationWorkflowState) -> str:
-    critique = state.get("critique") or {}
-    feedback = ""
-    if state.get("round", 0) > 0:
-        feedback = (
-            "\nReviewer feedback from the previous attempt:\n"
-            + json.dumps(critique, indent=2)
-            + "\nYou must address every rejection reason.\n"
-        )
-    return _bounded_prompt(
-        f"""You are the Implementor in a security remediation workflow.
-
-Implement the Planner's approved approach using minimal unified diffs. Return
-ONLY valid JSON. Put the unified diff in the `content` field so newlines and
-quotes are JSON escaped correctly:
-{{"summary":"...","changes":[{{"path":"relative/file","reason":"...","format":"unified_diff","content":"--- a/file\\n+++ b/file\\n@@ ..."}}]}}
-
-Rules:
-1. Modify only an allowed path.
-2. Use exact context lines from the repository excerpts; do not invent APIs.
-3. Keep at least three unchanged context lines around each diff hunk where available.
-4. Fix critical/high findings only. Do not perform unrelated refactors.
-5. Dependency upgrades must target a supplied editable manifest and its known fix version.
-
-Plan:
-{json.dumps(state.get('plan') or {}, indent=2)}
-{feedback}
-Findings:
-{json.dumps(_compact_findings(state['scan_data']), indent=2)}
-
-Allowed paths:
-{json.dumps(state['allowed_paths'])}
-
-Repository context:
-        {_render_contexts(state)}""",
-        max_chars=_prompt_char_limit(state),
+    return _json_prompt(
+        {
+            "schema_version": "remediation.request.v2",
+            "stage": "implementor",
+            "instructions": [
+                "Implement the approved plan as minimal unified diffs.",
+                "Modify only allowed_paths and use exact repository context lines.",
+                "Fix only supplied critical or high findings; do not perform unrelated refactors.",
+                "Return only data conforming to the supplied response JSON schema.",
+            ],
+            "input": {
+                "plan": state.get("plan") or {},
+                "allowed_paths": state["allowed_paths"],
+                "findings": _compact_findings(state["scan_data"]),
+                "repository_context": _render_contexts(state),
+            },
+        },
+        max_chars=_prompt_char_limit(state, "implementor"),
     )
 
 
@@ -532,35 +607,6 @@ def _vulnerability_ids_for_path(state: RemediationWorkflowState, path: str) -> l
     return identifiers
 
 
-def _reviewer_prompt(state: RemediationWorkflowState, valid: list[dict[str, str]]) -> str:
-    review_changes = [
-        {"path": item["path"], "reason": item["reason"], "diff": item["diff"][:5000]}
-        for item in valid
-    ]
-    return _bounded_prompt(
-        f"""You are the Reviewer in a security remediation workflow.
-
-Review the exact unified diffs against the Planner plan, findings, and source
-context. Reject patches that do not fix the root cause, change the wrong file,
-break syntax/behavior, weaken security, or omit a critical/high target.
-Return ONLY JSON:
-{{"verdict":"accept|reject","feedback":"...","missing":["..."],"quality_score":0}}
-
-Planner plan:
-{json.dumps(state.get('plan') or {}, indent=2)}
-
-Findings:
-{json.dumps(_compact_findings(state['scan_data']), indent=2)}
-
-Proposed, locally-applicable diffs:
-{json.dumps(review_changes, indent=2)}
-
-Relevant source context:
-        {_render_contexts(state, max_chars=8000)}""",
-        max_chars=_prompt_char_limit(state),
-    )
-
-
 def _bind_runtime_context(state: RemediationWorkflowState) -> None:
     set_current_project_id(state.get("project_id", ""))
     bind_remediation_run(state.get("remediation_run_id"))
@@ -581,6 +627,7 @@ def _llm(
     stage: str,
     *,
     max_tokens: int | None = None,
+    response_schema: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     _bind_runtime_context(state)
     return _dispatch_llm(
@@ -595,6 +642,7 @@ def _llm(
         access_mode=state.get("llm_access_mode", "auto"),
         credential_id=state.get("llm_credential_id", ""),
         max_tokens=max_tokens,
+        response_format=_response_format(stage, response_schema) if response_schema else None,
     )
 
 
@@ -615,63 +663,40 @@ def _planner_node(state: RemediationWorkflowState) -> RemediationWorkflowState:
         _planner_prompt(state),
         "workflow_planner",
         max_tokens=_stage_max_tokens(state, "planner"),
+        response_schema=_PLANNER_SCHEMA,
     )
-    if ok:
-        try:
-            parsed = _extract_json(raw)
-            targets = parsed.get("targets")
-            if isinstance(targets, list) and targets:
-                return {
-                    **state,
-                    "plan": parsed,
-                    "planner_warning": "",
-                }
-        except Exception as exc:
-            warning = f"Planner output was not valid JSON: {exc}"
-        else:
-            warning = "Planner returned no remediation targets."
-    else:
-        warning = f"Planner model call failed: {raw}"
-
-    fallback_targets = [
-        {
-            "path": path,
-            "findings": [],
-            "approach": "Apply a minimal fix for the scanner findings mapped to this file.",
-            "verification": "Patch must apply cleanly and pass syntax validation.",
-        }
-        for path in state.get("allowed_paths", [])
-    ]
-    return {
-        **state,
-        "plan": {
-            "summary": "Deterministic fallback plan built from vulnerability-mapped files.",
-            "targets": fallback_targets,
-            "constraints": ["Critical/high only", "Minimal changes", "No unrelated refactors"],
-        },
-        "planner_warning": warning,
-    }
+    if not ok:
+        return {**state, "error": f"Planner model call failed: {raw}"}
+    try:
+        parsed = _validate_planner_json(_extract_json(raw), state.get("allowed_paths") or [])
+    except Exception as exc:
+        return {**state, "error": f"Planner returned invalid structured JSON: {exc}"}
+    remediation_runs.store_agent_artifact(
+        state.get("remediation_run_id"), "planner", parsed, count_llm_call=True
+    )
+    return {**state, "plan": parsed, "planner_warning": ""}
 
 
 def _implementor_node(state: RemediationWorkflowState) -> RemediationWorkflowState:
-    round_number = int(state.get("round", 0)) + 1
     ok, raw = _llm(
         state,
         _implementor_prompt(state),
-        f"workflow_implementor_round_{round_number}",
+        "workflow_implementor",
         max_tokens=_stage_max_tokens(state, "implementor"),
+        response_schema=_IMPLEMENTOR_SCHEMA,
     )
     if not ok:
         return {**state, "error": f"Implementor model call failed: {raw}"}
     try:
-        parsed = _extract_json(raw)
-        changes = parsed.get("changes")
-        if not isinstance(changes, list):
-            raise ValueError("`changes` was not an array")
+        parsed = _validate_implementor_json(_extract_json(raw))
+        changes = parsed["changes"]
         proposal = {
             "summary": str(parsed.get("summary") or "").strip(),
             "changes": changes,
         }
+        remediation_runs.store_agent_artifact(
+            state.get("remediation_run_id"), "implementor", proposal, count_llm_call=True
+        )
         return {**state, "proposal": proposal, "proposer_parse_warning": ""}
     except Exception as exc:
         return {
@@ -698,66 +723,44 @@ def _record_review(
 
 def _reviewer_node(state: RemediationWorkflowState) -> RemediationWorkflowState:
     valid, errors = _proposal_preflight(state)
-    if errors:
-        return _record_review(
-            state,
-            {
-                "verdict": "reject",
-                "feedback": "Local patch preflight failed: " + "; ".join(errors[:6]),
-                "missing": errors[:8],
-                "quality_score": 0,
-            },
-        )
-
-    round_number = int(state.get("round", 0)) + 1
-    ok, raw = _llm(
-        state,
-        _reviewer_prompt(state, valid),
-        f"workflow_reviewer_round_{round_number}",
-        max_tokens=_stage_max_tokens(state, "reviewer"),
-    )
-    if not ok:
-        return {**state, "error": f"Reviewer model call failed: {raw}"}
-    try:
-        parsed = _extract_json(raw)
-        verdict = str(parsed.get("verdict") or "reject").strip().lower()
-        if verdict not in {"accept", "reject"}:
-            verdict = "reject"
-        try:
-            score = max(0, min(10, int(parsed.get("quality_score", 0))))
-        except (TypeError, ValueError):
-            score = 0
-        feedback = str(parsed.get("feedback") or "").strip()
-        missing = parsed.get("missing") if isinstance(parsed.get("missing"), list) else []
-        if verdict == "accept" and score < _REVIEW_MIN_SCORE:
-            verdict = "reject"
-            feedback = (
-                f"Reviewer score {score}/10 is below the required {_REVIEW_MIN_SCORE}/10. "
-                + feedback
-            ).strip()
-        critique = {
-            "verdict": verdict,
-            "feedback": feedback,
-            "missing": missing,
-            "quality_score": score,
-        }
-    except Exception as exc:
-        critique = {
-            "verdict": "reject",
-            "feedback": f"Reviewer returned malformed JSON: {exc}",
-            "missing": ["A machine-readable reviewer verdict is required."],
-            "quality_score": 0,
-        }
-    return _record_review(state, critique)
-
-
-def _retry_node(state: RemediationWorkflowState) -> RemediationWorkflowState:
-    return {
-        **state,
-        "round": int(state.get("round", 0)) + 1,
-        "proposal": {},
-        "proposer_parse_warning": "",
+    planned_paths = {
+        _normalize_path(target.get("path"))
+        for target in (state.get("plan") or {}).get("targets", [])
+        if isinstance(target, dict)
     }
+    changed_paths = {item["path"] for item in valid}
+    proposed_count = len((state.get("proposal") or {}).get("changes") or [])
+    scope_ok = not errors and bool(changed_paths) and changed_paths.issubset(set(state.get("allowed_paths") or []))
+    patch_ok = not errors and len(valid) == proposed_count and proposed_count > 0
+    safety_ok = patch_ok  # _proposal_preflight runs the local language-aware safety validator.
+    coverage_ok = bool(planned_paths) and planned_paths.issubset(changed_paths)
+    minimal_ok = proposed_count <= max(1, len(planned_paths)) and all(len(item["diff"]) <= 20_000 for item in valid)
+    checks = {
+        "allowed_file_scope": {"passed": scope_ok, "points": 25 if scope_ok else 0, "maximum": 25},
+        "patch_integrity": {"passed": patch_ok, "points": 20 if patch_ok else 0, "maximum": 20},
+        "syntax_and_safety": {"passed": safety_ok, "points": 20 if safety_ok else 0, "maximum": 20},
+        "planned_finding_coverage": {"passed": coverage_ok, "points": 25 if coverage_ok else 0, "maximum": 25},
+        "minimal_change": {"passed": minimal_ok, "points": 10 if minimal_ok else 0, "maximum": 10},
+    }
+    score = sum(int(check["points"]) for check in checks.values())
+    accepted = not errors and score >= _REVIEW_MIN_SCORE
+    missing = list(errors[:8])
+    if not coverage_ok:
+        missing.append("The patch does not cover every path in the approved plan.")
+    critique = {
+        "verdict": "accept" if accepted else "reject",
+        "feedback": (
+            "Deterministic local review passed."
+            if accepted
+            else "Deterministic local review failed: " + "; ".join(missing or [f"score below {_REVIEW_MIN_SCORE}"])
+        ),
+        "missing": missing,
+        "quality_score": score,
+        "score_maximum": 100,
+        "checks": checks,
+    }
+    remediation_runs.store_agent_artifact(state.get("remediation_run_id"), "reviewer", critique)
+    return _record_review(state, critique)
 
 
 def _synthesizer_node(state: RemediationWorkflowState) -> RemediationWorkflowState:
@@ -783,12 +786,13 @@ def _synthesizer_node(state: RemediationWorkflowState) -> RemediationWorkflowSta
         "proposed_change_count": len((state.get("proposal") or {}).get("changes") or []),
         "applied_change_count": len(changed_files),
         "files_considered": list(state.get("contexts", {}).keys()),
-        "negotiation_rounds": int(state.get("round", 0)) + 1,
+        "negotiation_rounds": 1,
         "critic_verdict": critique.get("verdict", "reject"),
         "critic_score": critique.get("quality_score", 0),
         "attempt_history": state.get("attempt_history") or [],
         "planner_warning": state.get("planner_warning") or "",
-        "workflow": "master_planner_implementor_reviewer",
+        "workflow": "master_planner_implementor_local_reviewer",
+        "llm_calls": 2,
         "llm_cost_usd": round(float(getattr(state.get("budget_tracker"), "total_usd", 0.0)), 6),
     }
     return {**state, "final_result": final}
@@ -802,24 +806,12 @@ def _route_after_implementor(state: RemediationWorkflowState) -> str:
     return "error_end" if state.get("error") else "reviewer"
 
 
-def _route_after_reviewer(state: RemediationWorkflowState) -> str:
-    if state.get("error"):
-        return "error_end"
-    verdict = str((state.get("critique") or {}).get("verdict") or "reject").lower()
-    if verdict == "accept":
-        return "synthesizer"
-    if int(state.get("round", 0)) < MAX_ROUNDS - 1:
-        return "retry"
-    return "synthesizer"
-
-
 def build_remediation_graph(checkpointer: Any | None = None) -> Any:
     graph = StateGraph(RemediationWorkflowState)
     graph.add_node("master", _master_node)
     graph.add_node("planner", _planner_node)
     graph.add_node("implementor", _implementor_node)
     graph.add_node("reviewer", _reviewer_node)
-    graph.add_node("retry", _retry_node)
     graph.add_node("synthesizer", _synthesizer_node)
     graph.add_node("error_end", lambda state: state)
 
@@ -835,12 +827,7 @@ def build_remediation_graph(checkpointer: Any | None = None) -> Any:
         _route_after_implementor,
         {"reviewer": "reviewer", "error_end": "error_end"},
     )
-    graph.add_conditional_edges(
-        "reviewer",
-        _route_after_reviewer,
-        {"retry": "retry", "synthesizer": "synthesizer", "error_end": "error_end"},
-    )
-    graph.add_edge("retry", "implementor")
+    graph.add_edge("reviewer", "synthesizer")
     graph.add_edge("synthesizer", END)
     graph.add_edge("error_end", END)
     return graph.compile(checkpointer=checkpointer)
@@ -904,14 +891,15 @@ async def run_remediation_workflow(
     }
 
     thread_id = f"remediation:{project_id}:{run_id or uuid4()}"
-    checkpointer, checkpoint_backend = remediation_runs.checkpoint_saver(
-        direct_api_key_present=bool(str(llm_api_key or "").strip())
-    )
+    # Full LangGraph checkpoints contain source excerpts. Persist only compact,
+    # embedded agent artifacts in Mongo and keep transient source context local.
+    checkpointer = MemorySaver()
+    checkpoint_backend = "mongodb_artifacts" if remediation_runs.enabled else "memory"
     remediation_runs.mark_status(run_id, "running", checkpoint_backend=checkpoint_backend)
-    graph = build_remediation_graph(checkpointer=checkpointer or MemorySaver())
+    graph = build_remediation_graph(checkpointer=checkpointer)
     config = {
         "configurable": {"thread_id": thread_id},
-        "recursion_limit": max(12, MAX_ROUNDS * 4 + 4),
+        "recursion_limit": 10,
     }
     latest = state
 
@@ -920,7 +908,7 @@ async def run_remediation_workflow(
         f"Master selected {len(contexts)} context file(s); Planner is mapping findings to fixes.",
     )
     try:
-        async with asyncio.timeout(max(AGENT_NODE_TIMEOUT_SECONDS * (2 * MAX_ROUNDS + 1), 300)):
+        async with asyncio.timeout(max(AGENT_NODE_TIMEOUT_SECONDS * 2, 300)):
             async for update in graph.astream(state, config=config, stream_mode="updates"):
                 if not isinstance(update, dict):
                     continue
@@ -934,13 +922,12 @@ async def run_remediation_workflow(
                             await emit("warning", warning)
                         await emit(
                             "implementor_phase",
-                            f"Planner persisted {targets} target(s); Implementor round 1 is generating patches.",
+                            f"Planner persisted {targets} target(s); Implementor is generating patches in the second and final LLM call.",
                         )
                     elif node == "implementor":
                         changes = len((latest.get("proposal") or {}).get("changes") or [])
-                        round_number = int(latest.get("round", 0)) + 1
-                        await emit("info", f"Implementor round {round_number} proposed {changes} change(s).")
-                        await emit("reviewer_phase", f"Reviewer is validating round {round_number} against source context.")
+                        await emit("info", f"Implementor proposed {changes} change(s).")
+                        await emit("reviewer_phase", "Local reviewer is validating the patch without an LLM call.")
                     elif node == "reviewer":
                         critique = latest.get("critique") or {}
                         verdict = str(critique.get("verdict") or "reject").upper()
@@ -948,13 +935,7 @@ async def run_remediation_workflow(
                         feedback = str(critique.get("feedback") or "")[:300]
                         await emit(
                             "success" if verdict == "ACCEPT" else "warning",
-                            f"Reviewer: {verdict} ({score}/10) - {feedback}",
-                        )
-                    elif node == "retry":
-                        round_number = int(latest.get("round", 0)) + 1
-                        await emit(
-                            "supervisor_phase",
-                            f"Master routed reviewer feedback back to Implementor for round {round_number}.",
+                            f"Local reviewer: {verdict} ({score}/100) - {feedback}",
                         )
                     elif node == "synthesizer":
                         await emit("synthesizer_phase", "Synthesizer validated the accepted patch set.")

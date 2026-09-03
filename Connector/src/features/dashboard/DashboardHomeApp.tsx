@@ -837,29 +837,30 @@ export default function DashboardHomeApp({ initialTab = 'overview' }: { initialT
   const loadDashboardData = useCallback(async () => {
     setRefreshing(true);
     try {
-      const sessionRes = await fetch('/api/auth/session', { cache: 'no-store' });
+      const [sessionRes, projectsRes] = await Promise.all([
+        fetch('/api/auth/session', { cache: 'no-store' }).catch(() => null),
+        fetch('/api/projects', { cache: 'no-store' }).catch(() => null),
+      ]);
 
-      if (sessionRes.ok) {
-        const session = await sessionRes.json() as SessionResponse;
-        if (!session.isLoggedIn || !session.user) {
-          window.location.assign(LOGIN_HREF);
-          return;
-        }
-        const nextUser = session.user.login || session.user.name;
-        setUserName(nextUser || 'Signed in');
-        setUserAvatarUrl(session.user.avatarUrl || '');
-      } else {
+      if (!sessionRes?.ok) {
         window.location.assign(LOGIN_HREF);
         return;
       }
+      const session = await sessionRes.json() as SessionResponse;
+      if (!session.isLoggedIn || !session.user) {
+        window.location.assign(LOGIN_HREF);
+        return;
+      }
+      const nextUser = session.user.login || session.user.name;
+      setUserName(nextUser || 'Signed in');
+      setUserAvatarUrl(session.user.avatarUrl || '');
 
-      const projectsRes = await fetch('/api/projects', { cache: 'no-store' });
-      if (projectsRes.ok) {
+      if (projectsRes?.ok) {
         const payload = await projectsRes.json() as ProjectsResponse;
         const projects = Array.isArray(payload.projects) ? payload.projects : [];
         setRepositories(mapProjectsToRepositories(projects));
         setProjectsById(Object.fromEntries(projects.map((project) => [project.id, project])));
-      } else if (projectsRes.status === 401) {
+      } else if (projectsRes?.status === 401) {
         window.location.assign(LOGIN_HREF);
       }
     } finally {

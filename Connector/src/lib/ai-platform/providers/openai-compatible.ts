@@ -211,6 +211,7 @@ export class OpenAICompatibleAdapter implements AIProviderAdapter {
       temperature: input.temperature ?? 0.2,
     };
     if (input.maxTokens) payload.max_tokens = input.maxTokens;
+    if (input.responseFormat) payload.response_format = input.responseFormat;
     if (input.tools?.length) {
       payload.tools = input.tools.map((tool) => ({
         type: 'function',

@@ -49,6 +49,27 @@ class RemediationRunStoreTests(unittest.TestCase):
         self.assertEqual(snapshot["run"]["status"], "running")
         self.assertEqual(snapshot["events"], [])
 
+    def test_agent_artifacts_are_embedded_and_secrets_are_redacted(self):
+        with patch.dict(os.environ, {"MONGODB_URI": ""}, clear=False):
+            store = RemediationRunStore()
+            run_id = store.begin_run(project_id="project-1", user_id="user-1", organization_id=None, scope="major")
+            store.store_agent_artifact(
+                run_id,
+                "planner",
+                {
+                    "summary": "Use key sk-123456789012345678",
+                    "targets": [{"path": "src/auth.ts"}],
+                    "contexts": {"src/auth.ts": "complete source must not be stored"},
+                },
+                count_llm_call=True,
+            )
+            snapshot = store.latest_for_project("project-1")
+
+        context = snapshot["run"]["agent_context"]
+        self.assertEqual(context["calls_used"], 1)
+        self.assertIn("[redacted]", context["planner"]["summary"])
+        self.assertNotIn("contexts", context["planner"])
+
     def test_llm_event_uses_bound_run_project(self):
         with patch.dict(os.environ, {"MONGODB_URI": ""}, clear=False):
             # Exercise the current-context binding contract used by LangGraph nodes.

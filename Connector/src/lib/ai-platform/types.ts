@@ -292,6 +292,7 @@ export interface NormalizedChatRequest {
   temperature?: number;
   maxTokens?: number;
   tools?: ChatTool[];
+  responseFormat?: JsonSchemaResponseFormat;
   task?: string;
   metadata?: Record<string, unknown>;
   ephemeralApiKey?: string;
@@ -339,7 +340,17 @@ export interface AdapterChatRequest {
   temperature?: number;
   maxTokens?: number;
   tools?: ChatTool[];
+  responseFormat?: JsonSchemaResponseFormat;
   signal?: AbortSignal;
+}
+
+export interface JsonSchemaResponseFormat {
+  type: 'json_schema';
+  json_schema: {
+    name: string;
+    strict: true;
+    schema: Record<string, unknown>;
+  };
 }
 
 export interface AdapterChatResponse {

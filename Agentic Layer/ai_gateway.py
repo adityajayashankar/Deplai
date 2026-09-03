@@ -96,6 +96,7 @@ class DeplaiAI:
         credential_id: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         timeout_seconds: int = 90,
     ) -> dict[str, Any]:
@@ -124,6 +125,8 @@ class DeplaiAI:
             payload["temperature"] = temperature
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if response_format:
+            payload["response_format"] = response_format
         if metadata:
             payload["metadata"] = metadata
 
@@ -179,6 +182,7 @@ def remediate_text(
     provider: str | None = None,
     credential_id: str | None = None,
     max_tokens: int | None = None,
+    response_format: dict[str, Any] | None = None,
     timeout_seconds: int = 120,
 ) -> tuple[bool, str]:
     """Call the Connector AI gateway for security remediation."""
@@ -203,6 +207,7 @@ def remediate_text(
         credential_id=credential_id,
         temperature=0.1,
         max_tokens=max_tokens,
+        response_format=response_format,
         timeout_seconds=timeout_seconds,
         metadata={"product": "security", "stage": "remediation"},
     )

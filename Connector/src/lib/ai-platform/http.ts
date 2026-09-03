@@ -22,7 +22,7 @@ import { listAuditEvents } from './audit';
 import { executeChat, streamChat, toGatewayMessages } from './gateway';
 import { firstEnv } from './config';
 import { getProviderDefinition } from './providers/definitions';
-import type { AccessMode, GatewayContext, ProviderId } from './types';
+import type { AccessMode, GatewayContext, JsonSchemaResponseFormat } from './types';
 import { ALIAS_CAPABILITY } from './catalog/seed';
 import { rankModels, defaultRoutingPolicy } from './routing';
 import { userModelSetup } from './model-setup';
@@ -318,6 +318,7 @@ export async function handleAiRequest(request: NextRequest, path: string[]): Pro
         temperature?: number;
         max_tokens?: number;
         tools?: NormalizedChatLike['tools'];
+        response_format?: JsonSchemaResponseFormat;
         task?: string;
         metadata?: Record<string, unknown>;
         api_key?: string;
@@ -334,6 +335,7 @@ export async function handleAiRequest(request: NextRequest, path: string[]): Pro
         temperature: body.temperature,
         maxTokens: body.max_tokens,
         tools: body.tools,
+        responseFormat: normalizeResponseFormat(body.response_format),
         task: body.task,
         metadata: body.metadata,
         ephemeralApiKey: body.api_key,
@@ -402,3 +404,19 @@ export async function handleAiRequest(request: NextRequest, path: string[]): Pro
 type NormalizedChatLike = {
   tools?: Array<{ name: string; description?: string; parameters?: Record<string, unknown> }>;
 };
+
+function normalizeResponseFormat(value: JsonSchemaResponseFormat | undefined): JsonSchemaResponseFormat | undefined {
+  if (!value) return undefined;
+  if (value.type !== 'json_schema' || value.json_schema?.strict !== true) {
+    throw new AiPlatformError('INVALID_REQUEST', 'Only strict json_schema response_format is supported');
+  }
+  const name = String(value.json_schema.name || '').trim();
+  const schema = value.json_schema.schema;
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name) || !schema || typeof schema !== 'object' || Array.isArray(schema)) {
+    throw new AiPlatformError('INVALID_REQUEST', 'Invalid JSON response schema');
+  }
+  if (Buffer.byteLength(JSON.stringify(schema), 'utf8') > 16_384) {
+    throw new AiPlatformError('INVALID_REQUEST', 'JSON response schema exceeds 16KB');
+  }
+  return { type: 'json_schema', json_schema: { name, strict: true, schema } };
+}

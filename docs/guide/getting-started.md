@@ -1,60 +1,81 @@
-# Getting started
+# DeplAI in 5 minutes
 
-Shortest path from GitHub login to a scan you can read—and where to go for billing, teams, and deploy.
+This quickstart creates a project, establishes repository evidence, and shows where customization, security, and deployment branch from that shared context.
+
+## Before you begin
+
+You need a GitHub account and either a repository you may grant to the DeplAI GitHub App or a ZIP archive you are authorized to upload. Deployment additionally needs an AWS account and suitably scoped credentials. Model-assisted steps need platform access or a valid BYOK credential.
 
 ## 1. Sign in
 
-1. Open DeplAI and choose **Continue with GitHub**.
-2. Pick the GitHub account that can see your repository. DeplAI requests an account chooser instead of silently reusing the last session.
-3. Approve **email**, **profile**, and **org membership**. That is identity only—repository access comes from the GitHub App next.
+Choose **Continue with GitHub**. GitHub OAuth supplies identity, profile, email, and organization membership. It does not grant repository write access.
 
-## 2. Connect a repository
+If sign-in loops or returns an error, see [Authentication failures](troubleshooting.md#authentication-and-session).
 
-1. Open **Account → Integrations** or **Your Profile → Integrations**.
-2. Install the DeplAI GitHub App on the account or GitHub organization that owns the repo.
-3. Grant the repositories DeplAI should see.
-4. Select the repository in the workspace project picker. DeplAI clones it for scans and analysis.
+## 2. Connect or upload source
 
-**ZIP instead of GitHub:** upload an archive from the project picker. Remediation can produce local diffs; pull requests require a GitHub project.
+Open the project picker.
 
-## 3. Optional: create or join an organization
+- For GitHub, install the DeplAI GitHub App and grant only the repositories you want DeplAI to use.
+- For a local project, upload a ZIP. DeplAI extracts it into a user-scoped workspace.
 
-For team governance, open **Organizations** → create an org or accept an invite from email (`/invite/{token}`). Owners invite members and assign roles. Personal projects can stay on your user account. Details: [Organizations](organizations.md).
+Select the resulting project before starting a service. If a GitHub repository is missing, refresh the installation and confirm the repository grant.
 
-## 4. Run the first scan
+## 3. Establish repository context
 
-1. Select the project in the left nav.
-2. Open **Security Agent**.
-3. On **Scan**, choose coverage:
+Deploy runs repository analysis as part of its planning path. Other services inspect the source they need. Repository analysis looks for languages, dependency manifests, frameworks, services, data stores, build and start commands, containers, CI, health signals, environment-variable names, and existing infrastructure.
 
-| Option | What runs |
+Conflicting or low-confidence evidence should be reviewed. The analyzer reports signals; it does not know undeclared operational requirements.
+
+## 4. Choose an outcome
+
+| Goal | Start here | First useful output |
+| --- | --- | --- |
+| Restyle a frontend | **Services -> UI/UX customizer** | Structured manifest and proposed frontend changes |
+| Assess source and dependencies | **Services -> Security Agent** | Normalized findings and scan evidence |
+| Test a running application | **Services -> DAST** | Findings from a verified HTTP target |
+| Plan AWS infrastructure | **Services -> Deploy** | Repository context, review questions, architecture options, and estimate |
+| Review prior work | **Services -> Sessions** | Durable status, stage, metadata, and logs |
+
+These workflows are independent. Run only those relevant to your goal.
+
+## 5. Configure model access when requested
+
+Choose one access mode:
+
+| Mode | Use when |
 | --- | --- |
-| **SAST** | Bearer — source vulnerabilities and hardcoded secrets. |
-| **SCA** | Syft inventory + Grype CVE match on dependencies. |
-| **Full Scan** | SAST + SCA plus secrets, infrastructure, API checks when relevant files exist. |
+| **Platform** | Your plan includes an appropriate model and you want DeplAI to manage provider credentials. |
+| **BYOK** | You want calls billed by your provider account or need a model available through your own key. |
+| **Auto** | You want a valid BYOK credential preferred when available, with platform fallback where policy permits. |
 
-4. Start the scan and leave the tab open until **Results** unlocks.
+Add and validate provider keys under **BYOK -> Keys**. Never paste an AWS key, GitHub token, or database password into a model-key field.
 
-## 5. Read the first result
+## 6. Review before mutation
 
-- **Code security** — CWE-grouped Bearer findings with path, line, severity.
-- **Supply chain** — package, installed version, CVE, optional fix version.
+Security remediation and customization produce changes for review. Deployment shows architecture, cost, Terraform, and plan stages before apply. Read the output at the boundary where it will change source or cloud state.
 
-Prioritize `critical` and `high`—those map to **major** scope in remediation.
+For a first run:
 
-Export a report or continue through the full pipeline—see [Security Agent](agents/security-agent.md) for every stage, integration, and troubleshooting detail.
+1. Use a non-production project or branch.
+2. Run the smallest relevant scan or workflow.
+3. Inspect skipped modules and warnings, not only failures.
+4. Review every proposed diff or Terraform plan.
+5. Use staging for the first application deployment.
+6. Confirm bootstrap and HTTP health before declaring the application live.
 
-## 6. Optional next steps
+## 7. Inspect the durable record
 
-| Goal | Page |
+Open **Sessions** after the run. A `needs_review` session is waiting for a human decision, not failed. A completed infrastructure action may still require application health verification in the deployment surface.
+
+## Quick decision guide
+
+| Question | Answer |
 | --- | --- |
-| Fix findings and open a PR | [Security Agent](agents/security-agent.md) |
-| Verify a staging URL and run DAST | [DAST](dast.md) |
-| Restyle the frontend only | [UI/UX customizer](agents/uiux-customizer.md) |
-| Generate Terraform and deploy to AWS | [Deploy](agents/deploy.md) |
-| Operate EC2 after apply | [Instance management](instance-management.md) |
-| Plans, Razorpay checkout, credit packs | [Billing](billing.md) |
-| Profile, usage wrap, invoices | [Profile, usage, and invoices](profile-usage-and-invoices.md) |
-| Provider API keys | [Security and data](security-and-data.md) |
+| SAST or DAST? | Start with SAST for source evidence; add DAST for an authorized running target. |
+| Scan or remediation? | Scan establishes evidence; remediation proposes source changes for selected findings. |
+| Retry or restart? | Retry a transient failed stage when context and inputs remain valid. Restart when source, credentials, policy, or architecture decisions changed. |
+| BYOK or platform? | BYOK for provider control and direct billing; platform for managed access within plan limits. |
+| Development or production? | Validate in development/staging first; production needs tighter permissions, review, backups, and health gates. |
 
-Related: [How it works](how-it-works.md) · [Core concepts](concepts.md)
+Related: [How it works](how-it-works.md) | [Security Agent](agents/security-agent.md) | [Deploy](agents/deploy.md) | [Troubleshooting](troubleshooting.md)
