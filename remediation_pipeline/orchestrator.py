@@ -82,17 +82,16 @@ class RemediationOrchestrator:
         clear_repo_file_cache()
 
         vulnerabilities = self.ingester.ingest(project_id)
-        triage = await triage_vulnerabilities(
-            vulnerabilities,
-            user_id=user_id,
-            organization_id=organization_id,
-            access_mode=access_mode,
-            llm_model=llm_model,
-            llm_credential_id=llm_credential_id,
-            remediation_scope=remediation_scope,
-            on_progress=on_progress,
-        )
-        vulnerabilities = triage.keep
+        from remediation_pipeline.remediation_store import remediation_runs
+        # Defense in depth for direct callers that bypass request normalization.
+        selected = [v for v in vulnerabilities if v.severity in {"critical", "high"}]
+        manual = [v for v in selected if v.remediation_capability == "manual_action"]
+        remediation_runs.store_agent_artifact(remediation_run_id, "master", {
+            "selected_findings": [{"id": v.id, "status": "manual_action" if v in manual else "unresolved"} for v in selected],
+        })
+        if manual and on_progress:
+            await self._emit_progress(on_progress, "warning", f"{len(manual)} findings require manual action (credential rotation or live resource verification); they remain unresolved.")
+        vulnerabilities = [v for v in selected if v.remediation_capability == "source_patch"]
         if not vulnerabilities:
             if on_progress is not None:
                 await self._emit_progress(
@@ -136,11 +135,11 @@ class RemediationOrchestrator:
                     "Run another round after verification for the next slice."
                 ),
             )
-        if on_progress is not None and snapshot["force_claude"]:
+        if on_progress is not None and snapshot.get("strategy_reason") == "large_repo":
             await self._emit_progress(
                 on_progress,
                 "info",
-                "Claude SDK forced for staged large-repository remediation.",
+                "Large repository pass stays on free/cheap models; Claude is never forced.",
             )
 
         if _supervisor_enabled():
@@ -170,8 +169,9 @@ class RemediationOrchestrator:
                     await self._emit_progress(
                         on_progress,
                         "warning",
-                        f"Supervisor remediation unavailable ({type(exc).__name__}: {exc}); continuing with targeted fixes.",
+                        f"Remediation stopped: {type(exc).__name__}: {exc}",
                     )
+                raise
             for fix in supervised_fixes:
                 validated = await loop.run_in_executor(self._validator_pool, self.validator.validate, project_id, fix)
                 if validated is None:
@@ -271,7 +271,7 @@ class RemediationOrchestrator:
                             llm_provider,
                             llm_api_key,
                             llm_model,
-                            force_claude or bool(snapshot["force_claude"]),
+                            False,
                             on_progress,
                             loop,
                             user_id,
@@ -404,7 +404,7 @@ class RemediationOrchestrator:
             "strategy_mode": snapshot["strategy_mode"],
             "strategy_reason": snapshot["strategy_reason"],
             "stop_after_major": int(snapshot["stop_after_major"]),
-            "force_claude": int(snapshot["force_claude"]),
+            "force_claude": 0,
         }
 
     @staticmethod
@@ -425,7 +425,7 @@ class RemediationOrchestrator:
         remediation_scope: str = "major",
     ) -> dict[str, object]:
         threshold = max(1, int(os.getenv("REMEDIATION_LARGE_FINDING_THRESHOLD", "1000")))
-        normalized_scope = "major" if str(remediation_scope or "").strip().lower() == "major" else "all"
+        normalized_scope = "major"
         severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
         for vuln in vulnerabilities:
             severity_counts[vuln.severity] = severity_counts.get(vuln.severity, 0) + 1
@@ -443,7 +443,6 @@ class RemediationOrchestrator:
         if major_only_requested:
             stop_after_major = True
             strategy_reason = "large_repo" if threshold_exceeded else "scope_major"
-            force_claude = threshold_exceeded
             major_groups = [
                 group for group in groups
                 if group.max_severity in {"critical", "high"}
@@ -590,9 +589,11 @@ class RemediationOrchestrator:
 
     @staticmethod
     def _normalize_relative_path(filepath: str) -> str:
-        normalized = str(filepath or "").strip().replace("\\", "/").lstrip("/")
+        normalized = str(filepath or "").strip().replace("\\", "/")
         path = Path(normalized)
-        if not normalized or path.is_absolute() or ".." in path.parts:
+        if (not normalized or normalized.startswith("/") or path.is_absolute()
+                or ":" in normalized or ".." in path.parts or ".git" in path.parts
+                or any(ord(char) < 32 for char in normalized)):
             raise RuntimeError(f"Invalid remediation filepath: {filepath}")
         return normalized
 
@@ -700,6 +701,8 @@ class RemediationOrchestrator:
         base_sha = str(((ref.get("object") or {}).get("sha")) or "")
         if not base_sha:
             raise RuntimeError("Unable to resolve base branch SHA")
+        if not payload.source_revision or payload.source_revision != base_sha:
+            raise RuntimeError("Source branch changed or source revision is unknown. Rescan and revalidate the diff before creating a PR.")
 
         self._github_request(
             "POST",

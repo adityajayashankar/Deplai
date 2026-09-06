@@ -2,7 +2,8 @@ import os
 import re
 
 from dast_scan import is_module_only_run
-from utils import get_docker_client, sanitize_name, decode_output, SECURITY_REPORTS_VOLUME
+from scanner_runtime import LogCallback, run_detached
+from utils import sanitize_name, SECURITY_REPORTS_VOLUME
 
 SCANNER_TIMEOUT_SECONDS = int(os.getenv("CLOUD_TIMEOUT_SECONDS", os.getenv("SCANNER_TIMEOUT_SECONDS", "1800")))
 PROWLER_IMAGE = os.getenv("PROWLER_IMAGE", "prowlercloud/prowler:5.8.0")
@@ -41,13 +42,13 @@ def run_cloud_scan(
     secret_key: str,
     session_token: str | None = None,
     region: str = "eu-north-1",
+    on_log: LogCallback | None = None,
 ) -> tuple[bool, str]:
     """Run live AWS account scanning against the authorized operator credentials."""
     ok, error, aws_region = validate_cloud_scan_request(access_key, secret_key, region)
     if not ok:
         return (False, error)
 
-    container = None
     stem = f"{sanitize_name(project_name)}_{project_id}_Cloud"
     environment = {
         "AWS_ACCESS_KEY_ID": str(access_key).strip(),
@@ -55,52 +56,38 @@ def run_cloud_scan(
         "AWS_DEFAULT_REGION": aws_region,
         "AWS_REGION": aws_region,
         "HOME": "/tmp",
+        "STEM": stem,
     }
     token = str(session_token or "").strip()
     if token:
         environment["AWS_SESSION_TOKEN"] = token
 
-    environment["STEM"] = stem
-    try:
-        # Prowler 5 dropped native JSON. json-ocsf writes {stem}.ocsf.json; copy
-        # that to {stem}.json so the reports volume lookup for Cloud.json works.
-        container = get_docker_client().containers.run(
-            PROWLER_IMAGE,
-            entrypoint="/bin/sh",
-            command=[
-                "-c",
-                (
-                    "prowler aws --region \"$AWS_REGION\" --filter-region \"$AWS_REGION\" "
-                    "--output-formats json-ocsf --output-directory /home/prowler/output "
-                    "--output-filename \"$STEM\"; "
-                    "code=$?; "
-                    "if [ -f \"/home/prowler/output/${STEM}.ocsf.json\" ]; then "
-                    "cp \"/home/prowler/output/${STEM}.ocsf.json\" \"/home/prowler/output/${STEM}.json\"; "
-                    "fi; "
-                    "exit $code"
-                ),
-            ],
-            user="0:0",
-            environment=environment,
-            volumes={
-                SECURITY_REPORTS_VOLUME: {"bind": "/home/prowler/output", "mode": "rw"},
-            },
-            detach=True,
-        )
-        result = container.wait(timeout=SCANNER_TIMEOUT_SECONDS)
-        logs = decode_output(container.logs(stdout=True, stderr=True, tail=40))
-        container.remove(force=True)
-        exit_code = result.get("StatusCode", -1)
-        # 0 = no FAIL findings, 3 = FAIL findings present. Both are completed scans.
-        if exit_code in (0, 3):
-            return (True, "")
-        detail = " ".join(logs.split())[:280]
-        suffix = f": {detail}" if detail else ""
-        return (False, f"Cloud scanning exited with code {exit_code}{suffix}")
-    except Exception as exc:
-        if container is not None:
-            try:
-                container.remove(force=True)
-            except Exception:
-                pass
-        return (False, str(exc))
+    # Prowler 5 dropped native JSON. json-ocsf writes {stem}.ocsf.json; copy
+    # that to {stem}.json so the reports volume lookup for Cloud.json works.
+    return run_detached(
+        image=PROWLER_IMAGE,
+        entrypoint="/bin/sh",
+        command=[
+            "-c",
+            (
+                "prowler aws --region \"$AWS_REGION\" --filter-region \"$AWS_REGION\" "
+                "--output-formats json-ocsf --output-directory /home/prowler/output "
+                "--output-filename \"$STEM\"; "
+                "code=$?; "
+                "if [ -f \"/home/prowler/output/${STEM}.ocsf.json\" ]; then "
+                "cp \"/home/prowler/output/${STEM}.ocsf.json\" \"/home/prowler/output/${STEM}.json\"; "
+                "fi; "
+                "exit $code"
+            ),
+        ],
+        user="0:0",
+        environment=environment,
+        volumes={
+            SECURITY_REPORTS_VOLUME: {"bind": "/home/prowler/output", "mode": "rw"},
+        },
+        timeout_seconds=SCANNER_TIMEOUT_SECONDS,
+        engine="Prowler",
+        on_log=on_log,
+        success_codes=(0, 3),
+        poll_seconds=20,
+    )

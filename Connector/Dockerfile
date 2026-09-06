@@ -55,7 +55,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /app/tmp/repos /app/tmp/local-projects \
+    && mkdir -p /app/tmp/repos /app/tmp/local-projects /app/tmp/uiux-state \
     && chown -R node:node /app
 USER node
 

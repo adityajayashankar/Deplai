@@ -21,9 +21,12 @@ from iac_scan import (
 from dast_scan import dast_should_run, is_dast_only_run, run_dast_scan, ZAP_IMAGE
 from cloud_scan import (
     PROWLER_IMAGE,
+    cloud_credentials_present,
     is_cloud_only_run,
     run_cloud_scan,
 )
+from sdlc_pipeline import SDLC_PHASES, TOOLS, engine_for, phase_for, validate_report
+from scanner_runtime import execution_evidence
 from datetime import datetime, timezone
 from utils import (
     ensure_docker_image,
@@ -37,8 +40,22 @@ from utils import (
     resolve_host_projects_dir,
     set_current_project_id,
     sanitize_name,
+    read_volume_file,
 )
 import json
+
+
+def scanner_log_callback(loop: asyncio.AbstractEventLoop, send_message, phase_label: str):
+    """Return a scanner callback safe to invoke from Docker worker threads."""
+    def on_log(message: str) -> None:
+        text = message if message.startswith("[") else f"[{phase_label}] {message}"
+        try:
+            asyncio.run_coroutine_threadsafe(send_message("info", text), loop)
+        except Exception:
+            # Scanner output must never abort the underlying scanner process.
+            pass
+
+    return on_log
 
 TOTAL_STEPS = 24
 CONTAINER_OP_TIMEOUT = int(os.getenv("CONTAINER_OP_TIMEOUT", "120"))  # seconds for volume/clone ops
@@ -62,6 +79,8 @@ class EnvironmentInitializer(RunnerBase):
         super().__init__(websocket, TOTAL_STEPS)
         self.scan_context = scan_context
         self._docker = get_docker_client()
+        self.run_id = getattr(websocket, "run_id", None)
+        self.source_revision = scan_context.source_revision
 
     def _check_docker_running(self) -> bool:
         """Verify the Docker Engine is reachable."""
@@ -201,18 +220,21 @@ class EnvironmentInitializer(RunnerBase):
                     detail = clone_error or public_error or "git clone failed"
                     return (False, f"Git clone failed. {detail}")
 
-            # Strip the embedded token from .git/config by resetting the remote URL to
-            # the plain https:// form — the token never lingers in the volume.
-            # We intentionally keep .git so the remediation pipeline can later commit
-            # and push fixes without needing to re-clone.
-            cleanup = self._docker.containers.run(
-                "alpine/git",
-                command=["git", "-C", f"/repo/{project_id}", "remote", "set-url", "origin", repo_url],
-                volumes={CODEBASE_VOLUME: {"bind": "/repo", "mode": "rw"}},
-                detach=True,
-            )
-            cleanup.wait(timeout=CONTAINER_OP_TIMEOUT)
-            cleanup.remove(force=True)
+            try:
+                if self.scan_context.source_revision:
+                    for command in (["-C", f"/repo/{project_id}", "fetch", "--depth", "1", "origin", self.scan_context.source_revision],
+                                    ["-C", f"/repo/{project_id}", "checkout", "--detach", self.scan_context.source_revision]):
+                        self._docker.containers.run("alpine/git", entrypoint="git", command=command,
+                            volumes={CODEBASE_VOLUME: {"bind": "/repo", "mode": "rw"}}, remove=True)
+                self.source_revision = decode_output(self._docker.containers.run("alpine/git", entrypoint="git",
+                    command=["-C", f"/repo/{project_id}", "rev-parse", "HEAD"],
+                    volumes={CODEBASE_VOLUME: {"bind": "/repo", "mode": "ro"}}, remove=True)).strip()
+            finally:
+                # Cleanup also runs when revision fetching or checkout fails.
+                self._docker.containers.run(
+                    "alpine/git", entrypoint="git",
+                    command=["-C", f"/repo/{project_id}", "remote", "set-url", "origin", repo_url],
+                    volumes={CODEBASE_VOLUME: {"bind": "/repo", "mode": "rw"}}, remove=True)
 
             return (True, "")
         except Exception as e:
@@ -295,6 +317,11 @@ class EnvironmentInitializer(RunnerBase):
         try:
             filename = f"{sanitize_name(self.scan_context.project_name)}_{self.scan_context.project_id}_Pipeline.json"
             payload = json.dumps({
+                "run_id": self.run_id,
+                "project_id": self.scan_context.project_id,
+                "source_revision": self.source_revision,
+                "trigger": self.scan_context.trigger,
+                "artifact_digest": self.scan_context.artifact_digest,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "modules": modules,
             })
@@ -305,11 +332,27 @@ class EnvironmentInitializer(RunnerBase):
                 volumes={SECURITY_REPORTS_VOLUME: {"bind": "/vol", "mode": "rw"}},
                 detach=True,
             )
-            container.wait(timeout=CONTAINER_OP_TIMEOUT)
+            result = container.wait(timeout=CONTAINER_OP_TIMEOUT)
             container.remove(force=True)
+            if result.get("StatusCode") != 0:
+                return False, "Cannot persist scan summary"
+            if self.run_id:
+                self._docker.containers.run("alpine", command=["sh", "-ec",
+                    'if [ -d "/code/$PID" ] && [ ! -d "/code/scan_$RUN" ]; then mkdir "/code/scan_$RUN"; cp -a "/code/$PID/." "/code/scan_$RUN/"; fi'],
+                    environment={"RUN": self.run_id, "PID": self.scan_context.project_id},
+                    volumes={CODEBASE_VOLUME: {"bind": "/code", "mode": "rw"}}, remove=True)
+                self._docker.containers.run("alpine", command=["sh", "-c",
+                    'mkdir -p "/vol/history/$RUN" && for file in /vol/*_${PID}_*.json; do [ ! -f "$file" ] || cp "$file" "/vol/history/$RUN/"; done'],
+                    environment={"RUN": self.run_id, "PID": self.scan_context.project_id},
+                    volumes={SECURITY_REPORTS_VOLUME: {"bind": "/vol", "mode": "rw"}}, remove=True)
             return (True, "")
         except Exception as exc:
             return (False, str(exc))
+
+    def _validated_report(self, module: str) -> dict:
+        filename = f"{sanitize_name(self.scan_context.project_name)}_{self.scan_context.project_id}_{TOOLS[module].report_suffix}"
+        result = validate_report(module, read_volume_file(filename))
+        return {**result, "report_ref": filename}
 
     async def _send_module(self, module: str, status: str, **extra) -> None:
         payload = {"module": module, "status": status, **extra}
@@ -360,24 +403,40 @@ class EnvironmentInitializer(RunnerBase):
             await self._send_status(StreamStatus.error)
             return False
 
-        await self._send_module(module_id, "RUNNING")
-        await self._send_message("info", f"Starting {label}...")
-        success, error_msg = await self._run_step(runner)
+        engine = engine_for(module_id)
+        phase_id, phase_label = phase_for(module_id)
+        await self._send_module(module_id, "RUNNING", engine=engine, phase=phase_id)
+        await self._send_message("info", f"[{phase_label or 'scan'}] {engine}: starting {label}...")
+        evidence = {}
+        token = execution_evidence.set(evidence)
+        try:
+            success, error_msg = await self._run_step(runner)
+        finally:
+            execution_evidence.reset(token)
+        report = {}
         if success:
-            record = {"id": module_id, "status": "COMPLETED"}
-            await self._send_module(module_id, "COMPLETED")
-            await self._send_message("success", f"{label[0].upper() + label[1:]} completed")
+            try:
+                report = await self._run_step(lambda: self._validated_report(module_id))
+            except Exception as exc:
+                success, error_msg = False, str(exc)
+        if success:
+            status = "SKIPPED" if report.get("coverage") == "not_applicable" else "COMPLETED"
+            record = {**report, **evidence, "id": module_id, "status": status, "engine": engine, "phase": phase_id}
+            await self._send_module(module_id, status, engine=engine, phase=phase_id, **report, **evidence)
+            await self._send_message("info", f"[{phase_label or 'scan'}] {engine}: {status.lower()}")
         else:
             record = {
                 "id": module_id,
                 "status": "FAILED",
-                "error": error_msg or f"{label[0].upper() + label[1:]} failed.",
+                "engine": engine,
+                "phase": phase_id,
+                "error": error_msg or f"{engine} failed.",
             }
-            await self._send_module(module_id, "FAILED", error=record["error"])
-            await self._send_message("error", f"{label[0].upper() + label[1:]} failed. {error_msg}")
+            await self._send_module(module_id, "FAILED", engine=engine, phase=phase_id, error=record["error"])
+            await self._send_message("error", f"[{phase_label or 'scan'}] {engine}: failed. {error_msg}")
 
-        await self._run_step(lambda: self._write_pipeline_summary([record]))
-        return True
+        summary_ok, _ = await self._run_step(lambda: self._write_pipeline_summary([record]))
+        return success and summary_ok
 
     async def _run_dast_only(self, dast_url: str) -> bool:
         """Test an authorized URL without wiping or re-running other modules."""
@@ -436,14 +495,6 @@ class EnvironmentInitializer(RunnerBase):
                 "Docker Engine is not running. Please start Docker Desktop and try again."
             )
 
-        await self._send_message("info", "Preparing security scanner images...")
-        images_ready, image_error = await self._run_step(self._ensure_scan_images)
-        if not images_ready:
-            return await self._terminate(
-                f"Unable to prepare required scanner images. Verify Docker Hub access from the production host. {image_error}"
-            )
-        await self._send_message("success", "Security scanner images are ready.")
-
         already_exist = await self._run_step(self._check_volumes_exist)
 
         if already_exist:
@@ -488,21 +539,54 @@ class EnvironmentInitializer(RunnerBase):
         if not success:
             return await self._terminate(f"Error: Terminating workflow — {error_msg}")
         await self._send_message("success", "Project successfully copied to volume.")
+        if self.scan_context.generated_files:
+            def write_generated():
+                import io
+                import tarfile
+                # Reject symlink destinations before Docker extracts the archive.
+                # Generated artifacts must never follow repository-controlled links.
+                self._docker.containers.run("alpine", entrypoint="sh",
+                    command=["-ec", 'root="$1"; shift; test ! -L "$root"; for item do current="$root"; oldifs="$IFS"; IFS=/; for part in $item; do current="$current/$part"; test ! -L "$current" || exit 1; done; IFS="$oldifs"; done',
+                        "guard", f"/repo/{self.scan_context.project_id}", *[item.path for item in self.scan_context.generated_files]],
+                    volumes={CODEBASE_VOLUME: {"bind": "/repo", "mode": "ro"}}, remove=True)
+                data = io.BytesIO()
+                with tarfile.open(fileobj=data, mode="w") as archive:
+                    for item in self.scan_context.generated_files:
+                        raw = item.content.encode()
+                        entry = tarfile.TarInfo(item.path)
+                        entry.size = len(raw)
+                        archive.addfile(entry, io.BytesIO(raw))
+                worker = self._docker.containers.create("alpine", command=["true"],
+                    volumes={CODEBASE_VOLUME: {"bind": "/repo", "mode": "rw"}})
+                try:
+                    if not worker.put_archive(f"/repo/{self.scan_context.project_id}", data.getvalue()):
+                        raise RuntimeError("Generated scan files could not be staged")
+                finally:
+                    worker.remove(force=True)
+            await self._run_step(write_generated)
 
         self._check_cancelled()
-        await self._send_message("phase", "Executing security tools")
+        await self._send_message("phase", "Executing security tools across SDLC stages")
 
         p_name = self.scan_context.project_name
         p_id = self.scan_context.project_id
         scan_type = getattr(self.scan_context, "scan_type", "all")
         requested = getattr(self.scan_context, "enabled_modules", None) or None
         dast_url = getattr(self.scan_context, "dast_target_url", None)
+        aws_key = getattr(self.scan_context, "aws_access_key_id", None)
+        aws_secret = getattr(self.scan_context, "aws_secret_access_key", None)
+        cloud_ready = cloud_credentials_present(aws_key, aws_secret)
         module_records: dict[str, dict] = {}
+        running_engines: set[str] = set()
 
         def wants(module: str) -> bool:
             if module == "cloud":
+                if requested:
+                    return "cloud" in requested and cloud_ready
                 return False
             if module == "dast":
+                if requested is not None and "dast" not in requested:
+                    return False
                 return dast_should_run(dast_url)
             if requested:
                 if module == "sbom":
@@ -514,233 +598,316 @@ class EnvironmentInitializer(RunnerBase):
                 return module in ("sca", "sbom")
             return True
 
+        # Scanner adapters run in executor threads. Capture the event loop here,
+        # before entering those threads, so an adapter log cannot raise
+        # "no running event loop" and abort the scan.
+        scan_loop = asyncio.get_running_loop()
+
+        def make_log(phase_label: str, engine: str):
+            del engine  # The adapter includes its engine name in emitted output.
+            return scanner_log_callback(scan_loop, self._send_message, phase_label)
+
         async def emit_module(module: str, status: str, **extra) -> None:
-            record = {"id": module, "status": status, **extra}
+            engine = extra.get("engine") or engine_for(module)
+            phase_id, _ = phase_for(module)
+            record = {**module_records.get(module, {}), "id": module, "status": status, "engine": engine, "phase": phase_id, **extra}
             module_records[module] = record
-            await self._send_module(module, status, **extra)
+            await self._send_module(module, status, engine=engine, phase=phase_id, **{
+                k: v for k, v in extra.items() if k not in {"engine", "phase"}
+            })
 
         for module_id in PIPELINE_MODULES:
             await emit_module(module_id, "QUEUED")
 
-        targets = {"iac": False, "container": False, "kubernetes": False, "cicd": False, "api": False}
-        needs_detection = any(wants(name) for name in ("iac", "containers", "kubernetes", "cicd", "api"))
-        if needs_detection:
-            await self._send_message("info", "Detecting infrastructure, API, and workflow files...")
+        # Detection is informational only — selected Checkov modules always run.
+        if any(wants(name) for name in ("iac", "containers", "kubernetes", "cicd", "api")):
+            await self._send_message("info", "Detecting infrastructure, API, and workflow files (informational)...")
             detected = await self._run_step(lambda: detect_scan_targets(p_id))
             if isinstance(detected, dict):
-                targets = {
-                    "iac": bool(detected.get("iac")),
-                    "container": bool(detected.get("container")),
-                    "kubernetes": bool(detected.get("kubernetes")),
-                    "cicd": bool(detected.get("cicd")),
-                    "api": bool(detected.get("api")),
-                }
+                bits = [
+                    f"{key}={'yes' if detected.get(key) else 'no'}"
+                    for key in ("iac", "container", "kubernetes", "cicd", "api")
+                ]
+                await self._send_message("info", f"Target detection: {', '.join(bits)}")
 
-        async def sast_branch() -> tuple[bool, str, str]:
-            await emit_module("sast", "RUNNING")
-            await self._send_message("info", "Starting static code analysis (large repos may take 10-30+ minutes)...")
-            success, error_msg = await self._run_step(lambda: run_bearer_scan(p_name, p_id))
-            if success:
-                await emit_module("sast", "COMPLETED")
-                await self._send_message("success", "Static code analysis completed")
-                return (True, "", "sast")
-            await emit_module("sast", "FAILED", error="Static code analysis failed.")
-            await self._send_message("error", f"Static code analysis failed: {error_msg}")
-            return (False, error_msg, "sast")
+        slots = asyncio.Semaphore(max(1, int(os.getenv("SECURITY_SCAN_CONCURRENCY", "3"))))
 
-        async def sca_branch() -> tuple[bool, str, str]:
-            await emit_module("sbom", "RUNNING")
-            await self._send_message("info", "Generating software bill of materials and scanning dependencies...")
-            success, error_msg = await self._run_step(lambda: run_syft_scan(p_name, p_id))
+        async def run_named(module, phase_label, runner, *, blocking=False):
+            engine = engine_for(module)
+            async with slots:
+                await emit_module(module, "STARTING", started_at=datetime.now(timezone.utc).isoformat())
+                try:
+                    image_ok, image_error = await self._run_step(lambda: self._ensure_image(TOOLS[module].image))
+                    if not image_ok:
+                        raise RuntimeError(image_error)
+                    # RUNNING means an adapter is executing; container lifecycle is separate evidence.
+                    await emit_module(module, "RUNNING")
+                    running_engines.add(engine)
+                    evidence = {}
+                    token = execution_evidence.set(evidence)
+                    try:
+                        success, error_msg = await self._run_step(runner)
+                    finally:
+                        execution_evidence.reset(token)
+                    await emit_module(module, "RUNNING", **evidence)
+                    if not success:
+                        raise RuntimeError(error_msg or f"{engine} failed")
+                    report = await self._run_step(lambda: self._validated_report(module))
+                    status = "SKIPPED" if report["coverage"] == "not_applicable" else "COMPLETED"
+                    await emit_module(module, status, **report,
+                        reason="No applicable targets were checked." if status == "SKIPPED" else None,
+                        finished_at=datetime.now(timezone.utc).isoformat())
+                    await self._send_message("info", f"[{phase_label}] {engine}: report validated ({report['coverage']})")
+                    return (True, "", module)
+                except Exception as exc:
+                    error = str(exc)
+                    await emit_module(module, "FAILED", error=error, finished_at=datetime.now(timezone.utc).isoformat())
+                    await self._send_message("error", f"[{phase_label}] {engine}: {error}. Independent tools continue.")
+                    return (False, error, module)
+                finally:
+                    running_engines.discard(engine)
+
+        async def sast_branch(phase_label: str) -> tuple[bool, str, str]:
+            return await run_named(
+                "sast",
+                phase_label,
+                lambda: run_bearer_scan(p_name, p_id, on_log=make_log(phase_label, "Bearer")),
+                blocking=True,
+            )
+
+        async def secrets_branch(phase_label: str) -> tuple[bool, str, str]:
+            return await run_named(
+                "secrets",
+                phase_label,
+                lambda: run_secrets_scan(p_name, p_id, on_log=make_log(phase_label, "Gitleaks")),
+            )
+
+        async def sca_branch(phase_label: str) -> tuple[bool, str, str]:
+            success, error, _ = await run_named("sbom", phase_label,
+                lambda: run_syft_scan(p_name, p_id, on_log=make_log(phase_label, "Syft")))
             if not success:
-                await emit_module("sbom", "FAILED", error="Software bill of materials could not be generated.")
-                await emit_module("sca", "FAILED", error="Dependency scanning requires an SBOM.")
-                await self._send_message("error", f"SBOM generation failed: {error_msg}")
-                return (False, error_msg, "sca")
-            await emit_module("sbom", "COMPLETED")
+                await emit_module("sca", "SKIPPED", coverage="blocked", reason="Dependency blocked: Syft did not produce a valid SBOM.")
+                return (False, error, "sca")
             if not wants("sca"):
                 await emit_module("sca", "SKIPPED", reason="Not selected for this run.")
                 return (True, "", "sca")
-            await emit_module("sca", "RUNNING")
-            success, error_msg = await self._run_step(lambda: run_grype_scan(p_name, p_id))
-            if success:
-                await emit_module("sca", "COMPLETED")
-                await self._send_message("success", "Dependency scanning completed")
-                return (True, "", "sca")
-            await emit_module("sca", "FAILED", error="Dependency scanning failed.")
-            await self._send_message("error", f"Dependency scanning failed: {error_msg}")
-            return (False, error_msg, "sca")
+            result = await run_named("sca", phase_label,
+                lambda: run_grype_scan(p_name, p_id, on_log=make_log(phase_label, "Grype")))
+            if self.scan_context.artifact_digest:
+                try:
+                    await self._send_message("info", "Build artifact: executing Syft then Grype against the supplied image digest.")
+                    for module, suffix, operation in (
+                        ("sbom", "ImageSbom.json", lambda: run_syft_scan(p_name, p_id,
+                            on_log=make_log("Build image", "Syft"), target_source="registry:" + self.scan_context.artifact_digest,
+                            report_suffix="ImageSbom.json")),
+                        ("sca", "ImageGrype.json", lambda: run_grype_scan(p_name, p_id,
+                            on_log=make_log("Build image", "Grype"), sbom_suffix="ImageSbom.json", report_suffix="ImageGrype.json")),
+                    ):
+                        success, error = await self._run_step(operation)
+                        if not success:
+                            raise RuntimeError(error)
+                        await self._run_step(lambda: validate_report(module, read_volume_file(f"{sanitize_name(p_name)}_{p_id}_{suffix}")))
+                    await emit_module("sca", "COMPLETED" if result[0] else "FAILED", artifact_digest=self.scan_context.artifact_digest,
+                        artifact_report_ref=f"{sanitize_name(p_name)}_{p_id}_ImageGrype.json")
+                except Exception as exc:
+                    await emit_module("sca", "FAILED", error=f"Built image coverage incomplete: {exc}")
+                    return False, str(exc), "sca"
+            return result
 
-        async def policy_branch(module: str, label: str, runner) -> tuple[bool, str, str]:
-            await emit_module(module, "RUNNING")
-            await self._send_message("info", f"Starting {label}...")
-            success, error_msg = await self._run_step(lambda: runner(p_name, p_id))
-            if success:
-                await emit_module(module, "COMPLETED")
-                await self._send_message("success", f"{label[0].upper() + label[1:]} completed")
-                return (True, "", module)
-            await emit_module(module, "FAILED", error=f"{label[0].upper() + label[1:]} failed. Other modules continued.")
-            await self._send_message("error", f"{label[0].upper() + label[1:]} failed. Other modules continued.")
-            return (True, error_msg, module)
-
-        async def secrets_branch() -> tuple[bool, str, str]:
-            return await policy_branch("secrets", "secret scanning", run_secrets_scan)
-
-        async def iac_branch() -> tuple[bool, str, str]:
-            return await policy_branch("iac", "infrastructure-as-code scanning", run_iac_scan)
-
-        async def containers_branch() -> tuple[bool, str, str]:
-            return await policy_branch("containers", "container configuration scanning", run_container_scan)
-
-        async def kubernetes_branch() -> tuple[bool, str, str]:
-            return await policy_branch("kubernetes", "Kubernetes scanning", run_kubernetes_scan)
-
-        async def cicd_branch() -> tuple[bool, str, str]:
-            return await policy_branch("cicd", "CI/CD scanning", run_cicd_scan)
-
-        async def api_branch() -> tuple[bool, str, str]:
-            return await policy_branch("api", "API specification scanning", run_api_scan)
-
-        async def dast_branch() -> tuple[bool, str, str]:
-            await emit_module("dast", "RUNNING")
-            await self._send_message("info", "Starting dynamic application testing against the authorized target...")
-            success, error_msg = await self._run_step(lambda: run_dast_scan(
-                p_name,
-                p_id,
-                str(dast_url),
-                context=self.scan_context,
-                cancelled_check=lambda: self._cancelled,
-            ))
-            if success:
-                await emit_module("dast", "COMPLETED")
-                await self._send_message("success", "Dynamic testing completed")
-                return (True, "", "dast")
-            await emit_module(
-                "dast",
-                "FAILED",
-                error=error_msg or "Dynamic testing failed. Other modules continued.",
+        async def containers_branch(phase_label: str) -> tuple[bool, str, str]:
+            return await run_named(
+                "containers",
+                phase_label,
+                lambda: run_container_scan(p_name, p_id, on_log=make_log(phase_label, "Checkov Containers")),
             )
-            await self._send_message("error", f"Dynamic testing failed. Other modules continued. {error_msg}")
-            return (True, error_msg, "dast")
 
-        skip_reasons = {
-            "sast": "Not selected for this run.",
-            "sca": "Not selected for this run.",
-            "sbom": "Not selected for this run.",
-            "secrets": "Not selected for this run.",
-            "iac": "No supported infrastructure files detected.",
-            "containers": "No container definition files detected.",
-            "kubernetes": "No Kubernetes manifests detected.",
-            "cicd": "No CI/CD workflow files detected.",
-            "api": "No API specification files detected.",
-            "dast": "Configure an authorized target URL to enable dynamic testing.",
-            "cloud": "Run Cloud after this project is deployed. Open the Cloud tab.",
+        async def iac_branch(phase_label: str) -> tuple[bool, str, str]:
+            return await run_named(
+                "iac",
+                phase_label,
+                lambda: run_iac_scan(p_name, p_id, on_log=make_log(phase_label, "Checkov IaC")),
+            )
+
+        async def kubernetes_branch(phase_label: str) -> tuple[bool, str, str]:
+            return await run_named(
+                "kubernetes",
+                phase_label,
+                lambda: run_kubernetes_scan(p_name, p_id, on_log=make_log(phase_label, "Checkov Kubernetes")),
+            )
+
+        async def cicd_branch(phase_label: str) -> tuple[bool, str, str]:
+            return await run_named(
+                "cicd",
+                phase_label,
+                lambda: run_cicd_scan(p_name, p_id, on_log=make_log(phase_label, "Checkov CI/CD")),
+            )
+
+        async def api_branch(phase_label: str) -> tuple[bool, str, str]:
+            return await run_named(
+                "api",
+                phase_label,
+                lambda: run_api_scan(p_name, p_id, on_log=make_log(phase_label, "Checkov API")),
+            )
+
+        async def dast_branch(phase_label: str) -> tuple[bool, str, str]:
+            return await run_named(
+                "dast",
+                phase_label,
+                lambda: run_dast_scan(
+                    p_name,
+                    p_id,
+                    str(dast_url),
+                    context=self.scan_context,
+                    cancelled_check=lambda: self._cancelled,
+                ),
+            )
+
+        async def cloud_branch(phase_label: str) -> tuple[bool, str, str]:
+            return await run_named(
+                "cloud",
+                phase_label,
+                lambda: run_cloud_scan(
+                    p_name,
+                    p_id,
+                    str(aws_key or ""),
+                    str(aws_secret or ""),
+                    str(getattr(self.scan_context, "aws_session_token", "") or "") or None,
+                    str(getattr(self.scan_context, "aws_region", "") or "eu-north-1"),
+                    on_log=make_log(phase_label, "Prowler"),
+                ),
+            )
+
+        branch_builders = {
+            "sast": sast_branch,
+            "secrets": secrets_branch,
+            "sca": sca_branch,
+            "sbom": None,  # handled with sca
+            "containers": containers_branch,
+            "iac": iac_branch,
+            "kubernetes": kubernetes_branch,
+            "cicd": cicd_branch,
+            "api": api_branch,
+            "dast": dast_branch,
+            "cloud": cloud_branch,
         }
 
-        tasks = []
-        if wants("sast"):
-            tasks.append(sast_branch())
-        else:
-            await emit_module("sast", "SKIPPED", reason=skip_reasons["sast"])
+        results: list[tuple[bool, str, str]] = []
+        checkov_image_ready: bool | None = None
 
-        if wants("sca") or wants("sbom"):
-            tasks.append(sca_branch())
-        else:
-            await emit_module("sbom", "SKIPPED", reason=skip_reasons["sbom"])
-            await emit_module("sca", "SKIPPED", reason=skip_reasons["sca"])
+        for phase_id, phase_label, modules in SDLC_PHASES:
+            phase_tasks = []
+            await self._send_message("phase", f"SDLC · {phase_label}")
 
-        if wants("secrets"):
-            tasks.append(secrets_branch())
-        else:
-            await emit_module("secrets", "SKIPPED", reason=skip_reasons["secrets"])
+            for module in modules:
+                if module == "sbom":
+                    continue
+                if module == "sca":
+                    if wants("sca") or wants("sbom"):
+                        phase_tasks.append(sca_branch(phase_label))
+                    else:
+                        await emit_module("sbom", "SKIPPED", reason="Not selected for this run.")
+                        await emit_module("sca", "SKIPPED", reason="Not selected for this run.")
+                    continue
 
-        checkov_jobs = []
-        if wants("iac") and targets["iac"]:
-            checkov_jobs.append(("iac", iac_branch))
-        elif wants("iac"):
-            await emit_module("iac", "SKIPPED", reason=skip_reasons["iac"])
-        else:
-            await emit_module("iac", "SKIPPED", reason="Not selected for this run.")
+                if not wants(module):
+                    if module == "dast":
+                        reason = "Configure an authorized target URL to enable dynamic testing."
+                    elif module == "cloud":
+                        reason = (
+                            "AWS credentials required for live cloud scanning."
+                            if not cloud_ready
+                            else "Not selected for this run."
+                        )
+                    else:
+                        reason = "Not selected for this run."
+                    await emit_module(module, "SKIPPED", reason=reason)
+                    continue
 
-        if wants("containers") and targets["container"]:
-            checkov_jobs.append(("containers", containers_branch))
-        elif wants("containers"):
-            await emit_module("containers", "SKIPPED", reason=skip_reasons["containers"])
-        else:
-            await emit_module("containers", "SKIPPED", reason="Not selected for this run.")
+                if module == "dast":
+                    if not dast_url:
+                        await emit_module(
+                            "dast",
+                            "SKIPPED",
+                            reason="Configure an authorized target URL to enable dynamic testing.",
+                        )
+                        continue
+                    image_ok, image_error = await self._run_step(lambda: self._ensure_image(ZAP_IMAGE))
+                    if not image_ok:
+                        await emit_module("dast", "FAILED", error="Dynamic testing image could not be prepared.")
+                        await self._send_message(
+                            "error",
+                            f"[{phase_label}] OWASP ZAP: image could not be prepared. {image_error}",
+                        )
+                        continue
+                    phase_tasks.append(dast_branch(phase_label))
+                    continue
 
-        if wants("kubernetes") and targets["kubernetes"]:
-            checkov_jobs.append(("kubernetes", kubernetes_branch))
-        elif wants("kubernetes"):
-            await emit_module("kubernetes", "SKIPPED", reason=skip_reasons["kubernetes"])
-        else:
-            await emit_module("kubernetes", "SKIPPED", reason="Not selected for this run.")
+                if module == "cloud":
+                    if not cloud_ready:
+                        await emit_module(
+                            "cloud",
+                            "SKIPPED",
+                            reason="AWS credentials required for live cloud scanning.",
+                        )
+                        continue
+                    image_ok, image_error = await self._run_step(lambda: self._ensure_image(PROWLER_IMAGE))
+                    if not image_ok:
+                        await emit_module("cloud", "FAILED", error="Cloud scanner image could not be prepared.")
+                        await self._send_message(
+                            "error",
+                            f"[{phase_label}] Prowler: image could not be prepared. {image_error}",
+                        )
+                        continue
+                    phase_tasks.append(cloud_branch(phase_label))
+                    continue
 
-        if wants("cicd") and targets["cicd"]:
-            checkov_jobs.append(("cicd", cicd_branch))
-        elif wants("cicd"):
-            await emit_module("cicd", "SKIPPED", reason=skip_reasons["cicd"])
-        else:
-            await emit_module("cicd", "SKIPPED", reason="Not selected for this run.")
+                if module in ("iac", "containers", "kubernetes", "cicd", "api"):
+                    if checkov_image_ready is None:
+                        image_ok, image_error = await self._run_step(lambda: self._ensure_image(CHECKOV_IMAGE))
+                        checkov_image_ready = image_ok
+                        if not image_ok:
+                            await self._send_message(
+                                "error",
+                                f"[{phase_label}] Checkov: image could not be prepared. {image_error}",
+                            )
+                    if not checkov_image_ready:
+                        await emit_module(
+                            module,
+                            "FAILED",
+                            error="Infrastructure scanner image could not be prepared.",
+                        )
+                        continue
 
-        if wants("api") and targets["api"]:
-            checkov_jobs.append(("api", api_branch))
-        elif wants("api"):
-            await emit_module("api", "SKIPPED", reason=skip_reasons["api"])
-        else:
-            await emit_module("api", "SKIPPED", reason="Not selected for this run.")
+                builder = branch_builders.get(module)
+                if builder:
+                    phase_tasks.append(builder(phase_label))
 
-        if checkov_jobs:
-            image_ok, image_error = await self._run_step(lambda: self._ensure_image(CHECKOV_IMAGE))
-            if not image_ok:
-                reason = "Infrastructure scanner image could not be prepared."
-                for module_id, _ in checkov_jobs:
-                    await emit_module(module_id, "FAILED", error=reason)
-                await self._send_message("error", f"{reason} {image_error}")
-            else:
-                for _, branch in checkov_jobs:
-                    tasks.append(branch())
+            if not phase_tasks:
+                continue
 
-        if wants("dast") and dast_url:
-            image_ok, image_error = await self._run_step(lambda: self._ensure_image(ZAP_IMAGE))
-            if not image_ok:
-                await emit_module("dast", "FAILED", error="Dynamic testing image could not be prepared.")
-                await self._send_message("error", f"Dynamic testing image could not be prepared. {image_error}")
-            else:
-                tasks.append(dast_branch())
-        elif wants("dast"):
-            await emit_module("dast", "SKIPPED", reason=skip_reasons["dast"])
-        else:
-            await emit_module("dast", "SKIPPED", reason=skip_reasons["dast"])
+            async def heartbeat(interval: int = 30):
+                elapsed = 0
+                while True:
+                    await asyncio.sleep(interval)
+                    elapsed += interval
+                    engines = ", ".join(sorted(running_engines)) or "scanners"
+                    await self._send_message(
+                        "info",
+                        f"Worker heartbeat [{phase_label}]: pending adapters {engines} ({elapsed}s elapsed)",
+                    )
 
-        await emit_module("cloud", "SKIPPED", reason=skip_reasons["cloud"])
-
-        async def heartbeat(interval: int = 30):
-            elapsed = 0
-            while True:
-                await asyncio.sleep(interval)
-                elapsed += interval
-                await self._send_message("info", f"Scanners still running... ({elapsed}s elapsed)")
-
-        hb_task = asyncio.create_task(heartbeat())
-        try:
-            results = await asyncio.gather(*tasks) if tasks else []
-        finally:
-            hb_task.cancel()
+            hb_task = asyncio.create_task(heartbeat())
             try:
-                await hb_task
-            except asyncio.CancelledError:
-                pass
+                phase_results = await asyncio.gather(*phase_tasks)
+                results.extend(phase_results)
+            finally:
+                hb_task.cancel()
+                try:
+                    await hb_task
+                except asyncio.CancelledError:
+                    pass
 
-        await self._run_step(lambda: self._write_pipeline_summary(list(module_records.values())))
 
-        blocking_failed = any(
-            (not success) and name in ("sast", "sca")
-            for success, _, name in results
-        )
-        if blocking_failed:
-            await self._send_status(StreamStatus.error)
-            return False
-
-        return True
+        summary_ok, _ = await self._run_step(lambda: self._write_pipeline_summary(list(module_records.values())))
+        return summary_ok and not any(r["status"] == "FAILED" for r in module_records.values())
 

@@ -9,7 +9,6 @@ import logging
 import os
 import httpx
 from typing import Optional
-from anthropic import AsyncAnthropic
 
 logger = logging.getLogger(__name__)
 
@@ -177,13 +176,10 @@ def _system_prompt_for(provider: str) -> str:
     return _AWS_SYSTEM_PROMPT  # default to AWS
 
 
-# --- LLM dispatch (Groq → OpenRouter fallback) --------------------------------
+# --- LLM dispatch (OpenRouter) -----------------------------------------------
 
-_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-_DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
-_DEFAULT_OPENROUTER_MODEL = "mistralai/mistral-7b-instruct"
-_DEFAULT_CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-7-sonnet-latest")
+_DEFAULT_OPENROUTER_MODEL = "qwen/qwen-2.5-coder-32b-instruct:free"
 
 
 async def _call_llm_json(system: str, user: str, provider: str = "", api_key: str = "", model: str = "") -> dict:
@@ -224,57 +220,32 @@ async def _call_llm_json(system: str, user: str, provider: str = "", api_key: st
         except Exception as exc:
             logger.warning("User-provider %s failed in arch gen: %s", provider, exc)
 
-    # 2. Claude SDK
-    claude_key = os.getenv("ANTHROPIC_API_KEY", "").strip() or os.getenv("CLAUDE_API_KEY", "").strip()
-    if claude_key:
-        try:
-            result = await _call_anthropic(messages, claude_key, model or _DEFAULT_CLAUDE_MODEL)
-            if result:
-                return result
-        except Exception as exc:
-            logger.warning("Claude fallback failed in arch gen: %s", exc)
-
-    # 3. Groq
-    groq_key = os.getenv("GROQ_API_KEY", "")
-    if groq_key:
-        try:
-            result = await _openai_compatible(messages, "groq", groq_key, _DEFAULT_GROQ_MODEL)
-            if result:
-                return result
-        except Exception as exc:
-            logger.warning("Groq fallback failed in arch gen: %s", exc)
-
-    # 4. OpenRouter
-    or_key = os.getenv("OPENROUTER_API_KEY", "")
+    # Routed exclusively through OpenRouter
+    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if or_key:
         try:
-            result = await _openai_compatible(messages, "openrouter", or_key, _DEFAULT_OPENROUTER_MODEL)
+            result = await _openai_compatible(messages, "openrouter", or_key, model or "qwen/qwen-2.5-coder-32b-instruct:free")
             if result:
                 return result
         except Exception as exc:
-            logger.warning("OpenRouter fallback failed in arch gen: %s", exc)
+            logger.warning("OpenRouter failed: %s", exc)
 
-    raise RuntimeError("All LLM providers failed for architecture generation.")
+    raise RuntimeError("OpenRouter LLM unavailable.")
 
 
 async def _openai_compatible(messages: list, provider: str, api_key: str, model: str) -> Optional[dict]:
     provider_lower = provider.lower()
 
     url_map = {
-        "groq": (_GROQ_URL, model or _DEFAULT_GROQ_MODEL),
         "openrouter": (_OPENROUTER_URL, model or _DEFAULT_OPENROUTER_MODEL),
-        "openai": ("https://api.openai.com/v1/chat/completions", model or "gpt-4o-mini"),
-        "claude": ("https://api.anthropic.com/v1/messages", model or _DEFAULT_CLAUDE_MODEL),
     }
-
-    if provider_lower == "claude":
-        return await _call_anthropic(messages, api_key, model or _DEFAULT_CLAUDE_MODEL)
 
     base_url, resolved_model = url_map.get(provider_lower, (_OPENROUTER_URL, model or _DEFAULT_OPENROUTER_MODEL))
 
     payload = {
         "model": resolved_model,
         "messages": messages,
+        "reasoning": {"effort": "high"},
         "response_format": {"type": "json_object"},
         "temperature": 0.3,
         "max_tokens": 4096,

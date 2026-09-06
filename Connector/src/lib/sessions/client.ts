@@ -48,6 +48,7 @@ async function postJson(url: string, body: unknown): Promise<Record<string, unkn
       credentials: 'same-origin',
       keepalive: true,
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5_000),
     });
     if (!response.ok) return null;
     return await response.json().catch(() => ({}));

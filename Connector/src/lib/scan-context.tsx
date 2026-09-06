@@ -91,6 +91,7 @@ interface ScanContextValue {
     remediationScope?: 'major' | 'all',
     accessMode?: 'platform' | 'byok' | 'auto',
     llmCredentialId?: string,
+    allowPaid?: boolean,
   ) => Promise<void>;
   continueRemediationRound: (projectId: string) => void;
   pushCurrentRemediationChanges: (projectId: string) => void;
@@ -114,7 +115,7 @@ export function useScan() {
 }
 
 async function fetchWsToken(projectId: string): Promise<string> {
-  const res = await fetch(`/api/scan/ws-token?project_id=${encodeURIComponent(projectId)}`, { cache: 'no-store' });
+  const res = await fetch(`/api/scan/ws-token?project_id=${encodeURIComponent(projectId)}`, { cache: 'no-store', signal: AbortSignal.timeout(8_000) });
   const data = await res.json().catch(() => ({})) as { token?: string; error?: string };
   if (!res.ok) {
     const fallback = res.status === 401
@@ -210,24 +211,6 @@ async function resolveWsBaseUrl(): Promise<string> {
   } finally {
     wsBaseFetchInFlight = null;
   }
-}
-
-function messagesIndicateSettledScan(messages: ScanMessage[]): boolean {
-  const latest = new Map<string, string>();
-  for (const message of messages) {
-    if (message.type !== 'module') continue;
-    try {
-      const payload = JSON.parse(message.content) as { module?: string; status?: string };
-      if (payload.module && payload.status) latest.set(payload.module, payload.status);
-    } catch {
-      // Ignore malformed live module payloads.
-    }
-  }
-  if (latest.size === 0) return false;
-  const terminal = new Set(['COMPLETED', 'FAILED', 'SKIPPED', 'CANCELLED', 'TIMED OUT']);
-  const statuses = [...latest.values()];
-  return statuses.every((status) => terminal.has(status))
-    && statuses.some((status) => status === 'COMPLETED' || status === 'FAILED');
 }
 
 function connectWebSocket(
@@ -415,6 +398,8 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
   const [resultsCache, setResultsCache] = useState<Record<string, CachedScanResults>>({});
   const [storageHydrated, setStorageHydrated] = useState(false);
   const wsRefs = useRef<Record<string, WebSocket>>({});
+  const scanAttemptRefs = useRef<Record<string, number>>({});
+  const scanStatusRevisionRefs = useRef<Record<string, number>>({});
   const remWsRefs = useRef<Record<string, WebSocket>>({});
   const securitySessionIdsRef = useRef<Record<string, string>>({});
 
@@ -567,6 +552,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
   }, [trimMessages]);
 
   const updateScanStatus = useCallback((projectId: string, status: string) => {
+    scanStatusRevisionRefs.current[projectId] = (scanStatusRevisionRefs.current[projectId] || 0) + 1;
     setScanStates(prev => {
       const existing = prev[projectId];
       if (!existing) return prev;
@@ -584,74 +570,33 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const reconcileScanStatusAfterSocketClose = useCallback(async (projectId: string) => {
-    const markFromMessages = () => {
-      setScanStates(prev => {
-        const existing = prev[projectId];
-        if (!existing) return prev;
-        if (existing.state === 'completed') return prev;
-        if (messagesIndicateSettledScan(existing.messages)) {
-          return { ...prev, [projectId]: { ...existing, state: 'completed' } };
-        }
-        if (existing.state !== 'running') return prev;
-        const alreadyLogged = existing.messages.some((entry) => (
-          entry.type === 'error' && entry.content.includes('Scan connection closed before the backend reported progress')
-        ));
-        const closedMessage = 'Scan connection closed before the backend reported progress. Results stay available if this run already finished.';
-        if (!alreadyLogged) {
-          const sessionId = securitySessionIdsRef.current[projectId];
-          if (sessionId) {
-            persistSessionProgress(sessionId, {
-              status: 'failed',
-              current_stage: 'scan',
-              completed: true,
-              line: { level: 'error', message: closedMessage, stage: 'scan' },
-            });
-          }
-        }
-        const nextMessages = alreadyLogged ? existing.messages : trimMessages([
-          ...existing.messages,
-          {
-            index: existing.messages.length + 1,
-            total: 0,
-            type: 'error',
-            content: closedMessage,
-            timestamp: new Date().toISOString(),
-          },
-        ]);
-        return {
-          ...prev,
-          [projectId]: {
-            ...existing,
-            state: 'error',
-            messages: nextMessages,
-          },
-        };
-      });
-    };
-
+    const revision = scanStatusRevisionRefs.current[projectId];
     try {
-      const res = await fetch(`/api/scan/status?project_id=${encodeURIComponent(projectId)}`, { cache: 'no-store' });
-      const payload = await res.json().catch(() => ({})) as { status?: string };
-      const status = String(payload.status || (res.ok ? 'not_initiated' : 'error'));
-      if (status === 'running') {
-        updateScanStatus(projectId, 'running');
-      } else if (status === 'found' || status === 'not_found') {
-        updateScanStatus(projectId, 'completed');
-      } else {
-        markFromMessages();
-      }
+      const res = await fetch(`/api/scan/status?project_id=${encodeURIComponent(projectId)}`, {
+        cache: 'no-store', signal: AbortSignal.timeout(8_000),
+      });
+      const payload = await res.json() as { status?: string; backend?: string };
+      // A status service outage is not evidence that the worker failed.
+      if (!res.ok || payload.backend || revision !== scanStatusRevisionRefs.current[projectId]) return;
+      if (payload.status === 'running') updateScanStatus(projectId, 'running');
+      else if (payload.status === 'found' || payload.status === 'not_found') updateScanStatus(projectId, 'completed');
+      else if (payload.status === 'error' || payload.status === 'not_initiated') updateScanStatus(projectId, 'error');
     } catch {
-      markFromMessages();
+      // Keep polling after a temporary transport failure.
     }
-  }, [trimMessages, updateScanStatus]);
+  }, [updateScanStatus]);
 
   const startScan = useCallback(async (
     projectId: string,
     projectName: string,
     options?: { preserveRemediation?: boolean },
   ) => {
+    const attempt = (scanAttemptRefs.current[projectId] || 0) + 1;
+    scanAttemptRefs.current[projectId] = attempt;
+    scanStatusRevisionRefs.current[projectId] = (scanStatusRevisionRefs.current[projectId] || 0) + 1;
+    const isCurrent = () => scanAttemptRefs.current[projectId] === attempt;
     const existingWs = wsRefs.current[projectId];
-    if (existingWs && existingWs.readyState === WebSocket.OPEN) existingWs.close();
+    if (existingWs && (existingWs.readyState === WebSocket.OPEN || existingWs.readyState === WebSocket.CONNECTING)) existingWs.close();
 
     setScanStates(prev => ({
       ...prev,
@@ -678,17 +623,19 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     }
 
     try {
-      const sessionId = await createWorkspaceSession({
+      void createWorkspaceSession({
         service: 'security_agent',
         project_id: projectId,
         title: `Security scan · ${projectName}`,
         repo: projectName,
         status: 'running',
         current_stage: 'scan',
+      }).then((sessionId) => {
+        if (sessionId && isCurrent()) securitySessionIdsRef.current[projectId] = sessionId;
       });
-      if (sessionId) securitySessionIdsRef.current[projectId] = sessionId;
       const wsBaseUrl = await resolveWsBaseUrl();
       const wsToken = await fetchWsToken(projectId);
+      if (!isCurrent()) return;
       appendScanMessage(projectId, {
         index: Date.now(),
         total: Date.now(),
@@ -699,19 +646,21 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       wsRefs.current[projectId] = connectWebSocket(
         wsBaseUrl,
         '/ws/scan', projectId,
-        appendScanMessage,
-        updateScanStatus,
+        (id, message) => { if (isCurrent()) appendScanMessage(id, message); },
+        (id, status) => { if (isCurrent()) updateScanStatus(id, status); },
         (id, detail) => {
+          if (!isCurrent()) return;
           appendScanMessage(id, {
             index: Date.now(),
             total: Date.now(),
-            type: 'error',
+            type: 'warning',
             content: detail || 'Failed to connect to the live scan stream.',
             timestamp: new Date().toISOString(),
           });
-          updateScanStatus(id, 'error');
+          void reconcileScanStatusAfterSocketClose(id);
         },
         (id) => {
+          if (!isCurrent()) return;
           // Reconcile with backend status to avoid false failures when the WS drops
           // during server restarts/reloads while scan workers may still be running.
           void reconcileScanStatusAfterSocketClose(id);
@@ -720,16 +669,18 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
         wsToken,
       );
     } catch (error) {
+      if (!isCurrent()) return;
       const detail = error instanceof Error ? error.message : 'Failed to connect to the live scan stream.';
       appendScanMessage(projectId, {
         index: Date.now(),
         total: Date.now(),
-        type: 'error',
+        type: 'warning',
         content: detail,
         timestamp: new Date().toISOString(),
       });
-      updateScanStatus(projectId, 'error');
-      throw error;
+      // The authenticated HTTP request already started the worker. A failed
+      // progress connection must not turn an accepted scan into a failed run.
+      void reconcileScanStatusAfterSocketClose(projectId);
     }
   }, [appendScanMessage, reconcileScanStatusAfterSocketClose, updateScanStatus]);
 
@@ -742,6 +693,17 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
       .filter(([, s]) => s.state === 'running')
       .map(([id]) => id);
   }, [scanStates]);
+
+  const activeScanKey = activeScanIds.join(',');
+  useEffect(() => {
+    if (!activeScanKey) return;
+    const timer = window.setInterval(() => {
+      for (const projectId of activeScanKey.split(',')) {
+        void reconcileScanStatusAfterSocketClose(projectId);
+      }
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [activeScanKey, reconcileScanStatusAfterSocketClose]);
 
   // ── Remediation ──
 
@@ -793,8 +755,9 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     llmApiKey?: string,
     llmModel?: string,
     remediationScope: 'major' | 'all' = 'major',
-    accessMode: 'platform' | 'byok' | 'auto' = 'auto',
+    accessMode: 'platform' | 'byok' | 'auto' = 'platform',
     llmCredentialId?: string,
+    allowPaid?: boolean,
   ) => {
     const existingRemWs = remWsRefs.current[projectId];
     if (existingRemWs && existingRemWs.readyState === WebSocket.OPEN) existingRemWs.close();
@@ -811,11 +774,10 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
         body: JSON.stringify({
           project_id: projectId,
           github_token: githubToken || null,
-          llm_provider: llmProvider || null,
-          llm_api_key: llmApiKey || null,
+          // Remediation is platform-owned OpenRouter free-model traffic.
+          // Do not send BYOK/provider fields even if an old saved UI state has
+          // them; the route also enforces this server-side.
           llm_model: llmModel || null,
-          llm_access_mode: accessMode || 'auto',
-          llm_credential_id: llmCredentialId || null,
           remediation_scope: remediationScope,
         }),
       });

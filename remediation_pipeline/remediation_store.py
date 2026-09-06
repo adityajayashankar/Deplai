@@ -105,6 +105,25 @@ def _safe_event_content(message_type: str, content: str) -> str:
 
 
 class RemediationRunStore:
+    def packet_result(self, run_id: str, packet_id: str, result: dict | None = None) -> dict | None:
+        """Keep completed packet outputs for continuation without repeating inference."""
+        key = f"{run_id}:{packet_id}"
+        db = self._mongo_db()
+        if not hasattr(self, "_packets"):
+            self._packets = {}
+        if result is not None:
+            self._packets[key] = deepcopy(result)
+            if db is not None:
+                db.remediation_packets.replace_one({"_id": key}, {"_id": key, "result": result,
+                    "expire_at": _now() + timedelta(days=_retention_days())}, upsert=True)
+            return result
+        if key in self._packets:
+            return deepcopy(self._packets[key])
+        if db is not None:
+            record = db.remediation_packets.find_one({"_id": key})
+            return record.get("result") if record else None
+        return None
+
     """A memory fallback plus optional MongoDB-backed remediation event journal."""
 
     def __init__(self) -> None:

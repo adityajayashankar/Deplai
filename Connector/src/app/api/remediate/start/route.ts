@@ -1,18 +1,10 @@
+import { DEFAULT_REMEDIATION_PLATFORM_MODEL } from '@/lib/ai-platform/remediation-platform-models';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders, formatAgenticFetchError } from '@/lib/agentic';
 import { resolveAgenticBillingContext } from '@/lib/agentic-context';
 import { query } from '@/lib/db';
 import { githubService } from '@/lib/github';
-import { getBalance } from '@/lib/billing/credits';
-import { getCredentialRecord } from '@/lib/ai-platform/credentials';
-import { canonicalizeProviderId } from '@/lib/ai-platform/providers/definitions';
-import {
-  assertPlatformModelAllowed,
-  defaultRemediationModel,
-  isLogicalAliasName,
-  parseAccessMode,
-} from '@/lib/ai-platform/subscription-access';
 import {
   findLatestSession,
   isReusableSecuritySession,
@@ -78,91 +70,29 @@ export async function POST(request: NextRequest) {
     const {
       project_id,
       github_token,
-      llm_provider,
-      llm_api_key,
-      llm_model,
-      llm_access_mode,
-      llm_credential_id,
-      remediation_scope,
     } = await request.json();
     const runtimeGithubToken =
       typeof github_token === 'string' && github_token.trim().length > 0
         ? github_token.trim()
         : null;
-    const canonicalProvider = canonicalizeProviderId(typeof llm_provider === 'string' ? llm_provider : '');
-    const normalizedLlmProvider = canonicalProvider || (
-      typeof llm_provider === 'string' && llm_provider.trim().length > 0
-        ? llm_provider.trim().toLowerCase()
-        : null
-    );
-    const normalizedLlmApiKey =
-      typeof llm_api_key === 'string' && llm_api_key.trim().length > 0
-        ? llm_api_key.trim()
-        : null;
-    const normalizedLlmModel =
-      typeof llm_model === 'string' && llm_model.trim().length > 0
-        ? llm_model.trim()
-        : null;
-    const normalizedLlmCredentialId =
-      typeof llm_credential_id === 'string' && llm_credential_id.trim().length > 0
-        ? llm_credential_id.trim()
-        : null;
-    const accessMode = parseAccessMode(llm_access_mode) || 'auto';
-    const scope = remediation_scope === 'all' ? 'all' : 'major';
+    // Incoming scope values from older clients are ignored; remediation never
+    // expands beyond critical/high findings.
+    const scope = 'major';
     let usedInstallationToken = false;
 
     if (!project_id) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
     }
 
-    if (accessMode === 'platform') {
-      const balance = await getBalance(user.id).catch(() => null);
-      const model = normalizedLlmModel || defaultRemediationModel(balance?.planId);
-      const allowed = assertPlatformModelAllowed(balance?.planId, model);
-      if (!allowed.ok) {
-        return NextResponse.json({ error: allowed.message }, { status: 403 });
-      }
-    }
-    let resolvedByokCredential = null as Awaited<ReturnType<typeof getCredentialRecord>>;
-    if (accessMode === 'byok' && !normalizedLlmApiKey) {
-      if (!normalizedLlmCredentialId) {
-        return NextResponse.json(
-          { error: 'Select a saved BYOK credential before starting BYOK remediation.' },
-          { status: 400 },
-        );
-      }
-      resolvedByokCredential = await getCredentialRecord(user.id, normalizedLlmCredentialId);
-      if (!resolvedByokCredential) {
-        return NextResponse.json({ error: 'BYOK credential not found.' }, { status: 400 });
-      }
-      if (resolvedByokCredential.status !== 'VALID' && resolvedByokCredential.status !== 'PENDING') {
-        return NextResponse.json({ error: 'Selected BYOK credential is not usable.' }, { status: 400 });
-      }
-      if (normalizedLlmProvider && resolvedByokCredential.providerId !== normalizedLlmProvider) {
-        return NextResponse.json(
-          { error: 'Selected BYOK credential does not match the chosen provider.' },
-          { status: 400 },
-        );
-      }
-      if (
-        resolvedByokCredential.allowedModelIds?.length
-        && normalizedLlmModel
-        && !isLogicalAliasName(normalizedLlmModel)
-        && !resolvedByokCredential.allowedModelIds.includes(normalizedLlmModel)
-      ) {
-        return NextResponse.json(
-          { error: 'Selected model is not allowed for this BYOK credential.' },
-          { status: 400 },
-        );
-      }
-    }
-
+    // The OpenRouter free router owns upstream model selection. Ignore a model
+    // value sent by older browser sessions so remediation can never be routed
+    // to a selected catalog model, BYOK credential, or paid fallback.
     const llmFields = {
-      llm_provider: normalizedLlmProvider || resolvedByokCredential?.providerId || null,
-      llm_api_key: normalizedLlmApiKey,
-      llm_model: normalizedLlmModel,
-      llm_access_mode: accessMode,
-      llm_credential_id: normalizedLlmCredentialId,
+      llm_provider: 'openrouter',
+      llm_api_key: null,
+      llm_model: DEFAULT_REMEDIATION_PLATFORM_MODEL,
+      llm_access_mode: 'platform',
+      llm_credential_id: null,
     };
 
     const projectRows = await query<ProjectRow[]>(

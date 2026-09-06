@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from remediation_pipeline.models import Vulnerability
-from remediation_pipeline.noise_triage import apply_heuristic_noise_triage
+from remediation_pipeline.noise_triage import apply_heuristic_noise_triage, filter_by_remediation_scope
 
 
 def _vuln(**kwargs) -> Vulnerability:
@@ -22,6 +22,16 @@ def _vuln(**kwargs) -> Vulnerability:
 
 
 class NoiseTriageTests(unittest.TestCase):
+    def test_critical_high_policy_ignores_medium_low_even_for_legacy_all_scope(self) -> None:
+        kept, ignored = filter_by_remediation_scope([
+            _vuln(id="critical", severity="critical"),
+            _vuln(id="high", severity="high"),
+            _vuln(id="medium", severity="medium"),
+            _vuln(id="low", severity="low"),
+        ], "all")
+        self.assertEqual([vuln.id for vuln in kept], ["critical", "high"])
+        self.assertEqual(ignored, 2)
+
     def test_ignores_node_modules_findings(self) -> None:
         result = apply_heuristic_noise_triage([
             _vuln(file="node_modules/lodash/index.js", severity="high"),

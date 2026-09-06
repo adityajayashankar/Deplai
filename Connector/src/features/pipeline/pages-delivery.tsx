@@ -1203,9 +1203,6 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
   const [prUrl, setPrUrl] = useState<string | null>(null);
   const [sendingPr, setSendingPr] = useState<boolean>(false);
   const [liveValidated, setLiveValidated] = useState<boolean>(false);
-  const [awsAccessKeyId, setAwsAccessKeyId] = useState<string>(() => readSavedAws().aws_access_key_id);
-  const [awsSecretAccessKey, setAwsSecretAccessKey] = useState<string>(() => readSavedAws().aws_secret_access_key);
-  const [awsSessionToken, setAwsSessionToken] = useState<string>(() => readSavedAws().aws_session_token);
   const [awsRegion, setAwsRegion] = useState<string>(() => readSavedAws().aws_region);
   const [iacMode, setIacMode] = useState<IacMode>(() => {
     if (typeof window === 'undefined') return 'deterministic';
@@ -1267,14 +1264,7 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
     }
   }, [projectId]);
 
-  useEffect(() => {
-    writeSavedAws({
-      aws_access_key_id: awsAccessKeyId,
-      aws_secret_access_key: awsSecretAccessKey,
-      aws_session_token: awsSessionToken,
-      aws_region: awsRegion || 'eu-north-1',
-    });
-  }, [awsAccessKeyId, awsRegion, awsSecretAccessKey, awsSessionToken]);
+
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1321,9 +1311,6 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
         iac_mode: iacMode,
         qa_summary: qaSummary,
         architecture_context: qaSummary,
-        aws_access_key_id: awsAccessKeyId.trim() || undefined,
-        aws_secret_access_key: awsSecretAccessKey.trim() || undefined,
-        aws_session_token: awsSessionToken.trim() || undefined,
         aws_region: awsRegion.trim() || 'eu-north-1',
       };
       if (iacMode === 'llm') {
@@ -1440,36 +1427,14 @@ export function IaCPage({ onNavigate, projectId, projectName }: IacPageProps) {
         {error && <span className="text-red-400 ml-3">{error}</span>}
       </div>
       <div className="mx-7 mt-4 rounded-2xl border border-white/5 bg-zinc-900/60 p-5">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <p className="text-sm font-semibold text-zinc-100">AWS credentials for Stage 8</p>
-            <p className="mt-1 text-xs text-zinc-400 max-w-3xl">
-              Optional for Terraform file generation. If provided, DeplAI also attempts backend bootstrap and live Terraform validation during this stage.
-              Without credentials, Stage 8 still generates Terraform files and AWS access is only required before deploy/apply.
-            </p>
-          </div>
-          <Tag color={awsAccessKeyId.trim() && awsSecretAccessKey.trim() ? 'emerald' : 'zinc'}>
-            {awsAccessKeyId.trim() && awsSecretAccessKey.trim() ? 'Saved locally' : 'Optional'}
-          </Tag>
-        </div>
-        <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-3">
-          <div>
-            <p className="mb-1.5 text-[11px] text-zinc-500">AWS_ACCESS_KEY_ID</p>
-            <input value={awsAccessKeyId} onChange={(e) => setAwsAccessKeyId(e.target.value)} placeholder="AKIA..." className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
-          </div>
-          <div>
-            <p className="mb-1.5 text-[11px] text-zinc-500">AWS_SECRET_ACCESS_KEY</p>
-            <input type="password" value={awsSecretAccessKey} onChange={(e) => setAwsSecretAccessKey(e.target.value)} placeholder="Enter AWS secret access key" className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
-          </div>
-          <div>
-            <p className="mb-1.5 text-[11px] text-zinc-500">AWS_REGION</p>
-            <input value={awsRegion} onChange={(e) => setAwsRegion(e.target.value)} placeholder="eu-north-1" className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
-          </div>
-          <div className="md:col-span-3">
-            <p className="mb-1.5 text-[11px] text-zinc-500">AWS_SESSION_TOKEN (required for temporary ASIA credentials)</p>
-            <input type="password" value={awsSessionToken} onChange={(e) => setAwsSessionToken(e.target.value)} placeholder="Optional for long-lived AKIA credentials" className="w-full bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs font-mono text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-cyan-500/40 focus:ring-1 focus:ring-cyan-500/20" />
-          </div>
-        </div>
+        <p className="text-sm font-semibold text-zinc-100">Prepare infrastructure</p>
+        <p className="mt-1 text-xs text-zinc-400">
+          Generate and review Terraform first. Connect AWS when you are ready to plan and deploy.
+        </p>
+        <label className="mt-4 block max-w-sm text-xs text-zinc-400">
+          AWS region
+          <input value={awsRegion} onChange={(event) => setAwsRegion(event.target.value)} placeholder="eu-north-1" className="mt-2 w-full rounded-lg border border-white/10 bg-zinc-950 px-3 py-2 text-zinc-200" />
+        </label>
         <div className="mt-4 rounded-xl border border-white/8 bg-zinc-950/70 p-4">
           <div className="flex items-center justify-between gap-4">
             <div>
@@ -2422,6 +2387,17 @@ export function DeployPage({ projectId, onDeploymentStateChange }: DeployPagePro
       : null;
 
     if (statusValue === 'running') {
+      return;
+    }
+
+    if (statusValue === 'awaiting_plan_confirmation') {
+      patchState((prev) => ({
+        ...prev,
+        status: 'idle',
+        progress: Math.max(prev.progress, 60),
+        deployResult: result || prev.deployResult,
+      }));
+      appendLog('Terraform plan is ready for confirmation before apply.', 'info');
       return;
     }
 

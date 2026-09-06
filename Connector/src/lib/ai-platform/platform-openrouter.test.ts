@@ -13,7 +13,6 @@ import {
 } from './openrouter-catalog';
 import { SEED_MODELS } from './catalog/seed';
 import { providerBudgetPaiseToUsdLimit, shouldUsePlatformOpenRouterUpstream } from './platform-upstream';
-import { SEED_MODELS } from './catalog/seed';
 import { platformMeteringCostUsd } from './metering';
 
 describe('platform model allowlist', () => {

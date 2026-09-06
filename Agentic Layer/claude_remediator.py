@@ -48,13 +48,11 @@ DEFAULT_GROQ_MODELS = [
 ]
 
 DEFAULT_OPENROUTER_MODELS = [
-    os.getenv("OPENROUTER_MODEL", "").strip(),
-    "qwen/qwen3-32b",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "moonshotai/kimi-k2-instruct",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
+    os.getenv("REMEDIATION_OPENROUTER_MODEL", "openrouter/free").strip() or "openrouter/free",
 ]
+
+# Only openrouter/free is allowed; no other providers.
+ALLOWED_PROVIDERS = {"openrouter"}
 
 MODEL_PRICING_PER_MILLION: dict[str, tuple[float, float]] = {
     "claude-opus-4-6": (5.00, 25.00),
@@ -393,6 +391,10 @@ def _build_unified_diff(path: str, before: str, after: str) -> str:
 
 
 def _pricing_for_model(model: str) -> tuple[float, float]:
+    normalized = str(model or "").strip().lower()
+    if "openrouter/free" in normalized or "/free" in normalized:
+        return (0.0, 0.0)
+    return (0.0, 0.0)
     normalized = str(model or "").strip().lower()
     if normalized in MODEL_PRICING_PER_MILLION:
         return MODEL_PRICING_PER_MILLION[normalized]
@@ -935,6 +937,7 @@ def _openai_compatible_chat_completion(
         "model": model,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "reasoning": {"effort": "high"},
         "messages": [{"role": "user", "content": prompt}],
     }
     headers = {
@@ -980,9 +983,12 @@ def _openai_compatible_chat_completion(
 
 
 def _call_groq(prompt: str) -> tuple[bool, str]:
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    api_key = (
+        os.getenv("OPENROUTER_API_KEY", "").strip()
+        or api_key or ""
+    )
     if not api_key:
-        return (False, "Missing GROQ_API_KEY.")
+        return (False, "Missing OPENROUTER_API_KEY for remediation.")
 
     preferred = _split_models(os.getenv("REMEDIATION_GROQ_MODEL", "").strip())
     configured_fallbacks = _split_models(os.getenv("REMEDIATION_GROQ_MODEL_FALLBACKS", "").strip())
@@ -1230,73 +1236,23 @@ def run_claude_remediation(
         return (False, "No readable source files were available for remediation.")
 
     def _run_chain(prompt: str) -> tuple[bool, str]:
-        if user_id:
-            try:
-                from ai_gateway import bound_organization, remediate_text
-                ok_gw, raw_gw = remediate_text(
-                    user_id=str(user_id),
-                    organization_id=bound_organization() or None,
-                    model=llm_model or "best_coding",
-                    prompt=prompt,
-                    access_mode=access_mode or "auto",
-                    api_key=llm_api_key,
-                    provider=llm_provider,
-                    credential_id=llm_credential_id,
-                    max_tokens=MAX_COMPLETION_TOKENS,
-                )
-                if ok_gw:
-                    return (True, raw_gw)
-                if str(access_mode or "").strip().lower() in {"platform", "byok"}:
-                    return (False, raw_gw)
-            except Exception as exc:
-                if str(access_mode or "").strip().lower() in {"platform", "byok"}:
-                    return (False, str(exc))
-
-        provider_lower = (llm_provider or "").strip().lower()
-
-        # Groq remediation path (cheap/fast; used for large repos with only
-        # critical/high findings). Falls back to the Claude Agent SDK on failure
-        # when a Claude key is available.
-        if provider_lower == "groq":
-            ok, raw_text = _call_groq(prompt)
-            if ok:
-                return (True, raw_text)
-            claude_key = (
-                os.getenv("ANTHROPIC_API_KEY", "").strip()
-                or os.getenv("CLAUDE_API_KEY", "").strip()
+        """Legacy entrypoint retained for callers, but never a provider fallback."""
+        if not user_id:
+            return False, "Security remediation requires authenticated platform OpenRouter context."
+        try:
+            from ai_gateway import bound_organization, remediate_text
+            return remediate_text(
+                user_id=str(user_id),
+                organization_id=bound_organization() or None,
+                model=llm_model or "best_coding",
+                prompt=prompt,
+                # The gateway helper drops all BYOK/provider values and uses
+                # platform OpenRouter free-model routing.
+                access_mode="platform",
+                max_tokens=MAX_COMPLETION_TOKENS,
             )
-            if not claude_key:
-                return (False, "Groq remediation failed and no Claude fallback key configured: " + raw_text)
-            ok_fb, raw_fb = _call_claude_sdk(
-                prompt,
-                None,
-                None,
-                budget_tracker=budget_tracker,
-                stage="fallback_remediation",
-            )
-            if ok_fb:
-                return (True, raw_fb)
-            return (False, f"Groq remediation failed ({raw_text}); Claude fallback also failed: {raw_fb}")
-
-        effective_api_key = llm_api_key if provider_lower in ("", "claude") else None
-        effective_model = llm_model if provider_lower in ("", "claude") else None
-
-        ok, raw_text = _call_claude_sdk(
-            prompt,
-            effective_api_key,
-            effective_model,
-            budget_tracker=budget_tracker,
-            stage="fallback_remediation",
-        )
-        if ok:
-            return (True, raw_text)
-
-        if provider_lower and provider_lower != "claude":
-            return (
-                False,
-                f"Remediation supports the Claude Agent SDK and Groq; ignored provider '{provider_lower}'. Claude SDK error: {raw_text}",
-            )
-        return (False, "Claude SDK remediation failed: " + raw_text)
+        except Exception as exc:
+            return False, str(exc)
 
     ok = False
     raw_text = ""

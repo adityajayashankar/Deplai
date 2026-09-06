@@ -20,6 +20,8 @@ SCANNER_SUFFIXES = [
     "Dast.json",
     "Cloud.json",
     "Pipeline.json",
+    "ImageSbom.json",
+    "ImageGrype.json",
 ]
 
 CODEBASE_VOLUME = "codebase_deplai"

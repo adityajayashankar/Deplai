@@ -19,6 +19,10 @@ Repo / ZIP (+ optional customization snapshot)
 
 Azure and GCP appear as `provider` on the TypeScript body; **implemented apply path is AWS**.
 
+Analysis, planning, and Terraform generation do not collect AWS credentials, including the older Pipeline IaC screen. Credentials are collected for cloud planning/apply after preparation. Restoring a saved credential/deploy stage requires its analysis, approved decision, and current project Terraform run; missing preparation returns the user to the appropriate earlier stage. Reopening a running deployment resumes monitoring.
+
+The Connector rejects the legacy AWS `runtime_apply=false` generate-and-apply shortcut with HTTP 409 and `requires_generation: true`. AWS callers must use the reviewed Terraform bundle/run and the existing runtime apply confirmation flow.
+
 ## Plan confirmation (hard gate)
 
 `terraform_apply.py` returns `status: awaiting_plan_confirmation` until Connector sends `confirm_plan_summary: true`. The UI copy is “Plan confirmation acknowledged. Calling `/api/pipeline/deploy` with `confirm_plan_summary=true`…”.

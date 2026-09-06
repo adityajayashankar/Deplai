@@ -316,9 +316,10 @@ def filter_by_remediation_scope(
     vulnerabilities: list[Vulnerability],
     remediation_scope: str,
 ) -> tuple[list[Vulnerability], int]:
-    """Keep only critical/high when scope is major (default)."""
-    if str(remediation_scope or "").strip().lower() != "major":
-        return vulnerabilities, 0
+    """Keep only critical/high findings; lower severities are never remediated."""
+    # The argument is retained for request compatibility and intentionally has
+    # no effect on the critical/high-only product policy.
+    _ = remediation_scope
     kept = [v for v in vulnerabilities if v.severity in {"critical", "high"}]
     return kept, len(vulnerabilities) - len(kept)
 
@@ -362,26 +363,9 @@ async def triage_vulnerabilities(
             ),
         )
 
-    llm_candidates = [
-        vuln for vuln in heuristic_candidates
-        if vuln.severity in {"low", "medium"}
-    ]
+    # Medium and low findings are deliberately ignored before any inference.
+    # They remain in the common scope filter so the UI gets the correct count.
     always_remediate = [vuln for vuln in heuristic_candidates if vuln.severity in {"critical", "high"}]
-
-    llm_decisions: dict[str, TriageDecision] = {}
-    if _llm_triage_enabled() and llm_candidates:
-        max_llm = max(1, int(os.getenv("REMEDIATION_LLM_NOISE_TRIAGE_MAX", "24")))
-        batch = llm_candidates[:max_llm]
-        await emit("info", f"Running LLM noise triage on {len(batch)} medium/low finding(s).")
-        llm_decisions = _llm_triage_batch(
-            batch,
-            user_id=user_id,
-            organization_id=organization_id,
-            access_mode=access_mode,
-            llm_model=llm_model,
-            llm_credential_id=llm_credential_id,
-        )
-        result.llm_reviewed = len(batch)
 
     for vuln in always_remediate:
         _apply_decision(
@@ -390,21 +374,13 @@ async def triage_vulnerabilities(
             result=result,
         )
 
-    for vuln in llm_candidates:
-        decision = llm_decisions.get(vuln.id)
-        if decision is None:
-            _apply_decision(
-                vuln,
-                TriageDecision("remediate", "no triage override", 0.6),
-                result=result,
-            )
+    for vuln in heuristic_candidates:
+        if vuln.severity in {"critical", "high"}:
             continue
-        _apply_decision(vuln, decision, result=result)
-
-    if result.llm_ignored:
-        await emit(
-            "info",
-            f"LLM triage marked {result.llm_ignored} additional finding(s) as ignorable noise.",
+        _apply_decision(
+            vuln,
+            TriageDecision("remediate", "below critical/high remediation policy", 0.0),
+            result=result,
         )
 
     scoped_keep, scope_dropped = filter_by_remediation_scope(result.keep, remediation_scope)

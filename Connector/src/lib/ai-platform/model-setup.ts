@@ -20,7 +20,6 @@ import {
 } from '@/lib/ai-platform/subscription-access';
 import {
   DEFAULT_REMEDIATION_PLATFORM_MODEL,
-  filterRemediationPlatformModels,
 } from '@/lib/ai-platform/remediation-platform-models';
 
 export type SetupModelRow = {
@@ -144,8 +143,8 @@ export async function userModelSetup(input: { userId: string; organizationId?: s
 export async function remediationModelSetup(input: { userId: string; organizationId?: string }) {
   const base = await userModelSetup(input);
   return {
-    ...base,
+    ...base, security_free_catalog: true, allow_paid: false,
     default_model: DEFAULT_REMEDIATION_PLATFORM_MODEL,
-    models: filterRemediationPlatformModels(base.models),
+    models: [],
   };
 }

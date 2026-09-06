@@ -50,7 +50,6 @@ import {
   uniqueFindingIds,
   RESULTS_SURFACES,
   type FindingCategory,
-  type RemediationModelValue,
   type ResultsSurface,
   type ScanResultsPayload,
   type SecurityModuleId,
@@ -82,7 +81,16 @@ const STAGE_INDEX: Record<PipelineStageId, number> = {
 };
 
 const RESULTS_HEARTBEAT_MS = 30_000;
-const REMEDIATION_DEFAULT_MODEL = '';
+const REMEDIATION_DEFAULT_MODEL = 'openrouter/free';
+const REMEDIATION_AGENT = {
+  accessMode: 'platform',
+  model: REMEDIATION_DEFAULT_MODEL,
+  provider: null,
+  credentialId: null,
+  ready: true,
+  blockedReason: null,
+  sourceLabel: 'OpenRouter Free',
+};
 
 const EMPTY_STATS = { total: 0, critical: 0, high: 0, medium: 0, low: 0, autoFixable: 0 };
 
@@ -458,212 +466,6 @@ const BorderGlow: React.FC<BorderGlowProps> = ({
   );
 };
 
-class Pixel {
-  width: number;
-  height: number;
-  ctx: CanvasRenderingContext2D;
-  x: number;
-  y: number;
-  color: string;
-  speed: number;
-  size: number;
-  sizeStep: number;
-  minSize: number;
-  maxSizeInteger: number;
-  maxSize: number;
-  delay: number;
-  counter: number;
-  counterStep: number;
-  isIdle: boolean;
-  isReverse: boolean;
-  isShimmer: boolean;
-
-  constructor(canvas: HTMLCanvasElement, context: CanvasRenderingContext2D, x: number, y: number, color: string, speed: number, delay: number) {
-    const dpr = window.devicePixelRatio || 1;
-    this.width = canvas.width / dpr;
-    this.height = canvas.height / dpr;
-    this.ctx = context;
-    this.x = x;
-    this.y = y;
-    this.color = color;
-    this.speed = this.getRandomValue(0.1, 0.9) * speed;
-    this.size = 0;
-    this.sizeStep = Math.random() * 0.4;
-    this.minSize = 0.5;
-    this.maxSizeInteger = 2;
-    this.maxSize = this.getRandomValue(this.minSize, this.maxSizeInteger);
-    this.delay = delay;
-    this.counter = 0;
-    this.counterStep = Math.random() * 4 + (this.width + this.height) * 0.01;
-    this.isIdle = false;
-    this.isReverse = false;
-    this.isShimmer = false;
-  }
-
-  getRandomValue(min: number, max: number) {
-    return Math.random() * (max - min) + min;
-  }
-
-  draw() {
-    const centerOffset = this.maxSizeInteger * 0.5 - this.size * 0.5;
-    this.ctx.fillStyle = this.color;
-    this.ctx.fillRect(Math.round(this.x + centerOffset), Math.round(this.y + centerOffset), Math.round(this.size), Math.round(this.size));
-  }
-
-  appear() {
-    this.isIdle = false;
-    if (this.counter <= this.delay) {
-      this.counter += this.counterStep;
-      return;
-    }
-    if (this.size >= this.maxSize) this.isShimmer = true;
-    if (this.isShimmer) this.shimmer();
-    else this.size += this.sizeStep;
-    this.draw();
-  }
-
-  disappear() {
-    this.isShimmer = false;
-    this.counter = 0;
-    if (this.size <= 0) {
-      this.isIdle = true;
-      return;
-    }
-    this.size -= 0.1;
-    this.draw();
-  }
-
-  shimmer() {
-    if (this.size >= this.maxSize) this.isReverse = true;
-    else if (this.size <= this.minSize) this.isReverse = false;
-    if (this.isReverse) this.size -= this.speed;
-    else this.size += this.speed;
-  }
-}
-
-function getEffectiveSpeed(value: number, reducedMotion: boolean) {
-  const throttle = 0.001;
-  if (value <= 0 || reducedMotion) return 0;
-  if (value >= 100) return 100 * throttle;
-  return value * throttle;
-}
-
-interface PixelCardProps {
-  gap?: number;
-  speed?: number;
-  colors?: string;
-  noFocus?: boolean;
-  className?: string;
-  children: React.ReactNode;
-}
-
-const PixelCard: React.FC<PixelCardProps> = ({
-  gap = 5,
-  speed = 35,
-  colors = '#f8fafc,#f1f5f9,#cbd5e1',
-  noFocus = false,
-  className = '',
-  children,
-}) => {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const pixelsRef = useRef<Pixel[]>([]);
-  const animationRef = useRef<number | null>(null);
-  const timePreviousRef = useRef(0);
-  const reducedMotionRef = useRef(false);
-
-  const initPixels = useCallback(() => {
-    if (!containerRef.current || !canvasRef.current) return;
-    const rect = containerRef.current.getBoundingClientRect();
-    const width = Math.floor(rect.width);
-    const height = Math.floor(rect.height);
-    const ctx = canvasRef.current.getContext('2d');
-    if (!ctx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    canvasRef.current.width = width * dpr;
-    canvasRef.current.height = height * dpr;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.scale(dpr, dpr);
-
-    const colorsArray = colors.split(',');
-    const pixels: Pixel[] = [];
-    for (let x = 0; x < width; x += gap) {
-      for (let y = 0; y < height; y += gap) {
-        const color = colorsArray[Math.floor(Math.random() * colorsArray.length)];
-        const dx = x - width / 2;
-        const dy = y - height / 2;
-        const distance = Math.sqrt(dx * dx + dy * dy);
-        const delay = reducedMotionRef.current ? 0 : distance;
-        pixels.push(new Pixel(canvasRef.current, ctx, x, y, color, getEffectiveSpeed(speed, reducedMotionRef.current), delay));
-      }
-    }
-    pixelsRef.current = pixels;
-  }, [colors, gap, speed]);
-
-  const handleAnimation = useCallback((name: 'appear' | 'disappear') => {
-    if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
-    const tick = () => {
-      animationRef.current = requestAnimationFrame(tick);
-      const timeNow = performance.now();
-      const timePassed = timeNow - timePreviousRef.current;
-      const timeInterval = 1000 / 60;
-      if (timePassed < timeInterval) return;
-      timePreviousRef.current = timeNow - (timePassed % timeInterval);
-
-      const canvas = canvasRef.current;
-      const ctx = canvas?.getContext('2d');
-      if (!canvas || !ctx) return;
-      const dpr = window.devicePixelRatio || 1;
-      ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
-
-      let allIdle = true;
-      for (const pixel of pixelsRef.current) {
-        pixel[name]();
-        if (!pixel.isIdle) allIdle = false;
-      }
-      if (allIdle && animationRef.current !== null) {
-        cancelAnimationFrame(animationRef.current);
-        animationRef.current = null;
-      }
-    };
-    timePreviousRef.current = performance.now();
-    animationRef.current = requestAnimationFrame(tick);
-  }, []);
-
-  useEffect(() => {
-    reducedMotionRef.current = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    initPixels();
-    const observer = new ResizeObserver(() => initPixels());
-    if (containerRef.current) observer.observe(containerRef.current);
-    return () => {
-      observer.disconnect();
-      if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
-    };
-  }, [initPixels]);
-
-  return (
-    <div
-      ref={containerRef}
-      className={`relative isolate overflow-hidden select-none transition-colors duration-200 ease-[cubic-bezier(0.5,1,0.89,1)] ${className}`}
-      onMouseEnter={() => handleAnimation('appear')}
-      onMouseLeave={() => handleAnimation('disappear')}
-      onFocus={noFocus ? undefined : (event) => {
-        if (event.currentTarget.contains(event.relatedTarget)) return;
-        handleAnimation('appear');
-      }}
-      onBlur={noFocus ? undefined : (event) => {
-        if (event.currentTarget.contains(event.relatedTarget)) return;
-        handleAnimation('disappear');
-      }}
-      tabIndex={noFocus ? -1 : 0}
-    >
-      <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 z-0 block h-full w-full" />
-      <div className="relative z-10 flex h-full w-full flex-col">{children}</div>
-    </div>
-  );
-};
-
 const VERTEX_SRC = 'void main() { gl_Position = vec4(position, 1.0); }';
 const FRAGMENT_SRC = `
 precision highp float;
@@ -768,30 +570,14 @@ function RunButton({
   children: React.ReactNode;
 }) {
   return (
-    <div className={`h-12 w-full ${className}`}>
-      <PixelCard
-        noFocus
-        colors="#3f3f46,#27272a,#18181b"
-        gap={4}
-        speed={35}
-        className={`h-full w-full rounded-none transition-all ${
-          disabled
-            ? 'cursor-not-allowed border-[3px] border-black bg-white opacity-50'
-            : 'cursor-pointer border-[3px] border-black bg-black shadow-[4px_4px_0_0_#000] hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none'
-        }`}
-      >
-        <button
-          type="button"
-          onClick={disabled ? undefined : onClick}
-          disabled={disabled}
-          className={`flex h-full w-full items-center justify-center gap-2 text-sm font-semibold outline-none transition-colors ${
-            disabled ? 'text-neutral-400' : 'text-white'
-          }`}
-        >
-          {children}
-        </button>
-      </PixelCard>
-    </div>
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`h-12 w-full ${appBtnInk} ${className}`}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -842,17 +628,15 @@ function inferBaseStage({
   approvalSent,
   remediationState,
   hasScanOutcome,
-  hasVulnerabilities,
   scanState,
 }: {
   setupOpen: boolean;
   approvalSent: boolean;
   remediationState: 'idle' | 'running' | 'waiting_decision' | 'waiting_approval' | 'completed' | 'error';
   hasScanOutcome: boolean;
-  hasVulnerabilities: boolean;
   scanState: 'idle' | 'running' | 'completed' | 'error' | 'waiting_decision' | 'waiting_approval';
 }): PipelineStageId {
-  if (setupOpen && hasScanOutcome && hasVulnerabilities) return 'remediate_setup';
+  if (setupOpen && hasScanOutcome) return 'remediate_setup';
   if (approvalSent || remediationState === 'completed') return 'pr_rescan';
   if (remediationState === 'waiting_decision' || remediationState === 'waiting_approval') return 'approval';
   if (remediationState === 'running' || remediationState === 'error') return 'remediate_run';
@@ -881,15 +665,7 @@ export default function SecurityAnalysisPage() {
     setCachedResults,
     resetRemediation,
   } = useScan();
-  const [agentModel, setAgentModel] = useState<RemediationModelValue>({
-    accessMode: 'platform',
-    model: REMEDIATION_DEFAULT_MODEL,
-    provider: null,
-    credentialId: null,
-    ready: false,
-    blockedReason: 'Loading model options…',
-    sourceLabel: 'Platform',
-  });
+  const agentModel = REMEDIATION_AGENT;
 
   const { state: scanState, messages: scanMessages, projectName: scanProjectName } = getScanState(projectId);
   const { state: remediationState, messages: remMessages } = getRemediationState(projectId);
@@ -1358,6 +1134,15 @@ export default function SecurityAnalysisPage() {
   const unifiedFindings = useMemo<UnifiedFinding[]>(() => (
     uniqueFindingIds(Array.isArray(results?.findings) ? results.findings : [])
   ), [results]);
+  const remediableFindingCount = useMemo(() => {
+    const fromFindings = unifiedFindings.filter((finding) => {
+      const severity = String(finding.severity || '').trim().toLowerCase();
+      return severity === 'critical' || severity === 'high';
+    }).length;
+    if (fromFindings > 0) return fromFindings;
+    return Math.max(0, Number(scanStats?.critical || results?.posture?.critical || 0))
+      + Math.max(0, Number(scanStats?.high || results?.posture?.high || 0));
+  }, [results?.posture?.critical, results?.posture?.high, scanStats?.critical, scanStats?.high, unifiedFindings]);
   const pipelineModules = useMemo(
     () => mergeModules(results?.modules, liveModules, {
       scanning: scanState === 'running' || scanActive,
@@ -1372,9 +1157,8 @@ export default function SecurityAnalysisPage() {
   const remediatingThisProject = remediationState === 'running';
   const remediationFinished = remediationState === 'completed';
   const remediationCanStart = !['running', 'waiting_decision', 'waiting_approval'].includes(remediationState);
-  const projectAccessReady = Boolean(projectMeta) && !loadingProject && !projectAuthError;
-  const canOpenRemediationSetup = projectAccessReady && hasVulnerabilities && scanState !== 'running' && remediationCanStart;
-  const canLaunchRemediation = canOpenRemediationSetup;
+  const canOpenRemediationSetup = hasScanOutcome && scanState !== 'running' && remediationCanStart;
+  const canLaunchRemediation = canOpenRemediationSetup && remediableFindingCount > 0;
 
   useEffect(() => {
     if (activeStage !== 'results' || !hasScanOutcome || (scanState === 'running' && !modulesSettled)) return;
@@ -1389,7 +1173,6 @@ export default function SecurityAnalysisPage() {
     approvalSent,
     remediationState,
     hasScanOutcome,
-    hasVulnerabilities,
     scanState,
   });
   const canOpenResults = hasScanOutcome && (scanState !== 'running' || modulesSettled);
@@ -1682,20 +1465,16 @@ export default function SecurityAnalysisPage() {
   const handleStartRemediation = useCallback(async () => {
     const trimmedToken = githubToken.trim();
 
-    if (loadingProject) {
-      setError('Project metadata is still loading. Wait a moment, then retry remediation.');
-      return;
-    }
-    if (!projectMeta || projectAuthError) {
-      setError(projectAuthError || 'Project access could not be verified. Reopen it from the dashboard, then retry remediation.');
+    if (remediableFindingCount === 0) {
+      setError('No critical or high findings are available for remediation. Medium and low findings are ignored.');
       return;
     }
     if (!canLaunchRemediation) {
-      setError('Run a successful scan with current project access before starting remediation.');
+      setError('Complete a scan with critical or high findings before starting remediation.');
       return;
     }
     if (!agentModel.ready) {
-      setError(agentModel.blockedReason || 'Choose a platform model or a saved BYOK credential before starting remediation.');
+      setError(agentModel.blockedReason || 'OpenRouter Free Router is not ready. Try again shortly.');
       return;
     }
 
@@ -1714,18 +1493,17 @@ export default function SecurityAnalysisPage() {
       await startRemediation(
         projectId,
         trimmedToken || undefined,
-        agentModel.provider || undefined,
+        undefined,
         undefined,
         agentModel.model,
         'major',
-        agentModel.accessMode,
-        agentModel.credentialId || undefined,
+        'platform',
       );
       setGithubToken('');
     } catch (remediationError) {
       setError(remediationError instanceof Error ? remediationError.message : 'Failed to start remediation');
     }
-  }, [agentModel, canLaunchRemediation, githubToken, loadingProject, projectAuthError, projectId, projectMeta, remediationState, resetRemediation, startRemediation]);
+  }, [agentModel, canLaunchRemediation, githubToken, projectId, remediationState, remediableFindingCount, resetRemediation, startRemediation]);
 
   const handleContinueRound = useCallback(() => {
     continueRemediationRound(projectId);
@@ -2183,14 +1961,18 @@ export default function SecurityAnalysisPage() {
           />
         )}
 
-        {canLaunchRemediation ? (
+        {hasScanOutcome && scanState !== 'running' ? (
           <div className={`${secPaper} overflow-hidden`}>
             <div className="relative z-10 flex flex-col gap-4 p-6 sm:flex-row sm:items-center sm:justify-between">
               <div>
-                <h3 className="mb-1 flex items-center gap-2 text-base font-bold text-black"><Sparkles className="h-4 w-4" />AI Auto-Remediation Available</h3>
-                <p className="text-[13px] text-neutral-600">Deploy the remediation agent to patch these vulnerabilities, create a PR, and verify with a re-scan.</p>
+                <h3 className="mb-1 flex items-center gap-2 text-base font-bold text-black"><Sparkles className="h-4 w-4" />AI Auto-Remediation</h3>
+                <p className="text-[13px] text-neutral-600">
+                  {remediableFindingCount > 0
+                    ? `${remediableFindingCount} critical/high finding${remediableFindingCount === 1 ? '' : 's'} can be remediated. Medium and low findings are ignored.`
+                    : 'No critical or high findings are eligible. Medium and low findings are ignored.'}
+                </p>
               </div>
-              <div className="w-55"><RunButton onClick={() => { setSetupOpen(true); setActiveStage('remediate_setup'); }}>Setup AI Agent</RunButton></div>
+              <div className="w-55"><RunButton disabled={!canOpenRemediationSetup} onClick={() => { setSetupOpen(true); setActiveStage('remediate_setup'); }}>Setup Remediation Agent</RunButton></div>
             </div>
           </div>
         ) : null}
@@ -2221,11 +2003,11 @@ export default function SecurityAnalysisPage() {
             <div className="border-[3px] border-black bg-white px-4 py-3">
               <div className="text-sm font-semibold text-black">Remediation Pipeline Engine</div>
               <p className="mt-1 text-xs text-neutral-600">
-                Choose a subscription-hosted platform model or a vaulted BYOK key. API keys are not pasted on this page.
+                Remediation uses the OpenRouter Free Router. Upstream selection is automatic and this workflow never uses paid or BYOK inference.
               </p>
             </div>
           </div>
-          <RemediationModelPicker value={agentModel} onChange={setAgentModel} persistKey={projectId} />
+          <RemediationModelPicker />
           <div className="border-t border-[#1A1A1A] pt-4">
             <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">GitHub PAT (Optional)</label>
             <input type="password" value={githubToken} onChange={(event) => setGithubToken(event.target.value)} placeholder="ghp_..." className={appInput} />
@@ -2239,6 +2021,9 @@ export default function SecurityAnalysisPage() {
           </RunButton>
           {!agentModel.ready ? (
             <p className="text-xs text-amber-800">{agentModel.blockedReason || 'Loading remediation models…'}</p>
+          ) : null}
+          {remediableFindingCount === 0 ? (
+            <p className="text-xs text-neutral-600">No critical or high findings are available. Medium and low findings are ignored.</p>
           ) : null}
           {remediationState !== 'idle' ? (
             <button type="button" onClick={handleResetRemediation} className={appBtnPaper}>
@@ -2382,7 +2167,7 @@ export default function SecurityAnalysisPage() {
           <p className="text-sm text-zinc-400">
             {waitingForDecision
               ? 'The first remediation round finished. Review the patch set and decide whether to push these fixes or run one more remediation round.'
-              : 'Review the current patch set one last time, then approve persistence and PR creation. You can rerun a verification scan after the PR exists.'}
+              : 'Review the current patch set, then approve verification and PR creation. ZIP projects receive downloadable patches.'}
           </p>
         </div>
 
@@ -2402,6 +2187,16 @@ export default function SecurityAnalysisPage() {
             ))}
           </div>
         </div>
+
+        <button type="button" className={appBtnPaper} disabled={!changedFiles.some((item) => item.diff)} onClick={() => {
+          const patch = changedFiles.filter((item) => item.diff).map((item) => item.diff).join('\n');
+          const url = URL.createObjectURL(new Blob([patch], { type: 'text/x-diff;charset=utf-8' }));
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = `security-${projectId}.patch`;
+          link.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }}>Download patches</button>
 
         {selectedDiff ? (
           <div className={`${secPaper} overflow-hidden`}>
@@ -2448,7 +2243,7 @@ export default function SecurityAnalysisPage() {
             <div className="mb-6 border-[3px] border-black bg-white p-4">
               <label className="flex cursor-pointer items-start gap-3">
                 <input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)} className="mt-1 h-4 w-4 rounded-none border-black bg-white text-black" />
-                <span className="text-sm leading-relaxed text-neutral-600">I approve these code modifications. Persist the fix branch and open a Pull Request automatically if this is a GitHub project. Verification scan is optional after the PR is created.</span>
+                <span className="text-sm leading-relaxed text-neutral-600">I approve these code modifications. Run verification and open a Pull Request if this is a GitHub project. Findings remain unverified when their required checks fail.</span>
               </label>
             </div>
             <RunButton disabled={!approved} onClick={handleApproveAndPush}>Approve &amp; Push PR</RunButton>

@@ -151,24 +151,24 @@ MAX_FILE_CHARS = 7000
 MAX_TOTAL_CHARS = 48000
 MAX_FILES = 14
 
-REPO_ANALYZER_MODEL = os.getenv("CLAUDE_REPO_ANALYZER_MODEL", "claude-3-5-haiku-20241022").strip() or "claude-3-5-haiku-20241022"
-REVIEW_QUESTION_MODEL = os.getenv("CLAUDE_REVIEW_QUESTION_MODEL", "claude-3-5-haiku-20241022").strip() or "claude-3-5-haiku-20241022"
-INFRA_PLANNER_MODEL = os.getenv("CLAUDE_INFRA_PLANNER_MODEL", os.getenv("CLAUDE_MODEL", "claude-3-7-sonnet-latest")).strip() or "claude-3-7-sonnet-latest"
+REPO_ANALYZER_MODEL = os.getenv("CLAUDE_REPO_ANALYZER_MODEL", "qwen/qwen-2.5-coder-32b-instruct:free").strip() or "openrouter/free"
+REVIEW_QUESTION_MODEL = os.getenv("CLAUDE_REVIEW_QUESTION_MODEL", "qwen/qwen-2.5-coder-32b-instruct:free").strip() or "openrouter/free"
+INFRA_PLANNER_MODEL = os.getenv("CLAUDE_INFRA_PLANNER_MODEL", os.getenv("CLAUDE_MODEL", "qwen/qwen-2.5-coder-32b-instruct:free")).strip() or "openrouter/free"
 TERRAFORM_CONTEXT_MODEL = os.getenv("CLAUDE_TERRAFORM_CONTEXT_MODEL", REPO_ANALYZER_MODEL).strip() or REPO_ANALYZER_MODEL
 TERRAFORM_PROFILE_MODEL = os.getenv("CLAUDE_TERRAFORM_PROFILE_MODEL", INFRA_PLANNER_MODEL).strip() or INFRA_PLANNER_MODEL
 TERRAFORM_STRUCTURE_MODEL = os.getenv("CLAUDE_TERRAFORM_STRUCTURE_MODEL", REPO_ANALYZER_MODEL).strip() or REPO_ANALYZER_MODEL
 TERRAFORM_VALIDATOR_MODEL = os.getenv("CLAUDE_TERRAFORM_VALIDATOR_MODEL", REPO_ANALYZER_MODEL).strip() or REPO_ANALYZER_MODEL
 MAX_CLAUDE_PIPELINE_COST_USD = float(os.getenv("DEPLAI_CLAUDE_MAX_PIPELINE_COST_USD", "3.0") or "3.0")
 MAX_CLAUDE_TERRAFORM_GEN_COST_USD = float(os.getenv("DEPLAI_CLAUDE_MAX_TERRAFORM_GEN_COST_USD", "1.0") or "1.0")
-FREE_TERRAFORM_DEFAULT_PROVIDER = "groq"
-FREE_TERRAFORM_DEFAULT_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip() or "llama-3.1-8b-instant"
-FREE_TERRAFORM_OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free").strip() or "meta-llama/llama-3.3-70b-instruct:free"
+FREE_TERRAFORM_DEFAULT_PROVIDER = "openrouter"
+FREE_TERRAFORM_DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-coder-32b-instruct:free").strip() or "openrouter/free"
+FREE_TERRAFORM_OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen-2.5-coder-32b-instruct:free").strip() or "meta-llama/llama-3.3-70b-instruct:free"
 FREE_TERRAFORM_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b").strip() or "qwen2.5-coder:7b"
-TERRAFORM_LLM_PROVIDERS = ("groq", "openrouter", "ollama")
+TERRAFORM_LLM_PROVIDERS = ("openrouter",)
 MODEL_PRICING_PER_MILLION: dict[str, tuple[float, float]] = {
-    "claude-3-5-haiku-20241022": (0.80, 4.00),
+    "qwen/qwen-2.5-coder-32b-instruct:free": (0.80, 4.00),
     "claude-3-5-sonnet-20241022": (3.00, 15.00),
-    "claude-3-7-sonnet-latest": (3.00, 15.00),
+    "qwen/qwen-2.5-coder-32b-instruct:free": (3.00, 15.00),
 }
 
 
@@ -196,8 +196,8 @@ def _pricing_for_model(model: str) -> tuple[float, float]:
     if normalized in MODEL_PRICING_PER_MILLION:
         return MODEL_PRICING_PER_MILLION[normalized]
     if "haiku" in normalized:
-        return MODEL_PRICING_PER_MILLION["claude-3-5-haiku-20241022"]
-    return MODEL_PRICING_PER_MILLION["claude-3-7-sonnet-latest"]
+        return MODEL_PRICING_PER_MILLION["qwen/qwen-2.5-coder-32b-instruct:free"]
+    return MODEL_PRICING_PER_MILLION["qwen/qwen-2.5-coder-32b-instruct:free"]
 
 
 def _estimate_tokens(text: str) -> int:

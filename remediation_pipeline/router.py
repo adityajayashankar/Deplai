@@ -1,28 +1,16 @@
 from __future__ import annotations
 
-import json
-import os
-import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from threading import Lock
-from urllib import error as urlerror
-from urllib import request as urlrequest
 
 from remediation_pipeline.models import ProviderQuota, ProviderStatusResponse
 from remediation_pipeline.remediation_store import record_llm_dispatch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "Agentic Layer"))
 
-from claude_remediator import _call_claude_sdk  # noqa: E402
-
-
-DEFAULT_TIMEOUT_SECONDS = 10
-
-
-@dataclass
+@dataclass(frozen=True)
 class ProviderConfig:
+    """Compatibility shape for remediation provider status responses."""
+
     name: str
     model: str
     quota_daily: int
@@ -30,18 +18,14 @@ class ProviderConfig:
 
 
 class LLMRouter:
-    """Route requests through free-tier providers with quota-aware fallback."""
+    """Security-remediation inference gateway.
 
-    def __init__(self) -> None:
-        self._configs: list[ProviderConfig] = [
-            ProviderConfig("groq", os.getenv("REMEDIATION_GROQ_MODEL", "llama-3.3-70b-versatile"), int(os.getenv("REMEDIATION_GROQ_DAILY_QUOTA", "14400")), 1),
-            ProviderConfig("openrouter", os.getenv("REMEDIATION_OPENROUTER_MODEL", "deepseek/deepseek-chat-v3-0324:free"), int(os.getenv("REMEDIATION_OPENROUTER_DAILY_QUOTA", "50")), 2),
-            ProviderConfig("ollama", os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b"), int(os.getenv("REMEDIATION_OLLAMA_DAILY_QUOTA", "1000000")), 3),
-            ProviderConfig("opencode", os.getenv("OPENCODE_MODEL", "gpt-4o-mini"), int(os.getenv("REMEDIATION_OPENCODE_DAILY_QUOTA", "1000000")), 4),
-        ]
-        self._used_today: dict[str, int] = {cfg.name: 0 for cfg in self._configs}
-        self._reset_at_utc = self._next_midnight_utc()
-        self._lock = Lock()
+    This class deliberately has no direct provider SDK or HTTP fallback. Every
+    request must enter Connector's authenticated AI platform, which selects a
+    live OpenRouter ``:free`` model, meters it, and owns retries/cooldowns.
+    """
+
+    _config = ProviderConfig("openrouter", "best_coding", 0, 1)
 
     def route(
         self,
@@ -57,257 +41,66 @@ class LLMRouter:
         access_mode: str | None = None,
         llm_credential_id: str | None = None,
     ) -> tuple[str, str, int]:
-        self._reset_if_needed()
+        if not user_id:
+            raise RuntimeError(
+                "Security remediation requires authenticated platform OpenRouter context; "
+                "direct provider fallback is disabled."
+            )
 
-        mode = (access_mode or "auto").strip().lower() or "auto"
+        model = preferred_model or "best_coding"
+        try:
+            from ai_gateway import bound_organization, remediate_text
 
-        def journal(
-            success: bool | None = None,
-            error: str | None = None,
-            *,
-            provider: str | None = None,
-            model: str | None = None,
-        ) -> None:
             record_llm_dispatch(
                 stage="pipeline_targeted",
-                provider=provider or preferred_provider or "auto",
-                model=model or preferred_model or "auto",
-                access_mode=mode,
-                success=success,
-                error=error,
+                provider="openrouter",
+                model=model,
+                access_mode="platform",
             )
-
-        if user_id:
-            try:
-                from ai_gateway import bound_organization, remediate_text
-                journal()
-                ok, response = remediate_text(
-                    user_id=str(user_id),
-                    organization_id=str(organization_id or bound_organization() or "").strip() or None,
-                    prompt=prompt,
-                    model=preferred_model,
-                    access_mode=mode,
-                    api_key=preferred_api_key,
-                    provider=preferred_provider,
-                    credential_id=llm_credential_id,
-                )
-                journal(ok, None if ok else response)
-                if ok:
-                    tokens_used = max(estimated_tokens, len(response) // 4)
-                    return response, f"gateway:{mode}", tokens_used
-                if mode in {"platform", "byok"}:
-                    raise RuntimeError(f"AI platform {mode} remediation failed: {response}")
-            except RuntimeError:
-                raise
-            except Exception as exc:
-                journal(False, str(exc))
-                if mode in {"platform", "byok"}:
-                    raise RuntimeError(f"AI platform {mode} remediation failed: {exc}") from exc
-
-        provider_name = str(preferred_provider or "").strip().lower()
-        if force_claude or provider_name in {"claude", "anthropic"}:
-            journal(provider="claude", model=preferred_model)
-            ok, response = self._dispatch_claude_sdk(
-                prompt,
-                api_key=str(preferred_api_key or "").strip(),
-                model=str(preferred_model or "").strip(),
+            ok, response = remediate_text(
+                user_id=str(user_id),
+                organization_id=str(organization_id or bound_organization() or "").strip() or None,
+                prompt=prompt,
+                model=model,
+                # Caller API keys, providers, and modes are intentionally not
+                # forwarded. remediate_text enforces platform OpenRouter.
+                access_mode="platform",
             )
-            journal(ok, None if ok else response, provider="claude", model=preferred_model)
-            if ok:
-                tokens_used = max(estimated_tokens, len(response) // 4)
-                return response, "claude", tokens_used
-            raise RuntimeError(f"Claude SDK remediation failed: {response}")
+            record_llm_dispatch(
+                stage="pipeline_targeted",
+                provider="openrouter",
+                model=model,
+                access_mode="platform",
+                success=ok,
+                error=None if ok else response,
+            )
+        except Exception as exc:
+            record_llm_dispatch(
+                stage="pipeline_targeted",
+                provider="openrouter",
+                model=model,
+                access_mode="platform",
+                success=False,
+                error=str(exc),
+            )
+            raise RuntimeError(f"Platform OpenRouter remediation failed: {exc}") from exc
 
-        errors: list[str] = []
-        for cfg in sorted(self._configs, key=lambda item: item.priority):
-            if not self._has_quota(cfg):
-                continue
-
-            journal(provider=cfg.name, model=cfg.model)
-            ok, response = self._dispatch(cfg, prompt)
-            journal(ok, None if ok else response, provider=cfg.name, model=cfg.model)
-            if ok:
-                with self._lock:
-                    self._used_today[cfg.name] = self._used_today.get(cfg.name, 0) + 1
-                tokens_used = max(estimated_tokens, len(response) // 4)
-                return response, cfg.name, tokens_used
-
-            errors.append(f"{cfg.name}: {response}")
-            if "429" in response.lower() or "rate limit" in response.lower():
-                continue
-
-        raise RuntimeError("All remediation providers failed: " + " | ".join(errors))
-
-    @staticmethod
-    def _dispatch_claude_sdk(prompt: str, *, api_key: str, model: str) -> tuple[bool, str]:
-        effective_api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "").strip()
-        effective_model = (
-            model
-            or os.getenv("REMEDIATION_CLAUDE_MODEL", "").strip()
-            or os.getenv("CLAUDE_MODEL", "").strip()
-            or "claude-sonnet-4-5"
-        )
-        if not effective_api_key:
-            return False, "Missing ANTHROPIC_API_KEY"
-        return _call_claude_sdk(
-            prompt,
-            effective_api_key,
-            effective_model,
-            stage="remediation_pipeline",
-        )
+        if not ok:
+            raise RuntimeError(f"Platform OpenRouter remediation failed: {response}")
+        return response, "gateway:platform-openrouter", max(estimated_tokens, len(response) // 4)
 
     def status(self) -> ProviderStatusResponse:
-        self._reset_if_needed()
-        providers = [
-            ProviderQuota(
-                provider=cfg.name,
-                model=cfg.model,
-                quota_daily=cfg.quota_daily,
-                calls_used_today=self._used_today.get(cfg.name, 0),
-                reset_at_utc=self._reset_at_utc,
-            )
-            for cfg in sorted(self._configs, key=lambda item: item.priority)
-        ]
-        return ProviderStatusResponse(providers=providers)
-
-    def _has_quota(self, cfg: ProviderConfig) -> bool:
-        used = self._used_today.get(cfg.name, 0)
-        return used < cfg.quota_daily
-
-    def _reset_if_needed(self) -> None:
-        now = datetime.now(UTC)
-        with self._lock:
-            if now < self._reset_at_utc:
-                return
-            self._used_today = {cfg.name: 0 for cfg in self._configs}
-            self._reset_at_utc = self._next_midnight_utc()
-
-    @staticmethod
-    def _next_midnight_utc() -> datetime:
-        now = datetime.now(UTC)
-        tomorrow = now.date() + timedelta(days=1)
-        return datetime.combine(tomorrow, datetime.min.time(), tzinfo=UTC)
-
-    def _dispatch(self, cfg: ProviderConfig, prompt: str) -> tuple[bool, str]:
-        if cfg.name == "groq":
-            api_key = os.getenv("GROQ_API_KEY", "").strip()
-            if not api_key:
-                return False, "Missing GROQ_API_KEY"
-            base = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-            return self._openai_compatible_chat(
-                url=f"{base}/chat/completions",
-                api_key=api_key,
-                model=cfg.model,
-                prompt=prompt,
-            )
-
-        if cfg.name == "openrouter":
-            api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-            if not api_key:
-                return False, "Missing OPENROUTER_API_KEY"
-            base = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-            extra = {
-                "HTTP-Referer": os.getenv("NEXT_PUBLIC_APP_URL", "http://localhost:3000"),
-                "X-Title": os.getenv("OPENROUTER_APP_NAME", "deplai-agentic"),
-            }
-            return self._openai_compatible_chat(
-                url=f"{base}/chat/completions",
-                api_key=api_key,
-                model=cfg.model,
-                prompt=prompt,
-                extra_headers=extra,
-            )
-
-        if cfg.name == "ollama":
-            api_key = os.getenv("OLLAMA_API_KEY", "").strip()
-            if not api_key:
-                return False, "Missing OLLAMA_API_KEY"
-            endpoint = os.getenv("OLLAMA_CLOUD_CHAT_ENDPOINT", "https://ollama.com/api/chat")
-            payload = {
-                "model": cfg.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 1400},
-            }
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-                "User-Agent": "deplai-agentic/1.0",
-            }
-            return self._raw_chat(endpoint, payload, headers, response_path=("message", "content"))
-
-        if cfg.name == "opencode":
-            api_key = os.getenv("OPENCODE_API_KEY", "").strip()
-            if not api_key:
-                return False, "Missing OPENCODE_API_KEY"
-            base = os.getenv("OPENCODE_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-            return self._openai_compatible_chat(
-                url=f"{base}/chat/completions",
-                api_key=api_key,
-                model=cfg.model,
-                prompt=prompt,
-            )
-
-        return False, f"Unsupported provider: {cfg.name}"
-
-    def _openai_compatible_chat(
-        self,
-        *,
-        url: str,
-        api_key: str,
-        model: str,
-        prompt: str,
-        extra_headers: dict[str, str] | None = None,
-    ) -> tuple[bool, str]:
-        payload = {
-            "model": model,
-            "temperature": 0.1,
-            "max_tokens": 1400,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "deplai-agentic/1.0",
-        }
-        if extra_headers:
-            headers.update(extra_headers)
-        return self._raw_chat(url, payload, headers, response_path=("choices", 0, "message", "content"))
-
-    @staticmethod
-    def _raw_chat(
-        url: str,
-        payload: dict,
-        headers: dict[str, str],
-        response_path: tuple,
-    ) -> tuple[bool, str]:
-        req = urlrequest.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
+        tomorrow = datetime.now(UTC).date() + timedelta(days=1)
+        return ProviderStatusResponse(
+            providers=[
+                ProviderQuota(
+                    provider=self._config.name,
+                    model=self._config.model,
+                    # Shared platform quota is enforced by Connector instead
+                    # of an inaccurate worker-local daily counter.
+                    quota_daily=0,
+                    calls_used_today=0,
+                    reset_at_utc=datetime.combine(tomorrow, datetime.min.time(), tzinfo=UTC),
+                )
+            ]
         )
-        try:
-            with urlrequest.urlopen(req, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
-                body = response.read().decode("utf-8")
-                data = json.loads(body)
-        except urlerror.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
-            return False, f"HTTP {exc.code}: {raw}"
-        except Exception as exc:
-            return False, str(exc)
-
-        value: object = data
-        try:
-            for key in response_path:
-                if isinstance(key, int):
-                    value = value[key]  # type: ignore[index]
-                else:
-                    value = value[key]  # type: ignore[index]
-        except Exception:
-            return False, "Malformed LLM response payload"
-
-        text = str(value or "").strip()
-        if not text:
-            return False, "Empty LLM response"
-        return True, text

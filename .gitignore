@@ -112,6 +112,3 @@ Customization Agent/tenant_builder_app/backend/tenants/
 tmp/
 temp_tf_fmt_check/
 Plans/
-
-# scratch_puppeteer dependencies
-scratch_puppeteer/node_modules/

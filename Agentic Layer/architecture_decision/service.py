@@ -752,7 +752,7 @@ def _derive_runtime_config(context: RepositoryContextDocument, environment: str)
 def _derive_build_pipeline(context: RepositoryContextDocument, answers: dict[str, str]) -> BuildPipelineProfile:
     project_slug = _project_slug(context.project_name)
     return BuildPipelineProfile(
-        build_command=context.build.build_command,
+        build_command=answers.get("build_command_override") or context.build.build_command,
         start_command=context.build.start_command,
         ecr_repository=project_slug,
         ci_provider=context.build.ci_provider,

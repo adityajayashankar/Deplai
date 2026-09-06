@@ -1,4 +1,4 @@
-import { NextResponse } from 'next/server';
+import { NextResponse, type NextRequest } from 'next/server';
 import { isBillingEnforced } from '@/lib/ai-platform/subscription-access';
 import { getOrganizationSubscription } from '@/lib/billing/credits';
 import { resolveBillingOrganization } from '@/lib/billing/organization-context';
@@ -12,7 +12,7 @@ import {
 } from './plan-features';
 
 export async function resolveOrganizationPlanId(
-  request: Request,
+  request: NextRequest,
   user: SessionUser,
 ): Promise<{ organizationId: string; planId: string }> {
   const organization = await resolveBillingOrganization({
@@ -28,7 +28,7 @@ export async function resolveOrganizationPlanId(
 }
 
 export async function denyUnlessPlanFeature(
-  request: Request,
+  request: NextRequest,
   user: SessionUser,
   feature: PlanFeature,
 ): Promise<NextResponse | null> {

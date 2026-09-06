@@ -1,3 +1,4 @@
+import { enqueueSecurityEvent } from '@/lib/security/sdlc-events';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
@@ -21,7 +22,6 @@ import {
 } from '@/lib/sessions/store';
 import type { SessionStatus } from '@/lib/sessions/types';
 
-const AGENTIC_KEY = process.env.DEPLAI_SERVICE_KEY ?? '';
 
 export const runtime = 'nodejs';
 export const maxDuration = 3600;
@@ -872,22 +872,6 @@ function detectStaleAwsTerraformBundle(files: GeneratedFile[]): string[] {
   return reasons;
 }
 
-// Suffixes produced by the architecture consultant that the Terraform Agent template
-// registry does not accept — strip them to get the canonical service_type token.
-const SERVICE_TYPE_SUFFIXES = [
-  '-instance', '-cluster', '-function', '-bucket',
-  '-database', '-cache', '-balancer', '-gateway',
-] as const;
-
-function normalizeServiceType(raw: string): string {
-  const lower = raw.trim().toLowerCase();
-  const stripped = SERVICE_TYPE_SUFFIXES.reduce(
-    (s, suffix) => s.endsWith(suffix) ? s.slice(0, -suffix.length) : s,
-    lower,
-  );
-  return stripped || 'ec2';
-}
-
 async function fetchFileSha(owner: string, repo: string, filePath: string, pat: string): Promise<string | null> {
   const readRes = await ghFetch(
     `https://api.github.com/repos/${owner}/${repo}/contents/${filePath}`,
@@ -1030,58 +1014,18 @@ export async function POST(req: NextRequest) {
 
     const runtimeMode = body.runtime_apply === true;
     if (provider === 'aws' && !runtimeMode) {
-      let agenticRes: Response;
-      try {
-        agenticRes = await fetch(`${AGENTIC_URL}/api/iac/generate-and-apply`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-API-Key': AGENTIC_KEY,
-          },
-          body: JSON.stringify({
-            project_id: projectId,
-            service_type: body.service_type,
-            repo_context: { ...((body.repo_context as Record<string, unknown>) ?? {}), project_name: projectName },
-            user_customizations: {
-              ...(body.customizations ?? body.user_customizations ?? {}),
-              ...(customizationSource ? { customization_source: customizationSource } : {}),
-            },
-            aws_credentials: {
-              access_key_id: body.aws_access_key_id,
-              secret_access_key: body.aws_secret_access_key,
-              region: body.aws_region ?? 'us-east-1',
-            },
-          }),
-        });
-      } catch (err) {
-        return NextResponse.json(
-          { error: 'Agentic Layer unreachable', detail: String(err) },
-          { status: 502 },
-        );
-      }
-
-      if (!agenticRes.ok) {
-        const detail = await agenticRes.text();
-        return NextResponse.json(
-          { error: 'IaC pipeline failed to start', detail },
-          { status: agenticRes.status },
-        );
-      }
-
-      const { run_id, status } = await agenticRes.json();
-      return NextResponse.json(await bindDeploySession({
-        success: true,
-        mode: 'iac_pipeline',
-        provider: 'aws',
-        run_id,
-        service_type: normalizeServiceType(String(body.service_type || 'ec2')),
-        status,
-      }, 'running', 'pipeline', 'IaC pipeline started.'));
+      return NextResponse.json({
+        error: 'Prepare infrastructure in the deployment pipeline, then review the Terraform plan before applying it.',
+        requires_generation: true,
+        next_stage: 'analysis',
+      }, { status: 409 });
     }
 
     const runId = String(body.run_id || '').trim();
     const workspace = String(body.workspace || '').trim();
     const baseFiles = Array.isArray(body.files) ? body.files : [];
+    if (baseFiles.length) await enqueueSecurityEvent(projectId, 'predeploy', String(body.run_id || Date.now()), undefined, baseFiles)
+      .catch((error) => console.warn('Advisory pre-deploy scan could not be queued:', error instanceof Error ? error.message : 'queue unavailable'));
     const useRunReference = runtimeMode && Boolean(runId && workspace);
     if (snapshotSource && !useRunReference) {
       return NextResponse.json(
@@ -1582,6 +1526,8 @@ export async function POST(req: NextRequest) {
         );
       }
 
+      if (applicationReady) await enqueueSecurityEvent(projectId, 'deployment', String(body.run_id || Date.now()))
+        .catch((error) => console.warn('Advisory deployment scan could not be queued:', error instanceof Error ? error.message : 'queue unavailable'));
       return NextResponse.json(await bindDeploySession({
         success: true,
         provider,

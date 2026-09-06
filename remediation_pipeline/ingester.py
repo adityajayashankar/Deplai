@@ -44,6 +44,24 @@ class VulnIngester:
         vulns: list[Vulnerability] = []
         vulns.extend(self._read_sast(project_id))
         vulns.extend(self._read_sca(project_id))
+        from result_parser import get_scan_results
+        ok, payload = get_scan_results(project_id)
+        if ok and isinstance(payload, dict):
+            for finding in payload.get("findings", []):
+                category = finding.get("category")
+                if category in ("sast", "sca"):
+                    continue
+                asset = str(finding.get("asset") or "")
+                location = str(finding.get("location") or "")
+                line = location.rsplit(":", 1)[-1]
+                start = max(1, int(line)) if line.isdigit() else 1
+                metadata = finding.get("metadata") or {}
+                vulns.append(Vulnerability(id=finding["id"], file=asset or "manual-action",
+                    line_start=start, line_end=start, rule_id=str(metadata.get("rule_id") or finding["id"]),
+                    severity=self._normalize_severity(finding.get("severity")) or "medium",
+                    description=str(finding.get("title") or "Security finding"), type=category,
+                    remediation_capability=finding.get("remediation_capability", "manual_action"),
+                    run_id=payload.get("run_id"), source_revision=payload.get("source_revision"), evidence=metadata))
         return vulns
 
     def _read_sast(self, project_id: str) -> list[Vulnerability]:

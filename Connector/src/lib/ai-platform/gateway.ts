@@ -1,5 +1,11 @@
+import { reserveSecurityCost, settleSecurityCost } from './security-run-budget';
+import { fitSecurityRequest, reserveSecurityRequest, coolSecurityRequest } from './security-request-budget';
 import { randomUUID } from 'node:crypto';
 import { query } from '@/lib/db';
+import {
+  DEFAULT_REMEDIATION_PLATFORM_MODEL,
+  openRouterFreeRemediationModel,
+} from './remediation-platform-models';
 import { AiPlatformError } from './errors';
 import { isAiPlatformEnabled, isFeatureEnabled, defaultAccessMode, maxRequestCostUsd } from './config';
 import { ensureAiPlatformSchema } from './schema';
@@ -23,6 +29,7 @@ import {
 import { filterModelsForPlatformAccess } from './platform-allowlist';
 import { resolvePlatformDispatch } from './openrouter-catalog';
 import { constrainOpenRouterRequest } from './openrouter-request-budget';
+import { retryDelayMs } from './retry-delay';
 import {
   expandProvidersForPlatformOpenRouter,
   isPlatformOpenRouterUpstream,
@@ -55,8 +62,25 @@ function backoff(attempt: number): number {
 
 function isStrictRemediation(request: NormalizedChatRequest): boolean {
   return request.metadata?.product === 'security'
-    && request.metadata?.stage === 'remediation'
-    && request.responseFormat?.type === 'json_schema';
+    && ['remediation', 'openwiki'].includes(String(request.metadata?.stage));
+}
+
+/** Remediation must never surface an upstream schema/auth 400/401 to the UI. */
+function securityProviderError(error: AiPlatformError): AiPlatformError {
+  if (!['AUTHENTICATION_ERROR', 'INVALID_REQUEST', 'MODEL_NOT_FOUND', 'CAPABILITY_UNSUPPORTED', 'CONTEXT_LIMIT', 'TOKEN_LIMIT'].includes(error.code)) {
+    return error;
+  }
+  return new AiPlatformError(
+    'PROVIDER_UNAVAILABLE',
+    'Platform OpenRouter remediation capacity is temporarily unavailable; retry shortly.',
+    {
+      status: 503,
+      providerId: 'openrouter',
+      retryable: true,
+      sanitizedProviderDetail: error.sanitizedProviderDetail,
+      detail: error.detail,
+    },
+  );
 }
 
 function validateSecuritySchema(text: string): string | null {
@@ -189,6 +213,10 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
   const traceId = randomUUID();
   const started = Date.now();
   const accessMode = request.accessMode || defaultAccessMode();
+  const remediation = isStrictRemediation(request);
+  if (remediation && (accessMode !== 'platform' || request.ephemeralApiKey)) {
+    throw new AiPlatformError('POLICY_DENIED', 'Security remediation uses the platform OpenRouter credential only');
+  }
   const policy = await getOrganizationPolicy(context.userId);
 
   if (policy.byokRequired && accessMode === 'platform') {
@@ -201,13 +229,22 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
     throw new AiPlatformError('POLICY_DENIED', 'Requested access mode is not allowed');
   }
 
-  const routing = await resolveRoutingPolicy(context.userId, request.routingPolicy || 'default', request.task);
+  const routing = await resolveRoutingPolicy(
+    context.userId,
+    request.routingPolicy || 'default',
+    remediation ? 'security_analysis' : request.task,
+  );
   const platformUpstream = isPlatformOpenRouterUpstream();
-  const models = filterModelsForPlatformAccess(
+  let models = filterModelsForPlatformAccess(
     await listModels(),
     accessMode,
     platformUpstream,
   );
+  if (remediation) {
+    const template = (await listModels())[0];
+    if (!template) throw new AiPlatformError('MODEL_NOT_FOUND', 'Model catalog is empty');
+    models = [openRouterFreeRemediationModel(template)];
+  }
   const health = await getProviderHealthMap();
   const ephemeralProvider = request.ephemeralProvider || (request.ephemeralApiKey ? canonicalizeProviderId(String(request.metadata?.provider || '')) || undefined : undefined);
   const available = await providersWithCredentials(
@@ -217,7 +254,7 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
     context.organizationId,
   );
   const ranked = rankModels({
-    requested: canonicalizeRequestedModel(request.model, models),
+    requested: remediation ? DEFAULT_REMEDIATION_PLATFORM_MODEL : canonicalizeRequestedModel(request.model, models),
     models,
     policy,
     routing,
@@ -231,8 +268,8 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
     reason: item.skipReason || 'Skipped',
   }));
 
-  const chain = ranked.ranked.slice(0, isFeatureEnabled('ai_fallback') && policy.fallbackAllowed ? 4 : 1);
-  if (routing.fallbackModelId) {
+  const chain = ranked.ranked.slice(0, request.metadata?.stage === 'openwiki' ? 1 : remediation ? 3 : isFeatureEnabled('ai_fallback') && policy.fallbackAllowed ? 4 : 1);
+  if (routing.fallbackModelId && !remediation) {
     const fallback = models.find((model) => model.id === routing.fallbackModelId);
     if (fallback && !chain.some((item) => item.model.id === fallback.id)) {
       chain.push({ model: fallback, score: 0, reasons: ['Configured fallback'] });
@@ -267,13 +304,14 @@ export async function executeChat(
   let lastError: AiPlatformError | null = null;
   let fallbackCount = 0;
   let retryCount = 0;
+  let waitedMs = 0;
 
   for (let index = 0; index < chain.length; index += 1) {
     const candidate = chain[index];
     if (index > 0) {
-      if (isStrictRemediation(request)) break;
-      if (!policy.fallbackAllowed) break;
-      if (!policy.crossProviderFallbackAllowed && candidate.model.providerId !== primary.model.providerId) continue;
+      if (isStrictRemediation(request) && (!lastError || !['RATE_LIMIT', 'PROVIDER_UNAVAILABLE', 'TIMEOUT'].includes(lastError.code))) break;
+      if (!isStrictRemediation(request) && !policy.fallbackAllowed) break;
+      if (!isStrictRemediation(request) && !policy.crossProviderFallbackAllowed && candidate.model.providerId !== primary.model.providerId) continue;
       fallbackCount += 1;
     }
 
@@ -307,8 +345,9 @@ export async function executeChat(
         credentialId: request.credentialId,
       });
     if ('error' in credential) {
-      skipped.push({ model: candidate.model.displayName, reason: credential.error });
-      lastError = new AiPlatformError(credential.code, credential.error);
+      const credentialError = new AiPlatformError(credential.code, credential.error);
+      lastError = isStrictRemediation(request) ? securityProviderError(credentialError) : credentialError;
+      skipped.push({ model: candidate.model.displayName, reason: lastError.message });
       continue;
     }
 
@@ -316,9 +355,11 @@ export async function executeChat(
     for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
       let reservation: CreditReservation | null = null;
       let providerCompleted = false;
+      let securityReserved = 0;
+      const securityRunId = String(request.metadata?.remediation_run_id || '');
       try {
         const requestedMaxTokens = request.maxTokens || policy.maxTokenLimit || undefined;
-        const openRouterBudget = dispatch.adapterProviderId === 'openrouter'
+        const openRouterBudget = isStrictRemediation(request) ? fitSecurityRequest(request, candidate.model) : dispatch.adapterProviderId === 'openrouter'
           ? constrainOpenRouterRequest({
             secret: credential.secret,
             model: dispatch.upstreamModelId,
@@ -328,9 +369,12 @@ export async function executeChat(
             responseFormat: request.responseFormat,
           })
           : null;
-        const boundedRequest = openRouterBudget
-          ? { ...request, maxTokens: openRouterBudget.maxTokens }
-          : request;
+        const boundedRequest = {
+          ...(openRouterBudget ? { ...request, maxTokens: openRouterBudget.maxTokens } : request),
+          // Free upstreams do not consistently implement native json_schema.
+          // The worker validates the exact same contract after normal chat.
+          responseFormat: isStrictRemediation(request) ? undefined : request.responseFormat,
+        };
         const managed = credential.source === 'platform';
         if (managed) {
           assertManagedPricing(candidate.model);
@@ -346,6 +390,12 @@ export async function executeChat(
             maximumProviderCostUsd: maximumCostUsd,
           });
         }
+        if (isStrictRemediation(request)) {
+          await reserveSecurityRequest(credential.secret, dispatch.upstreamModelId);
+          securityReserved = ((openRouterBudget?.reservedTokens || 0) * (candidate.model.pricing.inputPerMillionUsd || 0)
+            + (boundedRequest.maxTokens || 4096) * (candidate.model.pricing.outputPerMillionUsd || 0)) / 1e6;
+          await reserveSecurityCost(securityRunId, context.userId, securityReserved);
+        }
         const result = await adapter.chat({
           secret: credential.secret,
           model: dispatch.upstreamModelId,
@@ -353,7 +403,7 @@ export async function executeChat(
           temperature: request.temperature,
           maxTokens: boundedRequest.maxTokens || policy.maxTokenLimit || undefined,
           tools: request.tools,
-          responseFormat: request.responseFormat,
+          responseFormat: boundedRequest.responseFormat,
         });
         providerCompleted = true;
         if (request.task === 'security_analysis') {
@@ -367,6 +417,10 @@ export async function executeChat(
         const billedProviderCostUsd = billingSource === 'platform'
           ? platformMeteringCostUsd(candidate.model, result.usage)
           : cost.providerCostUsd;
+        if (securityReserved) {
+          await settleSecurityCost(securityRunId, securityReserved, cost.providerCostUsd);
+          securityReserved = 0;
+        }
         const billedCost = billedProviderCostUsd !== cost.providerCostUsd
           ? { ...cost, providerCostUsd: billedProviderCostUsd, customerChargeUsd: billedProviderCostUsd }
           : cost;
@@ -445,6 +499,10 @@ export async function executeChat(
         });
         return response;
       } catch (error) {
+        // Keep an uncertain timed-out request reserved; it may still have incurred upstream cost.
+        if (securityReserved && error instanceof AiPlatformError && ['RATE_LIMIT', 'AUTHENTICATION_ERROR', 'INVALID_REQUEST'].includes(error.code) && !providerCompleted) {
+          await settleSecurityCost(securityRunId, securityReserved, 0);
+        }
         if (reservation && !providerCompleted) {
           await releaseOrganizationCreditReservation(reservation).catch(() => undefined);
         }
@@ -458,11 +516,19 @@ export async function executeChat(
             cause: error,
           });
         }
-        const normalized = adapter.normalizeError(error);
+        const upstreamError = adapter.normalizeError(error);
+        const normalized = isStrictRemediation(request) ? securityProviderError(upstreamError) : upstreamError;
         lastError = normalized;
+        if (isStrictRemediation(request)) {
+          await coolSecurityRequest(credential.secret, dispatch.upstreamModelId, upstreamError);
+          if (upstreamError.detail?.quotaScope === 'account') throw normalized;
+        }
+        if (isStrictRemediation(request) && (providerCompleted || !['RATE_LIMIT', 'PROVIDER_UNAVAILABLE', 'TIMEOUT'].includes(normalized.code))) throw normalized;
         retryCount += 1;
-        if (normalized.retryable && attempt + 1 < maximumAttempts && isFeatureEnabled('ai_fallback')) {
-          await sleep(backoff(attempt));
+        const delay = providerCompleted || isStrictRemediation(request) ? null : retryDelayMs(normalized, attempt, waitedMs);
+        if (delay !== null) {
+          waitedMs += delay;
+          await sleep(delay);
           continue;
         }
         if (!normalized.retryable) {
@@ -498,6 +564,9 @@ export async function* streamChat(
   context: GatewayContext,
   request: NormalizedChatRequest,
 ): AsyncGenerator<CanonicalStreamEvent> {
+  if (isStrictRemediation(request)) {
+    throw new AiPlatformError('PROVIDER_UNAVAILABLE', 'Security inference is temporarily unavailable for streaming requests; use non-streaming execution', { status: 503 });
+  }
   const { requestId, traceId, started, accessMode, policy, routing, skipped, chain, primary } = await prepareChat(context, request);
   yield {
     type: 'stream.started',
@@ -513,7 +582,7 @@ export async function* streamChat(
   for (let index = 0; index < chain.length; index += 1) {
     const candidate = chain[index];
     if (index > 0) {
-      if (isStrictRemediation(request)) break;
+      if (isStrictRemediation(request) && (!lastError || !['RATE_LIMIT', 'PROVIDER_UNAVAILABLE', 'TIMEOUT'].includes(lastError.code))) break;
       if (!policy.fallbackAllowed) break;
       if (!policy.crossProviderFallbackAllowed && candidate.model.providerId !== primary.model.providerId) continue;
       fallbackCount += 1;

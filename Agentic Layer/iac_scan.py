@@ -1,5 +1,6 @@
 import os
 
+from scanner_runtime import LogCallback, run_detached
 from utils import get_docker_client, sanitize_name, decode_output, CODEBASE_VOLUME, SECURITY_REPORTS_VOLUME
 
 SCANNER_TIMEOUT_SECONDS = int(os.getenv("CHECKOV_TIMEOUT_SECONDS", os.getenv("SCANNER_TIMEOUT_SECONDS", "900")))
@@ -72,70 +73,97 @@ def detect_scan_targets(project_id: str) -> dict[str, bool]:
     return _detect_targets(project_id)
 
 
-def run_checkov_scan(project_name: str, project_id: str, frameworks: str, report_suffix: str) -> tuple[bool, str]:
+def run_checkov_scan(
+    project_name: str,
+    project_id: str,
+    frameworks: str,
+    report_suffix: str,
+    *,
+    engine: str = "Checkov",
+    on_log: LogCallback | None = None,
+) -> tuple[bool, str]:
     """Run infrastructure policy scanning for the given Checkov frameworks."""
-    container = None
-    try:
-        filename = f"{sanitize_name(project_name)}_{project_id}_{report_suffix}"
-        container = get_docker_client().containers.run(
-            CHECKOV_IMAGE,
-            entrypoint="/bin/sh",
-            command=[
-                "-c",
-                (
-                    "checkov -d \"/src/${PID}\" --framework \"${FW}\" "
-                    "-o json --quiet --compact --skip-download --soft-fail "
-                    "--skip-path node_modules --skip-path .git --skip-path .venv "
-                    "--skip-path dist --skip-path .next --skip-path vendor "
-                    "> \"/output/${FILE}\" 2>/tmp/checkov.err; "
-                    "code=$?; "
-                    "if [ \"$code\" -eq 0 ] || [ \"$code\" -eq 1 ]; then exit 0; fi; "
-                    "cat /tmp/checkov.err >&2; "
-                    "exit \"$code\""
-                ),
-            ],
-            environment={"PID": project_id, "FW": frameworks, "FILE": filename},
-            user="0:0",
-            volumes={
-                CODEBASE_VOLUME: {"bind": "/src", "mode": "ro"},
-                SECURITY_REPORTS_VOLUME: {"bind": "/output", "mode": "rw"},
-            },
-            detach=True,
-        )
-        result = container.wait(timeout=SCANNER_TIMEOUT_SECONDS)
-        logs = decode_output(container.logs(stdout=True, stderr=True, tail=40))
-        container.remove(force=True)
-        exit_code = result.get("StatusCode", -1)
-        # Checkov: 0 = passed, 1 = failed checks found.
-        if exit_code in (0, 1):
-            return (True, "")
-        detail = " ".join(logs.split())[:280]
-        suffix = f": {detail}" if detail else ""
-        return (False, f"Infrastructure scanner exited with code {exit_code}{suffix}")
-    except Exception as e:
-        if container is not None:
-            try:
-                container.remove(force=True)
-            except Exception:
-                pass
-        return (False, str(e))
+    filename = f"{sanitize_name(project_name)}_{project_id}_{report_suffix}"
+    return run_detached(
+        image=CHECKOV_IMAGE,
+        entrypoint="/bin/sh",
+        command=[
+            "-c",
+            (
+                "checkov -d \"/src/${PID}\" --framework \"${FW}\" "
+                "-o json --quiet --compact --skip-download --soft-fail "
+                "--skip-path node_modules --skip-path .git --skip-path .venv "
+                "--skip-path dist --skip-path .next --skip-path vendor "
+                "> \"/output/${FILE}\" 2>/tmp/checkov.err; "
+                "code=$?; "
+                "if [ \"$code\" -eq 0 ] || [ \"$code\" -eq 1 ]; then exit 0; fi; "
+                "cat /tmp/checkov.err >&2; "
+                "exit \"$code\""
+            ),
+        ],
+        environment={"PID": project_id, "FW": frameworks, "FILE": filename},
+        user="0:0",
+        volumes={
+            CODEBASE_VOLUME: {"bind": "/src", "mode": "ro"},
+            SECURITY_REPORTS_VOLUME: {"bind": "/output", "mode": "rw"},
+        },
+        timeout_seconds=SCANNER_TIMEOUT_SECONDS,
+        engine=engine,
+        on_log=on_log,
+        success_codes=(0, 1),
+    )
 
 
-def run_iac_scan(project_name: str, project_id: str) -> tuple[bool, str]:
-    return run_checkov_scan(project_name, project_id, IAC_FRAMEWORKS, "Checkov.json")
+def run_iac_scan(
+    project_name: str,
+    project_id: str,
+    on_log: LogCallback | None = None,
+) -> tuple[bool, str]:
+    return run_checkov_scan(
+        project_name, project_id, IAC_FRAMEWORKS, "Checkov.json",
+        engine="Checkov IaC", on_log=on_log,
+    )
 
 
-def run_container_scan(project_name: str, project_id: str) -> tuple[bool, str]:
-    return run_checkov_scan(project_name, project_id, CONTAINER_FRAMEWORKS, "Containers.json")
+def run_container_scan(
+    project_name: str,
+    project_id: str,
+    on_log: LogCallback | None = None,
+) -> tuple[bool, str]:
+    return run_checkov_scan(
+        project_name, project_id, CONTAINER_FRAMEWORKS, "Containers.json",
+        engine="Checkov Containers", on_log=on_log,
+    )
 
 
-def run_kubernetes_scan(project_name: str, project_id: str) -> tuple[bool, str]:
-    return run_checkov_scan(project_name, project_id, KUBERNETES_FRAMEWORKS, "Kubernetes.json")
+def run_kubernetes_scan(
+    project_name: str,
+    project_id: str,
+    on_log: LogCallback | None = None,
+) -> tuple[bool, str]:
+    return run_checkov_scan(
+        project_name, project_id, KUBERNETES_FRAMEWORKS, "Kubernetes.json",
+        engine="Checkov Kubernetes", on_log=on_log,
+    )
 
 
-def run_cicd_scan(project_name: str, project_id: str) -> tuple[bool, str]:
-    return run_checkov_scan(project_name, project_id, CICD_FRAMEWORKS, "Cicd.json")
+def run_cicd_scan(
+    project_name: str,
+    project_id: str,
+    on_log: LogCallback | None = None,
+) -> tuple[bool, str]:
+    return run_checkov_scan(
+        project_name, project_id, CICD_FRAMEWORKS, "Cicd.json",
+        engine="Checkov CI/CD", on_log=on_log,
+    )
 
 
-def run_api_scan(project_name: str, project_id: str) -> tuple[bool, str]:
-    return run_checkov_scan(project_name, project_id, API_FRAMEWORKS, "Api.json")
+def run_api_scan(
+    project_name: str,
+    project_id: str,
+    on_log: LogCallback | None = None,
+) -> tuple[bool, str]:
+    return run_checkov_scan(
+        project_name, project_id, API_FRAMEWORKS, "Api.json",
+        engine="Checkov API", on_log=on_log,
+    )

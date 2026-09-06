@@ -7,6 +7,7 @@ from typing import Any
 
 from services.agent_logger import log_agent
 from services.llm_client import ProjectLLMClient
+from services.platform_theme import platform_theme_prompt
 
 
 def log_file_modification(file_path: str, operation: str, details: str) -> None:
@@ -198,7 +199,8 @@ def _review_change_with_llm(client: ProjectLLMClient, manifest: dict, relative_p
     excerpt = _excerpt_for_change(original_content, change)
     system_prompt = (
         "You are a frontend customization modifier reviewer. Decide whether a proposed change is appropriate for the provided frontend excerpt. "
-        "Return strict JSON only."
+        "Return strict JSON only.\n"
+        + platform_theme_prompt()
     )
     user_prompt = (
         "Manifest summary:\n"

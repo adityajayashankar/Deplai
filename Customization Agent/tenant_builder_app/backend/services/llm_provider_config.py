@@ -14,14 +14,11 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 HF_API_URL = "https://router.huggingface.co/v1/chat/completions"
 
-DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
-DEFAULT_OPENROUTER_MODEL = "qwen/qwen3-coder:free"
-DEFAULT_HF_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct"
+DEFAULT_GROQ_MODEL = "qwen/qwen-2.5-coder-32b-instruct:free"
+DEFAULT_OPENROUTER_MODEL = "qwen/qwen-2.5-coder-32b-instruct:free"
+DEFAULT_HF_MODEL = "qwen/qwen-2.5-coder-32b-instruct:free"
 OPENROUTER_FALLBACK_MODELS = (
     DEFAULT_OPENROUTER_MODEL,
-    "openai/gpt-oss-20b:free",
-    "z-ai/glm-4.5-air:free",
-    "google/gemma-3n-e2b-it:free",
 )
 
 

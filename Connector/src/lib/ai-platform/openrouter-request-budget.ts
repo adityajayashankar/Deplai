@@ -38,7 +38,8 @@ function envInteger(name: string, fallback: number, minimum: number, maximum?: n
  */
 export function isOpenRouterLowQuotaModel(model: string): boolean {
   const normalized = model.trim().toLowerCase();
-  return normalized.endsWith(':free')
+  return normalized === 'openrouter/free'
+    || normalized.endsWith(':free')
     || normalized.startsWith('minimax/minimax-m3')
     || normalized.startsWith('minimax/minimax-m2.7')
     || normalized.startsWith('nvidia/nemotron');
@@ -132,7 +133,7 @@ export function constrainOpenRouterRequest(input: {
       'RATE_LIMIT',
       'OpenRouter low-quota RPM/TPM safety budget is temporarily exhausted',
       {
-        retryable: false,
+        retryable: true,
         detail: {
           retryAfterSeconds: reservation.retryAfterSeconds,
           rpm: envInteger('OPENROUTER_LOW_QUOTA_RPM', DEFAULT_RPM, 1),

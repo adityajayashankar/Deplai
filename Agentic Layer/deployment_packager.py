@@ -758,6 +758,26 @@ def _build_deterministic_package(
     repo_context = repository_context or {}
     profile = deployment_profile or {}
     answers = user_answers or {}
+    # User-supplied build/start command override (e.g. "vercel build" style).
+    # We mutate repo_context so the manifest resolver and downstream EC2 user-data
+    # pick up the user choice without breaking the existing data flow.
+    user_build_command = (
+        str(answers.get("build_command_override") or "").strip()
+        or str(answers.get("build_command") or "").strip()
+        or None
+    )
+    user_start_command = (
+        str(answers.get("start_command_override") or "").strip()
+        or str(answers.get("start_command") or "").strip()
+        or None
+    )
+    if user_build_command or user_start_command:
+        build_section = _record((repo_context.get("build")))
+        if user_build_command:
+            build_section["build_command"] = user_build_command
+        if user_start_command:
+            build_section["start_command"] = user_start_command
+        repo_context = {**repo_context, "build": build_section}
     manifest, cache_hit, fingerprint = resolve_deployment_manifest(root, project_name)
     selected_root = (root / manifest.app_root).resolve()
     try:

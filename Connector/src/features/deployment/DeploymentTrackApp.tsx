@@ -1652,7 +1652,9 @@ export default function DeploymentTrackApp() {
   const lastPrefillQuestionIdRef = useRef<string | null>(null);
   const deployRequestRef = useRef<string | null>(null);
   const idleRecoveryRef = useRef<string | null>(null);
+  const staleStatusRecoveryRef = useRef<string | null>(null);
   const analysisRequestRef = useRef<string | null>(null);
+  const initializedEntryRef = useRef<string | null>(null);
   const reviewRequestRef = useRef<string | null>(null);
   const generatePlanInFlightRef = useRef(false);
   const planAttemptedKeyRef = useRef<string | null>(null);
@@ -2770,6 +2772,7 @@ export default function DeploymentTrackApp() {
       || '',
     ).trim();
     const entry = searchParams.get('entry');
+    if (!projectsLoaded) return;
     const storedProjectId = String(
       localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY)
       || sessionStorage.getItem(PLANNING_PROJECT_KEY)
@@ -2781,6 +2784,7 @@ export default function DeploymentTrackApp() {
       || null;
     if (!nextProjectId) {
       idleRecoveryRef.current = null;
+      staleStatusRecoveryRef.current = null;
       decisionCostRequestKeyRef.current = null;
       setSelectedProjectId(null);
       persistApprovedDecision(null);
@@ -2802,14 +2806,18 @@ export default function DeploymentTrackApp() {
       return;
     }
     const nextProject = projects.find((project) => project.id === nextProjectId) || null;
+    const entryKey = `${nextProjectId}:${entry || 'resume'}`;
+    if (initializedEntryRef.current === entryKey) return;
+    initializedEntryRef.current = entryKey;
     const nextWorkspace = buildDeploymentWorkspace(nextProjectId, nextProject?.name || nextProjectId);
     const previousPlanningProjectId = sessionStorage.getItem(PLANNING_PROJECT_KEY);
-    const freshLaunch = entry === 'card' || entry === 'selector';
     const switchedProject = Boolean(previousPlanningProjectId && previousPlanningProjectId !== nextProjectId);
     const snapshot = loadDeploySnapshot(nextProjectId);
+    const freshLaunch = (entry === 'card' || entry === 'selector') && snapshot?.status !== 'running';
     if (freshLaunch || switchedProject) {
       clearPlanningState();
       idleRecoveryRef.current = null;
+      staleStatusRecoveryRef.current = null;
       analysisRequestRef.current = null;
       reviewRequestRef.current = null;
       terraformAutostartRef.current = null;
@@ -2863,13 +2871,17 @@ export default function DeploymentTrackApp() {
     setActiveStage(
       freshLaunch
         ? 'analysis'
-        : normalizeDeployUiStage(resolveRestoredDeployUiStage(snapshot, loadDeployUiStage(nextProjectId))),
+        : normalizeDeployUiStage(resolveRestoredDeployUiStage(snapshot, loadDeployUiStage(nextProjectId), {
+          hasAnalysis: readStoredJson<RepositoryContextJson>('deplai.pipeline.repoContext')?.workspace === nextWorkspace,
+          hasApprovedPlan: Boolean(readStoredJson(APPROVED_DECISION_KEY)),
+          hasTerraform: Boolean(getCurrentSavedRun(readSavedIacRun(), readSavedIacMeta(), nextProjectId, nextWorkspace)),
+        })),
     );
     const existing = activeDeployments.get(nextProjectId);
     const nextState = existing?.state || toDeployState(snapshot || undefined);
     setActiveDeploymentState(nextProjectId, nextState);
     setEndpointChecks([]);
-  }, [persistApprovedDecision, projects, searchParams]);
+  }, [persistApprovedDecision, projects, projectsLoaded, searchParams]);
 
   useEffect(() => {
     if (!selectedProjectId) return;
@@ -2962,6 +2974,7 @@ export default function DeploymentTrackApp() {
     if (!selectedProjectId) return;
     clearPlanningState();
     idleRecoveryRef.current = null;
+    staleStatusRecoveryRef.current = null;
     analysisRequestRef.current = null;
     reviewRequestRef.current = null;
     generatePlanInFlightRef.current = false;
@@ -3919,12 +3932,17 @@ export default function DeploymentTrackApp() {
     return mergeDeployResultWithRuntimeDetails(baseResult, data.details);
   }, [aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, hasAwsSecrets, selectedProject, terraformRuntimeConfig.aws_region]);
 
-  const reconcileDeploymentStatus = useCallback(async (runIdOverride?: string) => {
+  const reconcileDeploymentStatus = useCallback(async (runIdOverride?: string, modeOverride?: string) => {
     if (!selectedProject) return;
     const response = await fetch('/api/pipeline/deploy/status', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project_id: selectedProject.id, project_name: selectedProject.name, run_id: runIdOverride || deployResult?.run_id }),
+      body: JSON.stringify({
+        project_id: selectedProject.id,
+        project_name: selectedProject.name,
+        run_id: runIdOverride || deployResult?.run_id,
+        mode: modeOverride || deployResult?.mode,
+      }),
     });
     const data = await response.json().catch(() => ({})) as DeployStatusResponse;
     if (!response.ok || data.success !== true) {
@@ -4074,10 +4092,11 @@ export default function DeploymentTrackApp() {
     }
     getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
     appendLog('No active deployment process found. Marking stale UI run as stopped.', 'error');
-  }, [appendLog, deployResult?.run_id, finalizeSuccessfulDeploy, hydrateTerminalDeployResult, patchState, pushDeploymentHistory, selectedProject]);
+  }, [appendLog, deployResult?.mode, deployResult?.run_id, finalizeSuccessfulDeploy, hydrateTerminalDeployResult, patchState, pushDeploymentHistory, selectedProject]);
 
   const pollDeploymentReconciliation = useCallback(async (
     runIdOverride?: string,
+    modeOverride?: string,
     timeoutMs = TERRAFORM_APPLY_POLL_TIMEOUT_MS,
   ) => {
     if (!selectedProject) {
@@ -4094,7 +4113,7 @@ export default function DeploymentTrackApp() {
     while (Date.now() - pollStart < timeoutMs) {
       await waitForDelay(DEPLOY_RECONCILE_POLL_INTERVAL_MS);
       try {
-        await reconcileDeploymentStatus(runIdOverride);
+        await reconcileDeploymentStatus(runIdOverride, modeOverride);
       } catch {
         // keep polling through transient status fetch failures
       }
@@ -4153,7 +4172,10 @@ export default function DeploymentTrackApp() {
       String(payload.error || 'Connection to the runtime dropped, but Terraform may still be applying. Reconciling…'),
       'info',
     );
-    const latest = await pollDeploymentReconciliation(runIdOverride);
+    const latest = await pollDeploymentReconciliation(
+      runIdOverride,
+      String(payload.mode || 'runtime_apply'),
+    );
     if (latest.status !== 'done' && !isFailedDeployAttempt({ status: latest.status, result: latest.deployResult })) {
       appendLog('Terraform may still be applying. Use Reconcile Backend Status or refresh this page.', 'info');
     }
@@ -4165,6 +4187,7 @@ export default function DeploymentTrackApp() {
       setError('Select a repository before starting deployment.');
       return;
     }
+    staleStatusRecoveryRef.current = null;
     // Capture before any patchState — clearing deployResult would flip this to false via the listener.
     const confirmingPlan = requiresPlanConfirmation
       || deployUiPhase === 'awaiting_plan'
@@ -4304,9 +4327,6 @@ export default function DeploymentTrackApp() {
         setPendingPlanSummary(null);
       }
       appendLog('Calling /api/pipeline/deploy — Terraform apply can take 15–25 minutes when RDS Multi-AZ is included…');
-      void reconcileDeploymentStatus().catch(() => {
-        // Status polling starts immediately; the POST may still be in flight.
-      });
       const retryRunId = String(deployResult?.run_id || activeSavedRun?.run_id || '').trim();
       const retryWorkspace = String(deployResult?.workspace || activeSavedRun?.workspace || '').trim();
       const canReuseSavedRun = shouldUseSavedRunForDeploy || Boolean(retryingFailedDeploy && retryRunId);
@@ -4424,7 +4444,10 @@ export default function DeploymentTrackApp() {
         return;
       }
 
-      if (data.mode !== 'iac_pipeline' && !data.run_id) {
+      const runtimeApplyPending = data.mode === 'runtime_apply'
+        && ['pending', 'selecting_params', 'validating', 'planning', 'applying', 'running', 'accepted']
+          .includes(String(data.status || '').trim().toLowerCase());
+      if (data.mode !== 'iac_pipeline' && !data.run_id && !runtimeApplyPending) {
         clearHeartbeat();
         finalizeSuccessfulDeploy({
           ...data,
@@ -4459,15 +4482,17 @@ export default function DeploymentTrackApp() {
           while (Date.now() - pollStart < MAX_POLL_MS) {
             await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
             try {
-              await reconcileDeploymentStatus(data.run_id);
+              await reconcileDeploymentStatus(data.run_id, data.mode);
             } catch {
               // transient error — keep polling
             }
             const latestRun = getOrCreateActiveDeployment(selectedProject.id);
             if (!latestRun.inFlight || latestRun.state.status === 'error') break;
           }
+        } else if (data.mode === 'runtime_apply') {
+          await pollDeploymentReconciliation(data.run_id, data.mode);
         } else if (data.run_id) {
-          await reconcileDeploymentStatus(data.run_id);
+          await reconcileDeploymentStatus(data.run_id, data.mode);
         } else {
           appendLog('Backend accepted the deploy request, but no run identifier was returned yet. Use Reconcile Backend Status if this state persists.', 'info');
         }
@@ -4515,7 +4540,7 @@ export default function DeploymentTrackApp() {
         deployHeartbeatRef.current = null;
       }
     }
-  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, finalizeDeployUiFromState, finalizeSuccessfulDeploy, hasAwsSecrets, iacFiles, infraUserAnswers, patchState, pushDeploymentHistory, reconcileDeploymentStatus, recoverDeployAfterTransportGap, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
+  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, finalizeDeployUiFromState, finalizeSuccessfulDeploy, hasAwsSecrets, iacFiles, infraUserAnswers, patchState, pollDeploymentReconciliation, pushDeploymentHistory, reconcileDeploymentStatus, recoverDeployAfterTransportGap, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
 
   const stopDeployment = useCallback(async () => {
     if (!selectedProject || stopLoading || deployStatus !== 'running') return;
@@ -4746,13 +4771,17 @@ export default function DeploymentTrackApp() {
     const transportGap = deployStatus === 'error'
       && isTransportFalseFailureMessage(String(deployResult?.error || ''))
       && deployResult?.success !== false;
-    if (deployStatus !== 'running' && !transportGap) {
+    const staleUiStop = deployStatus === 'error'
+      && /no active deployment process found/i.test(String(deployResult?.error || ''))
+      && staleStatusRecoveryRef.current !== selectedProject.id;
+    if (deployStatus !== 'running' && !transportGap && !staleUiStop) {
       const liveUiPhase = String(deployUiPhase || '').trim().toLowerCase();
       if (!['starting', 'waiting_api', 'reconciling'].includes(liveUiPhase)) return;
     }
     if (isAwaitingPlanConfirmation({
       result: deployResult,
     })) return;
+    if (staleUiStop) staleStatusRecoveryRef.current = selectedProject.id;
     let cancelled = false;
 
     const probe = async () => {
@@ -5091,7 +5120,7 @@ export default function DeploymentTrackApp() {
                 <StageHeader
                   eyebrow="Stage 01 · Analysis"
                   title="Repository analysis"
-                  description="DeplAI reads the codebase to infer runtime, framework, exposed ports, and the external services your app depends on."
+                  description="DeplAI reads your repository and prepares the deployment before asking you to connect AWS. No cloud credentials are needed for analysis, planning, or Terraform generation."
                   meta={
                     <>
                       <MetaChip label="repo" value={selectedProject.name} />

@@ -14,7 +14,7 @@ from runner_base import RunnerBase
 from utils import set_current_project_id
 
 
-MAX_ROUNDS = 1  # One bounded Planner + Implementor cycle per remediation run.
+MAX_ROUNDS = 24  # Each additional slice is an explicit user decision.
 TOTAL_STEPS = 8
 
 
@@ -24,6 +24,7 @@ class RemediationTrackRunner(RunnerBase):
     def __init__(self, websocket: WebSocket, context: RemediationRequest, orchestrator: RemediationOrchestrator):
         super().__init__(websocket, TOTAL_STEPS)
         self.context = context
+        self.original_project_id = context.project_id
         self.orchestrator = orchestrator
         self.remediation_run_id = str(context.remediation_run_id or "")
         self._command_event = asyncio.Event()
@@ -32,13 +33,14 @@ class RemediationTrackRunner(RunnerBase):
         self._approval_requested = False
         self._latest_fixes: list[Fix] = []
         self._accepted_fixes: list[Fix] = []
+        self.source_revision = None
 
     async def _send_message(self, msg_type: str, content: str):
         await super()._send_message(msg_type, content)
         await asyncio.to_thread(
             remediation_runs.append_event,
             self.remediation_run_id,
-            project_id=self.context.project_id,
+            project_id=self.original_project_id,
             message_type=msg_type,
             content=content,
             stage="remediation",
@@ -102,44 +104,72 @@ class RemediationTrackRunner(RunnerBase):
         return True
 
     async def _run_verification_rescan(self) -> bool:
+        from result_parser import invalidate_cache, get_scan_results
+        from environment import EnvironmentInitializer
+        from models import ScanContext
         from bearer import run_bearer_scan
-        from result_parser import invalidate_cache
-        from sbom import run_grype_scan, run_syft_scan
+        from sbom import run_syft_scan, run_grype_scan
+        from secrets_scan import run_secrets_scan
+        from iac_scan import run_iac_scan, run_container_scan, run_kubernetes_scan, run_cicd_scan, run_api_scan
+        from sdlc_pipeline import engine_for
 
-        await self._send_message("phase", "Running verification security scan")
-        await self._run_step(lambda: invalidate_cache(self.context.project_id))
-
-        scan_steps = [
-            ("Bearer", lambda: run_bearer_scan(self.context.project_name, self.context.project_id)),
-            ("Syft", lambda: run_syft_scan(self.context.project_name, self.context.project_id)),
-            ("Grype", lambda: run_grype_scan(self.context.project_name, self.context.project_id)),
-        ]
-        for label, scan_step in scan_steps:
-            ok, message = await self._run_step(scan_step)
-            if not ok:
-                return await self._terminate(f"{label} verification scan failed: {message}")
-            await self._send_message("success", f"{label} verification scan completed.")
-
-        await self._run_step(lambda: invalidate_cache(self.context.project_id))
-        try:
-            snapshot = await self._run_step(
-                lambda: self.orchestrator.refresh(
-                    self.context.project_id,
-                    remediation_scope=self.context.remediation_scope,
-                )
-            )
-            await self._send_message(
-                "success",
-                (
-                    "Verification scan refreshed results "
-                    f"(critical={snapshot.get('critical', 0)}, high={snapshot.get('high', 0)}, "
-                    f"medium={snapshot.get('medium', 0)}, low={snapshot.get('low', 0)})."
-                ),
-            )
-        except Exception as exc:
-            return await self._terminate(f"Verification scan completed, but refreshed results could not be loaded: {exc}")
-
+        project = self.context.project_id
+        name = self.context.project_name
+        ok, before = await self._run_step(lambda: get_scan_results(project))
+        if not ok:
+            return await self._terminate("Baseline findings unavailable for verification")
+        validator = EnvironmentInitializer(self.websocket, ScanContext(project_id=project, project_name=name,
+            project_type=self.context.project_type, user_id=self.context.user_id))
+        steps = {"sast": run_bearer_scan, "sbom": run_syft_scan, "sca": run_grype_scan,
+            "secrets": run_secrets_scan, "iac": run_iac_scan, "containers": run_container_scan,
+            "kubernetes": run_kubernetes_scan, "cicd": run_cicd_scan, "api": run_api_scan}
+        records = []
+        sbom_ok = False
+        for module, scanner in steps.items():
+            try:
+                if module == "sca" and not sbom_ok:
+                    raise RuntimeError("Syft dependency failed")
+                await self._send_message("info", f"Verification: executing {engine_for(module)}")
+                success, detail = await self._run_step(lambda: scanner(name, project))
+                if not success:
+                    raise RuntimeError(detail)
+                report = await self._run_step(lambda: validator._validated_report(module))
+                if module == "sbom":
+                    sbom_ok = True
+                records.append({"id": module, "status": "SKIPPED" if report.get("coverage") == "not_applicable" else "COMPLETED", **report})
+            except Exception as exc:
+                records.append({"id": module, "status": "FAILED", "error": str(exc)})
+                await self._send_message("warning", f"Verification {engine_for(module)} failed: {exc}")
+        validator.source_revision = self.source_revision
+        await self._run_step(lambda: validator._write_pipeline_summary(records))
+        invalidate_cache(project)
+        ok, after = await self._run_step(lambda: get_scan_results(project))
+        if not ok:
+            return await self._terminate("Verification results could not be parsed")
+        def identity(finding):
+            return (finding.get("category"), finding.get("title"), finding.get("asset"))
+        remaining = {identity(finding) for finding in after.get("findings", [])}
+        passed = {r["id"] for r in records if r["status"] == "COMPLETED" and r.get("coverage") == "evaluated"}
+        outcomes = []
+        for finding in before.get("findings", []):
+            status = "unverified"
+            if finding.get("remediation_capability") == "manual_action":
+                status = "manual_action"
+            elif finding.get("category") == "sca":
+                # A manifest rescan alone cannot establish the resolved dependency
+                # graph. Keep this unverified until package-manager regeneration
+                # and repository behavior validation have both been recorded.
+                status = "unresolved" if identity(finding) in remaining else "unverified"
+            elif finding.get("category") in passed:
+                status = "unresolved" if identity(finding) in remaining else "verified_fixed"
+            outcomes.append({"id": finding["id"], "status": status})
+        await self._send_message("verification_results", json.dumps({"findings": outcomes, "modules": records}))
+        by_id = {item["id"]: item["status"] for item in outcomes}
+        for fix in self._accepted_fixes:
+            statuses = [by_id.get(finding_id, "unverified") for finding_id in fix.vulns_addressed]
+            fix.verification_status = "verified_fixed" if statuses and all(status == "verified_fixed" for status in statuses) else "unverified"
         return True
+
 
     async def handle_command(self, command: WebSocketCommand):
         if command.action == "continue_round":
@@ -169,6 +199,30 @@ class RemediationTrackRunner(RunnerBase):
             self._command_event.set()
 
     async def _run_pipeline(self) -> bool:
+        # Never apply candidate fixes to the checkout used by Scan or deployment.
+        from utils import CODEBASE_VOLUME, SECURITY_REPORTS_VOLUME, get_docker_client
+        workspace_id = "remediation_" + self.remediation_run_id.replace("-", "")
+        if not self.remediation_run_id:
+            return await self._terminate("Remediation requires a persisted run id.")
+        from result_parser import get_scan_results
+        ok, initial = await self._run_step(lambda: get_scan_results(self.original_project_id))
+        if not ok or not isinstance(initial, dict):
+            return await self._terminate("A completed scan baseline is required.")
+        baseline_run = initial.get("run_id")
+        baseline_source = "scan_" + baseline_run if baseline_run else self.original_project_id
+        self.source_revision = initial.get("source_revision")
+        def prepare_workspace():
+            get_docker_client().containers.run("alpine", command=["sh", "-ec",
+                'test -d "/code/$SOURCE"; mkdir "/code/$TARGET"; cp -a "/code/$SOURCE/." "/code/$TARGET/"; '
+                'for file in /reports/*_${REPORT_SOURCE}_*.json; do [ ! -f "$file" ] || cp "$file" "/reports/$(basename "$file" | sed "s/_${REPORT_SOURCE}_/_${TARGET}_/")"; done'],
+                environment={"SOURCE": baseline_source, "REPORT_SOURCE": self.original_project_id, "TARGET": workspace_id},
+                volumes={CODEBASE_VOLUME: {"bind": "/code", "mode": "rw"},
+                         SECURITY_REPORTS_VOLUME: {"bind": "/reports", "mode": "rw"}}, remove=True)
+        try:
+            await self._run_step(prepare_workspace)
+        except Exception as exc:
+            return await self._terminate(f"Cannot prepare isolated remediation checkout: {exc}")
+        self.context = self.context.model_copy(update={"project_id": workspace_id})
         set_current_project_id(self.context.project_id)
         bind_remediation_run(self.remediation_run_id)
         await asyncio.to_thread(remediation_runs.mark_status, self.remediation_run_id, "running")
@@ -181,7 +235,7 @@ class RemediationTrackRunner(RunnerBase):
             await self._send_message("phase", f"Round {current_round}: ingesting findings and generating fixes")
             await self._send_message(
                 "info",
-                "Noise triage filters scanner noise; critical/high findings go through Master -> Planner -> Implementor -> Local Reviewer (two LLM calls maximum).",
+                "Selected findings go through Planner, Implementor and local validation, with at most one repair call after actionable validation failure.",
             )
 
             try:
@@ -189,7 +243,7 @@ class RemediationTrackRunner(RunnerBase):
                     None,
                     lambda: self.orchestrator.refresh(
                         self.context.project_id,
-                        remediation_scope=self.context.remediation_scope,
+                        remediation_scope="major",
                     ),
                 )
             except Exception as exc:
@@ -263,7 +317,7 @@ class RemediationTrackRunner(RunnerBase):
                     self.context.project_id,
                     on_fix=on_fix,
                     on_progress=on_progress,
-                    remediation_scope=self.context.remediation_scope,
+                    remediation_scope="major",
                     llm_provider=self.context.llm_provider,
                     llm_api_key=self.context.llm_api_key,
                     llm_model=self.context.llm_model,
@@ -275,18 +329,25 @@ class RemediationTrackRunner(RunnerBase):
                     remediation_run_id=self.remediation_run_id,
                 )
             except Exception as exc:
+                if any(marker in str(exc).lower() for marker in ("rate_limit", "rate limit", "quota", "http 429")):
+                    await self._send_message("warning", f"Remediation paused: {exc}. Resume when capacity resets; previous work is retained.")
+                    self._decision_requested = True
+                    await self._send_status(StreamStatus.waiting_decision)
+                    action = await self._wait_for_action()
+                    if action == "continue_round":
+                        continue
                 return await self._terminate(f"Remediation pipeline execution failed: {type(exc).__name__}: {exc}")
             self._latest_fixes = fixes
 
             for fix in fix_events:
                 if fix.diff:
-                    await self._send_message("info", f"Updated {fix.filepath}")
+                    await self._send_message("info", f"Proposed patch for {fix.filepath}")
                 if fix.status == "needs_review":
                     await self._send_message("warning", f"{fix.filepath} flagged for manual review")
                     if not fix.diff and fix.warnings:
                         await self._send_message("warning", f"{fix.filepath}: {fix.warnings[0]}")
                 else:
-                    await self._send_message("success", f"Validated fix for {fix.filepath}")
+                    await self._send_message("info", f"Local patch review passed for {fix.filepath}; security verification is pending")
 
             if not fixes:
                 if self._accepted_fixes:
@@ -297,8 +358,7 @@ class RemediationTrackRunner(RunnerBase):
                     approved_for_push = True
                     break
                 return await self._terminate(
-                    "Noise triage found no actionable vulnerabilities to patch in this round. "
-                    "Scanner findings were filtered as non-actionable noise — no credits were spent on fix generation."
+                    "No patches were produced for this execution slice. Selected findings remain unresolved or require manual action."
                 )
 
             actionable_fixes = [fix for fix in fixes if fix.diff]
@@ -378,6 +438,8 @@ class RemediationTrackRunner(RunnerBase):
         pending_fixes = [fix for fix in candidate_fixes if (fix.filepath, fix.diff) not in pending_keys]
         if pending_fixes and not await self._apply_fixes_to_volume(pending_fixes, "final approval"):
             return False
+        if not await self._run_verification_rescan():
+            return False
 
         accepted_fixes = list(self._accepted_fixes)
         accepted_paths = [fix.filepath for fix in accepted_fixes]
@@ -385,20 +447,11 @@ class RemediationTrackRunner(RunnerBase):
             return await self._terminate("No approved remediation fixes were available to persist.")
 
         if self.context.project_type != "github":
-            try:
-                await self._run_step(
-                    lambda: self.orchestrator.sync_project_volume_to_local_host(
-                        self.context.project_id,
-                        self.context.user_id,
-                    )
-                )
-                await self._send_message("success", "Remediation changes persisted locally.")
-            except Exception as exc:
-                return await self._terminate(f"Failed to persist local remediation changes: {exc}")
-            await self._send_message(
-                "success",
-                "Remediation persisted. Verification scan is optional; rerun it from Security Agent after the PR is ready.",
-            )
+            await self._send_message("patch_download", json.dumps({
+                "filename": f"security-{self.remediation_run_id}.patch",
+                "patch": "\n".join(fix.diff for fix in accepted_fixes),
+            }))
+            await self._send_message("success", "Remediation persisted. Patches are ready to download and review; verification evidence is recorded separately.")
             return True
 
         github_token = (self.context.github_token or "").strip()
@@ -416,6 +469,7 @@ class RemediationTrackRunner(RunnerBase):
                 lambda: self.orchestrator.create_pr(
                     RemediationPRRequest(
                         project_id=self.context.project_id,
+                        source_revision=self.source_revision,
                         repository_url=repository_url,
                         github_token=github_token,
                         fixes=accepted_fixes,

@@ -26,6 +26,7 @@ if str(ROOT_DIR) not in sys.path:
 from functools import partial
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Depends
 from service_auth import api_key_matches
+from scan_jobs import ScanJobs
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from models import (
@@ -206,8 +207,61 @@ if iac_router is not None:
 
 if dast_router is not None:
     app.include_router(dast_router, dependencies=[Depends(verify_api_key)])
+try:
+    from deploy_agent_ec2_build import run_ec2_build_commands
+except Exception:
+    run_ec2_build_commands = None  # type: ignore
+
+@app.post("/api/deploy/ec2/run-build")
+def deploy_ec2_run_build(payload: dict, x_api_key: str = Header(default="")):
+    if not verify_api_key(x_api_key):
+        raise HTTPException(status_code=401, detail="invalid api key")
+    if not run_ec2_build_commands:
+        raise HTTPException(status_code=503, detail="SSM build agent not available")
+    instance_id = str(payload.get("instance_id") or "").strip()
+    region = str(payload.get("region") or "us-east-1").strip()
+    credentials = payload.get("credentials") or {}
+    build_command = str(payload.get("build_command") or "").strip()
+    start_command = str(payload.get("start_command") or "").strip()
+    project_slug = str(payload.get("project_slug") or "deplai-app").strip()
+    if not instance_id:
+        raise HTTPException(status_code=400, detail="instance_id required")
+    if not (credentials.get("aws_access_key_id") and credentials.get("aws_secret_access_key")):
+        raise HTTPException(status_code=400, detail="aws credentials required")
+    try:
+        return run_ec2_build_commands(instance_id, region, credentials, build_command, start_command, project_slug)
+    except DeployError as exc:
+        return {"ok": False, "error": exc.code, "details": exc.details}
+
 app.include_router(deploy_exec_router, dependencies=[Depends(verify_api_key)])
 
+
+_security_dispatch_task = None
+
+@app.on_event("startup")
+async def start_security_dispatcher():
+    global _security_dispatch_task
+    if os.getenv("SECURITY_SDLC_AUTOMATIC", "false").lower() != "true":
+        return
+    async def dispatch_loop():
+        import httpx
+        origin = os.getenv("CONNECTOR_URL", "http://connector:3000").rstrip("/")
+        async with httpx.AsyncClient(timeout=55) as client:
+            while True:
+                try:
+                    response = await client.post(origin + "/api/security/events/dispatch",
+                        headers={"x-deplai-service-key": API_KEY})
+                    response.raise_for_status()
+                except Exception as exc:
+                    logger.warning("Security event dispatcher failed: %s", type(exc).__name__)
+                await asyncio.sleep(30)
+    _security_dispatch_task = asyncio.create_task(dispatch_loop())
+
+@app.on_event("shutdown")
+async def stop_security_dispatcher():
+    if _security_dispatch_task:
+        _security_dispatch_task.cancel()
+        await asyncio.gather(_security_dispatch_task, return_exceptions=True)
 
 # Startup event handler
 @app.on_event("startup")
@@ -228,6 +282,7 @@ async def on_startup():
 # In-memory stores
 active_scans: dict[str, EnvironmentInitializer] = {}
 scan_contexts: dict[str, ScanValidationRequest] = {}
+scan_jobs = ScanJobs()
 active_remediations: dict[str, RemediationTrackRunner] = {}
 remediation_contexts: dict[str, RemediationRequest] = {}
 # Pipeline monitor subscribers per project (shared websocket bus for dashboard events)
@@ -241,23 +296,19 @@ remediation_orchestrator = RemediationOrchestrator()
 
 
 def _normalize_remediation_request(request: RemediationRequest) -> RemediationRequest:
-    raw_provider = str(request.llm_provider or "").strip().lower() or None
-    raw_api_key = str(request.llm_api_key or "").strip() or None
-    raw_model = str(request.llm_model or "").strip() or None
-    raw_access = str(request.llm_access_mode or "auto").strip().lower() or "auto"
-    raw_credential_id = str(request.llm_credential_id or "").strip() or None
-    if raw_access not in {"platform", "byok", "auto"}:
-        raw_access = "auto"
-    if raw_provider == "claude":
-        raw_provider = "anthropic"
+    """Lock remediation to the authenticated platform OpenRouter route.
 
+    The worker deliberately drops BYOK keys and model preferences so no legacy
+    Groq/Claude/Ollama fallback can be reached from this boundary.
+    """
     return request.model_copy(
         update={
-            "llm_provider": raw_provider,
-            "llm_api_key": raw_api_key,
-            "llm_model": raw_model,
-            "llm_access_mode": raw_access,
-            "llm_credential_id": raw_credential_id,
+            "llm_provider": "openrouter",
+            "llm_api_key": None,
+            "llm_model": "openrouter/free",
+            "llm_access_mode": "platform",
+            "llm_credential_id": None,
+            "remediation_scope": "major",
         }
     )
 
@@ -374,21 +425,14 @@ async def _handle_websocket(
                 if on_complete:
                     on_complete()
                 remediation_runs.mark_status(remediation_run_id, "completed")
-                await websocket.send_json({
-                    "type": "status",
-                    "status": StreamStatus.completed.value,
-                })
+                # The runner may have been rebound to a reconnecting browser.
+                # A notification failure must not overwrite completed work.
+                await runner._send_status(StreamStatus.completed)
             else:
                 remediation_runs.mark_status(remediation_run_id, "failed")
                 # Pipeline returned False — error status was already sent by _terminate(),
                 # but send it again as a safety net in case the pipeline exited a different way.
-                try:
-                    await websocket.send_json({
-                        "type": "status",
-                        "status": StreamStatus.error.value,
-                    })
-                except Exception:
-                    pass
+                await runner._send_status(StreamStatus.error)
         except WebSocketDisconnect:
             # The browser may leave after the server-side workflow succeeded.
             # Runner messaging is deliberately best-effort; keep its last state.
@@ -521,18 +565,68 @@ async def validate_scan(request: ScanValidationRequest):
     )
 
 
+@app.post("/api/scan/start", response_model=ScanValidationResponse, dependencies=[Depends(verify_api_key)])
+async def start_scan(request: ScanValidationRequest):
+    _bind_ai_gateway_context(request)
+    try:
+        job = scan_jobs.start(
+            request.project_id, request.user_id,
+            lambda progress: EnvironmentInitializer(progress, request),
+            lambda: invalidate_cache(request.project_id),
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    scan_contexts.pop(request.project_id, None)
+    invalidate_cache(request.project_id)
+    return ScanValidationResponse(success=True, message="Scan started", data={**public_scan_validation(request), "run_id": job.run_id})
+
+
 @app.websocket("/ws/scan/{project_id}")
 async def websocket_scan(websocket: WebSocket, project_id: str):
-    await _handle_websocket(
-        websocket, project_id,
-        create_runner=lambda ws, pid, ctx: EnvironmentInitializer(ws, ctx),
-        contexts=scan_contexts,
-        active=active_scans,
-        missing_context_msg="No scan context found. Please validate the scan first.",
-        # Invalidate the Python cache after the scanner writes new volume files so
-        # the very first frontend fetch after 'completed' always reads fresh data.
-        on_complete=lambda: invalidate_cache(project_id),
-    )
+    await websocket.accept()
+    token = websocket.query_params.get("token")
+    if API_KEY is not None and (not token or not _verify_ws_token(token, project_id)):
+        await websocket.close(code=1008, reason="Invalid or missing token")
+        return
+    subject = _extract_ws_token_sub(token) if API_KEY is not None else None
+    job = None
+    try:
+        while True:
+            command = WebSocketCommand(**json.loads(await websocket.receive_text()))
+            if command.action != "start":
+                continue
+            job = scan_jobs.jobs.get(project_id)
+            if job is None:
+                snapshot = await scan_jobs.snapshot(project_id)
+                if snapshot:
+                    if subject is not None and str(snapshot["user_id"]) != str(subject):
+                        await websocket.close(code=1008, reason="Unauthorized")
+                        return
+                    for event in snapshot["events"]:
+                        await websocket.send_json(event)
+                    await websocket.send_json({"type": "status", "status": snapshot["status"], "run_id": snapshot["run_id"]})
+                    continue
+            context = scan_contexts.get(project_id)
+            owner = job.user_id if job else getattr(context, "user_id", None)
+            if subject is not None and str(owner) != str(subject):
+                await websocket.close(code=1008, reason="Unauthorized")
+                return
+            # Compatibility for older clients that still validate then send start.
+            if context is not None and (job is None or job.status != "running"):
+                await start_scan(context)
+                job = scan_jobs.jobs.get(project_id)
+            if job is None:
+                await websocket.send_json({"type": "status", "status": "error",
+                                           "error": "No scan found. Start a scan from the project."})
+                continue
+            await job.attach(websocket)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if job is not None:
+            job.subscribers.discard(websocket)
 
 
 @app.get("/api/scan/results/{project_id}", dependencies=[Depends(verify_api_key)])
@@ -550,13 +644,22 @@ async def scan_results(project_id: str):
 @app.get("/api/scan/status/{project_id}", dependencies=[Depends(verify_api_key)])
 async def scan_status(project_id: str):
     """Return lightweight vulnerability status: found, not_found, not_initiated, or running."""
-    if project_id in active_scans:
+    job = scan_jobs.jobs.get(project_id)
+    snapshot = await scan_jobs.snapshot(project_id)
+    if snapshot:
+        state = snapshot["status"]
+        if state in ("running", "error", "interrupted"):
+            return {**snapshot, "status": "error" if state == "interrupted" else state,
+                    "execution_status": state}
+    if job and job.status == "error":
+        return {"status": "error"}
+    if (job and job.status == "running") or project_id in active_scans:
         return {"status": "running"}
     loop = asyncio.get_running_loop()
     status = await loop.run_in_executor(
         None, partial(get_scan_status, project_id)
     )
-    return {"status": status}
+    return {"status": status, "run_id": snapshot["run_id"] if snapshot else None, "events": snapshot["events"] if snapshot else []}
 
 
 @app.delete("/api/scan/results/{project_id}", dependencies=[Depends(verify_api_key)])

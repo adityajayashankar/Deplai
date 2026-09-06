@@ -125,10 +125,18 @@ class DeplaiAI:
             payload["temperature"] = temperature
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
-        if response_format:
+        # Security remediation validates its JSON contract locally. Do not
+        # send OpenAI's native strict-schema option to OpenRouter free models:
+        # provider support is inconsistent and rejected schemas become 400s.
+        if response_format and not (metadata or {}).get("product") == "security":
             payload["response_format"] = response_format
         if metadata:
             payload["metadata"] = metadata
+        # Reasoning controls are optional provider extensions. Omit them for
+        # remediation so every selected OpenRouter free model receives the
+        # smallest common OpenAI-compatible request shape.
+        if (metadata or {}).get("product") != "security":
+            payload.setdefault("reasoning", {"effort": "high"})
 
         url = _gateway_url().rstrip("/") + "/api/ai/chat"
         headers = {
@@ -184,33 +192,41 @@ def remediate_text(
     max_tokens: int | None = None,
     response_format: dict[str, Any] | None = None,
     timeout_seconds: int = 120,
+    temperature: float = 0.15,
 ) -> tuple[bool, str]:
-    """Call the Connector AI gateway for security remediation."""
+    """Call the platform OpenRouter gateway for security remediation.
+
+    Remediation does not accept a caller key, BYOK credential, or alternate
+    provider. Keeping that decision here as well as in Connector prevents a
+    worker-side fallback from bypassing the product security policy.
+    """
     resolved_user = str(user_id or bound_user()).strip()
     if not resolved_user:
-        return (False, "AI gateway requires a user_id.")
-    mode = (access_mode or "auto").strip().lower() or "auto"
-    if mode not in {"platform", "byok", "auto"}:
-        mode = "auto"
-    requested = (model or "").strip()
-    if not requested and mode == "platform":
-        requested = os.getenv("REMEDIATION_PLATFORM_MODEL", "glm-5.2-free").strip()
-    resolved_model = requested or ("glm-5.2-free" if mode == "platform" else "best_coding")
+        return (False, "Security remediation requires the authenticated platform gateway user context.")
+    from cheap_models import resolve_cheap_model
+    from remediation_pipeline.remediation_store import current_remediation_run_id
     return chat_text(
         user_id=resolved_user,
         organization_id=organization_id,
-        model=resolved_model,
+        model=resolve_cheap_model(model, access_mode="platform"),
         prompt=prompt,
-        access_mode=mode,
-        api_key=api_key,
-        provider=None if resolved_model.startswith("best") else _map_provider(provider),
-        credential_id=credential_id,
-        temperature=0.1,
+        access_mode="platform",
+        # Deliberately omit api_key and credential_id: this is platform-only.
+        provider="openrouter",
+        temperature=temperature,
         max_tokens=max_tokens,
-        response_format=response_format,
+        # Strict JSON is a local postcondition. Native schema mode is omitted
+        # because not every OpenRouter free upstream accepts it.
+        response_format=None,
         timeout_seconds=timeout_seconds,
-        metadata={"product": "security", "stage": "remediation"},
+        metadata={
+            "product": "security",
+            "stage": "remediation",
+            "remediation_run_id": current_remediation_run_id(),
+            "json_contract": "local_strict",
+        },
     )
+
 
 
 def chat_text(**kwargs: Any) -> tuple[bool, str]:
@@ -218,6 +234,14 @@ def chat_text(**kwargs: Any) -> tuple[bool, str]:
         return (False, "AI platform gateway is not configured.")
     try:
         result = DeplaiAI().chat(**kwargs)
+        if (kwargs.get("metadata") or {}).get("product") == "security":
+            from remediation_pipeline.remediation_store import current_remediation_run_id, remediation_runs
+            for attempt in result.get("skipped", []) or []:
+                remediation_runs.append_event(current_remediation_run_id(), project_id="", message_type="model_attempt",
+                    content=json.dumps(attempt), stage="remediation")
+            remediation_runs.append_event(current_remediation_run_id(), project_id="", message_type="model_result",
+                content=json.dumps({"model": result.get("model"), "provider": result.get("provider"),
+                    "usage": result.get("usage"), "cost": result.get("cost"), "fallback": result.get("fallback")}), stage="remediation")
         text = str(result.get("output") or "").strip()
         if not text:
             return (False, "AI gateway returned an empty response.")

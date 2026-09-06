@@ -1,46 +1,33 @@
-# Tier 1 Docker Compose — UI/UX Refactor Agent + MongoDB
-# Based on agentos-docker-template with the db service swapped for Mongo.
-#
-# Usage:
-#   docker compose up -d --build
-#   # Confirm at http://localhost:7777/docs
-#   # Control Plane: os.agno.com → Add new OS → Local → http://localhost:7777
-#   docker compose down          # stop; add -v to wipe session/trace data
-
+# Standalone development worker. The root compose stack also wires Connector.
 services:
-  agentos:
+  uiux-agent:
     build:
       context: .
-      dockerfile: Dockerfile
-    ports: ["7777:7777"]
-    environment:
-      - MONGO_DB_URL=mongodb://agno:agno@mongo:27017
-      - MONGO_DB_NAME=agno
-      - AGNO_TELEMETRY=false
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - STRONG_MODEL=${STRONG_MODEL:-claude-sonnet-4-20250514}
-      - SMALL_MODEL=${SMALL_MODEL:-claude-haiku-3-20240307}
-      - TARGET_REPO_ROOT=/app/target-repo
-      - AGENTOS_PORT=7777
-    volumes:
-      - ./:/app                         # Live-reload during dev
-      - target-repo:/app/target-repo:ro # Mount the Connector source read-only
-    depends_on:
-      mongo:
-        condition: service_started
-
-  mongo:
-    image: mongo:7
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:7777:7777"
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=agno
-      - MONGO_INITDB_ROOT_PASSWORD=agno
+      DEPLAI_SERVICE_KEY: ${DEPLAI_SERVICE_KEY:?Set DEPLAI_SERVICE_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      UIUX_OPENROUTER_MODEL: ${UIUX_OPENROUTER_MODEL:-}
+      UIUX_RUN_DIRECTORY: /app/data/uiux-runs
+      UIUX_CONNECTOR_URL: ${UIUX_CONNECTOR_URL:-http://host.docker.internal:3000}
+      PYTHONDONTWRITEBYTECODE: "1"
     volumes:
-      - mongodata:/data/db
-    # Bind to localhost only — no external access.
-    # In production, use Atlas or VPC-internal replica set instead.
-    ports: ["27017:27017"]
+      - uiux_worker_state:/app/data/uiux-runs
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; from urllib.request import Request,urlopen; urlopen(Request('http://127.0.0.1:7777/uiux/health',headers={'X-API-Key':os.environ['DEPLAI_SERVICE_KEY']}),timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
 volumes:
-  mongodata:
-  target-repo:
+  uiux_worker_state:

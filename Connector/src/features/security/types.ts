@@ -46,7 +46,44 @@ export interface SecurityModule {
   component_count?: number;
   reason?: string;
   error?: string;
+  engine?: string;
+  phase?: string;
+  report_ref?: string;
+  report_validated?: boolean;
+  checked_target_count?: number | null;
+  coverage?: string;
+  container_id?: string;
+  image_id?: string;
+  exit_code?: number;
 }
+
+export type SdlcPhaseId = 'commit' | 'build' | 'predeploy' | 'runtime' | 'ops';
+
+export const SDLC_PHASES: Array<{
+  id: SdlcPhaseId;
+  label: string;
+  modules: SecurityModuleId[];
+}> = [
+  { id: 'commit', label: 'Commit / source', modules: ['secrets', 'sast'] },
+  { id: 'build', label: 'Build', modules: ['sbom', 'sca', 'containers'] },
+  { id: 'predeploy', label: 'Pre-deploy', modules: ['iac', 'kubernetes', 'cicd', 'api'] },
+  { id: 'runtime', label: 'Runtime', modules: ['dast'] },
+  { id: 'ops', label: 'Ops', modules: ['cloud'] },
+];
+
+export const MODULE_ENGINES: Record<SecurityModuleId, string> = {
+  secrets: 'Gitleaks',
+  sast: 'Bearer',
+  sbom: 'Syft',
+  sca: 'Grype',
+  containers: 'Checkov Containers',
+  iac: 'Checkov IaC',
+  kubernetes: 'Checkov Kubernetes',
+  cicd: 'Checkov CI/CD',
+  api: 'Checkov API',
+  dast: 'OWASP ZAP',
+  cloud: 'Prowler',
+};
 
 export interface UnifiedFinding {
   id: string;
@@ -129,20 +166,22 @@ export const PIPELINE_MODULES: Array<{
   id: SecurityModuleId;
   label: string;
   summary: string;
+  engine: string;
+  phase: SdlcPhaseId;
   defaultEnabled: boolean;
   tabOnly?: boolean;
 }> = [
-  { id: 'sast', label: 'SAST', summary: 'Static code analysis', defaultEnabled: true },
-  { id: 'sca', label: 'SCA', summary: 'Dependency vulnerabilities', defaultEnabled: true },
-  { id: 'sbom', label: 'SBOM', summary: 'Software bill of materials', defaultEnabled: true },
-  { id: 'secrets', label: 'Secrets', summary: 'Secret scanning', defaultEnabled: true },
-  { id: 'iac', label: 'IaC', summary: 'Infrastructure as code', defaultEnabled: true },
-  { id: 'containers', label: 'Containers', summary: 'Container configuration', defaultEnabled: true },
-  { id: 'kubernetes', label: 'Kubernetes', summary: 'Workload and cluster manifests', defaultEnabled: true },
-  { id: 'cicd', label: 'CI/CD', summary: 'Pipeline and workflow security', defaultEnabled: true },
-  { id: 'api', label: 'API Security', summary: 'API specification analysis', defaultEnabled: true },
-  { id: 'dast', label: 'DAST', summary: 'Dynamic application testing', defaultEnabled: false },
-  { id: 'cloud', label: 'Cloud', summary: 'Live AWS account posture after deploy', defaultEnabled: false, tabOnly: true },
+  { id: 'sast', label: 'SAST', summary: 'Static code analysis', engine: 'Bearer', phase: 'commit', defaultEnabled: true },
+  { id: 'sca', label: 'SCA', summary: 'Dependency vulnerabilities', engine: 'Grype', phase: 'build', defaultEnabled: true },
+  { id: 'sbom', label: 'SBOM', summary: 'Software bill of materials', engine: 'Syft', phase: 'build', defaultEnabled: true },
+  { id: 'secrets', label: 'Secrets', summary: 'Secret scanning', engine: 'Gitleaks', phase: 'commit', defaultEnabled: true },
+  { id: 'iac', label: 'IaC', summary: 'Infrastructure as code', engine: 'Checkov IaC', phase: 'predeploy', defaultEnabled: true },
+  { id: 'containers', label: 'Containers', summary: 'Container configuration', engine: 'Checkov Containers', phase: 'build', defaultEnabled: true },
+  { id: 'kubernetes', label: 'Kubernetes', summary: 'Workload and cluster manifests', engine: 'Checkov Kubernetes', phase: 'predeploy', defaultEnabled: true },
+  { id: 'cicd', label: 'CI/CD', summary: 'Pipeline and workflow security', engine: 'Checkov CI/CD', phase: 'predeploy', defaultEnabled: true },
+  { id: 'api', label: 'API Security', summary: 'API specification analysis', engine: 'Checkov API', phase: 'predeploy', defaultEnabled: true },
+  { id: 'dast', label: 'DAST', summary: 'Dynamic application testing', engine: 'OWASP ZAP', phase: 'runtime', defaultEnabled: false },
+  { id: 'cloud', label: 'Cloud', summary: 'Live AWS account posture after deploy', engine: 'Prowler', phase: 'ops', defaultEnabled: false, tabOnly: true },
 ];
 
 export const PHASE1_MODULES = PIPELINE_MODULES;

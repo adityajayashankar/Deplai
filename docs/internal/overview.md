@@ -19,7 +19,6 @@ DeplAI is a multi-service workspace. The browser never talks to Docker, Terrafor
 | `docs/guide/` | Client docs (dashboard) |
 | `docs/internal/` | This handbook |
 
-Scratch / reference UI kits in the repo (`auth-flows-ui-kit/`, `optimus-the-ai-platform-to-build-and-ship/`, etc.) are **not** part of the running product.
 
 ## Runtime topology (local)
 

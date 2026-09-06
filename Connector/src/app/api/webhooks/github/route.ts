@@ -1,3 +1,4 @@
+import { enqueueGithubSecurityEvent } from '@/lib/security/sdlc-events';
 import { NextRequest, NextResponse } from 'next/server';
 import { query } from '@/lib/db';
 import { verifyWebhookSignature } from '@/lib/crypto';
@@ -76,12 +77,22 @@ export async function POST(request: NextRequest) {
       
       case 'push':
         await handlePush(payload);
+        if (!payload.deleted) await enqueueGithubSecurityEvent(payload.repository.id, 'push', deliveryId, payload.after);
         break;
       
       case 'pull_request':
         await handlePullRequest(payload);
+        if (['opened', 'synchronize', 'reopened'].includes(payload.action)) await enqueueGithubSecurityEvent(payload.repository.id, 'pull_request', deliveryId, payload.pull_request.head.sha);
         break;
       
+      case 'workflow_run':
+        if (payload.action === 'completed' && payload.workflow_run.conclusion === 'success')
+          await enqueueGithubSecurityEvent(payload.repository.id, 'build', deliveryId, payload.workflow_run.head_sha);
+        break;
+      case 'deployment_status':
+        if (payload.deployment_status.state === 'success')
+          await enqueueGithubSecurityEvent(payload.repository.id, 'deployment', deliveryId, payload.deployment.sha);
+        break;
       default:
         console.log(`Unhandled event: ${event}`);
     }

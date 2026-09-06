@@ -37,6 +37,7 @@ export function resolveOpenRouterSlug(catalogModelId: string): string {
   if (!provider || !model) {
     throw new Error(`Invalid catalog model id: ${catalogModelId}`);
   }
+  if (provider === 'openrouter') return model;
   if (provider === 'gemini') return `google/${model}`;
   if (provider === 'xai') return `x-ai/${model}`;
   if (provider === 'kimi') return `moonshotai/${model}`;

@@ -96,6 +96,22 @@ test('refresh restores outputs stage for completed deployments', () => {
   assert.equal(resolveRestoredDeployUiStage(snapshot({ status: 'idle' }), 'terraform'), 'terraform');
 });
 
+test('expired preparation cannot restore credentials ahead of the pipeline', () => {
+  const idle = snapshot({ status: 'idle' });
+  assert.equal(resolveRestoredDeployUiStage(idle, 'aws_config', {
+    hasAnalysis: false, hasApprovedPlan: false, hasTerraform: false,
+  }), 'analysis');
+  assert.equal(resolveRestoredDeployUiStage(idle, 'aws_config', {
+    hasAnalysis: true, hasApprovedPlan: true, hasTerraform: false,
+  }), 'terraform');
+  assert.equal(resolveRestoredDeployUiStage(idle, 'aws_config', {
+    hasAnalysis: true, hasApprovedPlan: true, hasTerraform: true,
+  }), 'aws_config');
+  assert.equal(resolveRestoredDeployUiStage(snapshot({ status: 'running' }), 'analysis', {
+    hasAnalysis: false, hasApprovedPlan: false, hasTerraform: false,
+  }), 'deploy');
+});
+
 test('successful deploy commits durable history and terminal state', () => {
   const base = snapshot({ status: 'running', progress: 80 });
   const committed = commitSuccessfulDeployment(base, {

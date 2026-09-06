@@ -97,6 +97,7 @@ export interface ChatMessage {
   content: string;
   name?: string;
   toolCallId?: string;
+  toolCalls?: Array<{ id: string; name: string; arguments: string }>;
 }
 
 export interface ChatTool {

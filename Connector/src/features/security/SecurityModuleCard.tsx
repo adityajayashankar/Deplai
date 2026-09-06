@@ -31,11 +31,16 @@ export function SecurityModuleCard({
       <div className="mb-3 flex w-full items-start justify-between gap-3">
         <div>
           <p className="text-sm font-semibold text-black">{meta?.label || module.id}</p>
-          <p className="mt-1 text-[11px] text-zinc-500">{meta?.summary}</p>
+          <p className="mt-1 text-[11px] text-zinc-500">
+            {module.engine || meta?.engine || meta?.summary}
+            {meta?.engine ? ` · ${meta.summary}` : ''}
+          </p>
         </div>
         <ScanStatus status={module.status} />
       </div>
       <p className="font-mono text-xs text-neutral-700">{countLabel}</p>
+      {module.report_validated && <p className="mt-1 text-[11px] text-zinc-500">Report validated{module.checked_target_count != null ? ` · ${module.checked_target_count} targets/checks` : ' · target count not reported'}</p>}
+      {module.exit_code != null && <p className="text-[11px] text-zinc-500">Process exit: {module.exit_code}</p>}
       {detail ? <p className="mt-2 text-[11px] leading-5 text-zinc-500">{detail}</p> : null}
     </button>
   );

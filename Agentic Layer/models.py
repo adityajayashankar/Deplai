@@ -28,6 +28,21 @@ class RepositorySourceOverride(BaseModel):
     source_tree_hash: str
 
 
+class GeneratedScanFile(BaseModel):
+    path: str = Field(max_length=500)
+    content: str = Field(max_length=500_000)
+
+    @field_validator("path")
+    @classmethod
+    def safe_relative_path(cls, value):
+        from pathlib import PurePosixPath
+        value = value.replace("\\", "/")
+        path = PurePosixPath(value)
+        if path.is_absolute() or any(p in {"..", ".git"} for p in path.parts) or ":" in value or not path.parts:
+            raise ValueError("Generated scan file must have a safe relative path")
+        return value
+
+
 class ScanValidationRequest(BaseModel):
     project_id: str
     project_name: str
@@ -41,6 +56,10 @@ class ScanValidationRequest(BaseModel):
     # Which scanners to run: sast (Bearer), sca (Syft+Grype), or all
     scan_type: Literal["sast", "sca", "all"] = "all"
     enabled_modules: Optional[list[str]] = None
+    trigger: Literal["manual", "push", "pull_request", "build", "predeploy", "deployment", "schedule"] = "manual"
+    source_revision: Optional[str] = Field(default=None, pattern=r"^[a-fA-F0-9]{40,64}$")
+    artifact_digest: Optional[str] = Field(default=None, pattern=r"^[a-zA-Z0-9./:_-]+@sha256:[a-f0-9]{64}$")
+    generated_files: list[GeneratedScanFile] = Field(default_factory=list, max_length=100)
     dast_target_url: Optional[str] = None
     dast_asset_id: Optional[str] = None
     dast_scan_id: Optional[str] = None
@@ -131,6 +150,9 @@ class ScanValidationRequest(BaseModel):
             self.aws_secret_access_key = None
             self.aws_session_token = None
             return self
+        if not self.aws_access_key_id and not self.aws_secret_access_key:
+            # Missing prerequisites are explicit tool skips, not fabricated clean scans.
+            return self
         from cloud_scan import validate_cloud_scan_request
         ok, error, region = validate_cloud_scan_request(
             self.aws_access_key_id,
@@ -154,6 +176,9 @@ def public_scan_validation(request: ScanValidationRequest) -> dict[str, Any]:
     payload["aws_secret_access_key"] = None
     payload["aws_session_token"] = None
     payload["dast_authorization"] = None
+    payload["github_token"] = None
+    payload["aws_access_key_id"] = None
+    payload.pop("generated_files", None)
     return payload
 
 

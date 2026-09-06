@@ -759,6 +759,11 @@ async function bindUiuxWorkspaceSession(options: {
 }
 
 async function proxyUiuxAgentRequest(request: NextRequest, userId: string, pathSegments: string[]) {
+  // Retire the AgentOS transport: its request contract and provider selection
+  // cannot enforce the presentation worker's free-only and snapshot boundaries.
+  if (pathSegments[0] === 'uiux') {
+    return NextResponse.json({ error: 'The UI/UX agent has moved. Open /dashboard/customization to use the repository workspace.' }, { status: 410 });
+  }
   const action = pathSegments[1] || '';
   const agentBaseUrl = getUiuxAgentBaseUrl();
   const workflowId = encodeURIComponent(getUiuxWorkflowId());

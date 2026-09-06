@@ -1398,6 +1398,7 @@ export function isLiveManagedDeployment(snapshot: DeployStateSnapshot | null | u
 export function resolveRestoredDeployUiStage(
   snapshot: DeployStateSnapshot | null | undefined,
   savedStage: string | null | undefined,
+  preparation?: { hasAnalysis: boolean; hasApprovedPlan: boolean; hasTerraform: boolean },
 ): string {
   if (snapshot?.status === 'done' && deploymentHasProvisionedInfrastructure(snapshot.deployResult)) {
     return 'outputs';
@@ -1406,6 +1407,11 @@ export function resolveRestoredDeployUiStage(
     return 'deploy';
   }
   const stage = String(savedStage || '').trim();
+  if (preparation) {
+    if (!preparation.hasAnalysis) return 'analysis';
+    if (!preparation.hasApprovedPlan && !['analysis', 'qa'].includes(stage)) return 'qa';
+    if (!preparation.hasTerraform && ['aws_config', 'app_secrets', 'deploy', 'outputs'].includes(stage)) return 'terraform';
+  }
   return stage || 'analysis';
 }
 

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { classifyUpstreamError } from '@/features/deployment/apply-status';
+import { resolveDeploymentStatusTarget } from '@/features/deployment/status-target';
 
 function firstIacOutputString(outputs: unknown, keys: string[]): string | null {
   if (!outputs || typeof outputs !== 'object') return null;
@@ -39,7 +40,12 @@ export async function POST(req: NextRequest) {
     const { user, error } = await requireAuth();
     if (error) return error;
 
-    const body = await req.json().catch(() => ({})) as { project_id?: string; project_name?: string; run_id?: string };
+    const body = await req.json().catch(() => ({})) as {
+      project_id?: string;
+      project_name?: string;
+      run_id?: string;
+      mode?: string;
+    };
     const projectId = String(body.project_id || '').trim();
     if (!projectId) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
@@ -50,7 +56,8 @@ export async function POST(req: NextRequest) {
 
     const projectName = String(body.project_name || owned.project?.name || projectId).trim();
     const runId = String(body.run_id || '').trim();
-    if (runId) {
+    const statusTarget = resolveDeploymentStatusTarget({ runId, mode: body.mode });
+    if (statusTarget === 'iac_pipeline') {
       const res = await fetch(`${AGENTIC_URL}/api/iac/status/${encodeURIComponent(runId)}`, {
         method: 'GET',
         headers: { ...agenticHeaders(), 'Content-Type': 'application/json' },
@@ -154,10 +161,10 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     const msg = classifyStatusError(err);
     return NextResponse.json({
-      success: true,
-      status: 'idle',
+      success: false,
+      status: 'error',
       result: null,
-      warning: msg,
-    });
+      error: msg,
+    }, { status: 502 });
   }
 }

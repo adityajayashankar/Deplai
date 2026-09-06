@@ -330,7 +330,7 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const response = await fetch(`${AGENTIC_URL}/api/scan/validate`, {
+    const response = await fetch(`${AGENTIC_URL}/api/scan/start`, {
       method: 'POST',
       headers: agenticHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(backendPayload),
@@ -338,6 +338,12 @@ export async function POST(request: NextRequest) {
     });
 
     if (!response.ok) {
+      if (response.status === 404) {
+        return NextResponse.json({
+          error: 'The running scanner backend does not expose the scan-start endpoint. Restart or update the Agentic Layer service, then retry the scan.',
+          code: 'SCAN_BACKEND_VERSION_MISMATCH',
+        }, { status: 503 });
+      }
       const raw = await response.text();
       let errorBody: { error?: unknown; detail?: unknown } | null = null;
       try {

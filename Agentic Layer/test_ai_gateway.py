@@ -11,7 +11,7 @@ from ai_gateway import bind_ai_context, bound_organization, remediate_text
 
 
 class RemediateTextProviderTests(unittest.TestCase):
-    def test_empty_model_defaults_to_best_coding_without_mapped_provider(self) -> None:
+    def test_empty_model_uses_the_openrouter_free_router(self) -> None:
         with patch("ai_gateway.chat_text", return_value=(True, "ok")) as chat:
             ok, text = remediate_text(
                 user_id="user-1",
@@ -22,10 +22,11 @@ class RemediateTextProviderTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(text, "ok")
         kwargs = chat.call_args.kwargs
-        self.assertEqual(kwargs["model"], "best_coding")
-        self.assertIsNone(kwargs["provider"])
+        self.assertEqual(kwargs["model"], "openrouter/free")
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertEqual(kwargs["access_mode"], "platform")
 
-    def test_explicit_best_alias_does_not_map_provider(self) -> None:
+    def test_explicit_model_preference_is_ignored_for_the_free_router(self) -> None:
         with patch("ai_gateway.chat_text", return_value=(True, "ok")) as chat:
             remediate_text(
                 user_id="user-1",
@@ -34,10 +35,11 @@ class RemediateTextProviderTests(unittest.TestCase):
                 provider="claude",
             )
         kwargs = chat.call_args.kwargs
-        self.assertEqual(kwargs["model"], "best_fast")
-        self.assertIsNone(kwargs["provider"])
+        self.assertEqual(kwargs["model"], "openrouter/free")
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertEqual(kwargs["access_mode"], "platform")
 
-    def test_concrete_model_still_maps_provider(self) -> None:
+    def test_non_free_concrete_model_cannot_bypass_the_free_router(self) -> None:
         with patch("ai_gateway.chat_text", return_value=(True, "ok")) as chat:
             remediate_text(
                 user_id="user-1",
@@ -46,8 +48,9 @@ class RemediateTextProviderTests(unittest.TestCase):
                 provider="openai",
             )
         kwargs = chat.call_args.kwargs
-        self.assertEqual(kwargs["model"], "gpt-4.1")
-        self.assertEqual(kwargs["provider"], "openai")
+        self.assertEqual(kwargs["model"], "openrouter/free")
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertEqual(kwargs["access_mode"], "platform")
 
     def test_gateway_ready_requires_organization_by_default(self) -> None:
         with patch.dict(os.environ, {"DEPLAI_AI_GATEWAY_URL": "http://connector.test"}, clear=False):
@@ -68,7 +71,7 @@ class RemediateTextProviderTests(unittest.TestCase):
         self.assertEqual(text, "ok")
         self.assertEqual(chat.call_args.kwargs["organization_id"], "org-9")
 
-    def test_remediate_text_forwards_credential_id(self) -> None:
+    def test_remediate_text_drops_byok_credential_and_forces_platform(self) -> None:
         with patch("ai_gateway.chat_text", return_value=(True, "ok")) as chat:
             ok, text = remediate_text(
                 user_id="user-1",
@@ -78,8 +81,10 @@ class RemediateTextProviderTests(unittest.TestCase):
             )
         self.assertTrue(ok)
         self.assertEqual(text, "ok")
-        self.assertEqual(chat.call_args.kwargs["credential_id"], "cred-123")
-        self.assertEqual(chat.call_args.kwargs["access_mode"], "byok")
+        self.assertNotIn("credential_id", chat.call_args.kwargs)
+        self.assertNotIn("api_key", chat.call_args.kwargs)
+        self.assertEqual(chat.call_args.kwargs["provider"], "openrouter")
+        self.assertEqual(chat.call_args.kwargs["access_mode"], "platform")
 
 
 if __name__ == "__main__":

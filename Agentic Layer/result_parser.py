@@ -1,5 +1,6 @@
 import json
 import threading
+import hashlib
 
 import docker
 
@@ -407,8 +408,15 @@ def _finding(
     evidence_source: str,
     metadata: dict | None = None,
 ) -> dict:
+    identity = json.dumps([category, (metadata or {}).get("rule_id") or (metadata or {}).get("cve_id") or
+        (metadata or {}).get("cwe_id") or title, asset, location], separators=(",", ":"), sort_keys=True)
+    fingerprint = hashlib.sha256(identity.encode()).hexdigest()
     return {
-        "id": finding_id,
+        "id": fingerprint,
+        "fingerprint": fingerprint,
+        "source_finding_id": finding_id,
+        "provenance": [{"tool": scanner, "finding_id": finding_id}],
+        "remediation_capability": "manual_action" if category in ("cloud", "dast", "secrets") else "source_patch",
         "category": category,
         "severity": _normalize_severity(severity),
         "title": title,
@@ -609,19 +617,15 @@ def _annotate_risk(findings: list[dict]) -> list[dict]:
 
 
 def _ensure_unique_finding_ids(findings: list[dict]) -> list[dict]:
-    """Keep list rows distinct so React keys and row expansion stay stable.
-
-    Grype often emits the same CVE for the same package version more than
-    once (nested trees, related advisories). Other scanners can collide too.
-    """
-    seen: dict[str, int] = {}
+    """Deduplicate stable identities while retaining scanner provenance."""
+    unique = {}
     for finding in findings:
-        base = str(finding.get("id") or "finding").strip() or "finding"
-        count = seen.get(base, 0)
-        seen[base] = count + 1
-        if count:
-            finding["id"] = f"{base}#{count}"
-    return findings
+        key = finding["fingerprint"]
+        if key not in unique:
+            unique[key] = finding
+        else:
+            unique[key]["provenance"].extend(finding.get("provenance", []))
+    return list(unique.values())
 
 
 def _compute_risk(findings: list[dict]) -> dict:
@@ -770,12 +774,19 @@ def _module_record(
     component_count: int | None = None,
     reason: str | None = None,
     error: str | None = None,
+    engine: str | None = None,
+    phase: str | None = None,
 ) -> dict:
+    from sdlc_pipeline import engine_for, phase_for
+
+    phase_id, _ = phase_for(module_id)
     record = {
         "id": module_id,
         "status": status,
         "finding_count": len(findings or []),
         "severity_breakdown": _severity_breakdown(findings or []),
+        "engine": engine or engine_for(module_id),
+        "phase": phase or phase_id,
     }
     if component_count is not None:
         record["component_count"] = component_count
@@ -812,6 +823,7 @@ def build_scan_payload(
     dast_raw: str | None = None,
     cloud_raw: str | None = None,
     pipeline_raw: str | None = None,
+    image_grype_raw: str | None = None,
 ) -> dict:
     """Normalize scanner reports into the unified Security Pipeline payload."""
     pipeline = _loads_json(pipeline_raw) if pipeline_raw else None
@@ -830,6 +842,7 @@ def build_scan_payload(
     sbom = _try_parse(_parse_sbom_summary, syft_raw, {"component_count": 0, "components": []})
     dast = _try_parse(_parse_dast_report, dast_raw, [])
     cloud = _try_parse(_parse_cloud_report, cloud_raw, [])
+    image_supply = _try_parse(_parse_grype_report, image_grype_raw, []) if image_grype_raw else []
 
     iac = _merge_policy(_try_parse(lambda raw: _parse_checkov_report(raw, "iac"), checkov_raw, []))
     containers = _merge_policy(
@@ -860,6 +873,10 @@ def build_scan_payload(
         + _unified_from_policy(api, "api", _POLICY_EVIDENCE["api"])
         + _unified_from_dast(dast)
         + _unified_from_cloud(cloud)
+        + [_finding(finding_id=f"image:{item.get('cve_id')}:{item.get('name')}", category="containers",
+            severity=item.get("severity", "medium"), title=f"{item.get('cve_id')} in image package {item.get('name')}",
+            asset=str(pipeline.get("artifact_digest") or "built image"), location=str(item.get("purl") or item.get("name")),
+            scanner="Grype", evidence_source="Built image packages", metadata={**item, "requires_image_rebuild": True}) for item in image_supply]
     ))
 
     findings_by_category = {
@@ -888,13 +905,10 @@ def build_scan_payload(
         status = str(pipeline_item.get("status") or "").upper()
         reason = pipeline_item.get("reason")
         error = pipeline_item.get("error")
+        engine = pipeline_item.get("engine")
+        phase = pipeline_item.get("phase")
         if not status:
             status = "COMPLETED" if present.get(module_id) else "SKIPPED"
-        elif status == "SKIPPED" and present.get(module_id):
-            # A later DAST-only run writes a partial pipeline file. Keep prior
-            # module results when their reports are still on disk.
-            status = "COMPLETED"
-            reason = None
         if status == "SKIPPED" and not reason:
             reason = _SKIP_REASONS.get(module_id)
         if module_id == "sbom":
@@ -905,6 +919,8 @@ def build_scan_payload(
                 component_count=sbom.get("component_count", 0) if status == "COMPLETED" else 0,
                 reason=reason,
                 error=error,
+                engine=engine,
+                phase=phase,
             ))
         else:
             modules.append(_module_record(
@@ -913,10 +929,23 @@ def build_scan_payload(
                 findings_by_category.get(module_id, []),
                 reason=reason,
                 error=error,
+                engine=engine,
+                phase=phase,
             ))
 
     posture = _severity_breakdown(findings)
+    for module in modules:
+        module.update({key: value for key, value in _status_from_pipeline(pipeline, module["id"]).items()
+            if key not in {"id", "status", "finding_count", "severity_breakdown"}})
+    for finding in findings:
+        if finding.get("metadata", {}).get("requires_image_rebuild"):
+            finding["remediation_capability"] = "manual_action"
+        finding["run_id"] = pipeline.get("run_id")
+        finding["source_revision"] = pipeline.get("source_revision")
     return {
+        "run_id": pipeline.get("run_id"),
+        "project_id": pipeline.get("project_id"),
+        "source_revision": pipeline.get("source_revision"),
         "supply_chain": supply_chain,
         "code_security": code_security,
         "secrets": secrets,
@@ -976,6 +1005,7 @@ def _load_and_cache(project_id: str) -> tuple[bool, dict | str]:
             "dast": find_volume_file(project_id, "Dast.json"),
             "cloud": find_volume_file(project_id, "Cloud.json"),
             "pipeline": find_volume_file(project_id, "Pipeline.json"),
+            "image_grype": find_volume_file(project_id, "ImageGrype.json"),
         }
         raw = {key: (read_volume_file(path) if path else None) for key, path in files.items()}
 
@@ -1001,6 +1031,7 @@ def _load_and_cache(project_id: str) -> tuple[bool, dict | str]:
                 dast_raw=raw["dast"],
                 cloud_raw=raw["cloud"],
                 pipeline_raw=raw["pipeline"],
+                image_grype_raw=raw["image_grype"],
             )
         except Exception as exc:
             return (False, f"Failed to parse scan reports: {exc}")

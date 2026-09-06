@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 Severity = Literal["critical", "high", "medium", "low"]
-VulnType = Literal["sast", "sca"]
+VulnType = Literal["sast", "sca", "secrets", "iac", "containers", "kubernetes", "cicd", "api", "dast", "cloud"]
 FixStatus = Literal["auto", "needs_review"]
 
 
@@ -26,6 +26,10 @@ class Vulnerability(BaseModel):
     installed_version: Optional[str] = None
     fix_version: Optional[str] = None
     type: VulnType
+    run_id: Optional[str] = None
+    source_revision: Optional[str] = None
+    remediation_capability: Literal["source_patch", "manual_action"] = "source_patch"
+    evidence: dict = Field(default_factory=dict)
     triage_action: Optional[Literal["remediate", "ignore"]] = None
     triage_reason: Optional[str] = None
     triage_confidence: Optional[float] = None
@@ -70,6 +74,7 @@ class Fix(BaseModel):
     provider_used: str
     tokens_used: int = Field(ge=0)
     status: FixStatus
+    verification_status: Literal["proposed", "verified_fixed", "unverified", "unresolved"] = "proposed"
     raw_response: Optional[str] = None
     warnings: list[str] = Field(default_factory=list)
 
@@ -100,6 +105,7 @@ class ProviderStatusResponse(BaseModel):
 
 
 class RemediationPRRequest(BaseModel):
+    source_revision: Optional[str] = None
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     project_id: Optional[str] = None

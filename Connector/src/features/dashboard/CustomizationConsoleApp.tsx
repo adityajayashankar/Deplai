@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { KeyRound, Sparkles } from 'lucide-react';
 import { AgentPanel } from '@/features/customization/AgentPanel';
 import { ModelSourceDialog } from '@/features/customization/ModelSourceDialog';
+import { UiuxWorkspace } from '@/features/customization/UiuxWorkspace';
 import {
   AUTO_APPLY_STORAGE_KEY,
   CUSTOMIZATION_MODES,
@@ -110,6 +111,13 @@ const initialRun: ImplementRunState = {
 };
 
 export default function CustomizationConsoleApp() {
+  const searchParams = useSearchParams();
+  return searchParams.get('workspace') === 'legacy'
+    ? <LegacyCustomizationConsoleApp />
+    : <UiuxWorkspace initialProjectId={searchParams.get('projectId') || ''} />;
+}
+
+function LegacyCustomizationConsoleApp() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const chatEndRef = useRef<HTMLDivElement | null>(null);

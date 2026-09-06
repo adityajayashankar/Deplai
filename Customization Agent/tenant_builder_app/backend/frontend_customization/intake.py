@@ -21,7 +21,7 @@ COMPONENT_RE = re.compile(r"(export\s+default\s+function|export\s+function|funct
 HOOK_RE = re.compile(r"\buse[A-Z][A-Za-z0-9_]+\b")
 
 
-def analyze_repository(working_root: str) -> dict[str, Any]:
+def analyze_repository(working_root: str, max_read_batch: int = 8) -> dict[str, Any]:
     root = Path(working_root).resolve()
     files = iter_files(root)
     relatives = [relative_posix(root, path) for path in files]

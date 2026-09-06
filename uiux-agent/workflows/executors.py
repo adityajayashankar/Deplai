@@ -403,6 +403,15 @@ def _components_in_scope(state: PipelineState) -> list[Any]:
     return selected or state.component_index.components[:5]
 
 
+def _structured_output_guard(stage: str) -> str:
+    return (
+        "SYSTEM GUARD: You are a structured-output engine. Your response MUST "
+        "be exactly one valid JSON object. No markdown prose, no commentary, "
+        f"no apologies, no leading/trailing text. Stage: {stage}. Required keys "
+        "are listed below. If unsure, use empty arrays/strings — never omit a key."
+    )
+
+
 def build_design_system_prompt(step_input: StepInput) -> str:
     """Prompt builder for the design-system agent step."""
     envelope = _load_envelope(step_input)
@@ -414,12 +423,16 @@ def build_design_system_prompt(step_input: StepInput) -> str:
     )
     clarification_json = json.dumps(state.clarification or {}, indent=2)
     return (
-        "Extend the design token specification for this UI/UX refactor.\n\n"
-        f"Style direction: {state.style_direction or envelope.user_message}\n"
-        f"Scope: {state.scope or 'all'}\n"
-        f"Clarification: {clarification_json}\n\n"
-        f"Extracted tokens:\n{tokens_json}\n\n"
-        "Return JSON matching DesignTokenSpec."
+        _structured_output_guard("design_system")
+        + "\n\n"
+        + "Return JSON matching DesignTokenSpec exactly. Required top-level keys: "
+        + "colors, typography, spacing, border_radii, shadows, animations, "
+        + "interactive_states, source, notes.\n\n"
+        + f"Style direction: {state.style_direction or envelope.user_message}\n"
+        + f"Scope: {state.scope or 'all'}\n"
+        + f"Clarification: {clarification_json}\n\n"
+        + f"Extracted tokens:\n{tokens_json}\n\n"
+        + "Return JSON matching DesignTokenSpec."
     )
 
 
@@ -431,7 +444,16 @@ def build_refactor_prompt(step_input: StepInput) -> str:
     max_components = int(os.environ.get("UIUX_MAX_COMPONENTS", "3"))
     targets = scoped[:max_components]
     lines = [
-        "Generate presentation-only unified diff patches for these components.",
+        _structured_output_guard("component_refactor"),
+        "",
+        "Return JSON with this exact shape:",
+        '{ "patches": [ { "component_name": str, "file_path": str, '
+        '"diff": str (unified diff), "description": str, "success": true } ] }',
+        "Each diff MUST be a unified diff starting with '--- a/<file>' and "
+        "'+++ b/<file>' lines and contain at least one '@@' hunk header.",
+        "If a target is too risky to patch, omit it and explain in 'notes'.",
+        "Output ONLY the JSON object.",
+        "",
         f"Style direction: {state.style_direction or envelope.user_message}",
         "",
         "Targets:",
@@ -446,8 +468,8 @@ def build_refactor_prompt(step_input: StepInput) -> str:
     lines.extend(
         [
             "",
-            "Use write_patch for each component. Never modify logic-classified lines.",
-            "Require confirmation before any patch is accepted.",
+            "Generate presentation-only unified diff patches. "
+            "Use only tokens listed above. Never modify logic-classified lines.",
         ]
     )
     return "\n".join(lines)

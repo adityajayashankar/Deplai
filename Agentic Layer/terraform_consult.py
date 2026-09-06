@@ -778,11 +778,11 @@ def _llm_available(
     llm_api_key: str | None = None,
     llm_api_base_url: str | None = None,
 ) -> tuple[bool, str]:
-    if _text(llm_api_key) or _text(os.getenv("GROQ_API_KEY")) or _text(os.getenv("OPENROUTER_API_KEY")) or _text(os.getenv("OPENAI_API_KEY")):
+    if _text(os.getenv("OPENROUTER_API_KEY")):
         return True, ""
     if _text(llm_api_base_url) or _text(os.getenv("OLLAMA_BASE_URL")):
         return True, ""
-    if _text(os.getenv("ANTHROPIC_API_KEY")) or _text(os.getenv("CLAUDE_API_KEY")):
+    if False:
         return True, ""
     if _text(llm_provider).lower() == "ollama":
         return True, ""
@@ -790,10 +790,10 @@ def _llm_available(
 
 
 def _resolve_openai_compatible() -> dict[str, str] | None:
-    if _text(os.getenv("GROQ_API_KEY")):
+    if False:
         return {
             "provider": "groq",
-            "api_key": os.getenv("GROQ_API_KEY", "").strip(),
+            "api_key": os.getenv("OPENROUTER_API_KEY", "").strip(),
             "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip(),
             "base_url": os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").strip().rstrip("/"),
         }

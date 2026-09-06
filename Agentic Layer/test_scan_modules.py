@@ -327,7 +327,7 @@ class ScanModuleParserTests(unittest.TestCase):
         self.assertEqual(payload["dast"][0]["uri"], "https://staging.example.com/login")
         self.assertTrue(any(path["hops"][0]["label"] == "Internet" for path in payload["attack_paths"]))
 
-    def test_dast_only_pipeline_keeps_prior_sast_report(self):
+    def test_dast_only_pipeline_does_not_claim_prior_sast_executed(self):
         payload = build_scan_payload(
             bearer_raw=BEARER_REPORT,
             dast_raw=DAST_REPORT,
@@ -339,7 +339,7 @@ class ScanModuleParserTests(unittest.TestCase):
             }),
         )
         modules = {item["id"]: item for item in payload["modules"]}
-        self.assertEqual(modules["sast"]["status"], "COMPLETED")
+        self.assertEqual(modules["sast"]["status"], "SKIPPED")
         self.assertEqual(modules["dast"]["status"], "COMPLETED")
         self.assertTrue(any(item["category"] == "sast" for item in payload["findings"]))
         self.assertTrue(any(item["category"] == "dast" for item in payload["findings"]))
@@ -398,15 +398,15 @@ class ScanModuleParserTests(unittest.TestCase):
         self.assertEqual(payload["findings"], [])
         self.assertEqual(payload["posture"]["total"], 0)
 
-    def test_duplicate_sca_matches_get_unique_finding_ids(self):
+    def test_duplicate_sca_matches_keep_one_identity_and_all_evidence(self):
         duplicate = json.loads(GRYPE_REPORT)
         duplicate["matches"].append(duplicate["matches"][0])
         payload = build_scan_payload(grype_raw=json.dumps(duplicate))
-        ids = [item["id"] for item in payload["findings"] if item["category"] == "sca"]
-        self.assertEqual(len(ids), 2)
-        self.assertEqual(len(set(ids)), 2)
-        self.assertTrue(ids[0].startswith("sca:CVE-2024-1234:left-pad:1.2.3:"))
-        self.assertNotEqual(ids[0], ids[1])
+        rows = [item for item in payload["findings"] if item["category"] == "sca"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows[0]["provenance"]), 2)
+        original = build_scan_payload(grype_raw=GRYPE_REPORT)["findings"][0]
+        self.assertEqual(rows[0]["id"], original["id"])
 
 
 if __name__ == "__main__":

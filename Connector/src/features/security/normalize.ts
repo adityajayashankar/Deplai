@@ -38,22 +38,22 @@ export function parseModuleEvents(messages: ScanMessage[]): Partial<Record<Secur
   for (const message of messages) {
     if (message.type !== 'module') continue;
     try {
-      const payload = JSON.parse(message.content) as {
+      const payload = JSON.parse(message.content) as Partial<SecurityModule> & {
         module?: SecurityModuleId;
         status?: SecurityModuleStatus;
         reason?: string;
         error?: string;
         finding_count?: number;
         component_count?: number;
+        engine?: string;
+        phase?: string;
       };
       if (!payload.module || !payload.status) continue;
       next[payload.module] = {
+        ...next[payload.module],
+        ...payload,
         id: payload.module,
         status: payload.status,
-        reason: payload.reason,
-        error: payload.error,
-        finding_count: payload.finding_count,
-        component_count: payload.component_count,
       };
     } catch {
       // Ignore malformed live module payloads.

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
-import { userModelSetup, remediationModelSetup } from '@/lib/ai-platform/model-setup';
+import { remediationModelSetup } from '@/lib/ai-platform/model-setup';
 import { resolveBillingOrganization } from '@/lib/billing/organization-context';
 
 export async function GET(request: NextRequest) {

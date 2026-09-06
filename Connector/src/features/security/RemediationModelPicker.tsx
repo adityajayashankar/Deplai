@@ -1,28 +1,13 @@
 'use client';
 
-import {
-  PlatformModelPicker,
-  type PlatformModelValue,
-} from '@/features/ai-platform/PlatformModelPicker';
-
-export type RemediationModelValue = PlatformModelValue;
-
-export function RemediationModelPicker({
-  value,
-  onChange,
-  persistKey,
-}: {
-  value: RemediationModelValue;
-  onChange: (next: RemediationModelValue) => void;
-  persistKey?: string;
-}) {
+/** The free router picks an available upstream; remediation has no model choice. */
+export function RemediationModelPicker() {
   return (
-    <PlatformModelPicker
-      value={value}
-      onChange={onChange}
-      workNoun="remediation"
-      persistKey={persistKey}
-      setupUrl="/api/security/remediation-setup"
-    />
+    <div className="border-[3px] border-black bg-[#F6F4EE] px-4 py-3 text-sm text-neutral-800">
+      <span className="font-semibold text-black">OpenRouter Free Router</span>
+      <p className="mt-1 text-xs text-neutral-600">
+        DeplAI sends remediation directly to <code>openrouter/free</code>. OpenRouter selects an available free upstream and paid or BYOK inference is never used for this run.
+      </p>
+    </div>
   );
 }

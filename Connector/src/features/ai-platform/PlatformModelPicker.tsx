@@ -17,6 +17,7 @@ import {
 } from '@/features/security/remediationModelPreference';
 
 export type PlatformModelValue = {
+  allowPaid?: boolean;
   accessMode: AccessMode;
   model: string;
   provider: string | null;
@@ -27,6 +28,8 @@ export type PlatformModelValue = {
 };
 
 type SetupModel = {
+  contextWindow?: number;
+  maxOutputTokens?: number;
   id: string;
   providerId: string;
   providerModelId: string;
@@ -47,6 +50,8 @@ type SetupCredential = {
 };
 
 type SetupPayload = {
+  security_free_catalog?: boolean;
+  allow_paid?: boolean;
   plan_id: string;
   plan_name: string;
   credits_remaining: number;
@@ -69,6 +74,7 @@ type SelectionInput = {
 };
 
 function platformCatalogModels(payload: SetupPayload): SetupModel[] {
+  if (payload.security_free_catalog) return payload.models;
   const preferred = payload.models.filter((model) => model.coding || model.agents);
   const pool = preferred.length ? preferred : payload.models;
   const allowlisted = pool.filter((model) => isPlatformModelAllowed(model.id));
@@ -129,6 +135,7 @@ function isModelSelectable(
   if (isLogicalAliasName(model)) return false;
   const catalogModel = payload.models.find((item) => item.providerModelId === model || item.id === model);
   if (!catalogModel) return false;
+  if (payload.security_free_catalog && accessMode !== 'byok') return true;
   if (accessMode === 'platform') {
     return isPlatformModelAllowedForPlan(payload.plan_id, catalogModel.providerModelId);
   }
@@ -142,7 +149,14 @@ function isModelSelectable(
 function resolveInitialSelection(
   payload: SetupPayload,
   saved: RemediationModelPreference | null,
+  platformOnly = false,
 ): SelectionInput {
+  if (platformOnly) {
+    const model = payload.models.some((item) => item.providerModelId === saved?.model || item.id === saved?.model)
+      ? saved!.model
+      : payload.default_model || payload.models[0]?.providerModelId || '';
+    return { accessMode: 'platform', model, provider: null, credentialId: null };
+  }
   if (saved) {
     if (saved.accessMode === 'byok') {
       const credential = (saved.credentialId
@@ -200,13 +214,17 @@ export function PlatformModelPicker({
   workNoun = 'this work',
   persistKey,
   setupUrl = '/api/ai/model-setup',
+  platformOnly = false,
 }: {
   value: PlatformModelValue;
   onChange: (next: PlatformModelValue) => void;
   workNoun?: string;
   persistKey?: string;
   setupUrl?: string;
+  /** Use only platform credentials and the endpoint's managed model catalog. */
+  platformOnly?: boolean;
 }) {
+  const [allowPaid, setAllowPaid] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [setup, setSetup] = useState<SetupPayload | null>(null);
@@ -217,7 +235,10 @@ export function PlatformModelPicker({
       setLoading(true);
       setError('');
       try {
-        const response = await fetch(setupUrl, { cache: 'no-store' });
+        const requestUrl = platformOnly
+          ? setupUrl
+          : `${setupUrl}${setupUrl.includes('?') ? '&' : '?'}allow_paid=${allowPaid}`;
+        const response = await fetch(requestUrl, { cache: 'no-store' });
         const payload = await response.json().catch(() => ({})) as SetupPayload & { error?: string };
         if (!response.ok) {
           throw new Error(payload.error || 'Could not load model options');
@@ -225,8 +246,8 @@ export function PlatformModelPicker({
         if (cancelled) return;
         setSetup(payload);
         const saved = persistKey ? readRemediationModelPreference(persistKey) : null;
-        const initial = resolveInitialSelection(payload, saved);
-        emit(payload, initial, onChange, workNoun, persistKey);
+        const initial = resolveInitialSelection(payload, saved, platformOnly);
+        emit(payload, initial, onChange, workNoun, persistKey, platformOnly);
       } catch (err) {
         if (cancelled) return;
         setError(err instanceof Error ? err.message : 'Could not load model options');
@@ -245,11 +266,14 @@ export function PlatformModelPicker({
     };
     // Initial load only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [persistKey, setupUrl]);
+  }, [persistKey, setupUrl, allowPaid, platformOnly]);
 
   const emitSelection = (next: SelectionInput) => {
     if (!setup) return;
-    emit(setup, next, onChange, workNoun, persistKey);
+    const platformSelection = platformOnly
+      ? { accessMode: 'platform' as const, model: next.model, provider: null, credentialId: null }
+      : next;
+    emit(setup, platformSelection, onChange, workNoun, persistKey, platformOnly);
   };
 
   const blockedReason = (
@@ -258,7 +282,7 @@ export function PlatformModelPicker({
   ): string | null => {
     if (next.accessMode === 'platform' || next.accessMode === 'auto') {
       if (next.accessMode === 'platform') {
-        const check = assertPlatformModelAllowed(payload.plan_id, next.model);
+        const check = payload.security_free_catalog && payload.models.some((m) => m.id === next.model || m.providerModelId === next.model) ? { ok: true, message: '' } : assertPlatformModelAllowed(payload.plan_id, next.model);
         if (!check.ok) return check.message;
       }
       if (next.accessMode === 'auto' && !payload.credentials.length && !payload.providers.some((item) => item.platformConfigured)) {
@@ -319,8 +343,39 @@ export function PlatformModelPicker({
 
   const planLabel = setup.paid_plan ? setup.plan_name.replace(/_/g, ' ') : 'Free';
 
+  if (platformOnly) {
+    return (
+      <div className="space-y-3">
+        <p className="text-[12px] leading-5 text-zinc-600">
+          Security remediation uses DeplAI&apos;s platform OpenRouter key and verified free coding models only. BYOK, paid models, and direct-provider fallback are disabled.
+        </p>
+        <div>
+          <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">OpenRouter free coding model</label>
+          <select
+            value={value.model}
+            onChange={(event) => emitSelection({
+              accessMode: 'platform', model: event.target.value, provider: null, credentialId: null,
+            })}
+            className="w-full rounded-none border-[3px] border-black bg-white px-4 py-2.5 text-sm text-black outline-none"
+            disabled={!setup.models.length}
+          >
+            {setup.models.map((model) => (
+              <option key={model.id} value={model.providerModelId}>{model.displayName}</option>
+            ))}
+          </select>
+          {!setup.models.length ? <p className="mt-2 text-[11px] text-amber-700">No verified free coding model is currently available. Retry shortly.</p> : null}
+        </div>
+        {value.blockedReason ? <p className="text-[12px] text-amber-700">{value.blockedReason}</p> : null}
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-4">
+      {setup.security_free_catalog && <label className="flex gap-2 text-xs">
+        <input type="checkbox" checked={allowPaid} onChange={(event) => setAllowPaid(event.target.checked)} />
+        Allow inexpensive paid models for this run, up to $0.10 including retries and wiki context.
+      </label>}
       <div>
         <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">Model source</label>
         <div className="grid gap-3 sm:grid-cols-2">
@@ -476,11 +531,17 @@ function emit(
   onChange: (next: PlatformModelValue) => void,
   workNoun: string,
   persistKey?: string,
+  platformOnly = false,
 ) {
   const blocked = (() => {
+    if (platformOnly) {
+      return payload.models.some((item) => item.id === next.model || item.providerModelId === next.model)
+        ? null
+        : 'No verified OpenRouter free coding model is currently available.';
+    }
     if (next.accessMode === 'platform' || next.accessMode === 'auto') {
       if (next.accessMode === 'platform') {
-        const check = assertPlatformModelAllowed(payload.plan_id, next.model);
+        const check = payload.security_free_catalog && payload.models.some((m) => m.id === next.model || m.providerModelId === next.model) ? { ok: true, message: '' } : assertPlatformModelAllowed(payload.plan_id, next.model);
         if (!check.ok) return check.message;
       }
       if (next.accessMode === 'auto' && !payload.credentials.length && !payload.providers.some((item) => item.platformConfigured)) {
@@ -505,6 +566,7 @@ function emit(
   })();
 
   const nextValue: PlatformModelValue = {
+    allowPaid: Boolean(payload.allow_paid),
     accessMode: next.accessMode,
     model: next.model,
     provider: next.provider,

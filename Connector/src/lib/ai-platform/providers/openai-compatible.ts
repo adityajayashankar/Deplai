@@ -1,4 +1,5 @@
 import { platformTimeoutMs, appOrigin } from '../config';
+import { parseRetryAfter } from '../retry-delay';
 import {
   AiPlatformError,
   CapabilityError,
@@ -110,6 +111,9 @@ export class OpenAICompatibleAdapter implements AIProviderAdapter {
         status: response.status,
         providerId: this.definition.id,
         sanitizedProviderDetail: sanitizeProviderBody(raw),
+        detail: { retryAfterSeconds: parseRetryAfter(response.headers.get('retry-after')),
+          quotaScope: response.headers.has('x-ratelimit-limit') ? 'account' : 'model',
+          resetAt: response.headers.get('x-ratelimit-reset') },
       });
     }
     return { status: response.status, data, raw };
@@ -207,6 +211,8 @@ export class OpenAICompatibleAdapter implements AIProviderAdapter {
       messages: input.messages.map((message) => ({
         role: message.role === 'tool' ? 'tool' : message.role,
         content: message.content,
+        ...(message.toolCallId ? { tool_call_id: message.toolCallId } : {}),
+        ...(message.toolCalls?.length ? { tool_calls: message.toolCalls.map((call) => ({ id: call.id, type: 'function', function: { name: call.name, arguments: call.arguments } })) } : {}),
       })),
       temperature: input.temperature ?? 0.2,
     };

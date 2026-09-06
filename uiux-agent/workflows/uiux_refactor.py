@@ -52,6 +52,59 @@ def _get_agents() -> dict[str, Any]:
     }
 
 
+def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+    """Robustly extract the first balanced JSON object from noisy LLM output.
+
+    Free models emit thinking prose, then ```json fenced JSON, then trailing
+    text. Bracket-matching with quote-awareness picks the FIRST top-level
+    object — not the outermost, which often catches reasoning.
+    """
+    raw = str(text or "")
+    # Strip markdown code fences if present
+    if "```" in raw:
+        import re
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError:
+                raw = m.group(1)
+    depth = 0
+    in_str = False
+    esc = False
+    start = -1
+    for i, ch in enumerate(raw):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                candidate = raw[start : i + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    # Try a single-line sanitization pass for embedded newlines.
+                    try:
+                        return json.loads(candidate.replace("\n", "\\n").replace("\r", "\\r"))
+                    except json.JSONDecodeError:
+                        start = -1
+                        continue
+    return None
+
+
 def _capture_design_tokens(step_input: StepInput) -> StepOutput:
     envelope = _load_envelope(step_input)
     state = _state_from_envelope(envelope)
@@ -60,17 +113,29 @@ def _capture_design_tokens(step_input: StepInput) -> StepOutput:
         agent_output = agent_output.content
     text = str(agent_output or "").strip()
     if text:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
+        # Use balanced JSON extraction, not bracket find — reasoning prose
+        # routinely contains stray { and } that broke the old implementation.
+        parsed = _extract_first_json_object(text)
+        if isinstance(parsed, dict):
             try:
                 from schemas.token_spec import DesignTokenSpec
 
-                state.design_tokens = DesignTokenSpec.model_validate(json.loads(text[start : end + 1]))
-            except Exception:
-                pass
+                state.design_tokens = DesignTokenSpec.model_validate(parsed)
+            except Exception as exc:
+                envelope.summary = (
+                    f"Design-system output did not match DesignTokenSpec: {exc}. "
+                    "Continuing with extracted tokens only."
+                )
+        else:
+            envelope.summary = (
+                "Design-system output was not a single JSON object; "
+                "continuing with extracted tokens only."
+            )
+    else:
+        envelope.summary = "Design-system agent returned empty output; using extracted tokens only."
     envelope.stage = "design_system"
-    envelope.summary = "Design token specification updated."
+    if not envelope.summary or envelope.summary == "Design token specification updated.":
+        envelope.summary = "Design token specification updated."
     envelope.state = state.to_dict()
     return _output(envelope)
 
@@ -81,16 +146,48 @@ def _capture_refactor_output(step_input: StepInput) -> StepOutput:
     agent_output = step_input.previous_step_content
     if isinstance(agent_output, StepOutput):
         agent_output = agent_output.content
-    state.patches.append(
-        {
-            "success": True,
-            "component_name": "batch",
-            "file_path": "",
-            "summary": str(agent_output or "")[:2000],
-        }
-    )
+
+    text = str(agent_output or "").strip()
+    patches_found: list[dict[str, Any]] = []
+    if text:
+        # The agent may have called write_patch (manifest in tool_calls) or
+        # emitted diffs as JSON / fenced text. Try every channel.
+        parsed = _extract_first_json_object(text)
+        if isinstance(parsed, dict):
+            for key in ("patches", "changes", "diffs", "results"):
+                if isinstance(parsed.get(key), list):
+                    for item in parsed[key]:
+                        if isinstance(item, dict):
+                            patches_found.append(
+                                {
+                                    "success": bool(item.get("success", True)),
+                                    "component_name": str(item.get("component_name") or item.get("component_id") or "unknown"),
+                                    "file_path": str(item.get("file_path") or item.get("path") or ""),
+                                    "diff": str(item.get("diff") or ""),
+                                    "summary": str(item.get("description") or item.get("summary") or "")[:2000],
+                                }
+                            )
+                    break
+
+    if patches_found:
+        state.patches.extend(patches_found)
+        envelope.summary = f"Component refactor produced {len(patches_found)} patch entry(s)."
+    else:
+        # Refactorer didn't emit structured output. Record raw for review
+        # but do not lie about success — the downstream validator will catch it.
+        state.patches.append(
+            {
+                "success": False,
+                "component_name": "batch",
+                "file_path": "",
+                "summary": text[:2000] or "Refactorer produced no parseable patch set.",
+            }
+        )
+        envelope.summary = (
+            "Component refactor agent did not return a parseable patch set; "
+            "recorded raw output for review."
+        )
     envelope.stage = "refactor"
-    envelope.summary = "Component refactor stage completed."
     envelope.state = state.to_dict()
     return _output(envelope)
 

@@ -326,6 +326,8 @@ export async function handleAiRequest(request: NextRequest, path: string[]): Pro
         credential_id?: string;
         system?: string;
       };
+      const securityRemediation = body.metadata?.product === 'security'
+        && ['remediation', 'openwiki'].includes(String(body.metadata?.stage));
       const payload = {
         model: body.model || 'best',
         messages: toGatewayMessages(body.messages || [], body.system),
@@ -335,7 +337,9 @@ export async function handleAiRequest(request: NextRequest, path: string[]): Pro
         temperature: body.temperature,
         maxTokens: body.max_tokens,
         tools: body.tools,
-        responseFormat: normalizeResponseFormat(body.response_format),
+        // Free OpenRouter upstreams can reject json_schema with HTTP 400.
+        // Security remediation validates the contract after normal chat.
+        responseFormat: securityRemediation ? undefined : normalizeResponseFormat(body.response_format),
         task: body.task,
         metadata: body.metadata,
         ephemeralApiKey: body.api_key,

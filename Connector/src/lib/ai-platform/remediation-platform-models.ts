@@ -1,26 +1,44 @@
+import type { CanonicalModel } from './types';
+
+/** Security remediation is always delegated to OpenRouter's free router. */
+export const DEFAULT_REMEDIATION_PLATFORM_MODEL = 'openrouter/free';
+
 /**
- * Platform models exposed for security remediation (OpenRouter upstream).
- * Curated free and paid minimax, GLM, and OpenRouter-hosted models.
+ * The `/free` router selects a current free upstream itself. This catalog entry
+ * preserves gateway policy, quota, usage, and auditing without exposing an
+ * individual upstream-model choice to the user.
  */
-export const REMEDIATION_PLATFORM_MODEL_IDS = [
-  'minimax:MiniMax-M3-free',
-  'minimax:MiniMax-M3',
-  'glm:glm-5',
-  'glm:glm-5.2-free',
-  'openrouter:nemotron-3.5-content-safety-free',
-] as const;
-
-export type RemediationPlatformModelId = (typeof REMEDIATION_PLATFORM_MODEL_IDS)[number];
-
-/** Default remediation model — OpenRouter slug z-ai/glm-5.2:free */
-export const DEFAULT_REMEDIATION_PLATFORM_MODEL = 'glm-5.2-free';
-
-const REMEDIATION_MODEL_SET = new Set<string>(REMEDIATION_PLATFORM_MODEL_IDS);
-
-export function isRemediationPlatformModelId(modelId: string): boolean {
-  return REMEDIATION_MODEL_SET.has(modelId.trim());
-}
-
-export function filterRemediationPlatformModels<T extends { id: string }>(models: T[]): T[] {
-  return models.filter((model) => isRemediationPlatformModelId(model.id));
+export function openRouterFreeRemediationModel(template: CanonicalModel): CanonicalModel {
+  return {
+    ...template,
+    id: 'openrouter:openrouter/free',
+    providerId: 'openrouter',
+    providerModelId: DEFAULT_REMEDIATION_PLATFORM_MODEL,
+    displayName: 'OpenRouter Free',
+    family: 'openrouter-free',
+    version: 'router',
+    aliases: [DEFAULT_REMEDIATION_PLATFORM_MODEL],
+    status: 'active',
+    lifecycle: 'ACTIVE',
+    contextWindow: 200_000,
+    maxOutputTokens: 8_192,
+    capabilities: {
+      ...template.capabilities,
+      coding: true,
+      agents: true,
+      structured_output: false,
+    },
+    pricing: {
+      inputPerMillionUsd: 0,
+      outputPerMillionUsd: 0,
+      currency: 'USD',
+      source: 'provider_declared',
+    },
+    metadata: {
+      ...template.metadata,
+      openrouter_slug: DEFAULT_REMEDIATION_PLATFORM_MODEL,
+      security_free_router: true,
+    },
+    updatedAt: new Date().toISOString(),
+  };
 }

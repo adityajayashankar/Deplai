@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { usePopup } from '@/components/popup';
 import { FiShield, FiCode, FiPackage, FiGlobe, FiX } from 'react-icons/fi';
+import { defaultEnabledModules } from '@/features/security/dastTarget';
 
 type ScanType = 'sast' | 'sca' | 'all';
 
@@ -102,13 +103,15 @@ export default function ScanModal({ isOpen, onClose, project, onScanComplete }: 
   const handleSelect = async (type: ScanType) => {
     if (step !== 'select') return;
     setSelectedType(type);
-    setStep('thinking');
-
-    // Brief pause so the user sees the "thinking" dots before we fire
-    await new Promise(r => setTimeout(r, 650));
     setStep('launching');
 
     const name = projectName || 'Unknown';
+    const enabled_modules =
+      type === 'sast'
+        ? ['sast']
+        : type === 'sca'
+          ? ['sca', 'sbom']
+          : defaultEnabledModules();
     try {
       const response = await fetch('/api/scan/validate', {
         method: 'POST',
@@ -121,6 +124,7 @@ export default function ScanModal({ isOpen, onClose, project, onScanComplete }: 
           owner: project.owner,
           repo: project.repo,
           scan_type: type,
+          enabled_modules,
         }),
       });
 
@@ -150,8 +154,6 @@ export default function ScanModal({ isOpen, onClose, project, onScanComplete }: 
       return;
     }
     setSelectedType('all');
-    setStep('thinking');
-    await new Promise((r) => setTimeout(r, 400));
     setStep('launching');
 
     const name = projectName || 'Unknown';

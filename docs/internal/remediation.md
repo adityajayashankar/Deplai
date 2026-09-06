@@ -1,53 +1,33 @@
 # Remediation pipeline
 
-Two cooperating layers:
+The product track uses deterministic grouping and source context, then a Planner and Implementor followed by local patch review. All product inference goes through the Connector gateway. Each packet permits two generation calls and one repair after actionable validation feedback. Execution slices contain at most eight packets; completed packet results are checkpointed for continuation.
 
-1. **`remediation_pipeline/`** — ingest findings → group → extract snippets → generate diffs → validate.
-2. **Agentic `claude_remediator.py` + `agent/remediation_supervisor.py`** — LLM backends, WebSocket `/ws/remediate/{project_id}`, PR hand-off.
+## Model and cost policy
 
-Connector never writes GitHub from the browser. After **Review**, Connector uses `getInstallationTokenForRemediation` (`contents: write`, `pull_requests: write`) or a one-shot PAT from Agent setup (not stored in the BYOK vault).
+The picker uses the refreshed OpenRouter catalog and exposes only zero-priced `:free` coding variants with sufficient context/output limits and verified coding evaluations. Remediation is always `platform` access through Connector's platform OpenRouter credential: BYOK, paid-model opt-in, direct provider SDKs, and legacy provider fallbacks are disabled. `best_coding` is a gateway routing intent used only when a saved free-model selection has gone stale.
 
-## Orchestrator (`remediation_pipeline/orchestrator.py`)
+The planner and implementor retain strict JSON contracts, but enforce them locally rather than sending `response_format: { type: "json_schema" }` upstream. OpenRouter free upstreams do not uniformly support that optional extension and may otherwise return HTTP 400. Each stage prompts for one JSON object, parses and validates exact required keys/types/path allowlists locally, and makes one bounded contract-repair retry before rejecting the patch. Search/replace blocks are applied deterministically and converted to unified diffs before safety review.
 
-`RemediationOrchestrator.run(project_id, …)`:
+Gateway scheduling owns free-model fallback, cooldowns, and shared account quota reservations. Upstream malformed-schema, authentication, model, and capability failures are normalized to retryable platform-unavailable outcomes, so remediation never exposes upstream 400/401 failures to the product flow. Prompts are packetized below the OpenRouter free request budget; streaming security requests are unavailable because they do not use the shared reservation path.
 
-1. `VulnIngester` reads scan artifacts for `project_id` (codebase volume).
-2. `GrouperPrioritizer` groups findings (SAST by CWE/file, SCA by package).
-3. Selection snapshot + `remediation_scope` (`all` or a subset).
-4. `SnippetExtractor` pulls surrounding source (`REMEDIATION_SAST_CONTEXT_LINES`, SCA lines, import context).
-5. `LLMRouter` + `FixGenerator` propose patches (`REMEDIATION_MAX_PATCH_FILES`, `REMEDIATION_MAX_CONTEXT_FILES`).
-6. `DiffValidator` rejects unsafe/invalid diffs.
+## Patch review and verification
 
-Deterministic SCA bumps are limited to `package.json`, `requirements.txt`, `go.mod`. Lockfiles (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `go.sum`, `poetry.lock`, …) are **not** rewritten by that path.
+The product track copies the exact scan source into an isolated remediation checkout. Patches remain proposed until validated. Absolute paths, traversal, Git metadata and control characters are rejected. Review provides per-file diffs and downloadable patches. Explicit approval is required for PR creation; the current branch SHA must still match the scan source.
 
-## LLM backends (`claude_remediator.py`)
+Final approval triggers repository security checks. Failed, missing or inapplicable checks never verify a finding fixed. Dependency findings remain unverified even when absent from a manifest rescan: package-manager lockfile regeneration and behavior validation are still outstanding. Secret rotation and live cloud actions remain manual. ZIP projects receive patches rather than copying the isolated checkout over user source.
 
-Order of intent (env `REMEDIATION_LLM_BACKEND=auto` by default):
+## OpenWiki
 
-1. Connector AI gateway (`ai_gateway.py` / `DeplaiAI`) with `user_id` + `access_mode` — preferred.
-2. Anthropic / Claude if keys present.
-3. Groq if `GROQ_API_KEY` is set (lean/cheap path — **do not advertise as the default product**).
-4. OpenRouter / Ollama-compatible fallbacks.
+The optional worker is pinned to OpenWiki 0.5.0 and runs in a separate checkout. Its short-lived gateway capability is scoped to the user, run and model. Wiki requests share the remediation quota/budget policy and are capped at two inference requests. Cached context is keyed by tenant/repository/revision/generator and packet source evidence. Failure falls back visibly to direct source inspection.
 
-Caps: `DEPLAI_MAX_REMEDIATION_COST_USD` (default 1.0), `REMEDIATION_LLM_TIMEOUT_SECONDS` (120), `REMEDIATION_MAX_COMPLETION_TOKENS` (2048).
+`SECURITY_OPENWIKI_GENERATE` defaults to false. Automatic generation requires fixture evidence of lower total token usage without worse repairs; that comparison has not been completed. Generated documentation is excluded from remediation patches.
 
-## Agentic HTTP / WS
+## Remaining acceptance work
 
-| Path | Role |
-| --- | --- |
-| `POST /api/remediate/validate` | Preconditions (scan results exist, project_id allowlist) |
-| `WS /ws/remediate/{project_id}` | Live run; HMAC token from Connector. Browser URL: `{ws_base}/ws/remediate/{project_id}?token=…` (production `ws_base` = `wss://<APP_DOMAIN>/agentic`) |
-| `POST /remediation/run` | Kick orchestrator |
-| `POST /remediation/status` | Poll |
-| `POST /remediation/pr` | Open PR after Review |
-| `POST /remediation/refresh`, `/navigate` | UI sync |
+- Package-manager lockfile regeneration, relevant application tests, and verification fixtures demonstrating vulnerability removal without scanner suppression.
+- Full consolidation of legacy HTTP entrypoints and reliable remediation restart continuation.
+- Complete unified finding ID propagation through legacy SAST/SCA ingestion and packet outcomes.
+- Dedicated affected-check/full-scan controls and browser end-to-end acceptance, including stale-head PR rejection.
+- Database-backed quota/cost concurrency, actual OpenRouter throttling behavior, Docker scanners, and OpenWiki comparison fixtures.
 
-Review gate in the product is **`approve_push`**: diffs exist in the volume; GitHub write waits for the user on stage **Review**.
-
-## Connector façade
-
-- `POST /api/remediate/start` — ownership, clone, Agentic validate, session row
-- Security analysis page stage rail: Agent setup → Remediation → Review → GitHub & verify
-- Agent setup: plan-gated platform model (`best_coding` on paid, `best_fast` on free) or BYOK
-
-Related: [Security pipeline](security-pipeline.md) · [AI platform](ai-platform.md) · [Known gaps](known-gaps.md)
+The local unit/type checks do not establish production readiness. Automatic SDLC triggers and OpenWiki generation remain disabled pending these checks.

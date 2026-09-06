@@ -97,7 +97,7 @@ export class InsufficientOrganizationCreditsError extends Error {
  * - CREDIT_METERING_MODE=shadow — record reservations without debiting
  * - CREDIT_METERING_MODE=enforce — reserve and debit managed-key LLM calls; HTTP 402 when insufficient
  */
-export function creditMeteringMode(env: NodeJS.ProcessEnv = process.env): CreditMeteringMode {
+export function creditMeteringMode(env: Record<string, string | undefined> = process.env): CreditMeteringMode {
   const mode = env.CREDIT_METERING_MODE?.trim().toLowerCase();
   if (mode === 'shadow' || mode === 'enforce' || mode === 'off') return mode;
   return 'enforce';

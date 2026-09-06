@@ -32,8 +32,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from claude_remediator import (  # noqa: E402
     ClaudeBudgetTracker,
-    _call_claude_sdk,
-    _call_groq,
     _collect_context_files,
     _extract_json,
     _normalize_changes_with_report,
@@ -68,11 +66,14 @@ def _env_int_positive(name: str, default: int) -> int:
 AGENT_DELAY_SECONDS = float(os.getenv("REMEDIATION_AGENT_DELAY_SECONDS", "3"))
 AGENT_NODE_TIMEOUT_SECONDS = float(os.getenv("REMEDIATION_AGENT_NODE_TIMEOUT_SECONDS", "180"))
 MAX_ROUNDS = 3  # Max Proposer→Critic negotiation rounds (2 = two full attempts)
-SUPERVISOR_MAX_FILES = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_FILES", 8)
-SUPERVISOR_MAX_FILE_CHARS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_FILE_CHARS", 2200)
-SUPERVISOR_MAX_CONTEXT_CHARS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_CONTEXT_CHARS", 12000)
-SUPERVISOR_MAX_FINDINGS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_FINDINGS", 16)
-SUPERVISOR_MAX_PROMPT_CHARS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_PROMPT_CHARS", 22000)
+# The active workflow uses a single free OpenRouter request per stage. These
+# conservative defaults keep a source packet and completion below the shared
+# low-quota limit; oversized findings are packetized instead of sent as 400s.
+SUPERVISOR_MAX_FILES = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_FILES", 4)
+SUPERVISOR_MAX_FILE_CHARS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_FILE_CHARS", 1800)
+SUPERVISOR_MAX_CONTEXT_CHARS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_CONTEXT_CHARS", 2600)
+SUPERVISOR_MAX_FINDINGS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_FINDINGS", 8)
+SUPERVISOR_MAX_PROMPT_CHARS = _env_int_positive("REMEDIATION_SUPERVISOR_MAX_PROMPT_CHARS", 4600)
 
 
 # ── Shared state ───────────────────────────────────────────────────────────────
@@ -105,18 +106,8 @@ class RemediationState(TypedDict):
 # ── LLM dispatch  (rate-limit-aware) ──────────────────────────────────────────
 
 def _call_with_backoff(fn, max_retries: int = 2) -> tuple[bool, str]:
-    """Call fn() with exponential back-off on 429 / rate-limit errors."""
-    ok, result = False, "No attempts made"
-    for attempt in range(max_retries):
-        ok, result = fn()
-        if ok:
-            return ok, result
-        lower = (result or "").lower()
-        if "429" in result or "rate limit" in lower or "rate_limit" in lower:
-            wait = 15 * (attempt + 1)
-            time.sleep(wait)
-        else:
-            return ok, result  # non-rate-limit error, fail fast
+    """Call fn() once; rate limits are handled by cheap-model rotation."""
+    ok, result = fn()
     return ok, result
 
 
@@ -133,12 +124,15 @@ def _dispatch_llm(
     credential_id: str = "",
     max_tokens: int | None = None,
     response_format: dict[str, Any] | None = None,
+    temperature: float = 0.15,
 ) -> tuple[bool, str]:
     """Route remediation supervisor calls through the AI platform when possible."""
-    provider = (provider or "").strip().lower()
-    api_key = (api_key or "").strip()
+    # Security remediation is platform-owned OpenRouter traffic only. Ignore
+    # a stale browser preference or any worker-side credential override.
+    provider = "openrouter"
+    api_key = ""
     model = (model or "").strip()
-    mode = (access_mode or "auto").strip().lower() or "auto"
+    mode = "platform"
 
     def journal(
         success: bool | None = None,
@@ -160,74 +154,37 @@ def _dispatch_llm(
         except Exception:
             pass
 
+    from cheap_models import resolve_cheap_model
+
+    cheap_model = resolve_cheap_model(model, access_mode="platform")
+
     if user_id:
         try:
             from ai_gateway import bound_organization, remediate_text
-            journal()
+            journal(effective_model=cheap_model)
             ok_gw, raw_gw = remediate_text(
                 user_id=str(user_id),
                 organization_id=str(organization_id or bound_organization() or "").strip() or None,
                 prompt=prompt,
-                model=model or "best_coding",
+                model=cheap_model,
                 access_mode=mode,
                 api_key=api_key,
                 provider=provider,
                 credential_id=credential_id or None,
                 max_tokens=max_tokens,
                 response_format=response_format,
+                temperature=temperature,
             )
-            journal(ok_gw, None if ok_gw else raw_gw)
+            journal(ok_gw, None if ok_gw else raw_gw, effective_model=cheap_model)
             if ok_gw:
                 return ok_gw, raw_gw
-            if mode in {"platform", "byok"}:
-                return False, raw_gw
+            return False, raw_gw
         except Exception as exc:
             journal(False, str(exc))
-            if mode in {"platform", "byok"}:
-                return False, str(exc)
+            return False, str(exc)
 
-    if response_format:
-        return False, "Strict JSON-schema remediation requires the configured AI platform gateway."
+    return False, "Security remediation requires the configured OpenRouter gateway and user context."
 
-    def _claude(effective_key: str, effective_model: str) -> tuple[bool, str]:
-        return _call_with_backoff(
-            lambda: _call_claude_sdk(
-                prompt,
-                effective_key,
-                effective_model,
-                budget_tracker=budget_tracker,
-                stage=stage,
-            )
-        )
-
-    if provider == "groq":
-        journal(effective_provider="groq")
-        ok, text = _call_with_backoff(lambda: _call_groq(prompt))
-        journal(ok, None if ok else text, effective_provider="groq")
-        if ok:
-            return ok, text
-        # Fall back to the Claude SDK only if a Claude key is available.
-        if (os.getenv("ANTHROPIC_API_KEY", "").strip() or os.getenv("CLAUDE_API_KEY", "").strip()):
-            ok_fb, text_fb = _claude("", "")
-            if ok_fb:
-                return ok_fb, text_fb
-            return (False, f"Groq remediation failed ({text}); Claude fallback also failed: {text_fb}")
-        return (False, f"Groq remediation supervisor failed: {text}")
-
-    effective_api_key = api_key if provider in ("", "claude") else ""
-    effective_model = model if provider in ("", "claude") else ""
-    journal(effective_provider="claude", effective_model=effective_model)
-    ok, text = _claude(effective_api_key, effective_model)
-    journal(ok, None if ok else text, effective_provider="claude", effective_model=effective_model)
-    if ok:
-        return ok, text
-
-    if provider and provider != "claude":
-        return (
-            False,
-            f"Remediation supports the Claude Agent SDK and Groq; ignored provider '{provider}'. Claude SDK error: {text}",
-        )
-    return (False, f"Claude SDK remediation supervisor failed: {text}")
 
 # ── Planner: CWE → search-pattern map ─────────────────────────────────────────
 # Maps common CWE IDs to grep-compatible patterns so the Planner can locate
@@ -830,7 +787,6 @@ async def run_remediation_supervisor(
             )
 
         # Rate-limit guard between Proposer and Critic
-        await asyncio.sleep(AGENT_DELAY_SECONDS)
 
         # ── Critic ────────────────────────────────────────────────────────────
         await emit("critic_phase", f"[{label}] Reviewing proposal for correctness, coverage & safety…")
@@ -877,7 +833,6 @@ async def run_remediation_supervisor(
             await emit("supervisor_phase", f"{len(missing)} finding(s) still unaddressed — re-queuing Proposer with feedback")
 
         # Delay before next round
-        await asyncio.sleep(AGENT_DELAY_SECONDS)
 
     # ── Synthesizer ───────────────────────────────────────────────────────────
     await emit("synthesizer_phase", "Writing accepted changes to repository…")
