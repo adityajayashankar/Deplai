@@ -4,29 +4,73 @@ const path = require('path');
 const root = path.resolve(__dirname, '../../docs/guide');
 const outFile = path.resolve(__dirname, '../src/features/docs/guide-pages.ts');
 
-const pages = [
-  { slug: 'introduction', file: 'introduction.md', group: 'start', label: 'Introduction', eyebrow: 'Start here' },
-  { slug: 'concepts', file: 'concepts.md', group: 'start', label: 'Core concepts', eyebrow: 'Start here' },
-  { slug: 'byok-models', file: 'byok-models.md', group: 'start', label: 'BYOK models', eyebrow: 'Start here' },
-  { slug: 'how-it-works', file: 'how-it-works.md', group: 'start', label: 'How it works', eyebrow: 'Start here' },
-  { slug: 'getting-started', file: 'getting-started.md', group: 'start', label: 'Getting started', eyebrow: 'Start here' },
-  { slug: 'security-agent', file: 'agents/security-agent.md', group: 'services', label: 'Security Agent', eyebrow: 'Services' },
-  { slug: 'dast', file: 'dast.md', group: 'services', label: 'DAST', eyebrow: 'Services' },
-  { slug: 'deploy', file: 'agents/deploy.md', group: 'services', label: 'Deploy', eyebrow: 'Services' },
-  { slug: 'instance-management', file: 'instance-management.md', group: 'services', label: 'Instance management', eyebrow: 'Services' },
-  { slug: 'uiux-customizer', file: 'agents/uiux-customizer.md', group: 'services', label: 'UI/UX customizer', eyebrow: 'Services' },
-  { slug: 'code-reviewer', file: 'agents/code-reviewer.md', group: 'services', label: 'Code Reviewer', eyebrow: 'Services' },
-  { slug: 'sessions', file: 'sessions.md', group: 'services', label: 'Sessions', eyebrow: 'Services' },
-  { slug: 'organizations', file: 'organizations.md', group: 'account', label: 'Organizations', eyebrow: 'Account' },
-  { slug: 'billing', file: 'billing.md', group: 'account', label: 'Plans and credits', eyebrow: 'Account' },
-  { slug: 'profile-usage-and-invoices', file: 'profile-usage-and-invoices.md', group: 'account', label: 'Profile and usage', eyebrow: 'Account' },
-  { slug: 'security-and-data', file: 'security-and-data.md', group: 'account', label: 'Security and data', eyebrow: 'Account' },
-  { slug: 'glossary', file: 'glossary.md', group: 'help', label: 'Glossary and FAQ', eyebrow: 'Help' },
+// Only customer-facing pages belong here. README and _internal-review are deliberately excluded.
+const groups = [
+  {
+    id: 'start',
+    label: 'Start here',
+    pages: [
+      ['introduction', 'introduction.md', 'Introduction'],
+      ['concepts', 'concepts.md', 'Core concepts'],
+      ['how-it-works', 'how-it-works.md', 'Repository to production'],
+      ['getting-started', 'getting-started.md', 'Getting started'],
+      ['why-deplai', 'why-deplai.md', 'Why DeplAI'],
+    ],
+  },
+  {
+    id: 'services',
+    label: 'Services',
+    pages: [
+      ['security-agent', 'agents/security-agent.md', 'Security Agent'],
+      ['dast', 'dast.md', 'DAST'],
+      ['deploy', 'agents/deploy.md', 'Deploy'],
+      ['instance-management', 'instance-management.md', 'Instance management'],
+      ['uiux-customizer', 'agents/uiux-customizer.md', 'UI/UX customizer'],
+      ['code-reviewer', 'agents/code-reviewer.md', 'Code Reviewer'],
+      ['sessions', 'sessions.md', 'Sessions'],
+      ['agents-and-workflows', 'agents-and-workflows.md', 'Agents and workflows'],
+      ['repository-intelligence', 'repository-intelligence.md', 'Repository intelligence'],
+      ['artifacts-and-state', 'artifacts-and-state.md', 'Artifacts and state'],
+    ],
+  },
+  {
+    id: 'account',
+    label: 'Account and models',
+    pages: [
+      ['organizations', 'organizations.md', 'Organizations'],
+      ['billing', 'billing.md', 'Plans and credits'],
+      ['profile-usage-and-invoices', 'profile-usage-and-invoices.md', 'Profile and usage'],
+      ['security-and-data', 'security-and-data.md', 'Security and data'],
+      ['byok-models', 'byok-models.md', 'BYOK models'],
+      ['model-providers', 'model-providers.md', 'Models and providers'],
+    ],
+  },
+  {
+    id: 'help',
+    label: 'Help and reference',
+    pages: [
+      ['api-and-automation', 'api-and-automation.md', 'API and automation'],
+      ['troubleshooting', 'troubleshooting.md', 'Troubleshooting'],
+      ['glossary', 'glossary.md', 'Glossary and FAQ'],
+      ['design-principles', 'design-principles.md', 'Design principles'],
+      ['platform-architecture', 'platform-architecture.md', 'Platform architecture'],
+      ['production-operations', 'production-operations.md', 'Production operations'],
+      ['future-direction', 'future-direction.md', 'Future direction'],
+    ],
+  },
 ];
 
+const pages = groups.flatMap((group) => group.pages.map(([slug, file, label]) => ({
+  slug,
+  file,
+  label,
+  group: group.id,
+  eyebrow: group.label,
+})));
+
 const entries = pages.map((page) => {
-  const { file: _file, ...meta } = page;
-  const markdown = fs.readFileSync(path.join(root, page.file), 'utf8').replace(/\r\n/g, '\n');
+  const { file, ...meta } = page;
+  const markdown = fs.readFileSync(path.join(root, file), 'utf8').replace(/\r\n/g, '\n');
   const titleMatch = markdown.match(/^#\s+(.+)$/m);
   const summaryLine = markdown
     .split('\n')
@@ -34,9 +78,15 @@ const entries = pages.map((page) => {
   return { ...meta, title: titleMatch ? titleMatch[1].trim() : page.label, summary: (summaryLine || '').trim(), markdown };
 });
 
+const groupMetadata = groups.map(({ id, label, pages: groupPages }) => ({
+  id,
+  label,
+  slugs: groupPages.map(([slug]) => slug),
+}));
+
 const body = `/* Generated from docs/guide. Re-run: node scripts/embed-guide-docs.cjs */
 
-export type GuideGroupId = 'start' | 'services' | 'account' | 'help';
+export type GuideGroupId = ${groups.map(({ id }) => `'${id}'`).join(' | ')};
 
 export type GuidePage = {
   slug: string;
@@ -50,12 +100,7 @@ export type GuidePage = {
 
 export const GUIDE_PAGES: GuidePage[] = ${JSON.stringify(entries, null, 2)};
 
-export const GUIDE_GROUPS: Array<{ id: GuideGroupId; label: string; slugs: string[] }> = [
-  { id: 'start', label: 'Start here', slugs: ['introduction', 'concepts', 'byok-models', 'how-it-works', 'getting-started'] },
-  { id: 'services', label: 'Services', slugs: ['security-agent', 'dast', 'deploy', 'instance-management', 'uiux-customizer', 'code-reviewer', 'sessions'] },
-  { id: 'account', label: 'Account', slugs: ['organizations', 'billing', 'profile-usage-and-invoices', 'security-and-data'] },
-  { id: 'help', label: 'Help', slugs: ['glossary'] },
-];
+export const GUIDE_GROUPS: Array<{ id: GuideGroupId; label: string; slugs: string[] }> = ${JSON.stringify(groupMetadata, null, 2)};
 
 export const DEFAULT_GUIDE_SLUG = 'introduction';
 

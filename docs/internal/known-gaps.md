@@ -22,9 +22,9 @@ Agentic mounts **`/var/run/docker.sock`**. Treat the host as a trusted execution
 
 ## LLM fallbacks
 
-- `GROQ_API_KEY` enables a cheap remediator path. Not the advertised default.
-- OpenRouter is a platform fallback adapter; routing may chain up to 4 models.
-- Gateway down → remediation/customization legacy provider paths.
+- General AI gateway requests may use OpenRouter and a ranked fallback chain of up to four models, subject to routing and organization policy.
+- **Security remediation is intentionally excluded from those fallbacks.** It is Connector platform OpenRouter only, accepts eligible free coding models only, and fails closed when that route is unavailable. BYOK, direct provider calls, paid-model opt-in, and worker-held fallback keys are not remediation recovery paths.
+- Customization and other non-remediation workflows retain their separately documented credential/routing behavior.
 
 ## Durability
 
@@ -39,7 +39,7 @@ Agentic mounts **`/var/run/docker.sock`**. Treat the host as a trusted execution
 ## Unused / stale
 
 - Neo4j and Qdrant in older `docs/technical-architecture.md` — not used by app code (MySQL only).
-- Scratch UI kits in the repo are not the product.
+- The former scratch UI kits, design drafts, one-off patch scripts, and Puppeteer scratch workspace were removed. Do not reintroduce generated UI projects or one-off source-mutating scripts into the repository root.
 - Auth kit email/password pages exist; **GitHub OAuth is the live identity path**.
 - Founder inbox `adityajayashankar@deplai.tech` on Settings contact / footer.
 

@@ -73,10 +73,10 @@ Target not **verified**, wrong scope, or org policy. Configure [DAST](dast.md) f
 No. **Review** approval is required. PRs use the GitHub App after you approve.
 
 **What model should I use for remediation?**  
-**Best coding** for patches. For complex agentic fixes, use **MiniMax M3** or **Grok 4.6** with high/extrahigh effort via BYOK. See [BYOK models](byok-models.md).
+Choose an eligible free coding model shown in **Configure AI Agent**. Security remediation uses DeplAI's platform OpenRouter route only; BYOK, paid-model, and direct-provider settings do not apply.
 
 **Why does remediation say no model?**  
-Free plan limits platform aliases; add a BYOK key or upgrade. Pick **Platform**, **BYOK**, or **Auto** on Agent setup.
+No eligible free platform model is currently available, or a saved selection is stale. Refresh the list or retry later. Adding a BYOK key or upgrading a plan does not bypass the remediation model policy.
 
 ## FAQ — Usage and support
 
@@ -99,7 +99,7 @@ Not yet—nav shows **Soon**. Use **Security Agent** and GitHub review on PRs.
 | Apply blocked | Org security policy, missing scan evidence, or unconfirmed plan. |
 | BYOK call failed | **Keys** validation status; provider quota; **Auto** vs **BYOK** mode. |
 | Security Agent scan failed | Repo access; module skipped reasons; see [Security Agent](agents/security-agent.md) troubleshooting. |
-| Remediation failed | Model/BYOK readiness; try **Best coding** or MiniMax M3 / Grok 4.6. |
+| Remediation failed | Check the stage failure detail; refresh the eligible free model list, select another offered free model, or retry after a temporary availability limit. |
 | Results empty after scan | Modules skipped; run **Full Scan** with GitHub access confirmed. |
 
 Related: [Getting started](getting-started.md) · [Billing](billing.md) · [Organizations](organizations.md)

@@ -14,7 +14,7 @@ DeplAI is not a black-box auto-patcher. Every change to source code waits for yo
 | --- | --- |
 | **What does it scan?** | Source (SAST), dependencies (SCA/SBOM), secrets, IaC, containers, Kubernetes, CI/CD, APIs, optional DAST, and cloud posture when available. |
 | **What does it fix?** | Proposes source patches for selected findings; you approve before anything is written. |
-| **What does it need?** | A GitHub project or ZIP upload, scan modules enabled, and—for remediation—a platform model or BYOK key. |
+| **What does it need?** | A GitHub project or ZIP upload, completed scan findings, and an available DeplAI platform remediation model. No BYOK key is used for remediation. |
 | **What is the output?** | Grouped findings, proposed diffs, optional GitHub PR, PDF report, and a **Session** record. |
 
 ---
@@ -175,33 +175,25 @@ This stage configures **which model** proposes fixes. It does **not** run anothe
 
 The page heading is **Configure AI Agent**; the pipeline rail still shows **Agent setup**.
 
-### Access modes
+### Remediation model policy
 
-| Mode | What DeplAI uses |
+Security remediation always uses DeplAI's **platform OpenRouter route** and an eligible **free coding model**. The model list is filtered for zero-priced, active coding variants that meet the workflow's context and output requirements.
+
+| Allowed for remediation | Not used for remediation |
 | --- | --- |
-| **Platform** | DeplAI-hosted provider keys. Consumes **credits** on paid platform models. |
-| **BYOK** | A key you saved under **BYOK → Keys** (`/dashboard/ai`). |
-| **Auto** | Your BYOK key if one exists; otherwise platform. |
+| An eligible free platform OpenRouter coding model | Your BYOK key or provider account |
+| A replacement eligible free model when the saved choice is unavailable | Paid OpenRouter models or paid-model opt-in |
+| DeplAI-managed request limits and temporary cooldown handling | Direct provider SDKs, local models, or worker-held provider keys |
 
-### Plan limits (platform mode)
+This is intentionally narrower than the general **BYOK** and **Compare** features. Saving a provider key, changing profile routing, upgrading a plan, or selecting a paid model elsewhere does not change the remediation route.
 
-| Plan | Platform model access |
-| --- | --- |
-| **Free** | **Best fast** and **Best cost** aliases only |
-| **Starter / Pro / Enterprise** | Full catalog including **Best coding**, **Best reasoning**, and flagship models |
+### Choose a model
 
-Add a BYOK key or upgrade your plan to unlock flagship models on Free. See [BYOK models](../byok-models.md) for the September 2026 catalog and performance recommendations.
+1. Select an available free remediation model from the list in **Configure AI Agent**.
+2. Start remediation. DeplAI checks availability and request capacity before generation.
+3. If the selected model became unavailable, DeplAI may use another eligible free remediation model. If none is available, wait and retry from the same stage.
 
-### Model aliases (common picks)
-
-| Alias | Typical use in Security Agent |
-| --- | --- |
-| **Best coding** | Source patches and multi-file fixes |
-| **Best reasoning** | Complex vulnerability chains |
-| **Best fast** | Quick triage on smaller repos |
-| **Best cost** | High-volume scans on a budget |
-
-For peak agentic performance, DeplAI recommends **MiniMax M3** or **Grok 4.6** with **high** or **extrahigh** thinking effort when you supply those provider keys. Details: [BYOK models](../byok-models.md).
+The picker does not expose a BYOK, Auto, or paid-model remediation option. You do not need to provide an OpenRouter key.
 
 ### GitHub PAT (optional)
 
@@ -235,9 +227,9 @@ Remediation turns selected findings into **proposed diffs**. Nothing is written 
 | **Awaiting final approval** | Transitioning toward Review |
 | **Remediation Failed** | Model error, access issue, or validation failure—see troubleshooting |
 
-### Credits and BYOK
+### Availability and usage
 
-Platform remediation consumes **credits** according to your plan. BYOK remediation bills your provider account directly. Token detail appears under **BYOK → Usage**.
+Remediation uses the platform's free-model route. It does not debit a BYOK provider account and does not send a remediation request with a key saved in **BYOK → Keys**. General platform/BYOK usage views may still show other product activity; they are not a way to select or fund a different remediation provider.
 
 ---
 
@@ -310,9 +302,9 @@ After a clean **GitHub & verify** pass, use **Continue to deployment** to move i
 
 Details: [Deploy](deploy.md).
 
-### BYOK
+### BYOK and other model features
 
-Store provider keys under **BYOK → Keys**. Pick **Platform**, **BYOK**, or **Auto** on **Agent setup**.
+**BYOK → Keys**, Catalog, Compare, and profile routing are available for the product features that support them. They do **not** apply to Security Agent remediation, which remains on the platform free-model route.
 
 Details: [BYOK models](../byok-models.md) · [Security and data](../security-and-data.md).
 
@@ -362,8 +354,8 @@ Details: [Sessions](../sessions.md).
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
 | Cannot start remediation | No findings or scan incomplete | Return to **Results** |
-| **Choose a platform model or BYOK credential** | No valid model for your plan/mode | Add BYOK key or pick allowed platform alias |
-| **Remediation Failed** | Model error or diff validation | Retry; try different model; check BYOK key health |
+| **No remediation model available** | No eligible free platform model is currently available or the selected model is stale | Refresh the model list or retry later; do not add a BYOK key for this workflow |
+| **Remediation Failed** | Platform availability, malformed model output, or patch validation failure | Retry from the stage; select another eligible free model when offered; review the failure detail |
 | BYOK call failed | Invalid or revoked key | **BYOK → Keys** → validate; check provider quota |
 
 ### Review & GitHub
@@ -389,7 +381,7 @@ Details: [Sessions](../sessions.md).
 2. **Verify staging URLs** in DAST before enabling dynamic tests on production.
 3. **Use major scope** for first remediation pass; widen only when needed.
 4. **Always Review** diffs—treat AI patches like any other contributor’s PR.
-5. **Prefer BYOK** with **MiniMax M3** or **Grok 4.6** at high/extrahigh effort for complex multi-file fixes.
+5. Select an eligible free remediation model and retry later if the platform reports temporary availability limits; BYOK and paid-model settings cannot bypass this policy.
 6. **Export PDF** from Results for audit trails before remediation changes the picture.
 7. **Link GitHub** early if you want PR-based workflow; ZIP is fine for evaluation only.
 

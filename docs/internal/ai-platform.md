@@ -18,11 +18,13 @@ Ephemeral playground keys: `ephemeralApiKey` treated as BYOK for that request; n
 
 - Free platform aliases: `best_fast`, `best_cost` only.
 - Paid (`starter_*`, `pro_*`, `enterprise*`): all `LOGICAL_ALIASES` plus catalog vendor models.
-- Default remediation: paid → `platform` / `best_coding`; free with BYOK → `byok`; else `platform` / `best_fast`.
+- **Security remediation is an explicit exception to normal access-mode routing.** It always uses Connector's platform-owned OpenRouter route and an eligible zero-priced `:free` coding model. The request rejects BYOK, `auto`, paid-model selection, direct provider adapters, and legacy fallback routes. This policy is independent of subscription access and general AI routing.
 
 ## Routing and fallback
 
-`AI_ROUTING_ENABLED`, `AI_FALLBACK_ENABLED`, `AI_ENABLE_CROSS_PROVIDER_FALLBACK`. Ranked chain up to **4** models. OpenRouter is a **platform fallback adapter**, not a first-class product provider in the UI.
+`AI_ROUTING_ENABLED`, `AI_FALLBACK_ENABLED`, `AI_ENABLE_CROSS_PROVIDER_FALLBACK`. General AI requests can use a ranked chain of up to **4** models. OpenRouter is a platform fallback adapter for the general gateway, not a first-class product provider in the UI.
+
+Security remediation does **not** inherit that chain: Connector owns its OpenRouter-only free-model selection, request budget, cooldowns, and failure normalization. A stale saved model may be replaced by an eligible free routing candidate; it is never replaced by a paid or BYOK provider.
 
 Organization policy (`ai_organization_policies`): `byokRequired`, `platformCredentialsAllowed`, allowed credential modes.
 

@@ -1,6 +1,6 @@
 # Security pipeline
 
-The product flow is Scan ? unified findings ? remediation model selection ? patch review ? verification and approved PR. Implementation is in progress; automatic checks remain disabled until staging acceptance.
+The product flow is Scan → unified findings → free platform remediation-model selection → patch review → verification and approved PR. Security remediation is Connector platform OpenRouter only: BYOK, paid-model selection, direct provider calls, and worker-side fallback routes are intentionally excluded. Implementation is in progress; automatic checks remain disabled until staging acceptance.
 
 ## Execution and evidence
 
@@ -23,6 +23,10 @@ Full scan execution still uses a project checkout protected by a lease; fully is
 GitHub push/PR/workflow/deployment events and the deployment pipeline enqueue deduplicated checks. The dispatcher publishes neutral GitHub check results. Publication errors are stored explicitly. These checks do not change deployment decisions or branch protection.
 
 `SECURITY_SDLC_AUTOMATIC` defaults to false. Configure it consistently on Connector and Agentic only after staging verification. Deployment project mapping, runtime authorization, generated artifacts, image digest delivery and cloud credential retrieval require end-to-end acceptance. OpenWiki generation is separately disabled by default.
+
+## Remediation handoff
+
+After finding selection, Connector enforces a platform-owned eligible free coding model and starts the Agentic workflow with service authentication. The workflow keeps strict response contracts locally: it validates a single JSON object and patch-path constraints, then permits one bounded contract-repair attempt. It must normalize upstream authentication, capability, malformed-output, and quota failures into product remediation failures rather than exposing raw upstream 400/401 responses or attempting a provider bypass. See [Remediation](remediation.md) for the full invariant list.
 
 ## Verification boundary
 

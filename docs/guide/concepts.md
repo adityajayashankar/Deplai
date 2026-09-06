@@ -56,7 +56,9 @@ An artifact is a reviewable output: a repository context document, scan report, 
 
 ## Finding and remediation
 
-A finding is normalized security evidence from a scanner, including severity and source-specific metadata such as CWE, CVE, package, file, or endpoint. Remediation is the process that groups findings, gathers source context, generates candidate changes, validates them, and waits for review before persistence or GitHub handoff.
+A finding is normalized security evidence from a scanner, including severity and source-specific metadata such as CWE, CVE, package, file, or endpoint. Remediation groups selected findings, gathers limited source context, generates candidate changes, validates them, and waits for review before persistence or GitHub handoff.
+
+For Security Agent remediation, generation always uses an eligible free model through DeplAI's platform OpenRouter route. It does not use BYOK keys, paid models, direct provider calls, or local-model fallbacks. If the selected free model is unavailable, the workflow may select another eligible free model or ask you to retry.
 
 Severity describes security impact. Remediation priority also considers patchability, location, grouping, and selected scope.
 

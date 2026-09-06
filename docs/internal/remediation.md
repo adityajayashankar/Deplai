@@ -10,6 +10,20 @@ The planner and implementor retain strict JSON contracts, but enforce them local
 
 Gateway scheduling owns free-model fallback, cooldowns, and shared account quota reservations. Upstream malformed-schema, authentication, model, and capability failures are normalized to retryable platform-unavailable outcomes, so remediation never exposes upstream 400/401 failures to the product flow. Prompts are packetized below the OpenRouter free request budget; streaming security requests are unavailable because they do not use the shared reservation path.
 
+## Request path and operational invariants
+
+`Connector/src/app/api/remediate/start/route.ts` accepts the user action, authenticates project ownership, and starts the workflow. Agentic calls Connector through `ai_gateway.py` with `DEPLAI_SERVICE_KEY` and the delegated user/org headers; the service key is internal service authentication, never an OpenRouter credential and never browser-visible. Connector's remediation gateway resolves only an active, zero-priced OpenRouter coding variant and sends the call using the platform OpenRouter credential.
+
+Keep these invariants when changing any remediation entrypoint:
+
+1. Do not accept an access-mode override, a provider key, a direct provider base URL, or a paid model for remediation.
+2. Do not add a worker-side fallback after a Connector error. A platform route error must remain a normalized remediation error.
+3. Validate model eligibility, request budget, and JSON output locally at the Connector/workflow boundary; do not rely on provider-specific `json_schema` support.
+4. Preserve the bounded retry policy: one generation response and at most one contract-repair request per stage. Retryable quota/cooldown behavior is owned by the gateway scheduler.
+5. Log opaque reason codes and request metadata only. Never log delegated credentials, the platform key, or unredacted source beyond the existing run/artifact controls.
+
+The corresponding customer-facing policy is in `docs/guide/agents/security-agent.md`; it intentionally describes the user-visible eligibility and recovery behavior without exposing service credentials, route names, or quotas.
+
 ## Patch review and verification
 
 The product track copies the exact scan source into an isolated remediation checkout. Patches remain proposed until validated. Absolute paths, traversal, Git metadata and control characters are rejected. Review provides per-file diffs and downloadable patches. Explicit approval is required for PR creation; the current branch SHA must still match the scan source.

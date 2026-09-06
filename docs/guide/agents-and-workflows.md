@@ -22,7 +22,7 @@ The framework is secondary. The defining properties are bounded responsibility, 
 | Typed handoffs | Repository facts, deployment profiles, findings, and diffs can be validated between stages. |
 | Targeted retries | A failed provider call or validator can be retried without replaying every stage. |
 | Auditability | Stage, model, warnings, and resulting artifacts can be recorded separately. |
-| Deterministic fallback | Supported paths can continue with explicit fallback provenance when a model is unavailable. |
+| Deterministic fallback | Supported paths can continue with explicit fallback provenance when a model is unavailable. Security remediation is an exception: it stays on the platform free-model route or reports that no eligible model is available. |
 
 ## Implemented workflow families
 
@@ -36,7 +36,7 @@ The active generator orchestrates context, profile refinement, structure plannin
 
 ### Security remediation
 
-The current checkpoint-capable remediation graph uses master, planner, implementor, reviewer, and synthesizer roles. Its outer pipeline selects bounded findings and source context. Candidate diffs must survive local validation before review or GitHub handoff.
+The current checkpoint-capable remediation graph uses master, planner, implementor, reviewer, and synthesizer roles. Its outer pipeline selects bounded findings and source context. Candidate diffs must survive local validation before review or GitHub handoff. Generation is constrained to DeplAI's platform OpenRouter route and an eligible free coding model; it does not use BYOK, paid models, direct provider adapters, or local fallbacks.
 
 ### Frontend customization
 
@@ -74,7 +74,7 @@ The remediation path supports durable, redacted run status and optional MongoDB-
 
 Use retry for transient provider, network, or tool failures when inputs and project revision are unchanged. Restart a workflow when source, credentials, model access, policy, or architecture decisions changed. Deterministic fallback output is marked through warnings or provenance and should be reviewed for reduced scope.
 
-Fallback never grants missing permission and never converts an unsupported cloud operation into a supported one.
+Fallback never grants missing permission and never converts an unsupported cloud operation into a supported one. In particular, a remediation availability failure never becomes permission to use a BYOK key, a paid model, or another provider.
 
 ## Guardrails
 

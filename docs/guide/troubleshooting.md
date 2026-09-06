@@ -45,8 +45,8 @@ GitHub OAuth authenticates the user. GitHub App installation authorizes reposito
 
 | Symptom | Response |
 | --- | --- |
-| No patch generated | Confirm selected findings/files are patchable and model access is valid |
-| Context limit | Reduce finding scope or customization breadth; use a permitted larger-context model |
+| No patch generated | Confirm selected findings/files are patchable and that an eligible free platform remediation model is available; refresh the model list or retry later if it is not. |
+| Context limit | Reduce finding scope or customization breadth. Remediation selects only eligible free platform models; other workflows may offer a permitted larger-context model. |
 | Diff rejected | Inspect path, applicability, protected-file, and validation errors; do not bypass the validator |
 | Preview fails | Check package install/start diagnostics and required environment-variable names |
 | Preview looks correct but tests fail | Treat tests and functional validation as authoritative; revise the change |
@@ -56,9 +56,9 @@ GitHub OAuth authenticates the user. GitHub App installation authorizes reposito
 
 | Symptom | Response |
 | --- | --- |
-| Credential invalid | Validate exact provider/key pairing and rotate if revoked |
-| Model unavailable | Confirm current provider model id and account entitlement; choose another catalog model |
-| Rate limited | Wait for reset or use an allowed fallback |
+| Credential invalid | Validate exact provider/key pairing and rotate if revoked for a feature that supports BYOK. Security remediation does not use a BYOK credential. |
+| Model unavailable | For remediation, refresh the eligible free platform list or retry later. For other features, confirm the provider model id and account entitlement, then choose another catalog model. |
+| Rate limited | Wait for reset. General workflows may use an allowed fallback; remediation remains on its platform free-model route. |
 | Quota exceeded | Increase provider quota or select a permitted credential source |
 | Policy denied | Review organization provider/model/access-mode restrictions |
 | Usage missing | Confirm the request reached the shared gateway; legacy/fallback paths may report differently |

@@ -92,10 +92,12 @@ flowchart TD
 
 | Surface | Control |
 | --- | --- |
-| Security Agent → **Agent setup** | Platform / BYOK / Auto + model; optional GitHub PAT. |
-| UI/UX customizer | Same picker before start. |
-| Deploy | Same setting when an LLM refine step runs. |
+| Security Agent → **Agent setup** | **Remediation is an exception:** choose an eligible free platform remediation model only. BYOK, Auto, paid models, and direct provider routing are unavailable for remediation; an optional GitHub PAT is still one-run push authority only. |
+| UI/UX customizer | Platform / BYOK / Auto model selection before start. |
+| Deploy | Platform / BYOK / Auto when an LLM-refine step runs. |
 | **Compare** | Explicit mode for ad-hoc chat. |
+
+The remediation restriction is intentional: it keeps security patch generation on a centrally budgeted and validated platform route. A key stored under **BYOK → Keys** is never sent for a remediation request.
 
 ### What BYOK changes economically
 

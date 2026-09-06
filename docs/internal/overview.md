@@ -17,7 +17,7 @@ DeplAI is a multi-service workspace. The browser never talks to Docker, Terrafor
 | `Connector/migrations/` | Incremental SQL applied on existing databases |
 | `.env.template` | Shared env names. Never commit a populated `.env` |
 | `docs/guide/` | Client docs (dashboard) |
-| `docs/internal/` | This handbook |
+| `docs/internal/` | This handbook; see `documentation.md` for client-guide publishing and documentation boundaries |
 
 
 ## Runtime topology (local)

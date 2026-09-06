@@ -36,7 +36,7 @@ Per-provider `AI_PROVIDER_*_ENABLED` flags.
 
 Claude pipeline caps: `CLAUDE_MODEL`, `CLAUDE_REPO_ANALYZER_MODEL`, `CLAUDE_REVIEW_QUESTION_MODEL`, `CLAUDE_INFRA_PLANNER_MODEL`, `DEPLAI_CLAUDE_MAX_PIPELINE_COST_USD`, `DEPLAI_CLAUDE_MAX_TERRAFORM_GEN_COST_USD`.
 
-`GROQ_API_KEY` also enables the lean remediator path in Agentic — ops-only, not a marketing claim.
+`GROQ_API_KEY` may be used by enabled general AI-provider integrations. It is not a security-remediation credential or fallback: remediation is restricted to Connector's platform OpenRouter free-model route.
 
 ## Billing
 

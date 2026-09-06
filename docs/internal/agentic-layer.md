@@ -62,6 +62,6 @@ Timeouts: `SCANNER_TIMEOUT_SECONDS` (default 1800), `GRYPE_TIMEOUT_SECONDS` (900
 
 ## LLM from Agentic
 
-`ai_gateway.py` (`DeplaiAI`) posts to Connector `DEPLAI_AI_GATEWAY_URL` with the service key and user id. Remediation (`claude_remediator.py`) uses that first, then legacy Anthropic/Groq/OpenRouter paths if the gateway is down. `GROQ_API_KEY` enables a cheaper remediator path — do not document that as the default product story.
+`ai_gateway.py` (`DeplaiAI`) posts to Connector `DEPLAI_AI_GATEWAY_URL` with the service key and delegated user id. The remediation path in `claude_remediator.py` and `agent/remediation_workflow.py` is gateway-only: it may use Connector's platform OpenRouter free-model route, but it must not fall back to Anthropic, Groq, direct OpenRouter, Ollama, BYOK, or any worker-held provider key. Gateway failures are returned as normalized remediation failures rather than bypassing the Connector trust, budget, and model policy.
 
 Related: [Security pipeline](security-pipeline.md) · [Deploy pipeline](deploy-pipeline.md) · [Remediation](remediation.md)

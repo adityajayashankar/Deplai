@@ -15,7 +15,7 @@ flowchart LR
   M --> U[Normalized response and usage]
 ```
 
-This boundary lets remediation, customization, deployment assistance, and Compare use the same credential and error model. It does not guarantee that every model supports every task.
+This boundary lets remediation, customization, deployment assistance, and Compare use common request and normalized-error infrastructure. It does not guarantee that every model supports every task. Security remediation deliberately applies a stricter route than the general gateway.
 
 ## Implemented providers
 
@@ -35,6 +35,10 @@ For current model identifiers and task recommendations, use [BYOK model catalog]
 
 An ephemeral credential can be supplied by specific workflows where implemented, but it is not the same as a stored BYOK record.
 
+### Security remediation exception
+
+Security Agent remediation always uses DeplAI's platform OpenRouter route and an eligible zero-priced coding model. It does not resolve `auto`, BYOK, a paid model, a direct provider credential, or a local-model fallback. The normal provider catalog and access-mode tables describe other eligible product surfaces; they do not override this remediation policy.
+
 ## Credentials
 
 BYOK credentials are validated through the provider adapter, encrypted at rest, and represented by a masked value in normal responses. Credential states include pending, valid, invalid, expired, revoked, rate-limited, quota-exceeded, and error.
@@ -51,7 +55,7 @@ Choose on task fit, not name alone:
 | Context window | Repository snippets and finding groups must fit without silently dropping essential evidence. |
 | Output limit | Large patches or structured plans may exceed a small output allowance. |
 | Latency | Interactive planning and large remediation have different acceptable wait times. |
-| Cost | Platform credit use or BYOK provider charges scale with tokens and model price. |
+| Cost | Platform credit use or BYOK provider charges scale with tokens and model price on features that support those modes. Security remediation is limited to the platform free-model route. |
 | Reliability | Preview, deprecated, or unhealthy models may fail even when a credential is valid. |
 | Policy | An organization can constrain providers, models, credential modes, logging, tokens, and spend. |
 
@@ -61,7 +65,7 @@ Logical aliases such as `best_coding`, `best_reasoning`, `best_fast`, and `best_
 
 Routing policies can specify primary and secondary aliases, a fallback model, access mode, provider allowlists, and weights for capability, reliability, policy, credential, latency, cost, and preference. Cross-provider fallback occurs only when enabled and allowed.
 
-Fallback should be observable. The resolved provider and model belong in usage and diagnostic records. A fallback result may differ in style or capability, so review generated artifacts even when the workflow completes.
+Fallback should be observable. The resolved provider and model belong in usage and diagnostic records. A fallback result may differ in style or capability, so review generated artifacts even when the workflow completes. Security remediation does not use this cross-provider fallback: it may move only to another eligible free remediation model or stop with a normalized availability error.
 
 ## Failure model
 

@@ -21,7 +21,8 @@ It is **not** customer documentation. Do not copy these pages into Dashboard →
 13. [Data model](data-model.md) — MySQL tables
 14. [Environment](environment.md) — env vars (names only)
 15. [Local development](local-development.md)
-16. [Known gaps](known-gaps.md) — unfinished wiring and product landmines
+16. [Documentation system](documentation.md) — handbook/client-guide boundaries and publishing flow
+17. [Known gaps](known-gaps.md) — unfinished wiring and product landmines
 
 Older, still useful narratives (overlap with this handbook; prefer this folder when they disagree):
 
