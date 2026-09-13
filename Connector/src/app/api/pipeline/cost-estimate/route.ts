@@ -2,6 +2,7 @@ import { createHash } from 'crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth, verifyProjectOwnership } from '@/lib/auth';
 import { canonicalDecisionJson } from '@/lib/decision-hash';
+import { denyUnlessPlanFeature } from '@/lib/billing/plan-access-guard';
 
 function hashDecisionSync(decision: Record<string, unknown>): string {
   return createHash('sha256').update(canonicalDecisionJson(decision)).digest('hex');
@@ -772,6 +773,9 @@ export async function POST(request: NextRequest) {
 
     const owned = await verifyProjectOwnership(user.id, projectId);
     if ('error' in owned) return owned.error;
+
+    const denied = await denyUnlessPlanFeature(request, user, 'cost_estimates');
+    if (denied) return denied;
 
     const decision = asRecord(body.decision);
     const components = normalizeDecisionComponents(decision);

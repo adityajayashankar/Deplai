@@ -111,6 +111,7 @@ from claude_deployment_pipeline import (
     _fallback_structure_plan,
     _normalize_compute_services,
     _project_slug,
+    _render_ecs_curated_bundle,
     _rewrite_legacy_region_var_references,
     _run_terraform_json_worker,
     generate_terraform_bundle,
@@ -152,6 +153,22 @@ def _profile(strategy: str) -> dict:
 
 
 class TerraformDynamicPipelineTests(unittest.TestCase):
+    def test_curated_ecs_bundle_serializes_shell_commands_as_ecs_command_arrays(self) -> None:
+        files, _warnings = _render_ecs_curated_bundle(
+            payload=_profile("ecs_fargate"),
+            provider_version="~> 5.0",
+            state_bucket="",
+            lock_table="",
+            aws_region="eu-north-1",
+            context_summary="unit test",
+        )
+
+        compute = files["terraform/modules/compute/main.tf"]
+        data = files["terraform/modules/data/main.tf"]
+        self.assertIn('command = length(trimspace(try(each.value.command, ""))) > 0 ? ["sh", "-c", tostring(each.value.command)] : null', compute)
+        self.assertIn("postgres_backup_retention_period", data)
+        self.assertIn("backup_retention_period = local.postgres_backup_retention_period", data)
+
     def test_normalize_compute_services_uses_homogeneous_terraform_shape(self) -> None:
         normalized = _normalize_compute_services([
             {

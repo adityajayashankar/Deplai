@@ -560,6 +560,8 @@ class ArchitectureReviewStartRequest(BaseModel):
     organization_id: str | None = None
     repo_full_name: str | None = None
     environment: str | None = None
+    answers: dict[str, str] = Field(default_factory=dict, max_length=40)
+    conversation: list[dict[str, str]] | None = Field(default=None, max_length=40)
 
 
 class ArchitectureReviewStartResponse(BaseModel):
@@ -581,6 +583,7 @@ class ArchitectureReviewCompleteRequest(BaseModel):
     repo_full_name: str | None = None
     answers: dict[str, str] = Field(default_factory=dict)
     aws_context: AwsDiscoveryContext | None = None
+    conversation: list[dict[str, str]] | None = Field(default=None, max_length=40)
 
 
 class ArchitectureReviewCompleteResponse(BaseModel):

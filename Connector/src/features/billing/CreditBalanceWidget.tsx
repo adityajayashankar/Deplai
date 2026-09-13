@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect, useRef, useState } from 'react';
+import { formatCreditAmount } from '@/lib/billing/credit-format';
 
 export type CreditBalancePayload = {
   available: number;
@@ -16,8 +17,7 @@ export type CreditBalancePayload = {
 };
 
 function displayCredits(value: number | undefined): string {
-  if (value == null) return '—';
-  return value.toLocaleString(undefined, { maximumFractionDigits: 6 });
+  return formatCreditAmount(value);
 }
 
 export function CreditBalanceWidget({

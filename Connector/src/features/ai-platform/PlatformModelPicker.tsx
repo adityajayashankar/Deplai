@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { ExternalLink, KeyRound, Sparkles } from 'lucide-react';
 import type { AccessMode } from '@/lib/ai-platform/types';
+import { formatCreditAmount } from '@/lib/billing/credit-format';
 import {
   assertPlatformModelAllowed,
   isLogicalAliasName,
@@ -99,9 +100,7 @@ export const DEFAULT_PLATFORM_MODEL_VALUE: PlatformModelValue = {
 };
 
 function formatCreditsRemaining(value: number): string {
-  if (!Number.isFinite(value)) return '0';
-  if (value >= 100) return Math.round(value).toLocaleString();
-  return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return formatCreditAmount(value);
 }
 
 function sourceLabel(mode: AccessMode): string {

@@ -483,6 +483,62 @@ def _run_iam_permission_preflight(
     }
 
 
+def _validate_aws_deploy_credentials(
+    *,
+    aws_access_key_id: str,
+    aws_secret_access_key: str,
+    aws_session_token: str,
+    aws_region: str,
+) -> dict[str, str | bool]:
+    """Verify the supplied credential set before Terraform contacts AWS.
+
+    Terraform otherwise reports a signing failure during ``plan`` even though
+    no configuration was evaluated. This check keeps that distinction clear
+    and never returns credential material.
+    """
+    try:
+        session = boto3.session.Session(
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token or None,
+            region_name=aws_region,
+        )
+        identity = session.client("sts", region_name=aws_region).get_caller_identity()
+        return {
+            "ok": True,
+            "account_id": str(identity.get("Account") or "").strip(),
+        }
+    except ClientError as exc:
+        error = getattr(exc, "response", {}).get("Error", {}) if isinstance(getattr(exc, "response", {}), dict) else {}
+        aws_code = str(error.get("Code") or "AWS_STS_REJECTED").strip()
+        if aws_code in {"SignatureDoesNotMatch", "InvalidSignatureException"}:
+            if aws_access_key_id.upper().startswith("ASIA"):
+                message = (
+                    "AWS rejected this temporary credential set. Re-enter the access key ID, secret access key, "
+                    "and session token issued together by AWS."
+                )
+            else:
+                message = (
+                    "AWS rejected this access key ID and secret access key combination. Paste the matching pair exactly as AWS generated it. "
+                    "Standard AWS access keys do not need a session token."
+                )
+        elif aws_code in {"InvalidClientTokenId", "UnrecognizedClientException"}:
+            message = (
+                "AWS does not recognize this access key. Re-enter an active IAM access key and its matching secret."
+            )
+        elif aws_code in {"ExpiredToken", "RequestExpired", "TokenRefreshRequired"}:
+            message = "These AWS temporary credentials have expired. Obtain a fresh access key, secret, and session token."
+        else:
+            message = "AWS could not verify the supplied credentials. Check the access key, secret, session token, and AWS region."
+        return {"ok": False, "code": aws_code, "message": message}
+    except Exception:
+        return {
+            "ok": False,
+            "code": "AWS_STS_UNAVAILABLE",
+            "message": "AWS credential verification could not complete. Check the AWS region and network connection, then retry.",
+        }
+
+
 def _tail(text: str, limit: int = 3000) -> str:
     value = text or ""
     if len(value) <= limit:
@@ -518,6 +574,14 @@ def _ec2_output_evidence(outputs: dict[str, Any]) -> dict[str, str]:
 
 def _friendly_terraform_error(combined_output: str) -> str:
     text = combined_output or ""
+    if "FreeTierRestrictionError" in text and "backup retention" in text.lower():
+        return (
+            " AWS rejected the RDS backup retention period under this account's Free plan. "
+            "Action: review a shorter backup retention period (for example, 1 day), or upgrade "
+            "the AWS account plan to keep the planned retention. Some infrastructure was already "
+            "created. Preserve the saved deployment and Terraform state; review the updated plan "
+            "before retrying this deployment. A new repository scan is not required."
+        )
     if "VcpuLimitExceeded" in text:
         return (
             " AWS EC2 vCPU quota was exceeded for the selected instance family bucket. "
@@ -636,6 +700,18 @@ def _extract_importable_aws_collisions(text: str) -> list[dict[str, str]]:
             r"RDS DB Instance \(([^)]+)\)",
             r"(?:^|\.)aws_db_instance\.[A-Za-z0-9_-]+(?:\[\d+\])?$",
         ),
+        (
+            "rds_subnet_group",
+            "DBSubnetGroupAlreadyExists",
+            r"RDS DB Subnet Group \(([^)]+)\)",
+            r"(?:^|\.)aws_db_subnet_group\.[A-Za-z0-9_-]+(?:\[\d+\])?$",
+        ),
+        (
+            "load_balancer",
+            "DuplicateLoadBalancerName",
+            r"(?:Application )?Load Balancer \(([^)]+)\)",
+            r"(?:^|\.)aws_lb\.[A-Za-z0-9_-]+(?:\[\d+\])?$",
+        ),
     )
     for chunk in chunks:
         address_match = re.search(r"(?m)^\s*with\s+([^,\n]+),", chunk)
@@ -682,6 +758,24 @@ def _aws_tags_mark_terraform_owned(
         if instances:
             arn = str(instances[0].get("DBInstanceArn") or "")
             raw_tags = client.list_tags_for_resource(ResourceName=arn).get("TagList") or []
+    elif kind == "rds_subnet_group":
+        client = session.client("rds", region_name=aws_region)
+        groups = client.describe_db_subnet_groups(DBSubnetGroupName=import_id).get("DBSubnetGroups") or []
+        if groups:
+            arn = str(groups[0].get("DBSubnetGroupArn") or "")
+            raw_tags = client.list_tags_for_resource(ResourceName=arn).get("TagList") or []
+    elif kind == "load_balancer":
+        client = session.client("elbv2", region_name=aws_region)
+        load_balancers = client.describe_load_balancers(Names=[import_id]).get("LoadBalancers") or []
+        if load_balancers:
+            arn = str(load_balancers[0].get("LoadBalancerArn") or "")
+            tag_descriptions = client.describe_tags(ResourceArns=[arn]).get("TagDescriptions") or [] if arn else []
+            if tag_descriptions:
+                raw_tags = tag_descriptions[0].get("Tags") or []
+            # Terraform imports an ALB by ARN. Keep the user-facing name only
+            # until AWS has resolved it, then retain the canonical import ID.
+            if arn:
+                collision["import_id"] = arn
 
     tags = {
         str(item.get("Key") or item.get("key") or "").strip().lower():
@@ -3396,6 +3490,64 @@ def _discover_remote_state_backend(files: list[dict[str, Any]]) -> tuple[str | N
     return bucket, lock_table
 
 
+def _remote_state_key(project_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9-]+", "-", str(project_name or "project").strip().lower()).strip("-")
+    return f"{slug[:48] or 'project'}/production/terraform.tfstate"
+
+
+def _configure_s3_state_backend(
+    files: list[dict[str, Any]],
+    *,
+    state_bucket: str,
+    lock_table: str,
+    aws_region: str,
+    project_name: str,
+) -> list[dict[str, Any]]:
+    """Replace the generated local backend with the request's durable S3 backend.
+
+    The state settings are supplied at deploy time, after IaC generation. The
+    apply workspace is disposable, so leaving its generated ``backend \"local\"``
+    untouched would make a later retry lose the state from a partial apply.
+    """
+    backend_block = "\n".join((
+        'backend "s3" {',
+        f"  bucket         = {json.dumps(str(state_bucket).strip())}",
+        f"  key            = {json.dumps(_remote_state_key(project_name))}",
+        f"  region         = {json.dumps(str(aws_region).strip())}",
+        f"  dynamodb_table = {json.dumps(str(lock_table).strip())}",
+        "  encrypt        = true",
+        "}",
+    ))
+    backend_pattern = re.compile(r'(?is)backend\s+"(?:local|s3)"\s*\{.*?\}')
+    normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
+    has_terraform_dir = any(path == "terraform" or path.startswith("terraform/") for path in normalized_paths)
+    root_prefix = "terraform/" if has_terraform_dir else ""
+    configured = False
+    updated: list[dict[str, Any]] = []
+
+    for item, path in zip(files, normalized_paths):
+        is_root_tf = path.startswith(root_prefix) and path[len(root_prefix):].endswith(".tf") and "/" not in path[len(root_prefix):]
+        content = _extract_text_payload(item)
+        if is_root_tf and not configured:
+            next_content, replacements = backend_pattern.subn(backend_block, content, count=1)
+            if replacements:
+                replacement = dict(item)
+                replacement["content"] = next_content
+                replacement["encoding"] = "utf-8"
+                updated.append(replacement)
+                configured = True
+                continue
+        updated.append(dict(item))
+
+    if not configured:
+        updated.append({
+            "path": f"{root_prefix}deplai_runtime_backend.tf",
+            "content": f"terraform {{\n  {backend_block}\n}}\n",
+            "encoding": "utf-8",
+        })
+    return updated
+
+
 def _is_missing_remote_state_error(text: str) -> bool:
     value = (text or "").lower()
     return any(
@@ -3591,6 +3743,25 @@ def apply_terraform_bundle(
             },
         }
 
+    credential_check = _validate_aws_deploy_credentials(
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        aws_session_token=aws_session_token,
+        aws_region=aws_region,
+    )
+    if not credential_check.get("ok"):
+        message = str(credential_check.get("message") or "AWS credentials could not be verified.")
+        _emit_progress(apply_context, "error", f"Terraform apply aborted before plan: {message}")
+        return {
+            "success": False,
+            "error": message,
+            "details": {
+                "stage": "credentials",
+                "code": str(credential_check.get("code") or "AWS_CREDENTIALS_INVALID"),
+            },
+        }
+    _emit_progress(apply_context, "info", "AWS credentials verified before Terraform plan.")
+
     docker = get_docker_client()
     volume_name = f"deplai_tf_apply_{uuid.uuid4().hex[:12]}"
     volume = docker.volumes.create(name=volume_name)
@@ -3738,6 +3909,16 @@ def apply_terraform_bundle(
         discovered_bucket, discovered_lock_table = _discover_remote_state_backend(files)
         state_bucket_name = str(state_bucket or "").strip() or discovered_bucket
         lock_table_name = str(lock_table or "").strip() or discovered_lock_table
+        if bool(state_bucket_name) != bool(lock_table_name):
+            return {
+                "success": False,
+                "error": "Terraform remote state requires both an S3 state bucket and a DynamoDB lock table.",
+                "details": {
+                    "terraform_root": tf_root,
+                    "state_bucket": state_bucket_name,
+                    "lock_table": lock_table_name,
+                },
+            }
 
         if auto_bootstrap_backend and (state_bucket_name or lock_table_name):
             try:
@@ -3759,9 +3940,21 @@ def apply_terraform_bundle(
                         "terraform_root": tf_root,
                         "state_bucket": state_bucket_name,
                         "lock_table": lock_table_name,
-                        "bundle_remediation": bundle_remediation,
-                    },
-                }
+                    "bundle_remediation": bundle_remediation,
+                },
+            }
+
+        if state_bucket_name and lock_table_name:
+            files = _configure_s3_state_backend(
+                files,
+                state_bucket=state_bucket_name,
+                lock_table=lock_table_name,
+                aws_region=backend_region_override or aws_region,
+                project_name=project_name,
+            )
+            normalized_paths = [_normalize_rel_path(str(item.get("path", ""))) for item in files]
+            _write_files_to_volume(volume_name, files)
+            _emit_progress(apply_context, "info", "Configured durable S3 Terraform state and DynamoDB locking for this deploy.")
 
         try:
             fmt_log = _run_terraform_with_tracking(
@@ -5094,10 +5287,16 @@ def apply_terraform_bundle(
             },
         }
     except Exception as exc:
-        _emit_progress(apply_context, "error", f"Terraform runtime apply failed: {exc}")
+        retention_restricted = "FreeTierRestrictionError" in str(exc) and "backup retention" in str(exc).lower()
+        error_message = (
+            _friendly_terraform_error(str(exc)).strip()
+            if retention_restricted else f"Terraform runtime apply failed: {str(exc)}"
+        )
+        _emit_progress(apply_context, "error", error_message)
         return {
             "success": False,
-            "error": f"Terraform runtime apply failed: {str(exc)}",
+            "error": error_message,
+            **({"error_code": "RDS_BACKUP_RETENTION_RESTRICTED", "requires_plan_review": True} if retention_restricted else {}),
             "details": {
                 "fmt_log_tail": _tail(fmt_log),
                 "init_log_tail": _tail(init_log),

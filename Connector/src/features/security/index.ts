@@ -20,7 +20,6 @@ export { ScanStatus } from './ScanStatus';
 export { SecurityKPI } from './SecurityKPI';
 export { SecurityModuleCard, SecurityModuleGrid } from './SecurityModuleCard';
 export { ScanReportDownloadButton } from './ScanReportDownloadButton';
-export { RemediationModelPicker } from './RemediationModelPicker';
 export { SeverityBadge } from './SeverityBadge';
 export { RiskScore } from './RiskScore';
 export { FindingDetail, correlatedFor } from './FindingDetail';

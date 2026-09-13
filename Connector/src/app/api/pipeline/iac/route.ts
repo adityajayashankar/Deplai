@@ -18,6 +18,12 @@ import {
   resolveOrCreateSession,
   tryAppendSessionLogs,
 } from '@/lib/sessions/store';
+import { denyUnlessPlanFeature } from '@/lib/billing/plan-access-guard';
+import {
+  deploymentProviderAvailabilityMessage,
+  isDeployableProvider,
+  parseDeploymentProvider,
+} from '@/lib/deployment-providers';
 import fs from 'fs';
 import path from 'path';
 
@@ -32,7 +38,7 @@ interface ScanResultsData {
 
 interface IacGenerateBody {
   project_id: string;
-  provider?: Provider;
+  provider?: string;
   iac_mode?: IacMode;
   budget_cap_usd?: number;
   qa_summary?: string;
@@ -1418,12 +1424,6 @@ async function resolveProjectSourceRoots(
   };
 }
 
-function clampProvider(value: string | undefined): Provider {
-  const v = (value || '').trim().toLowerCase();
-  if (v === 'azure' || v === 'gcp') return v;
-  return 'aws';
-}
-
 function clampIacMode(value: string | undefined): IacMode {
   return String(value || '').trim().toLowerCase() === 'llm' ? 'llm' : 'deterministic';
 }
@@ -2004,9 +2004,32 @@ export async function POST(req: NextRequest) {
     const owned = await verifyProjectOwnership(user.id, projectId);
     if ('error' in owned) return owned.error;
 
+    const denied = await denyUnlessPlanFeature(req, user, 'terraform_planning');
+    if (denied) return denied;
+
     const billing = await resolveAgenticBillingContext({ request: req, user });
 
-    const provider = clampProvider(body.provider);
+    const requestedProvider = parseDeploymentProvider(body.provider || 'aws');
+    if (!requestedProvider) {
+      return NextResponse.json(
+        { error: 'provider must be one of aws, heroku, azure, gcp' },
+        { status: 400 },
+      );
+    }
+    if (!isDeployableProvider(requestedProvider)) {
+      return NextResponse.json(
+        {
+          error: deploymentProviderAvailabilityMessage(requestedProvider),
+          code: 'deployment_provider_coming_soon',
+          provider: requestedProvider,
+        },
+        { status: 409 },
+      );
+    }
+    // The availability guard above narrows this to AWS at runtime. Preserve
+    // the legacy internal union because its deterministic templates are still
+    // compiled for future provider rollouts.
+    const provider = requestedProvider as Provider;
     const iacMode = clampIacMode(body.iac_mode);
     const llmApiKey = String(body.llm_api_key || body.openai_api_key || '').trim();
     const llmModel = String(body.llm_model || '').trim();
@@ -2743,5 +2766,3 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: classified.message }, { status: classified.status });
   }
 }
-
-

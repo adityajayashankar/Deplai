@@ -230,6 +230,15 @@ def test_ec2_renderer_workspace_user_data_proxies_api_and_web() -> None:
     )
     main_tf = {item["path"]: item["content"] for item in rendered["files"]}["terraform/main.tf"]
     assert "node_workspace_detected" in main_tf
+    # EC2 accepts compressed cloud-init data. The full bootstrap exceeds the
+    # request limit when it is only base64 encoded.
+    import base64
+    import gzip
+    assert 'user_data_base64 = base64gzip(<<-USERDATA' in main_tf
+    script = main_tf.split('<<-USERDATA', 1)[1].split('\nUSERDATA', 1)[0].encode()
+    encoded = base64.b64encode(gzip.compress(script))
+    assert len(encoded) < 16384
+    assert gzip.decompress(base64.b64decode(encoded)) == script
     assert "location /api/" in main_tf
     assert "APP_ROOT/$rel/package.json" in main_tf or "frontend/package.json" in main_tf
 

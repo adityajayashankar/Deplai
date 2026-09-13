@@ -23,7 +23,14 @@ Packs (`paidTiersOnly: true`, Free excluded): 10 / $12, 25 / $32, 50 / $70.
 - Upgrade mid-cycle uses `proratePaidDelta`.
 - Types: `grant_paid`, `grant_bonus`, `consume`, `expire`, `rollover`, `refund`.
 
-`POST /api/billing/credits/consume` implements this and returns 402 when empty. **Nothing in the AI gateway or Agentic calls it.** LLM spend is token/USD in `ai_usage` / `ai_costs`. Credits today gate **plan / platform model access**, not per-scan debit. Product intent “1 credit per scan” is **not wired**.
+`POST /api/billing/credits/consume` implements the organization ledger and returns 402 when empty. Product outcomes settle through the internal service-key route `POST /api/billing/product-usage/settle`; every debit is idempotent by run, or by project and UTC day for deployments.
+
+- A successful non-DAST security scan consumes 0.50 credit. Failed scans consume 0.
+- A successful DAST run consumes 1.00 credit. A DAST-only request does not also incur the base scan rate.
+- Successful remediation and verified UI/UX runs consume token-based usage at `DEPLAI_DYNAMIC_CREDITS_PER_MILLION_TOKENS` (default 1 credit per reported million tokens, rounded up to 0.01). Failed remediation consumes 0.50 credit; failed UI/UX consumes 0.
+- A verified deployment consumes 3.00 credits once per project per UTC day. Terraform completion without bootstrap and endpoint verification is not billable.
+
+The AI gateway continues to store token/USD spend in `ai_usage` / `ai_costs`; product-usage settlement is the organization credit ledger for these workflows.
 
 `POST /api/billing/credits/expire` is service-key (cron-style). `POST /api/billing/credits/admin-grant` is admin.
 

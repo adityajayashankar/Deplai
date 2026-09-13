@@ -24,10 +24,11 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ROOT = Path(os.getenv("UIUX_RUN_DIRECTORY", "./data/uiux-runs")).resolve()
-MAX_CALLS = 18
-MAX_TOKENS = 1_000_000  # Aggregate run budget, distinct from one model context.
+MAX_CALLS = 80
+MAX_STEPS = 64
+MAX_TOKENS = 8_000_000  # Aggregate safety ceiling, distinct from model context.
 CONTEXT_WINDOW = 200_000
-MAX_SECONDS = 600
+MAX_SECONDS = 3600
 MAX_CHANGED_FILES = 12
 OPENROUTER_FREE_ROUTER = "openrouter/free"
 MIN_FREE_CONTEXT = 200000
@@ -330,11 +331,76 @@ class Budget:
         return estimated + output_limit
 
     def reconcile(self, reserved, reported):
-        if all(isinstance(reported.get(k), int) and reported[k] >= 0 for k in ("prompt_tokens", "completion_tokens")):
+        if (all(type(reported.get(k)) is int and reported[k] >= 0 for k in ("prompt_tokens", "completion_tokens"))
+                and reported["prompt_tokens"] + reported["completion_tokens"] > 0):
             self.run["usage"]["budget_tokens"] += reported["prompt_tokens"] + reported["completion_tokens"] - reserved
 
 
-async def completion(client, budget, messages, tools=None, output_limit=3000):
+def compact_tool_history(messages):
+    """Compact old source reads, retaining provenance, edits and failure feedback."""
+    if len(json.dumps(messages, ensure_ascii=False).encode()) < 360000:
+        return
+    calls = {call.get("id"): call.get("function", {})
+             for message in messages for call in message.get("tool_calls", [])}
+    for message in messages[2:-12]:
+        call = calls.get(message.get("tool_call_id"), {})
+        content = str(message.get("content", ""))
+        # Never erase edit confirmations, rejected operations, discovery results
+        # or the assistant's reasoning about them.
+        if (message.get("role") != "tool" or call.get("name") != "read_file"
+                or len(content) <= 2000 or content.startswith("Tool rejected:")):
+            continue
+        try:
+            args = json.loads(call.get("arguments", "{}"))
+        except (ValueError, TypeError):
+            continue
+        message["content"] = json.dumps({
+            "compacted_source": True, "path": args.get("path"), "offset": args.get("offset", 0),
+            "characters": len(content), "sha256": hashlib.sha256(content.encode()).hexdigest(),
+            "excerpt_start": content[:800], "excerpt_end": content[-400:],
+            "instruction": "Partial historical source only. Read this path and offset again before exact edits; later edits may have changed it.",
+        }, ensure_ascii=False)
+
+
+async def completion(client, budget, messages, tools=None, output_limit=8192):
+    if budget.run.get("user_id") and not os.getenv("UIUX_CONNECTOR_URL"):
+        raise RuntimeError("Connector inference gateway is not configured; restore UIUX_CONNECTOR_URL")
+    if os.getenv("UIUX_CONNECTOR_URL"):
+        # Product deployments share Connector's durable account quota and
+        # retry scheduler with remediation. No worker-side provider fallback.
+        compact_tool_history(messages)
+        reserved = budget.reserve(messages, output_limit, tools)
+        canonical = []
+        for message in messages:
+            row = {"role": message["role"], "content": message.get("content") or ""}
+            if message.get("tool_call_id"):
+                row["toolCallId"] = message["tool_call_id"]
+            if message.get("tool_calls"):
+                row["toolCalls"] = [{"id": call["id"], **call["function"]} for call in message["tool_calls"]]
+            if message.get("reasoning_details"):
+                row["reasoningDetails"] = message["reasoning_details"]
+            canonical.append(row)
+        response = await client.post(os.environ["UIUX_CONNECTOR_URL"].rstrip("/") + "/api/ai/chat",
+            headers={"X-API-Key": os.getenv("DEPLAI_SERVICE_KEY", ""),
+                     "x-deplai-user-id": budget.run["user_id"],
+                     "x-deplai-organization-id": budget.run["organization_id"]},
+            json={"model": OPENROUTER_FREE_ROUTER, "access_mode": "platform", "messages": canonical,
+                  "max_tokens": output_limit, "tools": [item["function"] for item in tools or []],
+                  "metadata": {"product": "uiux", "stage": "editing", "run_id": budget.run["run_id"]}},
+            timeout=240)
+        if response.status_code >= 400:
+            raise RuntimeError(f"Inference gateway could not complete this step (HTTP {response.status_code}); saved drafts remain available")
+        data = response.json()
+        usage = data.get("usage") or {}
+        reported = {"prompt_tokens": usage.get("inputTokens"), "completion_tokens": usage.get("outputTokens")}
+        budget.reconcile(reserved, reported)
+        budget.run["usage"]["input_tokens"] += reported["prompt_tokens"] or 0
+        budget.run["usage"]["output_tokens"] += reported["completion_tokens"] or 0
+        persist(budget.run)
+        return {"content": data.get("output", ""), "reasoning_details": data.get("reasoningDetails"),
+                "tool_calls": [{"id": call.get("id") or uuid.uuid4().hex, "type": "function",
+                                "function": {"name": call["name"], "arguments": call["arguments"]}}
+                               for call in data.get("toolCalls", [])]}
     global LAST_CALL
     key = os.getenv("OPENROUTER_API_KEY", "")
     if not key:
@@ -345,6 +411,7 @@ async def completion(client, budget, messages, tools=None, output_limit=3000):
         if not eligible:
             raise RuntimeError("Free model capacity is cooling down; retry later")
         model = eligible[0]
+        compact_tool_history(messages)
         reserved = budget.reserve(messages, output_limit, tools)
         payload = {"model": model, "messages": messages, "max_tokens": output_limit,
                    "temperature": 0.15, "provider": {"allow_fallbacks": True,
@@ -355,8 +422,13 @@ async def completion(client, budget, messages, tools=None, output_limit=3000):
         async with MODEL_LOCK:
             await asyncio.sleep(max(0, 3.2 - (time.monotonic() - LAST_CALL)))
             LAST_CALL = time.monotonic()
+        try:
             response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload,
                                          headers={"Authorization": f"Bearer {key}"})
+        except (httpx.TimeoutException, httpx.TransportError):
+            event(budget.run, "waiting", "Model connection interrupted; retrying the current step")
+            await asyncio.sleep(min(8, 2 ** attempt))
+            continue
         if response.status_code in {429, 502, 503, 504}:
             delay = retry_delay(response.headers, attempt)
             COOLDOWNS[model] = time.monotonic() + delay
@@ -384,9 +456,11 @@ async def completion(client, budget, messages, tools=None, output_limit=3000):
             raise RuntimeError("Provider reported unexpected cost; run stopped")
         persist(budget.run)
         message = data["choices"][0]["message"]
-        # Preserve reasoning details for openrouter/free structured-output consistency.
-        if message.get("reasoning_details"):
-            messages[-1]["reasoning_details"] = message["reasoning_details"]
+        # Reasoning belongs to this assistant response. The caller appends it
+        # alongside tool calls; never mutate the preceding user/tool message.
+        if not str(message.get("content") or "").strip() and not message.get("tool_calls"):
+            event(budget.run, "waiting", "Model returned no output; retrying this step")
+            continue
         return message
     raise RuntimeError("Free model capacity unavailable after bounded retries")
 
@@ -424,6 +498,15 @@ async def execute_graph(run, request):
     files = {f.path: f.content for f in request.files}
     original = dict(files)
     writable = set(request.scope or files)
+    for draft in run.get("draft_changes", []):
+        path = safe_path(draft["path"])
+        if request.scope and path not in request.scope:
+            continue
+        if path in original and original[path] != draft["before"]:
+            raise RuntimeError("Source changed since the saved draft; rescan before continuing")
+        guarded_edit(path, draft["before"], draft["after"])
+        original[path], files[path] = draft["before"], draft["after"]
+        writable.add(path)
     inspected: set[str] = set()
     workspace = record_path(run["run_id"]).parent / "workspace"
     workspace.mkdir(mode=0o700, exist_ok=True)
@@ -441,17 +524,18 @@ async def execute_graph(run, request):
         event(run, "planning", "Planning presentation edits against the selected source snapshot")
         plan_messages = [{"role": "system", "content": system + " Plan the UI changes in under 250 words; no code yet."},
                          {"role": "user", "content": json.dumps({"prompt": request.prompt, "seed_files": list(files),
-                                                                   "scope": request.scope or "all presentation files", "repository_access": request.repository_access})}]
+                                                                   "scope": request.scope or "all presentation files", "repository_access": request.repository_access,
+                                                                   "validation_feedback": run.get("review_feedback", [])})}]
         plan = await completion(client, budget, plan_messages, output_limit=700)
         messages = [{"role": "system", "content": system}, plan_messages[1],
                     {"role": "assistant", "content": (plan.get("content") or "Inspect relevant files, then edit presentation.")[:4000]}]
         finished = False
-        for step in range(12):
+        for step in range(MAX_STEPS):
             # Reserve provider attempts for independent review. Reaching the
             # exploration ceiling is a handoff, not a reason to discard edits.
             if budget.run["usage"]["requests"] >= MAX_CALLS - 3:
                 break
-            if step >= 9:
+            if step >= MAX_STEPS - 4:
                 messages.append({"role": "user", "content": "Editing time is nearly complete. Finish the current presentation changes now using finish; do not restart discovery or reread unchanged files."})
             response = await completion(client, budget, messages, TOOLS + ([LIST_TOOL] if request.repository_access else []))
             calls = response.get("tool_calls") or []
@@ -517,6 +601,9 @@ async def execute_graph(run, request):
                         target.parent.mkdir(parents=True, exist_ok=True)
                         target.write_text(after, encoding="utf-8")
                         files[path] = after
+                        run["draft_changes"] = [{"path": p, "before": original[p], "after": text}
+                                          for p, text in files.items() if text != original[p]]
+                        run["validation_status"] = "pending"
                         result = "Presentation edit recorded. Final AST verification remains mandatory."
                         event(run, "editing", f"Edited {path}")
                     elif name == "finish":
@@ -565,11 +652,12 @@ async def execute_graph(run, request):
             except json.JSONDecodeError:
                 # Free-model degradation: treat as advisory review with warnings
                 # so the user gets visible output rather than a hard crash.
-                review = {
-                    "approved": True,
-                    "conflicts": [f"Reviewer returned non-JSON output (free model degradation): {content[:200]}"],
-                    "warnings": ["Review response could not be parsed; rely on Connector AST verification before publishing."],
-                }
+                review = {"approved": False, "conflicts": ["Reviewer returned an invalid response; review remains incomplete"], "warnings": []}
+        if (not isinstance(review, dict) or type(review.get("approved")) is not bool
+                or any(not isinstance(review.get(key), list)
+                       or not all(isinstance(item, str) for item in review[key])
+                       for key in ("conflicts", "warnings"))):
+            raise RuntimeError("Independent reviewer returned an invalid contract; saved edits need review")
         conflicts = [str(v)[:500] for v in review.get("conflicts", [])][:20]
         run["warnings"].extend([str(v)[:500] for v in review.get("warnings", [])][:20])
         process_only = conflicts and all(
@@ -590,6 +678,7 @@ async def execute_graph(run, request):
                 if approved and len(conflicts) == len(run.get("conflicts", conflicts)) and process_only:
                     pass  # approved stays true, conflicts already cleared above
                 else:
+                    run["review_feedback"] = conflicts or ["Reviewer did not approve the proposal"]
                     raise RuntimeError("Independent review rejected the proposed changes: " + "; ".join(conflicts[:3]))
         run["changes"] = changes
         run["status"] = "completed"
@@ -598,7 +687,15 @@ async def execute_graph(run, request):
 
 async def run_job(run, request):
     try:
-        await asyncio.wait_for(execute_graph(run, request), timeout=MAX_SECONDS)
+        async with asyncio.timeout(MAX_SECONDS):
+            for attempt in range(3):
+                try:
+                    await execute_graph(run, request)
+                    break
+                except RuntimeError as error:
+                    if attempt >= 2 or not str(error).startswith("Independent review rejected") or not run.get("draft_changes"):
+                        raise
+                    event(run, "repairing", "Returning review feedback and saved edits to the editor for correction")
     except asyncio.CancelledError:
         run["status"] = "cancelled"
         run["changes"] = []
@@ -606,6 +703,8 @@ async def run_job(run, request):
     except Exception as error:
         run["status"] = "failed"
         run["changes"] = []
+        if run.get("draft_changes"):
+            run["validation_status"] = "pending"
         # Only our controlled messages are exposed; transport/parser errors can contain source/key data.
         run["error"] = str(error)[:500] if type(error) is RuntimeError else "UI editor could not complete safely; retry or narrow the selected scope"
         event(run, "failed", run["error"])
@@ -652,8 +751,9 @@ async def limit_request(request: Request, call_next):
 
 @app.get("/uiux/health")
 async def health():
-    return {"status": "ready" if os.getenv("OPENROUTER_API_KEY") else "configuration_required",
-            "configured": bool(os.getenv("OPENROUTER_API_KEY")), "runtime": "bounded-uiux-graph",
+    configured = bool(os.getenv("UIUX_CONNECTOR_URL") and os.getenv("DEPLAI_SERVICE_KEY"))
+    return {"status": "ready" if configured else "configuration_required",
+            "configured": configured, "runtime": "bounded-uiux-graph",
             "free_models_only": True, "openrouter_model": preferred_free_model(),
             "max_calls": MAX_CALLS, "max_seconds": MAX_SECONDS, "max_tokens": MAX_TOKENS}
 
@@ -667,8 +767,8 @@ async def create_run(request: RunInput):
         if existing.get("request_fingerprint") != fingerprint:
             raise HTTPException(409, "Request ID was already used for different inputs")
         return existing
-    if not os.getenv("OPENROUTER_API_KEY"):
-        raise HTTPException(503, "Platform OpenRouter API key is not configured")
+    if not os.getenv("UIUX_CONNECTOR_URL"):
+        raise HTTPException(503, "Connector inference gateway is not configured; restore UIUX_CONNECTOR_URL")
     if len(ACTIVE) >= 2:
         raise HTTPException(429, "UI editor capacity is busy; retry shortly", headers={"Retry-After": "30"})
     for active_id in ACTIVE:

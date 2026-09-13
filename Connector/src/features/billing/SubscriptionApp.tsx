@@ -17,6 +17,8 @@ type Plan = {
   annualCreditAmount: number;
   providerBudgetPaise: number;
   isCustom: boolean;
+  isAvailable: boolean;
+  availabilityMessage: string | null;
   isRecommended: boolean;
   features: string[];
 };
@@ -51,7 +53,6 @@ export default function SubscriptionApp({ section = 'Billing', embedded = false 
   const router = useRouter();
   const [yearly, setYearly] = useState(false);
   const [plans, setPlans] = useState<Plan[]>([]);
-  const [salesEmail, setSalesEmail] = useState('founders@deplai.tech');
   const [currentPlanId, setCurrentPlanId] = useState('free');
   const [razorpayConfigured, setRazorpayConfigured] = useState(false);
   const [payments, setPayments] = useState<PaymentsInfo | null>(null);
@@ -68,14 +69,12 @@ export default function SubscriptionApp({ section = 'Billing', embedded = false 
       if (!response.ok || cancelled) return;
       const payload = await response.json() as {
         plans?: Plan[];
-        salesEmail?: string;
         razorpayConfigured?: boolean;
         payments?: PaymentsInfo;
         referral?: ReferralInfo;
       };
       if (cancelled) return;
       setPlans(Array.isArray(payload.plans) ? payload.plans : []);
-      if (payload.salesEmail) setSalesEmail(payload.salesEmail);
       setRazorpayConfigured(Boolean(payload.razorpayConfigured));
       if (payload.payments) setPayments(payload.payments);
       if (payload.referral) setReferral(payload.referral);
@@ -84,7 +83,7 @@ export default function SubscriptionApp({ section = 'Billing', embedded = false 
   }, []);
 
   const checkout = async (plan: Plan) => {
-    if (plan.isCustom) return void (window.location.href = `mailto:${salesEmail}`);
+    if (!plan.isAvailable) return setNotice(plan.availabilityMessage || 'This plan is coming soon.');
     if (plan.id === 'free') return setNotice('Free organizations receive 0 managed credits. Connect BYOK or choose a paid plan.');
     setBusyPlanId(plan.id);
     setCheckoutPhase(null);
@@ -167,29 +166,36 @@ export default function SubscriptionApp({ section = 'Billing', embedded = false 
                 const totalPaise = yearly && plan.yearlyPricePaise > 0 ? plan.yearlyPricePaise : plan.pricePaise;
                 const current = currentPlanId === plan.id;
                 const credits = yearly ? plan.annualCreditAmount : plan.paidCreditAmount;
+                const unavailable = !plan.isAvailable;
                 return (
                   <div key={plan.id} className={`app-paper relative p-6 ${plan.isRecommended ? 'xl:-my-2 xl:py-8' : ''}`}>
                     {plan.isRecommended ? <span className="absolute -top-3 left-6 border-2 border-black bg-black px-2 py-1 font-mono text-[10px] font-bold uppercase tracking-widest text-white">Recommended</span> : null}
                     <h3 className="font-display text-2xl text-black">{plan.displayName}</h3>
                     <p className="mt-2 min-h-10 text-[13px] text-neutral-600">{plan.description}</p>
                     <div className="my-6 border-b-[3px] border-black pb-6">
-                      <p className="font-display text-4xl text-black">{plan.isCustom ? 'Custom' : `₹${formatInr(totalPaise)}`}</p>
-                      {!plan.isCustom ? <p className="mt-2 text-[12px] font-semibold text-neutral-600">GST-inclusive · {yearly ? 'billed yearly' : 'billed monthly'}</p> : null}
+                      <p className="font-display text-4xl text-black">{unavailable ? 'Coming soon' : plan.isCustom ? 'Custom' : `\u20B9${formatInr(totalPaise)}`}</p>
+                      {!unavailable && !plan.isCustom ? <p className="mt-2 text-[12px] font-semibold text-neutral-600">GST-inclusive &middot; {yearly ? 'billed yearly' : 'billed monthly'}</p> : null}
                     </div>
                     <ul className="mb-6 space-y-3 text-[13px] text-neutral-700">
-                      <li className="flex items-start gap-2"><Check className="mt-0.5 h-4 w-4 shrink-0" />{credits} managed credits {yearly ? 'per year, released monthly' : 'per month'}</li>
-                      <li className="flex items-start gap-2"><Check className="mt-0.5 h-4 w-4 shrink-0" />Credits never expire</li>
+                      {unavailable ? (
+                        <li className="flex items-start gap-2"><Check className="mt-0.5 h-4 w-4 shrink-0" />{plan.availabilityMessage || 'This plan is coming soon.'}</li>
+                      ) : (
+                        <>
+                          <li className="flex items-start gap-2"><Check className="mt-0.5 h-4 w-4 shrink-0" />{credits} managed credits {yearly ? 'per year, released monthly' : 'per month'}</li>
+                          <li className="flex items-start gap-2"><Check className="mt-0.5 h-4 w-4 shrink-0" />Credits never expire</li>
+                        </>
+                      )}
                       {plan.features.filter((feature) => !isPerCreditRateFeature(feature)).map((feature) => (
                         <li key={feature} className="flex items-start gap-2"><Check className="mt-0.5 h-4 w-4 shrink-0" />{feature}</li>
                       ))}
                     </ul>
                     <button
                       type="button"
-                      disabled={Boolean(busyPlanId) || current || (!plan.isCustom && plan.id !== 'free' && !razorpayConfigured)}
+                      disabled={unavailable || Boolean(busyPlanId) || current || (!plan.isCustom && plan.id !== 'free' && !razorpayConfigured)}
                       onClick={() => void checkout(plan)}
                       className={`${plan.isRecommended ? 'app-btn-ink' : 'app-btn-paper'} w-full disabled:opacity-50`}
                     >
-                      {busyPlanId === plan.id ? (checkoutPhase === 'verifying' ? 'Verifying…' : 'Preparing…') : current ? 'Current plan' : plan.isCustom ? 'Contact sales' : plan.id === 'free' ? 'Included' : payments?.testAmountOverride ? 'Pay ₹1' : 'Choose plan'}
+                      {unavailable ? 'Coming soon' : busyPlanId === plan.id ? (checkoutPhase === 'verifying' ? 'Verifying\u2026' : 'Preparing\u2026') : current ? 'Current plan' : plan.id === 'free' ? 'Included' : payments?.testAmountOverride ? 'Pay \u20B91' : 'Choose plan'}
                     </button>
                   </div>
                 );

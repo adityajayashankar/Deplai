@@ -191,7 +191,7 @@ def remediate_text(
     credential_id: str | None = None,
     max_tokens: int | None = None,
     response_format: dict[str, Any] | None = None,
-    timeout_seconds: int = 120,
+    timeout_seconds: int = 660,
     temperature: float = 0.15,
 ) -> tuple[bool, str]:
     """Call the platform OpenRouter gateway for security remediation.
@@ -208,7 +208,7 @@ def remediate_text(
     return chat_text(
         user_id=resolved_user,
         organization_id=organization_id,
-        model=resolve_cheap_model(model, access_mode="platform"),
+        model=model if model == "z-ai/glm-5.3-flash" else resolve_cheap_model(model, access_mode="platform"),
         prompt=prompt,
         access_mode="platform",
         # Deliberately omit api_key and credential_id: this is platform-only.
@@ -233,15 +233,65 @@ def chat_text(**kwargs: Any) -> tuple[bool, str]:
     if not gateway_enabled():
         return (False, "AI platform gateway is not configured.")
     try:
-        result = DeplaiAI().chat(**kwargs)
+        reservation = 0
+        token_store = None
+        token_run_id = ""
         if (kwargs.get("metadata") or {}).get("product") == "security":
             from remediation_pipeline.remediation_store import current_remediation_run_id, remediation_runs
+            token_run_id = current_remediation_run_id()
+            if token_run_id and callable(getattr(remediation_runs, "reserve_tokens", None)):
+                serialized = json.dumps(kwargs.get("messages") or [{"role": "user", "content": kwargs.get("prompt", "")}], ensure_ascii=False)
+                ascii_count = sum(ord(char) < 128 for char in serialized)
+                reservation = (ascii_count + 2) // 3 + len(serialized.encode()) - ascii_count + 64 + int(kwargs.get("max_tokens") or 8192)
+                token_store = remediation_runs
+                token_store.reserve_tokens(token_run_id, reservation)
+        result = DeplaiAI().chat(**kwargs)
+        if token_store is not None:
+            usage = result.get("usage") or {}
+            actual = usage.get("totalTokens") or usage.get("total_tokens")
+            if not actual:
+                actual = (usage.get("inputTokens", 0) or 0) + (usage.get("outputTokens", 0) or 0)
+            try:
+                token_store.reconcile_tokens(token_run_id, reservation, actual)
+            except Exception:
+                # The original reservation remains charged. A completed model
+                # response must not be discarded because reconciliation failed.
+                token_store.append_event(token_run_id, project_id="", message_type="warning",
+                    content="Token budget reconciliation unavailable; retaining the request estimate.", stage="remediation")
+        if (kwargs.get("metadata") or {}).get("product") == "security":
+            from remediation_pipeline.remediation_store import current_remediation_run_id, remediation_runs
+            run_id = current_remediation_run_id()
             for attempt in result.get("skipped", []) or []:
-                remediation_runs.append_event(current_remediation_run_id(), project_id="", message_type="model_attempt",
+                remediation_runs.append_event(run_id, project_id="", message_type="model_attempt",
                     content=json.dumps(attempt), stage="remediation")
-            remediation_runs.append_event(current_remediation_run_id(), project_id="", message_type="model_result",
+            remediation_runs.append_event(run_id, project_id="", message_type="model_result",
                 content=json.dumps({"model": result.get("model"), "provider": result.get("provider"),
                     "usage": result.get("usage"), "cost": result.get("cost"), "fallback": result.get("fallback")}), stage="remediation")
+            record_usage = getattr(remediation_runs, "record_usage", None)
+            usage_error = "" if callable(record_usage) else "the remediation journal is from a different release"
+            if callable(record_usage):
+                try:
+                    record_usage(run_id, result.get("usage"))
+                except Exception as exc:  # Usage telemetry must not cancel a completed model response.
+                    usage_error = f"usage journaling failed ({type(exc).__name__})"
+            if usage_error:
+                # A split rollout must not turn a completed model response into
+                # a failed remediation. The warning remains truthful and tells
+                # operators to replace the stale journal with the same release.
+                try:
+                    remediation_runs.append_event(
+                        run_id,
+                        project_id="",
+                        message_type="warning",
+                        content=(
+                            "Model response succeeded, but token usage was not recorded because " + usage_error + ". "
+                            "Remediation will continue; "
+                            "deploy the matching Agentic Layer image before relying on usage billing."
+                        ),
+                        stage="remediation",
+                    )
+                except Exception:
+                    pass
         text = str(result.get("output") or "").strip()
         if not text:
             return (False, "AI gateway returned an empty response.")

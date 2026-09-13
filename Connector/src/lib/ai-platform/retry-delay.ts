@@ -17,3 +17,27 @@ export function parseRetryAfter(value: string | null, now = Date.now()): number 
   const result = Number.isFinite(seconds) ? seconds : (Date.parse(value) - now) / 1000;
   return Number.isFinite(result) && result > 0 ? Math.ceil(result) : undefined;
 }
+
+export function providerRetryHint(headers: Headers, now = Date.now()) {
+  const retry = parseRetryAfter(headers.get('retry-after'), now);
+  const rawReset = headers.get('x-ratelimit-reset');
+  const numeric = rawReset ? Number(rawReset) : NaN;
+  const resetMs = Number.isFinite(numeric)
+    ? (numeric >= 1e12 ? numeric : numeric * 1000)
+    : Date.parse(rawReset || '');
+  const reset = Number.isFinite(resetMs) && resetMs > now ? Math.ceil((resetMs - now) / 1000) : undefined;
+  return {
+    retryAfterSeconds: retry || reset ? Math.max(retry || 0, reset || 0) : undefined,
+    cooldownSource: retry || reset ? 'provider_hint' : 'local_backoff',
+    rateLimitSource: 'provider',
+  };
+}
+
+export function securityCooldown(error: AiPlatformError) {
+  // Reservation failures must never refresh the cooldown that produced them.
+  if (error.detail?.rateLimitSource === 'local' || !['RATE_LIMIT', 'QUOTA_EXCEEDED'].includes(error.code)) return null;
+  const hint = Number(error.detail?.retryAfterSeconds);
+  const validHint = Number.isFinite(hint) && hint > 0;
+  return { seconds: validHint ? Math.ceil(hint) : 15,
+    source: validHint ? 'provider_hint' : 'local_backoff' };
+}

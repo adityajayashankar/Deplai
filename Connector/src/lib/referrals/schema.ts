@@ -1,11 +1,14 @@
 import { query } from '@/lib/db';
+import { REFERRAL_CODE_MAX_LENGTH } from './codes';
+
+export const REFERRAL_ATTRIBUTION_CODE_MAX_LENGTH = REFERRAL_CODE_MAX_LENGTH;
 
 const TABLES = [
   `CREATE TABLE IF NOT EXISTS referral_attributions (
     id VARCHAR(36) PRIMARY KEY,
     referred_user_id VARCHAR(36) NOT NULL,
     referrer_user_id VARCHAR(36) NOT NULL,
-    referral_code VARCHAR(16) NOT NULL,
+    referral_code VARCHAR(${REFERRAL_ATTRIBUTION_CODE_MAX_LENGTH}) NOT NULL,
     status ENUM('pending','converted','expired','ineligible') NOT NULL DEFAULT 'pending',
     attributed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     expires_at TIMESTAMP NOT NULL,
@@ -52,11 +55,29 @@ async function ensureCheckoutDiscountColumns(): Promise<void> {
   );
 }
 
+async function ensureReferralCodeColumn(): Promise<void> {
+  const rows = await query<Array<{ max_length: number | string | null }>>(
+    `SELECT CHARACTER_MAXIMUM_LENGTH AS max_length
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'referral_attributions'
+       AND COLUMN_NAME = 'referral_code'
+     LIMIT 1`,
+  );
+  const currentLength = Number(rows[0]?.max_length || 0);
+  if (currentLength >= REFERRAL_ATTRIBUTION_CODE_MAX_LENGTH) return;
+  await query(
+    `ALTER TABLE referral_attributions
+       MODIFY COLUMN referral_code VARCHAR(${REFERRAL_ATTRIBUTION_CODE_MAX_LENGTH}) NOT NULL`,
+  );
+}
+
 export async function ensureReferralSchema(): Promise<void> {
   if (ensured) return;
   for (const sql of TABLES) {
     await query(sql);
   }
+  await ensureReferralCodeColumn();
   await ensureCheckoutDiscountColumns();
   ensured = true;
 }

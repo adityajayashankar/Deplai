@@ -1,5 +1,6 @@
 """Start scans independently of browser connections; retain bounded progress replay."""
 import asyncio
+import inspect
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -65,7 +66,7 @@ class ScanJobs:
         return {"run_id": run["_id"], "status": run["status"], "user_id": run["user_id"],
             "events": await asyncio.to_thread(self.store.events, run["_id"])}
 
-    def start(self, project_id, user_id, factory, on_complete):
+    def start(self, project_id, user_id, factory, on_complete, on_settled=None):
         existing = self.jobs.get(project_id)
         if existing and existing.status == "running":
             if existing.user_id != str(user_id):
@@ -96,7 +97,12 @@ class ScanJobs:
                     lease_task.result()
                 success = await runner_task
                 on_complete()
-                job.status = "completed" if success and not job.persistence_failed else "error"
+                final_success = bool(success and not job.persistence_failed)
+                job.status = "completed" if final_success else "error"
+                if on_settled:
+                    settled = on_settled(final_success, runner, job)
+                    if inspect.isawaitable(settled):
+                        await settled
             except asyncio.CancelledError:
                 job.status = "error"
                 raise

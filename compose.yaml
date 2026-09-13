@@ -7,6 +7,20 @@ name: deplai-local
 # GitHub OAuth/App and LLM functionality remains inactive
 # until real credentials are supplied as environment variables.
 services:
+  security-mongo:
+    image: mongo:7.0
+    restart: unless-stopped
+    # Local scan/remediation history stays private on the Compose network.
+    # No host port is published; production retains its configured MongoDB.
+    volumes:
+      - security_mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "quit(db.adminCommand({ping:1}).ok ? 0 : 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
   mysql:
     image: mysql:8.4
     restart: unless-stopped
@@ -169,8 +183,9 @@ services:
       REMEDIATION_OPENROUTER_IMPLEMENTOR_MAX_TOKENS: ${REMEDIATION_OPENROUTER_IMPLEMENTOR_MAX_TOKENS:-1800}
       REMEDIATION_LOCAL_REVIEW_MIN_SCORE: ${REMEDIATION_LOCAL_REVIEW_MIN_SCORE:-80}
       OPENROUTER_APP_NAME: ${OPENROUTER_APP_NAME:-deplai-agentic}
-      # Optional Atlas journal. The service remains usable without MongoDB.
-      MONGODB_URI: ${MONGODB_URI:-}
+      # Local history is durable without depending on Atlas network access.
+      # Set LOCAL_SECURITY_MONGODB_URI explicitly to use a remote database.
+      MONGODB_URI: ${LOCAL_SECURITY_MONGODB_URI:-mongodb://security-mongo:27017}
       REMEDIATION_MONGODB_DATABASE: ${REMEDIATION_MONGODB_DATABASE:-deplai_security}
       REMEDIATION_MONGODB_RETENTION_DAYS: ${REMEDIATION_MONGODB_RETENTION_DAYS:-30}
       # Checkpoints persist curated source context. Keep both false until the
@@ -209,6 +224,9 @@ services:
       - grype_db_cache:/var/lib/deplai/grype-db:ro
     tmpfs:
       - /tmp:size=2g,mode=1777
+    depends_on:
+      security-mongo:
+        condition: service_healthy
   customization:
     build:
       context: .
@@ -234,6 +252,7 @@ services:
       - "./Customization Agent/tenant_builder_app/backend:/app/tenant_builder_app/backend"
 
 volumes:
+  security_mongo_data:
   mysql_data:
   github_repos:
   local_projects:

@@ -42,3 +42,18 @@ export function openRouterFreeRemediationModel(template: CanonicalModel): Canoni
     updatedAt: new Date().toISOString(),
   };
 }
+
+export const PAID_REMEDIATION_MODEL = 'z-ai/glm-5.3-flash';
+export function configuredRemediationModel(): string {
+  return process.env.SECURITY_REMEDIATION_MODEL === PAID_REMEDIATION_MODEL
+    ? PAID_REMEDIATION_MODEL : DEFAULT_REMEDIATION_PLATFORM_MODEL;
+}
+export function paidRemediationModel(template: CanonicalModel): CanonicalModel {
+  const base = openRouterFreeRemediationModel(template);
+  return { ...base, id: `openrouter:${PAID_REMEDIATION_MODEL}`, providerModelId: PAID_REMEDIATION_MODEL,
+    displayName: 'GLM 5.3 Flash', family: 'glm', aliases: [PAID_REMEDIATION_MODEL],
+    contextWindow: 200_000, maxOutputTokens: 4096,
+    pricing: { inputPerMillionUsd: 0.15, outputPerMillionUsd: 0.50, currency: 'USD', source: 'provider_declared' },
+    metadata: { ...base.metadata, openrouter_slug: PAID_REMEDIATION_MODEL, security_free_router: false, security_paid_remediation: true },
+  };
+}

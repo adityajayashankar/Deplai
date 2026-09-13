@@ -6,11 +6,14 @@ export type PlanTier = 'free' | 'starter' | 'pro' | 'enterprise';
 
 export type PlanFeature =
   | 'managed_llm'
+  | 'security_automation'
+  | 'terraform_planning'
   | 'deploy'
   | 'dast'
   | 'cloud'
   | 'instances'
   | 'customization'
+  | 'cost_estimates'
   | 'multi_project';
 
 const TIER_RANK: Record<PlanTier, number> = {
@@ -22,11 +25,14 @@ const TIER_RANK: Record<PlanTier, number> = {
 
 const FEATURE_MIN_TIER: Record<PlanFeature, PlanTier> = {
   managed_llm: 'starter',
+  security_automation: 'starter',
+  terraform_planning: 'starter',
   deploy: 'starter',
   dast: 'starter',
   cloud: 'starter',
   instances: 'starter',
   customization: 'pro',
+  cost_estimates: 'pro',
   multi_project: 'starter',
 };
 
@@ -71,11 +77,14 @@ export function buildPlanFeatureMap(
 ): Record<PlanFeature, boolean> {
   return {
     managed_llm: planIncludesFeature(planId, 'managed_llm', billingEnforced),
+    security_automation: planIncludesFeature(planId, 'security_automation', billingEnforced),
+    terraform_planning: planIncludesFeature(planId, 'terraform_planning', billingEnforced),
     deploy: planIncludesFeature(planId, 'deploy', billingEnforced),
     dast: planIncludesFeature(planId, 'dast', billingEnforced),
     cloud: planIncludesFeature(planId, 'cloud', billingEnforced),
     instances: planIncludesFeature(planId, 'instances', billingEnforced),
     customization: planIncludesFeature(planId, 'customization', billingEnforced),
+    cost_estimates: planIncludesFeature(planId, 'cost_estimates', billingEnforced),
     multi_project: planIncludesFeature(planId, 'multi_project', billingEnforced),
   };
 }

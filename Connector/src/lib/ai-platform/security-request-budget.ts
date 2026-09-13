@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { query, withNamedLock } from '@/lib/db';
 import { AiPlatformError } from './errors';
+import { securityCooldown } from './retry-delay';
 import type { CanonicalModel, NormalizedChatRequest } from './types';
-import { estimateOpenRouterInputTokens, openRouterRequestTokenCap } from './openrouter-request-budget';
+import { estimateOpenRouterInputTokens, estimateRouterContextTokens, openRouterRequestTokenCap } from './openrouter-request-budget';
 
 let ready: Promise<void> | undefined;
 function schema() {
@@ -10,7 +11,7 @@ function schema() {
     id VARCHAR(191) PRIMARY KEY, state_json JSON NOT NULL
   )`).then(() => undefined).catch((error) => { ready = undefined; throw error; });
 }
-type State = { attempts: number[]; cooldown: number };
+type State = { attempts: number[]; cooldown: number; cooldownSource?: string };
 function scope(_secret: string) {
   // A configured account id allows multiple credentials for one account to share quota.
   // Conservatively share the default bucket instead of assuming different keys have independent quotas.
@@ -29,10 +30,15 @@ async function edit(id: string, change: (state: State) => void) {
 export function fitSecurityRequest(request: NormalizedChatRequest, model: CanonicalModel) {
   // Security JSON schemas are enforced locally, so omit their optional native
   // encoding from the exact OpenRouter free-model request budget.
-  const input = estimateOpenRouterInputTokens(request.messages, request.tools, undefined);
+  const input = (model.metadata?.security_free_router || model.metadata?.security_paid_remediation)
+    ? estimateRouterContextTokens(request.messages, request.tools)
+    : estimateOpenRouterInputTokens(request.messages, request.tools, undefined);
   const safetyMargin = 256;
   const contextOutputCap = model.contextWindow - input - safetyMargin;
-  const quotaOutputCap = openRouterRequestTokenCap() - input;
+  // The free router has a context window, not the historical 8K per-request
+  // cap imposed on individual low-quota models. Account RPM is reserved below.
+  const quotaOutputCap = (model.metadata?.security_free_router || model.metadata?.security_paid_remediation)
+    ? contextOutputCap : openRouterRequestTokenCap() - input;
   const maxTokens = Math.min(request.maxTokens || 4096, model.maxOutputTokens, contextOutputCap, quotaOutputCap);
   if (maxTokens < 256) {
     throw new AiPlatformError('CONTEXT_LIMIT', 'Remediation context packet must be split before dispatch', { retryable: false,
@@ -44,24 +50,28 @@ export async function reserveSecurityRequest(secret: string, model: string) {
   const account = scope(secret), now = Date.now();
   await edit(`${account}:${model}`, (state) => {
     if (state.cooldown > now) throw new AiPlatformError('RATE_LIMIT', 'Selected model is cooling down',
-      { detail: { retryAfterSeconds: Math.ceil((state.cooldown - now) / 1000), quotaScope: 'model' } });
+      { detail: { rateLimitSource: 'local', cooldownSource: state.cooldownSource || 'legacy_unknown', retryAfterSeconds: Math.ceil((state.cooldown - now) / 1000), quotaScope: 'model' } });
   });
   await edit(account, (state) => {
     state.attempts = state.attempts.filter((at) => at > now - 60_000);
     const rpm = Math.max(1, Math.min(20, Number(process.env.SECURITY_OPENROUTER_RPM || 8)));
     if (state.cooldown > now || state.attempts.length >= rpm) {
-      throw new AiPlatformError('RATE_LIMIT', 'Remediation paused for shared OpenRouter capacity', {
-        detail: { quotaScope: 'account', retryAfterSeconds: Math.max(1, Math.ceil((Math.max(state.cooldown, (state.attempts[0] || now) + 60_000) - now) / 1000)) },
+      throw new AiPlatformError('RATE_LIMIT', 'Remediation paused by the local gateway request limiter', {
+        detail: { rateLimitSource: 'local', cooldownSource: state.cooldown > now ? state.cooldownSource || 'legacy_unknown' : 'local_rpm', quotaScope: 'account', retryAfterSeconds: Math.max(1, Math.ceil(((state.cooldown > now ? state.cooldown : (state.attempts[0] || now) + 60_000) - now) / 1000)) },
       });
     }
     state.attempts.push(now);
   });
 }
 export async function coolSecurityRequest(secret: string, model: string, error: AiPlatformError) {
-  if (!['RATE_LIMIT', 'QUOTA_EXCEEDED'].includes(error.code)) return;
+  const policy = securityCooldown(error);
+  if (!policy) return;
   const accountWide = error.code === 'QUOTA_EXCEEDED' || error.detail?.quotaScope === 'account';
-  const seconds = Math.max(1, Number(error.detail?.retryAfterSeconds || (accountWide ? 3600 : 60)));
   await edit(accountWide ? scope(secret) : `${scope(secret)}:${model}`, (state) => {
-    state.cooldown = Math.max(state.cooldown, Date.now() + seconds * 1000);
+    const until = Date.now() + policy.seconds * 1000;
+    if (until > state.cooldown) {
+      state.cooldown = until;
+      state.cooldownSource = policy.source;
+    }
   });
 }

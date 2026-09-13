@@ -30,13 +30,13 @@ function envFlag(name: string): string {
 }
 
 /**
- * Plan and credit gates stay in the code for a later Razorpay launch.
- * Until BILLING_ENFORCEMENT / NEXT_PUBLIC_BILLING_ENFORCEMENT is true,
- * every signed-in user gets the full platform catalog.
+ * Subscription access is active in production. Local and staged rollouts can
+ * explicitly opt in or out through BILLING_ENFORCEMENT.
  */
 export function isBillingEnforced(): boolean {
   const raw = envFlag('NEXT_PUBLIC_BILLING_ENFORCEMENT') || envFlag('BILLING_ENFORCEMENT');
-  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+  if (raw) return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+  return process.env.NODE_ENV === 'production';
 }
 
 export function normalizePlanId(planId: string | null | undefined): string {

@@ -1,8 +1,8 @@
-// v3 prices are approximately 75% below the previous v2 catalog, rounded to
-// simple customer-facing amounts. Keep the per-credit
+// v4 prices keep the current customer-facing INR catalog aligned across
+// checkout, plan cards, and credit packs. Keep the per-credit
 // provider value stable so existing, never-expiring credits retain their
 // promised purchasing power; new grants are reduced proportionally instead.
-export const CREDIT_CATALOG_VERSION = 'v3-inr-rounded-2026-09';
+export const CREDIT_CATALOG_VERSION = 'v4-inr-499-999-399-2026-09';
 export const CREDIT_UNITS_PER_CREDIT = 1_000_000;
 export const CREDIT_VALUE_PAISE = 1_300;
 export const DEFAULT_METERING_FX_INR_PER_USD = 95;
@@ -61,8 +61,8 @@ export const CREDIT_PLANS: readonly CreditCatalogPlan[] = [
     name: 'starter_20',
     displayName: 'Starter',
     description: 'Go from repo connect to approved AWS deploy without stitching scanners, agents, and Terraform yourself',
-    monthlyPricePaise: 59_900,
-    annualPricePaise: 649_900,
+    monthlyPricePaise: 49_900,
+    annualPricePaise: 539_900,
     monthlyCredits: 25,
     annualCredits: 300,
     providerBudgetPaiseMonthly: 32_500,
@@ -83,8 +83,8 @@ export const CREDIT_PLANS: readonly CreditCatalogPlan[] = [
     name: 'pro_50',
     displayName: 'Pro',
     description: 'For teams that need design iteration, fix velocity, and deploy confidence in one place',
-    monthlyPricePaise: 139_900,
-    annualPricePaise: 1_519_900,
+    monthlyPricePaise: 99_900,
+    annualPricePaise: 1_079_900,
     monthlyCredits: 62.5,
     annualCredits: 750,
     providerBudgetPaiseMonthly: 81_250,
@@ -106,7 +106,7 @@ export const CREDIT_PACKS: readonly CreditCatalogPack[] = [
   {
     id: 'topup_100_v2',
     name: '25 credit top-up',
-    pricePaise: 56_225,
+    pricePaise: 39_900,
     credits: 25,
     providerBudgetPaise: 32_500,
     paidTiersOnly: true,
@@ -178,7 +178,7 @@ export function assertStarterContributionSafe(env: Record<string, string | undef
     (taxablePaise - processorFeePaise - starter.providerBudgetPaiseMonthly)
       * (100 / starter.monthlyCredits),
   );
-  if (contributionPerHundredPaise < 45_000) {
+  if (contributionPerHundredPaise < 30_000) {
     throw Object.assign(new Error('New credit purchases are temporarily paused by pricing safety controls'), {
       statusCode: 503,
       safeToExpose: true,

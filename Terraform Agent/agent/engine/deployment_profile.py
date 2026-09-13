@@ -538,7 +538,10 @@ resource "aws_security_group" "app" {{
         rds_class = str(postgres.get("instance_class") or "db.t3.small")
         rds_version = str(postgres.get("engine_version") or _default_db_versions[rds_engine])
         rds_storage = int(postgres.get("storage_gb") or 20)
-        rds_backup = int(postgres.get("backup_retention_days") or 7)
+        rds_backup = int(postgres.get("backup_retention_period") or postgres.get("backup_retention_days") or 7)
+        if str(postgres.get("instance_size_tier") or "").strip().lower() == "free_tier":
+            rds_backup = min(rds_backup, 1)
+        rds_backup = max(0, min(rds_backup, 35))
         rds_multi_az = str(bool(postgres.get("multi_az"))).lower()
         rds_tf = f"""
 resource "aws_security_group" "db" {{

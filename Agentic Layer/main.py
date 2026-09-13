@@ -284,6 +284,7 @@ active_scans: dict[str, EnvironmentInitializer] = {}
 scan_contexts: dict[str, ScanValidationRequest] = {}
 scan_jobs = ScanJobs()
 active_remediations: dict[str, RemediationTrackRunner] = {}
+remediation_start_locks: dict[str, asyncio.Lock] = {}
 remediation_contexts: dict[str, RemediationRequest] = {}
 # Pipeline monitor subscribers per project (shared websocket bus for dashboard events)
 pipeline_subscribers: dict[str, set[WebSocket]] = {}
@@ -305,7 +306,7 @@ def _normalize_remediation_request(request: RemediationRequest) -> RemediationRe
         update={
             "llm_provider": "openrouter",
             "llm_api_key": None,
-            "llm_model": "openrouter/free",
+            "llm_model": request.llm_model if request.llm_model == "z-ai/glm-5.3-flash" else "openrouter/free",
             "llm_access_mode": "platform",
             "llm_credential_id": None,
             "remediation_scope": "major",
@@ -417,6 +418,51 @@ async def _handle_websocket(
 
     async def run_workflow(runner: RunnerBase):
         remediation_run_id = str(getattr(runner, "remediation_run_id", "") or "")
+        usage_settled = False
+
+        async def settle_remediation_usage(outcome: str) -> None:
+            nonlocal usage_settled
+            if getattr(getattr(runner, "context", None), "resume_publication", False):
+                return  # Publication recovery does not charge remediation again.
+            if usage_settled or not remediation_run_id:
+                return
+            from product_usage import settle_product_usage
+
+            context = getattr(runner, "context", None)
+            try:
+                result = await asyncio.to_thread(
+                    settle_product_usage,
+                    kind="remediation",
+                    outcome=outcome,
+                    organization_id=getattr(context, "organization_id", None),
+                    user_id=getattr(context, "user_id", None),
+                    project_id=getattr(runner, "original_project_id", None) or getattr(context, "project_id", None),
+                    run_id=remediation_run_id,
+                    usage=remediation_runs.usage_for_run(remediation_run_id),
+                )
+            except Exception as exc:
+                result = {"ok": False, "error": f"Billing settlement unavailable: {type(exc).__name__}."}
+            usage_settled = True
+            if result.get("ok"):
+                credits = float(result.get("credits") or 0)
+                remediation_runs.append_event(
+                    remediation_run_id,
+                    project_id=str(getattr(runner, "original_project_id", "") or ""),
+                    message_type="usage",
+                    content=f"Usage settled: {credits:.2f} credit(s).",
+                    stage="remediation",
+                )
+                return
+            remediation_runs.append_event(
+                remediation_run_id,
+                project_id=str(getattr(runner, "original_project_id", "") or ""),
+                message_type="warning",
+                content=(
+                    "Remediation completed" if outcome == "succeeded" else "Remediation failed"
+                ) + ", but credit settlement is pending: " + str(result.get("error") or "billing unavailable."),
+                stage="remediation",
+            )
+
         try:
             success = await runner.run()
             if success:
@@ -425,20 +471,26 @@ async def _handle_websocket(
                 if on_complete:
                     on_complete()
                 remediation_runs.mark_status(remediation_run_id, "completed")
+                await settle_remediation_usage("succeeded")
                 # The runner may have been rebound to a reconnecting browser.
                 # A notification failure must not overwrite completed work.
                 await runner._send_status(StreamStatus.completed)
             else:
                 remediation_runs.mark_status(remediation_run_id, "failed")
+                await settle_remediation_usage("failed")
                 # Pipeline returned False — error status was already sent by _terminate(),
                 # but send it again as a safety net in case the pipeline exited a different way.
                 await runner._send_status(StreamStatus.error)
+        except asyncio.CancelledError:
+            remediation_runs.mark_status(remediation_run_id, "cancelled")
+            raise
         except WebSocketDisconnect:
             # The browser may leave after the server-side workflow succeeded.
             # Runner messaging is deliberately best-effort; keep its last state.
             pass
         except Exception as e:
             remediation_runs.mark_status(remediation_run_id, "failed")
+            await settle_remediation_usage("failed")
             try:
                 await websocket.send_json({
                     "type": "status",
@@ -528,7 +580,13 @@ async def _handle_websocket(
                         "error": "No active workflow found for this project.",
                     })
                     continue
-                await runner.handle_command(command)
+                if command.action == "cancel":
+                    if not _context_matches_token(getattr(runner, "context", None)):
+                        await _send_unauthorized()
+                        return
+                    runner.cancel()
+                else:
+                    await runner.handle_command(command)
 
     except WebSocketDisconnect:
         pass
@@ -568,11 +626,53 @@ async def validate_scan(request: ScanValidationRequest):
 @app.post("/api/scan/start", response_model=ScanValidationResponse, dependencies=[Depends(verify_api_key)])
 async def start_scan(request: ScanValidationRequest):
     _bind_ai_gateway_context(request)
+
+    async def settle_scan_usage(success: bool, runner: Any, job: Any) -> None:
+        from dast_scan import is_dast_only_run
+        from product_usage import settle_product_usage
+
+        try:
+            result = await asyncio.to_thread(
+                settle_product_usage,
+                kind="security_scan",
+                outcome="succeeded" if success else "failed",
+                organization_id=request.organization_id,
+                user_id=request.user_id,
+                project_id=request.project_id,
+                run_id=job.run_id,
+                dast_only=is_dast_only_run(request.enabled_modules, request.dast_target_url),
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": f"Billing settlement unavailable: {type(exc).__name__}."}
+        if result.get("ok"):
+            credits = float(result.get("credits") or 0)
+            if credits > 0:
+                await job.send_json({
+                    "type": "message",
+                    "data": {
+                        "type": "usage",
+                        "content": f"Usage settled: {credits:.2f} credit(s) for this successful scan.",
+                    },
+                })
+            return
+        if not success:
+            # Failed scans carry no product charge, so a billing outage is not
+            # relevant to the scan outcome and must not be presented as one.
+            return
+        await job.send_json({
+            "type": "message",
+            "data": {
+                "type": "warning",
+                "content": "Scan completed, but its credit settlement is pending: " + str(result.get("error") or "billing unavailable."),
+            },
+        })
+
     try:
         job = scan_jobs.start(
             request.project_id, request.user_id,
             lambda progress: EnvironmentInitializer(progress, request),
             lambda: invalidate_cache(request.project_id),
+            settle_scan_usage,
         )
     except PermissionError:
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -702,9 +802,43 @@ async def cleanup():
 @app.post("/api/remediate/validate", response_model=RemediationResponse, dependencies=[Depends(verify_api_key)])
 async def validate_remediation(request: RemediationRequest):
     """Validate a remediation request and store context."""
+    lock = remediation_start_locks.setdefault(request.project_id, asyncio.Lock())
+    async with lock:
+        return await _prepare_remediation_start(request)
+
+
+async def _prepare_remediation_start(request: RemediationRequest):
     request = _normalize_remediation_request(request)
+    saved_run_id = None
+    if request.resume_publication:
+        snapshot = remediation_runs.latest_for_project(request.project_id)
+        run = (snapshot or {}).get("run", {})
+        if (not run or str(run.get("user_id")) != str(request.user_id)
+                or str(run.get("organization_id")) != str(request.organization_id)):
+            raise HTTPException(status_code=404, detail="No saved remediation is available for this scope")
+        if run.get("status") == "completed":
+            raise HTTPException(status_code=409, detail="This run is already completed; view its saved result")
+        saved_run_id = run["run_id"]
+    # A new HTTP start is distinct from a WebSocket reconnect. Retire the old
+    # worker before replacing its project context, or reconnect would attach
+    # the new run's browser to the old run's pending review.
+    previous = active_remediations.get(request.project_id)
+    if previous is not None:
+        previous_context = previous.context
+        if (str(previous_context.user_id) != str(request.user_id)
+                or str(previous_context.organization_id) != str(request.organization_id)):
+            raise HTTPException(status_code=403, detail="Active remediation belongs to a different scope")
+        previous.cancel()
+        if previous._task is not None:
+            try:
+                await previous._task
+            except asyncio.CancelledError:
+                pass
+        remediation_runs.mark_status(previous.remediation_run_id, "cancelled")
+        if active_remediations.get(request.project_id) is previous:
+            active_remediations.pop(request.project_id, None)
     _bind_ai_gateway_context(request)
-    run_id = remediation_runs.begin_run(
+    run_id = saved_run_id or remediation_runs.begin_run(
         project_id=request.project_id,
         user_id=request.user_id,
         organization_id=request.organization_id,
@@ -730,6 +864,14 @@ async def remediation_run_status(project_id: str):
     if status is None:
         raise HTTPException(status_code=404, detail="No remediation run was found for this project.")
     return status
+
+
+@app.get("/api/remediate/archive/{run_id}", dependencies=[Depends(verify_api_key)])
+def remediation_archive(run_id: str, project_id: str, user_id: str, organization_id: str):
+    archive = remediation_runs.archive_for_run(run_id, project_id=project_id, user_id=user_id, organization_id=organization_id)
+    if archive is None:
+        raise HTTPException(status_code=404, detail="Remediation archive not found")
+    return archive
 
 
 @app.websocket("/ws/remediate/{project_id}")
@@ -899,8 +1041,7 @@ async def architecture_review_start(request: ArchitectureReviewStartRequest):
     _bind_ai_gateway_context(request)
     loop = asyncio.get_running_loop()
     try:
-        review = await loop.run_in_executor(
-            None,
+        review = await asyncio.to_thread(
             lambda: start_architecture_review(
                 project_id=request.project_id,
                 project_name=request.project_name,
@@ -909,6 +1050,9 @@ async def architecture_review_start(request: ArchitectureReviewStartRequest):
                 user_id=request.user_id,
                 repo_full_name=request.repo_full_name,
                 environment=request.environment,
+                use_glm=True,
+                answers=request.answers,
+                conversation=request.conversation,
             ),
         )
     except Exception as exc:
@@ -922,8 +1066,7 @@ async def architecture_review_complete(request: ArchitectureReviewCompleteReques
     _bind_ai_gateway_context(request)
     loop = asyncio.get_running_loop()
     try:
-        answers_json, deployment_profile, architecture_view, approval_payload, runtime_paths = await loop.run_in_executor(
-            None,
+        answers_json, deployment_profile, architecture_view, approval_payload, runtime_paths = await asyncio.to_thread(
             lambda: complete_architecture_review(
                 project_id=request.project_id,
                 project_name=request.project_name,
@@ -933,6 +1076,8 @@ async def architecture_review_complete(request: ArchitectureReviewCompleteReques
                 user_id=request.user_id,
                 repo_full_name=request.repo_full_name,
                 aws_context=request.aws_context,
+                use_glm=True,
+                conversation=request.conversation,
             ),
         )
     except Exception as exc:
@@ -1249,14 +1394,21 @@ def _record_terraform_apply_result(
     apply_key: str,
     request: TerraformApplyRequest,
     result: dict[str, Any] | None,
+    apply_ctx: dict[str, Any] | None = None,
 ) -> None:
     if result is None:
         return
+    details = result.get("details")
+    if not isinstance(details, dict):
+        details = {}
+    apply_logs = apply_ctx.get("apply_logs") if isinstance(apply_ctx, dict) else None
+    if isinstance(apply_logs, list):
+        # Keep the authoritative bounded scanner/Terraform output available
+        # after the active worker record has been removed.
+        details["apply_logs"] = [str(line) for line in apply_logs[-400:] if str(line).strip()]
     if request.deployment_metadata:
-        details = result.get("details")
-        if not isinstance(details, dict):
-            details = {}
         details["deployment_metadata"] = dict(request.deployment_metadata)
+    if details:
         result["details"] = details
     result_status = str(result.get("status") or "").strip()
     terraform_apply_results[apply_key] = {
@@ -1354,7 +1506,7 @@ async def _execute_runtime_terraform_apply(request: TerraformApplyRequest, apply
         result = {"success": False, "error": f"Terraform apply runtime error: {exc}"}
     finally:
         active_terraform_applies.pop(apply_key, None)
-        _record_terraform_apply_result(apply_key, request, result)
+        _record_terraform_apply_result(apply_key, request, result, apply_ctx)
         if result and result.get("status") == "awaiting_plan_confirmation":
             emit_apply_event("info", "Terraform plan is awaiting confirmation before apply.")
         elif result and result.get("success"):

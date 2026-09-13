@@ -438,14 +438,14 @@ INSERT IGNORE INTO billing_plans (
 ),
 (
   'starter_20', 'starter_20', 'Starter', 'Go from repo connect to approved AWS deploy without stitching scanners, agents, and Terraform yourself',
-  599, 6499, 'monthly', 0, 0, 0, 0, 0,
+  499, 5399, 'monthly', 0, 0, 0, 0, 0,
   'Managed-LLM credits never expire. Annual credits are released monthly.',
   '["Security Agent: SAST, dependency scans, and AI remediation","Terraform generation with plan review before every apply","DeplAI-managed LLMs — no vendor API keys required","Unlimited projects and deployment pipelines","Organization workspace to share with collaborators","Email support when something blocks your release"]',
   20
 ),
 (
   'pro_50', 'pro_50', 'Pro', 'For teams that need design iteration, fix velocity, and deploy confidence in one place',
-  1399, 15199, 'monthly', 0, 0, 0, 0, 1,
+  999, 10799, 'monthly', 0, 0, 0, 0, 1,
   'Managed-LLM credits never expire. Annual credits are released monthly.',
   '["Everything in Starter","UI/UX customizer for safe, frontend-only design changes","Guided vulnerability fixes with human review gates","Traffic-aware AWS cost estimates before infrastructure applies","Priority support for production incidents","Organization roles, teams, and shared billing context"]',
   30
@@ -459,7 +459,7 @@ INSERT IGNORE INTO billing_plans (
 );
 
 INSERT IGNORE INTO credit_packs (id, name, credit_amount, price_cents, paid_tiers_only) VALUES
-  ('topup_100_v2', '25 credit top-up', 25, 562, 1);
+  ('topup_100_v2', '25 credit top-up', 25, 399, 1);
 
 CREATE TABLE IF NOT EXISTS billing_profiles (
   user_id VARCHAR(36) PRIMARY KEY,

@@ -93,6 +93,7 @@ export type CanonicalErrorCode =
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 
 export interface ChatMessage {
+  reasoningDetails?: unknown[];
   role: ChatRole;
   content: string;
   name?: string;
@@ -309,7 +310,8 @@ export interface NormalizedChatResponse {
   provider: ProviderId;
   credentialSource: CredentialSource;
   output: string;
-  toolCalls: Array<{ name: string; arguments: string }>;
+  toolCalls: Array<{ id?: string; name: string; arguments: string }>;
+  reasoningDetails?: unknown[];
   finishReason: string | null;
   usage: UsageBreakdown;
   cost: CostBreakdown;
@@ -356,7 +358,8 @@ export interface JsonSchemaResponseFormat {
 
 export interface AdapterChatResponse {
   text: string;
-  toolCalls: Array<{ name: string; arguments: string }>;
+  toolCalls: Array<{ id?: string; name: string; arguments: string }>;
+  reasoningDetails?: unknown[];
   finishReason: string | null;
   usage: UsageBreakdown;
   providerRequestId: string | null;

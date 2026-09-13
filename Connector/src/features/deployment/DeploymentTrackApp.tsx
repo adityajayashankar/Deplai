@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation';
 import { ArrowLeft, ArrowRight, CheckCircle2, ChevronRight, CircleDashed, ExternalLink, RefreshCw, Rocket, Server } from 'lucide-react';
 import { ApplyLogViewer } from '@/components/pipeline/ApplyLogViewer';
+import { DeploymentConversation } from './DeploymentConversation';
 import {
   ProcessStatusTrack,
   TERRAFORM_APPLY_STATUS_LABEL,
@@ -53,6 +54,7 @@ import {
   deriveAnalysisMetrics,
   deriveDetectedServices,
 } from '@/features/deployment/DeploymentPipelineChrome';
+import type { DeploymentProviderId } from '@/lib/deployment-providers';
 import { InfraOutputsStage } from '@/features/deployment/deployment-outputs';
 import { DecisionTopologyDiagram } from '@/features/deployment/DecisionTopologyDiagram';
 import {
@@ -149,6 +151,7 @@ import {
   extractApplyLogLines,
   isRecoverableApplyTransportError,
   isTransportFalseFailureMessage,
+  mergeApplyLogLines,
   mergeAcceptedApplyResult,
 } from '@/features/deployment/apply-status';
 import { TERRAFORM_APPLY_POLL_TIMEOUT_MS } from '@/lib/terraform-apply-wait';
@@ -383,7 +386,7 @@ const DEFAULT_RDS_RESOURCE_CONFIG: RdsResourceConfig = {
   instance_class: 'db.t4g.micro',
   allocated_storage: 20,
   multi_az: false,
-  backup_retention_period: 7,
+  backup_retention_period: 1,
   instance_size_tier: 'free_tier',
   db_identifier: 'database-1',
   master_username: 'admin',
@@ -442,6 +445,9 @@ function normalizeRdsResourceConfig(value: unknown): RdsResourceConfig {
   const credentialsMode = record.credentials_mode === 'secrets_manager' ? 'secrets_manager' : 'self_managed';
   const sizeTiers = ['production', 'dev_test', 'free_tier'] as const;
   const requestedTier = String(record.instance_size_tier || '').trim();
+  const instanceSizeTier = sizeTiers.includes(requestedTier as (typeof sizeTiers)[number])
+    ? requestedTier as RdsResourceConfig['instance_size_tier']
+    : DEFAULT_RDS_RESOURCE_CONFIG.instance_size_tier;
   return {
     engine,
     engine_version: String(record.engine_version || meta.defaultVersion).trim() || meta.defaultVersion,
@@ -450,9 +456,14 @@ function normalizeRdsResourceConfig(value: unknown): RdsResourceConfig {
       ? meta.defaultStorage
       : clampInteger(record.allocated_storage ?? record.storage_gb, meta.defaultStorage, meta.minStorage, 4096),
     multi_az: meta.supportsAurora ? false : normalizeBool(record.multi_az, DEFAULT_RDS_RESOURCE_CONFIG.multi_az),
-    backup_retention_period: clampInteger(record.backup_retention_period ?? record.backup_retention_days, DEFAULT_RDS_RESOURCE_CONFIG.backup_retention_period, 0, 35),
+    backup_retention_period: clampInteger(
+      record.backup_retention_period ?? record.backup_retention_days,
+      DEFAULT_RDS_RESOURCE_CONFIG.backup_retention_period,
+      0,
+      instanceSizeTier === 'free_tier' ? 1 : 35,
+    ),
     aurora_mode: meta.supportsAurora ? (isAuroraServerless ? 'serverless' : 'provisioned') : undefined,
-    instance_size_tier: sizeTiers.includes(requestedTier as (typeof sizeTiers)[number]) ? requestedTier as RdsResourceConfig['instance_size_tier'] : DEFAULT_RDS_RESOURCE_CONFIG.instance_size_tier,
+    instance_size_tier: instanceSizeTier,
     db_identifier: String(record.db_identifier || DEFAULT_RDS_RESOURCE_CONFIG.db_identifier || 'database-1').trim(),
     master_username: String(record.master_username || DEFAULT_RDS_RESOURCE_CONFIG.master_username || 'admin').trim(),
     credentials_mode: credentialsMode,
@@ -735,7 +746,11 @@ function applyDeploymentSelectionToDecision(
       instance_class: configs.rds.instance_class,
       allocated_storage: configs.rds.allocated_storage,
       multi_az: configs.rds.multi_az,
+      // AWS Free Tier accounts accept at most one day of RDS backup retention.
+      // Preserve both field names while older Agentic profile contracts are in use.
       backup_retention_period: configs.rds.backup_retention_period,
+      backup_retention_days: configs.rds.backup_retention_period,
+      instance_size_tier: configs.rds.instance_size_tier,
     };
   }
   if (planId !== 's3_cloudfront' && services.redis) {
@@ -1665,6 +1680,7 @@ export default function DeploymentTrackApp() {
   const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [activeStage, setActiveStage] = useState<PipelineStageId>('analysis');
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [selectedDeploymentProvider, setSelectedDeploymentProvider] = useState<DeploymentProviderId>('aws');
   const [repoContext, setRepoContext] = useState<RepositoryContextJson | null>(() => readStoredJson<RepositoryContextJson>('deplai.pipeline.repoContext'));
   const [repoContextMd, setRepoContextMd] = useState<string>(() => readStoredJson<string>(REPO_CONTEXT_MD_KEY) || '');
   const [review, setReview] = useState<ArchitectureReviewPayload | null>(() => readStoredJson<ArchitectureReviewPayload>(REVIEW_PAYLOAD_KEY));
@@ -1957,6 +1973,10 @@ export default function DeploymentTrackApp() {
       // Session log persistence is best-effort.
     }
   }, [patchState]);
+  const mergeDeployApplyLogs = useCallback((incoming: string[]) => {
+    if (incoming.length === 0) return;
+    setDeployApplyLogs((previous) => mergeApplyLogLines(previous, incoming));
+  }, []);
   const updateIacFileContent = useCallback((filePath: string, nextContent: string) => {
     setIacFiles((prev) => {
       const nextFiles = prev.map((file) => (
@@ -2074,6 +2094,21 @@ export default function DeploymentTrackApp() {
     }
     return '';
   }, [deployResult?.error, deployResult?.success, deployStatus, deployUiPhase]);
+  const orphanCollision = useMemo(() => {
+    const raw = deployResult?.details?.orphan_collision;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const details = raw as Record<string, unknown>;
+    const unverified = Array.isArray(details.unverified)
+      ? details.unverified
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+        .map((item) => ({
+          kind: String(item.kind || 'AWS resource').replaceAll('_', ' '),
+          id: String(item.import_id || 'unknown'),
+        }))
+        .filter((item) => item.id !== 'unknown')
+      : [];
+    return unverified.length > 0 ? unverified : null;
+  }, [deployResult?.details]);
   const hasEndpointTargets = useMemo(
     () => [
       deploySummary.cloudfrontUrl,
@@ -2168,7 +2203,7 @@ export default function DeploymentTrackApp() {
   const shouldUseSavedRunForDeploy = Boolean(activeSavedRun?.run_id && snapshotIacMatches);
   const deployStartBlockers = useMemo(() => {
     const blockers: string[] = [];
-    const confirmingPlan = requiresPlanConfirmation || deployUiPhase === 'awaiting_plan';
+    const confirmingPlan = isAwaitingPlanConfirmation({ requiresPlanConfirmation, uiPhase: deployUiPhase, result: deployResult });
     const deployAlreadyFailed = isFailedDeployAttempt({
       status: deployStatus,
       uiPhase: deployUiPhase,
@@ -2346,7 +2381,22 @@ export default function DeploymentTrackApp() {
     setDeployProcessPhase(status);
     setDeployProcessMessage(message ?? null);
     setDeployProgress((prev) => Math.max(prev, progressForProcessPhase(status, TERRAFORM_APPLY_STEPS)));
-  }, []);
+    if (normalizeProcessPhase(status) === 'awaiting_plan_confirmation') {
+      setDeployUiPhase('awaiting_plan');
+      setRequiresPlanConfirmation(true);
+      patchState((prev) => ({
+        ...prev,
+        status: 'idle',
+        deployResult: {
+          ...((prev.deployResult || {}) as DeployApiResult),
+          success: true,
+          status: 'awaiting_plan_confirmation',
+          requires_plan_confirmation: true,
+          apply_accepted: false,
+        },
+      }));
+    }
+  }, [patchState]);
   const canVerifyLiveEndpoints = Boolean(
     selectedProject &&
     deployStatus !== 'running' &&
@@ -2686,10 +2736,7 @@ export default function DeploymentTrackApp() {
       if (deployUiPhase !== 'error') setDeployUiPhase('error');
       return;
     }
-    const applyInFlight = deployUiPhase === 'starting'
-      || deployUiPhase === 'waiting_api'
-      || deployUiPhase === 'reconciling';
-    if (!applyInFlight && isAwaitingPlanConfirmation({
+    if (isAwaitingPlanConfirmation({
       uiPhase: deployUiPhase,
       requiresPlanConfirmation,
       result: deployResult,
@@ -3056,26 +3103,28 @@ export default function DeploymentTrackApp() {
     }
   }, [expectedWorkspace, infraConsultant, persistInfraConsultant]);
 
-  const loadReview = useCallback(async () => {
+  const loadReview = useCallback(async (answered?: Record<string, string>, conversation?: InfraConsultantMessage[]) => {
     if (!selectedProject) return;
     const workspace = repoContext?.workspace || buildDeploymentWorkspace(selectedProject.id, selectedProject.name);
     if (reviewRequestRef.current === workspace) return;
     reviewRequestRef.current = workspace;
+    setError(null);
     setReviewLoading(true);
     setError(null);
     try {
       const response = await fetch('/api/architecture/review/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_id: selectedProject.id, workspace }),
+        body: JSON.stringify({ project_id: selectedProject.id, workspace, answers: answered || answers, conversation: conversation || review?.conversation || [] }),
       });
       const data = await response.json().catch(() => ({})) as { success?: boolean; review?: ArchitectureReviewPayload; error?: string };
       if (!response.ok || !data.success || !data.review) {
         throw new Error(data.error || 'Failed to start architecture review.');
       }
       setReview(data.review);
-      const initialAnswers = Object.keys(answers).length > 0 ? answers : {};
+      const initialAnswers = data.review.answers || answered || answers;
       setAnswers(initialAnswers);
+      setQuestionCursor(nextScriptedQuestionIndex(data.review.questions, initialAnswers));
       writeStoredJson(REVIEW_PAYLOAD_KEY, data.review);
       writeStoredJson(REVIEW_ANSWERS_KEY, initialAnswers);
     } finally {
@@ -3084,11 +3133,11 @@ export default function DeploymentTrackApp() {
         reviewRequestRef.current = null;
       }
     }
-  }, [answers, repoContext?.workspace, selectedProject]);
+  }, [answers, repoContext?.workspace, selectedProject, review?.conversation]);
 
   useEffect(() => {
     if (activeStage !== 'qa' || !selectedProject) return;
-    if (review && repoContextMatchesWorkspace(review.context_json, selectedProject.id, expectedWorkspace) && review.questions.length > 0) return;
+    if (review && repoContextMatchesWorkspace(review.context_json, selectedProject.id, expectedWorkspace) && review.conversation?.length) return;
     if (!repoContextMatchesWorkspace(repoContext, selectedProject.id, expectedWorkspace)) {
       setAndPersistStage('analysis');
       return;
@@ -3117,18 +3166,20 @@ export default function DeploymentTrackApp() {
     const response = await fetch('/api/architecture/review/complete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project_id: selectedProject.id, workspace: review.context_json.workspace || buildDeploymentWorkspace(selectedProject.id, selectedProject.name), answers: mergedAnswers, aws_context: awsDiscovery }),
+      body: JSON.stringify({ project_id: selectedProject.id, workspace: review.context_json.workspace || buildDeploymentWorkspace(selectedProject.id, selectedProject.name), answers: userAnswers, aws_context: awsDiscovery, conversation: review.conversation }),
     });
     const data = await response.json().catch(() => ({})) as {
       success?: boolean;
       deployment_profile?: Record<string, unknown>;
       architecture_view?: Record<string, unknown>;
       approval_payload?: Record<string, unknown>;
+      answers_json?: { answers?: Record<string, string> };
       error?: string;
     };
     if (!response.ok || !data.success || !data.deployment_profile || !data.architecture_view) {
       throw new Error(data.error || 'Failed to generate deployment profile.');
     }
+    Object.assign(mergedAnswers, data.answers_json?.answers || {});
     setDeploymentProfile(data.deployment_profile);
     setArchitectureView(data.architecture_view);
     setApprovalPayload(data.approval_payload || null);
@@ -3175,7 +3226,7 @@ export default function DeploymentTrackApp() {
         setStaticSiteResourceConfig(nextStatic);
         writeStoredJson(STATIC_SITE_RESOURCE_CONFIG_KEY, nextStatic);
       }
-      const history = buildScriptedHistory(review.questions || [], mergedAnswers, (review.questions || []).length);
+      const history = review.conversation || buildScriptedHistory(review.questions || [], mergedAnswers, (review.questions || []).length);
       const summary = summarizeInfraConsultantDecision(synthesized);
       persistInfraConsultant({
         workspace: expectedWorkspace,
@@ -3311,7 +3362,7 @@ export default function DeploymentTrackApp() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           project_id: selectedProject.id,
-          provider: 'aws',
+          provider: selectedDeploymentProvider,
           terraform_renderer: 'auto',
           consultant_action: action,
           consultant_history: history,
@@ -3438,6 +3489,7 @@ export default function DeploymentTrackApp() {
     persistInfraConsultant,
     qaSummary,
     repoContext,
+    selectedDeploymentProvider,
     selectedProject,
     terraformRuntimeConfig.aws_region,
   ]);
@@ -3551,7 +3603,7 @@ export default function DeploymentTrackApp() {
         credentials: 'same-origin',
         body: JSON.stringify({
           project_id: selectedProject.id,
-          provider: 'aws',
+          provider: selectedDeploymentProvider,
           iac_mode: 'deterministic',
           terraform_renderer: 'deplai_deterministic',
           qa_summary: qaSummary,
@@ -3686,7 +3738,7 @@ export default function DeploymentTrackApp() {
     } finally {
       setTerraformGenerating(false);
     }
-  }, [appendLog, approvalPayload, approvedConsultantDecision, architectureView, consultantArchitectureSeed, customizationSnapshotId, customizationTenantId, decisionForVisualization, deploymentProfile, expectedWorkspace, infraUserAnswers, qaSummary, repoContext, selectedProject, terraformRuntimeConfig.aws_region, terraformRuntimeConfigWasStored]);
+  }, [appendLog, approvalPayload, approvedConsultantDecision, architectureView, consultantArchitectureSeed, customizationSnapshotId, customizationTenantId, decisionForVisualization, deploymentProfile, expectedWorkspace, infraUserAnswers, qaSummary, repoContext, selectedDeploymentProvider, selectedProject, terraformRuntimeConfig.aws_region, terraformRuntimeConfigWasStored]);
 
   const createIacPr = useCallback(async () => {
     if (!selectedProject || iacPrCreating || terraformGenerating || deployableIacFiles.length === 0) return;
@@ -3962,13 +4014,22 @@ export default function DeploymentTrackApp() {
       if (!mergedPolledLogs.includes(line)) mergedPolledLogs.push(line);
     }
     if (mergedPolledLogs.length > 0) {
-      setDeployApplyLogs(mergedPolledLogs);
+      mergeDeployApplyLogs(mergedPolledLogs);
     }
     const runtimeAwaitingPlan = isAwaitingPlanConfirmation({
       result: runtimeResult,
     }) || runtimeStatus === 'awaiting_plan_confirmation';
 
     if (runtimeAwaitingPlan) {
+      setDeployUiPhase('awaiting_plan');
+      setRequiresPlanConfirmation(true);
+      setPendingPlanSummary(runtimeResult?.plan_summary || null);
+      deployRequestRef.current = null;
+      if (deployHeartbeatRef.current !== null) {
+        window.clearInterval(deployHeartbeatRef.current);
+        deployHeartbeatRef.current = null;
+      }
+      deployStartedAtRef.current = null;
       setDeployProcessPhase('awaiting_plan_confirmation');
       setDeployProcessMessage(runtimeMessage);
       const gatedResult: DeployApiResult = {
@@ -4059,7 +4120,7 @@ export default function DeploymentTrackApp() {
       const message = runtimeResult?.error || 'Deployment runtime returned an error.';
       const tailLines = extractApplyLogLines(runtimeResult);
       if (tailLines.length > 0) {
-        setDeployApplyLogs(tailLines);
+        mergeDeployApplyLogs(tailLines);
       }
       setDeployProcessPhase('failed');
       setDeployProcessMessage(message);
@@ -4092,7 +4153,7 @@ export default function DeploymentTrackApp() {
     }
     getOrCreateActiveDeployment(selectedProject.id).inFlight = false;
     appendLog('No active deployment process found. Marking stale UI run as stopped.', 'error');
-  }, [appendLog, deployResult?.mode, deployResult?.run_id, finalizeSuccessfulDeploy, hydrateTerminalDeployResult, patchState, pushDeploymentHistory, selectedProject]);
+  }, [appendLog, deployResult?.mode, deployResult?.run_id, finalizeSuccessfulDeploy, hydrateTerminalDeployResult, mergeDeployApplyLogs, patchState, pushDeploymentHistory, selectedProject]);
 
   const pollDeploymentReconciliation = useCallback(async (
     runIdOverride?: string,
@@ -4168,19 +4229,12 @@ export default function DeploymentTrackApp() {
       progress: Math.max(prev.progress, 80),
       deployResult: merged,
     }));
-    appendLog(
-      String(payload.error || 'Connection to the runtime dropped, but Terraform may still be applying. Reconciling…'),
-      'info',
-    );
     const latest = await pollDeploymentReconciliation(
       runIdOverride,
       String(payload.mode || 'runtime_apply'),
     );
-    if (latest.status !== 'done' && !isFailedDeployAttempt({ status: latest.status, result: latest.deployResult })) {
-      appendLog('Terraform may still be applying. Use Reconcile Backend Status or refresh this page.', 'info');
-    }
     finalizeDeployUiFromState(latest);
-  }, [appendLog, finalizeDeployUiFromState, patchState, pollDeploymentReconciliation]);
+  }, [finalizeDeployUiFromState, patchState, pollDeploymentReconciliation]);
 
   const startDeploy = useCallback(async () => {
     if (!selectedProject) {
@@ -4251,6 +4305,15 @@ export default function DeploymentTrackApp() {
     if (confirmingPlan) {
       setRequiresPlanConfirmation(false);
       setPendingPlanSummary(null);
+      patchState((prev) => ({
+        ...prev,
+        status: 'running',
+        deployResult: {
+          ...((prev.deployResult || {}) as DeployApiResult),
+          requires_plan_confirmation: false,
+          status: 'applying',
+        },
+      }));
     }
     setDeployUiPhase('starting');
     setDeployProcessPhase('starting');
@@ -4317,16 +4380,34 @@ export default function DeploymentTrackApp() {
       deployRequestRef.current = null;
       return;
     }
+    const stateBucket = terraformRuntimeConfig.state_bucket.trim();
+    const lockTable = terraformRuntimeConfig.lock_table.trim();
+    if (!stateBucket || !lockTable) {
+      clearHeartbeat();
+      const message = 'A Terraform state bucket and lock table are required so this deployment can be recovered safely.';
+      setDeployUiPhase('error');
+      setError(message);
+      patchState({
+        status: 'error',
+        progress: 100,
+        deployResult: { success: false, error: message },
+      });
+      appendLog(message, 'error');
+      finalizeWorkspaceSession(workspaceSessionIdRef.current, {
+        status: 'failed',
+        current_stage: 'apply',
+        message,
+      });
+      activeDeployment.inFlight = false;
+      deployRequestRef.current = null;
+      return;
+    }
     setDeployUiPhase('waiting_api');
-    appendLog(confirmingPlan ? 'Submitting confirmed apply request…' : 'Preparing runtime deploy payload…');
     try {
       patchState({ progress: confirmingPlan ? 70 : 20 });
-      if (confirmingPlan) {
-        appendLog('Plan confirmation acknowledged. Calling /api/pipeline/deploy with confirm_plan_summary=true…', 'info');
-      } else {
+      if (!confirmingPlan) {
         setPendingPlanSummary(null);
       }
-      appendLog('Calling /api/pipeline/deploy — Terraform apply can take 15–25 minutes when RDS Multi-AZ is included…');
       const retryRunId = String(deployResult?.run_id || activeSavedRun?.run_id || '').trim();
       const retryWorkspace = String(deployResult?.workspace || activeSavedRun?.workspace || '').trim();
       const canReuseSavedRun = shouldUseSavedRunForDeploy || Boolean(retryingFailedDeploy && retryRunId);
@@ -4341,7 +4422,7 @@ export default function DeploymentTrackApp() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           project_id: selectedProject.id,
-          provider: 'aws',
+          provider: selectedDeploymentProvider,
           runtime_apply: true,
           service_type: deploymentPlanToServiceType(deploymentPlan),
           repo_context: repoContext || {},
@@ -4359,8 +4440,8 @@ export default function DeploymentTrackApp() {
           },
           run_id: canReuseSavedRun ? (retryRunId || activeSavedRun?.run_id) : undefined,
           workspace: canReuseSavedRun ? (retryWorkspace || activeSavedRun?.workspace) : undefined,
-          state_bucket: terraformRuntimeConfig.state_bucket.trim() || undefined,
-          lock_table: terraformRuntimeConfig.lock_table.trim() || undefined,
+          state_bucket: stateBucket,
+          lock_table: lockTable,
           files: runtimeDeployFiles,
           aws_access_key_id: aws.aws_access_key_id,
           aws_secret_access_key: aws.aws_secret_access_key,
@@ -4405,7 +4486,7 @@ export default function DeploymentTrackApp() {
         pushDeploymentHistory(data || null, 'error');
         const tailLines = extractApplyLogLines(data);
         if (tailLines.length > 0) {
-          setDeployApplyLogs(tailLines);
+          mergeDeployApplyLogs(tailLines);
         }
         appendLog(message, 'error');
         finalizeWorkspaceSession(workspaceSessionIdRef.current, {
@@ -4472,10 +4553,8 @@ export default function DeploymentTrackApp() {
         progress: Math.max(prev.progress, 80),
         deployResult: data,
       }));
-      appendLog('Runtime apply request returned. Waiting for backend runtime to reach a terminal state…');
       try {
         if (data.mode === 'iac_pipeline' && data.run_id) {
-          appendLog('IaC pipeline started. Polling for completion…');
           const POLL_INTERVAL_MS = 3_000;
           const MAX_POLL_MS = 30 * 60 * 1_000; // 30 minutes
           const pollStart = Date.now();
@@ -4493,8 +4572,6 @@ export default function DeploymentTrackApp() {
           await pollDeploymentReconciliation(data.run_id, data.mode);
         } else if (data.run_id) {
           await reconcileDeploymentStatus(data.run_id, data.mode);
-        } else {
-          appendLog('Backend accepted the deploy request, but no run identifier was returned yet. Use Reconcile Backend Status if this state persists.', 'info');
         }
       } catch {
         patchState((prev) => ({
@@ -4503,7 +4580,6 @@ export default function DeploymentTrackApp() {
           progress: Math.max(prev.progress, 90),
           deployResult: data,
         }));
-        appendLog('Backend confirmation is still pending. Use Reconcile Backend Status if this state persists.', 'info');
       }
       clearHeartbeat();
       const latest = getOrCreateActiveDeployment(selectedProject.id).state;
@@ -4540,7 +4616,7 @@ export default function DeploymentTrackApp() {
         deployHeartbeatRef.current = null;
       }
     }
-  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, finalizeDeployUiFromState, finalizeSuccessfulDeploy, hasAwsSecrets, iacFiles, infraUserAnswers, patchState, pollDeploymentReconciliation, pushDeploymentHistory, reconcileDeploymentStatus, recoverDeployAfterTransportGap, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
+  }, [activeSavedRun, appendLog, approvedConsultantDecision, aws.aws_access_key_id, aws.aws_secret_access_key, aws.aws_session_token, budgetOverride, effectiveBudgetCap, effectiveCostTotal, customizationSnapshotId, customizationTenantId, deployProgress, deployResult, deployStartBlockers, deployStatus, deployUiPhase, deployableIacFiles, deploymentHistory, deploymentPlan, deploymentProfile, finalizeDeployUiFromState, finalizeSuccessfulDeploy, hasAwsSecrets, iacFiles, infraUserAnswers, mergeDeployApplyLogs, patchState, pollDeploymentReconciliation, pushDeploymentHistory, reconcileDeploymentStatus, recoverDeployAfterTransportGap, rdsResourceConfig, repoContext, requiresPlanConfirmation, savedIacMeta?.source_metadata, secretsManagerPrefix, selectedDeploymentComponents, selectedDeploymentProvider, selectedProject, shouldUseSavedRunForDeploy, terraformRuntimeConfig.aws_region, terraformRuntimeConfig.lock_table, terraformRuntimeConfig.state_bucket]);
 
   const stopDeployment = useCallback(async () => {
     if (!selectedProject || stopLoading || deployStatus !== 'running') return;
@@ -4854,7 +4930,7 @@ export default function DeploymentTrackApp() {
     });
   }, [generatePlan, review]);
   const answerScriptedQuestion = useCallback((questionId: string, value: string) => {
-    if (!review) return;
+    if (!review || reviewLoading) return;
     const nextAnswers = { ...answers, [questionId]: value };
     const currentIdx = (review.questions || []).findIndex((question) => question.id === questionId);
     const questionCount = (review.questions || []).length;
@@ -4866,8 +4942,14 @@ export default function DeploymentTrackApp() {
     setAnswers(nextAnswers);
     writeStoredJson(REVIEW_ANSWERS_KEY, nextAnswers);
     setQuestionCursor(nextCursor);
+    if (unanswered < questionCount) {
+      void loadReview(nextAnswers).catch((reason: unknown) => {
+        setError(reason instanceof Error ? reason.message : 'The next question could not be loaded. Retry questions below.');
+      });
+      return;
+    }
     maybeGeneratePlan(nextAnswers, nextCursor);
-  }, [answers, maybeGeneratePlan, review, viewingQuestionIndex]);
+  }, [answers, loadReview, maybeGeneratePlan, review, reviewLoading, viewingQuestionIndex]);
   const jumpToQuestion = useCallback((index: number) => {
     if (reviewQuestions.length === 0) return;
     setQuestionCursor(resolveScriptedQuestionCursor(reviewQuestions.length, unansweredQuestionIndex, index));
@@ -4889,14 +4971,16 @@ export default function DeploymentTrackApp() {
     maybeGeneratePlan(answers, nextCursor);
   }, [answers, currentQuestionAnswered, maybeGeneratePlan, unansweredQuestionIndex, reviewQuestions.length, viewingQuestionIndex]);
   useEffect(() => {
+    if (review?.conversation) return;
     const questionId = currentScriptedQuestion?.id || null;
     if (lastPrefillQuestionIdRef.current === questionId) return;
     lastPrefillQuestionIdRef.current = questionId;
     if (!questionId || (currentScriptedQuestion?.options || []).length > 0) return;
     setInfraConsultantInput(String(answers[questionId] || ''));
-  }, [answers, currentScriptedQuestion]);
+  }, [answers, currentScriptedQuestion, review?.conversation]);
   useEffect(() => {
     if (activeStage !== 'qa' || planningLocked || infraConsultantLoading || reviewLoading) return;
+    if (review?.conversation) return;
     if (!questionsComplete) return;
     if (viewingQuestionIndex < reviewQuestions.length) return;
     const key = JSON.stringify(answers);
@@ -4905,7 +4989,7 @@ export default function DeploymentTrackApp() {
     void generatePlan(answers).catch((reason: unknown) => {
       setError(reason instanceof Error ? reason.message : 'Failed to generate deployment profile.');
     });
-  }, [activeStage, answers, generatePlan, infraConsultantLoading, planningLocked, questionsComplete, reviewLoading, reviewQuestions.length, viewingQuestionIndex]);
+  }, [activeStage, answers, generatePlan, infraConsultantLoading, planningLocked, questionsComplete, reviewLoading, review, reviewQuestions.length, viewingQuestionIndex]);
   const retryGeneratePlan = useCallback(() => {
     planAttemptedKeyRef.current = null;
     setQuestionCursor(reviewQuestions.length);
@@ -4960,20 +5044,20 @@ export default function DeploymentTrackApp() {
     <StageShell stageKey="planning" hasActionBar width="wide">
       <StageHeader
         eyebrow="Stage 02 · Planning"
-        title="Planning"
+        title="Plan your deployment"
         description={
           reviewLoading
             ? 'Preparing deployment questions from repository analysis.'
             : planningLocked
               ? 'Review the proposed AWS setup, then continue to architecture. Change answers anytime to edit the questionnaire.'
-              : 'Answer one question at a time. Use Back or Change to edit a previous response without starting over.'
+              : 'Chat about your application, ask questions, and tell us what you need. Review the plan when you are ready.'
         }
         meta={
           <>
             <MetaChip label="repo" value={selectedProject?.name || '—'} />
             <MetaChip
-              label="question"
-              value={reviewQuestions.length ? `${Math.min(viewingQuestionIndex + 1, reviewQuestions.length)}/${reviewQuestions.length}` : '—'}
+              label="conversation"
+              value={review?.conversation_ready ? 'Ready to plan' : 'Understanding your needs'}
             />
             <MetaChip
               label="budget"
@@ -4990,16 +5074,54 @@ export default function DeploymentTrackApp() {
           </>
         }
       />
-      {reviewLoading ? (
+      {repoContext && (
+        <Panel>
+          <SectionLabel>Detected project stack</SectionLabel>
+          <p className="mt-2">
+            {[
+              String(toRecord(repoContext.language).primary || ''),
+              ...(Array.isArray(repoContext.frameworks) ? repoContext.frameworks.map((item) => String(toRecord(item).name || '')) : []),
+              ...(Array.isArray(repoContext.data_stores) ? repoContext.data_stores.map((item) => String(toRecord(item).type || '')) : []),
+            ].filter(Boolean).join(' · ') || 'Repository analysis is available; deployment requirements will clarify the remaining details.'}
+          </p>
+          <p className="mt-2 text-sm">GLM uses this analysis and your answers to ask what your application needs.</p>
+        </Panel>
+      )}
+      {error && review && !reviewLoading && (
+        <button className={primaryButtonClass(false)} onClick={() => void loadReview(answers).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'The next question could not be loaded.'))}>
+          Retry next question — keep answers
+        </button>
+      )}
+      {reviewLoading && !review ? (
         <div className="space-y-4">
           {Array.from({ length: 3 }).map((_, index) => (
             <Skeleton key={index} className="h-28 w-full" />
           ))}
         </div>
       ) : review ? (
+      <>
+      <DeploymentConversation
+        messages={review.conversation || []}
+        input={infraConsultantInput}
+        onInput={setInfraConsultantInput}
+        loading={reviewLoading || infraConsultantLoading}
+        ready={Boolean(review.conversation_ready)}
+        locked={planningLocked}
+        onPlan={() => void generatePlan(answers).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Plan generation failed.'))}
+        onSend={() => {
+          if (!infraConsultantInput.trim() || reviewLoading || infraConsultantLoading) return;
+          const conversation: InfraConsultantMessage[] = [...(review.conversation || []), { role: 'user', content: infraConsultantInput.trim() }];
+          const pending = { ...review, conversation, conversation_ready: false };
+          setReview(pending);
+          writeStoredJson(REVIEW_PAYLOAD_KEY, pending);
+          setInfraConsultantInput('');
+          void loadReview(answers, conversation).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Reply could not be loaded. Retry without losing your message.'));
+        }}
+      />
+      {planningLocked && (
       <PlanningAgentPanel
         projectName={selectedProject?.name || 'project'}
-        loading={infraConsultantLoading}
+        loading={infraConsultantLoading || reviewLoading}
           messages={scriptedHistory.length > 0 ? scriptedHistory : [{ role: 'assistant', content: currentScriptedQuestion?.question || `I've analyzed \`${selectedProject?.name || 'your project'}\`. Let's lock the deployment plan with a few questions.` }]}
         input={infraConsultantInput}
         onInputChange={setInfraConsultantInput}
@@ -5014,7 +5136,7 @@ export default function DeploymentTrackApp() {
           showDecision={planningLocked}
           onRefine={unlockPlanningAnswers}
         approved={Boolean(currentInfraConsultant?.confirmed)}
-        planSummary={consultantDecisionSummary}
+        planSummary={String(deploymentProfile?.service_plan || consultantDecisionSummary)}
         planNotes={planningNotes}
         region={String(currentInfraConsultant?.decision?.region || terraformRuntimeConfig.aws_region || '')}
         estimateUsd={advisorEstimate}
@@ -5051,14 +5173,19 @@ export default function DeploymentTrackApp() {
           architectureConflicts={Array.isArray(deploymentProfile?.architecture_conflicts) ? deploymentProfile.architecture_conflicts as Array<{ severity?: string; code?: string; message?: string; recommendation?: string | null }> : []}
           candidateArchitectures={Array.isArray(deploymentProfile?.candidate_architectures) ? deploymentProfile.candidate_architectures as Array<{ id?: string; label?: string; description?: string; estimated_monthly_usd?: number | null; reliability?: string }> : []}
         />
+      )}
+      </>
       ) : (
         <Panel padded={false}>
           <EmptyState
             icon={<CircleDashed className="h-5 w-5" />}
             title="Questionnaire unavailable"
-            description="The deployment questionnaire could not be loaded. Return to repository analysis and retry."
+            description="The next deployment question could not be loaded. Retry here; your repository analysis and answers are saved."
           />
-      </Panel>
+          <button className={primaryButtonClass(false)} onClick={() => void loadReview(answers).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Questions could not be loaded.'))}>
+            Retry questions — keep repository analysis
+          </button>
+        </Panel>
       )}
     </StageShell>
   );
@@ -5076,6 +5203,8 @@ export default function DeploymentTrackApp() {
             projects={projects}
             selectedProjectId={selectedProjectId}
             onSelectProject={handleSelectDeploymentProject}
+            selectedProvider={selectedDeploymentProvider}
+            onSelectProvider={setSelectedDeploymentProvider}
             onRestart={restartPipeline}
             restartDisabled={!selectedProjectId || analysisLoading}
           />
@@ -5618,13 +5747,14 @@ export default function DeploymentTrackApp() {
                     <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                       <label className="block">
                         <span className={fieldLabelClass()}>State bucket</span>
-                        <input name="state_bucket" value={terraformRuntimeConfig.state_bucket} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, state_bucket: event.target.value }))} placeholder="optional" className={fieldClass()} />
+                        <input name="state_bucket" value={terraformRuntimeConfig.state_bucket} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, state_bucket: event.target.value }))} placeholder="deplai-tfstate-project" className={fieldClass()} />
                       </label>
                       <label className="block">
                         <span className={fieldLabelClass()}>Lock table</span>
-                        <input name="lock_table" value={terraformRuntimeConfig.lock_table} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, lock_table: event.target.value }))} placeholder="optional" className={fieldClass()} />
+                        <input name="lock_table" value={terraformRuntimeConfig.lock_table} onChange={(event) => setTerraformRuntimeConfig((prev) => ({ ...prev, lock_table: event.target.value }))} placeholder="deplai-tflock-project" className={fieldClass()} />
                       </label>
                     </div>
+                    <p className="mt-2 text-xs text-muted-foreground">DeplAI uses this S3 state bucket and DynamoDB lock table to keep retries attached to the same infrastructure. Both are created when you confirm the first apply.</p>
                   </div>
                   {hasAwsSecrets && !canContinueToAwsConfig && (
                     <Callout tone="warn">
@@ -5784,7 +5914,7 @@ export default function DeploymentTrackApp() {
                   deployIsLive
                     ? 'Deployment in progress'
                     : deployStatus === 'done'
-                      ? 'Deployment complete'
+                      ? deployResult?.deployment_verified === true ? 'Deployment complete' : 'Infrastructure ready — application verification pending'
                       : deployFailed
                         ? 'Deployment failed'
                         : deployUiPhase === 'awaiting_plan' || requiresPlanConfirmation
@@ -5846,7 +5976,7 @@ export default function DeploymentTrackApp() {
                   {(error || backendErrorMessage)
                     ? (error || backendErrorMessage)
                     : deployIsLive
-                      ? 'Request accepted. Multi-AZ RDS often takes 15–25 minutes (up to 45). This page will update when the backend reaches a terminal state.'
+                      ? 'Deployment is in progress. This page shows the current Terraform worker output.'
                       : (deployUiPhase === 'awaiting_plan' || requiresPlanConfirmation)
                         ? `${summarizePlanResources(activePlanSummary)} Click Confirm Plan & Deploy to continue.`
                         : deployPhaseLabel}
@@ -5925,7 +6055,7 @@ export default function DeploymentTrackApp() {
                           type="checkbox"
                           checked={budgetOverride}
                           onChange={(event) => setBudgetOverride(event.target.checked)}
-                          disabled={deployStatus === 'running'}
+                          disabled={deployIsLive}
                           className="mt-0.5 h-4 w-4 rounded border-[var(--dw-border)] bg-black accent-[var(--dw-accent)]"
                         />
                         <span>
@@ -6085,9 +6215,26 @@ export default function DeploymentTrackApp() {
                   {backendErrorMessage}
                 </Callout>
               )}
+              {orphanCollision ? (
+                <Callout tone="warn" title="Existing AWS resources need review">
+                  <p>DeplAI left these resources unchanged because their ownership tags do not prove they belong to this deployment:</p>
+                  <ul className="mt-2 list-disc space-y-1 pl-5 font-mono text-[11px]">
+                    {orphanCollision.map((resource) => <li key={`${resource.kind}-${resource.id}`}>{resource.kind}: {resource.id}</li>)}
+                  </ul>
+                  <p className="mt-3">If they belong to this project, add <span className="font-mono">ManagedBy=deplai</span> and <span className="font-mono">Project={selectedProject?.name || 'project-name'}</span> in AWS, then redeploy. Otherwise use a different resource prefix or remove only the resources you have reviewed.</p>
+                </Callout>
+              ) : null}
               {!backendErrorMessage && !hasLiveRuntimeDetails && deployResult?.success && deployResult.mode !== 'iac_pipeline' && (
                 <Callout tone="warn">
                   Live runtime details are missing for this repo. Fetch the latest runtime details to hydrate outputs before treating this deploy as successful.
+                </Callout>
+              )}
+              {selectedProject && deployResult?.deployment_verified === true && (
+                <Callout tone="info" title="Next: post-deployment security">
+                  <p>Review the live application with DAST and check its AWS configuration.</p>
+                  <button className={`${primaryButtonClass(false)} mt-3`} onClick={() => router.push(`/dashboard/deploy/security?projectId=${encodeURIComponent(selectedProject.id)}`)}>
+                    Continue to runtime security checks <ArrowRight className="h-4 w-4" />
+                  </button>
                 </Callout>
               )}
               <InfraOutputsStage

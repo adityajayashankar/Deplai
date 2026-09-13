@@ -28,6 +28,8 @@ Security remediation does **not** inherit that chain: Connector owns its OpenRou
 
 Organization policy (`ai_organization_policies`): `byokRequired`, `platformCredentialsAllowed`, allowed credential modes.
 
+Security cooldowns honor valid provider `Retry-After` and `X-RateLimit-Reset` timestamps (using the longer wait when both are present). A provider limit without a usable hint receives a 15-second local backoff, not an assumed one-hour account outage. Local reservation rejections never renew cooldowns. Persisted cooldowns record `provider_hint` or `local_backoff`; API errors distinguish provider responses, local RPM throttles, and replay of stored cooldowns. Older cooldowns without provenance remain `legacy_unknown` until they expire; they are not silently cleared. The free router still owns model selection, and actual provider limits remain enforced.
+
 ## Metering (do not put in client docs)
 
 `Connector/src/lib/ai-platform/metering.ts`:
@@ -37,7 +39,7 @@ Organization policy (`ai_organization_policies`): `byokRequired`, `platformCrede
 
 Written to `ai_usage` + `ai_costs`. Failures in `recordUsage` are swallowed so metering cannot fail the user request.
 
-**Credits are not decremented here.** Gateway only uses `getBalance` to know `planId` and to refuse empty/blocked platform use. `POST /api/billing/credits/consume` exists and is unused by Agentic and the gateway. See [Known gaps](known-gaps.md).
+Gateway model metering does not apply product outcome rates itself. Terminal scan, remediation, DAST, verified deployment, and verified UI/UX workflows call the Connector product-usage ledger with service authentication and idempotency keys. Gateway `ai_usage` / `ai_costs` remains the source for actual model token and USD usage.
 
 ## Encryption
 
@@ -49,6 +51,7 @@ BYOK secrets: `AI_CREDENTIAL_ENCRYPTION_KEY`, fallback `SESSION_SECRET`. API nev
 | --- | --- |
 | Browser | Session cookie → `/api/ai/*` |
 | Agentic | `Agentic Layer/ai_gateway.py` (`DeplaiAI`) |
+| UI/UX worker | `uiux-agent/service/deep_agent_app.py` via `UIUX_CONNECTOR_URL` |
 | Customization | `services/ai_gateway.py` |
 
 Internal HTTP: `DEPLAI_SERVICE_KEY` via `x-api-key` / `x-deplai-service-key` / Bearer, plus **`x-deplai-user-id`** so routing/BYOK is per user.

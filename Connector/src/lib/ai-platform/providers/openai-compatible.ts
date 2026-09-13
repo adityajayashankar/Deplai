@@ -1,5 +1,5 @@
 import { platformTimeoutMs, appOrigin } from '../config';
-import { parseRetryAfter } from '../retry-delay';
+import { providerRetryHint } from '../retry-delay';
 import {
   AiPlatformError,
   CapabilityError,
@@ -111,7 +111,7 @@ export class OpenAICompatibleAdapter implements AIProviderAdapter {
         status: response.status,
         providerId: this.definition.id,
         sanitizedProviderDetail: sanitizeProviderBody(raw),
-        detail: { retryAfterSeconds: parseRetryAfter(response.headers.get('retry-after')),
+        detail: { ...providerRetryHint(response.headers),
           quotaScope: response.headers.has('x-ratelimit-limit') ? 'account' : 'model',
           resetAt: response.headers.get('x-ratelimit-reset') },
       });
@@ -211,12 +211,20 @@ export class OpenAICompatibleAdapter implements AIProviderAdapter {
       messages: input.messages.map((message) => ({
         role: message.role === 'tool' ? 'tool' : message.role,
         content: message.content,
+        ...(message.reasoningDetails ? { reasoning_details: message.reasoningDetails } : {}),
         ...(message.toolCallId ? { tool_call_id: message.toolCallId } : {}),
         ...(message.toolCalls?.length ? { tool_calls: message.toolCalls.map((call) => ({ id: call.id, type: 'function', function: { name: call.name, arguments: call.arguments } })) } : {}),
       })),
       temperature: input.temperature ?? 0.2,
     };
     if (input.maxTokens) payload.max_tokens = input.maxTokens;
+    if (input.model === 'openrouter/free') {
+      payload.provider = { allow_fallbacks: true, max_price: { prompt: 0, completion: 0 } };
+    }
+    if (input.model === 'z-ai/glm-5.3-flash') {
+      payload.reasoning = { max_tokens: 512 };
+      payload.provider = { allow_fallbacks: true, max_price: { prompt: 0.15, completion: 0.50 } };
+    }
     if (input.responseFormat) payload.response_format = input.responseFormat;
     if (input.tools?.length) {
       payload.tools = input.tools.map((tool) => ({
@@ -241,14 +249,31 @@ export class OpenAICompatibleAdapter implements AIProviderAdapter {
     const message = ((choices[0] as Record<string, unknown> | undefined)?.message || {}) as Record<string, unknown>;
     const toolCalls = Array.isArray(message.tool_calls)
       ? message.tool_calls.map((call) => {
-          const row = call as { function?: { name?: string; arguments?: string } };
-          return { name: row.function?.name || 'unknown', arguments: row.function?.arguments || '{}' };
+          const row = call as { id?: string; function?: { name?: string; arguments?: string } };
+          return { id: row.id, name: row.function?.name || 'unknown', arguments: row.function?.arguments || '{}' };
         })
       : [];
     const usage = usageFromOpenAi(data);
     usage.toolCalls = toolCalls.length;
+    const text = typeof message.content === 'string' ? message.content : '';
+    // A 2xx response without either text or a tool call is not a completed
+    // generation. Treat it as a transient upstream failure so the gateway can
+    // apply its bounded retry and quota policy instead of sending an empty
+    // answer to downstream workflows.
+    if (!text.trim() && toolCalls.length === 0) {
+      throw new AiPlatformError('PROVIDER_UNAVAILABLE', `${this.definition.displayName} returned an empty response`, {
+        status: 502,
+        providerId: this.definition.id,
+        retryable: true,
+        detail: {
+          emptyResponse: true,
+          finishReason: String((choices[0] as { finish_reason?: string } | undefined)?.finish_reason || '') || null,
+        },
+      });
+    }
     return {
-      text: String(message.content || ''),
+      text,
+      reasoningDetails: Array.isArray(message.reasoning_details) ? message.reasoning_details : undefined,
       toolCalls,
       finishReason: String((choices[0] as { finish_reason?: string } | undefined)?.finish_reason || '') || null,
       usage,

@@ -7,6 +7,8 @@ import {
   resolveCustomizationSnapshot,
   SnapshotResolutionError,
 } from '@/lib/customization-snapshot';
+import { denyUnlessPlanFeature } from '@/lib/billing/plan-access-guard';
+import { resolveAgenticBillingContext } from '@/lib/agentic-context';
 
 interface ScanValidateBody {
   project_id?: string;
@@ -44,6 +46,7 @@ type ScanValidatePayload = {
   aws_session_token?: string;
   aws_region?: string;
   user_id: string;
+  organization_id: string;
   github_token?: string;
   repository_url?: string;
   source_override?: {
@@ -117,6 +120,7 @@ export async function POST(request: NextRequest) {
     if (error) return error;
 
     const body = await request.json().catch(() => ({})) as ScanValidateBody;
+    const billing = await resolveAgenticBillingContext({ request, user });
     const resolvedProjectId = String(body.project_id || '').trim();
     const resolvedProjectName = String(body.project_name || '').trim();
     const resolvedProjectType: 'local' | 'github' = body.project_type === 'github' ? 'github' : 'local';
@@ -143,7 +147,7 @@ export async function POST(request: NextRequest) {
       project_name: resolvedProjectName,
       project_type: resolvedProjectType,
       scan_type: resolvedScanType,
-      user_id: String(user.id),
+      ...billing.fields,
     };
     if (Array.isArray(body.enabled_modules) && body.enabled_modules.length > 0) {
       backendPayload.enabled_modules = body.enabled_modules.map((item) => String(item));
@@ -151,6 +155,14 @@ export async function POST(request: NextRequest) {
     const requestedModules = Array.isArray(body.enabled_modules)
       ? body.enabled_modules.map((item) => String(item).trim().toLowerCase())
       : [];
+    // Free includes a focused source scan. The full SDLC scan, dependency
+    // scanning, and every non-SAST module are Starter capabilities.
+    const isBasicSecurityScan = resolvedScanType === 'sast'
+      && requestedModules.every((module) => module === 'sast');
+    if (!isBasicSecurityScan) {
+      const denied = await denyUnlessPlanFeature(request, user, 'security_automation');
+      if (denied) return denied;
+    }
     const scanWarnings: Array<{ module: string; code: string; message: string }> = [];
     const dastTarget = String(body.dast_target_url || '').trim();
     const dastAssetId = String(body.dast_asset_id || '').trim();

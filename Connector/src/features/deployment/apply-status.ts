@@ -1,5 +1,6 @@
 export const APPLY_UNREACHABLE_MESSAGE = 'Connector could not reach the deployment runtime service.';
 export const APPLY_TIMEOUT_MESSAGE = 'Deployment runtime timed out before Terraform apply completed.';
+const APPLY_LOG_BUFFER_LIMIT = 800;
 
 function flattenErrorParts(err: unknown, depth = 0): string[] {
   if (depth > 4 || err == null) return [];
@@ -62,6 +63,7 @@ function detailsRecord(data: Record<string, unknown> | null | undefined): Record
 export function applyLooksInFlight(result: Record<string, unknown> | null | undefined): boolean {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
   const status = String(result.status || '').trim().toLowerCase();
+  if (result.requires_plan_confirmation === true || status === 'awaiting_plan_confirmation') return false;
   const details = detailsRecord(result);
   return Boolean(
     result.apply_accepted === true
@@ -78,6 +80,7 @@ export function isApplyStillRunningResponse(
 ): boolean {
   if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
   const status = String(data.status || '').trim().toLowerCase();
+  if (data.requires_plan_confirmation === true || status === 'awaiting_plan_confirmation') return false;
   const details = detailsRecord(data);
   const stillRunning = Boolean(
     data.apply_accepted === true
@@ -189,4 +192,20 @@ export function extractApplyLogLines(payload: unknown): string[] {
   }
 
   return lines;
+}
+
+/**
+ * Status polling returns a moving tail of backend logs. Preserve older lines
+ * in the browser while appending only newly observed output.
+ */
+export function mergeApplyLogLines(previous: string[], incoming: string[]): string[] {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of [...previous, ...incoming]) {
+    const line = String(candidate || '').trimEnd();
+    if (!line || seen.has(line)) continue;
+    seen.add(line);
+    merged.push(line);
+  }
+  return merged.slice(-APPLY_LOG_BUFFER_LIMIT);
 }

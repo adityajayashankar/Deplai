@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildPersistableDeploySnapshot, clearDownloadedDeploySecrets, type DeployStateSnapshot } from './state';
+import {
+  buildPersistableDeploySnapshot,
+  clearDownloadedDeploySecrets,
+  resolveTerraformRuntimeConfig,
+  type DeployStateSnapshot,
+} from './state';
 
 function bulkySnapshot(): DeployStateSnapshot {
   const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----';
@@ -96,4 +101,16 @@ test('clearDownloadedDeploySecrets wipes PEM and database password after downloa
   assert.equal(cleared?.one_time_credentials?.database_env, null);
   assert.equal(cleared?.one_time_credentials?.credentials_downloaded, true);
   assert.equal(cleared?.one_time_credentials?.key_file_name, 'ifca-prod-abcd-key-i-abc.pem');
+});
+
+test('runtime config gives each project a stable remote Terraform backend', () => {
+  const first = resolveTerraformRuntimeConfig('ifca-production');
+  const second = resolveTerraformRuntimeConfig('ifca-production');
+  const otherProject = resolveTerraformRuntimeConfig('another-project');
+
+  assert.equal(first.state_bucket, second.state_bucket);
+  assert.equal(first.lock_table, second.lock_table);
+  assert.match(first.state_bucket, /^deplai-tfstate-[a-z0-9-]{3,63}$/);
+  assert.match(first.lock_table, /^deplai-tflock-[a-z0-9-]+$/);
+  assert.notEqual(first.state_bucket, otherProject.state_bucket);
 });

@@ -8,6 +8,7 @@ import {
   isApplyStillRunningResponse,
   isRecoverableApplyTransportError,
   isTransportFalseFailureMessage,
+  mergeApplyLogLines,
   mergeAcceptedApplyResult,
 } from './apply-status';
 
@@ -29,6 +30,11 @@ describe('classifyUpstreamError', () => {
 });
 
 describe('apply still-running / recoverable transport', () => {
+  it('observed plan confirmation overrides stale acceptance flags', () => {
+    const result = { success: true, status: 'awaiting_plan_confirmation', apply_accepted: true, details: { apply_still_running: true } };
+    assert.equal(applyLooksInFlight(result), false);
+    assert.equal(isApplyStillRunningResponse(202, result), false);
+  });
   it('treats 202 apply_accepted as still running', () => {
     assert.equal(
       isApplyStillRunningResponse(202, {
@@ -92,5 +98,17 @@ describe('applyLooksInFlight / mergeAcceptedApplyResult', () => {
     assert.equal(merged.apply_accepted, true);
     assert.equal(merged.error, undefined);
     assert.equal(applyLooksInFlight(merged), true);
+  });
+});
+
+describe('mergeApplyLogLines', () => {
+  it('keeps earlier output when a later status response contains only a tail', () => {
+    assert.deepEqual(
+      mergeApplyLogLines(
+        ['terraform apply started', 'module.network: Creating...'],
+        ['module.network: Creating...', 'module.compute: Creating...', 'apply failed'],
+      ),
+      ['terraform apply started', 'module.network: Creating...', 'module.compute: Creating...', 'apply failed'],
+    );
   });
 });

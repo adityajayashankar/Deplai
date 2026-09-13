@@ -21,6 +21,12 @@ import {
   tryAppendSessionLogs,
 } from '@/lib/sessions/store';
 import type { SessionStatus } from '@/lib/sessions/types';
+import {
+  deploymentProviderAvailabilityMessage,
+  isDeployableProvider,
+  parseDeploymentProvider,
+} from '@/lib/deployment-providers';
+import { settleProductUsage } from '@/lib/billing/product-usage';
 
 
 export const runtime = 'nodejs';
@@ -37,7 +43,7 @@ interface GeneratedFile {
 
 interface DeployBody {
   project_id: string;
-  provider?: Provider;
+  provider?: string;
   service_type?: string;
   repo_context?: Record<string, unknown>;
   user_customizations?: Record<string, unknown>;
@@ -84,12 +90,6 @@ function resolveAgenticOrigin(): string {
   } catch {
     return AGENTIC_URL;
   }
-}
-
-function clampProvider(value: string | undefined): Provider {
-  const v = (value || '').trim().toLowerCase();
-  if (v === 'azure' || v === 'gcp') return v;
-  return 'aws';
 }
 
 function sanitizeRepoName(value: string): string {
@@ -908,8 +908,52 @@ export async function POST(req: NextRequest) {
       if (denied) return denied;
     }
 
-    const provider = clampProvider(body.provider);
+    const requestedProvider = parseDeploymentProvider(body.provider || 'aws');
+    if (!requestedProvider) {
+      return NextResponse.json(
+        { error: 'provider must be one of aws, heroku, azure, gcp' },
+        { status: 400 },
+      );
+    }
+    if (!isDeployableProvider(requestedProvider)) {
+      return NextResponse.json(
+        {
+          error: deploymentProviderAvailabilityMessage(requestedProvider),
+          code: 'deployment_provider_coming_soon',
+          provider: requestedProvider,
+        },
+        { status: 409 },
+      );
+    }
+    // The availability guard above narrows this to AWS at runtime. Preserve
+    // the legacy workflow union until the disabled providers are implemented.
+    const provider = requestedProvider as Provider;
     const projectName = String(owned.project?.name || owned.project?.full_name || projectId).split('/').pop() || projectId;
+    const deploymentOrganizationId = String(owned.project?.organization_id || '').trim();
+    const settleVerifiedDeploymentUsage = async () => {
+      if (!deploymentOrganizationId) {
+        return { status: 'pending', error: 'The project has no billing organization.' };
+      }
+      try {
+        const settlement = await settleProductUsage({
+          kind: 'deployment',
+          outcome: 'succeeded',
+          organizationId: deploymentOrganizationId,
+          userId: user.id,
+          projectId,
+          runId: String(body.run_id || projectId),
+        });
+        return {
+          status: 'settled',
+          credits: settlement.credits,
+          debited: settlement.debited,
+          duplicate: settlement.duplicate,
+        };
+      } catch (billingError) {
+        console.error('[deploy] usage settlement failed', billingError instanceof Error ? billingError.name : 'UnknownError');
+        return { status: 'pending', error: 'Deployment is verified; its daily credit settlement is pending.' };
+      }
+    };
     const incomingSessionId = String(body.workspace_session_id || '').trim();
     const bindDeploySession = async (
       payload: Record<string, unknown>,
@@ -1193,20 +1237,19 @@ export async function POST(req: NextRequest) {
           applyData = waited.result;
           applyTransportRecovered = true;
         } else if (terraformApplyNeedsPolling({ status: waited.status }) || waited.status === 'running') {
-          return NextResponse.json(
-            {
-              error: 'Terraform apply is still running. Multi-AZ RDS often takes 15–25 minutes (up to 45). Do not start another deploy — watch the apply log and the AWS console.',
-              status: 'running',
-              details: {
-                hint: 'The runtime accepted the apply. Leave this deploy alone until Terraform finishes. Retrying now can fight the in-progress RDS create.',
-                apply_still_running: true,
-                last_apply_status: waited.status,
-                agentic_origin: resolveAgenticOrigin(),
-                ...(startErr ? { upstream_error: startErr instanceof Error ? startErr.message : String(startErr) } : {}),
-              },
+          return NextResponse.json(await bindDeploySession({
+            success: true,
+            provider,
+            project_id: projectId,
+            mode: 'runtime_apply',
+            status: 'running',
+            details: {
+              apply_still_running: true,
+              last_apply_status: waited.status,
+              agentic_origin: resolveAgenticOrigin(),
+              ...(startErr ? { transport_reconciled: true } : {}),
             },
-            { status: 504 },
-          );
+          }, 'running', 'apply'), { status: 202 });
         } else if (startErr) {
           const classified = classifyUpstreamError(startErr);
           return NextResponse.json(
@@ -1221,19 +1264,18 @@ export async function POST(req: NextRequest) {
             { status: 502 },
           );
         } else if (terraformApplyNeedsPolling(applyData)) {
-          return NextResponse.json(
-            {
-              error: 'Terraform apply is still running. Multi-AZ RDS often takes 15–25 minutes (up to 45). Do not start another deploy — watch the apply log and the AWS console.',
-              status: 'running',
-              details: {
-                hint: 'The runtime accepted the apply. Leave this deploy alone until Terraform finishes.',
-                apply_still_running: true,
-                last_apply_status: waited.status,
-                agentic_origin: resolveAgenticOrigin(),
-              },
+          return NextResponse.json(await bindDeploySession({
+            success: true,
+            provider,
+            project_id: projectId,
+            mode: 'runtime_apply',
+            status: 'running',
+            details: {
+              apply_still_running: true,
+              last_apply_status: waited.status,
+              agentic_origin: resolveAgenticOrigin(),
             },
-            { status: 504 },
-          );
+          }, 'running', 'apply'), { status: 202 });
         }
       }
       const applyDetails: Record<string, unknown> = {
@@ -1366,6 +1408,7 @@ export async function POST(req: NextRequest) {
                 : 'EC2 is up in AWS; application verification is incomplete.'));
             }
 
+            const usageCharge = await settleVerifiedDeploymentUsage();
             return NextResponse.json(await bindDeploySession({
               success: true,
               provider,
@@ -1402,6 +1445,7 @@ export async function POST(req: NextRequest) {
               infrastructure_only_success: false,
               verification_checks: verification.checks,
               recovered_from_apply_error: true,
+              usage_charge: usageCharge,
               ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
             }, 'completed', 'apply', 'Runtime apply recovered after a transport error.'));
           }
@@ -1528,6 +1572,7 @@ export async function POST(req: NextRequest) {
 
       if (applicationReady) await enqueueSecurityEvent(projectId, 'deployment', String(body.run_id || Date.now()))
         .catch((error) => console.warn('Advisory deployment scan could not be queued:', error instanceof Error ? error.message : 'queue unavailable'));
+      const usageCharge = applicationReady ? await settleVerifiedDeploymentUsage() : null;
       return NextResponse.json(await bindDeploySession({
         success: true,
         provider,
@@ -1566,6 +1611,7 @@ export async function POST(req: NextRequest) {
         infrastructure_only_success: infraOnlySuccess,
         partial_deployment: Boolean(expectedEc2 && ec2InstanceId && !applicationReady),
         verification_checks: verification.checks,
+        usage_charge: usageCharge,
         ...(staleBundleWarning ? { stale_bundle_warning: staleBundleWarning } : {}),
       }, applicationReady ? 'completed' : 'needs_review', 'apply', applicationReady
         ? 'Runtime Terraform apply finished and application bootstrap verified.'

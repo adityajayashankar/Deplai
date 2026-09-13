@@ -42,6 +42,7 @@ export async function POST(request: NextRequest) {
       organization_id: organizationId,
       available: result.available,
       debited: result.debited,
+      duplicate: result.duplicate,
     });
   } catch (error) {
     if (error instanceof InsufficientOrganizationCreditsError) {

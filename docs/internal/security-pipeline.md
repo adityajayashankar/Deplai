@@ -16,6 +16,13 @@ HTTP `POST /api/scan/start` schedules scanning independently of browser connecti
 
 Production requires `MONGODB_URI` (`SECURITY_DURABLE_REQUIRED=true`, also enforced for `APP_ENV=production`). Reports and source snapshots are archived by run. Requested Git SHAs are checked out explicitly and embedded clone credentials are removed even on checkout failure. Generated artifact staging rejects symlink destinations.
 
+The local `compose.yaml` uses a private `security-mongo` service and the
+`security_mongo_data` volume for scan/remediation history. It publishes no host
+port. Set `LOCAL_SECURITY_MONGODB_URI` explicitly to use Atlas or another MongoDB
+instead; existing remote history is not migrated automatically. An unavailable
+configured MongoDB connection blocks scan startup with a sanitized HTTP 503 and
+recovery instructions. It never silently falls back to in-memory execution.
+
 Full scan execution still uses a project checkout protected by a lease; fully isolated per-run execution and automatic worker restart continuation are outstanding. Interrupted work must currently be restarted. Cross-worker live subscription behavior and Mongo recovery require integration tests.
 
 ## Advisory SDLC integration

@@ -55,7 +55,7 @@ def _now() -> datetime:
 
 def _retention_days() -> int:
     try:
-        return max(1, min(365, int(os.getenv("REMEDIATION_MONGODB_RETENTION_DAYS", "30"))))
+        return max(30, min(365, int(os.getenv("REMEDIATION_MONGODB_RETENTION_DAYS", "30"))))
     except ValueError:
         return 30
 
@@ -128,10 +128,58 @@ class RemediationRunStore:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._token_budgets: dict[str, int] = {}
         self._runs: dict[str, dict[str, Any]] = {}
         self._events: dict[str, list[dict[str, Any]]] = {}
         self._client: Any | None = None
         self._mongo_attempted = False
+
+    @staticmethod
+    def token_limit() -> int:
+        try:
+            return max(1_000, min(2_000_000, int(os.getenv("REMEDIATION_RUN_TOKEN_BUDGET", "2000000"))))
+        except ValueError:
+            return 2_000_000
+
+    def reserve_tokens(self, run_id: str, amount: int) -> None:
+        """Reserve an estimated worker request across every packet in this run.
+
+        Mongo reservations are atomic; the existing single-process fallback uses
+        the journal lock. Unknown/failed responses retain their reservation.
+        This is a worker safety budget, separate from Connector quota/billing.
+        """
+        if not run_id or type(amount) is not int or amount <= 0:
+            raise ValueError("A run ID and positive token reservation are required")
+        limit = self.token_limit()
+        db = self._mongo_db()
+        if db is not None:
+            from pymongo import ReturnDocument
+            db.remediation_token_budgets.update_one({"_id": run_id}, {"$setOnInsert": {
+                "used": 0, "expire_at": _now() + timedelta(days=_retention_days()),
+            }}, upsert=True)
+            reserved = db.remediation_token_budgets.find_one_and_update(
+                {"_id": run_id, "used": {"$lte": limit - amount}},
+                {"$inc": {"used": amount}}, return_document=ReturnDocument.AFTER)
+            if reserved is None:
+                raise RuntimeError("RUN_TOKEN_BUDGET: remediation reached its shared token allowance; accepted patches are retained")
+            return
+        with self._lock:
+            used = self._token_budgets.get(run_id, 0)
+            if used + amount > limit:
+                raise RuntimeError("RUN_TOKEN_BUDGET: remediation reached its shared token allowance; accepted patches are retained")
+            self._token_budgets[run_id] = used + amount
+
+    def reconcile_tokens(self, run_id: str, reserved: int, actual: int | None) -> None:
+        # Missing usage must not turn an expensive request into zero usage.
+        if type(actual) is not int or actual <= 0:
+            return
+        difference = actual - reserved
+        db = self._mongo_db()
+        if db is not None:
+            db.remediation_token_budgets.update_one({"_id": run_id}, {"$inc": {"used": difference}})
+            return
+        with self._lock:
+            self._token_budgets[run_id] = max(0, self._token_budgets.get(run_id, 0) + difference)
 
     @property
     def enabled(self) -> bool:
@@ -170,6 +218,8 @@ class RemediationRunStore:
                 db.remediation_events.create_index([("run_id", 1), ("sequence", 1)], unique=True)
                 db.remediation_events.create_index([("project_id", 1), ("created_at", -1)])
                 db.remediation_events.create_index("expire_at", expireAfterSeconds=0)
+                db.remediation_packets.create_index("expire_at", expireAfterSeconds=0)
+                db.remediation_token_budgets.create_index("expire_at", expireAfterSeconds=0)
                 self._client = client
                 logger.info("MongoDB remediation journal connected (database=%s)", self.database_name)
                 return client
@@ -194,12 +244,17 @@ class RemediationRunStore:
             "checkpoint_backend": "memory",
             "agent_context": {
                 "schema_version": "remediation.v2",
-                "calls_limit": 2,
+                "calls_limit": 14,
                 "calls_used": 0,
                 "master": None,
                 "planner": None,
                 "implementor": None,
                 "reviewer": None,
+            },
+            "usage": {
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
             },
             "created_at": created_at,
             "updated_at": created_at,
@@ -215,6 +270,81 @@ class RemediationRunStore:
             except Exception as exc:
                 logger.warning("Could not persist remediation run start: %s", type(exc).__name__)
         return run_id
+
+    def record_usage(self, run_id: str | None, usage: dict[str, Any] | None) -> None:
+        """Accumulate provider-reported tokens without storing prompts or output."""
+        resolved_run_id = str(run_id or "").strip()
+        if not resolved_run_id or not isinstance(usage, dict):
+            return
+
+        def positive(*values: Any) -> int:
+            for value in values:
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    return parsed
+            return 0
+
+        input_tokens = positive(usage.get("input_tokens"), usage.get("prompt_tokens"), usage.get("inputTokens"))
+        output_tokens = positive(usage.get("output_tokens"), usage.get("completion_tokens"), usage.get("outputTokens"))
+        if not input_tokens and not output_tokens:
+            input_tokens = positive(usage.get("total_tokens"), usage.get("totalTokens"))
+        if not input_tokens and not output_tokens:
+            return
+
+        updated_at = _now()
+        with self._lock:
+            run = self._runs.get(resolved_run_id)
+            if run:
+                totals = run.setdefault("usage", {"requests": 0, "input_tokens": 0, "output_tokens": 0})
+                totals["requests"] = int(totals.get("requests", 0) or 0) + 1
+                totals["input_tokens"] = int(totals.get("input_tokens", 0) or 0) + input_tokens
+                totals["output_tokens"] = int(totals.get("output_tokens", 0) or 0) + output_tokens
+                run["updated_at"] = updated_at
+        db = self._mongo_db()
+        if db is not None:
+            try:
+                db.remediation_runs.update_one(
+                    {"run_id": resolved_run_id},
+                    {"$inc": {
+                        "usage.requests": 1,
+                        "usage.input_tokens": input_tokens,
+                        "usage.output_tokens": output_tokens,
+                    }, "$set": {"updated_at": updated_at}},
+                )
+            except Exception as exc:
+                logger.warning("Could not persist remediation usage: %s", type(exc).__name__)
+
+    def usage_for_run(self, run_id: str | None) -> dict[str, int]:
+        resolved_run_id = str(run_id or "").strip()
+        empty = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+        if not resolved_run_id:
+            return empty
+        with self._lock:
+            local = self._runs.get(resolved_run_id)
+            if local:
+                usage = local.get("usage") if isinstance(local.get("usage"), dict) else {}
+                return {
+                    "requests": int(usage.get("requests", 0) or 0),
+                    "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                    "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                }
+        db = self._mongo_db()
+        if db is None:
+            return empty
+        try:
+            run = db.remediation_runs.find_one({"run_id": resolved_run_id}, {"usage": 1}) or {}
+            usage = run.get("usage") if isinstance(run.get("usage"), dict) else {}
+            return {
+                "requests": int(usage.get("requests", 0) or 0),
+                "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                "output_tokens": int(usage.get("output_tokens", 0) or 0),
+            }
+        except Exception as exc:
+            logger.warning("Could not read remediation usage: %s", type(exc).__name__)
+            return empty
 
     def store_agent_artifact(
         self,
@@ -243,7 +373,7 @@ class RemediationRunStore:
                 context = run.setdefault("agent_context", {})
                 context[normalized_stage] = safe
                 if count_llm_call:
-                    context["calls_used"] = min(2, int(context.get("calls_used", 0) or 0) + 1)
+                    context["calls_used"] = int(context.get("calls_used", 0) or 0) + 1
                 run["updated_at"] = updated_at
         db = self._mongo_db()
         if db is not None:
@@ -313,6 +443,7 @@ class RemediationRunStore:
             update["checkpoint_backend"] = checkpoint_backend
         if status in {"completed", "failed", "cancelled"}:
             update["completed_at"] = updated_at
+            update["expire_at"] = updated_at + timedelta(days=_retention_days())
         with self._lock:
             run = self._runs.get(resolved_run_id)
             if run:
@@ -321,8 +452,41 @@ class RemediationRunStore:
         if db is not None:
             try:
                 db.remediation_runs.update_one({"run_id": resolved_run_id}, {"$set": update})
+                if "completed_at" in update:
+                    expiry = update["expire_at"]
+                    db.remediation_events.update_many({"run_id": resolved_run_id}, {"$max": {"expire_at": expiry}})
+                    db.remediation_packets.update_many({"_id": {"$regex": "^" + re.escape(resolved_run_id) + ":"}}, {"$max": {"expire_at": expiry}})
+                    db.remediation_token_budgets.update_many({"_id": resolved_run_id}, {"$max": {"expire_at": expiry}})
             except Exception as exc:
                 logger.warning("Could not persist remediation status: %s", type(exc).__name__)
+
+    def archive_for_run(self, run_id: str, *, project_id: str, user_id: str, organization_id: str) -> dict | None:
+        scope = {"run_id": run_id, "project_id": project_id, "user_id": user_id, "organization_id": organization_id}
+        db = self._mongo_db()
+        if db is None:
+            raise RuntimeError("Durable remediation storage is unavailable")
+        run = db.remediation_runs.find_one(scope, {"_id": 0})
+        if not run:
+            return None
+        events = list(db.remediation_events.find({"run_id": run_id}, {"_id": 0}).sort("sequence", 1))
+        packets = list(db.remediation_packets.find({"_id": {"$regex": "^" + re.escape(run_id) + ":"}}))
+        archive = self._public_run(run, events)
+        archive["packets"] = [{"packet_id": item["_id"], "result": item.get("result", {})} for item in packets]
+        archive["schema_version"] = "remediation.archive.v1"
+        archive["retention_days_minimum"] = 30
+        # Export the complete recorded evidence, but never credentials or prompts.
+        def redact(value):
+            if isinstance(value, dict):
+                return {str(k): redact(v) for k, v in value.items() if str(k).lower() not in
+                        {"api_key", "github_token", "credential", "secret", "contexts", "source_context", "raw_response", "prompt"}}
+            if isinstance(value, list):
+                return [redact(v) for v in value]
+            if isinstance(value, str):
+                return _redact(value)
+            if isinstance(value, datetime):
+                return value.isoformat()
+            return value
+        return redact(archive)
 
     def latest_for_project(self, project_id: str, *, limit: int = 100) -> dict[str, Any] | None:
         target = str(project_id)
@@ -342,9 +506,10 @@ class RemediationRunStore:
                 return None
             events = list(
                 db.remediation_events.find({"run_id": found["run_id"]}, {"_id": 0})
-                .sort("sequence", 1)
+                .sort("sequence", -1)
                 .limit(max(1, min(limit, 200)))
             )
+            events.reverse()
             found.pop("_id", None)
             return self._public_run(found, events)
         except Exception as exc:

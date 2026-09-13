@@ -48,6 +48,7 @@ class ScanValidationRequest(BaseModel):
     project_name: str
     project_type: str
     user_id: str
+    organization_id: Optional[str] = None
 
     @field_validator('project_id')
     @classmethod
@@ -189,7 +190,7 @@ class ScanValidationResponse(BaseModel):
 
 
 class WebSocketCommand(BaseModel):
-    action: Literal["start", "continue_round", "push_current", "approve_push"]
+    action: Literal["start", "continue_round", "push_current", "approve_push", "cancel"]
 
 
 class StreamStatus(str, Enum):
@@ -244,6 +245,7 @@ class RemediationRequest(BaseModel):
     remediation_scope: Literal["major", "all"] = "major"
     # Created server-side after validation. Never accepted as a client identity.
     remediation_run_id: Optional[str] = None
+    resume_publication: bool = False
 
 
 class RemediationResponse(BaseModel):

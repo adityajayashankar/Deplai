@@ -67,6 +67,18 @@ export function estimateOpenRouterInputTokens(
   return Math.max(1, messageBytes + toolBytes + responseFormatBytes + 24);
 }
 
+/** Router tokenizers vary: estimate code, including tool history and reasoning.
+ * This is a fit estimate, not an exact tokenizer or provider quota guarantee.
+ */
+export function estimateRouterContextTokens(messages: ChatMessage[], tools?: ChatTool[]): number {
+  const serialized = JSON.stringify({ messages, tools: tools ?? [] });
+  let ascii = 0;
+  for (const character of serialized) {
+    if (character.charCodeAt(0) < 128) ascii += 1;
+  }
+  return Math.ceil(ascii / 3) + Buffer.byteLength(serialized, 'utf8') - ascii + 64;
+}
+
 function keyForSecret(secret: string): string {
   return createHash('sha256').update(secret).digest('hex').slice(0, 24);
 }

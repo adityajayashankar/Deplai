@@ -34,6 +34,7 @@ class RemediationTrackRunner(RunnerBase):
         self._latest_fixes: list[Fix] = []
         self._accepted_fixes: list[Fix] = []
         self.source_revision = None
+        self.scan_id = None
 
     async def _send_message(self, msg_type: str, content: str):
         await super()._send_message(msg_type, content)
@@ -103,6 +104,20 @@ class RemediationTrackRunner(RunnerBase):
         )
         return True
 
+    async def _await_verification(self, label, operation, interval=15):
+        started = asyncio.get_running_loop().time()
+        task = asyncio.create_task(self._run_step(operation))
+        try:
+            while not task.done():
+                done, _ = await asyncio.wait({task}, timeout=interval)
+                if not done:
+                    elapsed = int(asyncio.get_running_loop().time() - started)
+                    await self._send_message('info', f'Verification: {label} result is pending ({elapsed}s elapsed). PR creation will follow verification.')
+            return await task
+        finally:
+            if not task.done():
+                task.cancel()
+
     async def _run_verification_rescan(self) -> bool:
         from result_parser import invalidate_cache, get_scan_results
         from environment import EnvironmentInitializer
@@ -130,13 +145,14 @@ class RemediationTrackRunner(RunnerBase):
                 if module == "sca" and not sbom_ok:
                     raise RuntimeError("Syft dependency failed")
                 await self._send_message("info", f"Verification: executing {engine_for(module)}")
-                success, detail = await self._run_step(lambda: scanner(name, project))
+                success, detail = await self._await_verification(engine_for(module), lambda: scanner(name, project))
                 if not success:
                     raise RuntimeError(detail)
                 report = await self._run_step(lambda: validator._validated_report(module))
                 if module == "sbom":
                     sbom_ok = True
                 records.append({"id": module, "status": "SKIPPED" if report.get("coverage") == "not_applicable" else "COMPLETED", **report})
+                await self._send_message('info', f'Verification: {engine_for(module)} finished ({report.get("coverage", "validated report")}).')
             except Exception as exc:
                 records.append({"id": module, "status": "FAILED", "error": str(exc)})
                 await self._send_message("warning", f"Verification {engine_for(module)} failed: {exc}")
@@ -196,9 +212,13 @@ class RemediationTrackRunner(RunnerBase):
                 return
             self._pending_action = "approve_push"
             self._approval_requested = False
+            await self._send_status(StreamStatus.running)
+            await self._send_message("info", "Approval received. Assembling patches and running verification before PR creation.")
             self._command_event.set()
 
     async def _run_pipeline(self) -> bool:
+        if self.context.resume_publication:
+            return await self._resume_publication()
         # Never apply candidate fixes to the checkout used by Scan or deployment.
         from utils import CODEBASE_VOLUME, SECURITY_REPORTS_VOLUME, get_docker_client
         workspace_id = "remediation_" + self.remediation_run_id.replace("-", "")
@@ -209,8 +229,11 @@ class RemediationTrackRunner(RunnerBase):
         if not ok or not isinstance(initial, dict):
             return await self._terminate("A completed scan baseline is required.")
         baseline_run = initial.get("run_id")
+        self.scan_id = baseline_run
         baseline_source = "scan_" + baseline_run if baseline_run else self.original_project_id
         self.source_revision = initial.get("source_revision")
+        await asyncio.to_thread(remediation_runs.packet_result, self.remediation_run_id, "publication-base", {
+            "source_revision": self.source_revision, "baseline_source": baseline_source, "scan_id": self.scan_id})
         def prepare_workspace():
             get_docker_client().containers.run("alpine", command=["sh", "-ec",
                 'test -d "/code/$SOURCE"; mkdir "/code/$TARGET"; cp -a "/code/$SOURCE/." "/code/$TARGET/"; '
@@ -235,7 +258,7 @@ class RemediationTrackRunner(RunnerBase):
             await self._send_message("phase", f"Round {current_round}: ingesting findings and generating fixes")
             await self._send_message(
                 "info",
-                "Selected findings go through Planner, Implementor and local validation, with at most one repair call after actionable validation failure.",
+                "Selected findings go through source exploration, planning, patch generation and local validation, with one repair attempt after actionable validation failure.",
             )
 
             try:
@@ -421,6 +444,78 @@ class RemediationTrackRunner(RunnerBase):
         if not approved_for_push:
             return True
 
+        return await self._publish_saved_fixes()
+
+    async def _resume_publication(self) -> bool:
+        """Restore candidates, never invoke the remediation/model workflow."""
+        from remediation_pipeline.supervisor_bridge import supervisor_result_to_fixes
+        from result_parser import get_scan_results
+        from utils import CODEBASE_VOLUME, SECURITY_REPORTS_VOLUME, get_docker_client
+        from uuid import uuid4
+        archive = await asyncio.to_thread(remediation_runs.archive_for_run, self.remediation_run_id,
+            project_id=self.original_project_id, user_id=self.context.user_id,
+            organization_id=self.context.organization_id)
+        if not archive:
+            return await self._terminate("Saved run is unavailable. No new remediation was started.")
+        saved = await asyncio.to_thread(remediation_runs.packet_result, self.remediation_run_id, "publication-review")
+        if saved:
+            self._latest_fixes = [Fix(**item) for item in saved.get("fixes", [])]
+        else:
+            self._latest_fixes = [fix for packet in archive['packets']
+                for fix in supervisor_result_to_fixes(packet['result'])]
+        if not self._latest_fixes:
+            return await self._terminate("No saved patch candidates are available for publication recovery.")
+        base = await asyncio.to_thread(remediation_runs.packet_result, self.remediation_run_id, "publication-base")
+        if not base:
+            ok, initial = await self._run_step(lambda: get_scan_results(self.original_project_id))
+            if not ok or not initial.get('run_id') or not initial.get('source_revision'):
+                return await self._terminate("Saved source baseline is unavailable; recovery cannot safely validate these patches.")
+            base = {'baseline_source': 'scan_' + initial['run_id'], 'source_revision': initial['source_revision']}
+        self.source_revision = base['source_revision']
+        self.scan_id = base.get('scan_id') or (base['baseline_source'][5:] if base.get('baseline_source', '').startswith('scan_') else None)
+        workspace = 'remediation_recovery_' + uuid4().hex
+        def prepare():
+            get_docker_client().containers.run('alpine', command=['sh','-ec',
+                'test -d "/code/$SOURCE"; mkdir "/code/$TARGET"; cp -a "/code/$SOURCE/." "/code/$TARGET/"; '
+                'for file in /reports/*_${REPORT_SOURCE}_*.json; do [ ! -f "$file" ] || cp "$file" "/reports/$(basename "$file" | sed "s/_${REPORT_SOURCE}_/_${TARGET}_/")"; done'],
+                environment={'SOURCE':base['baseline_source'],'TARGET':workspace,'REPORT_SOURCE':self.original_project_id},
+                volumes={CODEBASE_VOLUME:{'bind':'/code','mode':'rw'},SECURITY_REPORTS_VOLUME:{'bind':'/reports','mode':'rw'}},remove=True)
+        await self._run_step(prepare)
+        self.context = self.context.model_copy(update={'project_id':workspace})
+        set_current_project_id(workspace)
+        bind_remediation_run(self.remediation_run_id)
+        await self._send_message('info', 'Restored saved patches. No initial scan or model generation was started. Approval will run required patch verification before publication.')
+        return await self._publish_saved_fixes()
+
+    async def _prepare_publication_review(self) -> bool:
+        """Assemble each file before approval; make exclusions explicit."""
+        import difflib
+        grouped = self.orchestrator._group_fixes_by_file(self._latest_fixes)
+        prepared = []
+        excluded = []
+        for path, fixes in grouped.items():
+            try:
+                source = await self._run_step(lambda: self.orchestrator.validator._read_repo_file(self.context.project_id, path))
+                combined = self.orchestrator._build_patched_files(fixes, lambda _: source)[path]
+                diff = ''.join(difflib.unified_diff(source.replace('\r\n','\n').splitlines(keepends=True), combined.splitlines(keepends=True), fromfile='a/'+path,tofile='b/'+path))
+                if diff:
+                    prepared.append(fixes[0].model_copy(update={'diff':diff,'raw_response':None,
+                        'vulns_addressed':list(dict.fromkeys(v for f in fixes for v in f.vulns_addressed))}))
+            except (RuntimeError, ValueError):
+                excluded.append(path)
+        await asyncio.to_thread(remediation_runs.packet_result, self.remediation_run_id, 'publication-review',
+            {'fixes':[fix.model_dump(exclude={'raw_response'}) for fix in [*self._accepted_fixes, *self._latest_fixes]], 'excluded_files':excluded})
+        if excluded:
+            await self._send_message('warning', 'Excluded conflicting files from this proposed PR: ' + ', '.join(excluded) + '. Their findings remain unresolved. Review the reduced patch set before approving.')
+        self._latest_fixes = prepared
+        await self._send_message('changed_files', json.dumps([{'path':f.filepath,'diff':f.diff,'reason':'Combined patch ready for review; verification pending'} for f in prepared]))
+        if not prepared:
+            return await self._terminate('All saved files are blocked by patch conflicts. Candidates are retained; no scan or generation is required to inspect them in Sessions.')
+        return True
+
+    async def _publish_saved_fixes(self) -> bool:
+        if not await self._prepare_publication_review():
+            return False
         self._approval_requested = True
         await self._send_status(StreamStatus.waiting_approval)
         action = await self._wait_for_action()
@@ -457,19 +552,16 @@ class RemediationTrackRunner(RunnerBase):
         github_token = (self.context.github_token or "").strip()
         repository_url = (self.context.repository_url or "").strip()
         if not github_token or not repository_url:
-            await self._send_message("warning", "Missing GitHub token or repository URL. Skipping PR creation.")
-            await self._send_message(
-                "success",
-                "Remediation persisted. Verification scan is optional; rerun it from Security Agent after the PR is ready.",
-            )
-            return True
+            return await self._terminate("Pull request creation is blocked: reconnect the GitHub App with repository contents and pull-request write permissions. Saved patches remain available.")
 
         try:
+            await self._send_message('info', 'Publishing approved patches to GitHub and creating the pull request.')
             pr = await self._run_step(
                 lambda: self.orchestrator.create_pr(
                     RemediationPRRequest(
                         project_id=self.context.project_id,
                         source_revision=self.source_revision,
+                        scan_id=self.scan_id,
                         repository_url=repository_url,
                         github_token=github_token,
                         fixes=accepted_fixes,
@@ -480,9 +572,9 @@ class RemediationTrackRunner(RunnerBase):
             if pr.success:
                 await self._send_message("success", f"Remediation PR created: {pr.pr_url}")
             else:
-                await self._send_message("warning", pr.message)
+                return await self._terminate(f"Pull request was not created: {pr.message}")
         except Exception as exc:
-            await self._send_message("warning", f"PR creation failed: {exc}")
+            return await self._terminate(f"Pull request creation failed: {type(exc).__name__}. Saved patches remain available; check the GitHub connection and repository permissions.")
 
         await self._send_message(
             "success",
@@ -491,7 +583,10 @@ class RemediationTrackRunner(RunnerBase):
         return True
 
     async def _wait_for_action(self) -> str:
+        if self._pending_action is None:
+            self._command_event.clear()
+            await self._command_event.wait()
+        action = self._pending_action or ""
         self._pending_action = None
         self._command_event.clear()
-        await self._command_event.wait()
-        return self._pending_action or ""
+        return action

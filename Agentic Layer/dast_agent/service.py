@@ -16,6 +16,37 @@ from dast_agent.nodes import _SCANNERS
 from dast_agent.state import DASTAgentState
 
 
+def _settle_successful_dast_usage(context: Any, state: DASTAgentState) -> None:
+    """DAST has its own successful-run rate, independent of the base scan."""
+    organization_id = str(getattr(context, "organization_id", "") or "").strip()
+    scan_id = str(state.get("scan_id") or "").strip()
+    if not organization_id or not scan_id:
+        return
+    try:
+        from product_usage import settle_product_usage
+
+        result = settle_product_usage(
+            kind="dast",
+            outcome="succeeded",
+            organization_id=organization_id,
+            user_id=str(getattr(context, "user_id", "") or "").strip() or None,
+            project_id=str(state.get("project_id") or "").strip() or None,
+            run_id=scan_id,
+        )
+        store.write_checkpoint(scan_id, "usage_settlement", {
+            "settled": bool(result.get("ok")),
+            "credits": result.get("credits") if result.get("ok") else None,
+            "reason": result.get("reason") if result.get("ok") else result.get("error"),
+        })
+    except Exception as exc:
+        # Metering has a durable idempotency key. Preserve the successful ZAP
+        # result and expose that the ledger delivery needs reconciliation.
+        store.write_checkpoint(scan_id, "usage_settlement", {
+            "settled": False,
+            "reason": f"Billing settlement unavailable: {type(exc).__name__}.",
+        })
+
+
 def _connector_url() -> str:
     return (
         os.getenv("CONNECTOR_URL", "").strip()
@@ -145,6 +176,7 @@ def execute_dast_scan(
 
     status = str((final or {}).get("scan_status") or "")
     if status == "completed":
+        _settle_successful_dast_usage(context, state)
         return True, ""
     errors = list((final or {}).get("errors") or [])
     code = str((final or {}).get("authorization_code") or "")

@@ -193,7 +193,14 @@ test('plan confirmation is not treated as a live apply', () => {
     uiPhase: 'starting',
     requiresPlanConfirmation: false,
     result: planResult,
-  }), true);
+  }), false);
+  for (const uiPhase of ['waiting_api', 'reconciling', 'starting']) {
+    assert.equal(isLiveDeployAttempt({ status: 'running', uiPhase, result: planResult }), false);
+    assert.equal(isLiveDeployAttempt({
+      status: 'running', uiPhase,
+      result: { status: 'applying', requires_plan_confirmation: false },
+    }), true);
+  }
 });
 
 test('real instance ids reject placeholders used before apply', () => {

@@ -1,4 +1,5 @@
-import { reserveSecurityCost, settleSecurityCost } from './security-run-budget';
+import { paidRemediationModel } from './remediation-platform-models';
+import { reserveSecurityCost, settleSecurityCost, securityPaidAllowed } from './security-run-budget';
 import { fitSecurityRequest, reserveSecurityRequest, coolSecurityRequest } from './security-request-budget';
 import { randomUUID } from 'node:crypto';
 import { query } from '@/lib/db';
@@ -18,6 +19,7 @@ import { defaultRoutingPolicy, rankModels, resolveRoutingPolicy } from './routin
 import { getProviderHealthMap, recordProviderHealth } from './health';
 import { estimateCost, platformMeteringCostUsd, recordUsage } from './metering';
 import { canonicalizeRequestedModel } from './model-resolution';
+import { deploymentGlmModel } from './security-model-catalog';
 import { redactUnknown } from './redact';
 import {
   InsufficientOrganizationCreditsError,
@@ -61,8 +63,9 @@ function backoff(attempt: number): number {
 }
 
 function isStrictRemediation(request: NormalizedChatRequest): boolean {
-  return request.metadata?.product === 'security'
-    && ['remediation', 'openwiki'].includes(String(request.metadata?.stage));
+  return (request.metadata?.product === 'security'
+    && ['remediation', 'openwiki'].includes(String(request.metadata?.stage)))
+    || (request.metadata?.product === 'uiux' && request.metadata?.stage === 'editing');
 }
 
 /** Remediation must never surface an upstream schema/auth 400/401 to the UI. */
@@ -71,12 +74,12 @@ function securityProviderError(error: AiPlatformError): AiPlatformError {
     return error;
   }
   return new AiPlatformError(
-    'PROVIDER_UNAVAILABLE',
-    'Platform OpenRouter remediation capacity is temporarily unavailable; retry shortly.',
+    error.code,
+    'Platform inference request could not be accepted. Check service configuration and request limits.',
     {
-      status: 503,
+      status: error.status,
       providerId: 'openrouter',
-      retryable: true,
+      retryable: false,
       sanitizedProviderDetail: error.sanitizedProviderDetail,
       detail: error.detail,
     },
@@ -214,6 +217,8 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
   const started = Date.now();
   const accessMode = request.accessMode || defaultAccessMode();
   const remediation = isStrictRemediation(request);
+  const glmDeployment = request.metadata?.product === 'deployment'
+    && ['deployment_requirements', 'deployment_service_plan'].includes(String(request.metadata?.stage || ''));
   if (remediation && (accessMode !== 'platform' || request.ephemeralApiKey)) {
     throw new AiPlatformError('POLICY_DENIED', 'Security remediation uses the platform OpenRouter credential only');
   }
@@ -243,9 +248,16 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
   if (remediation) {
     const template = (await listModels())[0];
     if (!template) throw new AiPlatformError('MODEL_NOT_FOUND', 'Model catalog is empty');
-    models = [openRouterFreeRemediationModel(template)];
+    const paid = request.metadata?.product === 'security' && request.metadata?.stage === 'remediation'
+      && await securityPaidAllowed(request.metadata?.remediation_run_id, context.userId, context.organizationId);
+    models = [paid ? paidRemediationModel(template) : openRouterFreeRemediationModel(template)];
   }
   const health = await getProviderHealthMap();
+  if (glmDeployment) {
+    const template = (await listModels())[0];
+    if (!template) throw new AiPlatformError('MODEL_NOT_FOUND', 'Model catalog is empty');
+    models = [await deploymentGlmModel(template)];
+  }
   const ephemeralProvider = request.ephemeralProvider || (request.ephemeralApiKey ? canonicalizeProviderId(String(request.metadata?.provider || '')) || undefined : undefined);
   const available = await providersWithCredentials(
     context.userId,
@@ -254,7 +266,7 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
     context.organizationId,
   );
   const ranked = rankModels({
-    requested: remediation ? DEFAULT_REMEDIATION_PLATFORM_MODEL : canonicalizeRequestedModel(request.model, models),
+    requested: remediation ? models[0].providerModelId : canonicalizeRequestedModel(request.model, models),
     models,
     policy,
     routing,
@@ -268,8 +280,8 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
     reason: item.skipReason || 'Skipped',
   }));
 
-  const chain = ranked.ranked.slice(0, request.metadata?.stage === 'openwiki' ? 1 : remediation ? 3 : isFeatureEnabled('ai_fallback') && policy.fallbackAllowed ? 4 : 1);
-  if (routing.fallbackModelId && !remediation) {
+  const chain = ranked.ranked.slice(0, glmDeployment || request.metadata?.stage === 'openwiki' ? 1 : remediation ? 3 : isFeatureEnabled('ai_fallback') && policy.fallbackAllowed ? 4 : 1);
+  if (routing.fallbackModelId && !remediation && !glmDeployment) {
     const fallback = models.find((model) => model.id === routing.fallbackModelId);
     if (fallback && !chain.some((item) => item.model.id === fallback.id)) {
       chain.push({ model: fallback, score: 0, reasons: ['Configured fallback'] });
@@ -351,7 +363,10 @@ export async function executeChat(
       continue;
     }
 
-    const maximumAttempts = isStrictRemediation(request) ? 1 : 3;
+    // A completed generation remains capped by the workflow. These are only
+    // transport-level attempts for one logical call, including an empty 2xx
+    // provider response, and stay inside the shared request/quota boundary.
+    const maximumAttempts = 3;
     for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
       let reservation: CreditReservation | null = null;
       let providerCompleted = false;
@@ -391,9 +406,11 @@ export async function executeChat(
           });
         }
         if (isStrictRemediation(request)) {
-          await reserveSecurityRequest(credential.secret, dispatch.upstreamModelId);
-          securityReserved = ((openRouterBudget?.reservedTokens || 0) * (candidate.model.pricing.inputPerMillionUsd || 0)
-            + (boundedRequest.maxTokens || 4096) * (candidate.model.pricing.outputPerMillionUsd || 0)) / 1e6;
+          if (!candidate.model.metadata?.security_paid_remediation) await reserveSecurityRequest(credential.secret, dispatch.upstreamModelId);
+          securityReserved = ((candidate.model.metadata?.security_paid_remediation
+            ? Buffer.byteLength(JSON.stringify([request.messages, request.tools || [], request.responseFormat || {}]), 'utf8') + 4096
+            : openRouterBudget?.reservedTokens || 0) * (candidate.model.pricing.inputPerMillionUsd || 0)
+            + ((boundedRequest.maxTokens || 4096) + (candidate.model.metadata?.security_paid_remediation ? 512 : 0)) * (candidate.model.pricing.outputPerMillionUsd || 0)) / 1e6;
           await reserveSecurityCost(securityRunId, context.userId, securityReserved);
         }
         const result = await adapter.chat({
@@ -404,6 +421,7 @@ export async function executeChat(
           maxTokens: boundedRequest.maxTokens || policy.maxTokenLimit || undefined,
           tools: request.tools,
           responseFormat: boundedRequest.responseFormat,
+          signal: isStrictRemediation(request) ? AbortSignal.timeout(600_000) : undefined,
         });
         providerCompleted = true;
         if (request.task === 'security_analysis') {
@@ -418,7 +436,10 @@ export async function executeChat(
           ? platformMeteringCostUsd(candidate.model, result.usage)
           : cost.providerCostUsd;
         if (securityReserved) {
-          await settleSecurityCost(securityRunId, securityReserved, cost.providerCostUsd);
+          const measuredCost = result.usage.estimated ? securityReserved
+            : (result.usage.inputTokens * (candidate.model.pricing.inputPerMillionUsd || 0)
+              + (result.usage.outputTokens + result.usage.reasoningTokens) * (candidate.model.pricing.outputPerMillionUsd || 0)) / 1e6;
+          await settleSecurityCost(securityRunId, securityReserved, measuredCost);
           securityReserved = 0;
         }
         const billedCost = billedProviderCostUsd !== cost.providerCostUsd
@@ -444,6 +465,7 @@ export async function executeChat(
           provider: candidate.model.providerId,
           credentialSource: credential.source,
           output: result.text,
+          reasoningDetails: result.reasoningDetails,
           toolCalls: result.toolCalls,
           finishReason: result.finishReason,
           usage: result.usage,
@@ -520,12 +542,18 @@ export async function executeChat(
         const normalized = isStrictRemediation(request) ? securityProviderError(upstreamError) : upstreamError;
         lastError = normalized;
         if (isStrictRemediation(request)) {
-          await coolSecurityRequest(credential.secret, dispatch.upstreamModelId, upstreamError);
-          if (upstreamError.detail?.quotaScope === 'account') throw normalized;
+          if (!candidate.model.metadata?.security_paid_remediation) await coolSecurityRequest(credential.secret, dispatch.upstreamModelId, upstreamError);
+          // Short account windows are queued through the same reservation
+          // boundary; long/daily exhaustion remains an explicit pause.
+          if (upstreamError.detail?.quotaScope === 'account'
+            && (upstreamError.code === 'QUOTA_EXCEEDED' || Number(upstreamError.detail?.retryAfterSeconds) > 65)) throw normalized;
         }
         if (isStrictRemediation(request) && (providerCompleted || !['RATE_LIMIT', 'PROVIDER_UNAVAILABLE', 'TIMEOUT'].includes(normalized.code))) throw normalized;
         retryCount += 1;
-        const delay = providerCompleted || isStrictRemediation(request) ? null : retryDelayMs(normalized, attempt, waitedMs);
+        // Strict remediation uses the same bounded retry policy as every
+        // gateway call. This honors Retry-After while avoiding retrying a
+        // completed generation or an invalid request.
+        const delay = providerCompleted ? null : retryDelayMs(normalized, attempt, waitedMs);
         if (delay !== null) {
           waitedMs += delay;
           await sleep(delay);
@@ -870,12 +898,15 @@ async function persistLog(input: {
   }
 }
 
-export function toGatewayMessages(messages: Array<{ role: string; content: string }>, system?: string): ChatMessage[] {
+export function toGatewayMessages(messages: Array<{ role: string; content: string; toolCallId?: string; toolCalls?: ChatMessage['toolCalls']; reasoningDetails?: unknown[] }>, system?: string): ChatMessage[] {
   const next: ChatMessage[] = [];
   if (system) next.push({ role: 'system', content: system });
   for (const message of messages) {
     const role = message.role === 'assistant' || message.role === 'system' || message.role === 'tool' ? message.role : 'user';
-    next.push({ role, content: message.content });
+    next.push({ role, content: message.content || '',
+      ...(role === 'tool' && message.toolCallId ? { toolCallId: message.toolCallId } : {}),
+      ...(role === 'assistant' && message.toolCalls ? { toolCalls: message.toolCalls } : {}),
+      ...(role === 'assistant' && message.reasoningDetails ? { reasoningDetails: message.reasoningDetails } : {}) });
   }
   return next;
 }

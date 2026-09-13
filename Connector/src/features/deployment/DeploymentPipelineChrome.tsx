@@ -30,6 +30,10 @@ import {
 import {
   WorkspaceNav,
 } from '@/features/workspace/WorkspaceNav';
+import {
+  DEPLOYMENT_PROVIDER_OPTIONS,
+  type DeploymentProviderId,
+} from '@/lib/deployment-providers';
 
 export type PipelineStageId =
   | 'analysis'
@@ -130,12 +134,16 @@ export function DeploymentPipelineHeader({
   projects,
   selectedProjectId,
   onSelectProject,
+  selectedProvider,
+  onSelectProvider,
   onRestart,
   restartDisabled,
 }: {
   projects: Array<{ id: string; name: string }>;
   selectedProjectId: string | null;
   onSelectProject: (projectId: string) => void;
+  selectedProvider: DeploymentProviderId;
+  onSelectProvider: (provider: DeploymentProviderId) => void;
   onRestart: () => void;
   restartDisabled?: boolean;
 }) {
@@ -149,38 +157,77 @@ export function DeploymentPipelineHeader({
           Deployment
         </h1>
       </div>
-      <div className="flex shrink-0 items-center gap-2">
-        {projects.length > 0 ? (
-          <label className="relative">
-            <span className="sr-only">Select repository</span>
-            <GitBranch className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-neutral-500" />
-            <select
-              value={selectedProjectId || ''}
-              onChange={(event) => {
-                const next = event.target.value.trim();
-                if (next) onSelectProject(next);
-              }}
-              className={`h-9 min-w-56 appearance-none rounded-none border-[3px] border-black bg-white pl-8 pr-8 text-[13px] text-black ${focusRing}`}
-            >
-              {!selectedProjectId ? <option value="">Select repository</option> : null}
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                </option>
-              ))}
-            </select>
-            <ChevronRight className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 rotate-90 text-neutral-500" />
-          </label>
-        ) : null}
-        <button
-          type="button"
-          onClick={onRestart}
-          disabled={restartDisabled}
-          className={`inline-flex h-9 items-center gap-2 rounded-none border-[3px] border-black bg-white px-3 text-[13px] font-bold text-black shadow-[4px_4px_0_0_#000] transition-transform hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none disabled:cursor-not-allowed disabled:opacity-40 ${focusRing}`}
-        >
-          <RotateCcw className="h-3.5 w-3.5" />
-          Restart
-        </button>
+      <div className="flex shrink-0 flex-wrap items-end justify-end gap-3">
+        <div>
+          <p className="mb-1.5 font-mono text-[10px] font-medium uppercase tracking-[0.16em] text-neutral-500">
+            Cloud provider
+          </p>
+          <div className="flex flex-wrap gap-1.5" role="group" aria-label="Cloud provider">
+            {DEPLOYMENT_PROVIDER_OPTIONS.map((provider) => {
+              const selected = provider.id === selectedProvider;
+              const unavailable = !provider.available;
+              return (
+                <button
+                  key={provider.id}
+                  type="button"
+                  aria-pressed={selected}
+                  disabled={unavailable}
+                  title={unavailable ? `${provider.label} deployment is coming soon.` : 'AWS is ready for deployment.'}
+                  onClick={() => onSelectProvider(provider.id)}
+                  className={[
+                    'inline-flex h-9 items-center gap-1.5 rounded-none border-[3px] px-2.5 text-[12px] font-bold transition',
+                    selected
+                      ? 'border-black bg-black text-white'
+                      : 'border-neutral-300 bg-white text-neutral-500',
+                    unavailable
+                      ? 'cursor-not-allowed opacity-60'
+                      : `hover:bg-neutral-100 ${focusRing}`,
+                  ].join(' ')}
+                >
+                  <span>{provider.label}</span>
+                  {unavailable ? (
+                    <span className="border border-current px-1 py-0.5 font-mono text-[8px] font-medium uppercase tracking-[0.08em]">
+                      Coming soon
+                    </span>
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {projects.length > 0 ? (
+            <label className="relative">
+              <span className="sr-only">Select repository</span>
+              <GitBranch className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-neutral-500" />
+              <select
+                value={selectedProjectId || ''}
+                onChange={(event) => {
+                  const next = event.target.value.trim();
+                  if (next) onSelectProject(next);
+                }}
+                className={`h-9 min-w-56 appearance-none rounded-none border-[3px] border-black bg-white pl-8 pr-8 text-[13px] text-black ${focusRing}`}
+              >
+                {!selectedProjectId ? <option value="">Select repository</option> : null}
+                {projects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+              <ChevronRight className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 rotate-90 text-neutral-500" />
+            </label>
+          ) : null}
+          <button
+            type="button"
+            onClick={onRestart}
+            disabled={restartDisabled}
+            className={`inline-flex h-9 items-center gap-2 rounded-none border-[3px] border-black bg-white px-3 text-[13px] font-bold text-black shadow-[4px_4px_0_0_#000] transition-transform hover:translate-x-0.5 hover:translate-y-0.5 hover:shadow-none disabled:cursor-not-allowed disabled:opacity-40 ${focusRing}`}
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+            Restart
+          </button>
+        </div>
       </div>
     </div>
   );

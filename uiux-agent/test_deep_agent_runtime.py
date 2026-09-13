@@ -13,6 +13,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "ROOT", tmp_path)
     monkeypatch.setenv("DEPLAI_SERVICE_KEY", "test-service-key")
     monkeypatch.setenv("OPENROUTER_API_KEY", "platform-test-key")
+    monkeypatch.setenv("UIUX_CONNECTOR_URL", "http://connector:3000")
     runtime.ACTIVE.clear()
     with TestClient(runtime.app) as client:
         client.headers["X-API-Key"] = "test-service-key"
@@ -182,13 +183,18 @@ def test_graph_dynamically_discovers_and_edits_unseeded_file(client, monkeypatch
     assert run["changes"][0]["path"] == "src/Card.tsx"
 
 
-def test_graph_with_mock_planner_editor_reviewer(client, monkeypatch):
+@pytest.mark.parametrize('review', [
+    {'approved': True, 'conflicts': [], 'warnings': []},
+    {'approved': 'false', 'conflicts': [], 'warnings': []},
+    {'approved': True, 'conflicts': 'hidden conflict', 'warnings': []},
+])
+def test_graph_with_mock_planner_editor_reviewer(client, monkeypatch, review):
     outputs = iter([
         {"content": "Inspect component and adjust color"},
         {"tool_calls": [{"id": "read", "function": {"name": "read_file", "arguments": json.dumps({"path": "src/app/page.tsx"})}}]},
         {"tool_calls": [{"id": "edit", "function": {"name": "edit_file", "arguments": json.dumps({"path": "src/app/page.tsx", "old": 'className="red"', "new": 'className="blue"'})}}]},
         {"tool_calls": [{"id": "done", "function": {"name": "finish", "arguments": json.dumps({"summary": "Updated text color"})}}]},
-        {"content": '{"approved":true,"conflicts":[],"warnings":[]}'},
+        {"content": json.dumps(review)},
     ])
     async def complete(client, budget, messages, tools=None, output_limit=3000):
         return next(outputs)
@@ -197,6 +203,12 @@ def test_graph_with_mock_planner_editor_reviewer(client, monkeypatch):
     run = {**record(), "status": "queued", "warnings": [], "conflicts": [], "changes": []}
     runtime.persist(run)
     asyncio.run(runtime.run_job(run, request))
+    if type(review['approved']) is not bool or not isinstance(review['conflicts'], list):
+        assert run['status'] == 'failed'
+        assert run['changes'] == []
+        assert run['draft_changes']
+        assert 'invalid contract' in run['error']
+        return
     assert run["status"] == "completed"
     assert len(run["changes"]) == 1
     assert 'className="blue"' in run["changes"][0]["after"]
@@ -227,6 +239,7 @@ def test_css_only_reviewer_rejection_is_advisory(client, monkeypatch):
 
 @pytest.mark.parametrize("approved", [True, False])
 def test_step_exhaustion_reviews_existing_edits_without_bypassing_reviewer(client, monkeypatch, approved):
+    monkeypatch.setattr(runtime, "MAX_STEPS", 12)
     outputs = iter([
         {"content": "Update styling"},
         {"tool_calls": [{"id": "read", "function": {"name": "read_file", "arguments": json.dumps({"path": "src/app/page.tsx"})}}]},
@@ -256,7 +269,112 @@ def test_failure_is_terminal_and_sanitized(client, monkeypatch):
     assert "secret" not in run["error"]
 
 
+def test_failed_review_preserves_unapproved_draft(client, monkeypatch):
+    draft = {"path": "app.css", "before": "a{color:red}", "after": "a{color:blue}"}
+    async def fail(run, request):
+        run["draft_changes"] = [draft]
+        raise RuntimeError("Model capacity unavailable")
+    monkeypatch.setattr(runtime, "execute_graph", fail)
+    run = {**record(), "status": "queued", "changes": []}
+    asyncio.run(runtime.run_job(run, runtime.RunInput(**payload())))
+    assert run["status"] == "failed"
+    assert run["changes"] == []
+    assert run["draft_changes"] == [draft]
+    assert run["validation_status"] == "pending"
+
+
+def test_review_feedback_repairs_saved_draft_against_original_baseline(client, monkeypatch):
+    def call(name, **args):
+        return {'tool_calls': [{'id': name, 'function': {'name': name, 'arguments': json.dumps(args)}}]}
+    outputs = iter([
+        {'content': 'Change color'}, call('read_file', path='src/app/page.tsx'),
+        call('edit_file', path='src/app/page.tsx', old='red', new='blue'), call('finish', summary='Blue'),
+        {'content': '{"approved":false,"conflicts":["Use green instead"],"warnings":[]}'},
+        {'content': 'Correct color from saved draft'}, call('read_file', path='src/app/page.tsx'),
+        call('edit_file', path='src/app/page.tsx', old='blue', new='green'), call('finish', summary='Green'),
+        {'content': '{"approved":true,"conflicts":[],"warnings":[]}'},
+    ])
+    prompts = []
+    async def complete(client, budget, messages, tools=None, output_limit=3000):
+        prompts.append(json.dumps(messages))
+        return next(outputs)
+    monkeypatch.setattr(runtime, 'completion', complete)
+    run = {**record(), 'status': 'queued', 'warnings': [], 'conflicts': [], 'changes': []}
+    runtime.persist(run)
+    asyncio.run(runtime.run_job(run, runtime.RunInput(**payload())))
+    assert run['status'] == 'completed'
+    assert run['changes'][0]['before'] == payload()['files'][0]['content']
+    assert 'className="green"' in run['changes'][0]['after']
+    assert 'Use green instead' in prompts[5]
+    assert any(event['type'] == 'repairing' for event in run['events'])
+
+
+def test_compaction_preserves_tool_pairing_and_recent_content():
+    messages = [{"role": "system", "content": "scope"}, {"role": "user", "content": "task"}]
+    for i in range(40):
+        messages += [{"role": "assistant", "tool_calls": [{"id": str(i), "function": {
+            "name": "read_file", "arguments": json.dumps({"path": f"src/file{i}.tsx", "offset": 12000})}}]},
+                     {"role": "tool", "tool_call_id": str(i), "content": "x" * 12000}]
+    runtime.compact_tool_history(messages)
+    assert 'compacted' in messages[3]['content']
+    assert messages[-1]['content'] == 'x' * 12000
+    assert messages[2]['tool_calls'][0]['id'] == messages[3]['tool_call_id']
+    summary = json.loads(messages[3]['content'])
+    assert summary['path'] == 'src/file0.tsx'
+    assert summary['offset'] == 12000
+    assert summary['characters'] == 12000
+    assert len(summary['sha256']) == 64
+
+
+def test_compaction_keeps_edit_results_and_rejections():
+    messages = [{'role': 'system', 'content': 'scope'}, {'role': 'user', 'content': 'task'}]
+    for index, name in enumerate(['edit_file', 'read_file'] * 20):
+        content = ('Edit confirmed: ' if name == 'edit_file' else 'Tool rejected: ') + 'x' * 12000
+        messages.extend([{'role': 'assistant', 'tool_calls': [{'id': str(index), 'function': {
+            'name': name, 'arguments': '{"path":"app.tsx"}'}}]},
+            {'role': 'tool', 'tool_call_id': str(index), 'content': content}])
+    before = json.dumps(messages)
+    runtime.compact_tool_history(messages)
+    assert json.dumps(messages) == before
+
+
+@pytest.mark.parametrize('reported', [{}, {'prompt_tokens': 0, 'completion_tokens': 0},
+                                     {'prompt_tokens': 10}])
+def test_unknown_usage_retains_reserved_budget(reported):
+    run = record()
+    budget = runtime.Budget(run)
+    reserved = budget.reserve([{'role': 'user', 'content': 'Inspect the source'}], 1000)
+    budget.reconcile(reserved, reported)
+    assert run['usage']['budget_tokens'] == reserved
+
+
+def test_product_inference_uses_shared_gateway_and_preserves_tool_ids(client, monkeypatch):
+    monkeypatch.setenv('UIUX_CONNECTOR_URL', 'http://connector:3000')
+    run = {**record(), 'user_id': 'owner', 'organization_id': 'org'}
+    messages = [{'role': 'assistant', 'content': '', 'tool_calls': [
+        {'id': 'call-one', 'function': {'name': 'read_file', 'arguments': '{}'}}]},
+        {'role': 'tool', 'tool_call_id': 'call-one', 'content': 'source'}]
+    async def handler(request):
+        assert str(request.url) == 'http://connector:3000/api/ai/chat'
+        body = json.loads(request.content)
+        assert body['metadata']['product'] == 'uiux'
+        assert body['messages'][0]['toolCalls'][0]['id'] == 'call-one'
+        assert body['messages'][1]['toolCallId'] == 'call-one'
+        assert request.headers['x-deplai-organization-id'] == 'org'
+        return httpx.Response(200, json={'output': '', 'toolCalls': [
+            {'id': 'call-two', 'name': 'finish', 'arguments': '{}'}],
+            'usage': {'inputTokens': 12, 'outputTokens': 3}})
+    async def perform():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+            return await runtime.completion(transport, runtime.Budget(run), messages)
+    result = asyncio.run(perform())
+    assert result['tool_calls'][0]['id'] == 'call-two'
+    assert run['usage']['input_tokens'] == 12
+
+
 def test_rate_retry_uses_openrouter_free_router(client, monkeypatch):
+    # Exercise the isolated adapter helper, never the product inference path.
+    monkeypatch.delenv('UIUX_CONNECTOR_URL', raising=False)
     run = record()
     runtime.persist(run)
     runtime.COOLDOWNS.clear()
@@ -288,6 +406,14 @@ def test_rate_retry_uses_openrouter_free_router(client, monkeypatch):
     assert sent[0] == "openrouter/free"
     assert len(sent) == 2
     assert run["usage"]["requests"] == 2
+
+
+def test_product_requires_gateway_but_no_worker_provider_key(client, monkeypatch):
+    monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
+    assert client.get('/uiux/health').json()['configured'] is True
+    monkeypatch.delenv('UIUX_CONNECTOR_URL', raising=False)
+    assert client.get('/uiux/health').json()['configured'] is False
+    assert client.post('/uiux/runs', json=payload()).status_code == 503
 
 
 def test_request_id_replay_checks_inputs_and_owner(client, monkeypatch):

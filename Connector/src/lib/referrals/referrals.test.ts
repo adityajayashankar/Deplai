@@ -13,6 +13,7 @@ import {
 } from './logic';
 import { getReferralProgramConfig } from './config';
 import {
+  REFERRAL_CODE_MAX_LENGTH,
   generateReferralCode,
   isLegacyReferralCode,
   isModernReferralCode,
@@ -20,6 +21,7 @@ import {
   referralTagFromIdentity,
   verifyReferralCodeMatchesUser,
 } from './codes';
+import { REFERRAL_ATTRIBUTION_CODE_MAX_LENGTH } from './schema';
 
 describe('referral code generation', () => {
   it('builds a username tag with cryptographic suffix', () => {
@@ -34,6 +36,11 @@ describe('referral code generation', () => {
     assert.equal(isRecognizedReferralCode(code), true);
     assert.equal(verifyReferralCodeMatchesUser(code, 'user-123'), true);
     assert.equal(verifyReferralCodeMatchesUser(code, 'other-user'), false);
+    assert.ok(code.length <= REFERRAL_ATTRIBUTION_CODE_MAX_LENGTH);
+  });
+
+  it('keeps referral attribution storage aligned with the generated-code limit', () => {
+    assert.equal(REFERRAL_ATTRIBUTION_CODE_MAX_LENGTH, REFERRAL_CODE_MAX_LENGTH);
   });
 
   it('still recognizes legacy DPL codes during migration', () => {
@@ -73,11 +80,11 @@ describe('referral economics', () => {
   it('computes referrer reward credits from plan catalog', () => {
     assert.equal(
       computeReferrerRewardCredits({ planId: 'starter_20', cadence: 'monthly', rewardPercent: 20 }),
-      20,
+      5,
     );
     assert.equal(
       computeReferrerRewardCredits({ planId: 'pro_50', cadence: 'yearly', rewardPercent: 20 }),
-      50,
+      12,
     );
     assert.equal(
       computeReferrerRewardCredits({ planId: 'free', cadence: 'monthly', rewardPercent: 20 }),

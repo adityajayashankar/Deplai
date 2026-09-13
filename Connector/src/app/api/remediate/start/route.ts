@@ -1,13 +1,14 @@
-import { DEFAULT_REMEDIATION_PLATFORM_MODEL } from '@/lib/ai-platform/remediation-platform-models';
+import { registerSecurityBudget } from '@/lib/ai-platform/security-run-budget';
+import { configuredRemediationModel, PAID_REMEDIATION_MODEL } from '@/lib/ai-platform/remediation-platform-models';
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuth } from '@/lib/auth';
 import { AGENTIC_URL, agenticHeaders, formatAgenticFetchError } from '@/lib/agentic';
 import { resolveAgenticBillingContext } from '@/lib/agentic-context';
 import { query } from '@/lib/db';
 import { githubService } from '@/lib/github';
+import { denyUnlessPlanFeature } from '@/lib/billing/plan-access-guard';
 import {
   findLatestSession,
-  isReusableSecuritySession,
   resolveOrCreateSession,
   tryAppendSessionLogs,
 } from '@/lib/sessions/store';
@@ -65,11 +66,15 @@ export async function POST(request: NextRequest) {
     const { user, error } = await requireAuth();
     if (error) return error;
 
+    const denied = await denyUnlessPlanFeature(request, user, 'security_automation');
+    if (denied) return denied;
+
     const billing = await resolveAgenticBillingContext({ request, user });
 
     const {
       project_id,
       github_token,
+      resume_publication,
     } = await request.json();
     const runtimeGithubToken =
       typeof github_token === 'string' && github_token.trim().length > 0
@@ -84,17 +89,22 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
     }
 
-    // The OpenRouter free router owns upstream model selection. Ignore a model
-    // value sent by older browser sessions so remediation can never be routed
-    // to a selected catalog model, BYOK credential, or paid fallback.
+    // Operator-selected remediation model; never trust a browser model override.
+    // Paid execution additionally requires a scoped, capped run registration.
     const llmFields = {
       llm_provider: 'openrouter',
       llm_api_key: null,
-      llm_model: DEFAULT_REMEDIATION_PLATFORM_MODEL,
+      llm_model: configuredRemediationModel(),
       llm_access_mode: 'platform',
       llm_credential_id: null,
     };
 
+    if (llmFields.llm_model === PAID_REMEDIATION_MODEL) {
+      const cap = Number(process.env.SECURITY_REMEDIATION_MAX_USD);
+      if (!Number.isFinite(cap) || cap <= 0 || cap > 2) {
+        return NextResponse.json({ error: 'Paid remediation requires a positive spending cap of at most US$2 per run.' }, { status: 503 });
+      }
+    }
     const projectRows = await query<ProjectRow[]>(
       `SELECT
         p.id,
@@ -123,7 +133,7 @@ export async function POST(request: NextRequest) {
         if (!project.repo_full_name || !project.installation_uuid) {
           return NextResponse.json({ error: 'GitHub project metadata is incomplete' }, { status: 400 });
         }
-        const token = runtimeGithubToken || await githubService.getInstallationToken(project.installation_uuid);
+        const token = runtimeGithubToken || await githubService.getInstallationTokenForRemediation(project.installation_uuid);
         usedInstallationToken = !runtimeGithubToken;
         if (runtimeGithubToken) {
           await validateGitHubTokenOwnership(runtimeGithubToken, user.login);
@@ -171,7 +181,7 @@ export async function POST(request: NextRequest) {
       if (ghRepo.user_id !== user.id) {
         return NextResponse.json({ error: 'Forbidden: You do not own this repository' }, { status: 403 });
       }
-      const token = runtimeGithubToken || await githubService.getInstallationToken(ghRepo.installation_uuid);
+      const token = runtimeGithubToken || await githubService.getInstallationTokenForRemediation(ghRepo.installation_uuid);
       usedInstallationToken = !runtimeGithubToken;
       if (runtimeGithubToken) {
         await validateGitHubTokenOwnership(runtimeGithubToken, user.login);
@@ -190,6 +200,7 @@ export async function POST(request: NextRequest) {
       };
     }
 
+    backendPayload = { ...backendPayload, resume_publication: resume_publication === true };
     let response: Response;
     try {
       response = await fetch(`${AGENTIC_URL}/api/remediate/validate`, {
@@ -208,6 +219,11 @@ export async function POST(request: NextRequest) {
     }
 
     const data = await response.json();
+    if (llmFields.llm_model === PAID_REMEDIATION_MODEL && resume_publication !== true) {
+      const cap = Number(process.env.SECURITY_REMEDIATION_MAX_USD);
+      if (typeof data.run_id !== 'string' || !data.run_id) throw new Error('Missing remediation run identity');
+      await registerSecurityBudget(data.run_id, user.id, true, billing.fields.organization_id, cap, PAID_REMEDIATION_MODEL);
+    }
     let workspaceSessionId: string | null = null;
     try {
       const repoLabel = String((backendPayload as { project_name?: string }).project_name || project_id);
@@ -215,20 +231,25 @@ export async function POST(request: NextRequest) {
         userId: user.id,
         projectId: String(project_id),
         service: 'security_agent',
+        externalId: String(data.run_id),
       });
       const session = await resolveOrCreateSession(
-        latest && isReusableSecuritySession(latest) ? latest.id : null,
+        latest?.id || null,
         {
           userId: user.id,
           projectId: String(project_id),
           service: 'security_agent',
-          title: latest?.title || `Security agent · ${repoLabel}`,
+          title: latest?.title || `Remediation - ${repoLabel}`,
           repo: repoLabel,
           status: 'running',
           currentStage: 'remediate_run',
           triggeredBy: user.id,
+          organizationId: billing.fields.organization_id,
+          externalId: String(data.run_id),
+          metadata: { remediation_run_id: data.run_id, organization_id: billing.fields.organization_id, remediation_model: llmFields.llm_model, max_spend_usd: llmFields.llm_model === PAID_REMEDIATION_MODEL ? Number(process.env.SECURITY_REMEDIATION_MAX_USD) : 0, retention_days_minimum: 30 },
         },
       );
+      if (!session) throw new Error('Could not create the remediation Session. Please retry.');
       if (session) {
         await tryAppendSessionLogs(session.id, [{
           level: 'info',
@@ -239,9 +260,12 @@ export async function POST(request: NextRequest) {
       }
     } catch (sessionError) {
       console.error('[sessions] remediation start hook failed', sessionError);
+      return NextResponse.json({ error: 'Could not save the remediation Session. Please retry before starting the run.' }, { status: 503 });
     }
     return NextResponse.json({
       ...data,
+      remediation_model: llmFields.llm_model,
+      max_spend_usd: llmFields.llm_model === PAID_REMEDIATION_MODEL ? Number(process.env.SECURITY_REMEDIATION_MAX_USD) : 0,
       auth_mode: usedInstallationToken ? 'installation_token' : 'user_token',
       workspace_session_id: workspaceSessionId,
     });

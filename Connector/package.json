@@ -16,6 +16,7 @@
     "migrate:credits-v2": "tsx scripts/apply-credit-wallet-v2-migration.ts",
     "migrate:credits-bonus": "tsx scripts/apply-credit-bonus-migration.ts",
     "migrate:pricing-v3": "tsx scripts/apply-pricing-v3-migration.ts",
+    "migrate:pricing-v4": "tsx scripts/apply-pricing-v4-migration.ts",
     "test:ai-platform": "tsx --test src/lib/ai-platform/*.test.ts",
     "test:profile": "tsx --test src/lib/profile/*.test.ts",
     "test:referrals": "tsx --test src/lib/referrals/*.test.ts",

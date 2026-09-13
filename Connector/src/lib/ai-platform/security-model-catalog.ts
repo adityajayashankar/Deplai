@@ -25,6 +25,25 @@ async function catalog(): Promise<CatalogRow[]> {
   return pending;
 }
 
+/** Deployment uses GLM only, with current provider metadata and normal wallet metering. */
+export async function deploymentGlmModel(template: CanonicalModel): Promise<CanonicalModel> {
+  const row = (await catalog()).find((item) => item.id === 'z-ai/glm-5.3-flash');
+  const input = row?.pricing?.prompt == null ? NaN : Number(row.pricing.prompt);
+  const output = row?.pricing?.completion == null ? NaN : Number(row.pricing.completion);
+  if (!row || ![input, output].every((value) => Number.isFinite(value) && value >= 0)
+    || !row.context_length || !row.top_provider?.max_completion_tokens) {
+    throw new AiPlatformError('MODEL_NOT_FOUND', 'GLM deployment model availability or pricing could not be verified');
+  }
+  return {
+    ...template, id: `openrouter:${row.id}`, providerId: 'openrouter', providerModelId: row.id,
+    displayName: row.name || row.id, aliases: [row.id], family: 'glm', status: 'active', lifecycle: 'ACTIVE',
+    contextWindow: row.context_length, maxOutputTokens: Math.min(4000, row.top_provider.max_completion_tokens),
+    capabilities: { ...template.capabilities, coding: true, agents: true },
+    pricing: { inputPerMillionUsd: input * 1e6, outputPerMillionUsd: output * 1e6, currency: 'USD', source: 'provider_declared' },
+    metadata: { openrouter_slug: row.id }, updatedAt: new Date().toISOString(),
+  };
+}
+
 /**
  * Remediation uses only current OpenRouter ``:free`` coding variants. Native
  * structured output is deliberately not a prerequisite: the workflow applies

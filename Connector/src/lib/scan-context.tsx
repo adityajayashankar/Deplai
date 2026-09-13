@@ -92,10 +92,11 @@ interface ScanContextValue {
     accessMode?: 'platform' | 'byok' | 'auto',
     llmCredentialId?: string,
     allowPaid?: boolean,
+    resumePublication?: boolean,
   ) => Promise<void>;
   continueRemediationRound: (projectId: string) => void;
   pushCurrentRemediationChanges: (projectId: string) => void;
-  approveRemediationPush: (projectId: string) => void;
+  approveRemediationPush: (projectId: string) => boolean;
   getRemediationState: (projectId: string) => ProjectRemediationState;
   resetRemediation: (projectId: string) => void;
   isAnyRemediating: boolean;
@@ -758,6 +759,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
     accessMode: 'platform' | 'byok' | 'auto' = 'platform',
     llmCredentialId?: string,
     allowPaid?: boolean,
+    resumePublication?: boolean,
   ) => {
     const existingRemWs = remWsRefs.current[projectId];
     if (existingRemWs && existingRemWs.readyState === WebSocket.OPEN) existingRemWs.close();
@@ -773,6 +775,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           project_id: projectId,
+          resume_publication: resumePublication === true,
           github_token: githubToken || null,
           // Remediation is platform-owned OpenRouter free-model traffic.
           // Do not send BYOK/provider fields even if an old saved UI state has
@@ -799,7 +802,14 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
         updateRemediationStatus(projectId, 'error');
         return;
       }
-      const startPayload = await res.json().catch(() => ({})) as { workspace_session_id?: string };
+      const startPayload = await res.json().catch(() => ({})) as { workspace_session_id?: string; run_id?: string; remediation_model?: string; max_spend_usd?: number };
+      if (startPayload.remediation_model) {
+        const cap = startPayload.max_spend_usd;
+        appendRemediationMessage(projectId, {
+          index: Date.now(), total: Date.now(), type: 'info', timestamp: new Date().toISOString(),
+          content: `Model: ${startPayload.remediation_model}. ${typeof cap === 'number' && cap > 0 ? `Maximum provider spend: US$${cap.toFixed(2)} per run, including retries.` : 'Free model route.'}${startPayload.run_id ? ` Run ID: ${startPayload.run_id}` : ''}`,
+        });
+      }
       const remSessionId = typeof startPayload.workspace_session_id === 'string'
         ? startPayload.workspace_session_id
         : securitySessionIdsRef.current[projectId];
@@ -952,9 +962,20 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
 
   const approveRemediationPush = useCallback((projectId: string) => {
     const ws = remWsRefs.current[projectId];
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ action: 'approve_push' }));
-  }, []);
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      appendRemediationMessage(projectId, {index:0, total:0, type:'error', content:'Approval was not sent because the connection is closed. Reconnect to the run before approving.', timestamp:new Date().toISOString()});
+      updateRemediationStatus(projectId, 'error');
+      return false;
+    }
+    try {
+      ws.send(JSON.stringify({ action: 'approve_push' }));
+      return true;
+    } catch {
+      appendRemediationMessage(projectId, {index:0, total:0, type:'error', content:'Approval could not be sent because the connection closed. Reconnect to the run before approving.', timestamp:new Date().toISOString()});
+      updateRemediationStatus(projectId, 'error');
+      return false;
+    }
+  }, [appendRemediationMessage, updateRemediationStatus]);
 
   const getRemediationState = useCallback((projectId: string): ProjectRemediationState => {
     return remediationStates[projectId] || { state: 'idle', messages: [] };
@@ -1012,6 +1033,7 @@ export function ScanProvider({ children }: { children: React.ReactNode }) {
 
   const resetRemediation = useCallback((projectId: string) => {
     const ws = remWsRefs.current[projectId];
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ action: 'cancel' }));
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) ws.close();
     delete remWsRefs.current[projectId];
     setRemediationStates(prev => {

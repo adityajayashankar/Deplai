@@ -59,8 +59,8 @@ def _default_compute_strategy(context: RepositoryContextDocument) -> str:
     application_type = _derive_application_type(context)
     if application_type == "static_site":
         return "s3_cloudfront"
-    if context.build.has_dockerfile:
-        return "ecs_fargate"
+    # Containerized applications also use the EC2 build/start delivery path by
+    # default. ECS remains an explicit reviewed requirement, not a Dockerfile inference.
     return "ec2"
 
 
@@ -430,7 +430,7 @@ def _build_adaptive_questions(context: RepositoryContextDocument, defaults: dict
     return sorted(questions, key=lambda item: item.priority, reverse=True)
 
 
-def start_architecture_review(*, project_id: str, project_name: str, project_type: str, workspace: str, user_id: str | None = None, repo_full_name: str | None = None, environment: str | None = None) -> ArchitectureReviewPayload:
+def start_architecture_review(*, project_id: str, project_name: str, project_type: str, workspace: str, user_id: str | None = None, repo_full_name: str | None = None, environment: str | None = None, use_glm: bool = False, answers: dict[str, str] | None = None, conversation: list[dict[str, str]] | None = None) -> ArchitectureReviewPayload:
     context = _load_or_build_context(
         project_id=project_id,
         project_name=project_name,
@@ -441,6 +441,13 @@ def start_architecture_review(*, project_id: str, project_name: str, project_typ
     )
     defaults = _default_answers(context, environment)
     questions = _build_adaptive_questions(context, defaults)
+    conversation_result = {}
+    if use_glm and conversation is not None:
+        from architecture_decision.llm import converse
+        conversation_result = converse(context, questions, answers or {}, conversation)
+    elif use_glm:
+        from architecture_decision.llm import personalize_questions
+        questions = personalize_questions(context, questions, answers)
     decisions = build_initial_decisions(context, defaults)
     return ArchitectureReviewPayload(
         context_json=context,
@@ -450,6 +457,7 @@ def start_architecture_review(*, project_id: str, project_name: str, project_typ
         low_confidence_items=context.low_confidence_items,
         decisions=decisions,
         planning_mode="guided",
+        **conversation_result,
     )
 
 
@@ -984,7 +992,7 @@ def _profile_to_infra_plan(profile: DeploymentProfileDocument) -> dict[str, Any]
     }
 
 
-def complete_architecture_review(*, project_id: str, project_name: str, project_type: str, workspace: str, answers: dict[str, str], user_id: str | None = None, repo_full_name: str | None = None, aws_context: AwsDiscoveryContext | dict[str, Any] | None = None) -> tuple[ArchitectureAnswersDocument, DeploymentProfileDocument, DerivedArchitectureView, dict[str, Any], dict[str, str]]:
+def complete_architecture_review(*, project_id: str, project_name: str, project_type: str, workspace: str, answers: dict[str, str], user_id: str | None = None, repo_full_name: str | None = None, aws_context: AwsDiscoveryContext | dict[str, Any] | None = None, use_glm: bool = False, conversation: list[dict[str, str]] | None = None) -> tuple[ArchitectureAnswersDocument, DeploymentProfileDocument, DerivedArchitectureView, dict[str, Any], dict[str, str]]:
     project_name = _project_slug(project_name)
     review = start_architecture_review(
         project_id=project_id,
@@ -995,6 +1003,10 @@ def complete_architecture_review(*, project_id: str, project_name: str, project_
         repo_full_name=repo_full_name,
     )
     context = review.context_json
+    service_plan = None
+    if use_glm:
+        from architecture_decision.llm import recommend_answers
+        answers, service_plan = recommend_answers(context, review.questions, answers, conversation)
     resolved_answers = dict(review.defaults)
     for key, value in answers.items():
         if value is not None and str(value).strip():
@@ -1042,6 +1054,9 @@ def complete_architecture_review(*, project_id: str, project_name: str, project_
         decisions=resolve_decisions(review.decisions, resolved_answers),
     )
     profile.candidate_architectures = estimate_candidates(profile)
+    if service_plan:
+        profile.planning_model = "z-ai/glm-5.3-flash"
+        profile.service_plan = service_plan
     profile.architecture_conflicts = critique(profile, _budget_cap_usd(resolved_answers))
     profile.warnings.extend(item.message for item in profile.architecture_conflicts if item.severity != "info")
     parsed_aws_context = (

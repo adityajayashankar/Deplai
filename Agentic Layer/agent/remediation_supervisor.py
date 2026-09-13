@@ -156,7 +156,7 @@ def _dispatch_llm(
 
     from cheap_models import resolve_cheap_model
 
-    cheap_model = resolve_cheap_model(model, access_mode="platform")
+    cheap_model = model if model == "z-ai/glm-5.3-flash" else resolve_cheap_model(model, access_mode="platform")
 
     if user_id:
         try:

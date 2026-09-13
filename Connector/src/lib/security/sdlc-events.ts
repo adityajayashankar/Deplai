@@ -4,12 +4,24 @@ import { AGENTIC_URL, agenticHeaders } from '@/lib/agentic';
 import { githubService } from '@/lib/github';
 import { listAssets, resolveAuthorizedAsset, createScanRecord } from '@/lib/dast/store';
 import { encryptSecret, decryptSecret } from '@/lib/ai-platform/crypto';
+import { getOrganizationSubscription } from '@/lib/billing/credits';
+import { planIncludesFeature } from '@/lib/billing/plan-features';
+import { isBillingEnforced } from '@/lib/ai-platform/subscription-access';
 
 export type SecurityTrigger = 'push' | 'pull_request' | 'build' | 'predeploy' | 'deployment' | 'schedule';
 const modules: Record<SecurityTrigger, string[]> = {
   push: ['secrets', 'sast'], pull_request: ['secrets', 'sast'], build: ['sbom', 'sca', 'containers'],
   predeploy: ['iac', 'kubernetes', 'cicd', 'api'], deployment: ['dast', 'cloud'], schedule: ['cloud'],
 };
+
+export function modulesForAutomaticSecurityPlan(
+  trigger: SecurityTrigger,
+  hasSecurityAutomation: boolean,
+): string[] | null {
+  if (hasSecurityAutomation) return modules[trigger];
+  // Free includes an automated basic source check when a revision changes.
+  return trigger === 'push' || trigger === 'pull_request' ? ['sast'] : null;
+}
 let ready: Promise<void> | undefined;
 async function schema() {
   return ready ??= query(`CREATE TABLE IF NOT EXISTS security_sdlc_events (
@@ -35,9 +47,9 @@ export async function enqueueGithubSecurityEvent(repositoryId: number, trigger: 
   for (const row of rows) await enqueueSecurityEvent(row.id, trigger, key, revision);
 }
 type Event = { id: string; project_id: string; trigger_name: SecurityTrigger; revision: string | null; run_id: string | null; status: string; artifacts_encrypted: string | null };
-type Repo = { full_name: string; installation_id: string; user_id: string };
+type Repo = { full_name: string; installation_id: string; user_id: string; organization_id: string | null };
 async function repoFor(projectId: string) {
-  const rows = await query<Repo[]>(`SELECT r.full_name, r.installation_id, i.user_id FROM github_repositories r
+  const rows = await query<Repo[]>(`SELECT r.full_name, r.installation_id, i.user_id, i.organization_id FROM github_repositories r
     JOIN github_installations i ON i.id = r.installation_id WHERE r.id = ? AND i.suspended_at IS NULL`, [projectId]);
   if (!rows[0]) throw new Error('No authorized GitHub repository is available for this automatic check');
   return rows[0];
@@ -72,11 +84,24 @@ export async function dispatchSecurityEvents() {
           await query("UPDATE security_sdlc_events SET status = 'completed' WHERE id = ?", [event.id]);
           continue;
         }
+        const subscription = repo.organization_id
+          ? await getOrganizationSubscription(repo.organization_id).catch(() => null)
+          : null;
+        const hasSecurityAutomation = !isBillingEnforced()
+          || planIncludesFeature(subscription?.planId || 'free', 'security_automation');
+        const enabledModules = modulesForAutomaticSecurityPlan(event.trigger_name, hasSecurityAutomation);
+        if (!enabledModules) {
+          await query(
+            "UPDATE security_sdlc_events SET status = 'not_applicable', error_text = ? WHERE id = ?",
+            ['Starter plan required for this automatic security stage.', event.id],
+          );
+          continue;
+        }
         const existing = await fetch(`${AGENTIC_URL}/api/scan/status/${event.project_id}`, { headers: agenticHeaders(), signal: AbortSignal.timeout(10_000) });
         if (existing.ok && (await existing.json()).status === 'running') continue;
         const payload: Record<string, unknown> = { project_id: event.project_id, project_name: repo.full_name.split('/')[1],
           project_type: 'github', user_id: repo.user_id, repository_url: `https://github.com/${repo.full_name}`, github_token: token,
-          enabled_modules: modules[event.trigger_name], trigger: event.trigger_name, source_revision: event.revision };
+          enabled_modules: enabledModules, trigger: event.trigger_name, source_revision: event.revision };
         if (event.artifacts_encrypted) payload.generated_files = JSON.parse(decryptSecret(event.artifacts_encrypted));
         if (event.trigger_name === 'deployment') {
           const asset = (await listAssets(repo.user_id, event.project_id)).find((item) => item.status === 'VERIFIED');

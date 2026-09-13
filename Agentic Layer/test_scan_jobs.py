@@ -87,6 +87,22 @@ class ScanJobsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(socket.events[0]['data']['content'], 'scanning')
         self.assertEqual(socket.events[-1]['status'], 'error')
 
+    async def test_settlement_receives_the_final_reported_outcome(self):
+        jobs = ScanJobs()
+        settled = []
+
+        class Runner:
+            async def run(self):
+                return True
+
+        async def on_settled(success, _runner, job):
+            settled.append((success, job.run_id))
+
+        job = jobs.start('metered-project', 'user', lambda _: Runner(), lambda: None, on_settled)
+        await job.task
+        self.assertEqual(job.status, 'completed')
+        self.assertEqual(settled, [(True, job.run_id)])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1145,7 +1145,7 @@ module "ec2" {
   associate_public_ip_address = true
   user_data_replace_on_change = true
 
-  user_data_base64 = base64encode(<<-USERDATA
+  user_data_base64 = base64gzip(<<-USERDATA
 #!/bin/bash
 # deplai_key_rotation=${var.ec2_key_rotation}
 set -euo pipefail

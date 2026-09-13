@@ -2831,7 +2831,14 @@ variable "db_security_group_id" { type = string }
 variable "cache_security_group_id" { type = string }
 variable "common_tags" { type = map(string) }
 """
-    data_main_tf = """resource "aws_db_subnet_group" "main" {
+    data_main_tf = """locals {
+  postgres_backup_retention_period = try(var.postgres_config.instance_size_tier, "") == "free_tier" ? min(
+    coalesce(try(var.postgres_config.backup_retention_period, null), try(var.postgres_config.backup_retention_days, null), 1),
+    1,
+  ) : coalesce(try(var.postgres_config.backup_retention_period, null), try(var.postgres_config.backup_retention_days, null), 7)
+}
+
+resource "aws_db_subnet_group" "main" {
   count      = var.postgres_config == null ? 0 : 1
   name       = "${var.project_name}-db-subnets"
   subnet_ids = var.private_subnet_ids
@@ -2852,7 +2859,7 @@ resource "aws_db_instance" "main" {
   password                = "ChangeMe123!"
   skip_final_snapshot     = true
   publicly_accessible     = false
-  backup_retention_period = try(var.postgres_config.backup_retention_days, 7)
+  backup_retention_period = local.postgres_backup_retention_period
   multi_az                = try(var.postgres_config.multi_az, false)
   tags                    = var.common_tags
 
@@ -2981,7 +2988,9 @@ resource "aws_ecs_task_definition" "service" {{
     name      = each.key
     image     = aws_ecr_repository.app.repository_url
     essential = true
-    command   = try(each.value.command, null)
+    # ECS requires command to be an array of strings. Profile commands are shell strings,
+    # so execute them through sh instead of serializing an invalid JSON string.
+    command = length(trimspace(try(each.value.command, ""))) > 0 ? ["sh", "-c", tostring(each.value.command)] : null
     portMappings = try(each.value.port, 0) > 0 ? [{{
       containerPort = try(each.value.port, 3000)
       hostPort      = try(each.value.port, 3000)

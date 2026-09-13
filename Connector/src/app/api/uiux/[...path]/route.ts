@@ -8,6 +8,7 @@ import { GET as listProjects } from '@/app/api/projects/route';
 import { editorPath, loadSnapshotFile, readState, saveState, snapshotRepository, UiuxError, type Snapshot } from '@/lib/uiux/snapshots';
 import { proposalPatch, verifyProposal } from '@/lib/uiux/proposals';
 import { createUiuxPullRequest, UiuxPullRequestError } from '@/lib/uiux/pull-request';
+import { settleProductUsage } from '@/lib/billing/product-usage';
 import type { UiuxRun } from '@/features/customization/uiux-workspace-types';
 
 export const runtime = 'nodejs';
@@ -156,7 +157,32 @@ async function handle(request: NextRequest, context: Context) {
       const run = verifyProposal(verifiedSnapshot, result);
       run.prompt = saved.prompt;
       run.pr_url = saved.pr_url;
-      if (request.method === 'GET' && segments.length === 2) return NextResponse.json(run);
+      if (request.method === 'GET' && segments.length === 2) {
+        let usageCharge: Record<string, unknown> | null = null;
+        if (run.status === 'completed' && access.project.organization_id) {
+          try {
+            const settlement = await settleProductUsage({
+              kind: 'uiux',
+              outcome: 'succeeded',
+              organizationId: access.project.organization_id,
+              userId,
+              projectId,
+              runId,
+              usage: result.usage || null,
+            });
+            usageCharge = {
+              status: 'settled',
+              credits: settlement.credits,
+              debited: settlement.debited,
+              duplicate: settlement.duplicate,
+            };
+          } catch (billingError) {
+            console.error('[uiux] usage settlement failed', billingError instanceof Error ? billingError.name : 'UnknownError');
+            usageCharge = { status: 'pending', error: 'Verified changes are available; credit settlement is pending.' };
+          }
+        }
+        return NextResponse.json({ ...run, usage_charge: usageCharge });
+      }
       if (run.status !== 'completed') throw new UiuxError('Only verified completed changes can be exported or published.', 409);
       if (segments[2] === 'patch' && segments.length === 3 && request.method === 'GET') return new Response(proposalPatch(run), { headers: { 'Content-Type': 'text/x-diff; charset=utf-8', 'Content-Disposition': `attachment; filename="uiux-${runId}.patch"` } });
       if (segments[2] === 'pr' && segments.length === 3 && request.method === 'POST') {

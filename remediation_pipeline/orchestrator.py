@@ -34,6 +34,7 @@ from remediation_pipeline.noise_triage import (
 from remediation_pipeline.router import LLMRouter
 from remediation_pipeline.supervisor_bridge import _supervisor_enabled, run_supervised_remediation
 from remediation_pipeline.validator import DiffValidator
+from remediation_pipeline.patch_assembly import assemble_patches
 from utils import CODEBASE_VOLUME, get_docker_client, resolve_host_projects_dir
 
 _SUPPORTED_DETERMINISTIC_SCA_FILES = {"package.json", "requirements.txt", "go.mod"}
@@ -81,7 +82,7 @@ class RemediationOrchestrator:
         from utils import clear_repo_file_cache
         clear_repo_file_cache()
 
-        vulnerabilities = self.ingester.ingest(project_id)
+        vulnerabilities = apply_heuristic_noise_triage(self.ingester.ingest(project_id)).keep
         from remediation_pipeline.remediation_store import remediation_runs
         # Defense in depth for direct callers that bypass request normalization.
         selected = [v for v in vulnerabilities if v.severity in {"critical", "high"}]
@@ -108,7 +109,7 @@ class RemediationOrchestrator:
         selected_groups = self._select_groups_for_run(groups, snapshot)
         self._apply_selection_stats(snapshot, selected_groups)
         selected_vulnerabilities = self._selected_vulnerabilities(selected_groups)
-        vuln_lookup: dict[str, Vulnerability] = {v.id: v for v in selected_vulnerabilities}
+        vuln_lookup: dict[str, Vulnerability] = {v.id: v for v in vulnerabilities}
 
         loop = asyncio.get_running_loop()
         fixes: list[Fix] = []
@@ -162,6 +163,7 @@ class RemediationOrchestrator:
                     access_mode=access_mode,
                     llm_credential_id=llm_credential_id,
                     remediation_run_id=remediation_run_id,
+                    selected_vulnerabilities=vulnerabilities,
                 )
             except Exception as exc:
                 supervised_fixes = []
@@ -191,7 +193,7 @@ class RemediationOrchestrator:
                 await self._emit_progress(
                     on_progress,
                     "info",
-                    "Two-call supervisor cycle complete; remaining findings are deferred to a later remediation run.",
+                    "Remediation pass complete; proposed patches still require review and applicable security checks. Remaining findings stay unresolved.",
                 )
             return fixes
 
@@ -613,13 +615,10 @@ class RemediationOrchestrator:
             source_text = loader(filepath)
             if source_text is None:
                 raise RuntimeError(f"Unable to load source file for remediation: {filepath}")
-            current_text = source_text
-            for fix in file_fixes:
-                try:
-                    current_text = self.validator._apply_unified_diff(current_text, fix.diff)
-                except Exception as exc:
-                    raise RuntimeError(f"Failed to apply remediation diff for {filepath}: {exc}") from exc
-            patched_files[filepath] = current_text
+            try:
+                patched_files[filepath] = assemble_patches(source_text, [fix.diff for fix in file_fixes], self.validator._apply_unified_diff)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to assemble remediation diffs for {filepath}: {exc}") from exc
         return patched_files
 
     def _write_patched_files_to_volume(self, project_id: str, patched_files: dict[str, str]) -> None:
@@ -728,9 +727,7 @@ class RemediationOrchestrator:
             source_b64 = str(content_resp.get("content") or "")
             source_sha = str(content_resp.get("sha") or "")
             source_text = base64.b64decode(source_b64.encode("utf-8")).decode("utf-8")
-            patched_text = source_text
-            for fix in file_fixes:
-                patched_text = self.validator._apply_unified_diff(patched_text, fix.diff)
+            patched_text = assemble_patches(source_text, [fix.diff for fix in file_fixes], self.validator._apply_unified_diff)
 
             self._github_request(
                 "PUT",
@@ -749,7 +746,7 @@ class RemediationOrchestrator:
             for fix in selected_fixes
         )
         pr_payload = {
-            "title": f"[DeplAI] Security fixes - {len(grouped_fixes)} files updated",
+            "title": f"DeplAi - Security Bot - [{payload.scan_id or 'scan-unavailable'}]",
             "head": branch,
             "base": default_branch,
             "body": "\n".join(

@@ -42,8 +42,8 @@ After payment, credits and plan status update when Razorpay verification complet
 | Plan | GST-inclusive list price (INR) | Managed credits | Bonus | Expiry |
 | --- | --- | --- | --- | --- |
 | **Free** | ₹0 | 0 | None | — |
-| **Starter** | ₹599/mo or ₹6,499/yr | 25/month; 300/yr, released monthly | None | Never |
-| **Pro** | ₹1,399/mo or ₹15,199/yr | 62.5/month; 750/yr, released monthly | None | Never |
+| **Starter** | ₹499/mo or ₹5,399/yr | 25/month; 300/yr, released monthly | None | Never |
+| **Pro** | ₹999/mo or ₹10,799/yr | 62.5/month; 750/yr, released monthly | None | Never |
 | **Enterprise** | Contract | From contract | Contract | Contract |
 
 Yearly billing shows a **Save ~10%** badge versus twelve monthly payments.
@@ -81,7 +81,7 @@ Available on **Billing → Credit packs** (paid plans only):
 
 | Pack | GST-inclusive INR price | Credits added |
 | --- | --- | --- |
-| 25 credit top-up | ₹562.25 | 25 |
+| 25 credit top-up | ₹399 | 25 |
 
 Packs add never-expiring organization credits. Checkout uses the same Razorpay INR + GST flow as subscriptions.
 

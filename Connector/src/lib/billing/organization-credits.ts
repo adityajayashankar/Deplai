@@ -833,14 +833,14 @@ export async function debitOrganizationCredits(input: {
   credits: number;
   source: string;
   idempotencyKey: string;
-}): Promise<{ available: number; debited: number }> {
+}): Promise<{ available: number; debited: number; duplicate: boolean }> {
   const mode = creditMeteringMode();
   const units = creditsToUnits(input.credits);
   if (units <= 0n) throw new Error('Debit must be positive');
 
   if (mode === 'off') {
     const balance = await getOrganizationCreditBalance(input.organizationId);
-    return { available: unitsToCredits(balance.availableUnits), debited: 0 };
+    return { available: unitsToCredits(balance.availableUnits), debited: 0, duplicate: false };
   }
 
   return withTransaction(async (exec) => {
@@ -857,6 +857,7 @@ export async function debitOrganizationCredits(input: {
       return {
         available: unitsToCredits(mapWallet(wallet[0]).availableUnits),
         debited: unitsToCredits(units),
+        duplicate: true,
       };
     }
 
@@ -905,6 +906,7 @@ export async function debitOrganizationCredits(input: {
     return {
       available: unitsToCredits(balanceAfter - wallet.reservedUnits),
       debited: mode === 'enforce' ? unitsToCredits(units) : 0,
+      duplicate: false,
     };
   });
 }

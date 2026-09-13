@@ -23,7 +23,7 @@ export default function DashboardCloudPage() {
   const [region, setRegion] = useState(DEFAULT_AWS_REGION);
 
   useEffect(() => {
-    const stored = window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY) || '';
+    const stored = new URLSearchParams(window.location.search).get('projectId') || window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY) || '';
     setProjectId(stored);
     const saved = readSavedAws();
     if (saved.aws_access_key_id) setAccessKey(saved.aws_access_key_id);

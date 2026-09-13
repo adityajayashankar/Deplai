@@ -20,6 +20,7 @@ import IntegrationsApp from '@/features/dashboard/IntegrationsApp';
 import { useRazorpayCheckout, type RazorpayCheckoutPayload } from '@/features/billing/useRazorpayCheckout';
 import { LOGIN_HREF } from '@/lib/auth-providers';
 import { buildReferralSignupUrl } from '@/lib/public-app-url';
+import { formatCreditAmount } from '@/lib/billing/credit-format';
 import {
   MAX_EFFICIENT_POOL,
   ROUTING_MODES,
@@ -97,6 +98,8 @@ type Plan = {
   paidCreditAmount: number;
   annualCreditAmount: number;
   isCustom: boolean;
+  isAvailable: boolean;
+  availabilityMessage: string | null;
   isRecommended: boolean;
   features: string[];
 };
@@ -153,7 +156,6 @@ export default function ProfileApp() {
   const [bundle, setBundle] = useState<ProfilePayload | null>(null);
   const [plans, setPlans] = useState<Plan[]>([]);
   const [creditPacks, setCreditPacks] = useState<CreditPack[]>([]);
-  const [salesEmail, setSalesEmail] = useState('founders@deplai.tech');
   const [razorpayConfigured, setRazorpayConfigured] = useState(false);
   const [payments, setPayments] = useState<PaymentsInfo | null>(null);
   const [models, setModels] = useState<CatalogModel[]>([]);
@@ -222,13 +224,11 @@ export default function ProfileApp() {
       const payload = await plansRes.json() as {
         plans?: Plan[];
         packs?: CreditPack[];
-        salesEmail?: string;
         razorpayConfigured?: boolean;
         payments?: PaymentsInfo;
       };
       setPlans(Array.isArray(payload.plans) ? payload.plans : []);
       setCreditPacks(Array.isArray(payload.packs) ? payload.packs : []);
-      if (payload.salesEmail) setSalesEmail(payload.salesEmail);
       setRazorpayConfigured(Boolean(payload.razorpayConfigured));
       if (payload.payments) setPayments(payload.payments);
     }
@@ -326,10 +326,7 @@ export default function ProfileApp() {
   };
 
   const startCheckout = async (plan: Plan) => {
-    if (plan.isCustom) {
-      window.location.href = `mailto:${salesEmail}`;
-      return;
-    }
+    if (!plan.isAvailable) return toasts.push(plan.availabilityMessage || 'This plan is coming soon.', 'info');
     if (plan.id === 'free') return;
     setCheckoutBusy(plan.id);
     try {
@@ -702,7 +699,7 @@ export default function ProfileApp() {
                           creditStatus === 'negative' ? 'text-rose-700' : creditStatus === 'warning' ? 'text-amber-700' : 'text-black'
                         }`}>
                           {usesOrgCredits
-                            ? displayCredits.toLocaleString(undefined, { maximumFractionDigits: 2 })
+                            ? formatCreditAmount(displayCredits)
                             : formatCreditUsd(displayCredits)}
                         </p>
                         <p className="mt-2 text-[12px] text-zinc-500">
@@ -763,8 +760,9 @@ export default function ProfileApp() {
                       const totalPaise = yearly && plan.yearlyPricePaise > 0 ? plan.yearlyPricePaise : plan.pricePaise;
                       const credits = yearly ? plan.annualCreditAmount : plan.paidCreditAmount;
                       const current = bundle.subscription?.planId === plan.id || bundle.credits?.plan_id === plan.id;
-                      const cta = plan.isCustom
-                        ? 'Contact sales'
+                      const unavailable = !plan.isAvailable;
+                      const cta = unavailable
+                        ? 'Coming soon'
                         : plan.id === 'free'
                           ? current
                             ? 'Current plan'
@@ -773,41 +771,37 @@ export default function ProfileApp() {
                             ? 'Current plan'
                             : razorpayConfigured
                               ? payments?.testAmountOverride
-                                ? 'Pay ₹1'
+                                ? 'Pay \u20B91'
                                 : 'Upgrade'
                               : 'Checkout not configured';
                       return (
-                        <div
-                          key={plan.id}
-                          className={`relative app-paper p-5 ${
-                            plan.isRecommended ? '' : ''
-                          }`}
-                        >
+                        <div key={plan.id} className={`relative app-paper p-5 ${plan.isRecommended ? '' : ''}`}>
                           <div className="flex items-start justify-between gap-2">
                             <h3 className="font-display text-lg text-black">{plan.displayName}</h3>
                             {plan.isRecommended ? (
-                              <span className="border-2 border-black bg-black px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-widest text-white">
-                                Recommended
-                              </span>
+                              <span className="border-2 border-black bg-black px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-widest text-white">Recommended</span>
                             ) : null}
                           </div>
-                          {plan.isCustom ? (
+                          {unavailable ? (
+                            <p className="mt-3 font-display text-3xl text-black">Coming soon</p>
+                          ) : plan.isCustom ? (
                             <p className="mt-3 font-display text-3xl text-black">Custom</p>
                           ) : (
                             <>
-                              <p className="mt-3 font-display text-3xl text-black">₹{formatInr(totalPaise)}</p>
-                              <p className="mt-1 text-[12px] font-semibold text-zinc-500">
-                                GST-inclusive · {yearly ? 'billed yearly' : 'billed monthly'}
-                              </p>
+                              <p className="mt-3 font-display text-3xl text-black">{'\u20B9'}{formatInr(totalPaise)}</p>
+                              <p className="mt-1 text-[12px] font-semibold text-zinc-500">GST-inclusive &middot; {yearly ? 'billed yearly' : 'billed monthly'}</p>
                             </>
                           )}
                           <p className="mt-2 text-[12px] text-zinc-500">{plan.description}</p>
                           <ul className="mt-4 space-y-2 text-[13px] text-neutral-700">
-                            <li className="flex gap-2">
-                              <Check className="mt-0.5 h-4 w-4 text-black" />
-                              {credits} managed credits {yearly ? 'per year, released monthly' : 'per month'}
-                            </li>
-                            <li className="flex gap-2"><Check className="mt-0.5 h-4 w-4 text-black" />Credits never expire</li>
+                            {unavailable ? (
+                              <li className="flex gap-2"><Check className="mt-0.5 h-4 w-4 text-black" />{plan.availabilityMessage || 'This plan is coming soon.'}</li>
+                            ) : (
+                              <>
+                                <li className="flex gap-2"><Check className="mt-0.5 h-4 w-4 text-black" />{credits} managed credits {yearly ? 'per year, released monthly' : 'per month'}</li>
+                                <li className="flex gap-2"><Check className="mt-0.5 h-4 w-4 text-black" />Credits never expire</li>
+                              </>
+                            )}
                             {plan.features
                               .filter((feature) => !isPerCreditRateFeature(feature) && !isManagedCreditFeature(feature))
                               .map((feature) => (
@@ -820,7 +814,7 @@ export default function ProfileApp() {
                           <PrimaryButton
                             variant={plan.isRecommended && !current ? 'white' : 'default'}
                             className="mt-5 w-full"
-                            disabled={Boolean(checkoutBusy) || current || plan.id === 'free'}
+                            disabled={unavailable || Boolean(checkoutBusy) || current || plan.id === 'free'}
                             loading={checkoutBusy === plan.id}
                             onClick={() => void startCheckout(plan)}
                           >
@@ -966,7 +960,9 @@ export default function ProfileApp() {
 
                 <ProfileCard className="p-6">
                   <h2 className="font-display text-lg font-semibold text-white">Redeem Promotional Code</h2>
-                  <p className="mt-2 text-[13px] text-zinc-400">Enter a promotional code to add credits to your account.</p>
+                  <p className="mt-2 text-[13px] text-zinc-400">
+                    Enter a promotional code to add credits. Referral codes apply through a shared sign-up link for a new user’s first paid plan.
+                  </p>
                   <form
                     className="mt-4 flex flex-col gap-3 sm:flex-row"
                     onSubmit={(event) => { event.preventDefault(); void redeemPromo(); }}

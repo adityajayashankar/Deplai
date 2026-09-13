@@ -105,6 +105,7 @@ class ProviderStatusResponse(BaseModel):
 
 
 class RemediationPRRequest(BaseModel):
+    scan_id: Optional[str] = Field(default=None, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     source_revision: Optional[str] = None
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 

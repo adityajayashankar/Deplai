@@ -28,11 +28,18 @@ import { rankModels, defaultRoutingPolicy } from './routing';
 import { userModelSetup } from './model-setup';
 import {
   ACTIVE_ORGANIZATION_COOKIE,
+  OrganizationError,
   requireOrganizationPermission,
   resolveActiveOrganization,
 } from '@/lib/organizations/store';
 
 function jsonError(error: unknown) {
+  if (error instanceof OrganizationError) {
+    return NextResponse.json(
+      { error: error.message, code: error.code },
+      { status: error.status },
+    );
+  }
   if (error instanceof AiPlatformError) {
     const retryAfterSeconds = Number(error.detail?.retryAfterSeconds);
     return NextResponse.json(

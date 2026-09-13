@@ -4,6 +4,7 @@ import os
 import sys
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -51,9 +52,11 @@ if "docker.errors" not in sys.modules:
     sys.modules["docker.errors"] = docker_errors_stub
 
 from terraform_apply import (
+    apply_terraform_bundle,
     _bundle_requests_ec2,
     _canonical_postgres_engine_version,
     _collect_one_time_credentials,
+    _configure_s3_state_backend,
     _collect_root_terraform_text,
     _collect_terraform_text,
     _collect_tfvars_text,
@@ -82,9 +85,119 @@ from terraform_apply import (
     _summarize_ec2_plan_changes,
     _terraform_has_aws_instance,
     _terraform_has_variable,
+    _validate_aws_deploy_credentials,
     rewrite_app_artifact_filemd5_guard,
     rewrite_ec2_module_v5_compat,
 )
+import terraform_apply
+
+
+class RdsRetentionErrorTests(unittest.TestCase):
+    def test_restriction_explains_review_and_preserving_state(self):
+        result = terraform_apply._friendly_terraform_error('FreeTierRestrictionError: specified backup retention period exceeds maximum')
+        self.assertIn('1 day', result)
+        self.assertIn('Preserve the saved deployment and Terraform state', result)
+        self.assertIn('new repository scan is not required', result)
+
+    def test_other_free_plan_restriction_is_not_misclassified(self):
+        self.assertEqual(terraform_apply._friendly_terraform_error('FreeTierRestrictionError: instance size exceeds maximum'), '')
+
+
+class AwsCredentialValidationTests(unittest.TestCase):
+    def test_signature_mismatch_is_reported_before_terraform_without_secret_material(self) -> None:
+        from botocore.exceptions import ClientError
+
+        try:
+            rejected = ClientError(
+                {"Error": {"Code": "SignatureDoesNotMatch", "Message": "bad signature"}},
+                "GetCallerIdentity",
+            )
+        except TypeError:
+            rejected = ClientError()
+            rejected.response = {"Error": {"Code": "SignatureDoesNotMatch", "Message": "bad signature"}}
+        if not isinstance(getattr(rejected, "response", None), dict):
+            rejected.response = {"Error": {"Code": "SignatureDoesNotMatch", "Message": "bad signature"}}
+
+        class StsClient:
+            def get_caller_identity(self):
+                raise rejected
+
+        class Session:
+            def __init__(self, **_kwargs):
+                pass
+
+            def client(self, service: str, **_kwargs):
+                if service != "sts":
+                    raise AssertionError(f"unexpected AWS service: {service}")
+                return StsClient()
+
+        with mock.patch.object(terraform_apply.boto3.session, "Session", Session):
+            result = _validate_aws_deploy_credentials(
+                aws_access_key_id="AKIAEXAMPLE00000000",
+                aws_secret_access_key="not-a-real-secret",
+                aws_session_token="",
+                aws_region="eu-north-1",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "SignatureDoesNotMatch")
+        self.assertIn("Standard AWS access keys do not need a session token", str(result["message"]))
+        self.assertNotIn("not-a-real-secret", str(result["message"]))
+
+
+class TerraformStateBackendTests(unittest.TestCase):
+    def test_runtime_configuration_replaces_disposable_local_backend(self) -> None:
+        files = [
+            {
+                "path": "terraform/backend.tf",
+                "content": 'terraform {\n  backend "local" {}\n}\n',
+            },
+            {"path": "terraform/main.tf", "content": 'resource "null_resource" "example" {}\n'},
+        ]
+
+        configured = _configure_s3_state_backend(
+            files,
+            state_bucket="deplai-tfstate-example",
+            lock_table="deplai-tflock-example",
+            aws_region="eu-north-1",
+            project_name="ifca",
+        )
+
+        backend = next(item for item in configured if item["path"] == "terraform/backend.tf")
+        self.assertNotIn('backend "local"', backend["content"])
+        self.assertIn('backend "s3"', backend["content"])
+        self.assertIn('bucket         = "deplai-tfstate-example"', backend["content"])
+        self.assertIn('dynamodb_table = "deplai-tflock-example"', backend["content"])
+        self.assertIn('key            = "ifca/production/terraform.tfstate"', backend["content"])
+        self.assertEqual(backend["encoding"], "utf-8")
+
+    def test_apply_stops_at_credential_preflight_before_creating_a_terraform_workspace(self) -> None:
+        with (
+            mock.patch.object(
+                terraform_apply,
+                "_validate_aws_deploy_credentials",
+                return_value={
+                    "ok": False,
+                    "code": "SignatureDoesNotMatch",
+                    "message": "AWS rejected the access key and secret as a pair.",
+                },
+            ) as validate,
+            mock.patch.object(terraform_apply, "get_docker_client") as docker,
+        ):
+            result = apply_terraform_bundle(
+                files=[{"path": "main.tf", "content": "terraform {}\n"}],
+                project_name="example",
+                provider="aws",
+                aws_access_key_id="AKIAEXAMPLE00000000",
+                aws_secret_access_key="not-a-real-secret",
+                aws_session_token="",
+                aws_region="eu-north-1",
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["details"]["stage"], "credentials")
+        validate.assert_called_once()
+        docker.assert_not_called()
 
 
 class TerraformApplyKeyPairDiscoveryTests(unittest.TestCase):
@@ -109,6 +222,28 @@ Error: creating CloudWatch Logs Log Group (/deplai/ifca): ResourceAlreadyExistsE
         )
         self.assertFalse(_is_orphan_key_pair_collision(error))
         self.assertFalse(_is_orphan_alb_collision(error))
+
+    def test_extracts_rds_subnet_group_collision_for_state_recovery(self) -> None:
+        error = """Error: creating RDS DB Subnet Group (ifca-db-subnets): DBSubnetGroupAlreadyExists: already exists
+
+  with module.data.aws_db_subnet_group.main[0],
+  on modules/data/main.tf line 8, in resource "aws_db_subnet_group" "main":
+"""
+        self.assertEqual(
+            _extract_importable_aws_collisions(error),
+            [{"kind": "rds_subnet_group", "address": "module.data.aws_db_subnet_group.main[0]", "import_id": "ifca-db-subnets"}],
+        )
+
+    def test_extracts_load_balancer_collision_for_state_recovery(self) -> None:
+        error = """Error: creating ELBv2 application Load Balancer (ifca-alb): DuplicateLoadBalancerName: already exists
+
+  with module.compute.aws_lb.main[0],
+  on modules/compute/main.tf line 1, in resource "aws_lb" "main":
+"""
+        self.assertEqual(
+            _extract_importable_aws_collisions(error),
+            [{"kind": "load_balancer", "address": "module.compute.aws_lb.main[0]", "import_id": "ifca-alb"}],
+        )
 
     def test_extracts_rds_collision_for_state_recovery(self) -> None:
         error = """Error: creating RDS DB Instance (ifca-postgres): DBInstanceAlreadyExists: DB instance already exists
@@ -141,6 +276,54 @@ Error: creating CloudWatch Logs Log Group (/deplai/ifca): ResourceAlreadyExistsE
         )
         self.assertTrue(owned)
         self.assertEqual(tags["managedby"], "deplai")
+
+    def test_verifies_tagged_rds_subnet_group_before_importing(self) -> None:
+        class RdsClient:
+            def describe_db_subnet_groups(self, **_kwargs):
+                return {"DBSubnetGroups": [{"DBSubnetGroupArn": "arn:aws:rds:eu-north-1:123:subgrp:ifca-db-subnets"}]}
+
+            def list_tags_for_resource(self, **_kwargs):
+                return {"TagList": [{"Key": "ManagedBy", "Value": "deplai"}, {"Key": "Project", "Value": "ifca"}]}
+
+        class Session:
+            def client(self, service, **_kwargs):
+                if service != "rds":
+                    raise AssertionError(f"unexpected AWS service: {service}")
+                return RdsClient()
+
+        owned, tags = _aws_tags_mark_terraform_owned(
+            {"kind": "rds_subnet_group", "import_id": "ifca-db-subnets", "address": "module.data.aws_db_subnet_group.main[0]"},
+            session=Session(),
+            aws_region="eu-north-1",
+            expected_project="ifca",
+        )
+        self.assertTrue(owned)
+        self.assertEqual(tags["project"], "ifca")
+
+    def test_verifies_tagged_load_balancer_and_resolves_its_import_arn(self) -> None:
+        class Elbv2Client:
+            def describe_load_balancers(self, **_kwargs):
+                return {"LoadBalancers": [{"LoadBalancerArn": "arn:aws:elasticloadbalancing:region:123:loadbalancer/app/ifca-alb/id"}]}
+
+            def describe_tags(self, **_kwargs):
+                return {"TagDescriptions": [{"Tags": [{"Key": "ManagedBy", "Value": "deplai"}, {"Key": "Project", "Value": "ifca"}]}]}
+
+        class Session:
+            def client(self, service, **_kwargs):
+                if service != "elbv2":
+                    raise AssertionError(f"unexpected AWS service: {service}")
+                return Elbv2Client()
+
+        collision = {"kind": "load_balancer", "import_id": "ifca-alb", "address": "module.compute.aws_lb.main[0]"}
+        owned, tags = _aws_tags_mark_terraform_owned(
+            collision,
+            session=Session(),
+            aws_region="eu-north-1",
+            expected_project="ifca",
+        )
+        self.assertTrue(owned)
+        self.assertEqual(tags["managedby"], "deplai")
+        self.assertTrue(collision["import_id"].startswith("arn:aws:elasticloadbalancing:"))
 
     def test_summarizes_ec2_create_and_replace_plan_changes(self) -> None:
         summary = _summarize_ec2_plan_changes(

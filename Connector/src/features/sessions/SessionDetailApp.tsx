@@ -1,5 +1,7 @@
 'use client';
 
+import { RemediationRunArchive } from './RemediationRunArchive';
+
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { ArrowLeft, Copy, TerminalSquare } from 'lucide-react';
@@ -164,6 +166,8 @@ export default function SessionDetailApp() {
                     {statusLabel(session.status)}
                   </span>
                 </div>
+
+                {typeof session.metadata.remediation_run_id === 'string' && <RemediationRunArchive sessionId={session.id} />}
 
                 <div className="mt-4 flex flex-wrap items-center gap-2 font-mono text-[12px] text-black">
                   <span>{truncateSessionId(session.id)}</span>

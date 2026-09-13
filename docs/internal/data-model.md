@@ -12,7 +12,19 @@ Canonical schema: `Connector/database.sql` (Compose init: `/docker-entrypoint-in
 
 AI tables are also `ensureAiPlatformSchema()` at runtime. Prefer applying SQL migrations on long-lived DBs rather than relying only on ensure helpers.
 
-Fresh Compose MySQL volumes load `database.sql` only. Re-creating the volume is the local reset.
+Fresh Compose MySQL volumes load `database.sql` only. Rebuilding images or
+recreating containers does **not** migrate an existing volume. Keep the volume
+and apply the relevant incremental migrations before exercising new routes.
+
+An older local database missing `organization_memberships` cannot perform
+project authorization or resolve scan/remediation billing scope. Apply the
+workspace-session, DAST, and deploy-execution table migrations listed in
+`Connector/migrations/` before `20260901_organizations_v1.sql`. The organization
+migration adds tenancy columns and backfills personal organizations and active
+owner memberships without removing legacy ownership. Verify both owner access
+and non-member rejection after migration. Follow the individual migration
+prerequisites for billing schema changes; do not reset data to repair a missing
+table. Container liveness alone does not verify schema compatibility.
 
 ## Identity and source
 

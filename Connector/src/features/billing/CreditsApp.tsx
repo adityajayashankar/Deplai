@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { WorkspaceCommandHeader } from '@/features/workspace/WorkspaceNav';
 import { CreditBalanceWidget } from '@/features/billing/CreditBalanceWidget';
+import { formatCreditAmount } from '@/lib/billing/credit-format';
 import { useRazorpayCheckout, type CheckoutPhase, type RazorpayCheckoutPayload } from '@/features/billing/useRazorpayCheckout';
 
 type Pack = {
@@ -43,7 +44,7 @@ function formatInr(paise: number): string {
 }
 
 function formatCredits(value: number): string {
-  return value.toFixed(6).replace(/\.?0+$/, '');
+  return formatCreditAmount(value);
 }
 
 export default function CreditsApp({ section = 'Credits', embedded = false }: { section?: string; embedded?: boolean }) {

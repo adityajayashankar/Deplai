@@ -19,10 +19,24 @@ class SecurityRunStore:
                 raise RuntimeError("Security execution requires MONGODB_URI")
             return None
         from pymongo import MongoClient
-        db = MongoClient(uri, serverSelectionTimeoutMS=3000)[os.getenv("REMEDIATION_MONGODB_DATABASE", "deplai_security")]
-        db.command("ping")
-        db.security_runs.create_index([("project_id", 1), ("created_at", -1)])
-        db.security_events.create_index([("run_id", 1), ("sequence", 1)], unique=True)
+        from pymongo.errors import PyMongoError
+        client = None
+        try:
+            client = MongoClient(uri, serverSelectionTimeoutMS=3000,
+                                 connectTimeoutMS=3000, socketTimeoutMS=3000)
+            db = client[os.getenv("REMEDIATION_MONGODB_DATABASE", "deplai_security")]
+            db.command("ping")
+            db.security_runs.create_index([("project_id", 1), ("created_at", -1)])
+            db.security_events.create_index([("run_id", 1), ("sequence", 1)], unique=True)
+        except PyMongoError:
+            if client is not None:
+                client.close()
+            # The API maps RuntimeError to a recoverable 503. Do not expose
+            # connection strings, Atlas hosts, or driver diagnostics to users.
+            raise RuntimeError(
+                "Scan storage is unavailable. Restore the configured MongoDB "
+                "connection (network access, TLS, and credentials), then retry the scan."
+            ) from None
         self._db = db
         return db
 

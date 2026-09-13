@@ -22,7 +22,7 @@ import {
   validateProfilePatch,
   validatePromoCode,
 } from './logic';
-import { allocateUniqueReferralCode, ensureUserReferralCode } from '@/lib/referrals/codes';
+import { allocateUniqueReferralCode, ensureUserReferralCode, isRecognizedReferralCode } from '@/lib/referrals/codes';
 import { decryptApiToken, encryptApiToken, generateApiToken, hashApiToken } from './crypto';
 import { ensureProfileSchema } from './schema';
 
@@ -451,6 +451,14 @@ export async function redeemPromoCode(userId: string, rawCode: string) {
     const error = new Error(parsed.error);
     (error as Error & { status?: number; code?: string }).status = 400;
     (error as Error & { code?: string }).code = 'invalid';
+    throw error;
+  }
+  if (isRecognizedReferralCode(parsed.code)) {
+    const error = new Error(
+      'This is a referral code, not a promotional code. Share its referral link with a new user before their first paid plan purchase.',
+    );
+    (error as Error & { status?: number; code?: string }).status = 400;
+    (error as Error & { code?: string }).code = 'referral_code';
     throw error;
   }
   await ensureProfileSchema();

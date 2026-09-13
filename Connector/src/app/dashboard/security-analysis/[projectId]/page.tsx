@@ -1,5 +1,8 @@
 'use client';
 
+import { describeRemediationEvent } from '@/features/security/remediation-log';
+import { RemediationActivityLog } from '@/features/security/RemediationActivityLog';
+
 import React, { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import * as THREE from 'three';
@@ -31,7 +34,6 @@ import {
   FindingTable,
   InfrastructureExplorer,
   PipelineConfig,
-  RemediationModelPicker,
   RiskExplorer,
   RiskScore,
   ScanProgress,
@@ -81,15 +83,9 @@ const STAGE_INDEX: Record<PipelineStageId, number> = {
 };
 
 const RESULTS_HEARTBEAT_MS = 30_000;
-const REMEDIATION_DEFAULT_MODEL = 'openrouter/free';
 const REMEDIATION_AGENT = {
-  accessMode: 'platform',
-  model: REMEDIATION_DEFAULT_MODEL,
-  provider: null,
-  credentialId: null,
   ready: true,
   blockedReason: null,
-  sourceLabel: 'OpenRouter Free',
 };
 
 const EMPTY_STATS = { total: 0, critical: 0, high: 0, medium: 0, low: 0, autoFixable: 0 };
@@ -739,7 +735,6 @@ export default function SecurityAnalysisPage() {
   const [projectOptions, setProjectOptions] = useState<Array<{ id: string; name: string }>>([]);
 
   const scanLogEndRef = useRef<HTMLDivElement>(null);
-  const remediateLogEndRef = useRef<HTMLDivElement>(null);
   const fetchVersionRef = useRef(0);
   const userStartedScanRef = useRef(false);
   const dastAutoStartRef = useRef(false);
@@ -755,9 +750,6 @@ export default function SecurityAnalysisPage() {
     scanLogEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [scanActive, scanMessages.length]);
 
-  useEffect(() => {
-    remediateLogEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [remMessages.length]);
 
   useEffect(() => {
     let cancelled = false;
@@ -839,14 +831,11 @@ export default function SecurityAnalysisPage() {
       return;
     }
     try {
-      const response = await fetch('/api/pipeline/remediation-pr', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_id: projectId }),
-      });
+      const response = await fetch(`/api/remediate/status/${encodeURIComponent(projectId)}`, { cache: 'no-store' });
       if (!response.ok) return;
-      const data = (await response.json()) as { pr_url?: string | null };
-      setPrUrl(String(data.pr_url || '') || null);
+      const data = (await response.json()) as { events?: Array<{ content?: string }> };
+      const publication = [...(data.events || [])].reverse().find(event => event.content?.startsWith('Remediation PR created: '));
+      setPrUrl(publication?.content?.slice('Remediation PR created: '.length).trim() || null);
     } catch {
       // ignore
     }
@@ -1080,6 +1069,7 @@ export default function SecurityAnalysisPage() {
       if (message.type !== 'changed_files') continue;
       try {
         const payload = JSON.parse(message.content) as ChangedFileEntry[];
+        byPath.clear(); // Each event is the complete current review set.
         for (const item of payload) {
           if (!item?.path) continue;
           byPath.set(item.path, { path: item.path, reason: item.reason, diff: item.diff });
@@ -1474,7 +1464,7 @@ export default function SecurityAnalysisPage() {
       return;
     }
     if (!agentModel.ready) {
-      setError(agentModel.blockedReason || 'OpenRouter Free Router is not ready. Try again shortly.');
+      setError(agentModel.blockedReason || 'The remediation service is not ready. Try again shortly.');
       return;
     }
 
@@ -1490,15 +1480,7 @@ export default function SecurityAnalysisPage() {
       if (remediationState !== 'idle') {
         resetRemediation(projectId);
       }
-      await startRemediation(
-        projectId,
-        trimmedToken || undefined,
-        undefined,
-        undefined,
-        agentModel.model,
-        'major',
-        'platform',
-      );
+      await startRemediation(projectId, trimmedToken || undefined);
       setGithubToken('');
     } catch (remediationError) {
       setError(remediationError instanceof Error ? remediationError.message : 'Failed to start remediation');
@@ -1515,8 +1497,9 @@ export default function SecurityAnalysisPage() {
   }, [projectId, pushCurrentRemediationChanges]);
 
   const handleApproveAndPush = useCallback(() => {
+    if (!approveRemediationPush(projectId)) return;
     setLocallyApproved(true);
-    approveRemediationPush(projectId);
+    setActiveStage('pr_rescan');
   }, [approveRemediationPush, projectId]);
 
   const handleResetRemediation = useCallback(() => {
@@ -2003,15 +1986,14 @@ export default function SecurityAnalysisPage() {
             <div className="border-[3px] border-black bg-white px-4 py-3">
               <div className="text-sm font-semibold text-black">Remediation Pipeline Engine</div>
               <p className="mt-1 text-xs text-neutral-600">
-                Remediation uses the OpenRouter Free Router. Upstream selection is automatic and this workflow never uses paid or BYOK inference.
+                The agent plans fixes, generates patches, and locally validates changes for critical and high findings.
               </p>
             </div>
           </div>
-          <RemediationModelPicker />
           <div className="border-t border-[#1A1A1A] pt-4">
             <label className="mb-2 block text-[10px] font-bold uppercase text-zinc-500">GitHub PAT (Optional)</label>
             <input type="password" value={githubToken} onChange={(event) => setGithubToken(event.target.value)} placeholder="ghp_..." className={appInput} />
-            <p className="mt-2 text-[11px] text-zinc-500">Required only for pushing the fix branch automatically. Not stored persistently.</p>
+            <p className="mt-2 text-[11px] text-zinc-500">Leave blank to use your connected GitHub App for branch and pull-request creation. A PAT is an optional override and is not stored persistently.</p>
           </div>
         </div>
         <div className="pt-6 flex flex-wrap items-center gap-3">
@@ -2020,7 +2002,7 @@ export default function SecurityAnalysisPage() {
             <span>Start Remediation Engine</span>
           </RunButton>
           {!agentModel.ready ? (
-            <p className="text-xs text-amber-800">{agentModel.blockedReason || 'Loading remediation models…'}</p>
+            <p className="text-xs text-amber-800">{agentModel.blockedReason || 'Preparing remediation service…'}</p>
           ) : null}
           {remediableFindingCount === 0 ? (
             <p className="text-xs text-neutral-600">No critical or high findings are available. Medium and low findings are ignored.</p>
@@ -2036,22 +2018,30 @@ export default function SecurityAnalysisPage() {
   );
 
   const renderRemediateRunView = () => {
-    const latestMessage = [...remMessages].reverse().find((message) => message.type !== 'changed_files');
+    const latestMessage = [...remMessages].reverse().find((message) => !describeRemediationEvent(message).detailOnly);
     const agentStatusLabel =
       remediationState === 'running'
-        ? 'Patching vulnerabilities'
+        ? 'Generating and checking patches'
         : remediationState === 'waiting_decision'
           ? 'Awaiting your decision'
           : remediationState === 'waiting_approval'
             ? 'Awaiting final approval'
             : remediationState === 'completed'
-              ? 'Remediation complete'
+              ? 'Run finished'
               : remediationState === 'error'
                 ? 'Run failed'
                 : 'Standing by';
 
     return (
       <div className="animate-fade-in space-y-6">
+        {(remediationState === 'waiting_decision' || remediationState === 'waiting_approval') && (
+          <div className={`${secPaper} border-l-8 border-l-amber-600 p-5`} role="status">
+            <h2 className="text-lg font-semibold text-black">Patch generation finished. Review is needed.</h2>
+            <p className="mt-2 text-sm leading-6 text-zinc-700">The run is waiting for you. Inspect the proposed changes before choosing the next step. Local checks are complete for accepted candidates; vulnerabilities still need security verification.</p>
+            <button type="button" className={`${appBtnInk} mt-4`} onClick={() => setActiveStage('approval')}>Review patches &amp; choose next step</button>
+            <p className="mt-2 text-xs text-zinc-600">Opening review does not apply changes, make model calls or create a pull request.</p>
+          </div>
+        )}
         <div className="grid gap-4 lg:grid-cols-[minmax(0,320px)_1fr]">
           <div className={`${secPaper} p-5`}>
             <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">Active agent</p>
@@ -2061,7 +2051,7 @@ export default function SecurityAnalysisPage() {
               </div>
               <div>
                 <p className="text-sm font-semibold text-white">Remediation agent</p>
-                <p className="text-[12px] text-zinc-500">{agentModel.sourceLabel} · {agentModel.model || REMEDIATION_DEFAULT_MODEL}</p>
+                <p className="text-[12px] text-zinc-500">Critical/high findings / Patch validation</p>
               </div>
             </div>
             <div className="mt-5 space-y-3 border-t border-white/10 pt-4 text-[13px]">
@@ -2091,46 +2081,12 @@ export default function SecurityAnalysisPage() {
             {latestMessage ? (
               <div className="mt-4 border-[3px] border-black bg-white p-3">
                 <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-zinc-600">Latest activity</p>
-                <p className="mt-2 text-[12px] leading-5 text-zinc-400">{String(latestMessage.content).slice(0, 220)}{String(latestMessage.content).length > 220 ? '…' : ''}</p>
+                <p className="mt-2 break-words text-[12px] leading-5 text-zinc-700">{describeRemediationEvent(latestMessage).title}</p>
               </div>
             ) : null}
           </div>
 
-          <div className={`${secPaper} overflow-hidden`}>
-            <div className="flex items-center justify-between border-b-[3px] border-black px-5 py-4">
-              <div className="flex items-center gap-2">
-                <TerminalSquare className="h-4 w-4 text-lime-300" />
-                <h3 className="text-sm font-semibold text-zinc-200">Agent execution log</h3>
-              </div>
-              {remediatingThisProject ? (
-                <span className="relative flex h-2 w-2">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-black opacity-75" />
-                    <span className="relative inline-flex h-2 w-2 rounded-full bg-black" />
-                </span>
-              ) : null}
-            </div>
-            <div className="sec-terminal custom-scrollbar max-h-[420px] overflow-y-auto bg-[#0d1117] p-6 font-mono text-[13px] leading-relaxed text-[#e6edf3]">
-              {remMessages.map((message, index) => {
-                if (message.type === 'changed_files') return null;
-                const logText = String(message.content || '');
-                const toneClass = logText.includes('[waiting_approval]') || logText.includes('[waiting_decision]') || message.type === 'warning'
-                  ? 'text-amber-400 font-medium'
-                  : message.type === 'success'
-                    ? 'text-emerald-400'
-                    : message.type === 'error'
-                      ? 'text-rose-400'
-                      : 'text-zinc-400';
-                return (
-                  <div key={`${message.timestamp}-${index}`} className="mb-2 flex gap-4">
-                    <span className="shrink-0 text-zinc-600">{String(index + 1).padStart(2, '0')}</span>
-                    <span className={toneClass}>{logText}</span>
-                  </div>
-                );
-              })}
-              {remediatingThisProject ? <div className="mt-2 animate-pulse text-zinc-600">_</div> : null}
-              <div ref={remediateLogEndRef} />
-            </div>
-          </div>
+          <RemediationActivityLog messages={remMessages} active={remediatingThisProject} />
         </div>
 
         {remediationState === 'error' ? (
@@ -2159,11 +2115,13 @@ export default function SecurityAnalysisPage() {
 
   const renderApprovalView = () => {
     const waitingForDecision = remediationState === 'waiting_decision';
+    const approvalFailure = [...remMessages].reverse().find(message => message.type === 'error')?.content;
+    const excludedFiles = [...remMessages].reverse().find(message => message.content?.startsWith('Excluded conflicting files'))?.content;
 
     return (
       <div className="relative z-10 mx-auto flex min-h-full w-full max-w-4xl animate-fade-in flex-col space-y-6 p-8">
         <div className="mb-6 mt-4 border-b border-[#1A1A1A] pb-6">
-          <h1 className="mb-2 text-2xl font-semibold text-zinc-100">{waitingForDecision ? 'Choose Next Step' : 'Approve & Push Fixes'}</h1>
+          <h1 className="mb-2 text-2xl font-semibold text-zinc-100">{waitingForDecision ? 'Choose Next Step' : 'Approve & Create PR'}</h1>
           <p className="text-sm text-zinc-400">
             {waitingForDecision
               ? 'The first remediation round finished. Review the patch set and decide whether to push these fixes or run one more remediation round.'
@@ -2171,6 +2129,13 @@ export default function SecurityAnalysisPage() {
           </p>
         </div>
 
+        {remediationState === 'error' && <AlertCard tone="error" title="PR creation stopped" message={approvalFailure || 'The run failed. Open remediation activity for details. Saved patches remain available in Sessions.'} />}
+        {remediationState === 'error' && <button type="button" className={appBtnPaper} onClick={() => {
+          setLocallyApproved(false); setApproved(false);
+          void startRemediation(projectId, githubToken, undefined, undefined, undefined, 'major', 'platform', undefined, false, true);
+        }}>Recover saved patches for review ? no new remediation</button>}
+        {excludedFiles && <AlertCard tone="warning" title="Some files are excluded from this PR" message={excludedFiles} />}
+        {remediationState === 'running' && <AlertCard tone="warning" title="Verification and PR creation in progress" message="Approval was received. Check remediation activity for verification progress." />}
         <div className={`${secPaper} overflow-hidden`}>
           <div className="flex items-center justify-between border-b-[3px] border-black p-4"><span className="text-sm font-semibold text-black">Changed Files</span><span className="font-mono text-xs text-neutral-600">{changedFiles.length} modification{changedFiles.length === 1 ? '' : 's'}</span></div>
           <div className="p-0">
@@ -2246,7 +2211,11 @@ export default function SecurityAnalysisPage() {
                 <span className="text-sm leading-relaxed text-neutral-600">I approve these code modifications. Run verification and open a Pull Request if this is a GitHub project. Findings remain unverified when their required checks fail.</span>
               </label>
             </div>
-            <RunButton disabled={!approved} onClick={handleApproveAndPush}>Approve &amp; Push PR</RunButton>
+            {remediationState === 'running' ? <div role="status" className="space-y-3">
+              <p className="text-sm text-black">Approval received. Verification is running before PR creation.</p>
+              <RunButton onClick={() => setActiveStage('pr_rescan')}>View verification and PR progress</RunButton>
+            </div> : prUrl ? <a href={prUrl} target="_blank" rel="noopener noreferrer" className={appBtnInk}>View created pull request</a> :
+              <RunButton disabled={!approved || remediationState !== 'waiting_approval'} onClick={handleApproveAndPush}>Approve &amp; Create PR</RunButton>}
           </div>
         )}
       </div>
@@ -2269,6 +2238,7 @@ export default function SecurityAnalysisPage() {
       ))
       || remediationFinished;
     const prCreating = githubProject && !prUrl && !persistComplete && remediationState !== 'error';
+    const publicationInProgress = prCreating && remediationState === 'running';
     const verificationRunning = verificationScanRequested && (scanRunning || loading || loadingResults);
     const verificationDone = verificationScanRequested && !verificationRunning && (results !== null || vulnStatus === 'found' || vulnStatus === 'not_found');
     const canRerunVerification = persistComplete && !verificationRunning && !rerunInProgress && !loadingProject;
@@ -2279,7 +2249,10 @@ export default function SecurityAnalysisPage() {
         ? 'The PR is ready. Click rerun if you want a fresh scan of the remediated branch.'
         : 'Wait until the pull request exists, then click rerun to scan the remediated code.')
       : 'Persistence finished. Click rerun if you want a fresh scan of the local workspace.';
-    if (verificationRunning) {
+    if (publicationInProgress) {
+      verificationTitle = 'Required verification in progress';
+      verificationCopy = 'DeplAI is validating the approved patch set before it creates the pull request. This can take several minutes.';
+    } else if (verificationRunning) {
       verificationTitle = 'Verification scan running…';
       verificationCopy = 'Rescanning to confirm the latest vulnerability state after remediation.';
     } else if (verificationDone) {
@@ -2293,8 +2266,8 @@ export default function SecurityAnalysisPage() {
       <div className="relative z-10 mx-auto flex min-h-full w-full max-w-5xl animate-fade-in flex-col space-y-6 p-8">
         <div className="mb-8 mt-4 flex flex-wrap items-center justify-between gap-4 border-b border-[#1A1A1A] pb-6">
           <div>
-            <h1 className="mb-2 text-2xl font-semibold text-zinc-100">Remediation Complete</h1>
-            <p className="text-sm text-zinc-400">{githubProject ? 'PR creation and verification status are shown below.' : 'Local remediation persistence and verification status are shown below.'}</p>
+            <h1 className="mb-2 text-2xl font-semibold text-zinc-100">{publicationInProgress ? 'Publishing approved remediation' : 'Remediation Complete'}</h1>
+            <p className="text-sm text-zinc-400">{publicationInProgress ? 'The GitHub App bot is validating the approved patch set and will then create the pull request.' : githubProject ? 'PR creation and verification status are shown below.' : 'Local remediation persistence and verification status are shown below.'}</p>
           </div>
           <ScanReportDownloadButton projectId={projectId} disabled={!results} />
         </div>
@@ -2302,8 +2275,8 @@ export default function SecurityAnalysisPage() {
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
           <div className={`${secPaper} p-8`}>
             <div className="mb-6 flex h-12 w-12 items-center justify-center border-[3px] border-black bg-white"><GitPullRequest className="h-6 w-6 text-black" /></div>
-            <h3 className="mb-2 text-lg font-semibold text-black">{githubProject ? (prUrl ? 'Pull Request Created' : prCreating ? 'Creating Pull Request...' : 'No Pull Request Created') : 'Changes Persisted Locally'}</h3>
-            <p className="mb-6 text-sm text-neutral-600">{githubProject ? (prUrl ? 'The remediation branch was pushed successfully. Open the PR to review or merge it in GitHub.' : prCreating ? 'The remediation engine is still persisting changes to GitHub and creating the Pull Request.' : 'No GitHub PR was created for this run. You can still rerun a verification scan if you want.') : 'The remediation engine wrote the approved changes back to the local project workspace.'}</p>
+            <h3 className="mb-2 text-lg font-semibold text-black">{githubProject ? (prUrl ? 'Pull Request Created' : prCreating ? 'Verifying and creating Pull Request...' : 'No Pull Request Created') : 'Changes Persisted Locally'}</h3>
+            <p className="mb-6 text-sm text-neutral-600">{githubProject ? (prUrl ? 'The DeplAI GitHub App pushed the remediation branch successfully. Open the PR to review or merge it in GitHub.' : prCreating ? 'The DeplAI GitHub App received your approval. Required verification is running before it pushes the branch and creates the Pull Request.' : 'No GitHub PR was created for this run. You can still rerun a verification scan if you want.') : 'The remediation engine wrote the approved changes back to the local project workspace.'}</p>
             {githubProject ? (
               <button type="button" onClick={() => prUrl && window.open(prUrl, '_blank', 'noopener,noreferrer')} disabled={!prUrl} className={`${appBtnInk} w-full disabled:cursor-not-allowed disabled:opacity-50`}>
                 View PR on GitHub <ExternalLink className="h-4 w-4" />
@@ -2323,12 +2296,22 @@ export default function SecurityAnalysisPage() {
                 {verificationRunning || rerunInProgress ? 'Scanning…' : 'Rerun scan'}
               </RunButton>
               {!verificationRunning ? (
-                <RunButton onClick={() => router.push('/dashboard')}>Return to Dashboard</RunButton>
+                <RunButton onClick={() => router.push('/dashboard')}>Done ? return to dashboard</RunButton>
               ) : null}
             </div>
           </div>
         </div>
 
+        <RemediationActivityLog messages={remMessages} active={remediationState === 'running'} />
+        {prUrl && <div className={`${secPaper} p-5`} role="status">
+          <h3 className="text-lg font-semibold text-black">Pull request created. What would you like to do next?</h3>
+          <p className="mt-2 text-sm text-zinc-700">Review the PR on GitHub, run another scan, or return to your dashboard. The PR is not merged automatically.</p>
+          <div className="mt-4 flex flex-wrap gap-3">
+            <a href={prUrl} target="_blank" rel="noopener noreferrer" className={appBtnPaper}>View pull request</a>
+            <button type="button" disabled={!canRerunVerification} onClick={() => void handleVerificationRerun()} className={appBtnPaper}>Run verification scan</button>
+            <button type="button" onClick={() => router.push('/dashboard')} className={appBtnInk}>Done</button>
+          </div>
+        </div>}
         {persistComplete ? (
           <div className={`${secPaper} p-8 text-center`}>
           <h3 className="font-display text-xl font-semibold text-black">Get your application deployed</h3>
@@ -2386,5 +2369,3 @@ export default function SecurityAnalysisPage() {
     </WorkspaceShell>
   );
 }
-
-

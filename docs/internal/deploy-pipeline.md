@@ -25,6 +25,18 @@ The Connector rejects the legacy AWS `runtime_apply=false` generate-and-apply sh
 
 ## Plan confirmation (hard gate)
 
+Planning uses a free-text conversation grounded in detected language, frameworks, datastores and processes. GLM answers user questions, asks a relevant follow-up and maps stated preferences into validated requirement choices. The transcript and answers survive browser refresh and in-place retry. Once requirements are ready, the user explicitly generates the service plan and reviews it before continuing. Legacy callers without a conversation retain the typed question interface. Requirements calls use a 1,024-token output limit. JSON is parsed and validated locally: do not send `response_format: {type: "json_object"}`, which the gateway rejects before inference (its native contract accepts strict `json_schema` only).
+
+The review start/complete API now calls GLM `z-ai/glm-5.3-flash` through the Connector gateway for repository-specific question wording and a bounded service recommendation. Question IDs/options and explicit user answers remain authoritative; unsupported recommendations fail the step. The service explanation is shown with the typed component plan, from which the diagram, cost and Terraform are derived. Gateway routing for these two stages is GLM-only, uses current OpenRouter catalog metadata, and retains organization policy and wallet metering. Each call reserves at most 4,000 output tokens; provider failures do not switch models. User answers remain in the session for retry. The API uses `asyncio.to_thread` so authenticated inference context crosses into the planning worker.
+
+EC2 is the default application runtime, including repositories with a Dockerfile. Static sites retain the S3/CloudFront option and explicitly selected ECS remains supported. The existing enterprise renderer already uses pinned Terraform Registry modules for EC2, ALB and VPC, with validated repository-specific inputs; it is not an arbitrary model-written Terraform path. The packaged application runs through `deployment_packager.py` and `ec2_app_renderer.py` bootstrap/build/start recipes, with bootstrap status and endpoint verification after apply. Console access and runtime management remain available in Outputs. This is automated EC2 execution, not browser automation of the AWS console.
+
+Observed `awaiting_plan_confirmation` state overrides stale API-wait/accepted flags in the browser. Both status polling and live status events expose **Confirm plan & deploy**. The explicit confirm handler clears the gate before awaiting session creation. Infrastructure completion without application verification is labelled accordingly.
+
+Verified deployment outputs link to `/dashboard/deploy/security?projectId=...`. This separate post-deployment screen offers only the existing project-scoped DAST and AWS posture flows. It does not start a scan on page load. DAST asset verification/grants and AWS credential checks remain required; SAST, SCA, SBOM and pre-deploy modules are not scheduled by this entry.
+
+Local tests cover planning contracts, plan-gate recovery, bootstrap status and the deterministic runtime graph. They do not prove a live AWS apply/build, provider inference, DNS or endpoint result.
+
 `terraform_apply.py` returns `status: awaiting_plan_confirmation` until Connector sends `confirm_plan_summary: true`. The UI copy is “Plan confirmation acknowledged. Calling `/api/pipeline/deploy` with `confirm_plan_summary=true`…”.
 
 Do not add a silent apply path. Budget override (`budget_override`) is a separate user acknowledgement for estimated monthly USD vs `budget_limit_usd`.

@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { Coins } from 'lucide-react';
 import { appFocusRing } from '@/features/workspace/theme';
+import { formatCreditAmount } from '@/lib/billing/credit-format';
 
 type BalancePayload = {
   available?: number;
@@ -12,9 +13,7 @@ type BalancePayload = {
 };
 
 function formatCredits(value: number | undefined): string {
-  if (value == null || !Number.isFinite(value)) return '—';
-  if (value >= 100) return Math.round(value).toLocaleString();
-  return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return formatCreditAmount(value);
 }
 
 export function WorkspaceCreditsBadge({ compact = false }: { compact?: boolean }) {

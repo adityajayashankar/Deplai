@@ -13,6 +13,8 @@ interface ArchitectureReviewStartBody {
   project_id: string;
   workspace?: string;
   environment?: string;
+  answers?: Record<string, string>;
+  conversation?: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
 function classifyAgenticRouteError(err: unknown, action: string): { message: string; status: number } {
@@ -51,6 +53,9 @@ export async function POST(req: NextRequest) {
     if (!projectId) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
     }
+    if (body.conversation !== undefined && (!Array.isArray(body.conversation) || body.conversation.length > 40 || body.conversation.some(message => !message || !['user', 'assistant'].includes(message.role) || typeof message.content !== 'string' || message.content.length > 3000))) {
+      return NextResponse.json({ error: 'Use at most 40 messages, each under 3,000 characters.' }, { status: 400 });
+    }
 
     const owned = await verifyProjectOwnership(user.id, projectId);
     if ('error' in owned) return owned.error;
@@ -78,6 +83,8 @@ export async function POST(req: NextRequest) {
         ...billing.fields,
         repo_full_name: meta.repo_full_name,
         environment: body.environment || null,
+        answers: body.answers || {},
+        conversation: body.conversation,
       }),
       signal: AbortSignal.timeout(120_000),
     });

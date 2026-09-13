@@ -84,6 +84,9 @@ export interface ArchitectureDecision {
 }
 
 export interface ArchitectureReviewPayload {
+  conversation?: InfraConsultantMessage[];
+  conversation_ready?: boolean;
+  answers?: Record<string, string>;
   context_json: RepositoryContextJson;
   questions: ArchitectureQuestion[];
   defaults: Record<string, string>;
@@ -579,6 +582,29 @@ export interface TerraformRuntimeConfig {
   lock_table: string;
 }
 
+/**
+ * Terraform's local backend lives only for the lifetime of an apply worker.
+ * Give every DeplAI project a stable remote-state identity so a retry sees the
+ * resources created by a preceding, partial apply.
+ */
+export function defaultTerraformStateBackend(projectId: string): Pick<TerraformRuntimeConfig, 'state_bucket' | 'lock_table'> {
+  const source = String(projectId || 'project').trim().toLowerCase() || 'project';
+  const slug = source
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 26) || 'project';
+  let hash = 2166136261;
+  for (let index = 0; index < source.length; index += 1) {
+    hash ^= source.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  const suffix = (hash >>> 0).toString(36);
+  return {
+    state_bucket: `deplai-tfstate-${slug}-${suffix}`,
+    lock_table: `deplai-tflock-${slug}-${suffix}`,
+  };
+}
+
 export interface DeploymentInstanceSummary {
   cloudfrontUrl: string;
   albDns: string;
@@ -810,12 +836,17 @@ export function resolveTerraformRuntimeConfig(
   },
 ): TerraformRuntimeConfig {
   const existing = readSavedTerraformRuntimeConfig(projectId);
-  if (existing) return existing;
-  return normalizeTerraformRuntimeConfig({
+  const configured = existing || normalizeTerraformRuntimeConfig({
     aws_region: String(options?.aws?.aws_region || DEFAULT_AWS_REGION).trim() || DEFAULT_AWS_REGION,
     state_bucket: String(options?.savedRun?.state_bucket || '').trim(),
     lock_table: String(options?.savedRun?.lock_table || '').trim(),
   });
+  const fallback = defaultTerraformStateBackend(projectId);
+  return {
+    ...configured,
+    state_bucket: configured.state_bucket || fallback.state_bucket,
+    lock_table: configured.lock_table || fallback.lock_table,
+  };
 }
 
 export function writeSavedTerraformRuntimeConfig(projectId: string, config: TerraformRuntimeConfig): void {
@@ -1346,10 +1377,10 @@ export function isLiveDeployAttempt(args: {
 }): boolean {
   if (args.failed) return false;
   const phase = String(args.uiPhase || '').trim().toLowerCase();
-  // Confirm click leaves awaiting_plan immediately; keep the button in the live
-  // state even if the previous result still carries plan-gate flags.
-  if (phase === 'starting' || phase === 'waiting_api' || phase === 'reconciling') return true;
+  // Observed plan gates take precedence over stale transport/UI phases. The
+  // confirm handler clears the gate before dispatching the apply request.
   if (isAwaitingPlanConfirmation(args)) return false;
+  if (phase === 'starting' || phase === 'waiting_api' || phase === 'reconciling') return true;
   return args.status === 'running';
 }
 

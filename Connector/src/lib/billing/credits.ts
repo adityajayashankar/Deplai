@@ -42,6 +42,9 @@ export type BillingPlan = {
   bonusCreditPercent: number;
   rolloverMonthsCap: number;
   isCustom: boolean;
+  /** Whether a new self-serve subscription can be started for this plan. */
+  isAvailable: boolean;
+  availabilityMessage: string | null;
   isRecommended: boolean;
   bonusTermsCopy: string;
   features: string[];
@@ -55,6 +58,12 @@ export type BillingPlan = {
   annualReleaseSchedule: { creditsPerRelease: number; interval: 'monthly'; releases: number } | null;
   catalogVersion: string;
 };
+
+export const ENTERPRISE_COMING_SOON_MESSAGE = 'Enterprise subscriptions are coming soon.';
+
+export function planIsAvailableForCheckout(planId: string): boolean {
+  return planId !== ENTERPRISE_PLAN_ID;
+}
 
 export type CreditPack = {
   id: string;
@@ -178,6 +187,7 @@ function parseFeatures(value: unknown): string[] {
 
 function mapPlan(row: PlanRow): BillingPlan {
   const v2 = catalogPlan(row.id);
+  const isAvailable = planIsAvailableForCheckout(row.id);
   return {
     id: row.id,
     name: row.name,
@@ -190,6 +200,8 @@ function mapPlan(row: PlanRow): BillingPlan {
     bonusCreditPercent: v2 ? 0 : Number(row.bonus_credit_percent),
     rolloverMonthsCap: v2 ? 0 : Number(row.rollover_months_cap),
     isCustom: asBool(row.is_custom),
+    isAvailable,
+    availabilityMessage: isAvailable ? null : ENTERPRISE_COMING_SOON_MESSAGE,
     isRecommended: asBool(row.is_recommended),
     bonusTermsCopy: v2 ? 'Managed-LLM credits never expire. Annual credits are released monthly.' : row.bonus_terms_copy,
     features: v2?.features || parseFeatures(row.features_json),
@@ -227,6 +239,8 @@ export const FALLBACK_PLANS: BillingPlan[] = [
     bonusCreditPercent: 0,
     rolloverMonthsCap: 0,
     isCustom: false,
+    isAvailable: true,
+    availabilityMessage: null,
     isRecommended: false,
     bonusTermsCopy: 'Free organizations receive no managed-LLM credits. BYOK remains available.',
     features: ['1 project', 'BYOK model access', 'Basic security scan', 'Community support'],
@@ -240,13 +254,15 @@ export const FALLBACK_PLANS: BillingPlan[] = [
     name: 'starter_20',
     displayName: 'Starter',
     description: 'Go from repo connect to approved AWS deploy without stitching scanners, agents, and Terraform yourself',
-    priceCents: 599,
-    yearlyPriceCents: 6499,
+    priceCents: 499,
+    yearlyPriceCents: 5399,
     billingCadence: 'monthly',
     paidCreditAmount: 25,
     bonusCreditPercent: 0,
     rolloverMonthsCap: 0,
     isCustom: false,
+    isAvailable: true,
+    availabilityMessage: null,
     isRecommended: false,
     bonusTermsCopy: 'Managed-LLM credits never expire. Annual credits are released 25 per month.',
     features: [
@@ -258,7 +274,7 @@ export const FALLBACK_PLANS: BillingPlan[] = [
       'Email support when something blocks your release',
     ],
     sortOrder: 20,
-    pricePaise: 59900, yearlyPricePaise: 649900, priceIncludesTax: true,
+    pricePaise: 49900, yearlyPricePaise: 539900, priceIncludesTax: true,
     providerBudgetPaise: 32500, yearlyProviderBudgetPaise: 390000, annualCreditAmount: 300,
     annualReleaseSchedule: { creditsPerRelease: 25, interval: 'monthly', releases: 12 }, catalogVersion: CREDIT_CATALOG_VERSION,
   },
@@ -267,13 +283,15 @@ export const FALLBACK_PLANS: BillingPlan[] = [
     name: 'pro_50',
     displayName: 'Pro',
     description: 'For teams that need design iteration, fix velocity, and deploy confidence in one place',
-    priceCents: 1399,
-    yearlyPriceCents: 15199,
+    priceCents: 999,
+    yearlyPriceCents: 10799,
     billingCadence: 'monthly',
     paidCreditAmount: 62.5,
     bonusCreditPercent: 0,
     rolloverMonthsCap: 0,
     isCustom: false,
+    isAvailable: true,
+    availabilityMessage: null,
     isRecommended: true,
     bonusTermsCopy: 'Managed-LLM credits never expire. Annual credits are released 62.5 per month.',
     features: [
@@ -285,7 +303,7 @@ export const FALLBACK_PLANS: BillingPlan[] = [
       'Organization roles, teams, and shared billing context',
     ],
     sortOrder: 30,
-    pricePaise: 139900, yearlyPricePaise: 1519900, priceIncludesTax: true,
+    pricePaise: 99900, yearlyPricePaise: 1079900, priceIncludesTax: true,
     providerBudgetPaise: 81250, yearlyProviderBudgetPaise: 975000, annualCreditAmount: 750,
     annualReleaseSchedule: { creditsPerRelease: 62.5, interval: 'monthly', releases: 12 }, catalogVersion: CREDIT_CATALOG_VERSION,
   },
@@ -301,6 +319,8 @@ export const FALLBACK_PLANS: BillingPlan[] = [
     bonusCreditPercent: 0,
     rolloverMonthsCap: 0,
     isCustom: true,
+    isAvailable: false,
+    availabilityMessage: ENTERPRISE_COMING_SOON_MESSAGE,
     isRecommended: false,
     bonusTermsCopy:
       'Credits and seats are provisioned from your contract. We align allotments to how your teams actually ship — not a one-size-fits-all shelf plan.',

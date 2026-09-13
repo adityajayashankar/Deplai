@@ -15,6 +15,7 @@ interface ArchitectureReviewCompleteBody {
   workspace: string;
   answers: Record<string, string>;
   aws_context?: Record<string, unknown> | null;
+  conversation?: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
 function classifyAgenticRouteError(err: unknown, action: string): { message: string; status: number } {
@@ -49,6 +50,9 @@ export async function POST(req: NextRequest) {
     if (error) return error;
 
     const body = await req.json() as ArchitectureReviewCompleteBody;
+    if (body.conversation !== undefined && (!Array.isArray(body.conversation) || body.conversation.length > 40 || body.conversation.some(message => !message || !['user', 'assistant'].includes(message.role) || typeof message.content !== 'string' || message.content.length > 3000))) {
+      return NextResponse.json({ error: 'Use at most 40 messages, each under 3,000 characters.' }, { status: 400 });
+    }
     const projectId = String(body.project_id || '').trim();
     if (!projectId) {
       return NextResponse.json({ error: 'project_id is required' }, { status: 400 });
@@ -80,6 +84,7 @@ export async function POST(req: NextRequest) {
         ...billing.fields,
         repo_full_name: meta.repo_full_name,
         answers: body.answers || {},
+        conversation: body.conversation,
         aws_context: body.aws_context || null,
       }),
       signal: AbortSignal.timeout(120_000),

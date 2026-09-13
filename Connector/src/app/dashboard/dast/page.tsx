@@ -17,7 +17,7 @@ export default function DashboardDastPage() {
   const [profile, setProfile] = useState<DastScanProfile>('BASELINE');
 
   useEffect(() => {
-    const stored = window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY) || '';
+    const stored = new URLSearchParams(window.location.search).get('projectId') || window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY) || '';
     setProjectId(stored);
     void fetch('/api/projects', { cache: 'no-store' })
       .then((res) => res.json())
