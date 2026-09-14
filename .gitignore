@@ -83,6 +83,7 @@ Terraform-generation-plan.md
 !admin-console/tsconfig.json
 !admin-console/postcss.config.mjs
 !admin-console/scripts/start-server.mjs
+!admin-console/scripts/server-boundary.mjs
 
 # Allow tracked config/source artifacts in Customization Agent
 !Customization Agent/**/*.json
