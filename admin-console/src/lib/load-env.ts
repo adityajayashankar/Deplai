@@ -76,6 +76,9 @@ export function loadAdminEnv(): void {
   if (loaded) return;
   loaded = true;
 
+  // Production configuration must come from the deployment environment.
+  if (process.env.NODE_ENV === 'production') return;
+
   const root = adminConsoleRoot();
   parseEnvFile(resolve(root, '.env'));
   parseEnvFile(resolve(root, '.env.local'), { override: true });

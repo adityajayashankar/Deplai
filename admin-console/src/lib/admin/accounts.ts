@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { hashPassword, validatePasswordStrength } from '@/lib/auth/password';
 import { encryptTotpSecret } from '@/lib/auth/totp';
 import { hashRecoveryCode } from '@/lib/crypto';
-import { query } from '@/lib/db';
+import { query, withNamedLock, withTransaction } from '@/lib/db';
 
 export type AdminAccount = {
   id: string;
@@ -82,44 +82,43 @@ export async function bootstrapOwner(input: {
   totpSecret: string;
   recoveryCodes: string[];
   force?: boolean;
-}): Promise<AdminAccount> {
-  const existing = await countOwners();
-  if (existing > 0 && !input.force) {
-    throw new Error('An OWNER account already exists. Run: npm run admin:reset-owner');
-  }
-  if (existing > 0 && input.force) {
-    await resetOwnerAccounts();
-  }
+}): Promise<AdminAccount | null> {
+  return withNamedLock('admin-owner-bootstrap', 30, async () => {
+    if (input.force) throw new Error('Bootstrap cannot replace an existing owner. Use the separate recovery procedure.');
+    if (await countOwners() > 0) return null;
 
-  const strengthError = validatePasswordStrength(input.password);
-  if (strengthError) throw new Error(strengthError);
+    const strengthError = validatePasswordStrength(input.password);
+    if (strengthError) throw new Error(strengthError);
 
-  const email = input.email.trim().toLowerCase();
-  const id = uuidv4();
-  const passwordHash = await hashPassword(input.password);
+    const email = input.email.trim().toLowerCase();
+    const id = uuidv4();
+    const passwordHash = await hashPassword(input.password);
 
-  await query(
-    `INSERT INTO admin_accounts (id, email, password_hash, role, status, password_changed_at)
-     VALUES (?, ?, ?, 'OWNER', 'ACTIVE', CURRENT_TIMESTAMP)`,
-    [id, email, passwordHash],
-  );
+    await withTransaction(async (exec) => {
+      await exec(
+        `INSERT INTO admin_accounts (id, email, password_hash, role, status, password_changed_at)
+         VALUES (?, ?, ?, 'OWNER', 'ACTIVE', CURRENT_TIMESTAMP)`,
+        [id, email, passwordHash],
+      );
 
-  await query(
-    `INSERT INTO admin_mfa_credentials (id, admin_id, kind, label, secret_encrypted)
-     VALUES (?, ?, 'TOTP', 'Primary authenticator', ?)`,
-    [uuidv4(), id, encryptTotpSecret(input.totpSecret)],
-  );
+      await exec(
+        `INSERT INTO admin_mfa_credentials (id, admin_id, kind, label, secret_encrypted)
+         VALUES (?, ?, 'TOTP', 'Primary authenticator', ?)`,
+        [uuidv4(), id, encryptTotpSecret(input.totpSecret)],
+      );
 
-  for (const code of input.recoveryCodes) {
-    await query(
-      `INSERT INTO admin_recovery_codes (id, admin_id, code_hash) VALUES (?, ?, ?)`,
-      [uuidv4(), id, hashRecoveryCode(code)],
-    );
-  }
+      for (const code of input.recoveryCodes) {
+        await exec(
+          `INSERT INTO admin_recovery_codes (id, admin_id, code_hash) VALUES (?, ?, ?)`,
+          [uuidv4(), id, hashRecoveryCode(code)],
+        );
+      }
+    });
 
-  const account = await getAdminById(id);
-  if (!account) throw new Error('Failed to create owner account');
-  return account;
+    const account = await getAdminById(id);
+    if (!account) throw new Error('Failed to create owner account');
+    return account;
+  });
 }
 
 export async function listActiveMfaKinds(adminId: string): Promise<Array<'TOTP' | 'WEBAUTHN'>> {

@@ -20,6 +20,9 @@ async function promptHidden(question: string): Promise<string> {
 
 async function main() {
   loadAdminEnv();
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('The development reset command is disabled in production. Use an explicitly reviewed owner recovery procedure.');
+  }
 
   const removed = await resetOwnerAccounts();
   if (removed > 0) {
@@ -43,8 +46,8 @@ async function main() {
     password,
     totpSecret,
     recoveryCodes,
-    force: true,
   });
+  if (!account) throw new Error('An OWNER already exists; no replacement credentials were generated.');
 
   console.log('\nOWNER account recreated successfully.');
   console.log(`Admin ID: ${account.id}`);

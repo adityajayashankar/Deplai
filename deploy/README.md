@@ -1,5 +1,7 @@
 # Production Docker deployment
 
+For admin-console schema/bind repairs on an existing stack, run `bash deploy/redeploy-admin-console.sh` from the repository root. It builds, migrates and recreates only admin-console. Initial owner enrollment is separate; see [admin production operations](../docs/admin-console-security.md#production-deployment).
+
 This bundle packages the production Connector UI/API, Agentic Layer (including
 the Terraform Agent, remediation pipeline, and Diagram/Cost agent),
 customization backend, MySQL, Qdrant, and a Caddy TLS proxy. The

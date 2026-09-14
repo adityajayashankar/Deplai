@@ -1,3 +1,6 @@
+import { existsSync } from 'node:fs';
+import { adminListenHost } from '../../scripts/server-boundary.mjs';
+
 const DEFAULT_DEV_SESSION_SECRET = 'deplai-admin-local-dev-secret-do-not-use-in-prod';
 const DEFAULT_DEV_AUDIT_SECRET = 'deplai-admin-local-audit-secret-do-not-use-in-prod';
 const DEFAULT_DEV_MFA_KEY = 'deplai-admin-local-mfa-key-do-not-use-in-prod';
@@ -42,10 +45,9 @@ export function getAdminConfig(): AdminConfig {
   const sessionSecret = envString('ADMIN_SESSION_SECRET', isProduction ? '' : DEFAULT_DEV_SESSION_SECRET);
   const auditHmacSecret = envString('ADMIN_AUDIT_HMAC_SECRET', isProduction ? '' : DEFAULT_DEV_AUDIT_SECRET);
   const mfaEncryptionKey = envString('ADMIN_MFA_ENCRYPTION_KEY', isProduction ? '' : DEFAULT_DEV_MFA_KEY);
-  const bindHost = envString('ADMIN_BIND_HOST', '127.0.0.1');
-  const allowUnsafeBind = envBoolean('ADMIN_ALLOW_UNSAFE_BIND', false);
+  const bindHost = adminListenHost(process.env, existsSync('/.dockerenv'));
 
-  cachedConfig = {
+  const config: AdminConfig = {
     enabled: envBoolean('ADMIN_ENABLED', true),
     bindHost,
     port: envNumber('ADMIN_PORT', 3100),
@@ -62,13 +64,14 @@ export function getAdminConfig(): AdminConfig {
   };
 
   if (isProduction) {
-    validateProductionConfig(cachedConfig, allowUnsafeBind);
+    validateProductionConfig(config);
   }
 
-  return cachedConfig;
+  cachedConfig = config;
+  return config;
 }
 
-function validateProductionConfig(config: AdminConfig, allowUnsafeBind: boolean): void {
+function validateProductionConfig(config: AdminConfig): void {
   const errors: string[] = [];
 
   if (!config.enabled) errors.push('ADMIN_ENABLED must be true in production');
@@ -80,9 +83,6 @@ function validateProductionConfig(config: AdminConfig, allowUnsafeBind: boolean)
   }
   if (!config.mfaEncryptionKey || config.mfaEncryptionKey === DEFAULT_DEV_MFA_KEY) {
     errors.push('ADMIN_MFA_ENCRYPTION_KEY must be set to a strong unique value');
-  }
-  if (config.bindHost === '0.0.0.0' && !allowUnsafeBind) {
-    errors.push('ADMIN_BIND_HOST=0.0.0.0 is not allowed in production without ADMIN_ALLOW_UNSAFE_BIND=true');
   }
 
   if (errors.length > 0) {

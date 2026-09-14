@@ -26,6 +26,8 @@ COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/migrations ./migrations
+COPY --from=builder /app/src/lib ./src/lib
+COPY --from=builder /app/tsconfig.json ./tsconfig.json
 
 RUN chown -R node:node /app
 USER node

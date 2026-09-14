@@ -5,12 +5,13 @@
   "scripts": {
     "dev": "next dev -p 3100 -H 127.0.0.1",
     "build": "next build",
+    "prestart": "tsx scripts/prestart.ts",
     "start": "node scripts/start-server.mjs",
     "lint": "eslint",
     "admin:bootstrap": "tsx scripts/bootstrap-owner.ts",
     "admin:reset-owner": "tsx scripts/reset-owner.ts",
     "migrate": "tsx scripts/apply-migration.ts",
-    "test": "tsx --test src/**/*.test.ts"
+    "test": "node --test scripts/*.test.mjs && tsx --test src/**/*.test.ts"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.0.2",

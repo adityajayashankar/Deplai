@@ -42,7 +42,7 @@ npm run migrate
 npm run admin:bootstrap
 ```
 
-The command creates exactly one `OWNER` account, prints a TOTP secret, and one-time recovery codes. Store them offline.
+The command requires a private interactive terminal, hides password input, and creates the owner, MFA credential and recovery codes in one transaction under a named lock. A repeated invocation exits successfully without changing an existing owner or printing new enrollment material. It never repairs or replaces an existing owner automatically. Store the initial TOTP enrollment and recovery codes offline; do not record the terminal session. The development reset command is disabled in production.
 
 ## Production deployment
 
@@ -60,11 +60,49 @@ ADMIN_AUDIT_HMAC_SECRET=...
 ADMIN_MFA_ENCRYPTION_KEY=...
 ```
 
-Deploy with the existing production stack:
+For an existing production stack, deploy only admin-console from the repository root on EC2:
 
 ```bash
-docker compose -f docker-compose.production.yml --env-file deploy/.env up -d --build
+bash deploy/redeploy-admin-console.sh
 ```
+
+The script builds the admin image, runs migrations in a one-off container without published ports, then recreates only admin-console and waits for health. MySQL must already be healthy and the platform schema (projects, organizations, billing_plans) installed. A migration failure stops deployment before recreation. No other service is restarted.
+
+Equivalent commands, useful for diagnosing a failed migration:
+
+```bash
+docker compose --env-file deploy/.env -f docker-compose.production.yml build admin-console
+docker compose --env-file deploy/.env -f docker-compose.production.yml run --rm --no-deps -T admin-console npm run migrate
+docker compose --env-file deploy/.env -f docker-compose.production.yml up -d --no-deps --wait admin-console
+```
+
+Migration applies all three admin migrations to `DB_NAME`, including `admin_login_attempts`. It serializes concurrent migration commands with a MySQL named lock, replays additive `CREATE TABLE IF NOT EXISTS` statements and verifies all 11 tables. MySQL DDL is not transactional: partial completion is recovered by rerunning. Existing data is preserved. The migration identity needs CREATE/REFERENCES permissions; runtime startup only checks table access. Future non-idempotent migrations require a versioned migration design before adding them to this replay list.
+
+`npm start` validates configuration and checks all admin tables before opening the listener. It does not run DDL. To check schema independently:
+
+```bash
+docker compose --env-file deploy/.env -f docker-compose.production.yml run --rm --no-deps -T admin-console npm run migrate -- --check
+```
+
+Initial owner enrollment is a separate, interactive operation after migration. Run through a private administrative terminal with session recording disabled for this enrollment:
+
+```bash
+docker compose --env-file deploy/.env -f docker-compose.production.yml run --rm --no-deps admin-console npm run admin:bootstrap
+```
+
+The production image includes the CLI source and TypeScript alias configuration. Production uses injected environment values and never falls back to Connector's local environment files.
+
+Both the custom server and application configuration use the same bind policy: production defaults to loopback; `0.0.0.0` requires both `ADMIN_CONTAINER_MODE=true` and Docker's `/.dockerenv` marker. Other non-loopback addresses are rejected. `ADMIN_ALLOW_UNSAFE_BIND` grants no exception. Docker detection cannot inspect host publishing rules: Compose must retain `127.0.0.1:3100:3100`, avoid host networking, and Caddy must continue blocking public admin paths. Keep EC2 inbound port 3100 closed. The Dockerfile EXPOSE declaration does not publish a port.
+
+After redeploy, verify privately on EC2:
+
+```bash
+docker compose --env-file deploy/.env -f docker-compose.production.yml ps admin-console
+docker compose --env-file deploy/.env -f docker-compose.production.yml port admin-console 3100
+curl --fail http://127.0.0.1:3100/api/health
+```
+
+The port command must show `127.0.0.1:3100`. Open the SSM tunnel below and sign in: a valid owner password must advance to MFA. Health/schema checks alone do not prove password or MFA authentication. If an owner already existed before this repair, use those existing credentials.
 
 ## Opening the console on EC2
 
