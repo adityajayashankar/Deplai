@@ -35,20 +35,9 @@ def test_rejects_unsafe_and_business_paths(path):
     assert not runtime.presentation_path(path)
 
 
-def test_free_catalog_prefers_openrouter_free_router(monkeypatch):
-    monkeypatch.delenv("UIUX_OPENROUTER_MODEL", raising=False)
-    valid = {"id": "vendor/code:free", "pricing": {"prompt": "0", "completion": "0"}, "supported_parameters": ["tools"]}
-    router = {"id": "openrouter/free", "pricing": {"prompt": "0", "completion": "0"}, "context_length": 200000}
-    assert runtime.free_candidates([valid, {**valid, "id": "vendor/paid"},
-                                    {**valid, "pricing": {"prompt": "1", "completion": "0"}},
-                                    {**valid, "supported_parameters": []}, router])[0] == "openrouter/free"
-    with pytest.raises(RuntimeError, match="verified free"):
-        runtime.free_candidates([valid])
-    monkeypatch.setenv("UIUX_OPENROUTER_MODEL", "vendor/paid")
-    with pytest.raises(RuntimeError, match="verified free"):
-        runtime.free_candidates([valid])
-    monkeypatch.setenv("UIUX_OPENROUTER_MODEL", "vendor/code:free")
-    assert runtime.free_candidates([valid]) == [valid["id"]]
+def test_model_is_glm_only(monkeypatch):
+    monkeypatch.setenv("UIUX_OPENROUTER_MODEL", "openrouter/free")
+    assert runtime.UIUX_MODEL == "z-ai/glm-5.3-flash"
 
 
 def test_scope_and_user_keys_rejected(client):
@@ -358,6 +347,8 @@ def test_product_inference_uses_shared_gateway_and_preserves_tool_ids(client, mo
         assert str(request.url) == 'http://connector:3000/api/ai/chat'
         body = json.loads(request.content)
         assert body['metadata']['product'] == 'uiux'
+        assert body['model'] == 'z-ai/glm-5.3-flash'
+        assert body['access_mode'] == 'platform'
         assert body['messages'][0]['toolCalls'][0]['id'] == 'call-one'
         assert body['messages'][1]['toolCallId'] == 'call-one'
         assert request.headers['x-deplai-organization-id'] == 'org'
@@ -372,40 +363,15 @@ def test_product_inference_uses_shared_gateway_and_preserves_tool_ids(client, mo
     assert run['usage']['input_tokens'] == 12
 
 
-def test_rate_retry_uses_openrouter_free_router(client, monkeypatch):
-    # Exercise the isolated adapter helper, never the product inference path.
+def test_raw_provider_fallback_is_unavailable(client, monkeypatch):
     monkeypatch.delenv('UIUX_CONNECTOR_URL', raising=False)
-    run = record()
-    runtime.persist(run)
-    runtime.COOLDOWNS.clear()
-    monkeypatch.setattr(runtime, "CATALOG", (0, []))
-    monkeypatch.setattr(runtime, "LAST_CALL", 0)
-    monkeypatch.delenv("UIUX_OPENROUTER_MODEL", raising=False)
-    sent = []
-    async def no_wait(seconds):
-        runtime.COOLDOWNS.clear()
-    monkeypatch.setattr(runtime.asyncio, "sleep", no_wait)
     async def handler(request):
-        if request.url.path.endswith("/models"):
-            return httpx.Response(200, json={"data": [
-                {"id": "openrouter/free", "pricing": {"prompt": "0", "completion": "0"}, "context_length": 200000},
-                {"id": "vendor/a:free", "pricing": {"prompt": "0", "completion": "0"}, "supported_parameters": ["tools"]},
-            ]})
-        assert request.headers["Authorization"] == "Bearer platform-test-key"
-        data = json.loads(request.content)
-        assert data["model"] == "openrouter/free"
-        assert data["provider"]["max_price"] == {"prompt": 0, "completion": 0}
-        sent.append(data["model"])
-        if len(sent) == 1:
-            return httpx.Response(429, headers={"Retry-After": "2"})
-        return httpx.Response(200, json={"choices": [{"message": {"content": "done"}}], "usage": {"cost": 0}})
+        raise AssertionError('Must not call a provider directly')
     async def perform():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
-            return await runtime.completion(transport, runtime.Budget(run), [{"role": "user", "content": "edit"}])
-    assert asyncio.run(perform())["content"] == "done"
-    assert sent[0] == "openrouter/free"
-    assert len(sent) == 2
-    assert run["usage"]["requests"] == 2
+            await runtime.completion(transport, runtime.Budget(record()), [])
+    with pytest.raises(RuntimeError, match='gateway'):
+        asyncio.run(perform())
 
 
 def test_product_requires_gateway_but_no_worker_provider_key(client, monkeypatch):

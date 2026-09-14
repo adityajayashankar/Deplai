@@ -5,7 +5,7 @@ import { validatePresentationChanges, type PresentationChange } from './presenta
 
 type RunProposal = { run_id: string; prompt?: string; summary?: string; changes: PresentationChange[] };
 export type UiuxPullRequestClient = {
-  git: Pick<Octokit['git'], 'getRef' | 'getCommit' | 'getTree' | 'createTree' | 'createCommit' | 'createRef'>;
+  git: Pick<Octokit['git'], 'getRef' | 'getCommit' | 'getTree' | 'createTree' | 'createCommit' | 'createRef' | 'updateRef'>;
   pulls: Pick<Octokit['pulls'], 'list' | 'create'>;
 };
 export class UiuxPullRequestError extends Error {
@@ -15,6 +15,48 @@ function statusOf(error: unknown) { return (error as { status?: number })?.statu
 export function uiuxBlobSha(content: string) {
   const bytes = Buffer.from(content, 'utf8');
   return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+}
+
+/** Applies a reviewed UI-only proposal to the currently reviewed branch. */
+export async function applyUiuxChanges(snapshot: Snapshot, run: RunProposal, suppliedClient?: UiuxPullRequestClient): Promise<{ branch: string; commit: string }> {
+  const { owner, repo, branch } = snapshot.project;
+  if (snapshot.project.type !== 'github' || !owner || !repo || !branch || !snapshot.installation_uuid) throw new UiuxPullRequestError('Connect a GitHub repository to apply changes. Local projects can download a patch.', 400);
+  if (!/^[a-f0-9]{40}$/i.test(snapshot.source_sha)) throw new UiuxPullRequestError('The source snapshot has no valid Git commit.', 400);
+  const validation = validatePresentationChanges(run.changes);
+  if (!validation.ok) throw new UiuxPullRequestError(validation.conflicts.join('\n'));
+  for (const change of run.changes) {
+    const original = snapshot.files.find(file => file.path === change.path);
+    if (typeof change.before !== 'string' || typeof change.after !== 'string' || !original || original.content !== change.before || change.before === change.after) throw new UiuxPullRequestError(`${change.path}: proposal does not match the reviewed source snapshot.`);
+  }
+  let client = suppliedClient;
+  if (!client) {
+    const { githubService } = await import('@/lib/github');
+    client = new Octokit({ auth: await githubService.getInstallationTokenForRemediation(snapshot.installation_uuid) });
+  }
+  const github = client;
+  const repository = { owner, repo };
+  const current = await github.git.getRef({ ...repository, ref: `heads/${branch}` });
+  if (current.data.object.sha !== snapshot.source_sha) throw new UiuxPullRequestError('The repository branch advanced after this design task. Start a new task against the latest source before applying changes.');
+  const sourceCommit = (await github.git.getCommit({ ...repository, commit_sha: snapshot.source_sha })).data;
+  if (snapshot.tree_sha && sourceCommit.tree.sha !== snapshot.tree_sha) throw new UiuxPullRequestError('Source tree does not match the reviewed snapshot.');
+  const sourceTree = (await github.git.getTree({ ...repository, tree_sha: sourceCommit.tree.sha, recursive: 'true' })).data;
+  if (sourceTree.truncated) throw new UiuxPullRequestError('GitHub returned an incomplete repository tree. Create a PR instead, or retry applying changes.');
+  const entries = run.changes.map(change => {
+    const entry = sourceTree.tree.find(item => item.path === change.path);
+    if (typeof change.before !== 'string' || typeof change.after !== 'string' || !entry || entry.type !== 'blob' || (entry.mode !== '100644' && entry.mode !== '100755') || entry.sha !== uiuxBlobSha(change.before)) throw new UiuxPullRequestError(`${change.path}: Git source differs from the reviewed baseline or is not a regular file.`);
+    return { path: change.path, type: 'blob' as const, mode: entry.mode as '100644' | '100755', content: change.after };
+  });
+  const tree = await github.git.createTree({ ...repository, base_tree: sourceCommit.tree.sha, tree: entries });
+  const commit = await github.git.createCommit({ ...repository, message: `UI/UX presentation update (${run.run_id})`, tree: tree.data.sha, parents: [snapshot.source_sha] });
+  const finalRef = await github.git.getRef({ ...repository, ref: `heads/${branch}` });
+  if (finalRef.data.object.sha !== snapshot.source_sha) throw new UiuxPullRequestError('The repository branch advanced while preparing this change. It was not applied.');
+  try {
+    await github.git.updateRef({ ...repository, ref: `heads/${branch}`, sha: commit.data.sha, force: false });
+  } catch (error) {
+    if (statusOf(error) === 422) throw new UiuxPullRequestError('GitHub rejected the branch update because it advanced. The change was not applied.');
+    throw error;
+  }
+  return { branch, commit: commit.data.sha };
 }
 
 /** Publishes a reviewed proposal without writing to an existing branch or running repository code. */

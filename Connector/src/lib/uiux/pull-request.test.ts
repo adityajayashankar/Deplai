@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { Snapshot } from './snapshots';
-import { createUiuxPullRequest, uiuxBlobSha, type UiuxPullRequestClient } from './pull-request';
+import { applyUiuxChanges, createUiuxPullRequest, uiuxBlobSha, type UiuxPullRequestClient } from './pull-request';
 
 const source = 'a'.repeat(40);
 const snapshot: Snapshot = { project: { id: 'p', name: 'example', type: 'github', owner: 'owner', repo: 'repo', branch: 'main' }, source_sha: source, tree_sha: 'base-tree', installation_uuid: 'installation', files: [{ path: 'src/style.css', content: '.card { color: black; }' }], warnings: [] };
@@ -19,6 +19,7 @@ function mock(options: { advanced?: boolean; hostile?: boolean; losePrResponse?:
       createTree: async (input: Record<string, unknown>) => { writes.push({ kind: 'tree', input }); return { data: { sha: 'expected-tree' } }; },
       createCommit: async (input: Record<string, unknown>) => { writes.push({ kind: 'commit', input }); return { data: { sha: 'proposal' } }; },
       createRef: async (input: Record<string, unknown>) => { writes.push({ kind: 'ref', input }); branchExists = true; return { data: {} }; },
+      updateRef: async (input: Record<string, unknown>) => { writes.push({ kind: 'update-ref', input }); return { data: {} }; },
     },
     pulls: {
       list: async () => ({ data: prExists ? [pr] : [] }),
@@ -42,6 +43,17 @@ test('publishes one atomic draft preserving base tree, parent, and file modes; r
   assert.equal(writes.filter(write => write.kind === 'commit').length, 1);
   assert.equal(writes.filter(write => write.kind === 'ref').length, 1);
   assert.equal(writes.filter(write => write.kind === 'pr').length, 1);
+});
+test('applies one reviewed presentation commit to the unchanged base branch without force', async () => {
+  const { client, writes } = mock();
+  const result = await applyUiuxChanges(snapshot, run, client);
+  assert.equal(result.branch, 'main');
+  assert.equal(result.commit, 'proposal');
+  const update = writes.find(write => write.kind === 'update-ref')!.input;
+  assert.equal(update.ref, 'heads/main');
+  assert.equal(update.force, false);
+  assert.deepEqual(writes.find(write => write.kind === 'commit')!.input.parents, [source]);
+  assert.equal(writes.some(write => write.kind === 'pr'), false);
 });
 test('rejects stale base before any writes', async () => {
   const { client, writes } = mock({ advanced: true });

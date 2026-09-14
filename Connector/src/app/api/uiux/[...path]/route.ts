@@ -7,14 +7,14 @@ import { getOrganizationPolicy } from '@/lib/ai-platform/policies';
 import { GET as listProjects } from '@/app/api/projects/route';
 import { editorPath, loadSnapshotFile, readState, saveState, snapshotRepository, UiuxError, type Snapshot } from '@/lib/uiux/snapshots';
 import { proposalPatch, verifyProposal } from '@/lib/uiux/proposals';
-import { createUiuxPullRequest, UiuxPullRequestError } from '@/lib/uiux/pull-request';
+import { applyUiuxChanges, createUiuxPullRequest, UiuxPullRequestError } from '@/lib/uiux/pull-request';
 import { settleProductUsage } from '@/lib/billing/product-usage';
 import type { UiuxRun } from '@/features/customization/uiux-workspace-types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 type Context = { params: Promise<{ path: string[] }> };
-type SavedRun = { snapshot: Snapshot; prompt: string; scope: string[]; pr_url?: string };
+type SavedRun = { snapshot: Snapshot; prompt: string; scope: string[]; pr_url?: string; applied_commit?: string };
 
 async function worker<T>(endpoint: string, method = 'GET', body?: unknown): Promise<T> {
   const key = process.env.DEPLAI_SERVICE_KEY?.trim();
@@ -74,7 +74,7 @@ async function handle(request: NextRequest, context: Context) {
     if (route === 'health' && request.method === 'GET') {
       try {
         const health = await worker<{ configured: boolean }>('health');
-        return NextResponse.json({ user_id: String(auth.user.id), available: health.configured, detail: health.configured ? 'Platform OpenRouter free-model worker is configured.' : 'The platform OpenRouter key is missing.' });
+        return NextResponse.json({ user_id: String(auth.user.id), available: health.configured, detail: health.configured ? 'Platform GLM 5.3 Flash worker is configured.' : 'The platform OpenRouter key is missing.' });
       } catch (error) { return NextResponse.json({ user_id: String(auth.user.id), available: false, detail: error instanceof UiuxError ? error.message : 'UI/UX worker unavailable.' }); }
     }
     let body: Record<string, unknown> = {};
@@ -89,7 +89,7 @@ async function handle(request: NextRequest, context: Context) {
     const projectId = String(body.project_id || request.nextUrl.searchParams.get('project_id') || '');
     if (!/^[a-zA-Z0-9_-]{1,200}$/.test(projectId)) throw new UiuxError('Select a repository first.');
     const userId = String(auth.user.id);
-    const action = request.method === 'GET' ? 'ui_customization.read' : request.method === 'DELETE' ? 'agent.cancel' : segments[2] === 'pr' ? 'project.update' : 'ui_customization.run';
+    const action = request.method === 'GET' ? 'ui_customization.read' : request.method === 'DELETE' ? 'agent.cancel' : ['pr', 'apply'].includes(String(segments[2] || '')) ? 'project.update' : 'ui_customization.run';
     const access = await verifyProjectOwnership(userId, projectId, action);
     if (access.error) return access.error;
     if (!access.project) throw new UiuxError('Project not found.', 404);
@@ -113,7 +113,7 @@ async function handle(request: NextRequest, context: Context) {
       if (body.scope !== undefined && (!Array.isArray(body.scope) || body.scope.some(value => typeof value !== 'string'))) throw new UiuxError('Invalid file scope.');
       const policy = await getOrganizationPolicy(userId);
       if (policy.byokRequired || !policy.platformCredentialsAllowed || !policy.allowedCredentialModes.some(mode => mode === 'platform' || mode === 'auto') || (policy.allowedProviders && !policy.allowedProviders.includes('openrouter'))) throw new UiuxError('Your AI policy does not allow platform OpenRouter access.', 403);
-      if (policy.allowedModels?.length) throw new UiuxError('This editor cannot run under a restricted model allowlist yet. Update the AI policy to allow free-model routing.', 403);
+      if (policy.allowedModels?.length && !policy.allowedModels.some(model => ['z-ai/glm-5.3-flash', 'openrouter:z-ai/glm-5.3-flash'].includes(model))) throw new UiuxError('Your AI policy must allow GLM 5.3 Flash for UI/UX editing.', 403);
       const snapshot = await readState<Snapshot>(userId, projectId, 'repository');
       const scope = (body.scope || []) as string[];
       if (scope.some(value => !editorPath(value) || !snapshot.files.some(file => file.path === value))) throw new UiuxError('The scope contains an unsupported or missing file.');
@@ -157,6 +157,7 @@ async function handle(request: NextRequest, context: Context) {
       const run = verifyProposal(verifiedSnapshot, result);
       run.prompt = saved.prompt;
       run.pr_url = saved.pr_url;
+      run.applied_commit = saved.applied_commit;
       if (request.method === 'GET' && segments.length === 2) {
         let usageCharge: Record<string, unknown> | null = null;
         if (run.status === 'completed' && access.project.organization_id) {
@@ -188,6 +189,12 @@ async function handle(request: NextRequest, context: Context) {
       if (segments[2] === 'pr' && segments.length === 3 && request.method === 'POST') {
         const result = await createUiuxPullRequest(verifiedSnapshot, run);
         await saveState(userId, projectId, runId, { ...saved, pr_url: result.url });
+        return NextResponse.json(result);
+      }
+      if (segments[2] === 'apply' && segments.length === 3 && request.method === 'POST') {
+        if (saved.applied_commit) return NextResponse.json({ branch: verifiedSnapshot.project.branch, commit: saved.applied_commit, existing: true });
+        const result = await applyUiuxChanges(verifiedSnapshot, run);
+        await saveState(userId, projectId, runId, { ...saved, applied_commit: result.commit });
         return NextResponse.json(result);
       }
     }

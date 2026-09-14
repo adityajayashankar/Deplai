@@ -24,13 +24,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ROOT = Path(os.getenv("UIUX_RUN_DIRECTORY", "./data/uiux-runs")).resolve()
-MAX_CALLS = 80
-MAX_STEPS = 64
-MAX_TOKENS = 8_000_000  # Aggregate safety ceiling, distinct from model context.
+MAX_CALLS = 24
+MAX_STEPS = 20
+MAX_TOKENS = 1_000_000  # Aggregate safety ceiling, distinct from model context.
 CONTEXT_WINDOW = 200_000
 MAX_SECONDS = 3600
 MAX_CHANGED_FILES = 12
-OPENROUTER_FREE_ROUTER = "openrouter/free"
+UIUX_MODEL = "z-ai/glm-5.3-flash"
 MIN_FREE_CONTEXT = 200000
 ACTIVE: dict[str, asyncio.Task] = {}
 COOLDOWNS: dict[str, float] = {}
@@ -249,45 +249,6 @@ _REVIEWER_SCOPE_EXCUSES = re.compile(
 )
 
 
-def preferred_free_model():
-    return os.getenv("UIUX_OPENROUTER_MODEL", "").strip() or OPENROUTER_FREE_ROUTER
-
-
-def free_candidates(data):
-    result = []
-    for model in data:
-        try:
-            model_id = model["id"]
-            if not zero_priced(model["pricing"]):
-                continue
-            if model_id == OPENROUTER_FREE_ROUTER:
-                context = int(model.get("context_length") or MIN_FREE_CONTEXT)
-                if context >= MIN_FREE_CONTEXT:
-                    result.append(model_id)
-                continue
-            if model_id.endswith(":free") and "tools" in model.get("supported_parameters", []):
-                result.append(model_id)
-        except (KeyError, TypeError, ValueError):
-            continue
-    preferred = preferred_free_model()
-    if preferred not in result:
-        raise RuntimeError("Configured UI editor model is not a verified free tool-capable model")
-    return [preferred]  # Do not silently switch to a smaller-context model.
-
-
-async def catalog(client):
-    global CATALOG
-    if time.monotonic() - CATALOG[0] < 300 and CATALOG[1]:
-        return CATALOG[1]
-    response = await client.get("https://openrouter.ai/api/v1/models")
-    response.raise_for_status()
-    models = free_candidates(response.json().get("data", []))
-    if not models:
-        raise RuntimeError("No verified free tool-capable OpenRouter models are available")
-    CATALOG = (time.monotonic(), models)
-    return models
-
-
 def retry_delay(headers, attempt):
     delay = min(2 ** (attempt + 1), 30)
     try:
@@ -362,7 +323,7 @@ def compact_tool_history(messages):
         }, ensure_ascii=False)
 
 
-async def completion(client, budget, messages, tools=None, output_limit=8192):
+async def completion(client, budget, messages, tools=None, output_limit=4000):
     if budget.run.get("user_id") and not os.getenv("UIUX_CONNECTOR_URL"):
         raise RuntimeError("Connector inference gateway is not configured; restore UIUX_CONNECTOR_URL")
     if os.getenv("UIUX_CONNECTOR_URL"):
@@ -384,7 +345,7 @@ async def completion(client, budget, messages, tools=None, output_limit=8192):
             headers={"X-API-Key": os.getenv("DEPLAI_SERVICE_KEY", ""),
                      "x-deplai-user-id": budget.run["user_id"],
                      "x-deplai-organization-id": budget.run["organization_id"]},
-            json={"model": OPENROUTER_FREE_ROUTER, "access_mode": "platform", "messages": canonical,
+            json={"model": UIUX_MODEL, "access_mode": "platform", "messages": canonical,
                   "max_tokens": output_limit, "tools": [item["function"] for item in tools or []],
                   "metadata": {"product": "uiux", "stage": "editing", "run_id": budget.run["run_id"]}},
             timeout=240)
@@ -396,73 +357,16 @@ async def completion(client, budget, messages, tools=None, output_limit=8192):
         budget.reconcile(reserved, reported)
         budget.run["usage"]["input_tokens"] += reported["prompt_tokens"] or 0
         budget.run["usage"]["output_tokens"] += reported["completion_tokens"] or 0
+        budget.run["usage"]["models"] = [UIUX_MODEL]
+        cost = (data.get("cost") or {}).get("providerCostUsd")
+        if isinstance(cost, (int, float)) and cost >= 0:
+            budget.run["usage"]["provider_cost_usd"] = budget.run["usage"].get("provider_cost_usd", 0) + cost
         persist(budget.run)
         return {"content": data.get("output", ""), "reasoning_details": data.get("reasoningDetails"),
                 "tool_calls": [{"id": call.get("id") or uuid.uuid4().hex, "type": "function",
                                 "function": {"name": call["name"], "arguments": call["arguments"]}}
                                for call in data.get("toolCalls", [])]}
-    global LAST_CALL
-    key = os.getenv("OPENROUTER_API_KEY", "")
-    if not key:
-        raise RuntimeError("Platform OpenRouter API key is not configured")
-    models = await catalog(client)
-    for attempt in range(3):
-        eligible = [m for m in models if COOLDOWNS.get(m, 0) <= time.monotonic()]
-        if not eligible:
-            raise RuntimeError("Free model capacity is cooling down; retry later")
-        model = eligible[0]
-        compact_tool_history(messages)
-        reserved = budget.reserve(messages, output_limit, tools)
-        payload = {"model": model, "messages": messages, "max_tokens": output_limit,
-                   "temperature": 0.15, "provider": {"allow_fallbacks": True,
-                   "max_price": {"prompt": 0, "completion": 0}, "require_parameters": True}}
-        if tools:
-            payload["tools"] = tools
-        # Shared across all runs/reviewers, below the usual free 20 requests/min ceiling.
-        async with MODEL_LOCK:
-            await asyncio.sleep(max(0, 3.2 - (time.monotonic() - LAST_CALL)))
-            LAST_CALL = time.monotonic()
-        try:
-            response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload,
-                                         headers={"Authorization": f"Bearer {key}"})
-        except (httpx.TimeoutException, httpx.TransportError):
-            event(budget.run, "waiting", "Model connection interrupted; retrying the current step")
-            await asyncio.sleep(min(8, 2 ** attempt))
-            continue
-        if response.status_code in {429, 502, 503, 504}:
-            delay = retry_delay(response.headers, attempt)
-            COOLDOWNS[model] = time.monotonic() + delay
-            event(budget.run, "waiting", "OpenRouter free capacity is rate limited; applying bounded cooldown")
-            # Platform reset applies across all free models, not merely this provider.
-            if response.headers.get("x-ratelimit-reset"):
-                for candidate in models:
-                    COOLDOWNS[candidate] = time.monotonic() + delay
-            if delay > 45:
-                raise RuntimeError("Free model quota is exhausted; retry after the provider reset")
-            await asyncio.sleep(delay)
-            continue
-        if response.status_code >= 400:
-            raise RuntimeError(f"Free model request failed (HTTP {response.status_code})")
-        data = response.json()
-        if data.get("error") or not data.get("choices"):
-            raise RuntimeError("Free model returned an invalid completion")
-        usage = data.get("usage") or {}
-        budget.reconcile(reserved, usage)
-        budget.run["usage"]["input_tokens"] += int(usage.get("prompt_tokens", 0))
-        budget.run["usage"]["output_tokens"] += int(usage.get("completion_tokens", 0))
-        if model not in budget.run["usage"]["models"]:
-            budget.run["usage"]["models"].append(model)
-        if float(usage.get("cost") or 0) > 0:
-            raise RuntimeError("Provider reported unexpected cost; run stopped")
-        persist(budget.run)
-        message = data["choices"][0]["message"]
-        # Reasoning belongs to this assistant response. The caller appends it
-        # alongside tool calls; never mutate the preceding user/tool message.
-        if not str(message.get("content") or "").strip() and not message.get("tool_calls"):
-            event(budget.run, "waiting", "Model returned no output; retrying this step")
-            continue
-        return message
-    raise RuntimeError("Free model capacity unavailable after bounded retries")
+    raise RuntimeError("Connector inference gateway is required for UI/UX editing")
 
 
 def tool(name, description, properties, required):
@@ -754,7 +658,7 @@ async def health():
     configured = bool(os.getenv("UIUX_CONNECTOR_URL") and os.getenv("DEPLAI_SERVICE_KEY"))
     return {"status": "ready" if configured else "configuration_required",
             "configured": configured, "runtime": "bounded-uiux-graph",
-            "free_models_only": True, "openrouter_model": preferred_free_model(),
+            "free_models_only": False, "openrouter_model": UIUX_MODEL,
             "max_calls": MAX_CALLS, "max_seconds": MAX_SECONDS, "max_tokens": MAX_TOKENS}
 
 
@@ -781,7 +685,7 @@ async def create_run(request: RunInput):
            "events": [], "changes": [], "summary": "", "conflicts": [],
            "warnings": ["Preview builds are not executed by this service. Connector AST verification is required before publishing."],
            "usage": {"requests": 0, "input_tokens": 0, "output_tokens": 0, "budget_tokens": 0, "models": []}}
-    event(run, "queued", "Run queued with OpenRouter free models router (200K context)")
+    event(run, "queued", "Run queued with platform GLM 5.3 Flash: plan, edit and independent review")
     ACTIVE[run["run_id"]] = asyncio.create_task(run_job(run, request))
     return run
 

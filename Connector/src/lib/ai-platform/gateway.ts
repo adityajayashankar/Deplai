@@ -64,8 +64,7 @@ function backoff(attempt: number): number {
 
 function isStrictRemediation(request: NormalizedChatRequest): boolean {
   return (request.metadata?.product === 'security'
-    && ['remediation', 'openwiki'].includes(String(request.metadata?.stage)))
-    || (request.metadata?.product === 'uiux' && request.metadata?.stage === 'editing');
+    && ['remediation', 'openwiki'].includes(String(request.metadata?.stage)));
 }
 
 /** Remediation must never surface an upstream schema/auth 400/401 to the UI. */
@@ -217,8 +216,12 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
   const started = Date.now();
   const accessMode = request.accessMode || defaultAccessMode();
   const remediation = isStrictRemediation(request);
-  const glmDeployment = request.metadata?.product === 'deployment'
-    && ['deployment_requirements', 'deployment_service_plan'].includes(String(request.metadata?.stage || ''));
+  const glmUiux = request.metadata?.product === 'uiux' && request.metadata?.stage === 'editing';
+  const glmDeployment = glmUiux || (request.metadata?.product === 'deployment'
+    && ['deployment_requirements', 'deployment_service_plan'].includes(String(request.metadata?.stage || '')));
+  if (glmUiux && (accessMode !== 'platform' || request.ephemeralApiKey)) {
+    throw new AiPlatformError('POLICY_DENIED', 'UI/UX editing uses the platform GLM credential only');
+  }
   if (remediation && (accessMode !== 'platform' || request.ephemeralApiKey)) {
     throw new AiPlatformError('POLICY_DENIED', 'Security remediation uses the platform OpenRouter credential only');
   }

@@ -11,7 +11,8 @@ export type UiuxRun = {
   warnings?: string[];
   conflicts?: string[];
   source_sha?: string;
-  usage?: { requests?: number; input_tokens?: number; output_tokens?: number };
+  usage?: { requests?: number; input_tokens?: number; output_tokens?: number; provider_cost_usd?: number };
   error?: string;
   pr_url?: string;
+  applied_commit?: string;
 };
