@@ -238,7 +238,9 @@ services:
     environment:
       NODE_ENV: production
       ADMIN_ENABLED: "true"
-      ADMIN_BIND_HOST: 127.0.0.1
+      # Listen on the container interface so the loopback-only host mapping works.
+      ADMIN_BIND_HOST: 0.0.0.0
+      ADMIN_CONTAINER_MODE: "true"
       ADMIN_PORT: "3100"
       DB_HOST: mysql
       DB_PORT: "3306"

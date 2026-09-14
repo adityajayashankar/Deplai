@@ -27,6 +27,7 @@ const STEP_UP_SCOPES = {
   'api_key.revoke_all': 'ADMIN_KEY_REVOKE',
   'refund.create': 'ADMIN_REFUND_CREATE',
   'subscription.cancel': 'ADMIN_BILLING_WRITE',
+  'subscription.grant': 'ADMIN_BILLING_WRITE',
   'credits.adjust': 'ADMIN_BILLING_WRITE',
   'org.destructive': 'ADMIN_ORG_WRITE',
   'owner.credentials': 'ADMIN_SETTINGS_WRITE',

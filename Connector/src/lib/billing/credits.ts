@@ -1150,6 +1150,9 @@ export async function linkSubscriptionToOrganization(userId: string, organizatio
 }
 
 export async function getOrganizationSubscription(organizationId: string) {
+  const { getComplimentaryAccess } = await import('./complimentary-access');
+  const grant = await getComplimentaryAccess(organizationId);
+  if (grant) return grant;
   const rows = await query<SubscriptionRow[]>(
     `SELECT * FROM billing_subscriptions
      WHERE organization_id = ? AND status IN ('active', 'trialing')

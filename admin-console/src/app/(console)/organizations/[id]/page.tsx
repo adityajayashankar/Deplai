@@ -9,6 +9,7 @@ import { BILLING_PLANS } from '@/lib/platform/credit-catalog';
 import { formatDate } from '@/lib/utils';
 
 type OrganizationDetail = {
+  complimentary: { planId: string; expiresAt: string | null; active: boolean } | null;
   id: string;
   name: string;
   slug: string;
@@ -40,18 +41,23 @@ export default function OrganizationDetailPage() {
   const [credits, setCredits] = useState('10');
   const [planId, setPlanId] = useState('free');
   const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [expiresAt, setExpiresAt] = useState('');
+  const [loadError, setLoadError] = useState('');
 
   async function load() {
     const data = await adminFetch<{ organization: OrganizationDetail }>(`/api/admin/organizations?id=${params.id}`);
     setOrg(data.organization);
-    setPlanId(data.organization.subscription?.planId || 'free');
+    setPlanId(data.organization.complimentary?.active ? data.organization.complimentary.planId : data.organization.subscription?.planId || 'free');
   }
 
   useEffect(() => {
-    load().catch(() => setOrg(null));
+    load().catch((error) => setLoadError(error instanceof Error ? error.message : 'Could not load organization'));
   }, [params.id]);
 
   async function runAction(action: () => Promise<void>) {
+    if (busy) return;
+    setBusy(true);
     setMessage('');
     try {
       await action();
@@ -59,6 +65,8 @@ export default function OrganizationDetailPage() {
       setMessage('Action completed.');
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Action failed');
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -80,7 +88,7 @@ export default function OrganizationDetailPage() {
     });
   }
 
-  if (!org) return <div className="text-muted">Loading organization...</div>;
+  if (!org) return <div role="status">{loadError || 'Loading organization...'}</div>;
 
   return (
     <div className="space-y-6">
@@ -125,7 +133,7 @@ export default function OrganizationDetailPage() {
         )}
       </section>
 
-      <section className="card p-4 space-y-4">
+      <fieldset disabled={busy} className="card p-4 space-y-4">
         <h2 className="font-medium">Resource controls</h2>
         <input
           className="input"
@@ -207,23 +215,37 @@ export default function OrganizationDetailPage() {
               <button
                 className="btn btn-outline"
                 type="button"
-                onClick={() => runAction(() => postOrg({ action: 'change_plan', planId }))}
+                onClick={() => runAction(() => postOrg({ action: 'change_plan', planId }, 'subscription.grant'))}
               >
-                Change plan
+                Change recorded billing plan
               </button>
               <button
                 className="btn btn-danger"
                 type="button"
                 onClick={() => runAction(() => postOrg({ action: 'cancel_subscription' }, 'subscription.cancel'))}
               >
-                Cancel subscription
+                Set recorded subscription to Free
               </button>
             </div>
+            <p className="text-sm text-muted">Recorded billing changes do not cancel charges at the payment provider. Use complimentary access below for free tier grants.</p>
           </div>
         </div>
 
-        {message ? <p className="text-sm text-muted">{message}</p> : null}
-      </section>
+        <div className="space-y-3 border-t pt-4">
+          <h3 className="font-medium">Complimentary tier access</h3>
+          <p className="text-sm text-muted">Applies to all members of this organization. No payment is required. Usage still consumes credits; use Grant credits above to fund access. Existing paid billing is not cancelled.</p>
+          <p>{org.complimentary?.active ? `Active: ${org.complimentary.planId}, expires ${org.complimentary.expiresAt ? formatDate(org.complimentary.expiresAt) : 'never'}` : 'No active complimentary access'}</p>
+          <label className="block">Expiry (optional, your local time)
+            <input className="input" type="datetime-local" value={expiresAt} onChange={(e) => setExpiresAt(e.target.value)} />
+          </label>
+          <p className="text-sm">Selected tier: {BILLING_PLANS.find((plan) => plan.id === planId)?.displayName}. Revocation or expiry restores the underlying subscription.</p>
+          <div className="flex gap-2">
+            <button className="btn btn-primary" disabled={!reason.trim()} onClick={() => runAction(() => postOrg({ action: 'grant_access', planId, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null }, 'subscription.grant'))}>Grant selected tier without payment</button>
+            <button className="btn btn-danger" disabled={!org.complimentary?.active || !reason.trim()} onClick={() => runAction(() => postOrg({ action: 'revoke_access' }, 'subscription.grant'))}>Revoke complimentary access</button>
+          </div>
+        </div>
+        {message ? <p role="status" className="text-sm text-muted">{message}</p> : null}
+      </fieldset>
     </div>
   );
 }

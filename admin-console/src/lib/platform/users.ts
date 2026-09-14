@@ -31,8 +31,8 @@ export async function listUsers(input: {
   limit?: number;
   offset?: number;
 }): Promise<{ users: UserListItem[]; total: number }> {
-  const limit = Math.min(Math.max(input.limit || 50, 1), 100);
-  const offset = Math.max(input.offset || 0, 0);
+  const limit = Number.isFinite(input.limit) ? Math.min(Math.max(Math.floor(input.limit!), 1), 100) : 50;
+  const offset = Number.isFinite(input.offset) ? Math.min(Math.max(Math.floor(input.offset!), 0), 1_000_000_000) : 0;
   const search = input.search?.trim().toLowerCase() || '';
   const params: unknown[] = [];
   let where = '1=1';
@@ -66,7 +66,7 @@ export async function listUsers(input: {
      LEFT JOIN billing_subscriptions bs ON bs.user_id = u.id
      LEFT JOIN billing_plans bp ON bp.id = bs.plan_id
      WHERE ${where}
-     ORDER BY u.created_at DESC
+     ORDER BY u.created_at DESC, u.id DESC
      LIMIT ? OFFSET ?`,
     [...params, limit, offset],
   );

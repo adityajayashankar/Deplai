@@ -18,6 +18,7 @@ async function main() {
   });
   await connection.query(sql);
   await connection.query(resourceSql);
+  await connection.query(readFileSync(resolve(process.cwd(), 'migrations/20260914_complimentary_access.sql'), 'utf8'));
   await connection.end();
   console.log('Admin console migration applied.');
 }

@@ -165,7 +165,7 @@ export async function reconcileOrganizationSubscriptionCredits(organizationId: s
   deltaCredits: number;
 }> {
   const subscription = await getOrganizationSubscription(organizationId);
-  if (!subscription?.planId || subscription.planId === 'free') {
+  if (!subscription?.planId || subscription.planId === 'free' || subscription.cadence === 'complimentary') {
     return { reconciled: false, deltaCredits: 0 };
   }
 

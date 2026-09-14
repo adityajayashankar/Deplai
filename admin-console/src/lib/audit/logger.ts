@@ -1,7 +1,7 @@
 import { createHmac } from 'node:crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { getAdminConfig } from '@/lib/config';
-import { query } from '@/lib/db';
+import { query, type SqlExecutor } from '@/lib/db';
 
 export type AuditInput = {
   actorAdminId?: string | null;
@@ -53,22 +53,22 @@ function canonicalEvent(input: AuditInput, previousHash: string): string {
   });
 }
 
-async function latestEventHash(): Promise<string> {
-  const rows = await query<Array<{ event_hash: string }>>(
+async function latestEventHash(exec: SqlExecutor): Promise<string> {
+  const rows = await exec<Array<{ event_hash: string }>>(
     `SELECT event_hash FROM admin_audit_logs ORDER BY created_at DESC, id DESC LIMIT 1`,
   );
   return rows[0]?.event_hash || 'GENESIS';
 }
 
-export async function writeAdminAuditLog(input: AuditInput): Promise<string> {
+export async function writeAdminAuditLog(input: AuditInput, exec: SqlExecutor = query): Promise<string> {
   const id = uuidv4();
-  const previousHash = await latestEventHash();
+  const previousHash = await latestEventHash(exec);
   const canonical = canonicalEvent(input, previousHash);
   const eventHash = createHmac('sha256', getAdminConfig().auditHmacSecret)
     .update(canonical)
     .digest('hex');
 
-  await query(
+  await exec(
     `INSERT INTO admin_audit_logs
       (id, previous_hash, event_hash, actor_admin_id, action, target_type, target_id,
        request_id, ip, session_id, success, reason, before_json, after_json, metadata_json)

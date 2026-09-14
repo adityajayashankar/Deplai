@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { writeAdminAuditLog } from '@/lib/audit/logger';
 import { requireAdminApi } from '@/lib/http/request-context';
 import { listOrganizations } from '@/lib/platform/organizations';
+import { setComplimentaryAccess } from '@/lib/platform/complimentary';
 import {
   getOrganizationDetail,
   setOrganizationStatus,
@@ -42,6 +43,7 @@ export async function POST(request: NextRequest) {
     action?: string;
     reason?: string;
     planId?: string;
+    expiresAt?: string | null;
     cadence?: 'monthly' | 'yearly';
     stepUpScope?: 'org.destructive' | 'subscription.cancel';
   };
@@ -63,6 +65,14 @@ export async function POST(request: NextRequest) {
   }
 
   try {
+    if (action === 'grant_access' || action === 'revoke_access') {
+      const elevated = await requireAdminApi(request, { permission: 'ADMIN_BILLING_WRITE', stepUp: 'subscription.grant' });
+      if ('error' in elevated) return elevated.error;
+      await setComplimentaryAccess({ organizationId, revoke: action === 'revoke_access', planId: body.planId, expiresAt: body.expiresAt }, {
+        action: '', actorAdminId: auth.context.session.adminId, sessionId: auth.context.session.id, ip: auth.context.ip, reason,
+      });
+      return NextResponse.json({ organizationId, updated: true });
+    }
     if (action === 'suspend') {
       await setOrganizationStatus(organizationId, 'SUSPENDED');
       await writeAdminAuditLog({
@@ -92,6 +102,8 @@ export async function POST(request: NextRequest) {
     }
 
     if (action === 'change_plan') {
+      const elevated = await requireAdminApi(request, { permission: 'ADMIN_BILLING_WRITE', stepUp: 'subscription.grant' });
+      if ('error' in elevated) return elevated.error;
       if (!body.planId) return NextResponse.json({ error: 'planId is required' }, { status: 400 });
       await updateOrganizationSubscription({
         organizationId,

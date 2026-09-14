@@ -2,6 +2,7 @@ import { query } from '@/lib/db';
 import { getOrganizationCreditBalance } from '@/lib/platform/credits';
 
 export type OrganizationDetail = {
+  complimentary: { planId: string; expiresAt: string | null; active: boolean } | null;
   id: string;
   name: string;
   slug: string;
@@ -85,7 +86,12 @@ export async function getOrganizationDetail(organizationId: string): Promise<Org
   }
 
   const sub = subRows[0];
+  const grants = await query<Array<{ plan_id: string; expires_at: Date | null; active: number }>>(
+    `SELECT plan_id, expires_at, (revoked_at IS NULL AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)) AS active
+     FROM admin_plan_grants WHERE organization_id = ?`, [organizationId]);
+  const grant = grants[0];
   return {
+    complimentary: grant ? { planId: grant.plan_id, expiresAt: grant.expires_at ? new Date(grant.expires_at).toISOString() : null, active: Boolean(grant.active) } : null,
     id: org.id,
     name: org.name,
     slug: org.slug,

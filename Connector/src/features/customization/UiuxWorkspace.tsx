@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUp, Check, ChevronDown, ChevronRight, Code2, FileCode2, Folder, GitPullRequest, Loader2, LockKeyhole, Search, Sparkles, Square } from 'lucide-react';
+import { ArrowUp, ChevronDown, ChevronRight, Code2, FileCode2, Folder, Loader2, LockKeyhole, Search, Sparkles, Square } from 'lucide-react';
+import { UiuxPublishActions } from './UiuxPublishActions';
 import type { UiuxFile, UiuxProject, UiuxRepository, UiuxRun } from './uiux-workspace-types';
 import { uiuxDiff } from './uiux-diff';
 import { UiuxDiffView } from './UiuxDiffView';
@@ -84,7 +85,7 @@ export function UiuxWorkspace({ initialProjectId = '' }: { initialProjectId?: st
     return () => controller.abort();
   }, [reload]);
 
-  return <section className="flex h-full min-h-[640px] flex-col border-[3px] border-black bg-white font-sans text-neutral-950 shadow-[6px_6px_0_0_#000]">
+  return <section className="flex h-full min-h-[640px] min-w-0 max-w-full flex-col overflow-hidden border-[3px] border-black bg-white font-sans text-neutral-950 shadow-[6px_6px_0_0_#000]">
     <header className="flex flex-wrap items-center justify-between gap-4 border-b-2 border-black bg-white px-6 py-6" style={{ backgroundImage: 'var(--app-hatch)' }}>
       <div className="flex min-w-0 flex-wrap items-center gap-3"><span className="flex size-8 items-center justify-center rounded-none bg-black text-white"><Code2 size={17} /></span><h1 className="text-2xl font-semibold tracking-tight">UI/UX Agent</h1><span className="text-neutral-300">/</span>
         <label className="sr-only" htmlFor="uiux-project">Repository</label><select id="uiux-project" value={projectId} onChange={(event) => setProjectId(event.target.value)} className="max-w-[300px] rounded-none border-2 border-black bg-white px-3 py-2 text-xs focus:outline-2 focus:outline-black">
@@ -252,38 +253,39 @@ function RepositoryWorkspace({ projectId, userId, available }: { projectId: stri
   function selectFile(path: string) { setSelected(path); if (!changedPaths.has(path)) setTab('source'); }
   const notifications = [...(repository?.warnings || []), ...(run?.warnings || []), ...(run?.conflicts || [])];
   const isGitHubRepository = Boolean(repository?.project.owner && repository.project.repo);
-  const canCreatePr = isGitHubRepository && run?.status === 'completed' && changes.length > 0 && !(run.conflicts?.length) && reviewed && !busy;
-  const canApply = canCreatePr && !run?.applied_commit && !run?.pr_url;
+
+
 
   if (restoring) return <div role="status" className="m-auto p-6 text-xs text-neutral-500">Restoring browser workspace memory…</div>;
 
   return <>
-    <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[210px_minmax(0,1fr)_320px] xl:grid-cols-[230px_minmax(0,1fr)_350px]">
+    {run && changes.length > 0 && <UiuxPublishActions run={run} github={isGitHubRepository} branch={repository?.project.branch || 'main'} reviewed={reviewed} busy={busy} onReview={setReviewed} onApply={() => void act('apply')} onPr={() => void act('pr')} />}
+    <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 lg:grid-cols-[200px_minmax(0,1fr)] xl:grid-cols-[210px_minmax(0,1fr)_minmax(280px,320px)]">
       <aside aria-label="Repository files" className="flex max-h-64 min-h-0 flex-col border-b-2 border-black bg-neutral-50 lg:max-h-none lg:border-r-2 lg:border-b-0">
         <div className="flex items-center justify-between px-4 pt-4 font-mono text-xs uppercase tracking-[0.16em]"><h2>Files</h2><span className="font-normal text-neutral-400">{repository?.files.length ?? 0}</span></div>
         <div className="relative m-3"><Search size={13} className="absolute top-2.5 left-2.5 text-neutral-400" /><input aria-label="Search repository files" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Find a file…" className="w-full rounded-none border-2 border-black bg-white py-2 pr-2 pl-8 text-xs outline-black" /></div>
         <div className="min-h-0 flex-1 overflow-auto px-2 pb-4">{repositoryLoading ? <p className="p-3 text-xs text-neutral-500">Loading repository…</p> : repository ? <FileTree node={tree} selected={selected} changed={changedPaths} expanded={expanded} searching={Boolean(search)} onSelect={selectFile} onToggle={(path) => setExpanded((previous) => { const next = new Set(previous); if (next.has(path)) next.delete(path); else next.add(path); return next; })} /> : <button type="button" onClick={() => setReload((value) => value + 1)} className="m-2 text-xs underline">Retry repository</button>}</div>
         <p className="border-t-2 border-black px-4 py-3 text-[10px] leading-4 text-neutral-500"><LockKeyhole size={10} className="mr-1 inline" /> Protected files can be inspected. Editing is limited to presentation code.</p>
       </aside>
-      <main className="flex min-h-[380px] min-w-0 flex-col overflow-hidden bg-white">
+      <main className="flex min-h-[520px] min-w-0 flex-col overflow-hidden bg-white">
         {changes.length > 0 && <section aria-label="Edited codebase" className="border-b-2 border-black p-4">
           <p className="font-mono text-[10px] uppercase tracking-widest">Proposed changes · {changes.length} files</p>
           <h2 className="mt-2 break-all text-base font-semibold">{repository?.project.owner && repository.project.repo ? `${repository.project.owner}/${repository.project.repo}` : repository?.project.name || 'Selected repository'}</h2>
-          <p className="mt-1 break-all font-mono text-xs text-neutral-500">Base commit: {run?.source_sha || repository?.source_sha || 'Not reported'}</p>
-          <ul className="mt-3 space-y-1">{changeSummary.map(item => <li key={item.path}><button type="button" onClick={() => { setSelected(item.path); setTab('changes'); setVersion('diff'); }} className="flex w-full items-start justify-between gap-3 border border-neutral-200 px-2 py-1 text-left font-mono text-xs hover:bg-neutral-100"><span className="break-all">{item.path}</span><span className="shrink-0">{item.diff ? `+${item.diff.added} / −${item.diff.removed}` : 'View file'}</span></button></li>)}</ul>
+          <p className="mt-1 font-mono text-xs text-neutral-500" title={run?.source_sha || repository?.source_sha}>Base revision: {(run?.source_sha || repository?.source_sha || 'Not reported').slice(0, 7)}</p>
+          <details className="mt-3"><summary className="cursor-pointer text-xs font-medium">Browse {changes.length} edited files</summary><ul className="mt-2 max-h-36 space-y-1 overflow-auto">{changeSummary.map(item => <li key={item.path}><button type="button" onClick={() => { setSelected(item.path); setTab('changes'); setVersion('diff'); }} className="flex w-full items-start justify-between gap-3 border border-neutral-200 px-2 py-1 text-left font-mono text-xs hover:bg-neutral-100"><span className="break-all">{item.path}</span><span className="shrink-0">{item.diff ? `+${item.diff.added} / −${item.diff.removed}` : 'View file'}</span></button></li>)}</ul></details>
           <p className="mt-2 text-xs text-neutral-500">These edits are proposals until you review and publish them.</p>
         </section>}
         <div className="flex shrink-0 items-center gap-5 border-b-2 border-black px-5" aria-label="File view">
           {(['source', 'changes'] as const).map((item) => <button key={item} type="button" onClick={() => { setTab(item); if (item === 'changes' && !selectedChange && changes[0]) setSelected(changes[0].path); }} aria-pressed={tab === item} className={`border-b-2 py-3 text-xs capitalize ${tab === item ? 'border-black font-medium text-black' : 'border-transparent text-neutral-500'}`}>{item}{item === 'changes' && <span className="ml-2 rounded bg-neutral-100 px-1.5 py-0.5 text-[10px]">{changes.length}</span>}</button>)}
         </div>
-        {tab === 'changes' && changes.length > 0 && <div className="flex flex-wrap gap-2 border-b border-neutral-100 p-3">{changes.map((change) => <button key={change.path} type="button" onClick={() => setSelected(change.path)} className={`max-w-full truncate rounded-none border px-2 py-1 text-[10px] ${selected === change.path ? 'border-black bg-neutral-100' : 'border-neutral-200'}`}>{change.path}</button>)}</div>}
+
         {selected && (tab === 'source' || selectedChange) && <div className="flex flex-wrap items-center justify-between gap-2 border-b border-neutral-100 bg-neutral-50 px-5 py-2"><span className="min-w-0 break-all font-mono text-[11px] text-neutral-500">{selected}</span>{tab === 'changes' && <div className="flex gap-1">{(['diff', 'before', 'after'] as const).map((item) => <button type="button" key={item} aria-pressed={version === item} onClick={() => setVersion(item)} className={`rounded px-2 py-1 text-[10px] capitalize ${version === item ? 'bg-black text-white' : 'text-neutral-500'}`}>{item}</button>)}</div>}</div>}
         <div className="min-h-0 flex-1 overflow-auto">
           {tab === 'source' ? selected ? fileLoading ? <p role="status" className="p-5 text-xs text-neutral-500">Loading file…</p> : fileError ? <p role="alert" className="p-5 text-xs">{fileError}</p> : <CodeView content={fileContent} /> : <EmptyEditor title="Your code, a new perspective." text="Explore the repository on the left. Tell the agent what should look or feel different to start a design task." /> : selectedChange ? version === 'diff' ? diff ? <UiuxDiffView diff={diff} /> : <p className="p-5 text-sm">This diff is too large to render quickly. Use Before / After or download the patch.</p> : <CodeView content={selectedChange[version]} /> : <EmptyEditor title="Changes will appear here." text="The agent prepares a proposal against the repository snapshot. Review each changed file before creating a pull request." />}
         </div>
         <div className="border-t-2 border-black px-5 py-2 text-[10px] text-neutral-400">Source review available. Live preview requires an isolated build environment.</div>
       </main>
-      <aside aria-label="Design conversation" className="flex min-h-[480px] min-w-0 flex-col border-t-2 border-black bg-white lg:min-h-0 lg:border-t-0 lg:border-l-2">
+      <aside aria-label="Design conversation" className="flex min-h-[400px] min-w-0 flex-col border-t-2 border-black bg-white lg:col-span-2 xl:col-span-1 xl:min-h-0 xl:border-t-0 xl:border-l-2">
         <div className="space-y-2 border-b-2 border-black px-4 py-2">
           <div className="flex items-center justify-between gap-2 text-[10px] text-neutral-500"><span>Memory saved in this browser</span><button type="button" disabled={running || Boolean(busy) || clearingMemory} onClick={() => void clearMemory()} className="underline disabled:opacity-40">{clearingMemory ? 'Clearing…' : 'Clear memory'}</button></div>
           {history.length > 0 && <><label htmlFor="uiux-history" className="sr-only">Browser run history</label><select id="uiux-history" value={run?.run_id || ''} disabled={running || Boolean(busy) || clearingMemory} onChange={(event) => { const previous = history.find(item => item.run_id === event.target.value); if (previous) { setRun(previous); setReviewed(false); setTab(previous.changes?.length ? 'changes' : 'source'); if (previous.changes?.[0]) setSelected(previous.changes[0].path); } }} className="w-full rounded-none border-2 border-black bg-white p-2 text-[10px]"><option value="">Previous tasks</option>{history.map(item => <option value={item.run_id} key={item.run_id}>{item.status} · {item.prompt?.slice(0, 65) || item.run_id}</option>)}</select></>}
@@ -302,7 +304,7 @@ function RepositoryWorkspace({ projectId, userId, available }: { projectId: stri
           {pollError && <p role="status" className="text-xs leading-5 text-neutral-600">{pollError}</p>}
           {(error || run?.error) && <div role="alert" className="rounded-none border-2 border-black bg-white p-3 text-xs leading-5 text-rose-900">{error || run?.error}</div>}
           {notifications.length > 0 && <details className="rounded-none border-2 border-black bg-white p-3" open={Boolean(run?.conflicts?.length)}><summary className="cursor-pointer text-xs font-medium">Constraints & conflicts ({notifications.length})</summary><ul className="mt-2 space-y-2 text-xs leading-5 text-neutral-600">{notifications.map((warning, index) => <li key={index}>{warning}</li>)}</ul></details>}
-          {run?.status === 'completed' && changes.length > 0 && <div className="space-y-3 rounded-none border-2 border-black bg-white p-3"><p className="flex items-center gap-2 text-xs font-medium"><Check size={14} />{changes.length} files verified and ready</p>{run.applied_commit ? <p className="text-xs leading-5 text-emerald-800">Applied to {repository?.project.branch || 'the repository branch'} at {run.applied_commit.slice(0, 7)}.</p> : <><label className="flex items-start gap-2 text-[11px] leading-5 text-neutral-600"><input type="checkbox" checked={reviewed} onChange={(event) => setReviewed(event.target.checked)} className="mt-1 accent-black" />I reviewed these UI-only changes and approve applying them to the repository or opening a pull request.</label>{isGitHubRepository && !run.pr_url && <button type="button" disabled={!canApply} onClick={() => void act('apply')} className="flex w-full items-center justify-center gap-2 rounded-none border-2 border-black bg-black px-3 py-2 text-xs font-semibold text-white shadow-[3px_3px_0_0_#000] disabled:opacity-40">{busy === 'apply' ? 'Applying changes…' : `Apply to ${repository?.project.branch || 'branch'}`}</button>}{isGitHubRepository && (run.pr_url ? <a href={run.pr_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 text-xs underline"><GitPullRequest size={13} />View pull request</a> : <button type="button" disabled={!canCreatePr} onClick={() => void act('pr')} className="flex w-full items-center justify-center gap-2 rounded-none border-2 border-black bg-white px-3 py-2 text-xs font-semibold shadow-[3px_3px_0_0_#000] disabled:opacity-40"><GitPullRequest size={13} />{busy === 'pr' ? 'Creating pull request…' : 'Create pull request'}</button>)}</>}</div>}
+
           {run?.status === 'completed' && changes.length > 0 && !isGitHubRepository && <p className="text-xs leading-5 text-neutral-500">This project has no connected GitHub repository. Download the patch to apply these changes locally.</p>}
           {run?.status === 'completed' && changes.length > 0 && <a href={`/api/uiux/runs/${encodeURIComponent(run.run_id)}/patch?project_id=${encodeURIComponent(projectId)}`} className="inline-block text-xs text-neutral-600 underline" download>Download patch</a>}
           {run?.usage && <p className="text-[10px] text-neutral-400">{run.usage.requests ?? 0} model requests · {(run.usage.input_tokens ?? 0) + (run.usage.output_tokens ?? 0)} tokens · GLM 5.3 Flash{typeof run.usage.provider_cost_usd === 'number' ? ` · $${run.usage.provider_cost_usd.toFixed(4)} provider cost` : ''}</p>}

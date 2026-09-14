@@ -19,6 +19,7 @@ export type StepUpScope =
   | 'api_key.revoke_all'
   | 'refund.create'
   | 'subscription.cancel'
+  | 'subscription.grant'
   | 'credits.adjust'
   | 'org.destructive'
   | 'owner.credentials';

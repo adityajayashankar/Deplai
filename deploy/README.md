@@ -160,8 +160,14 @@ https://<APP_DOMAIN>/api/webhooks/github
 `NEXT_PUBLIC_*` values are compiled into the Connector browser bundle. Rebuild
 the Connector image when the domain or GitHub App slug changes.
 
-Leave `BILLING_ENFORCEMENT=false` and `NEXT_PUBLIC_BILLING_ENFORCEMENT=false`
-until Razorpay is live.
+For public production release set `BILLING_ENFORCEMENT=true` and
+`NEXT_PUBLIC_BILLING_ENFORCEMENT=true`, then rebuild Connector. Validate Razorpay
+before accepting payments. Use audited admin complimentary grants and credits
+for free access instead of globally disabling enforcement.
+
+Production scans require reachable `MONGODB_URI`; GLM workflows require the
+platform `OPENROUTER_API_KEY`. Configuration preflight does not prove either
+external service is healthy.
 
 ### 2.5 Pre-pull scanner/apply worker images
 
@@ -225,11 +231,20 @@ migration before rolling out new application code.
 
 ## 4. Operate safely
 
-Create encrypted off-server backups of `mysql_data`,
-`qdrant_data`, `agentic_runtime`, `github_repos`, `local_projects`, and
-`customization_state`. Test restoring a MySQL backup regularly. Monitor disk
+Create database-consistent encrypted off-server MySQL backups (not a live copy
+of its data directory), MongoDB backups, and backups of `agentic_runtime`,
+`iac_workspaces`, `uiux_connector_state`, `uiux_worker_state`, `github_repos`,
+`local_projects`, and `customization_state`. Include any configured remote
+Terraform state and artifact stores. Retain run documentation for at least
+31 days; database TTL settings and backup retention must agree. Keep credential
+encryption keys recoverable separately under restricted access. Test restoring
+to an isolated environment regularly. Qdrant is currently an unused placeholder.
+Monitor disk
 usage: cloned repositories, scanner databases, Docker images, and Terraform
 workspaces can grow quickly.
+
+Use [production readiness and owner acceptance](production-readiness.md) for
+release evidence and recurring operating checks.
 
 To update an approved release:
 

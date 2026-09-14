@@ -16,7 +16,12 @@ value_for() {
   local key="$1"
   local line
   line="$(grep -m1 -E "^${key}=" "$ENV_FILE" || true)"
-  printf '%s' "${line#*=}" | tr -d '\r'
+  local value="${line#*=}"
+  value="${value%$'\r'}"
+  if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "$value"
 }
 
 invalid=()
@@ -41,6 +46,11 @@ required=(
   GITHUB_PRIVATE_KEY
   GITHUB_WEBHOOK_SECRET
   DOCKER_GID
+  MONGODB_URI
+  OPENROUTER_API_KEY
+  ADMIN_SESSION_SECRET
+  ADMIN_AUDIT_HMAC_SECRET
+  ADMIN_MFA_ENCRYPTION_KEY
 )
 
 for key in "${required[@]}"; do
@@ -69,24 +79,11 @@ if ! [[ "$(value_for DOCKER_GID)" =~ ^[0-9]+$ ]]; then
   invalid+=("DOCKER_GID must be numeric")
 fi
 
-provider_keys=(
-  OPENAI_API_KEY
-  ANTHROPIC_API_KEY
-  CLAUDE_API_KEY
-  GEMINI_API_KEY
-  GROQ_API_KEY
-  OPENROUTER_API_KEY
-)
-has_provider=0
-for key in "${provider_keys[@]}"; do
-  if [[ -n "$(value_for "$key")" ]]; then
-    has_provider=1
-    break
+for key in BILLING_ENFORCEMENT NEXT_PUBLIC_BILLING_ENFORCEMENT; do
+  if [[ "$(value_for "$key")" != 'true' ]]; then
+    invalid+=("$key must be true for public production release; grant complimentary access through the admin console")
   fi
 done
-if (( has_provider == 0 )); then
-  invalid+=("set at least one model provider key (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY)")
-fi
 
 distinct_pairs=(
   'DEPLAI_SERVICE_KEY:WS_TOKEN_SECRET'
@@ -94,6 +91,9 @@ distinct_pairs=(
   'DEPLAI_SERVICE_KEY:ADMIN_ACCESS_KEY'
   'WS_TOKEN_SECRET:SESSION_SECRET'
   'MYSQL_PASSWORD:MYSQL_ROOT_PASSWORD'
+  'ADMIN_SESSION_SECRET:SESSION_SECRET'
+  'ADMIN_AUDIT_HMAC_SECRET:ADMIN_SESSION_SECRET'
+  'ADMIN_MFA_ENCRYPTION_KEY:ADMIN_SESSION_SECRET'
 )
 for pair in "${distinct_pairs[@]}"; do
   left="${pair%%:*}"
@@ -117,4 +117,4 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --quiet
-printf 'Deployment preflight passed.\n'
+printf 'Configuration preflight passed. Live acceptance, restore and rollback checks are still required; see deploy/production-readiness.md.\n'
