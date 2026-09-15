@@ -1403,6 +1403,26 @@ class AppArtifactTarballTests(unittest.TestCase):
         artifact = next(item for item in patched if item["path"] == "terraform/artifacts/app.tgz")
         self.assertEqual(base64.b64decode(str(artifact["content"])), payload)
 
+    def test_inject_app_artifact_from_artifact_source_and_persisted_store(self) -> None:
+        import base64
+        from unittest import mock
+
+        payload = b"persisted-tarball"
+        files = [
+            {
+                "path": "terraform/terraform.tfvars",
+                "content": 'artifact_source = "pkg-demo-123"\n',
+            }
+        ]
+        with mock.patch(
+            "deployment_packager.load_persisted_app_tarball",
+            return_value=("pkg-demo-123", payload),
+        ) as loader:
+            patched = _inject_app_artifact_tarball(files, {"deployment_package_id": "pkg-demo-123"}, "demo-app")
+        loader.assert_called()
+        artifact = next(item for item in patched if item["path"] == "terraform/artifacts/app.tgz")
+        self.assertEqual(base64.b64decode(str(artifact["content"])), payload)
+
 
 class EcrPullPolicyInjectTests(unittest.TestCase):
     def test_injects_ecr_pull_when_instance_role_exists(self) -> None:

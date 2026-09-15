@@ -19,15 +19,33 @@ class SecurityRunStore:
                 raise RuntimeError("Security execution requires MONGODB_URI")
             return None
         from pymongo import MongoClient
-        from pymongo.errors import PyMongoError
+        from pymongo.errors import OperationFailure, PyMongoError
         client = None
         try:
-            client = MongoClient(uri, serverSelectionTimeoutMS=3000,
-                                 connectTimeoutMS=3000, socketTimeoutMS=3000)
+            kwargs = {
+                "serverSelectionTimeoutMS": 15000,
+                "connectTimeoutMS": 10000,
+                "socketTimeoutMS": 15000,
+                "retryWrites": True,
+                "appname": "deplai-security-scans",
+            }
+            if uri.startswith("mongodb+srv://") or "tls=true" in uri.lower() or "ssl=true" in uri.lower():
+                try:
+                    import certifi
+                    kwargs["tlsCAFile"] = certifi.where()
+                except Exception:
+                    pass
+            client = MongoClient(uri, **kwargs)
             db = client[os.getenv("REMEDIATION_MONGODB_DATABASE", "deplai_security")]
             db.command("ping")
-            db.security_runs.create_index([("project_id", 1), ("created_at", -1)])
-            db.security_events.create_index([("run_id", 1), ("sequence", 1)], unique=True)
+            try:
+                db.security_runs.create_index([("project_id", 1), ("created_at", -1)])
+                db.security_events.create_index([("run_id", 1), ("sequence", 1)], unique=True)
+            except OperationFailure as exc:
+                # Identical indexes are idempotent. Conflicting leftover
+                # definitions must not block scan startup after a successful ping.
+                if getattr(exc, "code", None) not in (85, 86):
+                    raise
         except PyMongoError:
             if client is not None:
                 client.close()

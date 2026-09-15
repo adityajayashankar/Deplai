@@ -14,22 +14,38 @@ def check_storage():
     client = None
     stage = "connect"
     try:
-        client = MongoClient(uri, serverSelectionTimeoutMS=5000,
-                             connectTimeoutMS=5000, socketTimeoutMS=5000)
+        kwargs = {
+            "serverSelectionTimeoutMS": 15000,
+            "connectTimeoutMS": 10000,
+            "socketTimeoutMS": 15000,
+            "retryWrites": True,
+            "appname": "deplai-scan-storage-check",
+        }
+        if uri.startswith("mongodb+srv://") or "tls=true" in uri.lower() or "ssl=true" in uri.lower():
+            try:
+                import certifi
+                kwargs["tlsCAFile"] = certifi.where()
+            except Exception:
+                pass
+        client = MongoClient(uri, **kwargs)
         db = client[os.getenv("REMEDIATION_MONGODB_DATABASE", "deplai_security")]
         db.command("ping")
         stage = "indexes"
         # The same idempotent initialization required by SecurityRunStore.db().
         # No scan records, reports or leases are modified.
-        db.security_runs.create_index([("project_id", 1), ("created_at", -1)])
-        db.security_events.create_index([("run_id", 1), ("sequence", 1)], unique=True)
+        try:
+            db.security_runs.create_index([("project_id", 1), ("created_at", -1)])
+            db.security_events.create_index([("run_id", 1), ("sequence", 1)], unique=True)
+        except OperationFailure as exc:
+            if exc.code not in (85, 86):
+                raise
         return 0, "OK: MongoDB connection and required scan indexes are available."
     except OperationFailure as exc:
         if exc.code == 18:
             return 1, "AUTHENTICATION: Check database credentials, URI escaping and authSource."
         if exc.code == 13:
             return 1, "AUTHORIZATION: Grant the scan service read/write and index permissions on its configured database."
-        if exc.code in (85, 86, 11000):
+        if exc.code == 11000:
             return 1, "INDEX_CONFLICT: Existing scan indexes or duplicate events need operator review; no data was deleted."
         return 1, "DATABASE_OPERATION: MongoDB rejected scan storage initialization at stage " + stage + "."
     except ServerSelectionTimeoutError:

@@ -9,6 +9,7 @@ import { editorPath, loadSnapshotFile, readState, saveState, snapshotRepository,
 import { proposalPatch, verifyProposal } from '@/lib/uiux/proposals';
 import { applyUiuxChanges, createUiuxPullRequest, UiuxPullRequestError } from '@/lib/uiux/pull-request';
 import { settleProductUsage } from '@/lib/billing/product-usage';
+import { isAllowedBrowserOrigin } from '@/lib/agentic-websocket';
 import type { UiuxRun } from '@/features/customization/uiux-workspace-types';
 
 export const runtime = 'nodejs';
@@ -68,7 +69,16 @@ async function handle(request: NextRequest, context: Context) {
     const route = segments.join('/');
     if (request.method !== 'GET') {
       const origin = request.headers.get('origin');
-      if (origin && origin !== request.nextUrl.origin) throw new UiuxError('Cross-origin requests are not allowed.', 403);
+      if (origin && !isAllowedBrowserOrigin(origin, {
+        requestOrigin: request.nextUrl.origin,
+        forwardedHost: request.headers.get('x-forwarded-host'),
+        forwardedProto: request.headers.get('x-forwarded-proto'),
+        hostHeader: request.headers.get('host'),
+        publicAppUrl: process.env.NEXT_PUBLIC_APP_URL,
+        corsOrigins: process.env.CORS_ORIGINS,
+      })) {
+        throw new UiuxError('Cross-origin requests are not allowed.', 403);
+      }
     }
     if (route === 'projects' && request.method === 'GET') return listProjects(request);
     if (route === 'health' && request.method === 'GET') {

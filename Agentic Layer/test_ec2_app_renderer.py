@@ -46,6 +46,15 @@ def test_source_root_candidates_translate_connector_host_paths_to_agentic_mounts
     assert "/repos/acme/demo" in candidates
 
 
+def test_source_root_candidates_translate_connector_container_paths_to_agentic_mounts() -> None:
+    candidates = [
+        str(path).replace("\\", "/")
+        for path in _source_root_candidates("/app/tmp/repos/acme/demo")
+    ]
+
+    assert "/repos/acme/demo" in candidates
+
+
 def test_ec2_renderer_materializes_requested_data_services() -> None:
     rendered = render_ec2_app_bundle(
         project_name="demo-app",

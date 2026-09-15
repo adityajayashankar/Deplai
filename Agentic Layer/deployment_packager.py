@@ -706,11 +706,15 @@ def _source_root_candidates(source_root: str) -> list[Path]:
         candidates.append(Path(raw).expanduser())
 
     normalized = raw.replace("\\", "/")
+    github_mount = Path(os.getenv("DEPLAI_GITHUB_REPOS_ROOT") or "/repos")
+    local_mount = Path(os.getenv("DEPLAI_LOCAL_PROJECTS_ROOT") or "/local-projects")
     markers = (
-        ("/Connector/tmp/repos/", Path("/repos")),
-        ("/Connector/tmp/local-projects/", Path("/local-projects")),
-        ("Connector/tmp/repos/", Path("/repos")),
-        ("Connector/tmp/local-projects/", Path("/local-projects")),
+        ("/Connector/tmp/repos/", github_mount),
+        ("/Connector/tmp/local-projects/", local_mount),
+        ("Connector/tmp/repos/", github_mount),
+        ("Connector/tmp/local-projects/", local_mount),
+        ("/app/tmp/repos/", github_mount),
+        ("/app/tmp/local-projects/", local_mount),
     )
     for marker, mount_root in markers:
         if marker not in normalized:

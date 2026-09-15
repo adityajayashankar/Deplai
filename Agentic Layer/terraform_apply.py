@@ -2245,17 +2245,29 @@ def _inject_app_artifact_tarball(
 
     package_id = ""
     package_base64 = ""
+    if isinstance(apply_context, dict):
+        package_id = str(apply_context.get("deployment_package_id") or "").strip()
+        metadata = apply_context.get("deployment_metadata")
+        if not package_id and isinstance(metadata, dict):
+            package_id = str(metadata.get("deployment_package_id") or "").strip()
+            package_meta = metadata.get("deployment_package")
+            if not package_id and isinstance(package_meta, dict):
+                package_id = str(package_meta.get("package_id") or "").strip()
     for item in files:
         path = str(item.get("path", "")).replace("\\", "/")
         if not path.endswith(".tfvars"):
             continue
         text = _extract_text_payload(item)
-        package_match = re.search(
+        for pattern in (
             r'deployment_package_id\s*=\s*"([^"]*)"',
-            text,
-        )
-        if package_match:
-            package_id = str(package_match.group(1) or "").strip()
+            r'artifact_source\s*=\s*"([^"]*)"',
+        ):
+            package_match = re.search(pattern, text)
+            if package_match:
+                found = str(package_match.group(1) or "").strip()
+                if found:
+                    package_id = found
+                    break
         archive_match = re.search(
             r'(?m)^\s*app_archive_base64\s*=\s*("(?:\\.|[^"\\])*")\s*$',
             text,
@@ -5366,6 +5378,12 @@ def apply_saved_terraform_run(
                     "success": False,
                     "error": "Saved Terraform run source does not match the validated customization snapshot.",
                 }
+        package_id = str(metadata.get("deployment_package_id") or "").strip()
+        package_meta = metadata.get("deployment_package")
+        if not package_id and isinstance(package_meta, dict):
+            package_id = str(package_meta.get("package_id") or "").strip()
+        if package_id and isinstance(apply_context, dict):
+            apply_context["deployment_package_id"] = package_id
         return apply_terraform_bundle(
             files=[item for item in files if isinstance(item, dict)],
             project_name=project_name,

@@ -12,7 +12,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH="/workspace/Agentic Layer:/workspace:/workspace/Terraform Agent" \
-    DEPLAI_WORKSPACE_ROOT=/workspace
+    DEPLAI_WORKSPACE_ROOT=/workspace \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl gcc git unzip \
@@ -25,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -f /tmp/terraform.zip /tmp/tflint.zip \
     && terraform version \
     && tflint --version \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Install every Python dependency set before copying source, keeping rebuilds

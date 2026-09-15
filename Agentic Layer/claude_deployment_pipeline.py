@@ -3902,7 +3902,12 @@ def generate_terraform_bundle(
 
     if use_ec2_app:
         package_manifest = rendered["package_manifest"]
-        files = list(rendered["files"])
+        files = attach_app_artifact_to_tf_files(
+            list(rendered["files"]),
+            package_id=str(package_manifest.get("package_id") or ""),
+            project_slug=project_name,
+            package_base64=str(deployment_package.package_base64 or ""),
+        )
         run_id = save_terraform_run(
             workspace=workspace,
             files=files,

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   agenticUpstreamWebSocketPath,
   buildAgenticWebSocketUrl,
+  isAllowedBrowserOrigin,
   resolveAgenticWsBaseFromConfig,
   resolveBrowserAgenticWsBase,
   resolvePublicHttpOrigin,
@@ -89,6 +90,43 @@ describe('resolvePublicHttpOrigin', () => {
       publicAppUrl: 'https://deplai.in',
     });
     assert.equal(origin, 'https://deplai.in');
+  });
+});
+
+describe('isAllowedBrowserOrigin', () => {
+  it('allows the public HTTPS origin when Next only sees the container listen address', () => {
+    assert.equal(
+      isAllowedBrowserOrigin('https://deplai.tech', {
+        requestOrigin: 'http://connector:3000',
+        forwardedHost: 'deplai.tech',
+        forwardedProto: 'https',
+        hostHeader: 'connector:3000',
+        publicAppUrl: 'https://deplai.tech',
+      }),
+      true,
+    );
+  });
+
+  it('allows CORS_ORIGINS when forwarded headers are missing', () => {
+    assert.equal(
+      isAllowedBrowserOrigin('https://deplai.tech', {
+        requestOrigin: 'http://localhost:3000',
+        corsOrigins: 'https://deplai.tech,https://www.deplai.tech',
+      }),
+      true,
+    );
+  });
+
+  it('rejects a true cross-origin browser', () => {
+    assert.equal(
+      isAllowedBrowserOrigin('https://evil.example', {
+        requestOrigin: 'http://connector:3000',
+        forwardedHost: 'deplai.tech',
+        forwardedProto: 'https',
+        publicAppUrl: 'https://deplai.tech',
+      }),
+      false,
+    );
   });
 });
 

@@ -24,7 +24,6 @@ class ScanStorageCheckTests(unittest.TestCase):
         cases = [
             (OperationFailure("secret-host-password", code=18), "AUTHENTICATION"),
             (OperationFailure("secret-host-password", code=13), "AUTHORIZATION"),
-            (OperationFailure("secret-host-password", code=86), "INDEX_CONFLICT"),
             (ServerSelectionTimeoutError("secret-host-password"), "UNREACHABLE"),
             (ConfigurationError("secret-host-password"), "CONFIGURATION"),
             (ValueError("secret-host-password"), "STORAGE_ERROR"),
@@ -51,6 +50,13 @@ class ScanStorageCheckTests(unittest.TestCase):
             code, message = module.check_storage()
             self.assertEqual(code, 1)
             self.assertTrue(message.startswith("AUTHORIZATION:"))
+
+    def test_index_option_conflict_is_not_a_storage_outage(self):
+        with patch.dict(os.environ, {"MONGODB_URI": "mongodb://fixture.invalid"}), patch.object(module, "MongoClient") as factory:
+            factory.return_value.__getitem__.return_value.security_events.create_index.side_effect = OperationFailure("private", code=86)
+            code, message = module.check_storage()
+            self.assertEqual(code, 0)
+            self.assertTrue(message.startswith("OK:"))
 
 
 if __name__ == "__main__":

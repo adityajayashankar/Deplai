@@ -132,6 +132,54 @@ export function resolvePublicHttpOrigin(options: {
   return requestOrigin || publicAppUrl || null;
 }
 
+export function normalizeHttpOrigin(origin: string): string {
+  return origin.trim().replace(/\/+$/, '');
+}
+
+/**
+ * CSRF check for browser POSTs behind Caddy. `request.nextUrl.origin` is the
+ * Connector container listen address (http://connector:3000); the browser Origin
+ * is https://APP_DOMAIN. Compare against the public origin, not the listen URL.
+ */
+export function isAllowedBrowserOrigin(
+  origin: string | null | undefined,
+  options: {
+    requestOrigin?: string;
+    forwardedHost?: string | null;
+    forwardedProto?: string | null;
+    hostHeader?: string | null;
+    publicAppUrl?: string | null;
+    corsOrigins?: string | null;
+  },
+): boolean {
+  const raw = origin?.trim();
+  if (!raw) return true;
+  let candidate: string;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    candidate = normalizeHttpOrigin(parsed.origin);
+  } catch {
+    return false;
+  }
+
+  const allowed = new Set<string>();
+  const add = (value: string | null | undefined) => {
+    const trimmed = value?.trim();
+    if (!trimmed) return;
+    try {
+      allowed.add(normalizeHttpOrigin(new URL(trimmed).origin));
+    } catch {
+      if (/^https?:\/\//i.test(trimmed)) allowed.add(normalizeHttpOrigin(trimmed));
+    }
+  };
+
+  add(resolvePublicHttpOrigin(options));
+  add(options.publicAppUrl);
+  for (const item of (options.corsOrigins || '').split(',')) add(item);
+  return allowed.has(candidate);
+}
+
 /** True when the browser should connect straight to FastAPI (no /agentic prefix). */
 export function isDirectLocalAgenticWsBase(wsBase: string): boolean {
   const normalized = normalizeAgenticWsBase(wsBase);

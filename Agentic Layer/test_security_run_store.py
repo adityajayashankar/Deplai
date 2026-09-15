@@ -45,6 +45,25 @@ class SecurityRunStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "requires MONGODB_URI"):
                 SecurityRunStore().db()
 
+    def test_atlas_connections_use_a_longer_timeout(self):
+        with patch.dict(os.environ, {"MONGODB_URI": "mongodb+srv://fixture.mongodb.net"}), patch(
+            "pymongo.MongoClient"
+        ) as factory:
+            SecurityRunStore().db()
+            kwargs = factory.call_args.kwargs
+            self.assertGreaterEqual(kwargs["serverSelectionTimeoutMS"], 10000)
+            self.assertGreaterEqual(kwargs["connectTimeoutMS"], 10000)
+
+    def test_index_option_conflict_does_not_block_scan_storage(self):
+        with patch.dict(os.environ, {"MONGODB_URI": "mongodb://fixture.invalid"}), patch(
+            "pymongo.MongoClient"
+        ) as factory:
+            db = factory.return_value.__getitem__.return_value
+            db.security_events.create_index.side_effect = OperationFailure("index options", code=85)
+            store = SecurityRunStore()
+            self.assertIs(store.db(), db)
+            self.assertIs(store._db, db)
+
 
 if __name__ == "__main__":
     unittest.main()
