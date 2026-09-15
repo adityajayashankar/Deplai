@@ -1,0 +1,78 @@
+First, make sure AWS CLI and the Session Manager plugin are on PATH for this PowerShell session:
+
+$env:Path += ";C:\Program Files\Amazon\AWSCLIV2"
+$env:Path += ";C:\Program Files\Amazon\SessionManagerPlugin\bin"
+
+Verify both:
+
+aws --version
+session-manager-plugin
+
+If AWS credentials are not active, log in:
+
+aws login
+
+When prompted for region, enter:
+
+eu-north-1
+
+Then verify authentication:
+
+aws sts get-caller-identity
+
+Now start the admin-console tunnel:
+
+aws ssm start-session `
+  --target i-07781a8e380ca5355 `
+  --document-name AWS-StartPortForwardingSession `
+  --parameters "portNumber=3100,localPortNumber=3100" `
+  --region eu-north-1
+
+Leave that PowerShell window open. You should see:
+
+Port 3100 opened...
+Waiting for connections...
+
+Then open in your browser:
+
+http://localhost:3100
+
+If you also need a separate EC2 shell for debugging, open a second PowerShell window and run:
+
+$env:Path += ";C:\Program Files\Amazon\AWSCLIV2"
+$env:Path += ";C:\Program Files\Amazon\SessionManagerPlugin\bin"
+
+aws ssm start-session `
+  --target i-07781a8e380ca5355 `
+  --region eu-north-1
+
+Then inside EC2:
+
+sudo -i
+cd /opt/deplai/Deplai
+
+For admin-console health:
+
+docker compose --env-file deploy/.env -f docker-compose.production.yml ps admin-console
+
+For logs:
+
+docker logs deplai-admin-console-1 --tail 100
+
+For local health check on EC2:
+
+curl --fail http://127.0.0.1:3100/api/health
+
+For port verification:
+
+docker compose --env-file deploy/.env -f docker-compose.production.yml port admin-console 3100
+
+It should show:
+
+127.0.0.1:3100
+
+For the browser login, keep the tunnel running and use:
+
+http://localhost:3100
+
+Then log in with the owner account you created and complete MFA.

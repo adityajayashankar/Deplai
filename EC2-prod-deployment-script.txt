@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+
+# ============================================================
+# DEPLAI PRODUCTION EC2 RUNBOOK
+# Known-good commands from the successful deplai.tech deployment
+#
+# EC2: Amazon Linux 2023
+# Region: eu-north-1
+# Repo: /opt/deplai/Deplai
+# Production env: deploy/.env
+# Compose: docker-compose.production.yml
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1. BECOME ROOT
+# ------------------------------------------------------------
+
+sudo -i
+
+
+# ------------------------------------------------------------
+# 2. GO TO DEPLAI
+# ------------------------------------------------------------
+
+cd /opt/deplai/Deplai
+
+
+# ------------------------------------------------------------
+# 3. PULL LATEST CODE
+# ------------------------------------------------------------
+
+git pull origin main
+
+
+# ------------------------------------------------------------
+# 4. VERIFY PRODUCTION CONFIG
+# ------------------------------------------------------------
+
+./deploy/preflight.sh deploy/.env
+
+
+# ------------------------------------------------------------
+# 5. OPTIONAL: VERIFY DNS
+#
+# Both should resolve to the production Elastic IP.
+# Current deployment EIP: 13.62.155.9
+# ------------------------------------------------------------
+
+getent hosts deplai.tech
+getent hosts www.deplai.tech
+
+
+# ------------------------------------------------------------
+# 6. PULL SECURITY / WORKER IMAGES
+# ------------------------------------------------------------
+
+./deploy/pull-worker-images.sh
+
+
+# ------------------------------------------------------------
+# 7. LIMIT PARALLEL BUILDS
+#
+# Useful on the current t3.large EC2.
+# ------------------------------------------------------------
+
+export COMPOSE_PARALLEL_LIMIT=1
+
+
+# ------------------------------------------------------------
+# 8. BUILD APPLICATION IMAGES
+# ------------------------------------------------------------
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  build customization
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  build uiux-agent
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  build connector
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  build agentic-layer
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  build admin-console
+
+
+# ------------------------------------------------------------
+# 9. START / UPDATE PRODUCTION STACK
+# ------------------------------------------------------------
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  up -d --remove-orphans
+
+
+# ------------------------------------------------------------
+# 10. VERIFY ALL CONTAINERS
+# ------------------------------------------------------------
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  ps
+
+
+# ------------------------------------------------------------
+# 11. ADMIN CONSOLE REDEPLOY + MIGRATIONS
+#
+# This is now the preferred admin-console deployment mechanism.
+# It:
+#   - builds admin-console
+#   - runs migrations
+#   - verifies the 11-table admin schema
+#   - recreates admin-console
+# ------------------------------------------------------------
+
+bash deploy/redeploy-admin-console.sh
+
+
+# ------------------------------------------------------------
+# 12. VERIFY ADMIN CONSOLE
+# ------------------------------------------------------------
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  ps admin-console
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  port admin-console 3100
+
+curl --fail http://127.0.0.1:3100/api/health
+
+
+# ------------------------------------------------------------
+# 13. VERIFY PUBLIC PRODUCTION SITE
+# ------------------------------------------------------------
+
+curl -I https://deplai.tech
+
+curl -I https://www.deplai.tech
+
+
+# Expected:
+#
+# https://deplai.tech
+# HTTP/2 200
+#
+# https://www.deplai.tech
+# HTTP/2 301
+# location: https://deplai.tech/
+
+
+# ------------------------------------------------------------
+# 14. USEFUL LOG COMMANDS
+# ------------------------------------------------------------
+
+# Admin console
+docker logs deplai-admin-console-1 --tail 100
+
+# Connector
+docker logs deplai-connector-1 --tail 100
+
+# Agentic Layer
+docker logs deplai-agentic-layer-1 --tail 100
+
+# Customization
+docker logs deplai-customization-1 --tail 100
+
+# UIUX Agent
+docker logs deplai-uiux-agent-1 --tail 100
+
+# Caddy
+docker logs deplai-caddy-1 --tail 100
+
+# MySQL
+docker logs deplai-mysql-1 --tail 100
+
+
+# ------------------------------------------------------------
+# 15. ADMIN OWNER BOOTSTRAP
+#
+# !!! INITIAL SETUP ONLY !!!
+#
+# Do NOT run this on every deployment.
+# Run only when initializing the admin owner / MFA.
+# ------------------------------------------------------------
+
+# docker compose \
+#   --env-file deploy/.env \
+#   -f docker-compose.production.yml \
+#   run --rm --no-deps \
+#   admin-console npm run admin:bootstrap
+
+
+# ============================================================
+# SUCCESS CRITERIA
+# ============================================================
+#
+# docker compose ps:
+#   admin-console     healthy
+#   agentic-layer     healthy
+#   caddy             healthy
+#   connector         healthy
+#   customization     healthy
+#   mysql             healthy
+#   uiux-agent        healthy
+#
+# Public:
+#   https://deplai.tech       -> HTTP 200
+#   https://www.deplai.tech   -> redirect to apex
+#
+# Admin:
+#   127.0.0.1:3100 only
+#   accessed through AWS SSM port forwarding
+#
+# ============================================================
+
+For normal future deployments
+
+You won't need that entire script every time. Your routine EC2 redeployment will usually collapse down to:
+
+sudo -i
+cd /opt/deplai/Deplai
+
+git pull origin main
+
+./deploy/preflight.sh deploy/.env
+
+export COMPOSE_PARALLEL_LIMIT=1
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  build
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  up -d --remove-orphans
+
+bash deploy/redeploy-admin-console.sh
+
+docker compose \
+  --env-file deploy/.env \
+  -f docker-compose.production.yml \
+  ps
+
+curl -I https://deplai.tech
+
+And importantly, never put deploy/.env, AWS credentials, admin passwords, MFA secrets, database passwords, or API keys into this script or Git. Your production secrets remain in deploy/.env on the EC2 host.
+
+One remaining cleanup item from this deployment: rotate the credentials that were exposed in earlier screenshots before treating this environment as fully production-secure.

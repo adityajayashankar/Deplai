@@ -40,6 +40,7 @@ export default function OrganizationDetailPage() {
   const [reason, setReason] = useState('');
   const [credits, setCredits] = useState('10');
   const [planId, setPlanId] = useState('free');
+  const [grantPlanId, setGrantPlanId] = useState('starter_20');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   const [expiresAt, setExpiresAt] = useState('');
@@ -48,7 +49,8 @@ export default function OrganizationDetailPage() {
   async function load() {
     const data = await adminFetch<{ organization: OrganizationDetail }>(`/api/admin/organizations?id=${params.id}`);
     setOrg(data.organization);
-    setPlanId(data.organization.complimentary?.active ? data.organization.complimentary.planId : data.organization.subscription?.planId || 'free');
+    setPlanId(data.organization.subscription?.planId || 'free');
+    setGrantPlanId(data.organization.complimentary?.active ? data.organization.complimentary.planId : 'starter_20');
   }
 
   useEffect(() => {
@@ -233,14 +235,20 @@ export default function OrganizationDetailPage() {
 
         <div className="space-y-3 border-t pt-4">
           <h3 className="font-medium">Complimentary tier access</h3>
+          <label className="block">Tier to grant
+            <select className="input max-w-xs" value={grantPlanId} onChange={(e) => setGrantPlanId(e.target.value)}>
+              {BILLING_PLANS.map((plan) => <option key={plan.id} value={plan.id}>{plan.displayName}</option>)}
+            </select>
+          </label>
           <p className="text-sm text-muted">Applies to all members of this organization. No payment is required. Usage still consumes credits; use Grant credits above to fund access. Existing paid billing is not cancelled.</p>
           <p>{org.complimentary?.active ? `Active: ${org.complimentary.planId}, expires ${org.complimentary.expiresAt ? formatDate(org.complimentary.expiresAt) : 'never'}` : 'No active complimentary access'}</p>
           <label className="block">Expiry (optional, your local time)
             <input className="input" type="datetime-local" value={expiresAt} onChange={(e) => setExpiresAt(e.target.value)} />
           </label>
-          <p className="text-sm">Selected tier: {BILLING_PLANS.find((plan) => plan.id === planId)?.displayName}. Revocation or expiry restores the underlying subscription.</p>
+          <p className="text-sm">Selected tier: {BILLING_PLANS.find((plan) => plan.id === grantPlanId)?.displayName}. Revocation or expiry restores the underlying subscription.</p>
+          {!reason.trim() ? <p className="text-sm text-muted">Enter a reason at the top of Resource controls to enable the grant button.</p> : null}
           <div className="flex gap-2">
-            <button className="btn btn-primary" disabled={!reason.trim()} onClick={() => runAction(() => postOrg({ action: 'grant_access', planId, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null }, 'subscription.grant'))}>Grant selected tier without payment</button>
+            <button className="btn btn-primary" disabled={!reason.trim()} onClick={() => runAction(() => postOrg({ action: 'grant_access', planId: grantPlanId, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null }, 'subscription.grant'))}>Grant selected tier without payment</button>
             <button className="btn btn-danger" disabled={!org.complimentary?.active || !reason.trim()} onClick={() => runAction(() => postOrg({ action: 'revoke_access' }, 'subscription.grant'))}>Revoke complimentary access</button>
           </div>
         </div>

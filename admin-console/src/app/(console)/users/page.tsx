@@ -47,6 +47,7 @@ export default function UsersPage() {
   return (
     <div>
       <PageHeader title="Users" description={`${total} accounts in the platform directory.`} />
+      <p className="text-sm text-muted mb-4">Use Upgrade / manage access to choose the user's organization and grant Starter or Pro access. Organization grants are separate from the recorded billing plan.</p>
       <div className="mb-4">
         <input className="input max-w-md" placeholder="Search email, name, or user ID" value={q} onChange={(e) => { setQ(e.target.value); setOffset(0); }} />
       </div>
@@ -60,6 +61,7 @@ export default function UsersPage() {
               <th>Organizations</th>
               <th>Projects</th>
               <th>Created</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -76,6 +78,7 @@ export default function UsersPage() {
                 <td>{user.organizationCount}</td>
                 <td>{user.projectCount}</td>
                 <td>{formatDate(user.createdAt)}</td>
+                <td><Link className="btn btn-outline" href={`/users/${user.id}`} aria-label={`Upgrade or manage access for ${user.email}`}>Upgrade / manage access</Link></td>
               </tr>
             ))}
           </tbody>

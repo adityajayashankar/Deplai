@@ -13,6 +13,40 @@ Use **one x86_64 EC2 host** and `docker-compose.production.yml`. Do not use
 application EC2 for DeplAI itself. Customer AWS accounts stay in the product
 UI; they are not this host.
 
+## Scan storage error after deployment
+
+Run this from the production checkout to check the running Agentic container's
+actual MongoDB configuration and network, without rebuilding or restarting:
+
+```bash
+bash deploy/check-scan-storage.sh
+```
+
+The check identifies Atlas versus other endpoints and prints only a safe failure
+category. It pings MongoDB and initializes the same required indexes as scan
+startup; it does not create scan runs or delete data. `OK` confirms connectivity
+and index initialization, not a complete scan or restart-recovery test.
+
+- `MISSING_URI`: configure `MONGODB_URI` in `deploy/.env`.
+- `AUTHENTICATION`: correct database credentials, URI escaping and `authSource`.
+- `AUTHORIZATION`: give the service the required database read/write and index permissions.
+- `INDEX_CONFLICT`: inspect existing indexes and duplicate events with an operator;
+  do not delete history or drop indexes blindly.
+- `UNREACHABLE` / `CONFIGURATION`: check the production server's network access,
+  DNS, MongoDB availability and TLS configuration. Do not disable TLS validation.
+
+After correcting `deploy/.env`, recreate Agentic during an idle maintenance
+window (active workers are interrupted), then rerun the check:
+
+```bash
+docker compose --env-file deploy/.env -f docker-compose.production.yml up -d --no-deps --force-recreate agentic-layer
+bash deploy/check-scan-storage.sh
+```
+
+Changing the file alone or using `docker compose restart` does not replace the
+container environment. Keep the existing database and its history; local
+`compose.yaml`'s `security-mongo` is not part of the production stack.
+
 ## AWS resources to create
 
 Create these in the AWS account that **hosts DeplAI** (for `deplai.in`,

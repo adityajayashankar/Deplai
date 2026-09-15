@@ -68,18 +68,19 @@ export default function UserDetailPage() {
         </section>
       </div>
       <section className="card p-4">
-        <h2 className="font-medium mb-3">Organizations</h2>
+        <h2 className="font-medium mb-3">Upgrade / manage organization access</h2>
         <p className="text-sm text-muted mb-3">Open an organization to grant a complimentary tier, adjust credits, or suspend access. Tier access is shared by all its members.</p>
         <div className="table-wrap">
           <table className="data-table">
-            <thead><tr><th>Name</th><th>Role</th><th>Status</th></tr></thead>
+            <thead><tr><th>Name</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
             <tbody>
               {user.organizations.map((org) => (
-                <tr key={org.id}><td><Link className="text-accent underline" href={`/organizations/${org.id}`}>{org.name} — Manage access</Link></td><td>{org.role}</td><td>{org.status}</td></tr>
+                <tr key={org.id}><td><Link className="text-accent underline" href={`/organizations/${org.id}`}>{org.name}</Link></td><td>{org.role}</td><td>{org.status}</td><td><Link className="btn btn-outline" href={`/organizations/${org.id}`}>Upgrade / manage access</Link></td></tr>
               ))}
             </tbody>
           </table>
         </div>
+        {!user.organizations.length ? <p className="text-sm text-muted mt-3">This user needs to create or join an organization in DeplAI before you can grant tier access.</p> : null}
       </section>
       <section className="card p-4 space-y-3">
         <h2 className="font-medium">Danger zone</h2>
