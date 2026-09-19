@@ -135,7 +135,7 @@ def _profile(strategy: str) -> dict:
         ]
     networking = {"vpc": "new", "layout": "private_subnets", "nat_gateway": True, "load_balancer": {"public": True}, "ports_exposed": [3000]}
     if strategy == "s3_cloudfront":
-        networking["load_balancer"] = {"public": False}
+        networking["load_balancer"] = {}
         networking["ports_exposed"] = [443]
     return {
         "document_kind": "deployment_profile",

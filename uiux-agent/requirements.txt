@@ -1,5 +1,5 @@
 # agno[os] — Agno framework + AgentOS runtime
-agno[os]>=1.0
+agno[os]>=1.0,<3
 # LLM providers
 anthropic
 # MongoDB driver (sync for Tier 0; swap to motor for async in Phase 5)

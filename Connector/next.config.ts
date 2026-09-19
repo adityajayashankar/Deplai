@@ -13,7 +13,7 @@ const agenticLayerUrl = (process.env.AGENTIC_LAYER_URL || 'http://127.0.0.1:8000
 
 const nextConfig: NextConfig = {
   reactCompiler: true,
-  serverExternalPackages: ['razorpay', 'pdfkit'],
+  serverExternalPackages: ['razorpay', 'pdfkit', 'ssh2'],
   async redirects() {
     return [
       {
