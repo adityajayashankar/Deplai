@@ -425,4 +425,4 @@ def build_frontend_customization_graph():
     graph.add_conditional_edges(START, next_node, destinations)
     for name in NODE_FUNCTIONS:
         graph.add_conditional_edges(name, next_node, destinations)
-    return graph.compile(recursion_limit=50)
+    return graph.compile()

@@ -87,8 +87,9 @@ class AuthProvisioningTests(unittest.TestCase):
             main_tf = next(item["content"] for item in rendered["files"] if item["path"] == "terraform/main.tf")
             self.assertIn("public_url_injected", main_tf)
             self.assertIn("NEXTAUTH_URL=", main_tf)
-            self.assertIn("GOOGLE_CLIENT_ID=demo-google-id", main_tf)
-            self.assertIn("GOOGLE_CLIENT_SECRET=demo-google-secret", main_tf)
+            self.assertIn("secrets_manager_fetch_started", main_tf)
+            self.assertNotIn("demo-google-id", main_tf)
+            self.assertNotIn("demo-google-secret", main_tf)
             self.assertIn("NEXTAUTH_SECRET=", main_tf)
             self.assertTrue(any("Missing OAuth/auth secrets" in w for w in rendered.get("warnings") or []))
 

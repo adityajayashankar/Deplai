@@ -25,11 +25,11 @@ data "aws_subnets" "default" {
 }
 
 locals {
-  is_aurora = startswith(var.engine, "aurora-")
+  is_aurora     = startswith(var.engine, "aurora-")
   is_serverless = var.instance_class == "db.serverless"
 
-  db_port = var.engine == "mysql" || var.engine == "aurora-mysql" ? 3306 : 5432
-  family  = var.engine == "mysql" ? "mysql8.0" : var.engine == "postgres" ? "postgres16" : ""
+  db_port              = var.engine == "mysql" || var.engine == "aurora-mysql" ? 3306 : 5432
+  family               = var.engine == "mysql" ? "mysql8.0" : var.engine == "postgres" ? "postgres16" : ""
   major_engine_version = var.engine == "mysql" ? "8.0" : var.engine == "postgres" ? "16" : ""
 
   environment = "production"
@@ -112,14 +112,14 @@ module "aurora" {
 
   count = local.is_aurora ? 1 : 0
 
-  name            = var.db_name
-  engine          = var.engine
-  engine_version  = var.engine_version
-  
-  master_username = var.db_username
-  master_password = var.db_password
+  name           = var.db_name
+  engine         = var.engine
+  engine_version = var.engine_version
+
+  master_username             = var.db_username
+  master_password             = var.db_password
   manage_master_user_password = false
-  
+
   port = local.db_port
 
   instances = {

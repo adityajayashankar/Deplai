@@ -23,7 +23,10 @@ from services.snapshot_manager import (
 
 
 def _remove_read_only(function, path, _exc_info) -> None:
-    os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    target = Path(path)
+    for candidate in (target, target.parent):
+        if candidate.exists():
+            os.chmod(candidate, stat.S_IRWXU)
     function(path)
 
 

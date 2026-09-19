@@ -133,6 +133,10 @@ def _profile(strategy: str) -> dict:
         services = [
             {"id": "web", "process_type": "web", "cpu": 256, "memory": 512, "port": 3000, "desired_count": 1, "command": "npm run start"},
         ]
+    networking = {"vpc": "new", "layout": "private_subnets", "nat_gateway": True, "load_balancer": {"public": True}, "ports_exposed": [3000]}
+    if strategy == "s3_cloudfront":
+        networking["load_balancer"] = {"public": False}
+        networking["ports_exposed"] = [443]
     return {
         "document_kind": "deployment_profile",
         "workspace": "unit-test",
@@ -141,7 +145,7 @@ def _profile(strategy: str) -> dict:
         "application_type": "web_app",
         "environment": "dev",
         "compute": {"strategy": strategy, "services": services},
-        "networking": {"vpc": "new", "layout": "private_subnets", "nat_gateway": True, "load_balancer": {"public": True}, "ports_exposed": [3000]},
+        "networking": networking,
         "data_layer": data_layer,
         "build_pipeline": {"build_command": "npm run build", "start_command": "npm run start", "ecr_repository": "demo-app"},
         "runtime_config": {"required_secrets": ["DATABASE_URL"], "config_values": ["NODE_ENV"], "secrets_manager_prefix": "/demo/dev"},

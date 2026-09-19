@@ -23,9 +23,9 @@ or `production` environment variables:
 | Variable | Value |
 | --- | --- |
 | `AWS_DEPLOY_ROLE_ARN` | IAM role trusted for the GitHub OIDC subject `repo:OWNER/REPO:environment:production` |
-| `AWS_REGION` | Host region, for example `ap-south-1` |
+| `AWS_REGION` | Host region; the current production instance is in `eu-north-1` |
 | `DEPLOY_INSTANCE_ID` | The EC2 instance ID running the production Compose stack |
-| `DEPLOY_APP_DIR` | Existing checkout on the host, normally `/opt/deplai` |
+| `DEPLOY_APP_DIR` | Existing checkout on the host; current production uses `/opt/deplai/Deplai` |
 | `APP_DOMAIN` | Public HTTPS hostname used for the workflow deployment link |
 
 The AWS role needs permission to call `ssm:SendCommand`,

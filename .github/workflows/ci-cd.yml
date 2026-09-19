@@ -97,7 +97,7 @@ jobs:
       - name: Install Agentic dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyyaml
+          python -m pip install pyyaml pytest
           python -m pip install -r "Agentic Layer/requirements.txt" \
             -r "Terraform Agent/agent/requirements.txt" \
             -r "Diagram-Cost-Agent/requirements.txt"
@@ -138,7 +138,7 @@ jobs:
           cache-dependency-path: uiux-agent/requirements.txt
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements.txt
-      - run: python -m unittest discover -s . -p 'test_*.py'
+      - run: python -m pytest -q
 
   terraform:
     name: Terraform validation
@@ -161,11 +161,11 @@ jobs:
       - name: Provide non-secret Compose validation environment
         run: |
           cp deploy/.env.example deploy/.env
-          sed -i \
-            -e 's/^ADMIN_SESSION_SECRET=$/ADMIN_SESSION_SECRET=ci-validation-admin-session/' \
-            -e 's/^ADMIN_AUDIT_HMAC_SECRET=$/ADMIN_AUDIT_HMAC_SECRET=ci-validation-admin-audit/' \
-            -e 's/^ADMIN_MFA_ENCRYPTION_KEY=$/ADMIN_MFA_ENCRYPTION_KEY=ci-validation-admin-mfa/' \
-            deploy/.env
+          cat >> deploy/.env <<'EOF'
+          ADMIN_SESSION_SECRET=ci-validation-admin-session
+          ADMIN_AUDIT_HMAC_SECRET=ci-validation-admin-audit
+          ADMIN_MFA_ENCRYPTION_KEY=ci-validation-admin-mfa
+          EOF
       - name: Validate Compose configuration
         run: docker compose --env-file deploy/.env -f docker-compose.production.yml config --quiet
       - name: Validate deployment preflight tests
@@ -198,10 +198,10 @@ jobs:
       contents: read
       id-token: write
     env:
-      AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'eu-north-1' }}
       AWS_ROLE_TO_ASSUME: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
       DEPLOY_INSTANCE_ID: ${{ vars.DEPLOY_INSTANCE_ID }}
-      DEPLOY_APP_DIR: ${{ vars.DEPLOY_APP_DIR || '/opt/deplai' }}
+      DEPLOY_APP_DIR: ${{ vars.DEPLOY_APP_DIR || '/opt/deplai/Deplai' }}
       APP_DOMAIN: ${{ vars.APP_DOMAIN }}
     steps:
       - uses: actions/checkout@v4
@@ -230,10 +230,16 @@ jobs:
             --parameters "$parameters" \
             --query 'Command.CommandId' --output text)"
           echo "SSM command started: $command_id"
-          set +e
-          aws ssm wait command-executed --command-id "$command_id" --instance-id "$DEPLOY_INSTANCE_ID"
-          wait_status=$?
-          set -e
+          deadline=$((SECONDS + 5400))
+          command_status=""
+          while (( SECONDS < deadline )); do
+            command_status="$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$DEPLOY_INSTANCE_ID" --query 'Status' --output text 2>/dev/null || true)"
+            case "$command_status" in
+              Success) break ;;
+              Cancelled|Cancelling|Failed|TimedOut) break ;;
+            esac
+            sleep 10
+          done
           aws ssm get-command-invocation --command-id "$command_id" --instance-id "$DEPLOY_INSTANCE_ID" \
             --query '{status:Status,stdout:StandardOutputContent,stderr:StandardErrorContent}' --output json
-          test "$wait_status" -eq 0
+          test "$command_status" = Success

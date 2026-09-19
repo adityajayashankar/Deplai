@@ -19,7 +19,7 @@ if [[ ! -d .git || ! -f "$compose_file" || ! -f "$env_file" ]]; then
   exit 2
 fi
 
-if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+if ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
   # deploy/.env is intentionally untracked; all other untracked files are unsafe
   # because they could enter a Docker build unexpectedly.
   unexpected="$(git ls-files --others --exclude-standard | grep -v '^deploy/\.env$' || true)"

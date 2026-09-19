@@ -48,7 +48,7 @@ class ScanValidationResponseTests(unittest.TestCase):
         self.assertIsNone(public["aws_secret_access_key"])
         self.assertIsNone(public["aws_session_token"])
         self.assertEqual(public["enabled_modules"], ["cloud"])
-        self.assertEqual(public["aws_access_key_id"], "AKIATESTKEYID0000000")
+        self.assertIsNone(public["aws_access_key_id"])
         response = ScanValidationResponse(
             success=True,
             message="ok",

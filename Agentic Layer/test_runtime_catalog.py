@@ -73,11 +73,6 @@ class RuntimeCatalogTests(unittest.TestCase):
 
     def test_renderer_installs_go_java_php_toolchains(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            package = build_deployment_package(
-                source_root=str(tmp),
-                project_name="placeholder",
-                repository_context={},
-            )
             # Force a go-shaped package through renderer.
             from deployment_packager import DeploymentPackage
 

@@ -141,7 +141,7 @@ def run_sync(backend_dir: Path, run_id: str) -> dict[str, Any]:
     graph = build_frontend_customization_graph()
     last = dict(state)
     try:
-        for update in graph.stream(state, stream_mode="updates"):
+        for update in graph.stream(state, {"recursion_limit": 50}, stream_mode="updates"):
             if not isinstance(update, dict):
                 continue
             for _node, payload in update.items():
