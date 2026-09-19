@@ -8,6 +8,49 @@ customization backend, MySQL, Qdrant, and a Caddy TLS proxy. The
 standalone design experiments elsewhere in the repository are not application
 runtime services and are intentionally not started.
 
+## CI/CD deployment
+
+The repository pipeline is `.github/workflows/ci-cd.yml`. Pull requests run the
+Connector, admin, Agentic, customization, UI/UX, Terraform, and production
+Compose checks. A version tag (`v*`) or a manually dispatched workflow can run
+the production deployment after those checks pass. Production is a protected
+GitHub Environment, so configure required reviewers before using it.
+
+The deployment job uses GitHub Actions OIDC and AWS Systems Manager; it does not
+store an EC2 SSH key or production `.env` in GitHub. Configure these repository
+or `production` environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `AWS_DEPLOY_ROLE_ARN` | IAM role trusted for the GitHub OIDC subject `repo:OWNER/REPO:environment:production` |
+| `AWS_REGION` | Host region, for example `ap-south-1` |
+| `DEPLOY_INSTANCE_ID` | The EC2 instance ID running the production Compose stack |
+| `DEPLOY_APP_DIR` | Existing checkout on the host, normally `/opt/deplai` |
+| `APP_DOMAIN` | Public HTTPS hostname used for the workflow deployment link |
+
+The AWS role needs permission to call `ssm:SendCommand`,
+`ssm:GetCommandInvocation`, and `ssm:ListCommandInvocations` for the selected
+instance. The EC2 instance profile needs `AmazonSSMManagedInstanceCore`. The
+host must already contain a clean checkout, `deploy/.env`, Docker Compose, an
+origin credential with read-only access to this repository, and the required
+named volumes. Prefer an SSH deploy key or an instance-managed Git credential;
+do not put a GitHub token in the workflow command. `deploy/remote-deploy.sh` fetches the exact commit,
+runs the existing preflight, builds the five shipped application services, waits
+for Compose health checks, and verifies scan storage. It never prints the
+production environment.
+
+The first version deploys from source on the existing single EC2 host. It is
+intentionally separate from customer Terraform applies: those still require a
+reviewed plan and explicit `confirm_plan_summary=true`. A later hardening step
+can publish immutable images to ECR and make the host pull image digests rather
+than rebuilding locally.
+
+After configuring the environment and host, push a branch or open a pull request
+to run validation. Deploy a reviewed release with `git tag v0.0.5 && git push
+origin v0.0.5`, or use **Run workflow** for the selected commit. A tag or manual
+run pauses at the protected `production` environment until its required
+reviewers approve it.
+
 Use **one x86_64 EC2 host** and `docker-compose.production.yml`. Do not use
 `compose.yaml` (local development). Do not add RDS, ALB, ECS, or a second
 application EC2 for DeplAI itself. Customer AWS accounts stay in the product
