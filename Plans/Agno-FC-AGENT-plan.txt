@@ -135,7 +135,7 @@ services:
     build: .
     ports: ["8000:8000"]
     environment:
-      - MONGO_DB_URL=mongodb://agno:agno@mongo:27017
+      - MONGO_DB_URL=MONGODB_URI_FROM_ENV
       - AGNO_TELEMETRY=false
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     volumes: ["./:/app"]          # live-reload during dev
@@ -251,7 +251,7 @@ from agno.os import AgentOS
 # --- Tier 0 (default): local MongoDB process, no containers ---
 from agno.db.mongo import MongoDb
 db = MongoDb(
-    db_url=os.environ.get("MONGO_DB_URL", "mongodb://localhost:27017"),
+    db_url=os.environ.get("MONGO_DB_URL", "MONGODB_URI_FROM_ENV"),
     db_name="agno",
 )
 

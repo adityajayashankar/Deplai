@@ -4,6 +4,21 @@ name: deplai
 # Only Caddy publishes host ports; every application API and database stays on
 # the private Docker network.
 services:
+  security-mongo:
+    image: mongo:7.0
+    restart: unless-stopped
+    # Private durable storage; never publish MongoDB to the host.
+    volumes:
+      - security_mongo_data:/data/db
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "quit(db.adminCommand({ping:1}).ok ? 0 : 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
   caddy:
     image: ${CADDY_IMAGE:-caddy:2.8.4-alpine}
     restart: unless-stopped
@@ -71,6 +86,7 @@ services:
       - ./deploy/.env
     environment:
       NODE_ENV: production
+      APP_URL: https://${APP_DOMAIN:?Set APP_DOMAIN in deploy/.env}
       PORT: "3000"
       DB_HOST: mysql
       DB_PORT: "3306"
@@ -149,6 +165,8 @@ services:
     environment:
       APP_ENV: production
       SECURITY_DURABLE_REQUIRED: "true"
+      MONGODB_URI: ${MONGODB_URI:-mongodb://security-mongo:27017}
+      DEPLAI_DEPLOYMENT_PACKAGE_ROOT: /workspace/runtime/deployment_packages
       SECURITY_SDLC_AUTOMATIC: ${SECURITY_SDLC_AUTOMATIC:-false}
       CONNECTOR_URL: http://connector:3000
       DAST_ALLOW_HTTP: "false"
@@ -179,6 +197,8 @@ services:
       - backend
     depends_on:
       connector:
+        condition: service_healthy
+      security-mongo:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
@@ -275,6 +295,7 @@ networks:
     driver: bridge
 
 volumes:
+  security_mongo_data:
   caddy_data:
   caddy_config:
   mysql_data:

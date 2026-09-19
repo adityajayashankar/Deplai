@@ -67,6 +67,12 @@ EC2 allowlist: `DEPLAI_FREE_TIER_EC2_TYPES` (default `t3.micro,t2.micro`). `DEPL
 
 ## Session
 
+Compose sets `DEPLAI_DEPLOYMENT_PACKAGE_ROOT=/workspace/runtime/deployment_packages`
+on the persistent Agentic runtime volume so application archives survive container
+replacement between generation and apply. Previously generated archives in the
+container-local `.deplai_runtime/deployment_packages` directory must be copied to
+that volume before replacing the container, or regenerated and reviewed again.
+
 Deploy writes `workspace_sessions` with `service=deploy` via `resolveOrCreateSession` / `tryAppendSessionLogs`. Live Terraform logs stream on `/ws/pipeline/{project_id}` using the same browser WebSocket base as scans (`resolveBrowserAgenticWsBase` in `DeploymentTrackApp` + `agentic-websocket.ts`). Production URL shape: `wss://<APP_DOMAIN>/agentic/ws/pipeline/{project_id}?token=…`.
 
 Related: [Terraform Agent](terraform-agent.md) · [Sessions](sessions-profile-settings.md)

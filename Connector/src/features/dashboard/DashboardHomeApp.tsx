@@ -833,6 +833,7 @@ export default function DashboardHomeApp({ initialTab = 'overview' }: { initialT
   const [refreshing, setRefreshing] = useState(false);
   const [uploadingLocalProject, setUploadingLocalProject] = useState(false);
   const [runAllProjectId, setRunAllProjectId] = useState<string | null>(null);
+  const [startingScanId, setStartingScanId] = useState<string | null>(null);
 
   const loadDashboardData = useCallback(async () => {
     setRefreshing(true);
@@ -918,8 +919,13 @@ export default function DashboardHomeApp({ initialTab = 'overview' }: { initialT
   }, [startScan]);
 
   const handleRunScan = useCallback(async (projectId: string) => {
+    if (startingScanId) return;
     const project = projectsById[projectId];
-    if (!project) return;
+    if (!project) {
+      window.alert('Project details are unavailable. Refresh the page and retry the scan.');
+      return;
+    }
+    setStartingScanId(projectId);
     primePipelineState(projectId, 'scan');
     try {
       await validateAndStartScan(projectId, project);
@@ -927,8 +933,10 @@ export default function DashboardHomeApp({ initialTab = 'overview' }: { initialT
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to start scan';
       window.alert(message);
+    } finally {
+      setStartingScanId(null);
     }
-  }, [primePipelineState, projectsById, router, validateAndStartScan]);
+  }, [primePipelineState, projectsById, router, startingScanId, validateAndStartScan]);
 
   const handleOpenCustomization = useCallback((repo: DashboardRepository) => {
     router.push(buildCustomizationHref(repo.id, repo.name));
@@ -1213,8 +1221,8 @@ export default function DashboardHomeApp({ initialTab = 'overview' }: { initialT
                           <PixelNoiseButton onClick={() => handleDeploy(repo.id)} className="px-4 py-2 text-sm">
                             Deploy
                           </PixelNoiseButton>
-                          <PixelNoiseButton onClick={() => void handleRunScan(repo.id)} className="px-4 py-2 text-sm">
-                            Scan
+                          <PixelNoiseButton disabled={Boolean(startingScanId)} onClick={() => void handleRunScan(repo.id)} className="px-4 py-2 text-sm">
+                            {startingScanId === repo.id ? 'Starting scan…' : 'Scan'}
                           </PixelNoiseButton>
                           <PixelNoiseButton onClick={() => handleOpenCustomization(repo)} className="px-4 py-2 text-sm">
                             Customize

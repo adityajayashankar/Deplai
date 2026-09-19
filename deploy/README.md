@@ -27,7 +27,7 @@ category. It pings MongoDB and initializes the same required indexes as scan
 startup; it does not create scan runs or delete data. `OK` confirms connectivity
 and index initialization, not a complete scan or restart-recovery test.
 
-- `MISSING_URI`: configure `MONGODB_URI` in `deploy/.env`.
+- `MISSING_URI`: recreate Agentic with the current Compose file (private Mongo default), or configure an external `MONGODB_URI`.
 - `AUTHENTICATION`: correct database credentials, URI escaping and `authSource`.
 - `AUTHORIZATION`: give the service the required database read/write and index permissions.
 - `INDEX_CONFLICT`: inspect existing indexes and duplicate events with an operator;
@@ -39,13 +39,31 @@ After correcting `deploy/.env`, recreate Agentic during an idle maintenance
 window (active workers are interrupted), then rerun the check:
 
 ```bash
-docker compose --env-file deploy/.env -f docker-compose.production.yml up -d --no-deps --force-recreate agentic-layer
+docker compose --env-file deploy/.env -f docker-compose.production.yml up -d security-mongo
+docker compose --env-file deploy/.env -f docker-compose.production.yml up -d --no-deps --build --force-recreate agentic-layer connector
 bash deploy/check-scan-storage.sh
 ```
 
 Changing the file alone or using `docker compose restart` does not replace the
-container environment. Keep the existing database and its history; local
-`compose.yaml`'s `security-mongo` is not part of the production stack.
+container environment. Keep the existing database and its history. A configured
+external URI remains authoritative; repair its credentials/network rather than
+clearing it to hide a failure. Switching to the private database requires an
+explicit history migration decision.
+
+Before replacing an older Agentic container, preserve existing deployment packages:
+
+```bash
+docker compose --env-file deploy/.env -f docker-compose.production.yml exec -T agentic-layer python -c 'from pathlib import Path; import shutil; source=Path("/workspace/Agentic Layer/.deplai_runtime/deployment_packages"); target=Path("/workspace/runtime/deployment_packages"); shutil.copytree(source, target, dirs_exist_ok=True) if source.is_dir() else None'
+```
+
+New packages use the persistent runtime volume. If the old container and archive
+are already gone, regenerate infrastructure and review the new plan before applying.
+No archive should be reconstructed from an unreviewed newer repository revision.
+
+A credential-bearing MongoDB URI was removed from a tracked plan. Rotate that
+database credential, update the private production environment if it uses it,
+and coordinate removal from Git history and existing clones. Source removal alone
+does not revoke a credential. Never paste the old or new URI into logs or tickets.
 
 ## AWS resources to create
 
@@ -201,7 +219,9 @@ For public production release set `BILLING_ENFORCEMENT=true` and
 before accepting payments. Use audited admin complimentary grants and credits
 for free access instead of globally disabling enforcement.
 
-Production scans require reachable `MONGODB_URI`; GLM workflows require the
+Production scans use private persistent `security-mongo` when `MONGODB_URI` is empty.
+An explicitly configured external URI must be reachable; there is no silent fallback.
+GLM workflows require the
 platform `OPENROUTER_API_KEY`. Configuration preflight does not prove either
 external service is healthy.
 

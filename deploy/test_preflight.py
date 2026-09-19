@@ -43,7 +43,7 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_missing_required_services_and_disabled_enforcement(self):
-        for key in ['MONGODB_URI', 'OPENROUTER_API_KEY', 'ADMIN_SESSION_SECRET', 'BILLING_ENFORCEMENT']:
+        for key in ['OPENROUTER_API_KEY', 'ADMIN_SESSION_SECRET', 'BILLING_ENFORCEMENT']:
             with self.subTest(key=key):
                 result = self.run_gate({key: ''})
                 self.assertNotEqual(result.returncode, 0)
@@ -51,6 +51,10 @@ class PreflightTests(unittest.TestCase):
 
     def test_quoted_empty_secret_rejected(self):
         self.assertNotEqual(self.run_gate({'OPENROUTER_API_KEY': '""'}).returncode, 0)
+
+    def test_private_mongo_default_needs_no_external_uri(self):
+        result = self.run_gate({'MONGODB_URI': ''})
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == '__main__':

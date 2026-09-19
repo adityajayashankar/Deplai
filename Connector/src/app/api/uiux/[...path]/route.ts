@@ -74,7 +74,7 @@ async function handle(request: NextRequest, context: Context) {
         forwardedHost: request.headers.get('x-forwarded-host'),
         forwardedProto: request.headers.get('x-forwarded-proto'),
         hostHeader: request.headers.get('host'),
-        publicAppUrl: process.env.NEXT_PUBLIC_APP_URL,
+        publicAppUrl: process.env.APP_URL || process.env.NEXT_PUBLIC_APP_URL,
         corsOrigins: process.env.CORS_ORIGINS,
       })) {
         throw new UiuxError('Cross-origin requests are not allowed.', 403);

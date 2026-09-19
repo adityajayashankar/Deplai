@@ -70,7 +70,9 @@ DOCKERFILE_CANDIDATES = (
 
 MAX_PACKAGE_BYTES = int(os.getenv("DEPLAI_APP_PACKAGE_MAX_BYTES", "8000000"))
 MAX_PACKAGE_FILES = int(os.getenv("DEPLAI_APP_PACKAGE_MAX_FILES", "2500"))
-PACKAGE_STORE_ROOT = Path(__file__).resolve().parent / ".deplai_runtime" / "deployment_packages"
+PACKAGE_STORE_ROOT = Path(os.environ.get("DEPLAI_DEPLOYMENT_PACKAGE_ROOT") or (
+    Path(__file__).resolve().parent / ".deplai_runtime" / "deployment_packages"
+))
 
 
 # ORM / database-client packages in package.json that indicate a DB is needed.

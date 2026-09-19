@@ -186,6 +186,7 @@ services:
       # Local history is durable without depending on Atlas network access.
       # Set LOCAL_SECURITY_MONGODB_URI explicitly to use a remote database.
       MONGODB_URI: ${LOCAL_SECURITY_MONGODB_URI:-mongodb://security-mongo:27017}
+      DEPLAI_DEPLOYMENT_PACKAGE_ROOT: /workspace/runtime/deployment_packages
       REMEDIATION_MONGODB_DATABASE: ${REMEDIATION_MONGODB_DATABASE:-deplai_security}
       REMEDIATION_MONGODB_RETENTION_DAYS: ${REMEDIATION_MONGODB_RETENTION_DAYS:-30}
       # Checkpoints persist curated source context. Keep both false until the
