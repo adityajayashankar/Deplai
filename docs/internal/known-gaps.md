@@ -38,7 +38,7 @@ Agentic mounts **`/var/run/docker.sock`**. Treat the host as a trusted execution
 
 ## Unused / stale
 
-- Neo4j and Qdrant in older `docs/technical-architecture.md` — not used by app code (MySQL only).
+- Neo4j in older `docs/technical-architecture.md` — not used by app code (MySQL is the product-data store).
 - The former scratch UI kits, design drafts, one-off patch scripts, and Puppeteer scratch workspace were removed. Do not reintroduce generated UI projects or one-off source-mutating scripts into the repository root.
 - Auth kit email/password pages exist; **GitHub OAuth is the live identity path**.
 - Founder inbox `adityajayashankar@deplai.tech` on Settings contact / footer.

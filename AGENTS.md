@@ -107,11 +107,9 @@ resource limits, input validation, and sanitized event output. Never turn
 repository text into shell commands, Docker options, filesystem paths, URLs,
 Terraform, or cloud arguments without typed validation.
 
-Production Compose starts a persistent Qdrant container, but no current
-application client, adapter, or feature path uses it. Treat it as an
-unconsumed deployment-side placeholder. Do not claim semantic search is live,
-make it a hidden dependency, or integrate it without a deliberate isolation,
-retention, migration, and evaluation design.
+Production Compose does not include a vector database. Do not claim semantic
+search is live or add a vector-store dependency without a deliberate
+isolation, retention, migration, and evaluation design.
 
 ## Service communication and Connector
 

@@ -59,6 +59,6 @@ Ledger uniqueness: `(user_id, cycle_start)`.
 - Scanner outputs (`security_reports`, `codebase_deplai`, `grype_db_cache`, `llm_output`)
 - Customization tenants (`customization_state`)
 
-Neo4j / Qdrant appear in older architecture notes as provisioned-but-unused. Application code uses **MySQL**.
+Neo4j appears only in older architecture notes. Application code uses **MySQL**.
 
 Related: [Billing](billing.md) · [Sessions](sessions-profile-settings.md)

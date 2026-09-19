@@ -240,14 +240,6 @@ services:
       retries: 3
       start_period: 30s
 
-  qdrant:
-    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.13.6}
-    restart: unless-stopped
-    volumes:
-      - qdrant_data:/qdrant/storage
-    networks:
-      - backend
-
   admin-console:
     build:
       context: .
@@ -307,7 +299,6 @@ volumes:
   customization_logs:
   uiux_connector_state:
   uiux_worker_state:
-  qdrant_data:
   # These exact names are used by the Docker SDK in the Agentic Layer.
   codebase_deplai:
     name: codebase_deplai

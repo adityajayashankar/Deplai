@@ -4,7 +4,7 @@ For admin-console schema/bind repairs on an existing stack, run `bash deploy/red
 
 This bundle packages the production Connector UI/API, Agentic Layer (including
 the Terraform Agent, remediation pipeline, and Diagram/Cost agent),
-customization backend, MySQL, Qdrant, and a Caddy TLS proxy. The
+customization backend, MySQL, security scan storage, and a Caddy TLS proxy. The
 standalone design experiments elsewhere in the repository are not application
 runtime services and are intentionally not started.
 
@@ -118,7 +118,7 @@ instance, security group, disk, and DNS.
 | --- | --- | --- |
 | Region | `ap-south-1` (Mumbai) unless the domain should live elsewhere | Lowest latency for `deplai.in` |
 | AMI | Ubuntu Server 24.04 LTS, **64-bit (x86)** | Worker images and the Agentic Dockerfile are amd64. Do not use Graviton (`m7g`, `t4g`, ARM). |
-| Instance type | **`m6i.2xlarge` or `m7i.2xlarge`** (8 vCPU, 32 GB RAM) | MySQL + Qdrant + Connector + Agentic + scan workers need RAM. Smaller types OOM during image build or ZAP/Prowler. |
+| Instance type | **`m6i.2xlarge` or `m7i.2xlarge`** (8 vCPU, 32 GB RAM) | MySQL, Connector, Agentic, and scan workers need RAM. Smaller types OOM during image build or ZAP/Prowler. |
 | Root volume | **200 GB gp3**, encrypted | Repos, scanner DBs, Docker images, and Terraform workspaces grow quickly. 30 GB AMIs fill up. |
 | Elastic IP | Allocate and associate | Keeps the public IPv4 stable if the instance stops. Point DNS at this address. |
 | Security group | Inbound **80/tcp and 443/tcp** from `0.0.0.0/0`. Inbound **22/tcp** only from your admin IP, or omit SSH and use SSM. Egress all. | Caddy needs 80 (HTTP-01) and 443. Nothing else should be public. |
@@ -301,7 +301,7 @@ docker compose --env-file deploy/.env -f docker-compose.production.yml up -d
 docker compose --env-file deploy/.env -f docker-compose.production.yml ps
 ```
 
-Only Caddy publishes host ports 80 and 443. MySQL, Qdrant, the
+Only Caddy publishes host ports 80 and 443. MySQL, security scan storage, the
 customization backend, Connector, and the Agentic Layer have no host port
 mappings.
 
@@ -326,7 +326,6 @@ migration before rolling out new application code.
 | `connector` | Built from `Connector/Dockerfile` | Next.js UI + API. |
 | `agentic-layer` | Built from `Agentic Layer/Dockerfile` | Scans, DAST, remediation, Terraform plan/apply. Packages Terraform Agent + Diagram/Cost + remediation. |
 | `customization` | Built from `Customization Agent/tenant_builder_app/backend/Dockerfile` | Tenant customization API. |
-| `qdrant` | `qdrant/qdrant:v1.13.6` | Vector store. |
 
 ## 4. Operate safely
 
@@ -337,8 +336,7 @@ of its data directory), MongoDB backups, and backups of `agentic_runtime`,
 Terraform state and artifact stores. Retain run documentation for at least
 31 days; database TTL settings and backup retention must agree. Keep credential
 encryption keys recoverable separately under restricted access. Test restoring
-to an isolated environment regularly. Qdrant is currently an unused placeholder.
-Monitor disk
+to an isolated environment regularly. Monitor disk
 usage: cloned repositories, scanner databases, Docker images, and Terraform
 workspaces can grow quickly.
 

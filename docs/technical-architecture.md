@@ -73,10 +73,9 @@ Local `compose.yaml` exposes the Connector and Agentic Layer for development.
 | Tenant customization | FastAPI, LangGraph, Pillow, optional project LLM configuration | Separates source scanning, planning, mutation, validation, previews, and assets. |
 | Edge / deployment | Docker Compose and Caddy | One private service network in production, TLS termination, compression, and a narrow public ingress. |
 
-The production compose file also starts Neo4j and Qdrant. A repository-wide code
-search currently finds no application-level runtime client usage for either, so
-they should be treated as provisioned platform dependencies rather than an
-active knowledge-graph or vector-search feature.
+Production Compose does not run a knowledge-graph or vector-search service.
+Older architecture notes that mention Neo4j or Qdrant are historical only and
+do not describe an active product feature.
 
 ## Core product flow
 
@@ -171,7 +170,7 @@ requires an isolated worker design outside the current implementation.
 | --- | --- | --- | --- |
 | Local | `docker compose up --build` | Connector `:3000`, Agentic Layer `:8000` | Starts MySQL, Connector, Agentic Layer, and customization backend with local-only defaults. |
 | Agentic development | `docker-compose.dev.yml` | Agentic Layer `:8001` | Focused development service configuration. |
-| Production | `docker-compose.production.yml` with `deploy/.env` | Caddy `:80` / `:443` | Caddy is the sole public service; Connector, Agentic, customization, MySQL, Neo4j, and Qdrant are private. |
+| Production | `docker-compose.production.yml` with `deploy/.env` | Caddy `:80` / `:443` | Caddy is the sole public service; Connector, Agentic, customization, MySQL, and security scan storage are private. |
 
 See [deploy/README.md](../deploy/README.md) for production host preparation,
 backup expectations, TLS, and the Docker trust-boundary warning.
