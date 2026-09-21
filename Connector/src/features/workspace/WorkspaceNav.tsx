@@ -44,6 +44,7 @@ import { DeplaiLogo } from '@/components/deplai-logo';
 
 export type WorkspaceNavId =
   | 'overview'
+  | 'deplai-agent'
   | 'customization'
   | 'instances'
   | 'profile'
@@ -75,6 +76,7 @@ type NavItem = {
   href: string;
   tag?: string;
   placeholder?: boolean;
+  newTab?: boolean;
 };
 
 type NavGroup = {
@@ -96,6 +98,7 @@ const focusRing =
   'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-lime-400/35 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0b0f14]';
 
 export function resolveWorkspaceNavId(pathname: string): WorkspaceNavId {
+  if (pathname === '/dashboard/agents' || pathname.startsWith('/dashboard/agents/')) return 'deplai-agent';
   if (pathname === '/dashboard' || pathname === '/dashboard/') return 'overview';
   if (pathname === '/profile' || pathname.startsWith('/profile/') || pathname.startsWith('/dashboard/profile')) return 'profile';
   if (pathname.startsWith('/dashboard/customization')) return 'customization';
@@ -154,6 +157,7 @@ export function buildWorkspaceNavGroups(projectId?: string | null, projectName?:
     {
       label: 'Services',
       items: [
+        { id: 'deplai-agent', label: 'DeplAI Agent', icon: Bot, href: '/dashboard/agents', tag: 'Preview', newTab: true },
         { id: 'customization', label: 'UI/UX customizer', icon: Palette, href: customizationHref },
         { id: 'security', label: 'Security Agent', icon: ShieldCheck, href: securityHref },
         { id: 'dast', label: 'DAST', icon: Globe, href: '/dashboard/dast' },
@@ -315,10 +319,12 @@ export function WorkspaceNav({
       <Link
         key={item.id}
         href={targetHref}
+        target={item.newTab && !locked ? '_blank' : undefined}
+        rel={item.newTab ? 'noopener noreferrer' : undefined}
         prefetch={true}
-        title={locked ? `${item.label} requires a plan upgrade` : item.label}
+        title={locked ? `${item.label} requires a plan upgrade` : `${item.label}${item.newTab ? ' (opens in a new tab)' : ''}`}
         onClick={() => {
-          onNavigate?.(targetHref);
+          if (!item.newTab || locked) onNavigate?.(targetHref);
         }}
         className={classNames}
       >
@@ -511,9 +517,12 @@ export function WorkspaceNav({
                   <Link
                     key={item.id}
                     href={item.href}
+                    target={item.newTab ? '_blank' : undefined}
+                    rel={item.newTab ? 'noopener noreferrer' : undefined}
+                    title={item.newTab ? `${item.label} (opens in a new tab)` : item.label}
                     prefetch={true}
                     onClick={() => {
-                      onNavigate?.(item.href);
+                      if (!item.newTab) onNavigate?.(item.href);
                       setSearchOpen(false);
                       setQuery('');
                     }}

@@ -216,6 +216,7 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
   const started = Date.now();
   const accessMode = request.accessMode || defaultAccessMode();
   const remediation = isStrictRemediation(request);
+  const buildAnalyst = request.metadata?.product === 'deplai-build' && request.metadata?.stage === 'repository_analysis';
   const glmUiux = request.metadata?.product === 'uiux' && request.metadata?.stage === 'editing';
   const glmDeployment = glmUiux || (request.metadata?.product === 'deployment'
     && ['deployment_requirements', 'deployment_service_plan'].includes(String(request.metadata?.stage || '')));
@@ -261,6 +262,10 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
     if (!template) throw new AiPlatformError('MODEL_NOT_FOUND', 'Model catalog is empty');
     models = [await deploymentGlmModel(template)];
   }
+  if (buildAnalyst) {
+    const { buildAnalystModels } = await import('./build-analyst-policy');
+    models = buildAnalystModels(models, request.model || '');
+  }
   const ephemeralProvider = request.ephemeralProvider || (request.ephemeralApiKey ? canonicalizeProviderId(String(request.metadata?.provider || '')) || undefined : undefined);
   const available = await providersWithCredentials(
     context.userId,
@@ -283,8 +288,8 @@ async function prepareChat(context: GatewayContext, request: NormalizedChatReque
     reason: item.skipReason || 'Skipped',
   }));
 
-  const chain = ranked.ranked.slice(0, glmDeployment || request.metadata?.stage === 'openwiki' ? 1 : remediation ? 3 : isFeatureEnabled('ai_fallback') && policy.fallbackAllowed ? 4 : 1);
-  if (routing.fallbackModelId && !remediation && !glmDeployment) {
+  const chain = ranked.ranked.slice(0, buildAnalyst || glmDeployment || request.metadata?.stage === 'openwiki' ? 1 : remediation ? 3 : isFeatureEnabled('ai_fallback') && policy.fallbackAllowed ? 4 : 1);
+  if (routing.fallbackModelId && !remediation && !glmDeployment && !buildAnalyst) {
     const fallback = models.find((model) => model.id === routing.fallbackModelId);
     if (fallback && !chain.some((item) => item.model.id === fallback.id)) {
       chain.push({ model: fallback, score: 0, reasons: ['Configured fallback'] });

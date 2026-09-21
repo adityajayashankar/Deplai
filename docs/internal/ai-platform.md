@@ -28,6 +28,14 @@ Security remediation does **not** inherit that chain: Connector owns its OpenRou
 
 Organization policy (`ai_organization_policies`): `byokRequired`, `platformCredentialsAllowed`, allowed credential modes.
 
+Build repository analysis (`product=deplai-build`, `stage=repository_analysis`) is
+restricted to one exact GLM-5.3 provider model ID already present in the eligible
+catalog. Missing/ambiguous configuration fails; configured fallback chains do not
+apply. Existing organization, credential, pricing and billing controls still apply.
+The Phase 4 internal service adapter requires trusted scoped run authorization;
+there is no public Build analysis execution endpoint. See
+[semantic analyst integration](../deplai-build/SEMANTIC_ANALYST.md).
+
 Security cooldowns honor valid provider `Retry-After` and `X-RateLimit-Reset` timestamps (using the longer wait when both are present). A provider limit without a usable hint receives a 15-second local backoff, not an assumed one-hour account outage. Local reservation rejections never renew cooldowns. Persisted cooldowns record `provider_hint` or `local_backoff`; API errors distinguish provider responses, local RPM throttles, and replay of stored cooldowns. Older cooldowns without provenance remain `legacy_unknown` until they expire; they are not silently cleared. The free router still owns model selection, and actual provider limits remain enforced.
 
 ## Metering (do not put in client docs)

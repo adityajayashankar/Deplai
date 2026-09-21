@@ -1,5 +1,5 @@
-import ComputeLanding from '@/features/landing/ComputeLanding';
+import PixelLanding from '@/features/pixel-landing/PixelLanding';
 
 export default function HomePage() {
-  return <ComputeLanding />;
+  return <PixelLanding />;
 }

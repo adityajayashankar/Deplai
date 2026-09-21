@@ -1,0 +1,534 @@
+/* ============================================================
+   DEPLAI — scenes 01–04 : PORT / LOAD / COURSE / CREW
+   world coordinate space: 1600 x 900
+   ============================================================ */
+
+/* ================= SCENE 01 — THE PORT (sunset) ================= */
+
+.dl-port .dl-stage {
+    background: linear-gradient(180deg, #12172e 0%, #25244c 30%, #533e62 46%, #9c5a54 55%, #e89a5b 60%, #f2b46a 61.5%, #17224a 62.5%, #0b142c 100%);
+}
+
+.dl-port-dusk {
+    position: absolute;
+    inset: 0;
+    background: #070c1c;
+    opacity: 0;
+}
+
+.dl-port-stars {
+    position: absolute;
+    inset: 0 0 42% 0;
+    opacity: 0;
+}
+
+.dl-port-stars i {
+    position: absolute;
+    width: 2px;
+    height: 2px;
+    background: #e8ecf5;
+    animation: dl-twinkle 3.6s ease-in-out infinite;
+}
+
+.dl-port-sun {
+    position: absolute;
+    left: 610px;
+    top: 300px;
+    width: 320px;
+    height: 320px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(255, 178, 96, 0.42) 0%, rgba(255, 150, 80, 0.1) 45%, transparent 68%);
+}
+
+.dl-port-sun::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 86px;
+    height: 86px;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    background: #ffd9a0;
+    box-shadow: 0 0 60px rgba(255, 170, 90, 0.7);
+}
+
+.dl-port-horizon {
+    position: absolute;
+    left: 36px;
+    bottom: 330px;
+    width: 620px;
+}
+
+.dl-port-water {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 340px;
+    background: linear-gradient(180deg, #27355e 0%, #182350 38%, #0b142c 100%);
+}
+
+.dl-port-sunpath {
+    position: absolute;
+    left: 708px;
+    top: 8px;
+    width: 124px;
+    height: 300px;
+    background: linear-gradient(180deg, rgba(255, 190, 120, 0.55) 0%, rgba(255, 190, 120, 0) 88%);
+    mask-image: repeating-linear-gradient(180deg, black 0 5px, transparent 5px 11px);
+    -webkit-mask-image: repeating-linear-gradient(180deg, black 0 5px, transparent 5px 11px);
+}
+
+.dl-port-under {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 128px;
+    background: linear-gradient(180deg, rgba(8, 16, 36, 0) 0%, #08101f 55%, #050a14 100%);
+}
+
+.dl-port-sub {
+    position: absolute;
+    left: 1030px;
+    top: 44px;
+    width: 150px;
+    opacity: 0.55;
+    animation: dl-sub-drift 30s ease-in-out infinite;
+}
+
+.dl-fish {
+    position: absolute;
+    animation: dl-fish-swim 24s linear infinite;
+}
+
+.dl-fish.f2 {
+    animation: dl-fish-swim-l 31s linear infinite;
+    animation-delay: -14s;
+}
+
+@keyframes dl-fish-swim {
+    from { transform: translateX(-80px); }
+    to { transform: translateX(1720px); }
+}
+
+@keyframes dl-fish-swim-l {
+    from { transform: translateX(1720px) scaleX(-1); }
+    to { transform: translateX(-80px) scaleX(-1); }
+}
+
+.dl-waves {
+    position: absolute;
+    left: 0;
+    top: -14px;
+    width: 200%;
+    height: 30px;
+    animation: dl-wave 9s linear infinite;
+}
+
+.dl-waves.slow {
+    top: -7px;
+    opacity: 0.45;
+    animation-duration: 15s;
+    animation-direction: reverse;
+}
+
+.dl-port-shipwrap {
+    position: absolute;
+    left: 896px;
+    bottom: 262px;
+    width: 540px;
+    animation: dl-bob 5.4s ease-in-out infinite;
+    z-index: 6;
+}
+
+.dl-port-wake {
+    position: absolute;
+    left: 846px;
+    bottom: 252px;
+    width: 620px;
+    height: 26px;
+    opacity: 0.5;
+}
+
+.dl-port-fg {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 560px;
+}
+
+.dl-port-copy {
+    left: 0;
+    right: 0;
+    margin: 0 auto;
+    top: 12.5vh;
+    z-index: 40;
+    max-width: 880px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.dl-port-copy .dl-sub {
+    text-align: center;
+}
+
+.dl-port-copy .dl-btn-row {
+    justify-content: center;
+}
+
+.dl-port .dl-console-wrap {
+    margin-top: 34px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.dl-port .dl-port-term {
+    margin-top: 0;
+}
+
+.dl-port-meta {
+    position: absolute;
+    right: 7vw;
+    bottom: 20vh;
+    z-index: 40;
+    text-align: right;
+    font-family: var(--dl-font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.24em;
+    color: var(--dl-mut);
+    text-transform: uppercase;
+    line-height: 2.1;
+}
+
+.dl-port-scrollhint {
+    position: absolute;
+    left: 50%;
+    bottom: 26px;
+    transform: translateX(-50%);
+    z-index: 40;
+    font-family: var(--dl-font-mono);
+    font-size: 10px;
+    letter-spacing: 0.3em;
+    color: var(--dl-mut);
+    text-transform: uppercase;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+}
+
+.dl-port-scrollhint .line {
+    width: 1px;
+    height: 34px;
+    background: linear-gradient(180deg, var(--dl-cyan), transparent);
+    animation: dl-scrollhint 1.8s ease-in-out infinite;
+}
+
+@keyframes dl-scrollhint {
+    0% { transform: scaleY(0); transform-origin: top; }
+    55% { transform: scaleY(1); transform-origin: top; }
+    56% { transform-origin: bottom; }
+    100% { transform: scaleY(0); transform-origin: bottom; }
+}
+
+/* ================= SCENE 02 — LOAD ================= */
+
+.dl-load .dl-stage {
+    background: linear-gradient(180deg, #232048 0%, #171a33 50%, #0d1226 100%);
+}
+
+.dl-load-water {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 190px;
+    background: linear-gradient(180deg, #142c46 0%, #0c1c30 60%, #081423 100%);
+}
+
+.dl-load-dock {
+    position: absolute;
+    left: 0;
+    bottom: 130px;
+    width: 560px;
+    height: 60px;
+    background: #1a2634;
+    border-top: 3px solid #24394e;
+}
+
+.dl-load-dock::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: repeating-linear-gradient(90deg, var(--dl-amber) 0 22px, transparent 22px 44px);
+    opacity: 0.3;
+}
+
+.dl-load-shipwrap {
+    position: absolute;
+    left: 900px;
+    bottom: 96px;
+    width: 600px;
+    animation: dl-bob 5.8s ease-in-out infinite;
+}
+
+.dl-load-crane {
+    position: absolute;
+    left: 240px;
+    bottom: 130px;
+    width: 900px;
+    height: 640px;
+}
+
+.dl-load-trolley {
+    position: absolute;
+    left: 0;
+    top: 0;
+    will-change: transform;
+}
+
+.dl-load-lift {
+    position: absolute;
+    left: 0;
+    top: 0;
+    will-change: transform;
+}
+
+.dl-load-cable {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 3px;
+    background: #5f7d95;
+    transform-origin: top center;
+}
+
+.dl-load-crate {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 150px;
+}
+
+.dl-load-labels {
+    position: absolute;
+    left: 150px;
+    top: 480px;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    z-index: 30;
+}
+
+.dl-load-label {
+    font-family: var(--dl-font-mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--dl-off);
+    background: rgba(5, 7, 10, 0.85);
+    border: 1px solid rgba(74, 107, 130, 0.6);
+    border-left: 3px solid var(--dl-green);
+    padding: 8px 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: max-content;
+    box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.35);
+}
+
+.dl-load-label .ok {
+    color: var(--dl-green);
+}
+
+.dl-load-copy {
+    right: 6vw;
+    top: 13vh;
+    text-align: right;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+}
+
+.dl-load-copy .dl-kicker::before {
+    order: 2;
+}
+
+/* ================= SCENE 03 — PLOT THE COURSE ================= */
+
+.dl-course .dl-stage {
+    background: linear-gradient(180deg, #0b1a2c 0%, #0a1828 50%, #071120 100%);
+}
+
+.dl-course-chart {
+    position: absolute;
+    inset: 0;
+    background-image: linear-gradient(rgba(31, 58, 86, 0.5) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(31, 58, 86, 0.5) 1px, transparent 1px);
+    background-size: 80px 80px;
+}
+
+.dl-course-chart::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image: linear-gradient(rgba(31, 58, 86, 0.22) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(31, 58, 86, 0.22) 1px, transparent 1px);
+    background-size: 16px 16px;
+}
+
+.dl-course-svg {
+    position: absolute;
+    inset: 0;
+    width: 1600px;
+    height: 900px;
+}
+
+.dl-course-ship {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 130px;
+    will-change: transform;
+}
+
+.dl-course-copy {
+    left: 6vw;
+    top: 10vh;
+}
+
+.dl-course-legend {
+    position: absolute;
+    right: 6vw;
+    bottom: 9vh;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    font-family: var(--dl-font-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    color: var(--dl-mut);
+    text-transform: uppercase;
+}
+
+.dl-course-legend .row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+.dl-course-legend .sw {
+    width: 22px;
+    height: 2px;
+    background: var(--dl-cyan);
+}
+
+.dl-course-legend .sw.dash {
+    background: repeating-linear-gradient(90deg, var(--dl-steel) 0 5px, transparent 5px 9px);
+}
+
+/* ================= SCENE 04 — AGENT CREW ================= */
+
+.dl-crew .dl-stage {
+    background: linear-gradient(180deg, #0a1120 0%, #080e1a 55%, #060a13 100%);
+}
+
+.dl-crew-blueprint {
+    position: absolute;
+    inset: 0;
+    background-image: linear-gradient(rgba(0, 240, 255, 0.05) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 240, 255, 0.05) 1px, transparent 1px);
+    background-size: 60px 60px;
+}
+
+.dl-crew-cutaway {
+    position: absolute;
+    left: 50%;
+    top: 54%;
+    width: 1240px;
+    transform: translate(-50%, -50%);
+    will-change: transform;
+}
+
+.dl-crew-copy {
+    left: 6vw;
+    top: 9vh;
+    z-index: 40;
+}
+
+.dl-crew-stats {
+    position: absolute;
+    right: 6vw;
+    top: 11vh;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    align-items: flex-end;
+}
+
+.dl-crew-stat {
+    background: rgba(5, 7, 10, 0.85);
+    border: 1px solid rgba(74, 107, 130, 0.6);
+    box-shadow: 5px 5px 0 rgba(0, 0, 0, 0.4);
+    padding: 13px 20px;
+    text-align: right;
+}
+
+.dl-crew-stat .num {
+    font-family: var(--dl-font-display);
+    font-size: 34px;
+    color: var(--dl-cyan);
+    line-height: 1;
+    letter-spacing: 0.03em;
+}
+
+.dl-crew-stat .cap {
+    font-family: var(--dl-font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+    color: var(--dl-mut);
+    margin-top: 5px;
+}
+
+.dl-crew-room {
+    will-change: transform, opacity;
+}
+
+.dl-crew-room .glow {
+    animation: dl-flicker 5s linear infinite;
+}
+
+.dl-crew-agent {
+    animation: dl-agent-bob 2.6s ease-in-out infinite;
+}
+
+.dl-crew-agent.d2 { animation-delay: -0.9s; animation-duration: 3.1s; }
+.dl-crew-agent.d3 { animation-delay: -1.7s; animation-duration: 2.2s; }
+
+/* ================= responsive ================= */
+
+@media (max-width: 760px) {
+    .dl-port-copy { top: 12vh; }
+    .dl-port-meta { display: none; }
+    .dl-load-copy { right: 20px; top: 9vh; align-items: flex-start; text-align: left; }
+    .dl-load-copy .dl-kicker::before { order: 0; }
+    .dl-load-labels { left: 40px; top: 560px; }
+    .dl-course-copy { top: 8vh; }
+    .dl-course-legend { display: none; }
+    .dl-crew-copy { top: 8vh; }
+    .dl-crew-stats { top: auto; bottom: 5vh; right: 20px; flex-direction: row; }
+    .dl-crew-stat { padding: 9px 14px; }
+    .dl-crew-stat .num { font-size: 24px; }
+}

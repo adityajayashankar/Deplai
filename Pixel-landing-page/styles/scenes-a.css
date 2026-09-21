@@ -1,0 +1,543 @@
+// Imports
+import ___CSS_LOADER_API_SOURCEMAP_IMPORT___ from "../../node_modules/css-loader/dist/runtime/sourceMaps.js";
+import ___CSS_LOADER_API_IMPORT___ from "../../node_modules/css-loader/dist/runtime/api.js";
+var ___CSS_LOADER_EXPORT___ = ___CSS_LOADER_API_IMPORT___(___CSS_LOADER_API_SOURCEMAP_IMPORT___);
+// Module
+___CSS_LOADER_EXPORT___.push([module.id, `/* ============================================================
+   DEPLAI — scenes 01–04 : PORT / LOAD / COURSE / CREW
+   world coordinate space: 1600 x 900
+   ============================================================ */
+
+/* ================= SCENE 01 — THE PORT (sunset) ================= */
+
+.dl-port .dl-stage {
+    background: linear-gradient(180deg, #12172e 0%, #25244c 30%, #533e62 46%, #9c5a54 55%, #e89a5b 60%, #f2b46a 61.5%, #17224a 62.5%, #0b142c 100%);
+}
+
+.dl-port-dusk {
+    position: absolute;
+    inset: 0;
+    background: #070c1c;
+    opacity: 0;
+}
+
+.dl-port-stars {
+    position: absolute;
+    inset: 0 0 42% 0;
+    opacity: 0;
+}
+
+.dl-port-stars i {
+    position: absolute;
+    width: 2px;
+    height: 2px;
+    background: #e8ecf5;
+    animation: dl-twinkle 3.6s ease-in-out infinite;
+}
+
+.dl-port-sun {
+    position: absolute;
+    left: 610px;
+    top: 300px;
+    width: 320px;
+    height: 320px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(255, 178, 96, 0.42) 0%, rgba(255, 150, 80, 0.1) 45%, transparent 68%);
+}
+
+.dl-port-sun::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 86px;
+    height: 86px;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    background: #ffd9a0;
+    box-shadow: 0 0 60px rgba(255, 170, 90, 0.7);
+}
+
+.dl-port-horizon {
+    position: absolute;
+    left: 36px;
+    bottom: 330px;
+    width: 620px;
+}
+
+.dl-port-water {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 340px;
+    background: linear-gradient(180deg, #27355e 0%, #182350 38%, #0b142c 100%);
+}
+
+.dl-port-sunpath {
+    position: absolute;
+    left: 708px;
+    top: 8px;
+    width: 124px;
+    height: 300px;
+    background: linear-gradient(180deg, rgba(255, 190, 120, 0.55) 0%, rgba(255, 190, 120, 0) 88%);
+    mask-image: repeating-linear-gradient(180deg, black 0 5px, transparent 5px 11px);
+    -webkit-mask-image: repeating-linear-gradient(180deg, black 0 5px, transparent 5px 11px);
+}
+
+.dl-port-under {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 128px;
+    background: linear-gradient(180deg, rgba(8, 16, 36, 0) 0%, #08101f 55%, #050a14 100%);
+}
+
+.dl-port-sub {
+    position: absolute;
+    left: 1030px;
+    top: 44px;
+    width: 150px;
+    opacity: 0.55;
+    animation: dl-sub-drift 30s ease-in-out infinite;
+}
+
+.dl-fish {
+    position: absolute;
+    animation: dl-fish-swim 24s linear infinite;
+}
+
+.dl-fish.f2 {
+    animation: dl-fish-swim-l 31s linear infinite;
+    animation-delay: -14s;
+}
+
+@keyframes dl-fish-swim {
+    from { transform: translateX(-80px); }
+    to { transform: translateX(1720px); }
+}
+
+@keyframes dl-fish-swim-l {
+    from { transform: translateX(1720px) scaleX(-1); }
+    to { transform: translateX(-80px) scaleX(-1); }
+}
+
+.dl-waves {
+    position: absolute;
+    left: 0;
+    top: -14px;
+    width: 200%;
+    height: 30px;
+    animation: dl-wave 9s linear infinite;
+}
+
+.dl-waves.slow {
+    top: -7px;
+    opacity: 0.45;
+    animation-duration: 15s;
+    animation-direction: reverse;
+}
+
+.dl-port-shipwrap {
+    position: absolute;
+    left: 896px;
+    bottom: 262px;
+    width: 540px;
+    animation: dl-bob 5.4s ease-in-out infinite;
+    z-index: 6;
+}
+
+.dl-port-wake {
+    position: absolute;
+    left: 846px;
+    bottom: 252px;
+    width: 620px;
+    height: 26px;
+    opacity: 0.5;
+}
+
+.dl-port-fg {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 560px;
+}
+
+.dl-port-copy {
+    left: 0;
+    right: 0;
+    margin: 0 auto;
+    top: 12.5vh;
+    z-index: 40;
+    max-width: 880px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.dl-port-copy .dl-sub {
+    text-align: center;
+}
+
+.dl-port-copy .dl-btn-row {
+    justify-content: center;
+}
+
+.dl-port .dl-console-wrap {
+    margin-top: 34px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.dl-port .dl-port-term {
+    margin-top: 0;
+}
+
+.dl-port-meta {
+    position: absolute;
+    right: 7vw;
+    bottom: 20vh;
+    z-index: 40;
+    text-align: right;
+    font-family: var(--dl-font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.24em;
+    color: var(--dl-mut);
+    text-transform: uppercase;
+    line-height: 2.1;
+}
+
+.dl-port-scrollhint {
+    position: absolute;
+    left: 50%;
+    bottom: 26px;
+    transform: translateX(-50%);
+    z-index: 40;
+    font-family: var(--dl-font-mono);
+    font-size: 10px;
+    letter-spacing: 0.3em;
+    color: var(--dl-mut);
+    text-transform: uppercase;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+}
+
+.dl-port-scrollhint .line {
+    width: 1px;
+    height: 34px;
+    background: linear-gradient(180deg, var(--dl-cyan), transparent);
+    animation: dl-scrollhint 1.8s ease-in-out infinite;
+}
+
+@keyframes dl-scrollhint {
+    0% { transform: scaleY(0); transform-origin: top; }
+    55% { transform: scaleY(1); transform-origin: top; }
+    56% { transform-origin: bottom; }
+    100% { transform: scaleY(0); transform-origin: bottom; }
+}
+
+/* ================= SCENE 02 — LOAD ================= */
+
+.dl-load .dl-stage {
+    background: linear-gradient(180deg, #232048 0%, #171a33 50%, #0d1226 100%);
+}
+
+.dl-load-water {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 190px;
+    background: linear-gradient(180deg, #142c46 0%, #0c1c30 60%, #081423 100%);
+}
+
+.dl-load-dock {
+    position: absolute;
+    left: 0;
+    bottom: 130px;
+    width: 560px;
+    height: 60px;
+    background: #1a2634;
+    border-top: 3px solid #24394e;
+}
+
+.dl-load-dock::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: repeating-linear-gradient(90deg, var(--dl-amber) 0 22px, transparent 22px 44px);
+    opacity: 0.3;
+}
+
+.dl-load-shipwrap {
+    position: absolute;
+    left: 900px;
+    bottom: 96px;
+    width: 600px;
+    animation: dl-bob 5.8s ease-in-out infinite;
+}
+
+.dl-load-crane {
+    position: absolute;
+    left: 240px;
+    bottom: 130px;
+    width: 900px;
+    height: 640px;
+}
+
+.dl-load-trolley {
+    position: absolute;
+    left: 0;
+    top: 0;
+    will-change: transform;
+}
+
+.dl-load-lift {
+    position: absolute;
+    left: 0;
+    top: 0;
+    will-change: transform;
+}
+
+.dl-load-cable {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 3px;
+    background: #5f7d95;
+    transform-origin: top center;
+}
+
+.dl-load-crate {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 150px;
+}
+
+.dl-load-labels {
+    position: absolute;
+    left: 150px;
+    top: 480px;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    z-index: 30;
+}
+
+.dl-load-label {
+    font-family: var(--dl-font-mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--dl-off);
+    background: rgba(5, 7, 10, 0.85);
+    border: 1px solid rgba(74, 107, 130, 0.6);
+    border-left: 3px solid var(--dl-green);
+    padding: 8px 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: max-content;
+    box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.35);
+}
+
+.dl-load-label .ok {
+    color: var(--dl-green);
+}
+
+.dl-load-copy {
+    right: 6vw;
+    top: 13vh;
+    text-align: right;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+}
+
+.dl-load-copy .dl-kicker::before {
+    order: 2;
+}
+
+/* ================= SCENE 03 — PLOT THE COURSE ================= */
+
+.dl-course .dl-stage {
+    background: linear-gradient(180deg, #0b1a2c 0%, #0a1828 50%, #071120 100%);
+}
+
+.dl-course-chart {
+    position: absolute;
+    inset: 0;
+    background-image: linear-gradient(rgba(31, 58, 86, 0.5) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(31, 58, 86, 0.5) 1px, transparent 1px);
+    background-size: 80px 80px;
+}
+
+.dl-course-chart::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image: linear-gradient(rgba(31, 58, 86, 0.22) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(31, 58, 86, 0.22) 1px, transparent 1px);
+    background-size: 16px 16px;
+}
+
+.dl-course-svg {
+    position: absolute;
+    inset: 0;
+    width: 1600px;
+    height: 900px;
+}
+
+.dl-course-ship {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 130px;
+    will-change: transform;
+}
+
+.dl-course-copy {
+    left: 6vw;
+    top: 10vh;
+}
+
+.dl-course-legend {
+    position: absolute;
+    right: 6vw;
+    bottom: 9vh;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    font-family: var(--dl-font-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    color: var(--dl-mut);
+    text-transform: uppercase;
+}
+
+.dl-course-legend .row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+.dl-course-legend .sw {
+    width: 22px;
+    height: 2px;
+    background: var(--dl-cyan);
+}
+
+.dl-course-legend .sw.dash {
+    background: repeating-linear-gradient(90deg, var(--dl-steel) 0 5px, transparent 5px 9px);
+}
+
+/* ================= SCENE 04 — AGENT CREW ================= */
+
+.dl-crew .dl-stage {
+    background: linear-gradient(180deg, #0a1120 0%, #080e1a 55%, #060a13 100%);
+}
+
+.dl-crew-blueprint {
+    position: absolute;
+    inset: 0;
+    background-image: linear-gradient(rgba(0, 240, 255, 0.05) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 240, 255, 0.05) 1px, transparent 1px);
+    background-size: 60px 60px;
+}
+
+.dl-crew-cutaway {
+    position: absolute;
+    left: 50%;
+    top: 54%;
+    width: 1240px;
+    transform: translate(-50%, -50%);
+    will-change: transform;
+}
+
+.dl-crew-copy {
+    left: 6vw;
+    top: 9vh;
+    z-index: 40;
+}
+
+.dl-crew-stats {
+    position: absolute;
+    right: 6vw;
+    top: 11vh;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    align-items: flex-end;
+}
+
+.dl-crew-stat {
+    background: rgba(5, 7, 10, 0.85);
+    border: 1px solid rgba(74, 107, 130, 0.6);
+    box-shadow: 5px 5px 0 rgba(0, 0, 0, 0.4);
+    padding: 13px 20px;
+    text-align: right;
+}
+
+.dl-crew-stat .num {
+    font-family: var(--dl-font-display);
+    font-size: 34px;
+    color: var(--dl-cyan);
+    line-height: 1;
+    letter-spacing: 0.03em;
+}
+
+.dl-crew-stat .cap {
+    font-family: var(--dl-font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+    color: var(--dl-mut);
+    margin-top: 5px;
+}
+
+.dl-crew-room {
+    will-change: transform, opacity;
+}
+
+.dl-crew-room .glow {
+    animation: dl-flicker 5s linear infinite;
+}
+
+.dl-crew-agent {
+    animation: dl-agent-bob 2.6s ease-in-out infinite;
+}
+
+.dl-crew-agent.d2 { animation-delay: -0.9s; animation-duration: 3.1s; }
+.dl-crew-agent.d3 { animation-delay: -1.7s; animation-duration: 2.2s; }
+
+/* ================= responsive ================= */
+
+@media (max-width: 760px) {
+    .dl-port-copy { top: 12vh; }
+    .dl-port-meta { display: none; }
+    .dl-load-copy { right: 20px; top: 9vh; align-items: flex-start; text-align: left; }
+    .dl-load-copy .dl-kicker::before { order: 0; }
+    .dl-load-labels { left: 40px; top: 560px; }
+    .dl-course-copy { top: 8vh; }
+    .dl-course-legend { display: none; }
+    .dl-crew-copy { top: 8vh; }
+    .dl-crew-stats { top: auto; bottom: 5vh; right: 20px; flex-direction: row; }
+    .dl-crew-stat { padding: 9px 14px; }
+    .dl-crew-stat .num { font-size: 24px; }
+}
+`, "",{"version":3,"sources":["webpack://./src/styles/scenes-a.css"],"names":[],"mappings":"AAAA;;;iEAGiE;;AAEjE,qEAAqE;;AAErE;IACI,+IAA+I;AACnJ;;AAEA;IACI,kBAAkB;IAClB,QAAQ;IACR,mBAAmB;IACnB,UAAU;AACd;;AAEA;IACI,kBAAkB;IAClB,gBAAgB;IAChB,UAAU;AACd;;AAEA;IACI,kBAAkB;IAClB,UAAU;IACV,WAAW;IACX,mBAAmB;IACnB,+CAA+C;AACnD;;AAEA;IACI,kBAAkB;IAClB,WAAW;IACX,UAAU;IACV,YAAY;IACZ,aAAa;IACb,kBAAkB;IAClB,8GAA8G;AAClH;;AAEA;IACI,WAAW;IACX,kBAAkB;IAClB,SAAS;IACT,QAAQ;IACR,WAAW;IACX,YAAY;IACZ,gCAAgC;IAChC,kBAAkB;IAClB,mBAAmB;IACnB,4CAA4C;AAChD;;AAEA;IACI,kBAAkB;IAClB,UAAU;IACV,aAAa;IACb,YAAY;AAChB;;AAEA;IACI,kBAAkB;IAClB,OAAO;IACP,QAAQ;IACR,SAAS;IACT,aAAa;IACb,0EAA0E;AAC9E;;AAEA;IACI,kBAAkB;IAClB,WAAW;IACX,QAAQ;IACR,YAAY;IACZ,aAAa;IACb,6FAA6F;IAC7F,gFAAgF;IAChF,wFAAwF;AAC5F;;AAEA;IACI,kBAAkB;IAClB,OAAO;IACP,QAAQ;IACR,SAAS;IACT,aAAa;IACb,qFAAqF;AACzF;;AAEA;IACI,kBAAkB;IAClB,YAAY;IACZ,SAAS;IACT,YAAY;IACZ,aAAa;IACb,gDAAgD;AACpD;;AAEA;IACI,kBAAkB;IAClB,2CAA2C;AAC/C;;AAEA;IACI,6CAA6C;IAC7C,qBAAqB;AACzB;;AAEA;IACI,OAAO,4BAA4B,EAAE;IACrC,KAAK,6BAA6B,EAAE;AACxC;;AAEA;IACI,OAAO,wCAAwC,EAAE;IACjD,KAAK,uCAAuC,EAAE;AAClD;;AAEA;IACI,kBAAkB;IAClB,OAAO;IACP,UAAU;IACV,WAAW;IACX,YAAY;IACZ,qCAAqC;AACzC;;AAEA;IACI,SAAS;IACT,aAAa;IACb,uBAAuB;IACvB,4BAA4B;AAChC;;AAEA;IACI,kBAAkB;IAClB,WAAW;IACX,aAAa;IACb,YAAY;IACZ,2CAA2C;IAC3C,UAAU;AACd;;AAEA;IACI,kBAAkB;IAClB,WAAW;IACX,aAAa;IACb,YAAY;IACZ,YAAY;IACZ,YAAY;AAChB;;AAEA;IACI,kBAAkB;IAClB,OAAO;IACP,SAAS;IACT,YAAY;AAChB;;AAEA;IACI,OAAO;IACP,QAAQ;IACR,cAAc;IACd,WAAW;IACX,WAAW;IACX,gBAAgB;IAChB,kBAAkB;IAClB,aAAa;IACb,sBAAsB;IACtB,mBAAmB;AACvB;;AAEA;IACI,kBAAkB;AACtB;;AAEA;IACI,uBAAuB;AAC3B;;AAEA;IACI,gBAAgB;IAChB,aAAa;IACb,sBAAsB;IACtB,mBAAmB;AACvB;;AAEA;IACI,aAAa;AACjB;;AAEA;IACI,kBAAkB;IAClB,UAAU;IACV,YAAY;IACZ,WAAW;IACX,iBAAiB;IACjB,gCAAgC;IAChC,iBAAiB;IACjB,sBAAsB;IACtB,oBAAoB;IACpB,yBAAyB;IACzB,gBAAgB;AACpB;;AAEA;IACI,kBAAkB;IAClB,SAAS;IACT,YAAY;IACZ,2BAA2B;IAC3B,WAAW;IACX,gCAAgC;IAChC,eAAe;IACf,qBAAqB;IACrB,oBAAoB;IACpB,yBAAyB;IACzB,aAAa;IACb,sBAAsB;IACtB,mBAAmB;IACnB,QAAQ;AACZ;;AAEA;IACI,UAAU;IACV,YAAY;IACZ,gEAAgE;IAChE,kDAAkD;AACtD;;AAEA;IACI,KAAK,oBAAoB,EAAE,qBAAqB,EAAE;IAClD,MAAM,oBAAoB,EAAE,qBAAqB,EAAE;IACnD,MAAM,wBAAwB,EAAE;IAChC,OAAO,oBAAoB,EAAE,wBAAwB,EAAE;AAC3D;;AAEA,wDAAwD;;AAExD;IACI,0EAA0E;AAC9E;;AAEA;IACI,kBAAkB;IAClB,OAAO;IACP,QAAQ;IACR,SAAS;IACT,aAAa;IACb,0EAA0E;AAC9E;;AAEA;IACI,kBAAkB;IAClB,OAAO;IACP,aAAa;IACb,YAAY;IACZ,YAAY;IACZ,mBAAmB;IACnB,6BAA6B;AACjC;;AAEA;IACI,WAAW;IACX,kBAAkB;IAClB,MAAM;IACN,OAAO;IACP,QAAQ;IACR,WAAW;IACX,2FAA2F;IAC3F,YAAY;AAChB;;AAEA;IACI,kBAAkB;IAClB,WAAW;IACX,YAAY;IACZ,YAAY;IACZ,2CAA2C;AAC/C;;AAEA;IACI,kBAAkB;IAClB,WAAW;IACX,aAAa;IACb,YAAY;IACZ,aAAa;AACjB;;AAEA;IACI,kBAAkB;IAClB,OAAO;IACP,MAAM;IACN,sBAAsB;AAC1B;;AAEA;IACI,kBAAkB;IAClB,OAAO;IACP,MAAM;IACN,sBAAsB;AAC1B;;AAEA;IACI,kBAAkB;IAClB,OAAO;IACP,MAAM;IACN,UAAU;IACV,mBAAmB;IACnB,4BAA4B;AAChC;;AAEA;IACI,kBAAkB;IAClB,OAAO;IACP,MAAM;IACN,YAAY;AAChB;;AAEA;IACI,kBAAkB;IAClB,WAAW;IACX,UAAU;IACV,aAAa;IACb,sBAAsB;IACtB,QAAQ;IACR,WAAW;AACf;;AAEA;IACI,gCAAgC;IAChC,eAAe;IACf,sBAAsB;IACtB,yBAAyB;IACzB,oBAAoB;IACpB,gCAAgC;IAChC,yCAAyC;IACzC,sCAAsC;IACtC,iBAAiB;IACjB,aAAa;IACb,mBAAmB;IACnB,SAAS;IACT,kBAAkB;IAClB,yCAAyC;AAC7C;;AAEA;IACI,sBAAsB;AAC1B;;AAEA;IACI,UAAU;IACV,SAAS;IACT,iBAAiB;IACjB,aAAa;IACb,sBAAsB;IACtB,qBAAqB;AACzB;;AAEA;IACI,QAAQ;AACZ;;AAEA,mEAAmE;;AAEnE;IACI,0EAA0E;AAC9E;;AAEA;IACI,kBAAkB;IAClB,QAAQ;IACR;0EACsE;IACtE,0BAA0B;AAC9B;;AAEA;IACI,WAAW;IACX,kBAAkB;IAClB,QAAQ;IACR;2EACuE;IACvE,0BAA0B;AAC9B;;AAEA;IACI,kBAAkB;IAClB,QAAQ;IACR,aAAa;IACb,aAAa;AACjB;;AAEA;IACI,kBAAkB;IAClB,OAAO;IACP,MAAM;IACN,YAAY;IACZ,sBAAsB;AAC1B;;AAEA;IACI,SAAS;IACT,SAAS;AACb;;AAEA;IACI,kBAAkB;IAClB,UAAU;IACV,WAAW;IACX,WAAW;IACX,aAAa;IACb,sBAAsB;IACtB,QAAQ;IACR,gCAAgC;IAChC,eAAe;IACf,sBAAsB;IACtB,oBAAoB;IACpB,yBAAyB;AAC7B;;AAEA;IACI,aAAa;IACb,mBAAmB;IACnB,SAAS;IACT,yBAAyB;AAC7B;;AAEA;IACI,WAAW;IACX,WAAW;IACX,0BAA0B;AAC9B;;AAEA;IACI,wFAAwF;AAC5F;;AAEA,8DAA8D;;AAE9D;IACI,0EAA0E;AAC9E;;AAEA;IACI,kBAAkB;IAClB,QAAQ;IACR;4EACwE;IACxE,0BAA0B;AAC9B;;AAEA;IACI,kBAAkB;IAClB,SAAS;IACT,QAAQ;IACR,aAAa;IACb,gCAAgC;IAChC,sBAAsB;AAC1B;;AAEA;IACI,SAAS;IACT,QAAQ;IACR,WAAW;AACf;;AAEA;IACI,kBAAkB;IAClB,UAAU;IACV,SAAS;IACT,WAAW;IACX,aAAa;IACb,sBAAsB;IACtB,SAAS;IACT,qBAAqB;AACzB;;AAEA;IACI,gCAAgC;IAChC,yCAAyC;IACzC,wCAAwC;IACxC,kBAAkB;IAClB,iBAAiB;AACrB;;AAEA;IACI,mCAAmC;IACnC,eAAe;IACf,qBAAqB;IACrB,cAAc;IACd,sBAAsB;AAC1B;;AAEA;IACI,gCAAgC;IAChC,gBAAgB;IAChB,sBAAsB;IACtB,yBAAyB;IACzB,oBAAoB;IACpB,eAAe;AACnB;;AAEA;IACI,+BAA+B;AACnC;;AAEA;IACI,wCAAwC;AAC5C;;AAEA;IACI,iDAAiD;AACrD;;AAEA,oBAAoB,sBAAsB,EAAE,wBAAwB,EAAE;AACtE,oBAAoB,sBAAsB,EAAE,wBAAwB,EAAE;;AAEtE,mDAAmD;;AAEnD;IACI,gBAAgB,SAAS,EAAE;IAC3B,gBAAgB,aAAa,EAAE;IAC/B,gBAAgB,WAAW,EAAE,QAAQ,EAAE,uBAAuB,EAAE,gBAAgB,EAAE;IAClF,mCAAmC,QAAQ,EAAE;IAC7C,kBAAkB,UAAU,EAAE,UAAU,EAAE;IAC1C,kBAAkB,QAAQ,EAAE;IAC5B,oBAAoB,aAAa,EAAE;IACnC,gBAAgB,QAAQ,EAAE;IAC1B,iBAAiB,SAAS,EAAE,WAAW,EAAE,WAAW,EAAE,mBAAmB,EAAE;IAC3E,gBAAgB,iBAAiB,EAAE;IACnC,qBAAqB,eAAe,EAAE;AAC1C","sourcesContent":["/* ============================================================\n   DEPLAI — scenes 01–04 : PORT / LOAD / COURSE / CREW\n   world coordinate space: 1600 x 900\n   ============================================================ */\n\n/* ================= SCENE 01 — THE PORT (sunset) ================= */\n\n.dl-port .dl-stage {\n    background: linear-gradient(180deg, #12172e 0%, #25244c 30%, #533e62 46%, #9c5a54 55%, #e89a5b 60%, #f2b46a 61.5%, #17224a 62.5%, #0b142c 100%);\n}\n\n.dl-port-dusk {\n    position: absolute;\n    inset: 0;\n    background: #070c1c;\n    opacity: 0;\n}\n\n.dl-port-stars {\n    position: absolute;\n    inset: 0 0 42% 0;\n    opacity: 0;\n}\n\n.dl-port-stars i {\n    position: absolute;\n    width: 2px;\n    height: 2px;\n    background: #e8ecf5;\n    animation: dl-twinkle 3.6s ease-in-out infinite;\n}\n\n.dl-port-sun {\n    position: absolute;\n    left: 610px;\n    top: 300px;\n    width: 320px;\n    height: 320px;\n    border-radius: 50%;\n    background: radial-gradient(circle, rgba(255, 178, 96, 0.42) 0%, rgba(255, 150, 80, 0.1) 45%, transparent 68%);\n}\n\n.dl-port-sun::after {\n    content: \"\";\n    position: absolute;\n    left: 50%;\n    top: 50%;\n    width: 86px;\n    height: 86px;\n    transform: translate(-50%, -50%);\n    border-radius: 50%;\n    background: #ffd9a0;\n    box-shadow: 0 0 60px rgba(255, 170, 90, 0.7);\n}\n\n.dl-port-horizon {\n    position: absolute;\n    left: 36px;\n    bottom: 330px;\n    width: 620px;\n}\n\n.dl-port-water {\n    position: absolute;\n    left: 0;\n    right: 0;\n    bottom: 0;\n    height: 340px;\n    background: linear-gradient(180deg, #27355e 0%, #182350 38%, #0b142c 100%);\n}\n\n.dl-port-sunpath {\n    position: absolute;\n    left: 708px;\n    top: 8px;\n    width: 124px;\n    height: 300px;\n    background: linear-gradient(180deg, rgba(255, 190, 120, 0.55) 0%, rgba(255, 190, 120, 0) 88%);\n    mask-image: repeating-linear-gradient(180deg, black 0 5px, transparent 5px 11px);\n    -webkit-mask-image: repeating-linear-gradient(180deg, black 0 5px, transparent 5px 11px);\n}\n\n.dl-port-under {\n    position: absolute;\n    left: 0;\n    right: 0;\n    bottom: 0;\n    height: 128px;\n    background: linear-gradient(180deg, rgba(8, 16, 36, 0) 0%, #08101f 55%, #050a14 100%);\n}\n\n.dl-port-sub {\n    position: absolute;\n    left: 1030px;\n    top: 44px;\n    width: 150px;\n    opacity: 0.55;\n    animation: dl-sub-drift 30s ease-in-out infinite;\n}\n\n.dl-fish {\n    position: absolute;\n    animation: dl-fish-swim 24s linear infinite;\n}\n\n.dl-fish.f2 {\n    animation: dl-fish-swim-l 31s linear infinite;\n    animation-delay: -14s;\n}\n\n@keyframes dl-fish-swim {\n    from { transform: translateX(-80px); }\n    to { transform: translateX(1720px); }\n}\n\n@keyframes dl-fish-swim-l {\n    from { transform: translateX(1720px) scaleX(-1); }\n    to { transform: translateX(-80px) scaleX(-1); }\n}\n\n.dl-waves {\n    position: absolute;\n    left: 0;\n    top: -14px;\n    width: 200%;\n    height: 30px;\n    animation: dl-wave 9s linear infinite;\n}\n\n.dl-waves.slow {\n    top: -7px;\n    opacity: 0.45;\n    animation-duration: 15s;\n    animation-direction: reverse;\n}\n\n.dl-port-shipwrap {\n    position: absolute;\n    left: 896px;\n    bottom: 262px;\n    width: 540px;\n    animation: dl-bob 5.4s ease-in-out infinite;\n    z-index: 6;\n}\n\n.dl-port-wake {\n    position: absolute;\n    left: 846px;\n    bottom: 252px;\n    width: 620px;\n    height: 26px;\n    opacity: 0.5;\n}\n\n.dl-port-fg {\n    position: absolute;\n    left: 0;\n    bottom: 0;\n    width: 560px;\n}\n\n.dl-port-copy {\n    left: 0;\n    right: 0;\n    margin: 0 auto;\n    top: 12.5vh;\n    z-index: 40;\n    max-width: 880px;\n    text-align: center;\n    display: flex;\n    flex-direction: column;\n    align-items: center;\n}\n\n.dl-port-copy .dl-sub {\n    text-align: center;\n}\n\n.dl-port-copy .dl-btn-row {\n    justify-content: center;\n}\n\n.dl-port .dl-console-wrap {\n    margin-top: 34px;\n    display: flex;\n    flex-direction: column;\n    align-items: center;\n}\n\n.dl-port .dl-port-term {\n    margin-top: 0;\n}\n\n.dl-port-meta {\n    position: absolute;\n    right: 7vw;\n    bottom: 20vh;\n    z-index: 40;\n    text-align: right;\n    font-family: var(--dl-font-mono);\n    font-size: 10.5px;\n    letter-spacing: 0.24em;\n    color: var(--dl-mut);\n    text-transform: uppercase;\n    line-height: 2.1;\n}\n\n.dl-port-scrollhint {\n    position: absolute;\n    left: 50%;\n    bottom: 26px;\n    transform: translateX(-50%);\n    z-index: 40;\n    font-family: var(--dl-font-mono);\n    font-size: 10px;\n    letter-spacing: 0.3em;\n    color: var(--dl-mut);\n    text-transform: uppercase;\n    display: flex;\n    flex-direction: column;\n    align-items: center;\n    gap: 8px;\n}\n\n.dl-port-scrollhint .line {\n    width: 1px;\n    height: 34px;\n    background: linear-gradient(180deg, var(--dl-cyan), transparent);\n    animation: dl-scrollhint 1.8s ease-in-out infinite;\n}\n\n@keyframes dl-scrollhint {\n    0% { transform: scaleY(0); transform-origin: top; }\n    55% { transform: scaleY(1); transform-origin: top; }\n    56% { transform-origin: bottom; }\n    100% { transform: scaleY(0); transform-origin: bottom; }\n}\n\n/* ================= SCENE 02 — LOAD ================= */\n\n.dl-load .dl-stage {\n    background: linear-gradient(180deg, #232048 0%, #171a33 50%, #0d1226 100%);\n}\n\n.dl-load-water {\n    position: absolute;\n    left: 0;\n    right: 0;\n    bottom: 0;\n    height: 190px;\n    background: linear-gradient(180deg, #142c46 0%, #0c1c30 60%, #081423 100%);\n}\n\n.dl-load-dock {\n    position: absolute;\n    left: 0;\n    bottom: 130px;\n    width: 560px;\n    height: 60px;\n    background: #1a2634;\n    border-top: 3px solid #24394e;\n}\n\n.dl-load-dock::after {\n    content: \"\";\n    position: absolute;\n    top: 0;\n    left: 0;\n    right: 0;\n    height: 3px;\n    background: repeating-linear-gradient(90deg, var(--dl-amber) 0 22px, transparent 22px 44px);\n    opacity: 0.3;\n}\n\n.dl-load-shipwrap {\n    position: absolute;\n    left: 900px;\n    bottom: 96px;\n    width: 600px;\n    animation: dl-bob 5.8s ease-in-out infinite;\n}\n\n.dl-load-crane {\n    position: absolute;\n    left: 240px;\n    bottom: 130px;\n    width: 900px;\n    height: 640px;\n}\n\n.dl-load-trolley {\n    position: absolute;\n    left: 0;\n    top: 0;\n    will-change: transform;\n}\n\n.dl-load-lift {\n    position: absolute;\n    left: 0;\n    top: 0;\n    will-change: transform;\n}\n\n.dl-load-cable {\n    position: absolute;\n    left: 0;\n    top: 0;\n    width: 3px;\n    background: #5f7d95;\n    transform-origin: top center;\n}\n\n.dl-load-crate {\n    position: absolute;\n    left: 0;\n    top: 0;\n    width: 150px;\n}\n\n.dl-load-labels {\n    position: absolute;\n    left: 150px;\n    top: 480px;\n    display: flex;\n    flex-direction: column;\n    gap: 9px;\n    z-index: 30;\n}\n\n.dl-load-label {\n    font-family: var(--dl-font-mono);\n    font-size: 12px;\n    letter-spacing: 0.14em;\n    text-transform: uppercase;\n    color: var(--dl-off);\n    background: rgba(5, 7, 10, 0.85);\n    border: 1px solid rgba(74, 107, 130, 0.6);\n    border-left: 3px solid var(--dl-green);\n    padding: 8px 14px;\n    display: flex;\n    align-items: center;\n    gap: 10px;\n    width: max-content;\n    box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.35);\n}\n\n.dl-load-label .ok {\n    color: var(--dl-green);\n}\n\n.dl-load-copy {\n    right: 6vw;\n    top: 13vh;\n    text-align: right;\n    display: flex;\n    flex-direction: column;\n    align-items: flex-end;\n}\n\n.dl-load-copy .dl-kicker::before {\n    order: 2;\n}\n\n/* ================= SCENE 03 — PLOT THE COURSE ================= */\n\n.dl-course .dl-stage {\n    background: linear-gradient(180deg, #0b1a2c 0%, #0a1828 50%, #071120 100%);\n}\n\n.dl-course-chart {\n    position: absolute;\n    inset: 0;\n    background-image: linear-gradient(rgba(31, 58, 86, 0.5) 1px, transparent 1px),\n        linear-gradient(90deg, rgba(31, 58, 86, 0.5) 1px, transparent 1px);\n    background-size: 80px 80px;\n}\n\n.dl-course-chart::after {\n    content: \"\";\n    position: absolute;\n    inset: 0;\n    background-image: linear-gradient(rgba(31, 58, 86, 0.22) 1px, transparent 1px),\n        linear-gradient(90deg, rgba(31, 58, 86, 0.22) 1px, transparent 1px);\n    background-size: 16px 16px;\n}\n\n.dl-course-svg {\n    position: absolute;\n    inset: 0;\n    width: 1600px;\n    height: 900px;\n}\n\n.dl-course-ship {\n    position: absolute;\n    left: 0;\n    top: 0;\n    width: 130px;\n    will-change: transform;\n}\n\n.dl-course-copy {\n    left: 6vw;\n    top: 10vh;\n}\n\n.dl-course-legend {\n    position: absolute;\n    right: 6vw;\n    bottom: 9vh;\n    z-index: 40;\n    display: flex;\n    flex-direction: column;\n    gap: 7px;\n    font-family: var(--dl-font-mono);\n    font-size: 11px;\n    letter-spacing: 0.14em;\n    color: var(--dl-mut);\n    text-transform: uppercase;\n}\n\n.dl-course-legend .row {\n    display: flex;\n    align-items: center;\n    gap: 10px;\n    justify-content: flex-end;\n}\n\n.dl-course-legend .sw {\n    width: 22px;\n    height: 2px;\n    background: var(--dl-cyan);\n}\n\n.dl-course-legend .sw.dash {\n    background: repeating-linear-gradient(90deg, var(--dl-steel) 0 5px, transparent 5px 9px);\n}\n\n/* ================= SCENE 04 — AGENT CREW ================= */\n\n.dl-crew .dl-stage {\n    background: linear-gradient(180deg, #0a1120 0%, #080e1a 55%, #060a13 100%);\n}\n\n.dl-crew-blueprint {\n    position: absolute;\n    inset: 0;\n    background-image: linear-gradient(rgba(0, 240, 255, 0.05) 1px, transparent 1px),\n        linear-gradient(90deg, rgba(0, 240, 255, 0.05) 1px, transparent 1px);\n    background-size: 60px 60px;\n}\n\n.dl-crew-cutaway {\n    position: absolute;\n    left: 50%;\n    top: 54%;\n    width: 1240px;\n    transform: translate(-50%, -50%);\n    will-change: transform;\n}\n\n.dl-crew-copy {\n    left: 6vw;\n    top: 9vh;\n    z-index: 40;\n}\n\n.dl-crew-stats {\n    position: absolute;\n    right: 6vw;\n    top: 11vh;\n    z-index: 40;\n    display: flex;\n    flex-direction: column;\n    gap: 12px;\n    align-items: flex-end;\n}\n\n.dl-crew-stat {\n    background: rgba(5, 7, 10, 0.85);\n    border: 1px solid rgba(74, 107, 130, 0.6);\n    box-shadow: 5px 5px 0 rgba(0, 0, 0, 0.4);\n    padding: 13px 20px;\n    text-align: right;\n}\n\n.dl-crew-stat .num {\n    font-family: var(--dl-font-display);\n    font-size: 34px;\n    color: var(--dl-cyan);\n    line-height: 1;\n    letter-spacing: 0.03em;\n}\n\n.dl-crew-stat .cap {\n    font-family: var(--dl-font-mono);\n    font-size: 9.5px;\n    letter-spacing: 0.26em;\n    text-transform: uppercase;\n    color: var(--dl-mut);\n    margin-top: 5px;\n}\n\n.dl-crew-room {\n    will-change: transform, opacity;\n}\n\n.dl-crew-room .glow {\n    animation: dl-flicker 5s linear infinite;\n}\n\n.dl-crew-agent {\n    animation: dl-agent-bob 2.6s ease-in-out infinite;\n}\n\n.dl-crew-agent.d2 { animation-delay: -0.9s; animation-duration: 3.1s; }\n.dl-crew-agent.d3 { animation-delay: -1.7s; animation-duration: 2.2s; }\n\n/* ================= responsive ================= */\n\n@media (max-width: 760px) {\n    .dl-port-copy { top: 12vh; }\n    .dl-port-meta { display: none; }\n    .dl-load-copy { right: 20px; top: 9vh; align-items: flex-start; text-align: left; }\n    .dl-load-copy .dl-kicker::before { order: 0; }\n    .dl-load-labels { left: 40px; top: 560px; }\n    .dl-course-copy { top: 8vh; }\n    .dl-course-legend { display: none; }\n    .dl-crew-copy { top: 8vh; }\n    .dl-crew-stats { top: auto; bottom: 5vh; right: 20px; flex-direction: row; }\n    .dl-crew-stat { padding: 9px 14px; }\n    .dl-crew-stat .num { font-size: 24px; }\n}\n"],"sourceRoot":""}]);
+// Exports
+___CSS_LOADER_EXPORT___.locals = {};
+export default ___CSS_LOADER_EXPORT___;

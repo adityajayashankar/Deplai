@@ -1,0 +1,10 @@
+[Unit]
+Description=Reclaim scoped local DeplAI preview resources
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/deplai-preview-runtime/gc.py --root /var/lib/deplai-preview-runtime
+User=root
+UMask=0077

@@ -1,0 +1,10 @@
+[Unit]
+Description=Recover expired DeplAI proof resources every minute
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+Unit=deplai-preview-proof-gc.service
+
+[Install]
+WantedBy=timers.target

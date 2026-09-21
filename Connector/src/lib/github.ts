@@ -127,6 +127,11 @@ export class GitHubService {
     return this._createInstallationToken(installationId);
   }
 
+  /** Repository ingestion only needs immutable tree/blob reads. */
+  async getInstallationTokenForBuildImport(installationId: string): Promise<string> {
+    return this._createInstallationToken(installationId, { contents: 'read' });
+  }
+
   /** Returns a token scoped for remediation (push + PR creation). */
   async getInstallationTokenForRemediation(installationId: string): Promise<string> {
     return this._createInstallationToken(installationId, {

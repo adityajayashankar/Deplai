@@ -1,0 +1,219 @@
+// Imports
+import ___CSS_LOADER_API_SOURCEMAP_IMPORT___ from "../../node_modules/css-loader/dist/runtime/sourceMaps.js";
+import ___CSS_LOADER_API_IMPORT___ from "../../node_modules/css-loader/dist/runtime/api.js";
+var ___CSS_LOADER_EXPORT___ = ___CSS_LOADER_API_IMPORT___(___CSS_LOADER_API_SOURCEMAP_IMPORT___);
+// Module
+___CSS_LOADER_EXPORT___.push([module.id, `/* Crew cutaway internals + svg helper animations + load labels overlay fix */
+
+.svg-blink {
+    animation: dl-blink 2s steps(2) infinite;
+}
+
+.svg-slowspin {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: dl-sweep 14s linear infinite;
+}
+
+/* load labels live above the world so they never crop on mobile */
+.dl-load-labels {
+    left: 5vw;
+    top: auto;
+    bottom: 17vh;
+    z-index: 40;
+}
+
+/* crew cutaway hull — double shape trick for a stroked chamfered hull */
+.dl-crew-hull-stroke {
+    background: #2a4258;
+    clip-path: polygon(3% 0, 97% 0, 100% 12%, 98% 82%, 90% 100%, 10% 100%, 2% 82%, 0 12%);
+    padding: 3px;
+}
+
+.dl-crew-hull {
+    background: #0c1626;
+    clip-path: polygon(3% 0, 97% 0, 100% 12%, 98% 82%, 90% 100%, 10% 100%, 2% 82%, 0 12%);
+    padding: 64px 84px 84px;
+    background-image: linear-gradient(rgba(0, 240, 255, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 240, 255, 0.04) 1px, transparent 1px);
+    background-size: 40px 40px;
+}
+
+.dl-crew-stat .num.feat {
+    font-size: 17px;
+    letter-spacing: 0.08em;
+    white-space: nowrap;
+}
+
+.dl-crew-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+}
+
+.dl-crew-room {
+    position: relative;
+    border: 1px dashed rgba(0, 240, 255, 0.32);
+    background: rgba(0, 240, 255, 0.025);
+    padding: 12px 12px 14px;
+    min-height: 168px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.dl-crew-room .glow {
+    position: absolute;
+    top: -1px;
+    left: 18%;
+    right: 18%;
+    height: 3px;
+    opacity: 0.9;
+}
+
+.dl-crew-room-head {
+    align-self: stretch;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--dl-font-mono);
+    font-size: 10px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--dl-off);
+    border-bottom: 1px solid rgba(74, 107, 130, 0.35);
+    padding-bottom: 7px;
+    margin-bottom: 8px;
+}
+
+.dl-crew-room-head .sq {
+    width: 7px;
+    height: 7px;
+    display: inline-block;
+}
+
+.dl-crew-agent {
+    width: 52px;
+    margin: 4px 0 6px;
+}
+
+.dl-crew-room-task {
+    font-family: var(--dl-font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.1em;
+    color: var(--dl-mut);
+    text-transform: uppercase;
+    text-align: center;
+}
+
+.dl-crew-prop {
+    position: absolute;
+    right: 8px;
+    bottom: 8px;
+    opacity: 0.85;
+}
+
+.dl-crew-anno {
+    position: absolute;
+    font-family: var(--dl-font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+    color: var(--dl-steel);
+}
+
+.dl-crew-anno.a1 { left: 6px; top: -34px; }
+.dl-crew-anno.a2 { right: 6px; top: -34px; color: var(--dl-cyan); }
+.dl-crew-anno.a3 { left: 6px; bottom: -32px; }
+
+@media (max-width: 760px) {
+    .dl-load-labels { left: 20px; bottom: 12vh; }
+    .dl-load-label { font-size: 10.5px; padding: 6px 10px; }
+    .dl-crew-hull { padding: 40px 34px 52px; }
+    .dl-crew-grid { gap: 9px; }
+    .dl-crew-room { min-height: 120px; padding: 8px 6px 10px; }
+    .dl-crew-agent { width: 38px; }
+    .dl-crew-room-task { display: none; }
+    .dl-crew-room-head { font-size: 8px; letter-spacing: 0.12em; }
+}
+
+/* ---------- generated artwork layers ---------- */
+
+.dl-art {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+/* destination — generated harbor city backdrop */
+.dl-dest .dl-stage {
+    background: linear-gradient(180deg, #0a1424 0%, #122639 52%, #1a3040 68%, #101018 100%);
+}
+
+.dl-dest-city img {
+    object-position: center 68%;
+    filter: brightness(0.45);
+}
+
+.dl-dest-gatelabel {
+    position: absolute;
+    left: 50%;
+    bottom: 10px;
+    transform: translateX(-50%);
+    font-family: var(--dl-font-mono);
+    font-size: 13px;
+    letter-spacing: 0.5em;
+    color: var(--dl-amber);
+    text-transform: uppercase;
+    white-space: nowrap;
+    opacity: 0.85;
+}
+
+/* fleet — let the generated night ocean show through a thinning veil */
+.dl-fleet-water {
+    background: linear-gradient(180deg, rgba(12, 26, 44, 0.35) 0%, rgba(6, 14, 26, 0.75) 55%, #03070d 100%);
+}
+
+/* ---------- mobile depth pass: reframe key actors for portrait ---------- */
+
+@media (max-width: 760px) {
+    /* hero: bring the ship, sun and reflection into the visible window */
+    .dl-port-shipwrap {
+        left: 560px;
+        bottom: 205px;
+        width: 430px;
+    }
+    .dl-port-wake {
+        left: 520px;
+        bottom: 197px;
+        width: 470px;
+    }
+    .dl-port-sun {
+        left: 640px;
+        top: 370px;
+        width: 240px;
+        height: 240px;
+    }
+    .dl-port-sunpath {
+        left: 700px;
+    }
+    .dl-port-fg {
+        width: 340px;
+    }
+    .dl-port-sub {
+        left: 620px;
+        top: 58px;
+        width: 110px;
+    }
+    /* arrival: keep the ship inside the cropped window at the end of its tween */
+    .dl-dest-shipwrap {
+        left: 220px;
+        width: 460px;
+    }
+}
+`, "",{"version":3,"sources":["webpack://./src/styles/scenes-c.css"],"names":[],"mappings":"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","sourcesContent":["/* Crew cutaway internals + svg helper animations + load labels overlay fix */\n\n.svg-blink {\n    animation: dl-blink 2s steps(2) infinite;\n}\n\n.svg-slowspin {\n    transform-box: fill-box;\n    transform-origin: center;\n    animation: dl-sweep 14s linear infinite;\n}\n\n/* load labels live above the world so they never crop on mobile */\n.dl-load-labels {\n    left: 5vw;\n    top: auto;\n    bottom: 17vh;\n    z-index: 40;\n}\n\n/* crew cutaway hull — double shape trick for a stroked chamfered hull */\n.dl-crew-hull-stroke {\n    background: #2a4258;\n    clip-path: polygon(3% 0, 97% 0, 100% 12%, 98% 82%, 90% 100%, 10% 100%, 2% 82%, 0 12%);\n    padding: 3px;\n}\n\n.dl-crew-hull {\n    background: #0c1626;\n    clip-path: polygon(3% 0, 97% 0, 100% 12%, 98% 82%, 90% 100%, 10% 100%, 2% 82%, 0 12%);\n    padding: 64px 84px 84px;\n    background-image: linear-gradient(rgba(0, 240, 255, 0.04) 1px, transparent 1px),\n        linear-gradient(90deg, rgba(0, 240, 255, 0.04) 1px, transparent 1px);\n    background-size: 40px 40px;\n}\n\n.dl-crew-stat .num.feat {\n    font-size: 17px;\n    letter-spacing: 0.08em;\n    white-space: nowrap;\n}\n\n.dl-crew-grid {\n    display: grid;\n    grid-template-columns: repeat(4, 1fr);\n    gap: 16px;\n}\n\n.dl-crew-room {\n    position: relative;\n    border: 1px dashed rgba(0, 240, 255, 0.32);\n    background: rgba(0, 240, 255, 0.025);\n    padding: 12px 12px 14px;\n    min-height: 168px;\n    display: flex;\n    flex-direction: column;\n    align-items: center;\n}\n\n.dl-crew-room .glow {\n    position: absolute;\n    top: -1px;\n    left: 18%;\n    right: 18%;\n    height: 3px;\n    opacity: 0.9;\n}\n\n.dl-crew-room-head {\n    align-self: stretch;\n    display: flex;\n    align-items: center;\n    gap: 7px;\n    font-family: var(--dl-font-mono);\n    font-size: 10px;\n    letter-spacing: 0.22em;\n    text-transform: uppercase;\n    color: var(--dl-off);\n    border-bottom: 1px solid rgba(74, 107, 130, 0.35);\n    padding-bottom: 7px;\n    margin-bottom: 8px;\n}\n\n.dl-crew-room-head .sq {\n    width: 7px;\n    height: 7px;\n    display: inline-block;\n}\n\n.dl-crew-agent {\n    width: 52px;\n    margin: 4px 0 6px;\n}\n\n.dl-crew-room-task {\n    font-family: var(--dl-font-mono);\n    font-size: 9.5px;\n    letter-spacing: 0.1em;\n    color: var(--dl-mut);\n    text-transform: uppercase;\n    text-align: center;\n}\n\n.dl-crew-prop {\n    position: absolute;\n    right: 8px;\n    bottom: 8px;\n    opacity: 0.85;\n}\n\n.dl-crew-anno {\n    position: absolute;\n    font-family: var(--dl-font-mono);\n    font-size: 10.5px;\n    letter-spacing: 0.24em;\n    text-transform: uppercase;\n    color: var(--dl-steel);\n}\n\n.dl-crew-anno.a1 { left: 6px; top: -34px; }\n.dl-crew-anno.a2 { right: 6px; top: -34px; color: var(--dl-cyan); }\n.dl-crew-anno.a3 { left: 6px; bottom: -32px; }\n\n@media (max-width: 760px) {\n    .dl-load-labels { left: 20px; bottom: 12vh; }\n    .dl-load-label { font-size: 10.5px; padding: 6px 10px; }\n    .dl-crew-hull { padding: 40px 34px 52px; }\n    .dl-crew-grid { gap: 9px; }\n    .dl-crew-room { min-height: 120px; padding: 8px 6px 10px; }\n    .dl-crew-agent { width: 38px; }\n    .dl-crew-room-task { display: none; }\n    .dl-crew-room-head { font-size: 8px; letter-spacing: 0.12em; }\n}\n\n/* ---------- generated artwork layers ---------- */\n\n.dl-art {\n    position: absolute;\n    inset: 0;\n    width: 100%;\n    height: 100%;\n    object-fit: cover;\n}\n\n/* destination — generated harbor city backdrop */\n.dl-dest .dl-stage {\n    background: linear-gradient(180deg, #0a1424 0%, #122639 52%, #1a3040 68%, #101018 100%);\n}\n\n.dl-dest-city img {\n    object-position: center 68%;\n    filter: brightness(0.45);\n}\n\n.dl-dest-gatelabel {\n    position: absolute;\n    left: 50%;\n    bottom: 10px;\n    transform: translateX(-50%);\n    font-family: var(--dl-font-mono);\n    font-size: 13px;\n    letter-spacing: 0.5em;\n    color: var(--dl-amber);\n    text-transform: uppercase;\n    white-space: nowrap;\n    opacity: 0.85;\n}\n\n/* fleet — let the generated night ocean show through a thinning veil */\n.dl-fleet-water {\n    background: linear-gradient(180deg, rgba(12, 26, 44, 0.35) 0%, rgba(6, 14, 26, 0.75) 55%, #03070d 100%);\n}\n\n/* ---------- mobile depth pass: reframe key actors for portrait ---------- */\n\n@media (max-width: 760px) {\n    /* hero: bring the ship, sun and reflection into the visible window */\n    .dl-port-shipwrap {\n        left: 560px;\n        bottom: 205px;\n        width: 430px;\n    }\n    .dl-port-wake {\n        left: 520px;\n        bottom: 197px;\n        width: 470px;\n    }\n    .dl-port-sun {\n        left: 640px;\n        top: 370px;\n        width: 240px;\n        height: 240px;\n    }\n    .dl-port-sunpath {\n        left: 700px;\n    }\n    .dl-port-fg {\n        width: 340px;\n    }\n    .dl-port-sub {\n        left: 620px;\n        top: 58px;\n        width: 110px;\n    }\n    /* arrival: keep the ship inside the cropped window at the end of its tween */\n    .dl-dest-shipwrap {\n        left: 220px;\n        width: 460px;\n    }\n}\n"],"sourceRoot":""}]);
+// Exports
+___CSS_LOADER_EXPORT___.locals = {};
+export default ___CSS_LOADER_EXPORT___;

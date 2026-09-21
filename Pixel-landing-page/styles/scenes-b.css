@@ -1,0 +1,737 @@
+// Imports
+import ___CSS_LOADER_API_SOURCEMAP_IMPORT___ from "../../node_modules/css-loader/dist/runtime/sourceMaps.js";
+import ___CSS_LOADER_API_IMPORT___ from "../../node_modules/css-loader/dist/runtime/api.js";
+import ___CSS_LOADER_GET_URL_IMPORT___ from "../../node_modules/css-loader/dist/runtime/getUrl.js";
+var ___CSS_LOADER_URL_IMPORT_0___ = new URL("data:image/svg+xml;utf8,<svg xmlns=%27http://www.w3.org/2000/svg%27 width=%27200%27 height=%27300%27><g stroke=%27%23aec6dd%27 stroke-width=%271.6%27 opacity=%270.5%27><line x1=%2726%27 y1=%278%27 x2=%2736%27 y2=%2778%27/><line x1=%2782%27 y1=%27120%27 x2=%2792%27 y2=%27196%27/><line x1=%27140%27 y1=%2740%27 x2=%27150%27 y2=%27116%27/><line x1=%27176%27 y1=%27200%27 x2=%27186%27 y2=%27272%27/><line x1=%2758%27 y1=%27224%27 x2=%2768%27 y2=%27292%27/><line x1=%27118%27 y1=%27150%27 x2=%27128%27 y2=%27214%27/></g></svg>", import.meta.url);
+var ___CSS_LOADER_URL_IMPORT_1___ = new URL("data:image/svg+xml;utf8,<svg xmlns=%27http://www.w3.org/2000/svg%27 width=%27260%27 height=%27380%27><g stroke=%27%23aec6dd%27 stroke-width=%272%27 opacity=%270.3%27><line x1=%2740%27 y1=%2720%27 x2=%2754%27 y2=%27130%27/><line x1=%27130%27 y1=%27160%27 x2=%27144%27 y2=%27270%27/><line x1=%27216%27 y1=%2760%27 x2=%27230%27 y2=%27170%27/><line x1=%2790%27 y1=%27270%27 x2=%27104%27 y2=%27372%27/></g></svg>", import.meta.url);
+var ___CSS_LOADER_URL_IMPORT_2___ = new URL("data:image/svg+xml;utf8,<svg xmlns=%27http://www.w3.org/2000/svg%27 width=%27300%27 height=%27420%27><g stroke=%27%23c4d6e8%27 stroke-width=%272.4%27 opacity=%270.5%27><line x1=%2760%27 y1=%2730%27 x2=%2776%27 y2=%27160%27/><line x1=%27190%27 y1=%27200%27 x2=%27206%27 y2=%27330%27/><line x1=%27260%27 y1=%2760%27 x2=%27274%27 y2=%27180%27/></g></svg>", import.meta.url);
+var ___CSS_LOADER_EXPORT___ = ___CSS_LOADER_API_IMPORT___(___CSS_LOADER_API_SOURCEMAP_IMPORT___);
+var ___CSS_LOADER_URL_REPLACEMENT_0___ = ___CSS_LOADER_GET_URL_IMPORT___(___CSS_LOADER_URL_IMPORT_0___);
+var ___CSS_LOADER_URL_REPLACEMENT_1___ = ___CSS_LOADER_GET_URL_IMPORT___(___CSS_LOADER_URL_IMPORT_1___);
+var ___CSS_LOADER_URL_REPLACEMENT_2___ = ___CSS_LOADER_GET_URL_IMPORT___(___CSS_LOADER_URL_IMPORT_2___);
+// Module
+___CSS_LOADER_EXPORT___.push([module.id, `/* ============================================================
+   DEPLAI — scenes 05–09 : SECURITY / STORM / DESTINATION /
+   WATCH / FLEET        world space: 1600 x 900
+   ============================================================ */
+
+/* ================= SCENE 05 — SECURITY WATERS ================= */
+
+.dl-sec .dl-stage {
+    background: linear-gradient(180deg, #071224 0%, #061020 26%, #030814 60%, #02050d 100%);
+}
+
+.dl-sec-waterline {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 268px;
+    height: 632px;
+    background: linear-gradient(180deg, rgba(13, 42, 66, 0.9) 0%, rgba(4, 12, 24, 0.96) 45%, #01040a 100%);
+}
+
+.dl-sec-waves {
+    position: absolute;
+    left: 0;
+    top: 254px;
+    width: 200%;
+    height: 30px;
+    animation: dl-wave 10s linear infinite;
+}
+
+.dl-sec-shipwrap {
+    position: absolute;
+    left: 560px;
+    top: 118px;
+    width: 480px;
+    animation: dl-bob 5.2s ease-in-out infinite;
+    z-index: 12;
+}
+
+.dl-sonar-ring {
+    position: absolute;
+    left: 798px;
+    top: 268px;
+    width: 220px;
+    height: 220px;
+    margin: -110px 0 0 -110px;
+    border: 2px solid var(--dl-green);
+    border-radius: 50%;
+    opacity: 0;
+    box-shadow: 0 0 30px rgba(0, 255, 157, 0.25), inset 0 0 30px rgba(0, 255, 157, 0.12);
+    will-change: transform, opacity;
+    z-index: 11;
+}
+
+.dl-threat {
+    position: absolute;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 7px;
+    opacity: 0.16;
+    will-change: opacity;
+    z-index: 10;
+}
+
+.dl-threat .tag {
+    font-family: var(--dl-font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.16em;
+    padding: 5px 9px;
+    border: 1px solid var(--dl-amber);
+    color: var(--dl-amber);
+    background: rgba(5, 7, 10, 0.85);
+    white-space: nowrap;
+    text-transform: uppercase;
+}
+
+.dl-threat .mine {
+    animation: dl-agent-bob 3.4s ease-in-out infinite;
+}
+
+.dl-threat.danger .tag {
+    border-color: var(--dl-red);
+    color: var(--dl-red);
+    box-shadow: 0 0 18px rgba(255, 74, 74, 0.35);
+}
+
+.dl-threat.safe .tag {
+    border-color: var(--dl-green);
+    color: var(--dl-green);
+}
+
+.dl-sec-console {
+    position: absolute;
+    right: 5vw;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 40;
+    width: 300px;
+}
+
+.dl-sec-line {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 14px;
+    border-bottom: 1px solid rgba(74, 107, 130, 0.28);
+    font-family: var(--dl-font-mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+}
+
+.dl-sec-line .name {
+    color: var(--dl-off);
+}
+
+.dl-sec-line .st {
+    position: relative;
+    width: 96px;
+    text-align: right;
+}
+
+.dl-sec-line .st .scan {
+    color: var(--dl-amber);
+}
+
+.dl-sec-line .st .clear {
+    position: absolute;
+    right: 0;
+    top: 0;
+    color: var(--dl-green);
+    opacity: 0;
+}
+
+.dl-sec-sub {
+    position: absolute;
+    left: 1020px;
+    top: 610px;
+    width: 170px;
+    opacity: 0.5;
+    z-index: 9;
+    animation: dl-sub-drift 26s ease-in-out infinite;
+}
+
+@keyframes dl-sub-drift {
+    0%, 100% { transform: translateX(0) translateY(0); }
+    50% { transform: translateX(-190px) translateY(-14px); }
+}
+
+.dl-sec-copy {
+    left: 6vw;
+    top: 12vh;
+    z-index: 40;
+}
+
+/* ================= SCENE 06 — THE STORM ================= */
+
+.dl-storm .dl-stage {
+    background: linear-gradient(180deg, #101a2c 0%, #0c1524 55%, #080e18 100%);
+}
+
+.dl-storm-dark {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(180deg, #06080f 0%, #0a0d14 100%);
+    opacity: 0;
+    z-index: 5;
+}
+
+.dl-storm-dawn {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(180deg, rgba(255, 184, 0, 0.16) 0%, rgba(255, 184, 0, 0.05) 40%, transparent 70%);
+    opacity: 0;
+    z-index: 6;
+}
+
+.dl-storm-flash {
+    position: absolute;
+    inset: 0;
+    background: #cfe9ff;
+    opacity: 0;
+    z-index: 8;
+}
+
+.dl-storm-clouds {
+    position: absolute;
+    inset: 0;
+    z-index: 6;
+    opacity: 0;
+}
+
+.dl-storm-cloud {
+    position: absolute;
+    animation: dl-drift 18s ease-in-out infinite alternate;
+}
+
+.dl-storm-cloud.c2 {
+    animation-duration: 24s;
+    animation-delay: -8s;
+}
+
+.dl-storm-cloud.c3 {
+    animation-duration: 30s;
+    animation-delay: -14s;
+    opacity: 0.85;
+}
+
+.dl-storm-rain {
+    position: absolute;
+    inset: -12%;
+    z-index: 7;
+    opacity: 0;
+    background-image: url(${___CSS_LOADER_URL_REPLACEMENT_0___});
+    background-size: 200px 300px;
+    animation: dl-rain1 0.75s linear infinite;
+}
+
+.dl-storm-rain.r2 {
+    background-image: url(${___CSS_LOADER_URL_REPLACEMENT_1___});
+    background-size: 260px 380px;
+    animation: dl-rain2 1.15s linear infinite;
+}
+
+.dl-storm-rain.r3 {
+    background-image: url(${___CSS_LOADER_URL_REPLACEMENT_2___});
+    background-size: 300px 420px;
+    animation: dl-rain3 0.55s linear infinite;
+}
+
+@keyframes dl-rain1 {
+    from { background-position: 0 -300px; }
+    to { background-position: 26px 300px; }
+}
+
+@keyframes dl-rain2 {
+    from { background-position: 0 -380px; }
+    to { background-position: 30px 380px; }
+}
+
+@keyframes dl-rain3 {
+    from { background-position: 0 -420px; }
+    to { background-position: 34px 420px; }
+}
+
+.dl-storm-water {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 330px;
+    background: linear-gradient(180deg, #12253c 0%, #0a1728 55%, #060d18 100%);
+    z-index: 9;
+}
+
+.dl-storm-shipwrap {
+    position: absolute;
+    left: 520px;
+    bottom: 210px;
+    width: 560px;
+    z-index: 12;
+    animation: dl-storm-rock 3.2s ease-in-out infinite;
+}
+
+@keyframes dl-storm-rock {
+    0%, 100% { transform: translateY(0) rotate(-2.4deg); }
+    50% { transform: translateY(-13px) rotate(2.6deg); }
+}
+
+.dl-err {
+    position: absolute;
+    z-index: 30;
+    font-family: var(--dl-font-mono);
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    will-change: transform, opacity;
+}
+
+.dl-err .card {
+    position: relative;
+    padding: 10px 15px;
+    border: 1px solid var(--dl-red);
+    color: var(--dl-red);
+    background: rgba(10, 6, 8, 0.92);
+    box-shadow: 0 0 22px rgba(255, 74, 74, 0.28), 5px 5px 0 rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    white-space: nowrap;
+}
+
+.dl-err .fix {
+    position: absolute;
+    inset: 0;
+    padding: 10px 15px;
+    border: 1px solid var(--dl-green);
+    color: var(--dl-green);
+    background: rgba(4, 10, 8, 0.94);
+    box-shadow: 0 0 22px rgba(0, 255, 157, 0.25), 5px 5px 0 rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    opacity: 0;
+    white-space: nowrap;
+}
+
+.dl-storm-agent {
+    position: absolute;
+    z-index: 20;
+    width: 46px;
+    opacity: 0;
+    animation: dl-agent-bob 1.8s ease-in-out infinite;
+}
+
+.dl-storm-spark {
+    position: absolute;
+    width: 5px;
+    height: 5px;
+    background: var(--dl-cyan);
+    z-index: 21;
+    opacity: 0;
+    animation: dl-spark 0.5s steps(2) infinite;
+}
+
+.dl-storm-copy {
+    left: 50%;
+    top: 11vh;
+    transform: translateX(-50%);
+    text-align: center;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.dl-storm-copy .dl-kicker::before {
+    display: none;
+}
+
+/* ================= SCENE 07 — DESTINATION ================= */
+
+.dl-dest .dl-stage {
+    background: linear-gradient(180deg, #131327 0%, #231c31 34%, #3d2b3d 58%, #241a28 78%, #101018 100%);
+}
+
+.dl-dest-sun {
+    position: absolute;
+    left: 50%;
+    top: 330px;
+    width: 460px;
+    height: 460px;
+    margin-left: -230px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(255, 184, 0, 0.5) 0%, rgba(255, 138, 60, 0.16) 45%, transparent 70%);
+}
+
+.dl-dest-sun::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 130px;
+    height: 130px;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    background: #ffce6b;
+    box-shadow: 0 0 90px rgba(255, 184, 0, 0.8);
+}
+
+.dl-dest-city {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 180px;
+    height: 480px;
+    will-change: transform;
+}
+
+.dl-dest-water {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 200px;
+    background: linear-gradient(180deg, #4a3040 0%, #2a1d2c 40%, #120e1a 100%);
+    z-index: 10;
+}
+
+.dl-dest-shipwrap {
+    position: absolute;
+    left: 150px;
+    bottom: 116px;
+    width: 520px;
+    z-index: 14;
+    animation: dl-bob 5.6s ease-in-out infinite;
+    will-change: transform;
+}
+
+.dl-dest-hud {
+    position: absolute;
+    left: 50%;
+    bottom: 8vh;
+    transform: translateX(-50%);
+    z-index: 40;
+    width: min(560px, 86vw);
+}
+
+.dl-dest-hud .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-family: var(--dl-font-mono);
+    font-size: 12px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--dl-off);
+    margin-bottom: 10px;
+}
+
+.dl-dest-hud .pct {
+    font-family: var(--dl-font-display);
+    font-size: 40px;
+    color: var(--dl-amber);
+    letter-spacing: 0.03em;
+}
+
+.dl-dest-bar {
+    height: 14px;
+    border: 1px solid rgba(255, 184, 0, 0.55);
+    background: rgba(5, 7, 10, 0.7);
+    padding: 2px;
+}
+
+.dl-dest-bar .fill {
+    height: 100%;
+    width: 100%;
+    transform: scaleX(0);
+    transform-origin: left;
+    background: repeating-linear-gradient(90deg, var(--dl-amber) 0 10px, #d99a00 10px 12px);
+}
+
+.dl-dest-live {
+    position: absolute;
+    left: 50%;
+    bottom: calc(8vh + 128px);
+    transform: translateX(-50%);
+    z-index: 45;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-family: var(--dl-font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.22em;
+    color: var(--dl-green);
+    border: 1px solid rgba(0, 255, 157, 0.45);
+    border-left: 3px solid var(--dl-green);
+    padding: 13px 22px;
+    background: rgba(4, 10, 8, 0.85);
+    box-shadow: 0 0 28px rgba(0, 255, 157, 0.16), 5px 5px 0 rgba(0, 0, 0, 0.4);
+    text-transform: uppercase;
+    white-space: nowrap;
+    opacity: 0;
+}
+
+.dl-dest-live .sq {
+    width: 9px;
+    height: 9px;
+    background: var(--dl-green);
+    animation: dl-blink 1.6s steps(2) infinite;
+}
+
+.dl-dest-copy {
+    left: 6vw;
+    top: 10vh;
+    z-index: 40;
+}
+
+.dl-dest-cta {
+    position: absolute;
+    right: 6vw;
+    top: 12vh;
+    z-index: 40;
+    opacity: 0;
+}
+
+/* ================= SCENE 08 — KEEP WATCH ================= */
+
+.dl-watch .dl-stage {
+    background: linear-gradient(180deg, #04070d 0%, #050a14 45%, #03060c 100%);
+}
+
+.dl-watch-stars {
+    position: absolute;
+    inset: 0 0 40% 0;
+}
+
+.dl-watch-stars i {
+    position: absolute;
+    width: 2px;
+    height: 2px;
+    background: #cfe4ff;
+    animation: dl-twinkle 3.4s ease-in-out infinite;
+}
+
+.dl-watch-water {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 240px;
+    background: linear-gradient(180deg, #0a1828 0%, #050c16 70%, #03070e 100%);
+}
+
+.dl-watch-city {
+    position: absolute;
+    left: 90px;
+    bottom: 190px;
+    width: 480px;
+    opacity: 0.9;
+}
+
+.dl-watch-lighthouse {
+    position: absolute;
+    right: 190px;
+    bottom: 190px;
+    width: 150px;
+    z-index: 12;
+}
+
+.dl-watch-beam {
+    position: absolute;
+    right: 232px;
+    bottom: 402px;
+    width: 620px;
+    height: 90px;
+    transform-origin: right center;
+    background: linear-gradient(90deg, transparent 0%, rgba(255, 230, 0, 0.14) 55%, rgba(255, 230, 0, 0.4) 100%);
+    clip-path: polygon(0 38%, 100% 0, 100% 100%, 0 62%);
+    animation: dl-sweep 9s linear infinite;
+    z-index: 11;
+    filter: blur(1px);
+}
+
+.dl-watch-shipwrap {
+    position: absolute;
+    left: 660px;
+    bottom: 168px;
+    width: 330px;
+    animation: dl-bob 6.2s ease-in-out infinite;
+    z-index: 12;
+}
+
+.dl-watch-radar {
+    position: absolute;
+    left: 6vw;
+    bottom: 8vh;
+    z-index: 40;
+    width: 190px;
+    height: 190px;
+}
+
+.dl-watch-radar .sweep {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    background: conic-gradient(from 0deg, rgba(0, 240, 255, 0.5) 0deg, rgba(0, 240, 255, 0.06) 70deg, transparent 90deg);
+    animation: dl-sweep 4s linear infinite;
+}
+
+.dl-watch-radar .ring {
+    position: absolute;
+    border: 1px solid rgba(0, 240, 255, 0.3);
+    border-radius: 50%;
+}
+
+.dl-watch-radar .blip {
+    position: absolute;
+    width: 6px;
+    height: 6px;
+    background: var(--dl-green);
+    border-radius: 50%;
+    box-shadow: 0 0 8px var(--dl-green);
+    animation: dl-blink 2.4s steps(2) infinite;
+}
+
+.dl-watch-readouts {
+    position: absolute;
+    right: 6vw;
+    bottom: 8vh;
+    z-index: 40;
+    width: 260px;
+}
+
+.dl-watch-readouts .r {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 14px;
+    border-bottom: 1px solid rgba(74, 107, 130, 0.28);
+    font-family: var(--dl-font-mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+}
+
+.dl-watch-readouts .r .k {
+    color: var(--dl-mut);
+}
+
+.dl-watch-readouts .r .v {
+    color: var(--dl-green);
+}
+
+.dl-watch-readouts .r .v.cy {
+    color: var(--dl-cyan);
+}
+
+.dl-watch-copy {
+    left: 6vw;
+    top: 11vh;
+    z-index: 40;
+}
+
+/* ================= SCENE 09 — THE FLEET ================= */
+
+.dl-fleet .dl-stage {
+    background: linear-gradient(180deg, #050810 0%, #070d18 45%, #04070d 100%);
+}
+
+.dl-fleet-moon {
+    position: absolute;
+    left: 1180px;
+    top: 90px;
+    width: 110px;
+    height: 110px;
+    border-radius: 50%;
+    background: #e8ecef;
+    box-shadow: 0 0 70px rgba(232, 236, 239, 0.35);
+}
+
+.dl-fleet-moon::after {
+    content: "";
+    position: absolute;
+    left: 22px;
+    top: 26px;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: rgba(140, 160, 179, 0.35);
+    box-shadow: 34px 22px 0 -4px rgba(140, 160, 179, 0.3), 10px 44px 0 -7px rgba(140, 160, 179, 0.3);
+}
+
+.dl-fleet-stars {
+    position: absolute;
+    inset: 0 0 45% 0;
+}
+
+.dl-fleet-stars i {
+    position: absolute;
+    width: 2px;
+    height: 2px;
+    background: #cfe4ff;
+    animation: dl-twinkle 4s ease-in-out infinite;
+}
+
+.dl-fleet-water {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 330px;
+    background: linear-gradient(180deg, #0c1a2c 0%, #060e1a 60%, #03070d 100%);
+}
+
+.dl-fleet-ship {
+    position: absolute;
+    will-change: transform, opacity;
+    animation: dl-bob 6s ease-in-out infinite;
+}
+
+.dl-fleet-ship.sub {
+    opacity: 0.85;
+    mask-image: linear-gradient(180deg, black 46%, transparent 86%);
+    -webkit-mask-image: linear-gradient(180deg, black 46%, transparent 86%);
+}
+
+.dl-fleet-route {
+    position: absolute;
+    inset: 0;
+}
+
+.dl-fleet-copy {
+    left: 50%;
+    top: 26vh;
+    transform: translateX(-50%);
+    text-align: center;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.dl-fleet-copy .dl-kicker::before {
+    display: none;
+}
+
+.dl-fleet-copy .dl-sub {
+    margin-left: auto;
+    margin-right: auto;
+}
+
+/* ================= responsive ================= */
+
+@media (max-width: 760px) {
+    .dl-sec-console { right: 20px; width: 240px; }
+    .dl-sec-line { font-size: 10.5px; padding: 7px 10px; }
+    .dl-dest-hud { bottom: 5vh; }
+    .dl-dest-cta { right: 20px; top: auto; bottom: 22vh; }
+    .dl-watch-readouts { right: 20px; width: 210px; }
+    .dl-watch-radar { width: 130px; height: 130px; }
+    .dl-fleet-copy { top: 20vh; }
+}
+`, "",{"version":3,"sources":["webpack://./src/styles/scenes-b.css"],"names":[],"mappings":"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","sourcesContent":["/* ============================================================\n   DEPLAI — scenes 05–09 : SECURITY / STORM / DESTINATION /\n   WATCH / FLEET        world space: 1600 x 900\n   ============================================================ */\n\n/* ================= SCENE 05 — SECURITY WATERS ================= */\n\n.dl-sec .dl-stage {\n    background: linear-gradient(180deg, #071224 0%, #061020 26%, #030814 60%, #02050d 100%);\n}\n\n.dl-sec-waterline {\n    position: absolute;\n    left: 0;\n    right: 0;\n    top: 268px;\n    height: 632px;\n    background: linear-gradient(180deg, rgba(13, 42, 66, 0.9) 0%, rgba(4, 12, 24, 0.96) 45%, #01040a 100%);\n}\n\n.dl-sec-waves {\n    position: absolute;\n    left: 0;\n    top: 254px;\n    width: 200%;\n    height: 30px;\n    animation: dl-wave 10s linear infinite;\n}\n\n.dl-sec-shipwrap {\n    position: absolute;\n    left: 560px;\n    top: 118px;\n    width: 480px;\n    animation: dl-bob 5.2s ease-in-out infinite;\n    z-index: 12;\n}\n\n.dl-sonar-ring {\n    position: absolute;\n    left: 798px;\n    top: 268px;\n    width: 220px;\n    height: 220px;\n    margin: -110px 0 0 -110px;\n    border: 2px solid var(--dl-green);\n    border-radius: 50%;\n    opacity: 0;\n    box-shadow: 0 0 30px rgba(0, 255, 157, 0.25), inset 0 0 30px rgba(0, 255, 157, 0.12);\n    will-change: transform, opacity;\n    z-index: 11;\n}\n\n.dl-threat {\n    position: absolute;\n    display: flex;\n    flex-direction: column;\n    align-items: center;\n    gap: 7px;\n    opacity: 0.16;\n    will-change: opacity;\n    z-index: 10;\n}\n\n.dl-threat .tag {\n    font-family: var(--dl-font-mono);\n    font-size: 10.5px;\n    letter-spacing: 0.16em;\n    padding: 5px 9px;\n    border: 1px solid var(--dl-amber);\n    color: var(--dl-amber);\n    background: rgba(5, 7, 10, 0.85);\n    white-space: nowrap;\n    text-transform: uppercase;\n}\n\n.dl-threat .mine {\n    animation: dl-agent-bob 3.4s ease-in-out infinite;\n}\n\n.dl-threat.danger .tag {\n    border-color: var(--dl-red);\n    color: var(--dl-red);\n    box-shadow: 0 0 18px rgba(255, 74, 74, 0.35);\n}\n\n.dl-threat.safe .tag {\n    border-color: var(--dl-green);\n    color: var(--dl-green);\n}\n\n.dl-sec-console {\n    position: absolute;\n    right: 5vw;\n    top: 50%;\n    transform: translateY(-50%);\n    z-index: 40;\n    width: 300px;\n}\n\n.dl-sec-line {\n    display: flex;\n    align-items: center;\n    justify-content: space-between;\n    padding: 9px 14px;\n    border-bottom: 1px solid rgba(74, 107, 130, 0.28);\n    font-family: var(--dl-font-mono);\n    font-size: 12px;\n    letter-spacing: 0.14em;\n}\n\n.dl-sec-line .name {\n    color: var(--dl-off);\n}\n\n.dl-sec-line .st {\n    position: relative;\n    width: 96px;\n    text-align: right;\n}\n\n.dl-sec-line .st .scan {\n    color: var(--dl-amber);\n}\n\n.dl-sec-line .st .clear {\n    position: absolute;\n    right: 0;\n    top: 0;\n    color: var(--dl-green);\n    opacity: 0;\n}\n\n.dl-sec-sub {\n    position: absolute;\n    left: 1020px;\n    top: 610px;\n    width: 170px;\n    opacity: 0.5;\n    z-index: 9;\n    animation: dl-sub-drift 26s ease-in-out infinite;\n}\n\n@keyframes dl-sub-drift {\n    0%, 100% { transform: translateX(0) translateY(0); }\n    50% { transform: translateX(-190px) translateY(-14px); }\n}\n\n.dl-sec-copy {\n    left: 6vw;\n    top: 12vh;\n    z-index: 40;\n}\n\n/* ================= SCENE 06 — THE STORM ================= */\n\n.dl-storm .dl-stage {\n    background: linear-gradient(180deg, #101a2c 0%, #0c1524 55%, #080e18 100%);\n}\n\n.dl-storm-dark {\n    position: absolute;\n    inset: 0;\n    background: linear-gradient(180deg, #06080f 0%, #0a0d14 100%);\n    opacity: 0;\n    z-index: 5;\n}\n\n.dl-storm-dawn {\n    position: absolute;\n    inset: 0;\n    background: linear-gradient(180deg, rgba(255, 184, 0, 0.16) 0%, rgba(255, 184, 0, 0.05) 40%, transparent 70%);\n    opacity: 0;\n    z-index: 6;\n}\n\n.dl-storm-flash {\n    position: absolute;\n    inset: 0;\n    background: #cfe9ff;\n    opacity: 0;\n    z-index: 8;\n}\n\n.dl-storm-clouds {\n    position: absolute;\n    inset: 0;\n    z-index: 6;\n    opacity: 0;\n}\n\n.dl-storm-cloud {\n    position: absolute;\n    animation: dl-drift 18s ease-in-out infinite alternate;\n}\n\n.dl-storm-cloud.c2 {\n    animation-duration: 24s;\n    animation-delay: -8s;\n}\n\n.dl-storm-cloud.c3 {\n    animation-duration: 30s;\n    animation-delay: -14s;\n    opacity: 0.85;\n}\n\n.dl-storm-rain {\n    position: absolute;\n    inset: -12%;\n    z-index: 7;\n    opacity: 0;\n    background-image: url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='300'><g stroke='%23aec6dd' stroke-width='1.6' opacity='0.5'><line x1='26' y1='8' x2='36' y2='78'/><line x1='82' y1='120' x2='92' y2='196'/><line x1='140' y1='40' x2='150' y2='116'/><line x1='176' y1='200' x2='186' y2='272'/><line x1='58' y1='224' x2='68' y2='292'/><line x1='118' y1='150' x2='128' y2='214'/></g></svg>\");\n    background-size: 200px 300px;\n    animation: dl-rain1 0.75s linear infinite;\n}\n\n.dl-storm-rain.r2 {\n    background-image: url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='260' height='380'><g stroke='%23aec6dd' stroke-width='2' opacity='0.3'><line x1='40' y1='20' x2='54' y2='130'/><line x1='130' y1='160' x2='144' y2='270'/><line x1='216' y1='60' x2='230' y2='170'/><line x1='90' y1='270' x2='104' y2='372'/></g></svg>\");\n    background-size: 260px 380px;\n    animation: dl-rain2 1.15s linear infinite;\n}\n\n.dl-storm-rain.r3 {\n    background-image: url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='300' height='420'><g stroke='%23c4d6e8' stroke-width='2.4' opacity='0.5'><line x1='60' y1='30' x2='76' y2='160'/><line x1='190' y1='200' x2='206' y2='330'/><line x1='260' y1='60' x2='274' y2='180'/></g></svg>\");\n    background-size: 300px 420px;\n    animation: dl-rain3 0.55s linear infinite;\n}\n\n@keyframes dl-rain1 {\n    from { background-position: 0 -300px; }\n    to { background-position: 26px 300px; }\n}\n\n@keyframes dl-rain2 {\n    from { background-position: 0 -380px; }\n    to { background-position: 30px 380px; }\n}\n\n@keyframes dl-rain3 {\n    from { background-position: 0 -420px; }\n    to { background-position: 34px 420px; }\n}\n\n.dl-storm-water {\n    position: absolute;\n    left: 0;\n    right: 0;\n    bottom: 0;\n    height: 330px;\n    background: linear-gradient(180deg, #12253c 0%, #0a1728 55%, #060d18 100%);\n    z-index: 9;\n}\n\n.dl-storm-shipwrap {\n    position: absolute;\n    left: 520px;\n    bottom: 210px;\n    width: 560px;\n    z-index: 12;\n    animation: dl-storm-rock 3.2s ease-in-out infinite;\n}\n\n@keyframes dl-storm-rock {\n    0%, 100% { transform: translateY(0) rotate(-2.4deg); }\n    50% { transform: translateY(-13px) rotate(2.6deg); }\n}\n\n.dl-err {\n    position: absolute;\n    z-index: 30;\n    font-family: var(--dl-font-mono);\n    font-size: 12px;\n    letter-spacing: 0.12em;\n    text-transform: uppercase;\n    will-change: transform, opacity;\n}\n\n.dl-err .card {\n    position: relative;\n    padding: 10px 15px;\n    border: 1px solid var(--dl-red);\n    color: var(--dl-red);\n    background: rgba(10, 6, 8, 0.92);\n    box-shadow: 0 0 22px rgba(255, 74, 74, 0.28), 5px 5px 0 rgba(0, 0, 0, 0.45);\n    display: flex;\n    align-items: center;\n    gap: 9px;\n    white-space: nowrap;\n}\n\n.dl-err .fix {\n    position: absolute;\n    inset: 0;\n    padding: 10px 15px;\n    border: 1px solid var(--dl-green);\n    color: var(--dl-green);\n    background: rgba(4, 10, 8, 0.94);\n    box-shadow: 0 0 22px rgba(0, 255, 157, 0.25), 5px 5px 0 rgba(0, 0, 0, 0.45);\n    display: flex;\n    align-items: center;\n    gap: 9px;\n    opacity: 0;\n    white-space: nowrap;\n}\n\n.dl-storm-agent {\n    position: absolute;\n    z-index: 20;\n    width: 46px;\n    opacity: 0;\n    animation: dl-agent-bob 1.8s ease-in-out infinite;\n}\n\n.dl-storm-spark {\n    position: absolute;\n    width: 5px;\n    height: 5px;\n    background: var(--dl-cyan);\n    z-index: 21;\n    opacity: 0;\n    animation: dl-spark 0.5s steps(2) infinite;\n}\n\n.dl-storm-copy {\n    left: 50%;\n    top: 11vh;\n    transform: translateX(-50%);\n    text-align: center;\n    z-index: 40;\n    display: flex;\n    flex-direction: column;\n    align-items: center;\n}\n\n.dl-storm-copy .dl-kicker::before {\n    display: none;\n}\n\n/* ================= SCENE 07 — DESTINATION ================= */\n\n.dl-dest .dl-stage {\n    background: linear-gradient(180deg, #131327 0%, #231c31 34%, #3d2b3d 58%, #241a28 78%, #101018 100%);\n}\n\n.dl-dest-sun {\n    position: absolute;\n    left: 50%;\n    top: 330px;\n    width: 460px;\n    height: 460px;\n    margin-left: -230px;\n    border-radius: 50%;\n    background: radial-gradient(circle, rgba(255, 184, 0, 0.5) 0%, rgba(255, 138, 60, 0.16) 45%, transparent 70%);\n}\n\n.dl-dest-sun::after {\n    content: \"\";\n    position: absolute;\n    left: 50%;\n    top: 50%;\n    width: 130px;\n    height: 130px;\n    transform: translate(-50%, -50%);\n    border-radius: 50%;\n    background: #ffce6b;\n    box-shadow: 0 0 90px rgba(255, 184, 0, 0.8);\n}\n\n.dl-dest-city {\n    position: absolute;\n    left: 0;\n    right: 0;\n    bottom: 180px;\n    height: 480px;\n    will-change: transform;\n}\n\n.dl-dest-water {\n    position: absolute;\n    left: 0;\n    right: 0;\n    bottom: 0;\n    height: 200px;\n    background: linear-gradient(180deg, #4a3040 0%, #2a1d2c 40%, #120e1a 100%);\n    z-index: 10;\n}\n\n.dl-dest-shipwrap {\n    position: absolute;\n    left: 150px;\n    bottom: 116px;\n    width: 520px;\n    z-index: 14;\n    animation: dl-bob 5.6s ease-in-out infinite;\n    will-change: transform;\n}\n\n.dl-dest-hud {\n    position: absolute;\n    left: 50%;\n    bottom: 8vh;\n    transform: translateX(-50%);\n    z-index: 40;\n    width: min(560px, 86vw);\n}\n\n.dl-dest-hud .row {\n    display: flex;\n    justify-content: space-between;\n    align-items: baseline;\n    font-family: var(--dl-font-mono);\n    font-size: 12px;\n    letter-spacing: 0.2em;\n    text-transform: uppercase;\n    color: var(--dl-off);\n    margin-bottom: 10px;\n}\n\n.dl-dest-hud .pct {\n    font-family: var(--dl-font-display);\n    font-size: 40px;\n    color: var(--dl-amber);\n    letter-spacing: 0.03em;\n}\n\n.dl-dest-bar {\n    height: 14px;\n    border: 1px solid rgba(255, 184, 0, 0.55);\n    background: rgba(5, 7, 10, 0.7);\n    padding: 2px;\n}\n\n.dl-dest-bar .fill {\n    height: 100%;\n    width: 100%;\n    transform: scaleX(0);\n    transform-origin: left;\n    background: repeating-linear-gradient(90deg, var(--dl-amber) 0 10px, #d99a00 10px 12px);\n}\n\n.dl-dest-live {\n    position: absolute;\n    left: 50%;\n    bottom: calc(8vh + 128px);\n    transform: translateX(-50%);\n    z-index: 45;\n    display: flex;\n    align-items: center;\n    gap: 12px;\n    font-family: var(--dl-font-mono);\n    font-size: 13px;\n    font-weight: 600;\n    letter-spacing: 0.22em;\n    color: var(--dl-green);\n    border: 1px solid rgba(0, 255, 157, 0.45);\n    border-left: 3px solid var(--dl-green);\n    padding: 13px 22px;\n    background: rgba(4, 10, 8, 0.85);\n    box-shadow: 0 0 28px rgba(0, 255, 157, 0.16), 5px 5px 0 rgba(0, 0, 0, 0.4);\n    text-transform: uppercase;\n    white-space: nowrap;\n    opacity: 0;\n}\n\n.dl-dest-live .sq {\n    width: 9px;\n    height: 9px;\n    background: var(--dl-green);\n    animation: dl-blink 1.6s steps(2) infinite;\n}\n\n.dl-dest-copy {\n    left: 6vw;\n    top: 10vh;\n    z-index: 40;\n}\n\n.dl-dest-cta {\n    position: absolute;\n    right: 6vw;\n    top: 12vh;\n    z-index: 40;\n    opacity: 0;\n}\n\n/* ================= SCENE 08 — KEEP WATCH ================= */\n\n.dl-watch .dl-stage {\n    background: linear-gradient(180deg, #04070d 0%, #050a14 45%, #03060c 100%);\n}\n\n.dl-watch-stars {\n    position: absolute;\n    inset: 0 0 40% 0;\n}\n\n.dl-watch-stars i {\n    position: absolute;\n    width: 2px;\n    height: 2px;\n    background: #cfe4ff;\n    animation: dl-twinkle 3.4s ease-in-out infinite;\n}\n\n.dl-watch-water {\n    position: absolute;\n    left: 0;\n    right: 0;\n    bottom: 0;\n    height: 240px;\n    background: linear-gradient(180deg, #0a1828 0%, #050c16 70%, #03070e 100%);\n}\n\n.dl-watch-city {\n    position: absolute;\n    left: 90px;\n    bottom: 190px;\n    width: 480px;\n    opacity: 0.9;\n}\n\n.dl-watch-lighthouse {\n    position: absolute;\n    right: 190px;\n    bottom: 190px;\n    width: 150px;\n    z-index: 12;\n}\n\n.dl-watch-beam {\n    position: absolute;\n    right: 232px;\n    bottom: 402px;\n    width: 620px;\n    height: 90px;\n    transform-origin: right center;\n    background: linear-gradient(90deg, transparent 0%, rgba(255, 230, 0, 0.14) 55%, rgba(255, 230, 0, 0.4) 100%);\n    clip-path: polygon(0 38%, 100% 0, 100% 100%, 0 62%);\n    animation: dl-sweep 9s linear infinite;\n    z-index: 11;\n    filter: blur(1px);\n}\n\n.dl-watch-shipwrap {\n    position: absolute;\n    left: 660px;\n    bottom: 168px;\n    width: 330px;\n    animation: dl-bob 6.2s ease-in-out infinite;\n    z-index: 12;\n}\n\n.dl-watch-radar {\n    position: absolute;\n    left: 6vw;\n    bottom: 8vh;\n    z-index: 40;\n    width: 190px;\n    height: 190px;\n}\n\n.dl-watch-radar .sweep {\n    position: absolute;\n    inset: 0;\n    border-radius: 50%;\n    background: conic-gradient(from 0deg, rgba(0, 240, 255, 0.5) 0deg, rgba(0, 240, 255, 0.06) 70deg, transparent 90deg);\n    animation: dl-sweep 4s linear infinite;\n}\n\n.dl-watch-radar .ring {\n    position: absolute;\n    border: 1px solid rgba(0, 240, 255, 0.3);\n    border-radius: 50%;\n}\n\n.dl-watch-radar .blip {\n    position: absolute;\n    width: 6px;\n    height: 6px;\n    background: var(--dl-green);\n    border-radius: 50%;\n    box-shadow: 0 0 8px var(--dl-green);\n    animation: dl-blink 2.4s steps(2) infinite;\n}\n\n.dl-watch-readouts {\n    position: absolute;\n    right: 6vw;\n    bottom: 8vh;\n    z-index: 40;\n    width: 260px;\n}\n\n.dl-watch-readouts .r {\n    display: flex;\n    justify-content: space-between;\n    padding: 8px 14px;\n    border-bottom: 1px solid rgba(74, 107, 130, 0.28);\n    font-family: var(--dl-font-mono);\n    font-size: 12px;\n    letter-spacing: 0.14em;\n}\n\n.dl-watch-readouts .r .k {\n    color: var(--dl-mut);\n}\n\n.dl-watch-readouts .r .v {\n    color: var(--dl-green);\n}\n\n.dl-watch-readouts .r .v.cy {\n    color: var(--dl-cyan);\n}\n\n.dl-watch-copy {\n    left: 6vw;\n    top: 11vh;\n    z-index: 40;\n}\n\n/* ================= SCENE 09 — THE FLEET ================= */\n\n.dl-fleet .dl-stage {\n    background: linear-gradient(180deg, #050810 0%, #070d18 45%, #04070d 100%);\n}\n\n.dl-fleet-moon {\n    position: absolute;\n    left: 1180px;\n    top: 90px;\n    width: 110px;\n    height: 110px;\n    border-radius: 50%;\n    background: #e8ecef;\n    box-shadow: 0 0 70px rgba(232, 236, 239, 0.35);\n}\n\n.dl-fleet-moon::after {\n    content: \"\";\n    position: absolute;\n    left: 22px;\n    top: 26px;\n    width: 24px;\n    height: 24px;\n    border-radius: 50%;\n    background: rgba(140, 160, 179, 0.35);\n    box-shadow: 34px 22px 0 -4px rgba(140, 160, 179, 0.3), 10px 44px 0 -7px rgba(140, 160, 179, 0.3);\n}\n\n.dl-fleet-stars {\n    position: absolute;\n    inset: 0 0 45% 0;\n}\n\n.dl-fleet-stars i {\n    position: absolute;\n    width: 2px;\n    height: 2px;\n    background: #cfe4ff;\n    animation: dl-twinkle 4s ease-in-out infinite;\n}\n\n.dl-fleet-water {\n    position: absolute;\n    left: 0;\n    right: 0;\n    bottom: 0;\n    height: 330px;\n    background: linear-gradient(180deg, #0c1a2c 0%, #060e1a 60%, #03070d 100%);\n}\n\n.dl-fleet-ship {\n    position: absolute;\n    will-change: transform, opacity;\n    animation: dl-bob 6s ease-in-out infinite;\n}\n\n.dl-fleet-ship.sub {\n    opacity: 0.85;\n    mask-image: linear-gradient(180deg, black 46%, transparent 86%);\n    -webkit-mask-image: linear-gradient(180deg, black 46%, transparent 86%);\n}\n\n.dl-fleet-route {\n    position: absolute;\n    inset: 0;\n}\n\n.dl-fleet-copy {\n    left: 50%;\n    top: 26vh;\n    transform: translateX(-50%);\n    text-align: center;\n    z-index: 40;\n    display: flex;\n    flex-direction: column;\n    align-items: center;\n}\n\n.dl-fleet-copy .dl-kicker::before {\n    display: none;\n}\n\n.dl-fleet-copy .dl-sub {\n    margin-left: auto;\n    margin-right: auto;\n}\n\n/* ================= responsive ================= */\n\n@media (max-width: 760px) {\n    .dl-sec-console { right: 20px; width: 240px; }\n    .dl-sec-line { font-size: 10.5px; padding: 7px 10px; }\n    .dl-dest-hud { bottom: 5vh; }\n    .dl-dest-cta { right: 20px; top: auto; bottom: 22vh; }\n    .dl-watch-readouts { right: 20px; width: 210px; }\n    .dl-watch-radar { width: 130px; height: 130px; }\n    .dl-fleet-copy { top: 20vh; }\n}\n"],"sourceRoot":""}]);
+// Exports
+___CSS_LOADER_EXPORT___.locals = {};
+export default ___CSS_LOADER_EXPORT___;

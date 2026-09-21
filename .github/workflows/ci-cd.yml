@@ -54,6 +54,7 @@ jobs:
       - run: npm run test:billing
       - run: npm run test:usage
       - run: npm run test:ai-platform
+      - run: npm run test:build
       - run: npm run test:deployment
       - run: npm run test:agentic-websocket
       - run: npm run test:docs
@@ -105,6 +106,8 @@ jobs:
         run: python -m unittest discover -s "Agentic Layer" -p 'test_*.py'
       - name: Run deployment and preflight tests
         run: python -m unittest discover -s deploy -p 'test_*.py'
+      - name: Run synthetic preview boundary policy tests
+        run: python -m unittest discover -s deploy/preview-proof -p 'test_*.py'
 
   customization:
     name: Customization backend tests

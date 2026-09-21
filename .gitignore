@@ -4,6 +4,7 @@
 Agentic Layer/.env
 
 # dependencies
+node_modules/
 Connector/node_modules
 admin-console/node_modules/
 Connector/.pnp
@@ -76,6 +77,12 @@ Terraform-generation-plan.md
 *.jsonl
 *.mjs
 *.map
+
+# Synthetic preview boundary proof harness source (not generated proof reports).
+!deploy/preview-proof/browser-proof.mjs
+!deploy/preview-runtime/browser-benchmark.mjs
+!deploy/preview-proof/package.json
+!deploy/preview-proof/package-lock.json
 
 # Allow admin console source/config files hidden by the broad artifact ignores.
 !admin-console/package.json

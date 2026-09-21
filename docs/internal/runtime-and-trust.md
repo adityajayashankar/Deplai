@@ -57,3 +57,16 @@ Caddy must strip **`/agentic` only** (`handle_path /agentic/*` or `uri strip_pre
 Connector-side helpers: `Connector/src/lib/agentic-websocket.ts`. Ops check: authenticated `GET /api/scan/ws-health`.
 
 Related: [Local development](local-development.md) · [Environment](environment.md)
+
+## Build preview boundary proof
+
+`deploy/preview-proof/` is a separate synthetic-only gVisor test harness. It uses
+an explicitly selected `runsc` runtime, read-only worktree/root mounts, bounded
+tmpfs, CPU/memory/PID limits, network-disabled app containers and a loopback TLS
+gateway over per-preview Unix sockets. The optional HTTPS broker uses exact host
+allowlists and IP-pinned public DNS checks. It is not part of production Compose.
+
+The external watchdog/timer reclaims label-scoped expired and orphan resources.
+See the [proof runbook](../../deploy/preview-proof/README.md) for prerequisites,
+the full browser/network/resource matrix and evidence limitations. Imported
+application execution remains gated until mandatory live proof succeeds.
