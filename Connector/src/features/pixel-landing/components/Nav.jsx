@@ -2,10 +2,9 @@ import { useState } from "react";
 import SoundToggle from "./SoundToggle";
 
 const LINKS = [
-    { label: "Product", href: "#course", testid: "nav-link-product" },
-    { label: "Agents", href: "#crew", testid: "nav-link-agents" },
-    { label: "Security", href: "#security", testid: "nav-link-security" },
-    { label: "Docs", href: "#watch", testid: "nav-link-docs" },
+    { label: "Pricing", href: "/dashboard/billing", testid: "nav-link-pricing" },
+    { label: "Demo", href: "mailto:demo@deplai.tech", testid: "nav-link-demo" },
+    { label: "Docs ↗", href: "/dashboard/documentation", testid: "nav-link-docs" },
 ];
 
 const LogoMark = () => (
@@ -22,7 +21,7 @@ export default function Nav({ active }) {
     const [open, setOpen] = useState(false);
     return (
         <>
-            <header className="dl-nav" data-testid="main-nav">
+            <header className="dl-nav dl-nav-reference" data-testid="main-nav">
                 <nav className="dl-nav-links" aria-label="Primary">
                     {LINKS.map((l) => (
                         <a key={l.label} className="dl-nav-link" href={l.href} data-testid={l.testid}>
@@ -37,12 +36,11 @@ export default function Nav({ active }) {
                     </span>
                 </a>
                 <div className="dl-nav-right">
-                    <SoundToggle active={active} />
                     <a className="dl-nav-signin" href="/auth/login" data-testid="nav-signin">
-                        Sign in
+                        Log in
                     </a>
-                    <a className="dl-nav-cta" href="/auth/signup" data-testid="nav-cta-start-shipping">
-                        Start shipping →
+                    <a className="dl-nav-cta" href="mailto:demo@deplai.tech" data-testid="nav-cta-request-demo">
+                        Request demo ↗
                     </a>
                     <button
                         className={`dl-nav-burger ${open ? "open" : ""}`}
@@ -58,20 +56,21 @@ export default function Nav({ active }) {
                 </div>
             </header>
             {open && (
-                <nav className="dl-mobile-menu" aria-label="Mobile" data-testid="mobile-menu">
+                <nav className="dl-mobile-menu dl-mobile-reference" aria-label="Mobile" data-testid="mobile-menu">
                     {LINKS.map((l) => (
                         <a key={l.label} href={l.href} data-testid={`mobile-${l.testid}`} onClick={() => setOpen(false)}>
                             {l.label}
                         </a>
                     ))}
                     <a href="/auth/login" data-testid="mobile-nav-signin" onClick={() => setOpen(false)}>
-                        Sign in
+                        Log in
                     </a>
-                    <a href="/auth/signup" data-testid="mobile-nav-cta" onClick={() => setOpen(false)}>
-                        Start shipping →
+                    <a href="mailto:demo@deplai.tech" data-testid="mobile-nav-cta" onClick={() => setOpen(false)}>
+                        Request demo ↗
                     </a>
                 </nav>
             )}
+            <div className="dl-nav-sound"><SoundToggle active={active} /></div>
         </>
     );
 }

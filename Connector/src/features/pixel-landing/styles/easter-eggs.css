@@ -1,0 +1,13 @@
+.dl-crab-habitat { position: fixed; inset: 0; z-index: 85; pointer-events: none; user-select: none; overflow: hidden; }
+.dl-hermit { position: absolute; top: 20px; left: 20px; width: 42px; height: 37.333px; image-rendering: pixelated; }
+.dl-hermit svg { width: 100%; height: 100%; }
+.dl-crab-feet { animation: dl-crab-steps .65s steps(2) infinite; transform-origin: center; }
+.dl-hermit[data-state="notice"] .dl-crab-feet { animation-play-state: paused; }
+.dl-hermit[data-state="notice"] svg { transform: translateY(-2px); }
+.dl-hermit[data-state="scuttle"] .dl-crab-feet { animation-duration: .09s; }
+@keyframes dl-crab-steps { to { transform: translateX(2px); } }
+.dl-footer-wreck { position: absolute; right: 9%; bottom: 0; width: min(540px, 68vw); height: auto; aspect-ratio: 36 / 11; z-index: 2; pointer-events: none; image-rendering: pixelated; }
+.dl-footer-wreck > svg { width: 100%; height: 100%; }
+.dl-wreck-bubbles { animation: dl-wreck-bubbles 8s linear infinite; }
+@keyframes dl-wreck-bubbles { 0% { transform: translateY(4px); opacity: 0; } 25% { opacity: .45; } 100% { transform: translateY(-20px); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .dl-crab-feet, .dl-wreck-bubbles { animation: none !important; } }

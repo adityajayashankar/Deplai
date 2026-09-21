@@ -1,3 +1,5 @@
+import FooterWreck from "./FooterWreck";
+
 const COLS = [
     {
         h: "Product",
@@ -34,33 +36,30 @@ const BUBBLES = [
 ];
 
 const Shark = () => (
-    <svg width="190" height="64" viewBox="0 0 200 64" fill="none">
-        {/* body with forked tail, facing right (flipped by its swim animation) */}
+    <svg className="dl-shark-body" width="210" height="80" viewBox="0 0 210 80" fill="none">
+        {/* Nose points left; travel must stay leftward without mirroring. */}
+        <g className="dl-shark-tail">
+            <path d="M160 36L183 26L202 5L195 34L204 62L181 47L160 44Z" fill="#38596d" stroke="#648899" strokeWidth="1.3" />
+            <path d="M180 36L198 13L189 36L198 55L179 44Z" fill="#243e53" />
+        </g>
+        <path d="M78 25L95 3L99 22L116 30Z" fill="#38596d" stroke="#648899" strokeWidth="1.3" />
         <path
-            d="M10,36 C34,16 62,9 96,11 C118,13 138,18 158,26 L174,20 L165,30 L174,40 L156,35 C136,43 112,48 84,47 C58,46 30,44 10,36 Z"
-            fill="#1c3049"
-            stroke="#3a5c80"
-            strokeWidth="1.6"
+            d="M10 40Q28 25 55 23Q100 17 137 32L171 36V44L139 49Q98 64 54 55Q27 52 10 40Z"
+            fill="#41677c" stroke="#648899" strokeWidth="1.4"
         />
-        {/* dorsal fin */}
-        <path d="M84,12 Q96,1 108,3 L100,13 Z" fill="#16283c" stroke="#3a5c80" strokeWidth="1.4" />
-        {/* pectoral fin */}
-        <path d="M84,46 L72,59 L94,47 Z" fill="#16283c" stroke="#3a5c80" strokeWidth="1.4" />
-        {/* belly shade */}
-        <path d="M14,36 C36,42 66,45 96,44 C120,43 140,39 154,34 C136,43 112,48 84,47 C58,46 30,44 14,36 Z" fill="#24405e" opacity="0.8" />
-        {/* gills + eye */}
-        <line x1="42" y1="24" x2="42" y2="34" stroke="#0a1420" strokeWidth="1.6" />
-        <line x1="48" y1="24" x2="48" y2="35" stroke="#0a1420" strokeWidth="1.6" />
-        <line x1="54" y1="25" x2="54" y2="35" stroke="#0a1420" strokeWidth="1.6" />
-        <circle cx="30" cy="28" r="2.6" fill="#05070a" />
-        <circle cx="29" cy="27" r="0.9" fill="#8ca0b3" />
+        <path d="M13 41Q55 49 98 45L167 41L139 49Q98 64 54 55Q27 52 13 41Z" fill="#8ba8af" opacity=".75" />
+        <path d="M51 27Q84 21 114 28" stroke="#a0c2cb" strokeWidth="2" opacity=".4" />
+        <path className="dl-shark-fin" d="M76 44L96 72L101 50L114 46Z" fill="#2b485d" stroke="#5a7c8a" strokeWidth="1.2" />
+        <path d="M51 33L49 44M58 32L56 46M65 32L63 46M17 44Q27 48 38 45" stroke="#1b3445" strokeWidth="1.5" strokeLinecap="round" />
+        <circle cx="33" cy="35" r="3" fill="#101f2b" />
+        <circle cx="32" cy="34" r="1" fill="#d0e2df" />
     </svg>
 );
 
 const Clownfish = () => (
     <svg width="58" height="32" viewBox="0 0 60 32" fill="none">
         {/* tail + body, facing right */}
-        <polygon points="3,16 15,7 15,25" fill="#ff8a3d" stroke="#c85f14" strokeWidth="1.2" />
+        <g className="dl-fish-tail"><polygon points="3,16 3,7 17,13 17,19 3,25" fill="#ff8a3d" stroke="#c85f14" strokeWidth="1.2" /><path d="M5 12L14 15M5 20L14 17" stroke="#ffd391" strokeWidth="1" /></g>
         <ellipse cx="33" cy="16" rx="20" ry="11" fill="#ff8a3d" stroke="#c85f14" strokeWidth="1.4" />
         {/* dorsal + belly fins */}
         <path d="M22,6 Q33,-1 45,7 L43,9 Q33,3 24,8 Z" fill="#e06f1c" />
@@ -72,15 +71,21 @@ const Clownfish = () => (
         {/* eye */}
         <circle cx="47" cy="13" r="2.6" fill="#f4f0ea" />
         <circle cx="47.6" cy="13.4" r="1.4" fill="#05070a" />
+        <path d="M33 17Q39 13 39 21Z" fill="#ffc273" stroke="#c85f14" strokeWidth=".8" />
+        <path d="M21 10Q28 5 37 8" stroke="#ffe0a3" strokeWidth="1.3" opacity=".7" />
+        <path d="M49 20h3" stroke="#8f441e" strokeWidth="1" />
     </svg>
 );
 
 const SmallFish = ({ w = 30 }) => (
     <svg width={w} height={(w * 14) / 30} viewBox="0 0 30 14" fill="none">
-        <polygon points="1,7 9,2 9,12" fill="#3a6284" />
+        <g className="dl-fish-tail"><polygon points="1,2 10,6 10,8 1,12" fill="#619fae" /></g>
+        <path d="M13 3L17 0L21 3" fill="#74b2bb" />
         <ellipse cx="17" cy="7" rx="11" ry="5.5" fill="#4a7ba6" />
         <ellipse cx="17" cy="8.6" rx="9" ry="2.8" fill="#35597c" />
+        <path d="M10 5Q17 2 22 5M15 8L19 7L18 10" stroke="#9bcaca" strokeWidth=".9" />
         <circle cx="24" cy="6" r="1.3" fill="#05070a" />
+        <circle cx="24.3" cy="5.7" r=".45" fill="#e5f2dd" />
     </svg>
 );
 
@@ -149,6 +154,7 @@ export default function Footer() {
 
             {/* sea floor */}
             <div className="dl-seafloor" aria-hidden="true">
+                <FooterWreck />
                 <svg viewBox="0 0 1600 160" preserveAspectRatio="none" width="100%" height="100%">
                     <g fill="#0a1524">
                         <polygon points="0,160 0,110 90,88 200,112 300,96 380,118 480,104 560,160" />

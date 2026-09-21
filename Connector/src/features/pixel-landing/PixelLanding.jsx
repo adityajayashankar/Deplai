@@ -7,7 +7,9 @@ import "./styles/scenes-a.css";
 import "./styles/scenes-b.css";
 import "./styles/scenes-c.css";
 import { ScrollTrigger, useReducedMotion, scrollToScene } from "./components/ui";
-import Octopus from "./components/Octopus";
+import "./styles/easter-eggs.css";
+import "./styles/navigation.css";
+import HermitCrab from "./components/HermitCrab";
 import Nav from "./components/Nav";
 import ScenePort from "./components/ScenePort";
 import SceneLoad from "./components/SceneLoad";
@@ -68,7 +70,7 @@ function App() {
         <div className={`dl-root ${reduced ? "dl-reduced" : ""}`}>
             <div className="dl-grain" aria-hidden="true" />
             <Nav active={active} />
-            <Octopus />
+            <HermitCrab />
             <main>
                 <ScenePort />
                 <SceneLoad />

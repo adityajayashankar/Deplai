@@ -776,8 +776,9 @@
     position: absolute;
     top: 30%;
     left: 0;
-    opacity: 0.55;
+    opacity: 0.65;
     animation: dl-swim-l 52s linear infinite;
+    animation-delay: -12s;
 }
 
 .dl-nemo {
@@ -811,8 +812,24 @@
 }
 
 @keyframes dl-swim-l {
-    from { transform: translateX(105vw) scaleX(-1); }
-    to { transform: translateX(-280px) scaleX(-1); }
+    from { transform: translateX(105vw); }
+    to { transform: translateX(-280px); }
+}
+
+/* Motion inside each sprite leaves its directional travel untouched. */
+.dl-shark-body { animation: dl-sea-glide 5s ease-in-out infinite; }
+.dl-shark-tail { transform-origin: 164px 40px; animation: dl-shark-tail-beat 1.7s ease-in-out infinite; }
+.dl-shark-fin { transform-origin: 80px 46px; animation: dl-shark-fin-beat 3.4s ease-in-out infinite; }
+.dl-nemo > svg, .dl-smlfish > svg { animation: dl-sea-glide 3s ease-in-out infinite; }
+.dl-smlfish.f2 > svg { animation-delay: -1.5s; }
+.dl-fish-tail { transform-box: fill-box; transform-origin: right center; animation: dl-fish-tail-beat .65s ease-in-out infinite; }
+@keyframes dl-sea-glide { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
+@keyframes dl-shark-tail-beat { 0%, 100% { transform: rotate(-5deg) scaleX(.93); } 50% { transform: rotate(5deg) scaleX(1); } }
+@keyframes dl-shark-fin-beat { 0%, 100% { transform: rotate(-3deg); } 50% { transform: rotate(4deg); } }
+@keyframes dl-fish-tail-beat { 0%, 100% { transform: scaleX(.72); } 50% { transform: scaleX(1); } }
+@media (prefers-reduced-motion: reduce) {
+    .dl-shark, .dl-nemo, .dl-smlfish, .dl-shark-body, .dl-shark-tail,
+    .dl-shark-fin, .dl-nemo > svg, .dl-smlfish > svg, .dl-fish-tail { animation: none !important; }
 }
 
 .dl-jelly {
